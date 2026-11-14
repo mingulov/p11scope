@@ -9,10 +9,10 @@ share of deliberately failing calls, so the observer's memory counters
 Single-threaded; an optional fork share adds short-lived processes for
 the R12 live/dead split.
 
-Reads no credentials and writes no tokens: it uses a private
-SOFTHSM2_CONF under a mkdtemp dir, never initializes a token, and the
-only "PIN" in play is a wrong PIN sent to provoke CKR failures (never
-a real secret; the observer captures call metadata only, never PINs).
+Reads no credentials: it uses a private SOFTHSM2_CONF under a mkdtemp
+dir, initializes one throwaway token there, and the only "PIN" in play
+is a wrong PIN sent to provoke CKR failures (never a real secret; the
+observer captures call metadata only, never PINs).
 """
 import argparse
 import ctypes
@@ -20,7 +20,6 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -184,119 +183,130 @@ def reap():
 def run(args):
     libpath = probe_lib(args.lib)
     workdir = tempfile.mkdtemp(prefix="mem-churn-")
-    conf = private_conf(workdir)
-    os.environ["SOFTHSM2_CONF"] = conf
-    init_token(conf)
-    drv = Driver(libpath)
-    rv = drv.init(None)
-    if rv != CKR_OK:
-        raise SystemExit(f"mem-churn: C_Initialize rv={rv:#x}")
-    slots = drv.slots()
-    if not slots:
-        raise SystemExit("mem-churn: module reports no slots")
-    slot = slots[0]
-    print(
-        f"mem-churn: lib={libpath} slots={len(slots)} rate={args.rate}/s "
-        f"fail_share={args.fail_share} fork_every={args.fork_every} "
-        f"duration={args.duration}s",
-        flush=True,
-    )
-
-    period = 1.0 / args.rate
-    fail_every = (
-        int(round(1.0 / args.fail_share)) if args.fail_share > 0 else 0
-    )
-    start = time.monotonic()
-    deadline = start + args.duration
-    ok = fail = forked = 0
-    iteration = 0
-    last_report = start
     try:
-        while not STOP and time.monotonic() < deadline:
-            tick = time.monotonic()
-            do_fail = fail_every and (iteration % fail_every) == (fail_every - 1)
-            do_fork = args.fork_every and (iteration % args.fork_every) == 0
-            if do_fork and not do_fail:
-                pid = os.fork()
-                if pid == 0:  # child: one open+close, then exit
-                    try:
+        conf = private_conf(workdir)
+        os.environ["SOFTHSM2_CONF"] = conf
+        init_token(conf)
+        drv = Driver(libpath)
+        rv = drv.init(None)
+        if rv != CKR_OK:
+            raise SystemExit(f"mem-churn: C_Initialize rv={rv:#x}")
+        slots = drv.slots()
+        if not slots:
+            raise SystemExit("mem-churn: module reports no slots")
+        slot = slots[0]
+        print(
+            f"mem-churn: lib={libpath} slots={len(slots)} rate={args.rate}/s "
+            f"fail_share={args.fail_share} fork_every={args.fork_every} "
+            f"duration={args.duration}s",
+            flush=True,
+        )
+
+        period = 1.0 / args.rate
+        fail_every = (
+            int(round(1.0 / args.fail_share)) if args.fail_share > 0 else 0
+        )
+        start = time.monotonic()
+        deadline = start + args.duration
+        ok = fail = forked = 0
+        iteration = 0
+        last_report = start
+        try:
+            while not STOP and time.monotonic() < deadline:
+                tick = time.monotonic()
+                do_fail = fail_every and (iteration % fail_every) == (fail_every - 1)
+                do_fork = args.fork_every and (iteration % args.fork_every) == 0
+                if do_fork and not do_fail:
+                    pid = os.fork()
+                    if pid == 0:  # child: one open+close, then exit
+                        try:
+                            handle = ctypes.c_ulong(0)
+                            if (
+                                drv.open_session(
+                                    slot,
+                                    CKF_SERIAL_SESSION | CKF_RW_SESSION,
+                                    None,
+                                    None,
+                                    ctypes.byref(handle),
+                                )
+                                == CKR_OK
+                            ):
+                                drv.close_session(handle.value)
+                        finally:
+                            os._exit(0)
+                    # Forked attempts count only in `forked`: the child's
+                    # open/close result is invisible to the parent, so the
+                    # done line partitions (ok + fail + forked == iterations).
+                    forked += 1
+                    reap()
+                elif do_fail:
+                    shape = (iteration // max(fail_every, 1)) % 3
+                    if shape == 0:
                         handle = ctypes.c_ulong(0)
-                        if (
-                            drv.open_session(
-                                slot,
-                                CKF_SERIAL_SESSION | CKF_RW_SESSION,
-                                None,
-                                None,
-                                ctypes.byref(handle),
-                            )
-                            == CKR_OK
-                        ):
-                            drv.close_session(handle.value)
-                    finally:
-                        os._exit(0)
-                forked += 1
-                ok += 1
-                reap()
-            elif do_fail:
-                shape = (iteration // max(fail_every, 1)) % 3
-                if shape == 0:
-                    handle = ctypes.c_ulong(0)
-                    drv.open_session(
-                        0xFFFFFFFF, CKF_SERIAL_SESSION, None, None,
-                        ctypes.byref(handle),
-                    )
-                elif shape == 1:
-                    drv.close_session(0xFFFFFFFE)
-                else:
-                    drv.login(0xFFFFFFFD, CKU_USER, b"wrong-pin", 9)
-                fail += 1
-            else:
-                handle = ctypes.c_ulong(0)
-                if (
-                    drv.open_session(
-                        slot,
-                        CKF_SERIAL_SESSION | CKF_RW_SESSION,
-                        None,
-                        None,
-                        ctypes.byref(handle),
-                    )
-                    == CKR_OK
-                ):
-                    drv.close_session(handle.value)
-                    ok += 1
-                else:
+                        drv.open_session(
+                            0xFFFFFFFF, CKF_SERIAL_SESSION, None, None,
+                            ctypes.byref(handle),
+                        )
+                    elif shape == 1:
+                        drv.close_session(0xFFFFFFFE)
+                    else:
+                        drv.login(0xFFFFFFFD, CKU_USER, b"wrong-pin", 9)
                     fail += 1
-            iteration += 1
-            now = time.monotonic()
-            if now - last_report >= 60:
-                wall = now - start
-                print(
-                    f"mem-churn: t={wall:.0f}s iterations={iteration} "
-                    f"ok={ok} fail={fail} forked={forked} "
-                    f"rate={iteration / wall:.1f}/s",
-                    flush=True,
-                )
-                last_report = now
-            delay = period - (time.monotonic() - tick)
-            if delay > 0:
-                time.sleep(delay)
-    finally:
-        reap()
-        # Reap stragglers briefly, then finalize.
-        for _ in range(50):
-            try:
-                if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                else:
+                    handle = ctypes.c_ulong(0)
+                    if (
+                        drv.open_session(
+                            slot,
+                            CKF_SERIAL_SESSION | CKF_RW_SESSION,
+                            None,
+                            None,
+                            ctypes.byref(handle),
+                        )
+                        == CKR_OK
+                    ):
+                        drv.close_session(handle.value)
+                        ok += 1
+                    else:
+                        fail += 1
+                iteration += 1
+                now = time.monotonic()
+                if now - last_report >= 60:
+                    wall = now - start
+                    print(
+                        f"mem-churn: t={wall:.0f}s iterations={iteration} "
+                        f"ok={ok} fail={fail} forked={forked} "
+                        f"rate={iteration / wall:.1f}/s",
+                        flush=True,
+                    )
+                    last_report = now
+                delay = period - (time.monotonic() - tick)
+                if delay > 0:
+                    time.sleep(delay)
+        finally:
+            reap()
+            # Reap stragglers briefly, then finalize.
+            for _ in range(50):
+                try:
+                    if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                        break
+                except ChildProcessError:
                     break
-            except ChildProcessError:
-                break
-            time.sleep(0.02)
-        drv.finalize(None)
-    wall = time.monotonic() - start
-    print(
-        f"mem-churn: done t={wall:.0f}s iterations={iteration} ok={ok} "
-        f"fail={fail} forked={forked} rate={iteration / max(wall, 1e-9):.1f}/s",
-        flush=True,
-    )
+                time.sleep(0.02)
+            drv.finalize(None)
+        wall = time.monotonic() - start
+        print(
+            f"mem-churn: done t={wall:.0f}s iterations={iteration} ok={ok} "
+            f"fail={fail} forked={forked} rate={iteration / max(wall, 1e-9):.1f}/s",
+            flush=True,
+        )
+    finally:
+        # The private token dir leaves with the run (a forked child exits
+        # via os._exit, so this runs in the parent only). --keep-workdir
+        # preserves it for debugging token setup.
+        if args.keep_workdir:
+            print(f"mem-churn: keeping workdir {workdir}", flush=True)
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def main(argv=None):
@@ -308,10 +318,14 @@ def main(argv=None):
     parser.add_argument("--fail-share", type=float, default=0.2,
                         help="share of failing iterations (default 0.2)")
     parser.add_argument("--fork-every", type=int, default=0,
-                        help="run every Nth ok-iteration in a forked child "
+                        help="run every Nth ok-iteration in a forked child, "
+                             "counted in forked rather than ok "
                              "(0=off; proof uses 20)")
     parser.add_argument("--duration", type=float, default=660,
                         help="run seconds (default 660)")
+    parser.add_argument("--keep-workdir", action="store_true",
+                        help="keep the private token dir after the run "
+                             "(default: remove it)")
     args = parser.parse_args(argv)
     if args.rate <= 0 or args.duration <= 0:
         raise SystemExit("mem-churn: --rate and --duration must be positive")

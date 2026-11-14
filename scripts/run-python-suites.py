@@ -141,6 +141,7 @@ RUN = [
     ("test_loader_lifetimes.py", []),
     ("test_matched_cost_run.py", []),
     ("test_measure_e03.py", []),
+    ("test_mem_churn.py", []),
     ("test_merge_checksum_ledgers.py", []),
     ("test_narrow_scope_oracle.py", []),
     ("test_nodata_matrix_oracle.py", []),

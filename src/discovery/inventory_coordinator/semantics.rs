@@ -7404,29 +7404,172 @@ mod promotion_lifecycle_tests {
     #[test]
     fn disclose_audit_void_gaps_stays_quiet_when_unlinked() {
         // S1-only lanes re-sync without fencing voids (breaks and
-        // re-syncs are linked-only), so their audit H3Loss counters
-        // must not disclose Joint history-loss scope gaps: with zero
-        // Joint feeds there is no Joint history to lose, and the
-        // quiet privileged cells fail on any `loss` reason. Fails
-        // pre-fix disclosing 5 H3Loss gaps.
+        // re-syncs are linked-only), so no audit-void reason or
+        // sub-cause may disclose Joint history-loss scope gaps on an
+        // unlinked lane: with zero Joint feeds there is no Joint
+        // history to lose, and the quiet privileged cells fail on any
+        // `loss` reason.
+        use crate::semantics_objects::journal::{AUDIT_VOID_GAPS, JointVoidCounts, JournalGap};
+
+        let mut all_buckets = JointVoidCounts {
+            void_audit: 77,
+            ..Default::default()
+        };
+        for gap in AUDIT_VOID_GAPS {
+            let cases: Vec<(&str, JointVoidCounts)> = match gap {
+                JournalGap::FaultChanged => {
+                    all_buckets.audit_fault_changed_chain = 2;
+                    all_buckets.audit_fault_changed_reread = 3;
+                    vec![
+                        (
+                            "audit_fault_changed_chain",
+                            JointVoidCounts {
+                                void_audit: 2,
+                                audit_fault_changed_chain: 2,
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "audit_fault_changed_reread",
+                            JointVoidCounts {
+                                void_audit: 3,
+                                audit_fault_changed_reread: 3,
+                                ..Default::default()
+                            },
+                        ),
+                    ]
+                }
+                JournalGap::H3Loss => {
+                    all_buckets.audit_h3_loss = 5;
+                    vec![(
+                        "audit_h3_loss",
+                        JointVoidCounts {
+                            void_audit: 5,
+                            audit_h3_loss: 5,
+                            ..Default::default()
+                        },
+                    )]
+                }
+                JournalGap::Discarded => {
+                    all_buckets.audit_discarded = 7;
+                    vec![(
+                        "audit_discarded",
+                        JointVoidCounts {
+                            void_audit: 7,
+                            audit_discarded: 7,
+                            ..Default::default()
+                        },
+                    )]
+                }
+                JournalGap::Malformed => {
+                    all_buckets.audit_malformed = 11;
+                    vec![(
+                        "audit_malformed",
+                        JointVoidCounts {
+                            void_audit: 11,
+                            audit_malformed: 11,
+                            ..Default::default()
+                        },
+                    )]
+                }
+                JournalGap::CounterUnprovable => {
+                    all_buckets.audit_counter_unprovable = 13;
+                    vec![(
+                        "audit_counter_unprovable",
+                        JointVoidCounts {
+                            void_audit: 13,
+                            audit_counter_unprovable: 13,
+                            ..Default::default()
+                        },
+                    )]
+                }
+                JournalGap::FaultUnreadable => {
+                    all_buckets.audit_fault_unreadable = 17;
+                    vec![(
+                        "audit_fault_unreadable",
+                        JointVoidCounts {
+                            void_audit: 17,
+                            audit_fault_unreadable: 17,
+                            ..Default::default()
+                        },
+                    )]
+                }
+                JournalGap::ResourceUnavailable => {
+                    all_buckets.audit_resource_unavailable = 19;
+                    vec![(
+                        "audit_resource_unavailable",
+                        JointVoidCounts {
+                            void_audit: 19,
+                            audit_resource_unavailable: 19,
+                            ..Default::default()
+                        },
+                    )]
+                }
+                other => unreachable!("unexpected AUDIT_VOID_GAPS variant: {other:?}"),
+            };
+            for (subcause, carried) in cases {
+                let mut coordinator = coordinator();
+                coordinator.note_journal_linked(false);
+                coordinator
+                    .joint_capture_mut()
+                    .adapter_mut()
+                    .carry_joint_void_counts(&carried);
+                coordinator.disclose_audit_void_gaps();
+                let staged = coordinator.registry().staged_scope_gaps_for_test();
+                assert!(
+                    staged.is_empty(),
+                    "an unlinked lane discloses no audit-void gaps for {gap:?} ({subcause}): {staged:?}"
+                );
+            }
+        }
+
         let mut coordinator = coordinator();
         coordinator.note_journal_linked(false);
-        let carried = crate::semantics_objects::journal::JointVoidCounts {
-            break_dispose: 0,
-            break_ingest: 0,
-            void_audit: 7,
-            void_resync: 0,
-            seal_below_fence: 0,
-            audit_fault_changed_chain: 0,
-            audit_fault_changed_reread: 0,
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .carry_joint_void_counts(&all_buckets);
+        coordinator.disclose_audit_void_gaps();
+        let staged = coordinator.registry().staged_scope_gaps_for_test();
+        assert!(
+            staged.is_empty(),
+            "an unlinked lane discloses no audit-void gaps across all buckets combined: {staged:?}"
+        );
+    }
+
+    #[test]
+    fn disclose_audit_void_gaps_swallows_unlinked_then_discloses_only_new_void_when_linked() {
+        // Swallow-then-link contract: draining while unlinked advances
+        // the disclosed baseline without emitting scope gaps, so when
+        // the lane later becomes linked and one new void arrives, only
+        // that new void is disclosed. An early-return mutant that skips
+        // advancing the baseline while unlinked leaks the prior voids.
+        use crate::semantics_objects::journal::JointVoidCounts;
+
+        let mut coordinator = coordinator();
+        coordinator.note_journal_linked(false);
+        let mut carried = JointVoidCounts {
+            void_audit: 8,
             audit_h3_loss: 5,
-            audit_discarded: 0,
-            audit_malformed: 0,
-            audit_counter_unprovable: 0,
-            audit_fault_unreadable: 0,
-            audit_resource_unavailable: 0,
-            voids_ended_joint_feed: 0,
+            audit_discarded: 3,
+            ..Default::default()
         };
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .carry_joint_void_counts(&carried);
+        coordinator.disclose_audit_void_gaps();
+        assert!(
+            coordinator
+                .registry()
+                .staged_scope_gaps_for_test()
+                .is_empty(),
+            "unlinked drain must disclose no gaps"
+        );
+
+        coordinator.note_journal_linked(true);
+        carried.void_audit += 1;
+        carried.audit_h3_loss += 1;
         coordinator
             .joint_capture_mut()
             .adapter_mut()
@@ -7435,8 +7578,19 @@ mod promotion_lifecycle_tests {
         let staged = coordinator.registry().staged_scope_gaps_for_test();
         assert_eq!(
             staged.len(),
-            0,
-            "an unlinked lane discloses no audit-void gaps: {staged:?}"
+            1,
+            "swallow-then-link must disclose only the single new void: {staged:?}"
+        );
+        assert_eq!(
+            staged[0].1, "joint_void_h3_loss_history_loss",
+            "the disclosed gap must be the new H3Loss void only: {staged:?}"
+        );
+
+        coordinator.disclose_audit_void_gaps();
+        assert_eq!(
+            coordinator.registry().staged_scope_gaps_for_test().len(),
+            1,
+            "a follow-up drain with no new voids discloses nothing"
         );
     }
 

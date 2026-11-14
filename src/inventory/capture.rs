@@ -4207,8 +4207,8 @@ where
         };
     };
     // Tick progress buffered since the last pass joins the counts the
-    // retiring line reports (and the retirement budget covers); the stop's
-    // own flush then no-ops.
+    // retiring line reports (and on Multi the retirement budget covers the
+    // flushed endpoints); the stop's own flush then no-ops.
     lane.flush_tick_progress(driver.host());
     if let Err(next) = publish(
         driver,

@@ -2245,6 +2245,51 @@ fn verbose_details_fold_leaves_lone_and_non_size_gaps_alone() {
     );
 }
 
+/// The Details fold skips budget rows: identical object-size-cap gaps
+/// carrying a budget refusal render one unfolded line each with the
+/// budget suffix, never a folded process count.
+#[test]
+fn verbose_details_fold_leaves_budgeted_size_gaps_unfolded() {
+    let (mut harness, _caller) = single_caller_harness("present-size-budget-nofold", 1);
+    for pid in [1001u32, 1002] {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(pid),
+                subject: "/opt/big.so".into(),
+                reason: "object is 600920136 bytes; limit is 536870912".into(),
+                budget: Some(crate::discovery::caller_registry::BudgetRefusal {
+                    resource: "callers",
+                    limit: 1,
+                    requested: 2,
+                }),
+            });
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let gap_lines: Vec<&str> = snapshot
+        .lines()
+        .filter(|line| line.starts_with("gap ["))
+        .collect();
+    assert_eq!(
+        gap_lines,
+        vec![
+            "gap [/opt/big.so] object is 600920136 bytes; limit is 536870912 (budget callers: limit 1, requested 2)",
+            "gap [/opt/big.so] object is 600920136 bytes; limit is 536870912 (budget callers: limit 1, requested 2)",
+        ],
+        "two unfolded budget lines, never a folded count:\n{snapshot}"
+    );
+    assert!(!snapshot.contains("processes)"), "{snapshot}");
+    // JSON keeps every row: the fold exclusion is text-only.
+    assert_eq!(document["gaps"].as_array().unwrap().len(), 2);
+}
+
 #[test]
 fn uncovered_edges_read_neither_idle_nor_armed() {
     // I3 (review): quiet is a fact only under a loss-free count or a

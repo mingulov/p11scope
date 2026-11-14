@@ -587,7 +587,8 @@ plus the per-entry-optional length descriptors".
 Per changed program: ≥5% verifier headroom on the 6.6 floor (R-52
 precedent), `object_producer_compiled_frames_are_bounded` green,
 `bpf-noninterference` baseline unchanged (no new maps, no new
-hook sites beyond the 9 named functions), `bpf loads` on vng
+hook sites beyond the 7 newly probed functions —
+Wrap/Unwrap/KEM ride their existing sites), `bpf loads` on vng
 6.6/6.12 + host 7.x, LP64 + ia32 load cells. The 6.1 E2BIG-style
 refusal precedent applies: if a floor kernel refuses, the lane
 reports the named refusal instead of simplifying the program.
@@ -905,8 +906,21 @@ integration: keyrows first, keymeta rebases). Keymeta Task 3
 develops against recorded row fixtures until the keyrows base
 merges, then re-runs the join twins on the merged SHA. Keymeta
 Task 5 (live proof) runs after BOTH lanes merge (yield needs rows
-AND facts). Task 7 runs after Task 2 (shared object_policy/flow/
-wire files, one writer at a time — the same rule). Task 5 also
+AND facts). Task 7 merges after Task 3's merge commit (shared
+projection/schema/test files — `src/inventory/present.rs`,
+`src/inventory/cbom/render.rs`, `docs/cbom-export.md`,
+`scripts/qualify-key-operations.py`, `docs/schema/inventory-v1.md`,
+`src/inventory/present_key_ops_tests.rs`,
+`src/inventory/cbom/cbom_tests.rs` — one writer at a time;
+development against recorded Task 2/Task 3 fixtures may proceed
+in parallel, the merge serializes). The Task 2 wire base rides
+the same chain: Task 3 already serializes after Task 2's merge,
+so Task 7-after-Task 3 also owns the shared
+object_policy/flow/wire files uncontended. Task 7 Step 0 (the
+§17.3 allowlist merge) serializes after the Task 0 merge commit
+(shared `docs/privacy/allowlist-v3.md`). Task 6 merges after
+Task 7 (shared `docs/schema/inventory-v1.md`; the optional item
+never gates the required one). Task 5 also
 carries the required Task 7 info positives (§17.6). Schema
 version allocation is the integrator's (§10.1). No v0.8.0 task
 depends on the postponed Task 8 (§18).
@@ -940,12 +954,13 @@ depends on the postponed Task 8 (§18).
 - K3: RSA size display. OVERRIDDEN by owner 2026-11-14 07:52
   (was: RANGE with arithmetic class): a standard octet length
   (128/256/384/512) shows the standard size — text "RSA 2048 (from
-  signature length)", JSON `size_class: 2048` with `source: length`
-  and raw `modulus_bytes: 256`. Only a non-standard admitted octet
+  signature length)", JSON `size_class: 2048` + `modulus_bytes: 256`
+  under the length-evidenced `inferred_size` key. Only a non-standard
+  admitted octet
   length shows a masked class ("RSA, 2,0xx-bit class (from signature
   length)") with the byte count. Same rule for the other families:
   ECDSA raw lengths → P-256/P-384/P-521, ML-KEM/ML-DSA lengths →
-  parameter sets. The source label keeps it honest; no range text
+  parameter sets. The evidence tag keeps it honest; no range text
   is rendered anywhere. The 64..=2048 admission bound stays as
   anti-aliasing (real odd sizes like 192-byte/1536-bit stay
   classed); widening it later is an amendment row.
@@ -985,6 +1000,14 @@ postponed to Later (§18 shortened to a pointer, full round-3 text
 in history; no v0.8.0 BPF/schema/privacy rows; nothing depends on
 it); K3 overridden to standard-size display with no range text
 (§5.2, §10.2, §10.3, §15); Task 7 stays required.
+Round 5 (fix4 review findings 1–6): §17.1 rebuilt on per-ABI
+cryptoki-sys 0.5.0 layouts (packing evidence, exact LP64/ia32
+offsets, per-ABI read lists, 4-layer BPF validation); Task 7
+merge order made explicit (after Task 3, Step 0 after Task 0,
+Task 6 after Task 7 — §13 + plan Tasks 0/3/6/7); §8.5 count
+fixed to 7; K3 reworded onto the closed §10.2 shape (§15);
+§17.3 gains the condition-(c) Edit 3 and §17.4 names wire
+value 16; plan Tasks 2/7 Step 1 gain the dropped negatives.
 
 ## 17. Required: provider, token and mechanism info (Task 7)
 
@@ -999,19 +1022,111 @@ them.
 ### 17.1 Read set (fixed-size struct reads at return)
 
 Arguments are zero-based; all indices ≤ 2 (no arg-7 exception).
-Struct layouts below are pinned against cryptoki-sys
-(`CK_INFO`/`CK_TOKEN_INFO`/`CK_MECHANISM_INFO` + static offset
-asserts); the lane pins both LP64 and ia32 layouts (ia32 differs
-only in `CK_ULONG`/`CK_FLAGS` width: 4 vs 8 bytes).
+Layouts below are transcribed from the product's ABI pin,
+cryptoki-sys 0.5.0 (`Cargo.toml:38`, `Cargo.lock:178-181`), whose
+per-target bindgen files carry compile-time size/offset asserts:
+`src/bindings/x86_64-unknown-linux-gnu.rs` (LP64) and
+`src/bindings/i686-unknown-linux-gnu.rs` (ia32). Both files
+number identically: `CK_VERSION` :1308, `CK_INFO` :1321 with
+asserts :1330-1340, `CK_MECHANISM_INFO` :1397 with asserts
+:1404-1410, `CK_TOKEN_INFO` :1468 with asserts :1490-1526.
 
-| Call | Args | Struct | Bytes read (LP64) |
+Linux packing is natural C alignment (`#[repr(C)]`, e.g. LP64
+:1319): the header's 1-byte pack is Windows-only —
+`vendor/pkcs11.h:10-12` guards `#pragma pack(push, cryptoki, 1)`
+with `#if defined(_WIN32) || defined(CRYPTOKI_FORCE_WIN32)`
+(pop at :2774-2775), and `build.rs:120-122` rewrites bindgen's
+`#[repr(C, packed)]` to `#[repr(C)]` plus a windows-only packed
+attribute. `CK_ULONG`/`CK_FLAGS` are `c_ulong` (:1056/:1074):
+8 bytes on LP64, 4 on ia32 — so ia32 differs from LP64 in
+offsets, sizes AND padding, never "only in width".
+
+Per-ABI field offsets (`@off[width]`; `R` = read, `–` = never
+fetched (§17.2), `P` = padding, never parsed or published — the
+contiguous whole-struct read covers the `CK_INFO` pads, while
+the `CK_TOKEN_INFO` LP64 tail pad sits outside all three
+ranges).
+
+`CK_INFO` — LP64 88 B (align 8), ia32 76 B (align 4):
+
+| Field | LP64 | ia32 | Use |
 | --- | --- | --- | --- |
-| `C_GetInfo` | 0: `pInfo` | `CK_INFO` (88 B) | whole struct: cryptokiVersion@0 (major, minor), manufacturerID@2[32], flags@40, libraryDescription@48[32], libraryVersion@80 — all provider build metadata, no identifiers |
-| `C_GetTokenInfo` | 0: slotID (scalar), 1: `pTokenInfo` | `CK_TOKEN_INFO` (208 B) | three ranges, 60 bytes: manufacturerID@32[32] + model@64[16] ([32..80)), flags@96 (8 B), hardwareVersion@184 + firmwareVersion@186 ([184..188)) |
-| `C_GetMechanismInfo` | 0: slotID (scalar), 1: mechanism type (scalar), 2: `pInfo` | `CK_MECHANISM_INFO` (24 B) | whole struct: ulMinKeySize@0, ulMaxKeySize@8, flags@16 |
+| cryptokiVersion | @0[2] | @0[2] | R |
+| manufacturerID | @2[32] | @2[32] | R |
+| (pad) | [34..40) | [34..36) | P |
+| flags | @40[8] | @36[4] | R |
+| libraryDescription | @48[32] | @40[32] | R |
+| libraryVersion | @80[2] | @72[2] | R |
+| (tail pad) | [82..88) | [74..76) | P |
+
+`CK_TOKEN_INFO` — LP64 208 B (align 8), ia32 160 B (align 4),
+LP64 only has a 4-byte tail pad (last field ends at 204):
+
+| Field | LP64 | ia32 | Use |
+| --- | --- | --- | --- |
+| label | @0[32] | @0[32] | – |
+| manufacturerID | @32[32] | @32[32] | R |
+| model | @64[16] | @64[16] | R |
+| serialNumber | @80[16] | @80[16] | – |
+| flags | @96[8] | @96[4] | R |
+| ulMaxSessionCount | @104[8] | @100[4] | – |
+| ulSessionCount | @112[8] | @104[4] | – |
+| ulMaxRwSessionCount | @120[8] | @108[4] | – |
+| ulRwSessionCount | @128[8] | @112[4] | – |
+| ulMaxPinLen | @136[8] | @116[4] | – |
+| ulMinPinLen | @144[8] | @120[4] | – |
+| ulTotalPublicMemory | @152[8] | @124[4] | – |
+| ulFreePublicMemory | @160[8] | @128[4] | – |
+| ulTotalPrivateMemory | @168[8] | @132[4] | – |
+| ulFreePrivateMemory | @176[8] | @136[4] | – |
+| hardwareVersion | @184[2] | @140[2] | R |
+| firmwareVersion | @186[2] | @142[2] | R |
+| utcTime | @188[16] | @144[16] | – |
+| (tail pad) | [204..208) | none | P |
+
+`CK_MECHANISM_INFO` — LP64 24 B (align 8), ia32 12 B (align 4):
+
+| Field | LP64 | ia32 | Use |
+| --- | --- | --- | --- |
+| ulMinKeySize | @0[8] | @0[4] | R |
+| ulMaxKeySize | @8[8] | @4[4] | R |
+| flags | @16[8] | @8[4] | R |
+
+Fixed read lists per call and ABI (full-span sizes differ — the
+entry guard and the return reader both take the target's ABI):
+
+| Call | Args | LP64 bytes read | ia32 bytes read |
+| --- | --- | --- | --- |
+| `C_GetInfo` | 0: `pInfo` | whole struct, 88 B | whole struct, 76 B |
+| `C_GetTokenInfo` | 0: slotID (scalar), 1: `pTokenInfo` | 60 B: [32..80) + flags [96..104) + [184..188) | 56 B: [32..80) + flags [96..100) + [140..144) |
+| `C_GetMechanismInfo` | 0: slotID (scalar), 1: mechanism type (scalar), 2: `pInfo` | whole struct, 24 B | whole struct, 12 B |
+
+BPF-side validation (Task 7 implements all four layers): (1)
+per-`LinuxLayout` const read-list tables (offsets, widths, span
+sizes) in `crates/ebpf-common`, following the pkcs11-abi
+`InterfaceLayout` pattern (`LinuxLayout::word_bytes`, per-layout
+const fn) — ebpf-common is no_std on the kernel side and cannot
+depend on cryptoki-sys (std + libloading), so the tables are
+checked-in consts, not the bindgen types; (2) `const _: () =
+assert!` / `const _: [(); N]` static asserts on the tables
+(precedent: `crates/ebpf-common/src/lib.rs:1941-1945`) — every
+range end ≤ its per-ABI span, every width = the ABI word; (3)
+host tests cross-checking the LP64 consts field-by-field against
+`size_of`/`offset_of` of the cryptoki-sys types (precedent:
+`crates/ebpf-common/src/inventory_callers.rs:197-221`), so a pin
+bump that moves any field fails the build; the ia32 consts are
+checked-in literals cited to the i686 assert lines above, and
+the §17.6 ia32 host twins (byte-exact buffers built at ia32
+offsets) fail on any wrong offset; an `artifact_contracts` case
+pins both read lists; (4) at runtime the probe selects the
+layout from the target CS register (`target_layout_from_cs`,
+`crates/ebpf-common/src/lib.rs:65-68`) exactly like `arg_u64`
+(`crates/ebpf/src/main.rs:2821`), and the full-span guard uses
+that ABI's span size.
 
 Protocol: entry retains the `pInfo` pointer with full-span
-validation of the fixed struct size and snapshots the slot/mechanism
+validation of the per-ABI fixed struct size (LP64/ia32: 88/76,
+208/160, 24/12) and snapshots the slot/mechanism
 scalars; return reads the fixed bytes on `CKR_OK` only. NULL
 pointer → unavailable; any other return → never (no
 BUFFER_TOO_SMALL/query-shape rule: these are not length cells).
@@ -1033,10 +1148,12 @@ numeric fields).
 `CK_TOKEN_INFO` excluded ranges are never fetched from the target
 (the BPF read list is the three §17.1 ranges only):
 
-- `serialNumber`@80[16]: an identifier — EXCLUDED by default, and
+- `serialNumber`@80[16] (same offset on both ABIs): an
+  identifier — EXCLUDED by default, and
   this design provides no opt-in flag to capture it in v0.8.0.
   Reintroducing it needs its own amendment + owner/Opus review.
-- `label`@0[32]: operator-set, identifier-ish — excluded (not
+- `label`@0[32] (same offset on both ABIs): operator-set,
+  identifier-ish — excluded (not
   requested, same treatment as the serial).
 - `ulMaxPinLen`/`ulMinPinLen`: PIN-adjacent — never (hard line).
 - Session counts, memory sizes: not requested — excluded.
@@ -1052,7 +1169,7 @@ Status when merged: PROPOSED for owner/Opus privacy review + Codex
 re-review (the Task 0 gate applies to this block too); not active
 until reviewed. Placement: a new `## Provider, token and mechanism
 info (v0.8.0 keymeta Task 7)` section appended after the §11 keymeta
-section, plus the two row edits below. Header status line gains the
+section, plus the three row edits below. Header status line gains the
 section (PROPOSED). v1/v2 bytes unchanged.
 
 Edit 1 — descriptor table (§Exact object descriptor combinations):
@@ -1074,6 +1191,14 @@ read-and-scrubbed); `Mechanism info struct (C_GetMechanismInfo)`
 size, flags incl. `CKF_HW`). Authority: per-entry optional (NULL/
 foreign/degraded entry → that entry count-only, provider still
 admitted — the §8.4 rule, never provider-gating).
+
+Edit 3 — authority condition (c): the §11-merged count text
+("... plus the per-entry-optional length descriptors") becomes
+"... plus the per-entry-optional length descriptors and Task 7
+info descriptors". Applies onto the §11-merged text (Task 7
+Step 0 serializes after the Task 0 merge, §13); NULL/foreign/
+degraded info entries stay count-only at that entry with no
+reads there and never refuse the provider.
 
 New section body (normative):
 
@@ -1106,19 +1231,21 @@ New section body (normative):
 
 ### 17.4 BPF design and budget
 
-New `ObjectAction::ProviderInfo` (next wire value after Task 2's
-15) on 3 descriptors; no inputs, no templates (never authorized).
+New `ObjectAction::ProviderInfo` (wire value 16,
+`OBJECT_ACTION_MAX` 15 → 16) on 3 descriptors; no inputs, no
+templates (never authorized).
 Up to +3 endpoints per provider instance — Task 7 measures the
 delta (these calls may already be probed for counting; worst case
-+3). No new maps. Largest single read is 88 bytes (`CK_INFO`);
++3). No new maps. Largest single read is 88 bytes (LP64 `CK_INFO`;
+ia32 `CK_INFO` is 76 bytes);
 the 512-byte frame test must pass unmodified in limit. Verifier:
 same §8.5 gates (≥5% headroom on the 6.6 floor, `bpf loads` on vng
 6.6/6.12 + host 7.x, LP64 + ia32). Wire: a new fixed 128-byte
 `ProviderInfoWire` completed-call record (action, slot, mechanism,
 kind, status, ≤96 payload bytes) with an exact version+length
-check like §8.3; old readers refuse it loudly. Task 7 runs after
-Task 2 and consumes the Task 2 wire base (shared files, one writer
-at a time — the §13 rule).
+check like §8.3; old readers refuse it loudly. Task 7 merges after
+Task 3's merge commit and consumes the Task 2 wire base through
+that chain (shared files, one writer at a time — the §13 rule).
 
 ### 17.5 Schema, output and CBOM
 

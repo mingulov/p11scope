@@ -15555,7 +15555,9 @@ impl Engine {
     /// is the ordinary end of a process. Timing proof goes either way.
     #[track_caller]
     fn mark_generation_change(&mut self, view: ProcessViewId, subject: &str, reason: &str) {
-        if self.original_exited(view) {
+        // A group in its final exit has ended too: it can never call or
+        // load again, even before its pin reports the exit.
+        if self.original_exited(view) || self.original_ending(view) {
             self.invalidate_causal_timing();
             return;
         }
@@ -24392,7 +24394,7 @@ impl Engine {
                 }
         );
         let lost_to_expected_exit = matches!(outcome, LoaderArmOutcome::GenerationLost { .. })
-            && self.original_exited(view_id)
+            && (self.original_exited(view_id) || self.original_ending(view_id))
             && !self.loader_view_has_live_context(view_id);
         let deferred = matches!(
             outcome,
@@ -25543,9 +25545,6 @@ impl Engine {
         })
     }
 
-    /// Whether this view's retained original pin *proves* its process exited.
-    /// A poll failure or a dropped view is not exit evidence and stays false,
-    /// so an unprovable loss is never downgraded.
     /// Whether `view`'s original thread group has exited or is in its
     /// final exit, so it can never run user code again: no further
     /// provider call and no further load can come from it. A per-process
@@ -25606,6 +25605,9 @@ impl Engine {
         Ok(false)
     }
 
+    /// Whether this view's retained original pin *proves* its process exited.
+    /// A poll failure or a dropped view is not exit evidence and stays false,
+    /// so an unprovable loss is never downgraded.
     fn original_exited(&self, view: ProcessViewId) -> bool {
         #[cfg(test)]
         if let Some(answer) = self.pop_pin_probe_exited() {

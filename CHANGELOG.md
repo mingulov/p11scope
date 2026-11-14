@@ -32,9 +32,8 @@ versioned separately and are opaque, exact dispatch keys.
   hooking it: a thread group that has exited, or whose every thread is
   already exiting or has a pending `SIGKILL`, can never call or load
   again, so its failed loader arm, missing loader context, or changed
-  generation around an export hook is the process ending, not a gap
-  (was: an unbound `loader_discovery` context plus "discovery
-  unavailable" skips). The same failures on a live process stay named
+  generation is the process ending, not a gap (was: an unbound
+  `loader_discovery` context plus "discovery unavailable" skips). The same failures on a live process stay named
   gaps. A tick that stops only to finish cleaning up such ended
   processes no longer files a postponement gap either, and a tick
   deep-scan deferral is withdrawn at capture end once every deferred

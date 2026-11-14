@@ -83523,3 +83523,36 @@ fn quantum_deferral_records_stand_only_while_a_rescan_is_owed() {
     assert!(!settled.counters.object_skips.contains(&record));
     assert!(!settled.plan.skipped.contains(&record));
 }
+
+/// A generation change on a group already in its final exit is its
+/// ordinary end, even before the pin reports the exit; on a live group
+/// it stays a named loss.
+#[test]
+fn generation_change_on_a_group_in_final_exit_files_no_loss() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    let subject = "live loader arming";
+    let reason = "the process generation changed before the loader-arm postcheck";
+    engine.mark_generation_change(view, subject, reason);
+    let filed = |engine: &Engine| {
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == subject && skip.reason == reason)
+    };
+    assert!(filed(&engine), "a live group's generation change is a loss");
+
+    let (mut ending_child, mut ending, _modules) = engine_with_one_accepted_provider();
+    let ending_view = ending.views[0].id();
+    ending.set_final_exit_for_test(ending_view);
+    ending.mark_generation_change(ending_view, subject, reason);
+    assert!(
+        !filed(&ending),
+        "an ending group's generation change is its end"
+    );
+    for child in [&mut child, &mut ending_child] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}

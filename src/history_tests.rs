@@ -396,6 +396,68 @@ fn retire_waits_for_drain_past_tap_position() {
 }
 
 #[test]
+fn retired_cookie_reopens_and_clears_exit_timestamp() {
+    // B1 step-4 twin: exit-retire never sets `closed`; an event on a
+    // retired cookie with a timestamp after the exit reopens the task,
+    // clears the exit timestamp, counts `exit_retire_reopened`, and is
+    // never refused; an event timestamped at or before the exit counts
+    // `exit_retire_late` and is still admitted. Fails while admission
+    // ignores the exit timestamp: nothing reopens or counts late.
+    let (mut s, mut t, _) = setup(64);
+    let mut first = ev(100, 90, 0, 0);
+    first.ts_ns = 100;
+    feed(&mut s, &mut t, [first]);
+    let cookie = key(90, 0);
+    // Exit at hook 200, retired past a future stamp.
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    assert_eq!(due, std::collections::BTreeSet::from([cookie]));
+    s.retire_processes(&due);
+    assert!(!s.has_process_state(cookie));
+    // A thread CALL after the exit reopens: admitted, never refused,
+    // and the exit timestamp clears.
+    let mut thread = ev(100, 90, 0, 0);
+    thread.ts_ns = 250;
+    feed(&mut s, &mut t, [thread]);
+    assert_eq!(s.semantic_evidence().semantic_history_drops, 0);
+    assert!(s.has_process_state(cookie));
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 1, 0));
+    // With the timestamp cleared, an older event counts nothing late.
+    let mut older = ev(100, 90, 0, 2);
+    older.ts_ns = 150;
+    feed(&mut s, &mut t, [older]);
+    assert_eq!(s.semantic_evidence().semantic_history_drops, 0);
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 1, 0));
+    // A second exit retires again; events at or before its hook count
+    // late — twice proves the timestamp stays set — yet still admit.
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 300,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    assert_eq!(due, std::collections::BTreeSet::from([cookie]));
+    s.retire_processes(&due);
+    assert!(!s.has_process_state(cookie));
+    for ts in [250, 260] {
+        let mut late = ev(100, 90, 0, 2);
+        late.ts_ns = ts;
+        feed(&mut s, &mut t, [late]);
+    }
+    assert_eq!(s.semantic_evidence().semantic_history_drops, 0);
+    assert!(s.has_process_state(cookie), "late events still admit");
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 1, 2));
+}
+
+#[test]
 fn history_cookie_fd_and_pid_changes_never_order_independent_producer_histories() {
     let (mut s, mut t, a) = setup(16);
     feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);

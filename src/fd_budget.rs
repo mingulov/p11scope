@@ -65,6 +65,10 @@ pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_TRUSTED: &str = "capture library-h
 /// Learned candidates that find the table full wait for the next drain
 /// instead of settling: the candidate stays learnable.
 pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_LEARNED: &str = "capture library-handle budget exhausted (1000 concurrent handles); learned candidate deferred to the next tick";
+/// Count-manifest objects that find the collector table full wait for
+/// the next pass instead of skipping permanently: the collector
+/// retries every pass under its reservation.
+pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST: &str = "capture library-handle budget exhausted (1000 concurrent handles); count manifest object deferred to the next pass";
 
 /// True for the open(2)-family errnos that mean "out of handles, wait":
 /// `EMFILE` (this process's fd table is full) and `ENFILE` (the

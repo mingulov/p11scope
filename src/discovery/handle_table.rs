@@ -143,6 +143,13 @@ pub(crate) enum DeferredReason {
     Live,
     Trusted,
     Learned,
+    /// Collector count-manifest objects: trusted-class admission (into
+    /// the cap, under the collector reservation) but retried every
+    /// pass, so their gap waits instead of skipping permanently.
+    CountManifest,
+    /// One-shot inspect lanes: scan-class admission, but the run never
+    /// retries, so stops name the terminal wait instead of a next tick.
+    Inspect,
 }
 
 /// The single acquire step's outcome: filed, or refused with its reason.
@@ -270,10 +277,10 @@ impl HandleTable {
                 inserted: false,
             });
         }
-        // Trusted inputs admit into the cap; every other site admits
-        // into the cap minus the trusted reservation.
+        // Trusted-class inputs admit into the cap; every other site
+        // admits into the cap minus the trusted reservation.
         let limit = match reason {
-            DeferredReason::Trusted => self.cap,
+            DeferredReason::Trusted | DeferredReason::CountManifest => self.cap,
             _ => self.scan_cap(),
         };
         if crate::fd_budget::library_handle_budget_exhausted(self.len(), limit) {

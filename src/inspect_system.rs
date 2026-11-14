@@ -2113,7 +2113,7 @@ fn prepare_count_manifests(
                 prior_objects,
                 prior_bytes,
                 &mut *table,
-                DeferredReason::Trusted,
+                DeferredReason::CountManifest,
             )
             .map_err(|error| anyhow::anyhow!("manifest pinning refused: {:?}", error.problems()))?;
             ensure!(
@@ -5995,7 +5995,7 @@ mod tests {
         assert!(
             collection.scope_gaps[0]
                 .reason
-                .contains("count manifest object deferred to the next pass"),
+                .contains(crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST),
             "the deferral waits for the next pass: {:?}",
             collection.scope_gaps[0].reason
         );

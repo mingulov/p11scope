@@ -7895,10 +7895,13 @@ fn trusted_refusal_gap(reason: DeferredReason) -> &'static str {
     match reason {
         DeferredReason::Trusted => crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_TRUSTED,
         DeferredReason::Learned => crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED,
+        DeferredReason::CountManifest => {
+            crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST
+        }
         _ => {
             debug_assert!(
                 false,
-                "manifest/prearm chains only refuse trusted/learned inputs"
+                "manifest/prearm chains only refuse trusted/learned/count inputs"
             );
             crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_TRUSTED
         }
@@ -8105,11 +8108,11 @@ fn batch_byte_allowance(spent: u64, wanted: usize) -> Result<usize, String> {
 }
 
 /// Inspect-lane variant of `pin_count_manifest_objects_in_views_with_prior`:
-/// manifest objects file rows into the run's own table. Inspect passes
-/// [`DeferredReason::Trusted`] for its operator-supplied manifest (the
-/// manifest chain only refuses trusted/learned inputs); the caller's
-/// strict `skipped.is_empty()` refusal turns any deferral into the
-/// run's hard error, unchanged.
+/// manifest objects file rows into the run's own table. The collector
+/// passes [`DeferredReason::CountManifest`] for its operator-supplied
+/// manifest (the manifest chain only refuses trusted/learned/count
+/// inputs); the caller's strict `skipped.is_empty()` refusal turns any
+/// deferral into the run's hard error, unchanged.
 pub(crate) fn pin_count_manifest_objects_in_views_with_prior_and_table(
     m: &Manifest,
     views: &[ProcessView],
@@ -9242,6 +9245,9 @@ fn pin_scanned_view_objects_with(
     // Probe-local scratch (`Filing::Scratch` only): proven pins that
     // build no entries and file no rows, dropped at return.
     let mut scratch = Vec::new();
+    // One-shot lanes never retry: their wait rows name the terminal
+    // wait instead of a next tick that never comes.
+    let retries = !matches!(&filing, Filing::Acquire(_, DeferredReason::Inspect));
     let mut wanted = wanted.into_iter();
     for raw in wanted.by_ref() {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
@@ -9263,6 +9269,7 @@ fn pin_scanned_view_objects_with(
                 wanted.by_ref(),
                 &mut skipped,
                 PIN_RESERVE_STOP_DETAIL,
+                retries,
             );
             break;
         }
@@ -9282,6 +9289,7 @@ fn pin_scanned_view_objects_with(
                 wanted.by_ref(),
                 &mut skipped,
                 PIN_BUDGET_STOP_DETAIL,
+                retries,
             );
             break;
         }
@@ -9315,6 +9323,7 @@ fn pin_scanned_view_objects_with(
                                     wanted.by_ref(),
                                     &mut skipped,
                                     PIN_BUDGET_STOP_DETAIL,
+                                    retries,
                                 );
                                 break;
                             }
@@ -9334,7 +9343,14 @@ fn pin_scanned_view_objects_with(
             }
             Err(failure) => Err(failure),
         };
-        record_scanned_candidate(&mut pinned, view.id(), raw, candidate, &mut skipped);
+        record_scanned_candidate(
+            &mut pinned,
+            view.id(),
+            raw,
+            candidate,
+            &mut skipped,
+            retries,
+        );
     }
     if !view.still_the_same() {
         return Err(exited());
@@ -9437,13 +9453,14 @@ fn record_pin_stop(
     remaining: impl Iterator<Item = RawObjectInstance>,
     skipped: &mut Vec<Skipped>,
     detail: &str,
+    retries: bool,
 ) {
     let stop = || PinFailure::Wait {
         reason: detail.into(),
     };
-    record_scanned_candidate(pinned, view, raw, Err(stop()), skipped);
+    record_scanned_candidate(pinned, view, raw, Err(stop()), skipped, retries);
     for raw in remaining {
-        record_scanned_candidate(pinned, view, raw, Err(stop()), skipped);
+        record_scanned_candidate(pinned, view, raw, Err(stop()), skipped, retries);
     }
 }
 
@@ -9453,6 +9470,7 @@ fn record_scanned_candidate(
     raw: RawObjectInstance,
     candidate: Result<Entry, PinFailure>,
     skipped: &mut Vec<Skipped>,
+    retries: bool,
 ) {
     match candidate {
         Ok(entry) => {
@@ -9462,13 +9480,20 @@ fn record_scanned_candidate(
             }
         }
         Err(PinFailure::Wait { reason }) => {
-            // Out of handles: the open waits for the next tick. No key
-            // rejection — nothing was proven about the file — just the
-            // counted named gap; the admission loops defer the view so
-            // the next tick retries the whole scan.
+            // Out of handles: the open waits for the next tick — or
+            // names the terminal wait when the lane never retries
+            // (one-shot inspect). No key rejection — nothing was
+            // proven about the file — just the counted named gap; the
+            // admission loops defer the view so the next tick retries
+            // the whole scan.
+            let tail = if retries {
+                "the pin waits for the next tick"
+            } else {
+                "the run does not retry"
+            };
             skipped.push(Skipped {
                 subject: PIN_WAIT_SUBJECT.into(),
-                reason: format!("{}: {reason}; the pin waits for the next tick", raw.path),
+                reason: format!("{}: {reason}; {tail}", raw.path),
             });
         }
         Err(PinFailure::Refused(reason)) => {
@@ -12972,6 +12997,7 @@ mod tests {
                     "/private/view-{view}.so: unavailable"
                 ))),
                 &mut skipped,
+                true,
             );
         }
         (pins, skipped)
@@ -14139,6 +14165,7 @@ mod tests {
                     raw.clone(),
                     Err("mapping identity unavailable".into()),
                     &mut skipped,
+                    true,
                 );
             }
             record_scanned_candidate(
@@ -14147,6 +14174,7 @@ mod tests {
                 raw.clone(),
                 Ok(entry),
                 &mut skipped,
+                true,
             );
             if !unavailable_first {
                 record_scanned_candidate(
@@ -14155,6 +14183,7 @@ mod tests {
                     raw,
                     Err("mapping identity unavailable".into()),
                     &mut skipped,
+                    true,
                 );
             }
             assert_eq!(
@@ -14203,6 +14232,7 @@ mod tests {
                     "/private/view-{view}.so: ROUND1_UNAVAILABLE_ERROR_{view}"
                 ))),
                 &mut skipped,
+                true,
             );
             skipped.extend(aggregate.absorb(pins));
         }
@@ -21657,7 +21687,7 @@ mod tests {
             &mut budget,
             None,
             &mut table,
-            DeferredReason::Live,
+            DeferredReason::Inspect,
         )
         .unwrap();
         assert_eq!(

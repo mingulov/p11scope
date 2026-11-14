@@ -751,7 +751,7 @@ fn run_with_view(
                 &mut context.1,
                 None,
                 &mut handles,
-                DeferredReason::Live,
+                DeferredReason::Inspect,
             )
         },
     );

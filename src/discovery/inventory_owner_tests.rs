@@ -1003,3 +1003,152 @@ fn reconciliation_commit_keeps_a_newer_requested_refresh_pending() {
         }
     );
 }
+
+/// Owner-scan invariant twin (extends the mixed-capture `len <= cap`
+/// invariant to the inventory owner site, which needs an Inventory
+/// engine): a six-module owner scan against a cap-6 table prefilled
+/// with four live rows admits exactly the two rows of headroom, then
+/// refuses through the acquiring funnel — the table holds the cap, the
+/// receipt stays partial with its named budget gap, and the stop
+/// counts. Never a silent over-cap adoption.
+#[test]
+fn handle_table_owner_scan_holds_len_within_cap() {
+    use std::os::unix::fs::MetadataExt as _;
+    const CAP: usize = 6;
+    const PREFILL: usize = 4;
+    const MODULES: usize = 6;
+    let mut engine = engine(2, 1);
+    engine.set_table_cap_for_test(CAP);
+    // Prefill the shared table with live rows over fresh tempfiles,
+    // leaving two rows of headroom. Dropping the shares frees them.
+    let dir = tempfile::tempdir().unwrap();
+    let mut live = Vec::new();
+    for n in 0..PREFILL {
+        let path = dir.path().join(format!("fill{n:02}.so"));
+        std::fs::write(&path, format!("fill-{n}")).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let maps = p11scope_manifest::maps::ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        };
+        let proved = crate::discovery::identity::ProvedEntry::for_test(
+            std::fs::File::open(&path).unwrap(),
+            maps,
+            &format!("fill-{n:02}"),
+            None,
+        );
+        let crate::discovery::identity::ProvedEntry { file, meta } = proved;
+        match engine.handle_table_mut().acquire(
+            file,
+            &meta,
+            crate::discovery::handle_table::DeferredReason::Live,
+        ) {
+            crate::discovery::handle_table::AcquireOutcome::Held(held) => {
+                assert!(held.inserted);
+                live.push(held);
+            }
+            crate::discovery::handle_table::AcquireOutcome::Deferred(reason) => {
+                panic!("prefill must admit below the cap: {reason:?}")
+            }
+        }
+    }
+    let owner = open(&mut engine);
+    // Six pinnable scan modules: copies of fixed bytes under distinct
+    // paths, each keyed by the production maps-comparable resolution,
+    // so the pin path's own identity guard passes and the twin
+    // exercises only the table funnel.
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.id() == owner)
+        .expect("the opened owner retains its view");
+    let bytes = std::fs::read("/bin/true").unwrap();
+    let mut mounts = crate::process::MountTableCache::default();
+    // Fixture key resolution spends a throwaway budget, never the
+    // engine's: the scan under test must meet a fresh budget.
+    let mut fixture_budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let mut modules = Vec::new();
+    for n in 0..MODULES {
+        let path = dir.path().join(format!("lib{n:02}.so"));
+        std::fs::write(&path, &bytes).unwrap();
+        let (_file, key) = crate::discovery::identity::open_view_object_cached(
+            view,
+            &path,
+            &mut mounts,
+            &mut fixture_budget,
+        )
+        .unwrap();
+        let mut module = crate::discovery::identity::test_fixture::module(key);
+        module.view = view.id();
+        module.mount_namespace = view.mount_namespace();
+        module.key = key;
+        module.path = path.to_str().unwrap().to_string();
+        module.tables = Vec::new();
+        modules.push(module);
+    }
+    drop(view);
+    let mut guard = ScriptedImage(ImageCheck::Exact);
+    let lease = engine.acquire_inventory_scan(owner).unwrap();
+    let window = engine
+        .budget
+        .begin_window(WindowId::new(0), u64::MAX)
+        .unwrap();
+    let checkpoint = engine.budget.checkpoint(window.clone()).unwrap();
+    let receipt = engine
+        .scan_inventory_owner_with(&lease, &mut guard, |_, _, _| {
+            Ok(ScanOutcome::Scanned {
+                modules,
+                skipped: Vec::new(),
+                scan_ms: 0,
+            })
+        })
+        .unwrap();
+    engine.budget.finish_scan(checkpoint).unwrap();
+    engine.budget.finish_window(window).unwrap();
+    assert!(
+        engine.handle_table.len() <= CAP,
+        "the owner scan holds the cap: {} rows over cap {CAP}",
+        engine.handle_table.len()
+    );
+    let ScanReceipt::AdditionsOnly(facts) = receipt else {
+        panic!("a deferred owner scan stays partial, never complete");
+    };
+    assert_eq!(
+        facts.modules.len(),
+        MODULES,
+        "all six modules reach the pin loop"
+    );
+    assert_eq!(
+        facts.pins.pinned().count(),
+        CAP - PREFILL,
+        "exactly the headroom pins before the stop"
+    );
+    assert_eq!(
+        engine.handle_table.stats().admits,
+        (PREFILL + CAP - PREFILL) as u64,
+        "prefill plus headroom admit, nothing more"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == crate::discovery::identity::PIN_WAIT_SUBJECT
+                && skip.reason == crate::discovery::identity::PIN_BUDGET_STOP_DETAIL
+        }),
+        "the stop files its named budget gap: {:?}",
+        engine.counters.object_skips
+    );
+    // Downstream: the partial receipt prepares and commits as
+    // incomplete, preserving prior claims instead of certifying
+    // absence.
+    let prepared = engine
+        .prepare_inventory_reconciliation(ScanReceipt::AdditionsOnly(facts), &mut guard)
+        .unwrap();
+    let commit = engine
+        .commit_inventory_reconciliation(prepared, &mut guard)
+        .unwrap();
+    engine.release_inventory_scan(&lease).unwrap();
+    assert!(!commit.complete, "the deferred commit stays incomplete");
+    drop(live);
+}

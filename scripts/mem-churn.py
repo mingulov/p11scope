@@ -150,12 +150,13 @@ def init_token(conf):
 
     Test PINs only, local to this throwaway token; the failing-login
     shape below deliberately uses a wrong PIN. The observer never
-    captures PINs (call metadata only).
+    captures PINs (call metadata only). Fatal on failure (Important 2):
+    a missing tool or a failed init would otherwise degrade silently to
+    an all-failure workload that the bench/soaks accept.
     """
     tool = shutil.which("softhsm2-util")
     if tool is None:
-        print("mem-churn: softhsm2-util missing, opens will fail", flush=True)
-        return
+        raise SystemExit("mem-churn: softhsm2-util missing (token init required)")
     env = dict(os.environ, SOFTHSM2_CONF=conf)
     proc = subprocess.run(
         [tool, "--init-token", "--slot", "0", "--label", "mem-churn",
@@ -163,10 +164,8 @@ def init_token(conf):
         env=env, capture_output=True, text=True, timeout=60,
     )
     if proc.returncode != 0:
-        print(
-            f"mem-churn: token init failed ({proc.stderr.strip()}), "
-            "opens will fail",
-            flush=True,
+        raise SystemExit(
+            f"mem-churn: token init failed ({proc.stderr.strip()})"
         )
 
 
@@ -195,6 +194,24 @@ def run(args):
         if not slots:
             raise SystemExit("mem-churn: module reports no slots")
         slot = slots[0]
+        # First success-shape open (Important 2): fail fast on a wrong
+        # slot order or an unusable token, instead of running a full
+        # all-failure soak that the bench would accept.
+        probe_handle = ctypes.c_ulong(0)
+        if (
+            drv.open_session(
+                slot,
+                CKF_SERIAL_SESSION | CKF_RW_SESSION,
+                None,
+                None,
+                ctypes.byref(probe_handle),
+            )
+            != CKR_OK
+        ):
+            raise SystemExit(
+                f"mem-churn: first success-shape open failed (slot={slot})"
+            )
+        drv.close_session(probe_handle.value)
         print(
             f"mem-churn: lib={libpath} slots={len(slots)} rate={args.rate}/s "
             f"fail_share={args.fail_share} fork_every={args.fork_every} "
@@ -209,6 +226,7 @@ def run(args):
         start = time.monotonic()
         deadline = start + args.duration
         ok = fail = forked = 0
+        ok_attempts = 0
         iteration = 0
         last_report = start
         try:
@@ -218,7 +236,12 @@ def run(args):
                 do_fork = args.fork_every and (iteration % args.fork_every) == 0
                 if do_fork and not do_fail:
                     pid = os.fork()
-                    if pid == 0:  # child: one open+close, then exit
+                    # Child: one open+close, then exit, WITHOUT a fresh
+                    # C_Initialize (it inherits the parent's initialized
+                    # state across fork). SoftHSM tolerates this; other
+                    # providers may not (Minor 8: forked children are a
+                    # SoftHSM-only shape).
+                    if pid == 0:
                         try:
                             handle = ctypes.c_ulong(0)
                             if (
@@ -253,6 +276,7 @@ def run(args):
                         drv.login(0xFFFFFFFD, CKU_USER, b"wrong-pin", 9)
                     fail += 1
                 else:
+                    ok_attempts += 1
                     handle = ctypes.c_ulong(0)
                     if (
                         drv.open_session(
@@ -299,6 +323,16 @@ def run(args):
             f"fail={fail} forked={forked} rate={iteration / max(wall, 1e-9):.1f}/s",
             flush=True,
         )
+        # No silent all-failure workload (Important 2): when any
+        # non-forked success was attempted but none succeeded, the run
+        # is a misconfiguration (wrong slot, dead token), not a soak.
+        # All-forked runs (fork_every=1) rely on the first-open probe
+        # above, since forked results are invisible to the parent.
+        if ok_attempts > 0 and ok == 0:
+            raise SystemExit(
+                f"mem-churn: no success in {ok_attempts} ok-attempts "
+                f"({fail} fail, {forked} forked)"
+            )
     finally:
         # The private token dir leaves with the run (a forked child exits
         # via os._exit, so this runs in the parent only). --keep-workdir

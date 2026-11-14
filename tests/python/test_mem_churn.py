@@ -70,6 +70,10 @@ class DriverRun(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
             self.assertRegex(proc.stdout + proc.stderr, r"mem-churn: done ")
+            match = DONE_RE.search(proc.stdout)
+            self.assertIsNotNone(match, proc.stdout[-2000:])
+            ok = int(match.group(2))
+            self.assertGreater(ok, 0)
             leftovers = list(tmpdir.glob("mem-churn-*"))
             self.assertEqual(leftovers, [])
 
@@ -100,6 +104,9 @@ class DriverRun(unittest.TestCase):
             self.assertIsNotNone(match, proc.stdout[-2000:])
             iterations, ok, fail, forked = (int(g) for g in match.groups())
             self.assertGreater(forked, 0)
+            # Important 2: a healthy run has visible successes; ok==0
+            # with fail_share<1 is a fatal misconfiguration, not a soak.
+            self.assertGreater(ok, 0)
             self.assertEqual(ok + fail + forked, iterations)
 
 

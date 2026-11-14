@@ -857,6 +857,31 @@ mod tests {
         assert!(error.contains("is missing from the mount table"), "{error}");
     }
 
+    /// The identity pin parses from bounded reads, never a mapping:
+    /// files the instance hooks already watch must never be mapped by the
+    /// observer (the mapping bumps the file's epoch and fails
+    /// in-flight joins in every target process), and a truncation
+    /// landing mid-parse would raise SIGBUS instead of a catchable
+    /// error. Pins the `inspect_file_with_reader_exporting` body, like
+    /// the scan's call-site pins: the overlay self-mapping probe
+    /// elsewhere in this file keeps its own one-page mapping.
+    #[test]
+    fn identity_pin_parses_from_reads_never_a_mapping() {
+        let body = include_str!("identity.rs")
+            .split_once("fn inspect_file_with_reader_exporting(")
+            .expect("the pin entry keeps its name")
+            .1
+            .split_once("\n}\n")
+            .expect("top-level fns close at column 0")
+            .0;
+        for token in ["memmap2", "Mmap", "Mmap::map"] {
+            assert!(
+                !body.contains(token),
+                "the pin must not map: found {token:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_missing_mount_classifier_matches_only_the_missing_mount_error() {
         let file = open_object(Path::new("/bin/sh")).unwrap();

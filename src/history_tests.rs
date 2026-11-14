@@ -623,6 +623,151 @@ fn exit_retire_budget_carries_unexamined_exits_to_the_next_drain() {
     assert_eq!(s.sessions().closed, 3);
 }
 
+/// Collects `(json path, before, after)` for every value that differs
+/// between two rendered documents.
+fn json_diffs(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    path: String,
+    out: &mut Vec<(String, serde_json::Value, serde_json::Value)>,
+) {
+    if before == after {
+        return;
+    }
+    match (before, after) {
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            let mut keys = std::collections::BTreeSet::new();
+            keys.extend(a.keys());
+            keys.extend(b.keys());
+            for key in keys {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let left = a.get(key).unwrap_or(&serde_json::Value::Null);
+                let right = b.get(key).unwrap_or(&serde_json::Value::Null);
+                json_diffs(left, right, child, out);
+            }
+        }
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+            for (index, (left, right)) in a.iter().zip(b.iter()).enumerate() {
+                json_diffs(left, right, format!("{path}[{index}]"), out);
+            }
+            if a.len() != b.len() {
+                out.push((path, before.clone(), after.clone()));
+            }
+        }
+        _ => out.push((path, before.clone(), after.clone())),
+    }
+}
+
+#[test]
+fn retired_sessions_count_as_closed_declared_diff() {
+    // B1 step-7 twin (declared correction): exit-retired sessions count
+    // as closed, so `sessions.closed`, the session balance, and "N still
+    // open" move — by exactly the retired sessions, and nothing else in
+    // either the profile JSON or the text moves. Byte-diffs both renders
+    // of the same capture with and without the exit retire.
+    let (mut s, mut t, _) = setup(64);
+    let mut first = ev(100, 90, 0, 0);
+    first.ts_ns = 100;
+    let mut second = ev(101, 91, 0, 0);
+    second.ts_ns = 100;
+    feed(&mut s, &mut t, [first, second]);
+    let render_json = |state: &semantics::State| {
+        let mut ev = crate::render::tests::evidence();
+        ev.verdict();
+        crate::render::profile_json(
+            &[],
+            crate::render::VersionedEvidence::wrap(&ev),
+            state,
+            &crate::render::CaptureMeta {
+                started: "t0",
+                ended: "t1",
+                kernel: "6.8.0",
+                policy: CapturePolicy::Allowlisted,
+                scope: "system",
+                caller: None,
+                ring_bytes: p11scope_ebpf_common::RING_BYTES,
+                drain_interval_ms: 1000,
+            },
+        )
+    };
+    let render_text = |state: &semantics::State| {
+        let mut ev = crate::render::tests::evidence();
+        ev.verdict();
+        crate::render::live_scoped_with_verbosity_and_sessions(
+            &[],
+            &ev,
+            std::time::Duration::from_secs(60),
+            "provider",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "system",
+            state.mechanisms(),
+            crate::cli::TextVerbosity::Concise,
+            &state.sessions(),
+            state.logins(),
+        )
+    };
+    let json_before = render_json(&s);
+    let text_before = render_text(&s);
+    // Exit-retire the first process past a future stamp.
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    let json_after = render_json(&s);
+    let text_after = render_text(&s);
+    // The JSON moves in exactly the two session-balance fields, by
+    // exactly the one retired session.
+    let mut diffs = Vec::new();
+    json_diffs(&json_before, &json_after, String::new(), &mut diffs);
+    diffs.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        diffs,
+        vec![
+            (
+                "sessions.balance".to_string(),
+                serde_json::json!(2),
+                serde_json::json!(1),
+            ),
+            (
+                "sessions.closed".to_string(),
+                serde_json::json!(0),
+                serde_json::json!(1),
+            ),
+        ]
+    );
+    // The text moves in exactly the sessions line, by the same session.
+    let before_lines: Vec<&str> = text_before.lines().collect();
+    let after_lines: Vec<&str> = text_after.lines().collect();
+    assert_eq!(before_lines.len(), after_lines.len());
+    let line_diffs: Vec<(usize, &str, &str)> = before_lines
+        .iter()
+        .zip(after_lines.iter())
+        .enumerate()
+        .filter(|(_, (left, right))| left != right)
+        .map(|(index, (left, right))| (index, *left, *right))
+        .collect();
+    assert_eq!(line_diffs.len(), 1, "only the sessions line moves");
+    let (_, left, right) = line_diffs[0];
+    assert!(
+        left.contains("2 still open"),
+        "before names two open sessions: {left}"
+    );
+    assert!(
+        right.contains("1 still open"),
+        "after names one open session: {right}"
+    );
+}
+
 #[test]
 fn history_cookie_fd_and_pid_changes_never_order_independent_producer_histories() {
     let (mut s, mut t, a) = setup(16);

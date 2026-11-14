@@ -508,6 +508,14 @@ struct ScriptedLane {
     acquisition_active: bool,
     /// The attach backend this scripted lane reports (Singles by default).
     backend: LaneBackend,
+    /// Fail closed when an extend's targets resolve no pin for an endpoint
+    /// (the collection-tick cache path): a broken pin cache then fails the
+    /// test instead of attaching blindly.
+    check_targets: bool,
+    /// Refuse every non-activating extend (the mid-run refusal twin): the
+    /// receipt carries the refusal and defers the whole delta, like the
+    /// production facade's sticky refusal arm.
+    refuse_extends: bool,
 }
 
 impl Drop for ScriptedLane {
@@ -559,6 +567,8 @@ impl ScriptedLane {
             acquisition: None,
             acquisition_active: false,
             backend: LaneBackend::singles(),
+            check_targets: false,
+            refuse_extends: false,
         }
     }
 
@@ -617,7 +627,7 @@ impl CaptureLane<Pin> for ScriptedLane {
     fn extend(
         &mut self,
         mut delta: TargetDelta,
-        _: &dyn CaptureTargets,
+        targets: &dyn CaptureTargets,
         window: ExtendWindow,
     ) -> ExtendReceipt {
         let ids: Vec<String> = delta
@@ -630,6 +640,21 @@ impl CaptureLane<Pin> for ScriptedLane {
             custody: Some(self.custody()),
             ..ExtendReceipt::default()
         };
+        if self.check_targets {
+            for endpoint in &delta.endpoints {
+                assert!(
+                    targets.target(endpoint.object).is_some(),
+                    "the extend's targets hold a pin for object {:?} (endpoint {})",
+                    endpoint.object,
+                    endpoint.id.0,
+                );
+            }
+        }
+        if self.refuse_extends && self.activated {
+            receipt.refused = Some("scripted mid-run extend refusal".into());
+            receipt.deferred = delta;
+            return receipt;
+        }
         if !self.activated {
             if self.refuse_activation {
                 receipt.refused = Some("scripted activation refusal".into());
@@ -1640,22 +1665,54 @@ fn mid_run_arrivals_merge_with_the_deferred_backlog_in_host_order() {
     );
 }
 
-/// A host that serves one fabricated delta and records every extend
-/// receipt as (attached, deferred), so the twins below observe the pass
-/// quantum the lane actually sends. Drain order is ID order: these tests
-/// isolate the quantum, not the ordering.
+/// A host that serves one delta and records every extend receipt as
+/// (attached, deferred), so the twins below observe the pass quantum the
+/// lane actually sends. Drain order is ID order: these tests isolate the
+/// quantum, not the ordering.
 struct ReceiptHost {
+    _dir: Option<tempfile::TempDir>,
     set: InventoryAttachSet,
     delta: TargetDelta,
     receipts: Vec<(usize, usize)>,
+    gaps: Vec<(String, String)>,
 }
 
 impl ReceiptHost {
     fn with_delta(delta: TargetDelta) -> Self {
         Self {
+            _dir: None,
             set: InventoryAttachSet::new(InventoryBudget::new(32768, 32768 * 8).unwrap()),
             delta,
             receipts: Vec::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    /// One provider with `count` endpoints absorbed through the real attach
+    /// set, so the set retains a pin per object: the lane's collection-tick
+    /// cache clones them, and the targets-checking lane fails closed when a
+    /// lookup misses. The fabricated delta (empty set) cannot serve that
+    /// path — every cached lookup would miss.
+    fn with_absorbed_provider(count: u64) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fx::provider(&dir, "tick.so", "tick-provider");
+        let pins = fx::pass_pins(&[(&path, "sha-tick")]);
+        let limit = count + 128;
+        let mut set = InventoryAttachSet::new(InventoryBudget::new(limit, limit * 8).unwrap());
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let modules = [fx::module(&pins, &path, &fx::offsets(count))];
+        let absorbed = set.absorb(&fx::lower_named(&modules, &pins, policy), &pins);
+        assert_eq!(
+            absorbed.delta.endpoints.len(),
+            count as usize,
+            "the attach set admits the whole {count}-endpoint provider"
+        );
+        Self {
+            _dir: Some(dir),
+            set,
+            delta: absorbed.delta,
+            receipts: Vec::new(),
+            gaps: Vec::new(),
         }
     }
 }
@@ -1684,7 +1741,9 @@ impl LaneHost<Pin> for ReceiptHost {
     }
     fn end_capture_coverage(&mut self, _at_ns: u64) {}
     fn note_native_lane(&mut self) {}
-    fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
+    fn note_scope_gap(&mut self, subject: String, reason: String) {
+        self.gaps.push((subject, reason));
+    }
     fn note_refresh_loss(&mut self, _reason: String) {}
 }
 
@@ -1715,6 +1774,34 @@ fn multi_lane(log: &Log) -> ScriptedLane {
         scope_filter: ScopeFilter::None,
     };
     lane
+}
+
+/// A targets-checking lane on `backend`: every extend fails closed when its
+/// targets resolve no pin, so the collection-tick cache path is pinned, not
+/// just the pass path over host targets.
+fn checking_lane(log: &Log, backend: AttachBackend) -> ScriptedLane {
+    let mut lane = ScriptedLane::new(log);
+    lane.backend = LaneBackend {
+        selection: match backend {
+            AttachBackend::Multi => BackendSelection::Multi,
+            AttachBackend::Singles => BackendSelection::Singles,
+        },
+        backend,
+        fallback: None,
+        scope_filter: ScopeFilter::None,
+    };
+    lane.check_targets = true;
+    lane
+}
+
+/// How many extends the scripted lane ran: activation, passes, and ticks.
+/// Ticks that skip (empty backlog, latched refusal) run no extend, so this
+/// count pins exactly how many tick extends drained the backlog.
+fn extend_calls(log: &Log) -> usize {
+    entries(log)
+        .iter()
+        .filter(|entry| entry.starts_with("extend["))
+        .count()
 }
 
 /// p11-kit's shape on the busy desktop: 6734 endpoints of the most-mapped
@@ -1771,14 +1858,23 @@ fn singles_lane_keeps_the_512_entry_pass_quantum() {
 /// ticks. This test uses 40000 demand (past the raised bound) so one pass
 /// still defers (32768 attached, 7232 deferred, entry-bound with wall
 /// remaining — scripted time never advances, so the deadline never binds)
-/// and ticks must drain the rest to zero at stop.
+/// and ticks must drain the rest. The drain is observed BEFORE the second
+/// pass — an empty backlog plus 8 tick extends — so a neutered tick path
+/// fails here even though the second pass could drain the rest alone. The
+/// targets-checking lane fails closed on a missing pin, so the
+/// collection-tick cache path is pinned too.
 #[test]
 fn multi_lane_tick_cadence_drains_backlog_within_wall_budget() {
     let log = Log::default();
-    let mut host = ReceiptHost::with_delta(fabricated_delta(40000));
-    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
-        .map_err(|(_, reason)| reason)
-        .unwrap();
+    let mut host = ReceiptHost::with_absorbed_provider(40000);
+    let mut lane = NativeLane::start(
+        checking_lane(&log, AttachBackend::Multi),
+        &mut host,
+        windows(),
+        None,
+    )
+    .map_err(|(_, reason)| reason)
+    .unwrap();
     assert_eq!(
         windows().multi_extend_budget,
         Duration::from_secs(4),
@@ -1799,11 +1895,25 @@ fn multi_lane_tick_cadence_drains_backlog_within_wall_budget() {
         lane.tick(&mut host);
         lane.collecting_tick();
     }
-    lane.after_pass(&mut host);
-    let (attached, deferred) = host.receipts.last().copied().unwrap();
+    assert!(
+        lane.backlog.endpoints.is_empty(),
+        "ticks drain the 7232-endpoint backlog with no second pass: {} left",
+        lane.backlog.endpoints.len(),
+    );
     assert_eq!(
-        deferred, 0,
-        "ticks drain the backlog so the run ends with zero deferred (last receipt attached {attached})"
+        extend_calls(&log),
+        10,
+        "activation plus one pass plus 8 tick extends of 1024 drain 7232 \
+         (7 full plus one partial); the rest of the 200 tick pairs skip"
+    );
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts,
+        vec![(0, 0), (32768, 7232), (7232, 0), (0, 0)],
+        "the buffered tick progress forwards as its own receipt ahead of the \
+         pass receipt; a neutered tick path forwards nothing and the second \
+         pass receipt reads (7232, 0) instead: {:?}",
+        host.receipts,
     );
     let total_attached: usize = host.receipts.iter().map(|(attached, _)| *attached).sum();
     assert_eq!(
@@ -1837,6 +1947,29 @@ fn multi_lane_raised_bound_carries_owner_demand_in_one_pass() {
     assert_eq!(host.receipts.last().copied().unwrap(), (0, 0));
 }
 
+/// The owner run's exact shape (2026-11-13): 20167 demand over two passes.
+/// On the old 8192 bound the receipts read [(0,0),(8192,11975),(8192,3783)]
+/// — 11975 deferred after pass 0, 3783 still deferred at stop. Under the
+/// raised bound one pass carries the whole demand and the second pass is
+/// empty; no ticks are needed.
+#[test]
+fn multi_lane_owner_two_pass_shape_ends_zero_deferred() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(20167));
+    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts,
+        vec![(0, 0), (20167, 0), (0, 0)],
+        "two passes over the 20167-endpoint owner demand end with zero \
+         deferred: {:?}",
+        host.receipts,
+    );
+}
+
 /// Healthy twin: demand within one pass stays attached; ticks with an
 /// empty backlog start no new extends.
 #[test]
@@ -1863,25 +1996,55 @@ fn multi_lane_ticks_keep_a_whole_provider_attached() {
     assert_eq!(host.receipts.last().copied().unwrap(), (0, 0));
 }
 
-/// Failure twin: demand past any per-pass entry bound still defers
-/// honestly (attached plus deferred sums to demand, nothing lost or
-/// hidden), with or without ticks.
+/// Failure twin: demand past passes AND ticks still defers honestly
+/// (attached plus deferred sums to demand, nothing lost or hidden). 100000
+/// demand: one pass defers 67232, 10 tick pairs drain 20480, the second
+/// pass attaches 32768 more and still defers 13984.
 #[test]
 fn multi_lane_over_ceiling_demand_still_defers_honestly() {
     let log = Log::default();
-    let mut host = ReceiptHost::with_delta(fabricated_delta(40000));
-    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
-        .map_err(|(_, reason)| reason)
-        .unwrap();
+    let mut host = ReceiptHost::with_absorbed_provider(100000);
+    let mut lane = NativeLane::start(
+        checking_lane(&log, AttachBackend::Multi),
+        &mut host,
+        windows(),
+        None,
+    )
+    .map_err(|(_, reason)| reason)
+    .unwrap();
     lane.after_pass(&mut host);
-    let (attached, deferred) = host.receipts[1];
-    assert!(
-        deferred > 0,
-        "over-ceiling demand defers past one pass: {attached} attached, {deferred} deferred"
+    assert_eq!(
+        host.receipts[1],
+        (32768, 67232),
+        "one Multi pass attaches 32768 and defers the rest: {:?}",
+        host.receipts
+    );
+    for _ in 0..10 {
+        lane.tick(&mut host);
+        lane.collecting_tick();
+    }
+    assert_eq!(
+        lane.backlog.endpoints.len(),
+        46752,
+        "10 tick pairs drain exactly 20 windows of 1024 from the 67232 backlog"
     );
     assert_eq!(
-        attached + deferred,
-        40000,
+        extend_calls(&log),
+        22,
+        "activation plus one pass plus 20 tick extends before the second pass"
+    );
+    lane.after_pass(&mut host);
+    let (attached, deferred) = host.receipts.last().copied().unwrap();
+    assert_eq!(
+        (attached, deferred),
+        (32768, 13984),
+        "the second pass attaches a full window and still defers honestly: {:?}",
+        host.receipts
+    );
+    let total_attached: usize = host.receipts.iter().map(|(attached, _)| *attached).sum();
+    assert_eq!(
+        total_attached + deferred,
+        100000,
         "every endpoint lands in exactly one bucket: {:?}",
         host.receipts
     );
@@ -1889,19 +2052,29 @@ fn multi_lane_over_ceiling_demand_still_defers_honestly() {
 
 /// Stop-path twin: the tick cadence plus the bounded stop ends with zero
 /// deferred when demand is past one pass but within tick reach (40000:
-/// one pass defers 7232, ticks drain it).
+/// one pass defers 7232, ticks drain it before the second pass).
 #[test]
 fn multi_lane_stop_after_tick_cadence_reports_zero_deferred() {
     let log = Log::default();
-    let mut host = ReceiptHost::with_delta(fabricated_delta(40000));
-    let mut lane = NativeLane::start(multi_lane(&log), &mut host, windows(), None)
-        .map_err(|(_, reason)| reason)
-        .unwrap();
+    let mut host = ReceiptHost::with_absorbed_provider(40000);
+    let mut lane = NativeLane::start(
+        checking_lane(&log, AttachBackend::Multi),
+        &mut host,
+        windows(),
+        None,
+    )
+    .map_err(|(_, reason)| reason)
+    .unwrap();
     lane.after_pass(&mut host);
     for _ in 0..200 {
         lane.tick(&mut host);
         lane.collecting_tick();
     }
+    assert!(
+        lane.backlog.endpoints.is_empty(),
+        "ticks drain the backlog before the second pass: {} left",
+        lane.backlog.endpoints.len(),
+    );
     lane.after_pass(&mut host);
     let stopped = lane.stop(&mut host);
     assert_eq!(
@@ -1915,6 +2088,207 @@ fn multi_lane_stop_after_tick_cadence_reports_zero_deferred() {
         0,
         "zero deferred at stop: {:?}",
         host.receipts
+    );
+    assert_eq!(
+        extend_calls(&log),
+        11,
+        "the stop runs no further extends past activation, two passes and 8 ticks"
+    );
+}
+
+/// The Singles arm of the cadence (64 entries / 10 ms per tick): 2000
+/// demand, one pass attaches 512 and defers 1488, 24 ticks of 64 drain the
+/// rest before the second pass. Same tick-before-pass observation as the
+/// Multi twin, over host targets and cached pins alike.
+#[test]
+fn singles_lane_tick_cadence_drains_backlog() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_absorbed_provider(2000);
+    let mut lane = NativeLane::start(
+        checking_lane(&log, AttachBackend::Singles),
+        &mut host,
+        windows(),
+        None,
+    )
+    .map_err(|(_, reason)| reason)
+    .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts[1],
+        (512, 1488),
+        "one Singles pass still attempts 512 and defers the rest: {:?}",
+        host.receipts
+    );
+    for _ in 0..200 {
+        lane.tick(&mut host);
+        lane.collecting_tick();
+    }
+    assert!(
+        lane.backlog.endpoints.is_empty(),
+        "ticks drain the 1488-endpoint backlog with no second pass: {} left",
+        lane.backlog.endpoints.len(),
+    );
+    assert_eq!(
+        extend_calls(&log),
+        26,
+        "activation plus one pass plus 24 tick extends of 64 drain 1488 \
+         (23 full plus one partial); the rest of the 200 tick pairs skip"
+    );
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts,
+        vec![(0, 0), (512, 1488), (1488, 0), (0, 0)],
+        "the buffered tick progress forwards as its own receipt ahead of the \
+         pass receipt: {:?}",
+        host.receipts,
+    );
+}
+
+/// Refusal twin: a mid-run extend refusal stops the cadence — later ticks
+/// skip (no extends), the flush reports the gap once, and the refused pass
+/// receipt keeps the remainder honestly deferred. 40000 demand: one pass
+/// attaches 32768, two tick pairs attach 4096, then the refusal latches
+/// with 3136 still deferred.
+#[test]
+fn multi_lane_tick_refusal_skips_later_ticks_and_reports_one_gap() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_absorbed_provider(40000);
+    let mut lane = NativeLane::start(
+        checking_lane(&log, AttachBackend::Multi),
+        &mut host,
+        windows(),
+        None,
+    )
+    .map_err(|(_, reason)| reason)
+    .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts[1], (32768, 7232));
+    for _ in 0..2 {
+        lane.tick(&mut host);
+        lane.collecting_tick();
+    }
+    assert_eq!(
+        lane.backlog.endpoints.len(),
+        3136,
+        "two tick pairs drain 4096 before the refusal latches"
+    );
+    lane.capture.refuse_extends = true;
+    for _ in 0..10 {
+        lane.tick(&mut host);
+        lane.collecting_tick();
+    }
+    assert_eq!(
+        lane.backlog.endpoints.len(),
+        3136,
+        "ticks after the refusal attach nothing and lose nothing"
+    );
+    lane.after_pass(&mut host);
+    assert_eq!(
+        extend_calls(&log),
+        8,
+        "activation plus one pass plus 4 draining ticks plus the refused tick \
+         plus the refused pass: every later tick skips without extending"
+    );
+    assert_eq!(
+        host.receipts,
+        vec![(0, 0), (32768, 7232), (4096, 0), (0, 3136)],
+        "the flush forwards the 4096 pre-refusal tick attaches with the \
+         latched refusal, and the refused pass keeps the 3136 remainder \
+         deferred: {:?}",
+        host.receipts,
+    );
+    let total_attached: usize = host.receipts.iter().map(|(attached, _)| *attached).sum();
+    assert_eq!(
+        total_attached, 36864,
+        "one pass plus two tick pairs attach 36864 before the refusal: {:?}",
+        host.receipts
+    );
+    assert_eq!(
+        host.gaps.len(),
+        1,
+        "the refusal is reported once, by the flush, not again by the pass: {:?}",
+        host.gaps
+    );
+    assert_eq!(host.gaps[0].0, "native capture refused an extend");
+}
+
+/// The retiring line counts tick progress buffered since the last pass: one
+/// pass defers an endpoint, an inter-pass tick drains it, and the stop lands
+/// before any second pass — so only the pre-publish flush puts the tick
+/// attach into `publish:retiring`. Without it the line undercounts `attached`
+/// (1, not 2) against the links the stop then retires.
+#[test]
+fn retiring_line_counts_tick_attaches_buffered_since_the_last_pass() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.defer_next = 1;
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    // The stop fires once the first pass published and 50 ms passed: the
+    // 1 ms inter-pass ticks in between drain the one deferred endpoint, and
+    // the loop breaks before a second pass could flush them first.
+    let published_at: Rc<RefCell<Option<Instant>>> = Rc::default();
+    let stop_log = Rc::clone(&log);
+    let stop_seen = Rc::clone(&published_at);
+    let stop = move || {
+        if stop_seen.borrow().is_none()
+            && stop_log
+                .borrow()
+                .iter()
+                .any(|entry| entry == "publish:pass")
+        {
+            *stop_seen.borrow_mut() = Some(Instant::now());
+        }
+        stop_seen
+            .borrow()
+            .is_some_and(|at| at.elapsed() >= Duration::from_millis(50))
+    };
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(600)),
+        stop: &stop,
+        now: &Instant::now,
+        interval: Duration::from_secs(600),
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let stopped = run_classic(
+        &mut scene,
+        Some(started),
+        &clock,
+        &mut |scene: &mut Scene, point| {
+            match point {
+                Publish::Pass { .. } => scene.note("publish:pass"),
+                Publish::Retiring {
+                    attached, budget, ..
+                } => scene.note(format!(
+                    "publish:retiring {attached} {}",
+                    budget.as_millis()
+                )),
+                Publish::Stop { .. } => scene.note("publish:stop"),
+            }
+            Ok(())
+        },
+    )
+    .unwrap()
+    .expect("the owned stop still drains");
+    assert_eq!(stopped.summary.passes, 1, "no second pass runs");
+    assert_eq!(
+        stopped.summary.attached,
+        2,
+        "the pass attach plus the tick attach: {:?}",
+        entries(&log)
+    );
+    let retiring = entries(&log)
+        .iter()
+        .find(|entry| entry.starts_with("publish:retiring "))
+        .cloned()
+        .expect("the run publishes its retiring line");
+    assert_eq!(
+        retiring.split_whitespace().nth(1),
+        Some("2"),
+        "the retiring line counts the buffered tick attach: {retiring}"
     );
 }
 

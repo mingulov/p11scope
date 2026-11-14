@@ -6987,6 +6987,24 @@ pub(crate) fn parse_manifest_text(text: &str, path: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
+/// Count the trusted reservation rows: the full trusted-object total
+/// across every manifest plus pre-arm paths, with no 512 clamp (several
+/// manifests are allowed, so the total can exceed it). Parse-only — no
+/// opens, no retained state. Unparseable manifests contribute nothing
+/// here; the pin path reports them through its own errors and gaps.
+pub(crate) fn count_trusted_reservation_rows(
+    manifests: &[PathBuf],
+    prearm_modules: &[PathBuf],
+) -> usize {
+    let mut total = prearm_modules.len();
+    for path in manifests {
+        if let Ok(manifest) = read_manifest_file(path) {
+            total = total.saturating_add(manifest.objects.len());
+        }
+    }
+    total
+}
+
 /// One newcomer queue age in whole milliseconds: first-observed-ready minus
 /// first-seen. Either endpoint missing (a failed clock read, a dropped
 /// mark) samples unknown — never an invented zero.
@@ -8610,6 +8628,14 @@ fn discover_plan(
         attribution::note(&skipped);
         discovered.base_counters.object_skips.push(skipped);
     }
+    // Trusted reservation: before the scan loop, count every trusted
+    // object (manifests parsed without views, pre-arm paths counted —
+    // no opens) and hold that many rows aside, so scans admit into
+    // `cap - R` and trusted pinning in today's position fits up to the
+    // cap. Released after the C1/C2 loop below.
+    let trusted_reserved = count_trusted_reservation_rows(&a.manifests, &a.prearm_modules)
+        .min(discovered.handle_table.cap());
+    discovered.handle_table.reserve_rows(trusted_reserved);
     // Library-handle cap, read live from the capture-owned table: at
     // most 1000 distinct library files held at once. One prune per pass
     // keeps the O(1) `len()` pre-check below honest; the in-loop
@@ -8938,7 +8964,7 @@ fn discover_plan(
             &manifest,
             &discovered.views,
             &mut discovered.budget,
-            Filing::Adopt(&mut discovered.handle_table),
+            Filing::Acquire(&mut discovered.handle_table, DeferredReason::Trusted),
         );
         discovered.stage_timings.span(
             crate::timing::StageKind::Pin,
@@ -9004,7 +9030,7 @@ fn discover_plan(
             prior_objects,
             prior_bytes,
             &mut discovered.budget,
-            Filing::Adopt(&mut discovered.handle_table),
+            Filing::Acquire(&mut discovered.handle_table, DeferredReason::Trusted),
         )
         .map_err(|error| {
             for problem in error.problems() {
@@ -9035,6 +9061,7 @@ fn discover_plan(
             inputs: pinning.inputs,
         });
     }
+    discovered.handle_table.release_rows(trusted_reserved);
 
     rebuild_discovered(&mut discovered)?;
     // The initial build's module set: assembly reads late discovery off it.
@@ -28864,12 +28891,13 @@ impl Engine {
         }
     }
 
-    /// The concurrent library-handle cap for this capture: the lane
-    /// table's cap ([`MAX_CONCURRENT_LIBRARY_HANDLES`](crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES),
+    /// The concurrent library-handle cap for this capture's scans:
+    /// the lane table's cap ([`MAX_CONCURRENT_LIBRARY_HANDLES`](crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES),
     /// or the test override when one is set through
-    /// [`Engine::set_table_cap_for_test`]).
+    /// [`Engine::set_table_cap_for_test`]) minus the trusted
+    /// reservation. Trusted pinning admits into the cap itself.
     fn library_handle_cap(&self) -> usize {
-        self.handle_table.cap()
+        self.handle_table.scan_cap()
     }
 
     /// Test-only cap override, repointed at the lane table: budget
@@ -29021,7 +29049,7 @@ impl Engine {
             budget,
             prior_objects,
             prior_bytes,
-            Filing::Adopt(&mut self.handle_table),
+            Filing::Acquire(&mut self.handle_table, DeferredReason::Trusted),
         )
     }
 

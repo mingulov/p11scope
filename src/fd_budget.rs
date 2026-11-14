@@ -58,6 +58,10 @@ pub(crate) const LIBRARY_HANDLE_BUDGET_SUBJECT: &str = "library handles";
 /// reserve's initial/live pair): the cap, the wait, never a drop.
 pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_INITIAL: &str = "capture library-handle budget exhausted (1000 concurrent handles); remaining processes deferred to the next tick";
 pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_LIVE: &str = "capture library-handle budget exhausted (1000 concurrent handles); remaining new processes deferred to the next tick";
+/// Trusted inputs that exceed the cap take this permanent gap: no wait,
+/// no retry — the reservation covers the full trusted total up to the
+/// cap, so anything past it can never file.
+pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_TRUSTED: &str = "capture library-handle budget exhausted (1000 concurrent handles); trusted input object skipped permanently";
 
 /// True for the open(2)-family errnos that mean "out of handles, wait":
 /// `EMFILE` (this process's fd table is full) and `ENFILE` (the
@@ -609,18 +613,35 @@ mod tests {
                 .expect("a pidfd stand-in must open before the reserve trips");
             held_views.push(pidfd);
             tick.note_opened();
-            let pins = crate::discovery::identity::test_fixture::real_scan_pin(
-                &pin_path,
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::metadata(&pin_path).unwrap();
+            let maps = p11scope_manifest::maps::ObjectKey {
+                device: p11scope_manifest::maps::Device {
+                    major: u64::from(libc::major(metadata.dev())),
+                    minor: u64::from(libc::minor(metadata.dev())),
+                },
+                inode: metadata.ino(),
+            };
+            let proved = crate::discovery::identity::ProvedEntry::for_test(
+                std::fs::File::open(&pin_path).unwrap(),
+                maps,
+                "aa",
                 None,
-                0,
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             );
-            held_pins.push(pins);
             let admits_before = table.stats().admits;
-            held_pins
-                .last_mut()
-                .expect("just pushed")
-                .adopt_handles_into(&mut table);
+            let crate::discovery::identity::ProvedEntry { file, meta } = proved;
+            match table.acquire(
+                file,
+                &meta,
+                crate::discovery::handle_table::DeferredReason::Live,
+            ) {
+                crate::discovery::handle_table::AcquireOutcome::Held(held) => {
+                    held_pins.push(held);
+                }
+                crate::discovery::handle_table::AcquireOutcome::Deferred(reason) => {
+                    panic!("the table holds room: deferred with {reason:?}")
+                }
+            }
             tick.note_opened_n(table.stats().admits - admits_before);
             admitted = admitted.saturating_add(1);
             assert!(admitted < 2000, "the reserve never deferred");

@@ -1523,7 +1523,7 @@ fn activation_extend_carries_pending_prearm_delta() {
             .unwrap()
             .success()
     );
-    let pinning = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+    let pinning = crate::discovery::identity::pin_prearm_proved_in_views_with_budget(
         &[so],
         &[],
         None,
@@ -1531,7 +1531,7 @@ fn activation_extend_carries_pending_prearm_delta() {
         0,
         &mut crate::discovery::scan::CaptureWorkBudget::default(),
     )
-    .expect("test pre-arm pins");
+    .expect("test pre-arm proves");
     scene.coordinator.set_prearm_pinning(pinning);
     scene.coordinator.absorb_prearm_plan(1_000);
     let lane = ScriptedLane::new(&log);

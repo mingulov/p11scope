@@ -1308,8 +1308,8 @@ fn primary_alias_conflict(report: &Path, kind: &str, other: &Path) -> anyhow::Er
 fn pin_inventory_prearm(
     prearm_modules: &[PathBuf],
     scope: InventoryRunScope,
-) -> Result<crate::discovery::identity::PrearmPinning> {
-    use crate::discovery::identity::pin_prearm_objects_in_views_with_budget;
+) -> Result<crate::discovery::identity::PrearmProvedPinning> {
+    use crate::discovery::identity::pin_prearm_proved_in_views_with_budget;
     use crate::process::{ProcessView, ProcessViewId};
     let (views, named_pid) = match scope {
         InventoryRunScope::Pid(pid) => {
@@ -1325,7 +1325,7 @@ fn pin_inventory_prearm(
     // budget is enforced on the other side instead — the coordinator
     // retains this pinning's object/byte usage and both the semantic and
     // the count manifest readers charge it when they pin.
-    let pinning = pin_prearm_objects_in_views_with_budget(
+    let pinning = pin_prearm_proved_in_views_with_budget(
         prearm_modules,
         &views,
         named_pid,
@@ -10569,7 +10569,7 @@ mod tests {
         let scope = InventoryRunScope::Pid(std::process::id());
         let pinning = super::pin_inventory_prearm(&[PathBuf::from("/opt/p11-provider.so")], scope)
             .expect("bad prearm path gaps, siblings continue");
-        assert_eq!(pinning.pins.pinned().count(), 0);
+        assert!(pinning.proved.is_empty());
         assert_eq!(pinning.skipped.len(), 1);
         assert!(
             pinning.skipped[0]
@@ -10600,10 +10600,10 @@ mod tests {
         let scope = InventoryRunScope::Pid(std::process::id());
         let valid = super::pin_inventory_prearm(std::slice::from_ref(&provider), scope)
             .expect("a valid provider pins");
-        assert_eq!(valid.inputs.len(), 1);
+        assert_eq!(valid.proved.len(), 1);
         assert!(
-            valid.pins.pinned().count() >= 1,
-            "pinning retains the held file"
+            valid.proved[0].proved.file.metadata().is_ok(),
+            "proving retains the held file"
         );
         drop(valid);
         let mixed = super::pin_inventory_prearm(
@@ -10611,7 +10611,7 @@ mod tests {
             scope,
         )
         .expect("a mixed batch gaps the bad path");
-        assert_eq!(mixed.inputs.len(), 1);
+        assert_eq!(mixed.proved.len(), 1);
         assert_eq!(mixed.skipped.len(), 1);
         assert!(
             mixed.skipped[0]
@@ -20119,7 +20119,7 @@ mod tests {
     fn prearm_pinning_for_test(
         dir: &tempfile::TempDir,
         name: &str,
-    ) -> crate::discovery::identity::PrearmPinning {
+    ) -> crate::discovery::identity::PrearmProvedPinning {
         let src = dir.path().join(format!("{name}.c"));
         std::fs::write(
             &src,
@@ -20137,7 +20137,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+        crate::discovery::identity::pin_prearm_proved_in_views_with_budget(
             &[so],
             &[],
             None,
@@ -20145,7 +20145,7 @@ mod tests {
             0,
             &mut crate::discovery::scan::CaptureWorkBudget::default(),
         )
-        .expect("test pre-arm pins")
+        .expect("test pre-arm proves")
     }
 
     #[test]

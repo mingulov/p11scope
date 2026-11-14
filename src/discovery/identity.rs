@@ -337,8 +337,10 @@ pub(crate) struct EntryMeta {
 }
 
 impl EntryMeta {
-    /// Snapshot the meta of an already-built entry (C4 re-file): every
-    /// field straight across, `unique` derived from the live handle.
+    /// Snapshot the meta of an already-built entry: every field straight
+    /// across, `unique` scripted by the caller. Test-only re-proving for
+    /// table twins.
+    #[cfg(test)]
     fn from_entry(entry: &Entry, unique: bool) -> Self {
         Self {
             raw: entry.raw.clone(),
@@ -2416,27 +2418,6 @@ impl PinnedObjects {
         use std::os::unix::io::AsRawFd as _;
         for entry in self.by_id.values() {
             fds.insert(entry.file.as_raw_fd());
-        }
-    }
-
-    /// File every entry's already-held handle into `table` (C4 re-file):
-    /// proven-key routing over the live `Arc`, never a reopen. Entries
-    /// sharing one file converge on one row; unshared entries file
-    /// their own. Adopt never refuses, so pins only gain shares here.
-    pub(crate) fn adopt_handles_into(&mut self, table: &mut HandleTable) {
-        for entry in self.by_id.values_mut() {
-            // Idempotent: an already-tabled handle keeps its row instead
-            // of filing a second row for one fd.
-            if entry.file.id() != RowId::MAX {
-                continue;
-            }
-            let unique = file_inodes_are_unique(&entry.file);
-            let meta = EntryMeta::from_entry(entry, unique);
-            let held = table.adopt_shared(entry.file.arc().clone(), &meta);
-            entry.file = held.handle;
-            if entry.mapped.is_none() {
-                entry.mapped = held.mapped;
-            }
         }
     }
 
@@ -7906,30 +7887,45 @@ fn identity_of_manifest(
 /// mismatch; the caller may ignore either stale class only after a scan-opened
 /// replacement is proven.
 /// File one worker-proven pin from a manifest/prearm chain: adopt
-/// into the table, or hold untracked. `Scratch` is scan-path-only and
-/// files `Untracked` here (a programming error, caught in debug).
-fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Entry {
+/// into the table, acquire with the caller's reason, or hold
+/// untracked. A refusal returns the reason for the caller's
+/// per-object gap; good pins continue. `Scratch` is scan-path-only
+/// and files `Untracked` here (a programming error, caught in debug).
+fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Result<Entry, DeferredReason> {
     let ProvedEntry { file, meta } = proved;
     match filing {
         Filing::Adopt(table) => {
             let held = table.adopt(file, &meta);
-            Entry::from_held(meta, held)
+            Ok(Entry::from_held(meta, held))
         }
-        // Trusted/learned sites acquire from Tasks 3-4 with their own
-        // gap handling; until then no caller files `Acquire` here.
-        Filing::Acquire(_, _) => {
-            debug_assert!(false, "trusted/learned sites adopt until Tasks 3-4");
-            let held = Held::untracked(Arc::new(file), meta.mapped);
-            Entry::from_held(meta, held)
-        }
+        Filing::Acquire(table, reason) => match table.acquire(file, &meta, *reason) {
+            AcquireOutcome::Held(held) => Ok(Entry::from_held(meta, held)),
+            AcquireOutcome::Deferred(reason) => Err(reason),
+        },
         Filing::Untracked => {
             let held = Held::untracked(Arc::new(file), meta.mapped);
-            Entry::from_held(meta, held)
+            Ok(Entry::from_held(meta, held))
         }
         Filing::Scratch => {
             debug_assert!(false, "Filing::Scratch is scan-path-only");
             let held = Held::untracked(Arc::new(file), meta.mapped);
-            Entry::from_held(meta, held)
+            Ok(Entry::from_held(meta, held))
+        }
+    }
+}
+
+/// The permanent per-object gap for a trusted/learned refusal: no wait,
+/// no retry. Trusted inputs take it from Task 3; learned candidates
+/// take their own reason from Task 4.
+fn trusted_refusal_gap(reason: DeferredReason) -> &'static str {
+    match reason {
+        DeferredReason::Trusted => crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_TRUSTED,
+        _ => {
+            debug_assert!(
+                false,
+                "manifest/prearm chains only refuse trusted inputs in Task 3"
+            );
+            crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_TRUSTED
         }
     }
 }
@@ -8436,7 +8432,16 @@ fn pin_manifest_objects_with_read_policy(
             held,
             verified_ns,
         ) {
-            Ok(proved) => file_proved_pin(proved, &mut filing),
+            Ok(proved) => match file_proved_pin(proved, &mut filing) {
+                Ok(entry) => entry,
+                Err(reason) => {
+                    skipped.push(Skipped {
+                        subject: object.path.clone(),
+                        reason: trusted_refusal_gap(reason).into(),
+                    });
+                    continue;
+                }
+            },
             Err(error) => {
                 skipped.push(Skipped {
                     subject: object.path.clone(),
@@ -8608,6 +8613,10 @@ impl PrearmPinRequest {
     }
 }
 
+/// Test-only since Task 3 (C4 proves without filing): production
+/// pre-arm pinning files through the `_and_filing` and `_proved`
+/// variants.
+#[cfg(test)]
 pub(crate) fn pin_prearm_objects_in_views_with_budget(
     paths: &[PathBuf],
     views: &[ProcessView],
@@ -8656,15 +8665,33 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget_and_filing(
 /// Pins pre-arm requests: same worker discipline as
 /// [`pin_prearm_objects_in_views_with_budget`], except each request opens
 /// its `open` path and records its `display` spelling.
-pub(crate) fn pin_prearm_requests_in_views_with_budget(
+/// One worker-proven pre-arm object: the owned proven file plus its
+/// pre-split provenance input. Filing turns it into a retained entry.
+pub(crate) struct PrearmProvedObject {
+    pub(crate) proved: ProvedEntry,
+    pub(crate) input: PrearmPinnedInput,
+}
+
+/// Prove-phase output for pre-arm pinning filed outside the pin
+/// site (C4): every object proven, none filed, skips kept.
+pub(crate) struct PrearmProvedPinning {
+    pub(crate) proved: Vec<PrearmProvedObject>,
+    pub(crate) skipped: Vec<Skipped>,
+}
+
+/// Prove every pre-arm request without filing: open, identify,
+/// hash, bracket, stamp the self-mapping proof and split the
+/// provenance input. Holds one owned fd per proven object until
+/// the caller files (bounded by the 512-object budget check);
+/// pre-arm lists are operator-curated and tiny in practice.
+fn prove_prearm_requests_in_views(
     requests: &[PrearmPinRequest],
     views: &[ProcessView],
     named_pid: Option<u32>,
     prior_objects: usize,
     prior_bytes: u64,
     budget: &mut CaptureWorkBudget,
-    mut filing: Filing<'_>,
-) -> Result<PrearmPinning, PrearmPinError> {
+) -> Result<PrearmProvedPinning, PrearmPinError> {
     let mut skipped: Vec<Skipped> = Vec::new();
     if prior_objects.saturating_add(requests.len()) > MAX_OBJECTS {
         return Err(PrearmPinError::Fatal(vec![format!(
@@ -8798,9 +8825,8 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
         opened.push((display, file, pin, mountinfo));
     }
 
-    // Phase 2: identify, hash, bracket and file every opened object.
-    let mut pins = PinnedObjects::empty();
-    let mut inputs = Vec::new();
+    // Phase 2: identify, hash, bracket and prove every opened object.
+    let mut proved_objects = Vec::new();
     let mut batch_spent = prior_bytes;
     for (spelling, file, pin, mountinfo) in opened {
         let inspected = match inspect_file_with_reader_exporting(
@@ -8866,7 +8892,7 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
             continue;
         };
         let input_path = raw.path.clone();
-        let mut entry = match ProvedEntry::prove(
+        let mut proved = match ProvedEntry::prove(
             file,
             pin,
             spelling.clone(),
@@ -8876,7 +8902,7 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
             None,
             verified_ns,
         ) {
-            Ok(proved) => file_proved_pin(proved, &mut filing),
+            Ok(proved) => proved,
             Err(error) => {
                 skipped.push(Skipped {
                     subject: spelling.clone(),
@@ -8885,18 +8911,72 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
                 continue;
             }
         };
-        // Same pin-time self-mapping proof as manifest objects: record how
-        // the kernel renders this exact held fd when it differs (pre-6.8
-        // overlay split), or latch the unproven note when inconclusive.
-        match self_mapped_fallback_detailed(&entry.file, key, budget, &KernelSelfMappingProbe) {
+        // Same pin-time self-mapping proof as manifest objects, stamped
+        // before filing (the C4 split files later, without reopening):
+        // record how the kernel renders this exact held fd when it
+        // differs (pre-6.8 overlay split), or latch the unproven note
+        // when inconclusive. Same fd, same key as the filed entry
+        // below, so the outcome is identical either way.
+        match self_mapped_fallback_detailed(&proved.file, key, budget, &KernelSelfMappingProbe) {
             SelfMappedFallback::Split(probed) => {
-                entry.probed_maps_key = Some(probed);
+                proved.meta.probed_maps_key = Some(probed);
             }
             SelfMappedFallback::Agrees => {}
             SelfMappedFallback::Inconclusive => {
-                entry.probed_maps_unproven = true;
+                proved.meta.probed_maps_unproven = true;
             }
         }
+        // R2-D1-2(b): only defined exports proved executable in held bytes
+        // lower pre-mapping; the rest wait for scan corroboration.
+        let mut proved_exports = Vec::new();
+        let mut non_executable = Vec::new();
+        for (name, offset) in &inspected.exports {
+            if inspected.contains_executable_offset(*offset) {
+                proved_exports.push((name.clone(), *offset));
+            } else {
+                non_executable.push((name.clone(), *offset));
+            }
+        }
+        proved_objects.push(PrearmProvedObject {
+            proved,
+            input: PrearmPinnedInput {
+                path: input_path,
+                key,
+                proved: proved_exports,
+                non_executable,
+            },
+        });
+    }
+    Ok(PrearmProvedPinning {
+        proved: proved_objects,
+        skipped,
+    })
+}
+
+/// File proved pre-arm objects: acquire each through `filing`,
+/// insert, and collect inputs; refusals and insert conflicts become
+/// per-object gaps while good pins continue.
+fn file_prearm_proved_objects(proved: PrearmProvedPinning, filing: &mut Filing) -> PrearmPinning {
+    let PrearmProvedPinning {
+        proved,
+        mut skipped,
+    } = proved;
+    let mut pins = PinnedObjects::empty();
+    let mut inputs = Vec::new();
+    for object in proved {
+        // The operator spelling the gaps name (the input path is
+        // the normalized form, carried on the input below).
+        let spelling = object.proved.meta.path.clone();
+        let entry = match file_proved_pin(object.proved, filing) {
+            Ok(entry) => entry,
+            Err(reason) => {
+                skipped.push(Skipped {
+                    subject: spelling,
+                    reason: trusted_refusal_gap(reason).into(),
+                });
+                continue;
+            }
+        };
         let mut insert_skipped = Vec::new();
         if pins.insert_entry(entry, &mut insert_skipped).is_none() {
             skipped.extend(insert_skipped.into_iter().map(|skip| Skipped {
@@ -8905,29 +8985,65 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
             }));
             continue;
         }
-        // R2-D1-2(b): only defined exports proved executable in held bytes
-        // lower pre-mapping; the rest wait for scan corroboration.
-        let mut proved = Vec::new();
-        let mut non_executable = Vec::new();
-        for (name, offset) in &inspected.exports {
-            if inspected.contains_executable_offset(*offset) {
-                proved.push((name.clone(), *offset));
-            } else {
-                non_executable.push((name.clone(), *offset));
-            }
-        }
-        inputs.push(PrearmPinnedInput {
-            path: input_path,
-            key,
-            proved,
-            non_executable,
-        });
+        inputs.push(object.input);
     }
-    Ok(PrearmPinning {
+    PrearmPinning {
         pins,
         inputs,
         skipped,
-    })
+    }
+}
+
+/// File proved pre-arm objects into `table`, acquiring each: the C4
+/// filing half of [`pin_prearm_proved_in_views_with_budget`].
+pub(crate) fn file_prearm_proved(
+    proved: PrearmProvedPinning,
+    table: &mut HandleTable,
+) -> PrearmPinning {
+    file_prearm_proved_objects(proved, &mut Filing::Acquire(table, DeferredReason::Trusted))
+}
+
+/// [`pin_prearm_objects_in_views_with_budget`] split for filing outside
+/// the pin site (C4): prove every object without filing. The caller
+/// files the result through [`file_prearm_proved`].
+pub(crate) fn pin_prearm_proved_in_views_with_budget(
+    paths: &[PathBuf],
+    views: &[ProcessView],
+    named_pid: Option<u32>,
+    prior_objects: usize,
+    prior_bytes: u64,
+    budget: &mut CaptureWorkBudget,
+) -> Result<PrearmProvedPinning, PrearmPinError> {
+    let requests: Vec<PrearmPinRequest> =
+        paths.iter().cloned().map(PrearmPinRequest::path).collect();
+    prove_prearm_requests_in_views(
+        &requests,
+        views,
+        named_pid,
+        prior_objects,
+        prior_bytes,
+        budget,
+    )
+}
+
+pub(crate) fn pin_prearm_requests_in_views_with_budget(
+    requests: &[PrearmPinRequest],
+    views: &[ProcessView],
+    named_pid: Option<u32>,
+    prior_objects: usize,
+    prior_bytes: u64,
+    budget: &mut CaptureWorkBudget,
+    mut filing: Filing<'_>,
+) -> Result<PrearmPinning, PrearmPinError> {
+    let proved = prove_prearm_requests_in_views(
+        requests,
+        views,
+        named_pid,
+        prior_objects,
+        prior_bytes,
+        budget,
+    )?;
+    Ok(file_prearm_proved_objects(proved, &mut filing))
 }
 
 pub fn pin_scanned_objects(
@@ -20812,38 +20928,6 @@ mod tests {
         assert_eq!(fds.len(), 1, "two views over one file hold one handle");
     }
 
-    /// The C4 re-file twin: already-held pins file into the table
-    /// without reopening. Pins sharing one file converge on one row;
-    /// every filed handle carries its row id.
-    #[test]
-    fn adopt_handles_into_files_held_pins_without_reopening() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first.so");
-        let second = dir.path().join("second.so");
-        std::fs::write(&first, b"first-bytes").unwrap();
-        std::fs::write(&second, b"second-bytes").unwrap();
-        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut pins = test_fixture::real_scan_pin(&first, None, 0, sha);
-        let more = test_fixture::real_scan_pin(&second, None, 1, sha);
-        let _skipped = pins.absorb(more);
-        let mut table = HandleTable::new(1000);
-        pins.adopt_handles_into(&mut table);
-        assert_eq!(table.len(), 2, "two files file two rows");
-        for entry in pins.by_id.values() {
-            assert_ne!(
-                entry.file.id(),
-                RowId::MAX,
-                "every re-filed handle carries its row"
-            );
-        }
-        let mut again = test_fixture::real_scan_pin(&first, None, 0, sha);
-        again.adopt_handles_into(&mut table);
-        // Unmapped fixture pins never lend (no mapped proof), so the
-        // second pin of the first file files its own row — exactly the
-        // post-scan share's verdict for the same pair.
-        assert_eq!(table.len(), 3);
-    }
-
     /// Copies of `/bin/true` as pinnable scan modules for the pin-wait
     /// twins. Each module's key is the production maps-comparable
     /// resolution for its copy, so the pin path's own identity guard
@@ -21622,5 +21706,260 @@ mod tests {
             crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES as u64
         );
         assert_eq!(table.stats().shares, 2);
+    }
+
+    /// A manifest over real files with real inspected identities: every
+    /// object pins when the table holds room, so trusted tests fail on
+    /// budget behavior, never on identity mismatch.
+    fn manifest_for_files(paths: &[PathBuf]) -> Manifest {
+        use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+        let mut objects = Vec::new();
+        let mut provenance = Vec::new();
+        for (id, path) in paths.iter().enumerate() {
+            let file = open_object(path).unwrap();
+            let inspected = inspect_file(&file).unwrap();
+            let mapping = mapping_file_key(&file).unwrap();
+            let spath = path.to_str().unwrap().to_string();
+            objects.push(ObjectRecord {
+                id: id as u32,
+                path: spath.clone(),
+                identity: inspected.identity.clone(),
+            });
+            provenance.push(ProvenanceObject {
+                path: spath,
+                device_major: mapping.device_major,
+                device_minor: mapping.device_minor,
+                inode: mapping.inode,
+                identity: inspected.identity,
+            });
+        }
+        Manifest {
+            schema: p11scope_manifest::manifest::SCHEMA.into(),
+            module_path: paths[0].to_str().unwrap().into(),
+            objects,
+            provenance_objects: provenance,
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Ok,
+                version: Some(Version {
+                    major: 2,
+                    minor: 40,
+                }),
+                walk: WalkOutcome::Full,
+                functions: Vec::new(),
+            }],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+            selection_evidence: Default::default(),
+        }
+    }
+
+    /// Task-3 reservation twin (cap-4 seam, R=3): scans fill `cap - R`,
+    /// trusted objects admit with zero trusted gaps, the next scan
+    /// defers with the existing budget gap, manifests stay intact, and
+    /// the reservation releases after the loop.
+    #[test]
+    fn handle_table_reservation_holds_rows_for_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let bytes = std::fs::read("/bin/true").unwrap();
+        let mut trusted_paths = Vec::new();
+        for n in 0..3 {
+            let path = dir.path().join(format!("trusted{n}.so"));
+            std::fs::write(&path, &bytes).unwrap();
+            trusted_paths.push(path);
+        }
+        let manifest = manifest_for_files(&trusted_paths);
+        let modules = pin_wait_modules(&view, dir.path(), 2, &mut budget);
+        let views = vec![view];
+        let mut table = HandleTable::new(4);
+        table.reserve_rows(3);
+        assert_eq!(table.scan_cap(), 1);
+        // Scans fill `cap - R`.
+        let (pins, skipped) = pin_scanned_view_objects_with_table(
+            &views[0],
+            &modules[..1],
+            &mut budget,
+            None,
+            &mut table,
+            DeferredReason::Live,
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(pins.entry_count_for_test(), 1);
+        assert_eq!(table.len(), 1);
+        // Trusted objects admit into the reservation with zero gaps.
+        let pinning = pin_manifest_objects_deferred_in_views_with_budget_and_filing(
+            &manifest,
+            &views,
+            &mut budget,
+            Filing::Acquire(&mut table, DeferredReason::Trusted),
+        )
+        .unwrap();
+        assert_eq!(
+            pinning.pins.entry_count_for_test(),
+            3,
+            "{:?}",
+            pinning.skipped
+        );
+        assert!(
+            pinning.skipped.is_empty(),
+            "reserved trusted objects take no gaps: {:?}",
+            pinning.skipped
+        );
+        assert_eq!(table.len(), 4);
+        // The next scan defers with the existing budget gap.
+        let (_pins, skipped) = pin_scanned_view_objects_with_table(
+            &views[0],
+            &modules[1..],
+            &mut budget,
+            None,
+            &mut table,
+            DeferredReason::Live,
+        )
+        .unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].reason.contains(PIN_BUDGET_STOP_DETAIL),
+            "the wait names the pre-emptive budget stop: {skipped:?}"
+        );
+        table.release_rows(3);
+        assert_eq!(
+            table.scan_cap(),
+            4,
+            "the reservation releases after the loop"
+        );
+    }
+
+    /// Task-3 two-manifest twin: two manifests totalling more than 512
+    /// objects reserve uncapped — R is the full total, all trusted
+    /// objects fit, and scans admit into `cap - R`.
+    #[test]
+    fn handle_table_reservation_uncapped_past_512() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = std::fs::read("/bin/true").unwrap();
+        let mut first_paths = Vec::new();
+        let mut second_paths = Vec::new();
+        for n in 0..257 {
+            let path = dir.path().join(format!("first{n:03}.so"));
+            std::fs::write(&path, &bytes).unwrap();
+            first_paths.push(path);
+        }
+        for n in 0..256 {
+            let path = dir.path().join(format!("second{n:03}.so"));
+            std::fs::write(&path, &bytes).unwrap();
+            second_paths.push(path);
+        }
+        let first = manifest_for_files(&first_paths);
+        let second = manifest_for_files(&second_paths);
+        let first_path = dir.path().join("first.json");
+        let second_path = dir.path().join("second.json");
+        std::fs::write(&first_path, serde_json::to_vec(&first).unwrap()).unwrap();
+        std::fs::write(&second_path, serde_json::to_vec(&second).unwrap()).unwrap();
+        // R counts every trusted object with no 512 clamp.
+        let reserved = crate::discovery::engine::count_trusted_reservation_rows(
+            &[first_path, second_path],
+            &[],
+        );
+        assert_eq!(reserved, 513);
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let mut table = HandleTable::new(600);
+        table.reserve_rows(reserved.min(table.cap()));
+        assert_eq!(table.scan_cap(), 87);
+        // Scans admit into `cap - R` first, like the startup order.
+        let views = vec![view];
+        let modules = pin_wait_modules(&views[0], dir.path(), 88, &mut budget);
+        let (pins, skipped) = pin_scanned_view_objects_with_table(
+            &views[0],
+            &modules[..87],
+            &mut budget,
+            None,
+            &mut table,
+            DeferredReason::Live,
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(pins.entry_count_for_test(), 87);
+        assert_eq!(table.len(), 87);
+        // All trusted objects fit with zero gaps.
+        for manifest in [&first, &second] {
+            let pinning = pin_manifest_objects_deferred_in_views_with_budget_and_filing(
+                manifest,
+                &views,
+                &mut budget,
+                Filing::Acquire(&mut table, DeferredReason::Trusted),
+            )
+            .unwrap();
+            assert!(
+                pinning.skipped.is_empty(),
+                "reserved trusted objects take no gaps: {:?}",
+                pinning.skipped
+            );
+        }
+        assert_eq!(table.len(), 600);
+        // The next scan defers with the existing budget gap.
+        let (_pins, skipped) = pin_scanned_view_objects_with_table(
+            &views[0],
+            &modules[87..],
+            &mut budget,
+            None,
+            &mut table,
+            DeferredReason::Live,
+        )
+        .unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].reason.contains(PIN_BUDGET_STOP_DETAIL),
+            "the 88th scan pin waits: {skipped:?}"
+        );
+        table.release_rows(reserved.min(600));
+        assert_eq!(table.scan_cap(), 600);
+    }
+
+    /// Task-3 trusted-permanent-gap twin (cap-4 seam, 6 trusted objects):
+    /// 4 admit, 2 take the permanent trusted gap, good pins continue,
+    /// no retry.
+    #[test]
+    fn handle_table_trusted_excess_takes_permanent_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = std::fs::read("/bin/true").unwrap();
+        let mut paths = Vec::new();
+        for n in 0..6 {
+            let path = dir.path().join(format!("object{n}.so"));
+            std::fs::write(&path, &bytes).unwrap();
+            paths.push(path);
+        }
+        let manifest = manifest_for_files(&paths);
+        let mut budget = CaptureWorkBudget::default();
+        let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
+            .unwrap();
+        let mut table = HandleTable::new(4);
+        let pinning = pin_manifest_objects_deferred_in_views_with_budget_and_filing(
+            &manifest,
+            &[view],
+            &mut budget,
+            Filing::Acquire(&mut table, DeferredReason::Trusted),
+        )
+        .unwrap();
+        assert_eq!(
+            pinning.pins.entry_count_for_test(),
+            4,
+            "{:?}",
+            pinning.skipped
+        );
+        assert_eq!(pinning.skipped.len(), 2, "{:?}", pinning.skipped);
+        for skip in &pinning.skipped {
+            assert_eq!(
+                skip.reason,
+                crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_TRUSTED,
+                "excess trusted objects take the permanent gap"
+            );
+        }
+        assert_eq!(table.len(), 4);
     }
 }

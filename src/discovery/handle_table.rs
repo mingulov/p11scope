@@ -137,8 +137,8 @@ impl Held {
 /// Why a refusal waits where it does: the site class whose gap vocabulary
 /// the caller files. Admission scans map to the initial/live budget tails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Initial/Live are constructed by the Task-1 admission paths; Trusted
-// and Learned follow in Tasks 3-4, when this allow goes away.
+// Initial/Live/Trusted are constructed by their acquire paths; Learned
+// follows in Task 4, when this allow goes away.
 #[allow(dead_code)]
 pub(crate) enum DeferredReason {
     Initial,
@@ -212,6 +212,12 @@ pub(crate) struct HandleTable {
     /// Live rows per maps key: the pre-open fast path's routing index.
     maps_live: BTreeMap<ObjectKey, usize>,
     cap: usize,
+    /// Rows held aside for trusted inputs: scans admit into
+    /// `cap - reserved` while trusted pinning admits into `cap`.
+    /// Additive across phases (the coordinator lane overlaps its
+    /// manifest and pre-arm windows); each phase releases its own
+    /// share, so the pool never strands rows.
+    reserved: usize,
     next_row: RowId,
     next_nonce: u64,
     admits: u64,
@@ -226,6 +232,7 @@ impl HandleTable {
             rows: BTreeMap::new(),
             maps_live: BTreeMap::new(),
             cap,
+            reserved: 0,
             next_row: 0,
             next_nonce: 1,
             admits: 0,
@@ -284,9 +291,15 @@ impl HandleTable {
                 inserted: false,
             });
         }
-        if refuse && crate::fd_budget::library_handle_budget_exhausted(self.len(), self.cap) {
+        // Trusted inputs admit into the cap; every other site admits
+        // into the cap minus the trusted reservation.
+        let limit = match reason {
+            DeferredReason::Trusted => self.cap,
+            _ => self.scan_cap(),
+        };
+        if refuse && crate::fd_budget::library_handle_budget_exhausted(self.len(), limit) {
             self.prune(usize::MAX);
-            if crate::fd_budget::library_handle_budget_exhausted(self.len(), self.cap) {
+            if crate::fd_budget::library_handle_budget_exhausted(self.len(), limit) {
                 self.defers = self.defers.saturating_add(1);
                 return AcquireOutcome::Deferred(reason);
             }
@@ -386,6 +399,25 @@ impl HandleTable {
         self.cap
     }
 
+    /// Hold `rows` aside for trusted inputs (additive, saturating at
+    /// the cap). Scans admitted afterwards see a smaller table until
+    /// the matching [`HandleTable::release_rows`].
+    pub(crate) fn reserve_rows(&mut self, rows: usize) {
+        self.reserved = self.reserved.saturating_add(rows).min(self.cap);
+    }
+
+    /// Return `rows` of reservation to scan admission (saturating).
+    /// Each phase releases its own share when its trusted pins filed.
+    pub(crate) fn release_rows(&mut self, rows: usize) {
+        self.reserved = self.reserved.saturating_sub(rows);
+    }
+
+    /// What scans (initial, live, learned) admit into: the cap minus
+    /// the trusted reservation. Trusted inputs admit into the cap.
+    pub(crate) fn scan_cap(&self) -> usize {
+        self.cap.saturating_sub(self.reserved)
+    }
+
     /// Test-only cap override (the `library_handle_cap_for_test` seam,
     /// repointed at the table).
     #[cfg(test)]
@@ -407,14 +439,18 @@ impl HandleTable {
 
     /// The cheap pre-open fast path: when full with no row under the
     /// borrower's maps key, defer without opening. A fail-closed
-    /// refusal, never an admission prediction. Wired in Task 1.
-    #[allow(dead_code)]
+    /// refusal, never an admission prediction. Scan-only, so it reads
+    /// the scan cap (the cap minus the trusted reservation).
     pub(crate) fn preopen_defers(&self, maps: &ObjectKey) -> bool {
         // Every prior acquire already filed or deferred, so nothing is
         // speculative at this point: `scan_new` is 0 and the kept
         // predicate below is exactly the room check.
         !self.maps_live.contains_key(maps)
-            && crate::fd_budget::library_handle_budget_defers_next_new(self.len(), 0, self.cap)
+            && crate::fd_budget::library_handle_budget_defers_next_new(
+                self.len(),
+                0,
+                self.scan_cap(),
+            )
     }
 
     /// Route one proven pin: its table key plus whether it may share.

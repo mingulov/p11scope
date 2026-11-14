@@ -230,6 +230,9 @@ pub(crate) struct SemanticInputs {
     /// finding 3), charged against the shared manifest+pre-arm budget when
     /// these manifests pin. Set by the coordinator before first use.
     prearm_prior: (usize, u64),
+    /// The trusted reservation rows counted when the manifests were set,
+    /// released after the memoized load files.
+    reserved_rows: usize,
 }
 
 struct RetainedInputs {
@@ -244,7 +247,20 @@ impl SemanticInputs {
             paths,
             retained: None,
             prearm_prior: (0, 0),
+            reserved_rows: 0,
         }
+    }
+
+    /// Records the trusted reservation the coordinator counted when the
+    /// manifests were set, for release after the memoized load.
+    pub(crate) fn set_reserved_rows(&mut self, rows: usize) {
+        self.reserved_rows = rows;
+    }
+
+    /// Takes the recorded reservation (for a setter replacing unloaded
+    /// inputs: their share returns to the pool unfiled).
+    pub(crate) fn take_reserved_rows(&mut self) -> usize {
+        std::mem::take(&mut self.reserved_rows)
     }
 
     /// Records the run-retained pre-arm pin usage the manifest side must
@@ -290,8 +306,8 @@ impl SemanticInputs {
     /// paths. Shared by the full mint and the selected restriction so
     /// both read the same retained files.
     fn retained_or_load(&mut self, engine: &mut Engine) -> &RetainedInputs {
-        let (prior_objects, prior_bytes) = self.prearm_prior;
-        self.retained.get_or_insert_with(|| {
+        if self.retained.is_none() {
+            let (prior_objects, prior_bytes) = self.prearm_prior;
             let mut inputs = Vec::new();
             let mut refusals = Vec::new();
             let mut budget = CaptureWorkBudget::default();
@@ -315,6 +331,9 @@ impl SemanticInputs {
                 match accepted {
                     // Never-stop: per-object skips keep the good pins and
                     // record one manifest-input refusal for the bad objects.
+                    // Trusted deferrals land here as skips too (their
+                    // permanent gap is already filed); no `Deferred` is
+                    // ever stored, never retried.
                     Ok((input, true)) => {
                         inputs.push(input);
                         refusals.push(SemanticRefusal::ManifestInput);
@@ -323,12 +342,18 @@ impl SemanticInputs {
                     Err(_) => refusals.push(SemanticRefusal::ManifestInput),
                 }
             }
-            RetainedInputs {
+            let requested = !self.paths.is_empty();
+            self.retained = Some(RetainedInputs {
                 inputs,
                 refusals,
-                requested: !self.paths.is_empty(),
-            }
-        })
+                requested,
+            });
+            // The memoized load filed: return its reservation share to
+            // scan admission.
+            let reserved = std::mem::take(&mut self.reserved_rows);
+            engine.handle_table_mut().release_rows(reserved);
+        }
+        self.retained.as_ref().expect("memoized just above")
     }
 }
 

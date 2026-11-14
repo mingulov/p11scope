@@ -1296,7 +1296,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(crate) fn set_manifests(&mut self, manifests: Vec<PathBuf>) {
         self.count_manifests = manifests.clone();
+        // A replaced input set returns its unfiled share first, so
+        // repeated setters never strand reservation rows.
+        let old = self.semantic_inputs.take_reserved_rows();
+        self.engine.handle_table_mut().release_rows(old);
+        // Count the trusted reservation rows (manifests parsed without
+        // views, no opens) and hold them aside for the memoized load,
+        // which releases its share when it files.
+        let reserved = count_trusted_reservation_rows(&manifests, &[])
+            .min(self.engine.handle_table_mut().cap());
+        self.engine.handle_table_mut().reserve_rows(reserved);
         self.semantic_inputs = semantics::SemanticInputs::new(manifests);
+        self.semantic_inputs.set_reserved_rows(reserved);
         // A fresh input set keeps the retained pre-arm charge whatever the
         // setter order is.
         let (objects, bytes) = self.prearm_prior;
@@ -1326,14 +1337,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// the one shared capture-level budget.
     pub(crate) fn set_prearm_pinning(
         &mut self,
-        pinning: crate::discovery::identity::PrearmPinning,
+        proved: crate::discovery::identity::PrearmProvedPinning,
     ) {
-        // Phase 0: the pins were proven before any table existed, so
-        // their already-held handles file here, without reopening.
-        let mut pinning = pinning;
-        pinning
-            .pins
-            .adopt_handles_into(self.engine.handle_table_mut());
+        // Each proved object acquires into the lane table without
+        // reopening; the excess takes the permanent trusted gap while
+        // good pins continue. Reserve this phase's share around the
+        // filing (no scan interleaves, so the window is uniform rather
+        // than load-bearing).
+        let share = proved
+            .proved
+            .len()
+            .min(self.engine.handle_table_mut().cap());
+        self.engine.handle_table_mut().reserve_rows(share);
+        let pinning =
+            crate::discovery::identity::file_prearm_proved(proved, self.engine.handle_table_mut());
+        self.engine.handle_table_mut().release_rows(share);
         let usage = (
             pinning.pins.pinned().count(),
             pinning.pins.pinned_object_bytes(),
@@ -12821,7 +12839,7 @@ pub(crate) mod tests {
             let b = dir.path().join(format!("prearm-{prearm_first}-b.so"));
             std::fs::copy("/bin/sh", &a).unwrap();
             std::fs::copy("/bin/sh", &b).unwrap();
-            let pinning = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+            let proved = crate::discovery::identity::pin_prearm_proved_in_views_with_budget(
                 &[a, b],
                 &[],
                 None,
@@ -12829,12 +12847,8 @@ pub(crate) mod tests {
                 0,
                 &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
-            .expect("two real pre-arm pins");
-            let usage = (
-                pinning.pins.pinned().count(),
-                pinning.pins.pinned_object_bytes(),
-            );
-            assert_eq!(usage.0, 2);
+            .expect("two real pre-arm proven objects");
+            assert_eq!(proved.proved.len(), 2);
             let mut coordinator = InventoryCoordinator::new_with_budget(
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
@@ -12847,12 +12861,28 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(coordinator.prearm_prior(), (0, 0));
             if prearm_first {
-                coordinator.set_prearm_pinning(pinning);
+                coordinator.set_prearm_pinning(proved);
                 coordinator.set_manifests(Vec::new());
             } else {
                 coordinator.set_manifests(Vec::new());
-                coordinator.set_prearm_pinning(pinning);
+                coordinator.set_prearm_pinning(proved);
             }
+            let usage = (
+                coordinator
+                    .prearm
+                    .as_ref()
+                    .expect("pre-arm retained")
+                    .pins
+                    .pinned()
+                    .count(),
+                coordinator
+                    .prearm
+                    .as_ref()
+                    .expect("pre-arm retained")
+                    .pins
+                    .pinned_object_bytes(),
+            );
+            assert_eq!(usage.0, 2);
             assert_eq!(coordinator.prearm_prior(), usage);
             assert_eq!(
                 coordinator.semantic_prearm_prior(),
@@ -12887,8 +12917,10 @@ pub(crate) mod tests {
         so
     }
 
-    fn pin_prearm_for_test(paths: &[PathBuf]) -> crate::discovery::identity::PrearmPinning {
-        crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+    fn pin_prearm_proved_for_test(
+        paths: &[PathBuf],
+    ) -> crate::discovery::identity::PrearmProvedPinning {
+        crate::discovery::identity::pin_prearm_proved_in_views_with_budget(
             paths,
             &[],
             None,
@@ -12896,7 +12928,66 @@ pub(crate) mod tests {
             0,
             &mut crate::discovery::scan::CaptureWorkBudget::default(),
         )
-        .expect("test pre-arm pins")
+        .expect("test pre-arm proves")
+    }
+
+    /// Task-3 C4 twin: pre-arm pins file through `acquire()` without
+    /// reopening — the same fds the prove phase held — with per-object
+    /// trusted gaps for the excess and the reservation released after.
+    #[test]
+    fn handle_table_prearm_pins_file_through_acquire_without_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for n in 0..2 {
+            let path = dir.path().join(format!("prearm{n}.so"));
+            std::fs::copy("/bin/sh", &path).unwrap();
+            paths.push(path);
+        }
+        let proved = crate::discovery::identity::pin_prearm_proved_in_views_with_budget(
+            &paths,
+            &[],
+            None,
+            0,
+            0,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        )
+        .expect("test pre-arm proves");
+        assert!(proved.skipped.is_empty(), "{:?}", proved.skipped);
+        assert_eq!(proved.proved.len(), 2);
+        use std::os::unix::io::AsRawFd as _;
+        let proved_fds: Vec<i32> = proved
+            .proved
+            .iter()
+            .map(|object| object.proved.file.as_raw_fd())
+            .collect();
+        let mut coordinator = InventoryCoordinator::new_with_budget(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+            crate::capacity::inventory_endpoint_budget(None).unwrap(),
+        )
+        .unwrap();
+        coordinator.set_prearm_pinning(proved);
+        let prearm = coordinator.prearm.as_ref().expect("pre-arm retained");
+        assert_eq!(prearm.pins.pinned().count(), 2);
+        assert_eq!(prearm.inputs.len(), 2);
+        let mut held = std::collections::BTreeSet::new();
+        prearm.pins.held_library_fds(&mut held);
+        assert_eq!(held.len(), 2);
+        for fd in &proved_fds {
+            assert!(
+                held.contains(fd),
+                "the filed handle is the proved fd, never a reopen: {held:?} vs {proved_fds:?}"
+            );
+        }
+        assert_eq!(
+            coordinator.engine.handle_table_mut().scan_cap(),
+            coordinator.engine.handle_table_mut().cap(),
+            "the reservation releases after set_prearm_pinning"
+        );
     }
 
     #[test]
@@ -12908,9 +12999,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "proved");
         let bytes = std::fs::read(&provider).unwrap();
-        let pinning = pin_prearm_for_test(&[provider]);
-        assert_eq!(pinning.inputs.len(), 1);
-        let proved: BTreeSet<String> = pinning.inputs[0]
+        let pinning = pin_prearm_proved_for_test(&[provider]);
+        assert_eq!(pinning.proved.len(), 1);
+        let proved: BTreeSet<String> = pinning.proved[0]
+            .input
             .proved
             .iter()
             .map(|(name, _)| name.clone())
@@ -12920,13 +13012,15 @@ pub(crate) mod tests {
             BTreeSet::from(["C_GetFunctionList".to_string(), "C_Initialize".to_string()]),
             "the fixture proves exactly its two standard-name functions"
         );
-        let skipped: Vec<String> = pinning.inputs[0]
+        let skipped: Vec<String> = pinning.proved[0]
+            .input
             .non_executable
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
         assert_eq!(skipped, ["C_Finalize"]);
-        let proved_offsets: BTreeSet<u64> = pinning.inputs[0]
+        let proved_offsets: BTreeSet<u64> = pinning.proved[0]
+            .input
             .proved
             .iter()
             .map(|(_, offset)| *offset)
@@ -12984,7 +13078,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "never-mapped");
         let bytes = std::fs::read(&provider).unwrap();
-        let pinning = pin_prearm_for_test(&[provider]);
+        let pinning = pin_prearm_proved_for_test(&[provider]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(1_000);
@@ -13046,7 +13140,7 @@ pub(crate) mod tests {
         let provider = prearm_provider_with_proved_exports(dir.path(), "replaced");
         let old_bytes = std::fs::read(&provider).unwrap();
         let old_ino = std::fs::metadata(&provider).unwrap().ino();
-        let pinning = pin_prearm_for_test(std::slice::from_ref(&provider));
+        let pinning = pin_prearm_proved_for_test(std::slice::from_ref(&provider));
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(crate::attach::monotonic_ns().expect("monotonic clock"));
@@ -13150,8 +13244,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .success()
         );
-        let pinning = pin_prearm_for_test(&[provider]);
-        assert!(pinning.inputs[0].proved.is_empty());
+        let pinning = pin_prearm_proved_for_test(&[provider]);
+        assert!(pinning.proved[0].input.proved.is_empty());
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(1_000);
@@ -13181,8 +13275,7 @@ pub(crate) mod tests {
                 dir.path(),
                 &format!("budget-{budget_endpoints}"),
             );
-            let pinning = pin_prearm_for_test(&[provider]);
-            let object = pinning.pins.pinned().next().unwrap().id;
+            let pinning = pin_prearm_proved_for_test(&[provider]);
             let mut coordinator = InventoryCoordinator::new_with_budget(
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
@@ -13194,6 +13287,15 @@ pub(crate) mod tests {
             )
             .unwrap();
             coordinator.set_prearm_pinning(pinning);
+            let object = coordinator
+                .prearm
+                .as_ref()
+                .expect("pre-arm retained")
+                .pins
+                .pinned()
+                .next()
+                .unwrap()
+                .id;
             coordinator.absorb_prearm_plan(1_000);
             let delta = coordinator.take_target_delta();
             coordinator.registry_mut().publish();
@@ -13245,7 +13347,7 @@ pub(crate) mod tests {
         use crate::attach::capture::AttachedEndpoint;
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "armed");
-        let pinning = pin_prearm_for_test(&[provider]);
+        let pinning = pin_prearm_proved_for_test(&[provider]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(1_000);
@@ -13302,7 +13404,7 @@ pub(crate) mod tests {
         use crate::attach::capture::AttachedEndpoint;
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "frozen-stop");
-        let pinning = pin_prearm_for_test(&[provider]);
+        let pinning = pin_prearm_proved_for_test(&[provider]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(1_000);
@@ -13347,7 +13449,7 @@ pub(crate) mod tests {
         use crate::attach::capture::AttachedEndpoint;
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "health-loss");
-        let pinning = pin_prearm_for_test(&[provider]);
+        let pinning = pin_prearm_proved_for_test(&[provider]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(1_000);
@@ -13390,7 +13492,7 @@ pub(crate) mod tests {
         use crate::attach::capture::AttachedEndpoint;
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "scope-uncertain");
-        let pinning = pin_prearm_for_test(&[provider]);
+        let pinning = pin_prearm_proved_for_test(&[provider]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(1_000);
@@ -13437,7 +13539,7 @@ pub(crate) mod tests {
         use crate::attach::capture::AttachedEndpoint;
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "counter-rise");
-        let pinning = pin_prearm_for_test(&[provider]);
+        let pinning = pin_prearm_proved_for_test(&[provider]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(1_000);
@@ -13514,12 +13616,19 @@ pub(crate) mod tests {
         use crate::attach::capture::AttachedEndpoint;
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "windowed");
-        let pinning = pin_prearm_for_test(&[provider]);
-        let summary = pinning.pins.pinned().next().expect("one pinned object");
-        let object = summary.id;
-        let (key, sha256) = (summary.key, summary.sha256.to_string());
+        let pinning = pin_prearm_proved_for_test(&[provider]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
+        let summary = coordinator
+            .prearm
+            .as_ref()
+            .expect("pre-arm retained")
+            .pins
+            .pinned()
+            .next()
+            .expect("one pinned object");
+        let object = summary.id;
+        let (key, sha256) = (summary.key, summary.sha256.to_string());
         coordinator.absorb_prearm_plan(1_000);
         let delta = coordinator.take_target_delta();
         assert_eq!(delta.endpoints.len(), 2);
@@ -13678,12 +13787,19 @@ pub(crate) mod tests {
         // `is_none_or` / `!pin_sha.is_empty()` guard.
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "digest-neg");
-        let pinning = pin_prearm_for_test(&[provider]);
-        let summary = pinning.pins.pinned().next().expect("one pinned object");
-        let (key, sha256) = (summary.key, summary.sha256.to_string());
-        assert!(!sha256.is_empty(), "the pin carries a proven digest");
+        let pinning = pin_prearm_proved_for_test(&[provider]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
+        let summary = coordinator
+            .prearm
+            .as_ref()
+            .expect("pre-arm retained")
+            .pins
+            .pinned()
+            .next()
+            .expect("one pinned object");
+        let (key, sha256) = (summary.key, summary.sha256.to_string());
+        assert!(!sha256.is_empty(), "the pin carries a proven digest");
         coordinator.absorb_prearm_plan(1_000);
         coordinator.take_target_delta();
         // Same key, wrong digest: unmapped.

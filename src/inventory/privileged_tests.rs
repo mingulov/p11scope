@@ -518,7 +518,7 @@ fn privileged_prearm_reaches_armed_pid() -> Result<()> {
     let mut coordinator = pid_coordinator(target.pid(), Path::new(softhsm()))?;
     // Pin the live provider as pre-arm before the lane starts: proved
     // offsets lower into the attach set and ride the activating extend.
-    let pinning = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+    let pinning = crate::discovery::identity::pin_prearm_proved_in_views_with_budget(
         &[PathBuf::from(softhsm())],
         &[],
         None,
@@ -528,10 +528,10 @@ fn privileged_prearm_reaches_armed_pid() -> Result<()> {
     )
     .map_err(|error| anyhow::anyhow!("--prearm-module: {}", error.problems().join("; ")))?;
     ensure!(
-        !pinning.inputs.is_empty() && !pinning.inputs[0].proved.is_empty(),
+        !pinning.proved.is_empty() && !pinning.proved[0].input.proved.is_empty(),
         "SoftHSM pins with no proved offsets; the fixture or oracle is broken"
     );
-    let declared = pinning.inputs[0].proved.len();
+    let declared = pinning.proved[0].input.proved.len();
     coordinator.set_prearm_pinning(pinning);
     coordinator.absorb_prearm_plan(crate::attach::monotonic_ns().unwrap_or(1));
     let probe = pid_probe(target.pid(), &coordinator)?;

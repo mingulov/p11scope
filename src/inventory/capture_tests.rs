@@ -9746,6 +9746,16 @@ struct DrainLane {
     drained: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     drained_ns: u64,
     stopping: bool,
+    /// Endpoints the next extend defers (from the end), once: the
+    /// activation backlog for the stop-during-load twin.
+    defer_next: usize,
+    /// The run's stop counter, shared with the test: extends and
+    /// services while set count separately, so the twin asserts zero
+    /// extends after the stop precisely.
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    extends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    extends_after_stop: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stopped_services: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DrainLane {
@@ -9758,6 +9768,11 @@ impl DrainLane {
             drained: std::sync::Arc::default(),
             drained_ns: 0,
             stopping: false,
+            defer_next: 0,
+            stop: None,
+            extends: std::sync::Arc::default(),
+            extends_after_stop: std::sync::Arc::default(),
+            stopped_services: std::sync::Arc::default(),
         }
     }
 }
@@ -9783,10 +9798,11 @@ impl CaptureLane<Pin> for DrainLane {
 
     fn extend(
         &mut self,
-        delta: TargetDelta,
+        mut delta: TargetDelta,
         _: &dyn CaptureTargets,
         _: ExtendWindow,
     ) -> ExtendReceipt {
+        use std::sync::atomic::Ordering;
         let mut receipt = ExtendReceipt {
             custody: Some(ScopeCustody::System),
             ..ExtendReceipt::default()
@@ -9795,6 +9811,28 @@ impl CaptureLane<Pin> for DrainLane {
             self.activated = true;
             receipt.activated_roots = true;
             receipt.exec_coverage = Some(ExecCoverage::scripted(self.domain, self.stamps.next()));
+        }
+        self.extends.fetch_add(1, Ordering::SeqCst);
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::SeqCst) > 0)
+        {
+            self.extends_after_stop.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.defer_next > 0 && !delta.endpoints.is_empty() {
+            let keep = delta.endpoints.len().saturating_sub(self.defer_next);
+            receipt
+                .deferred
+                .endpoints
+                .extend(delta.endpoints.split_off(keep));
+            self.defer_next = 0;
+            let deferred = receipt.deferred.endpoints.clone();
+            for endpoint in deferred {
+                if !receipt.deferred.objects.contains(&endpoint.object) {
+                    receipt.deferred.objects.push(endpoint.object);
+                }
+            }
         }
         for endpoint in delta.endpoints {
             receipt.attached.push(AttachedEndpoint {
@@ -9807,6 +9845,14 @@ impl CaptureLane<Pin> for DrainLane {
     }
 
     fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
+        use std::sync::atomic::Ordering;
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::SeqCst) > 0)
+        {
+            self.stopped_services.fetch_add(1, Ordering::SeqCst);
+        }
         // SAFETY: `DiscoveryRecord` is a plain `repr(C)` integer record; all
         // zeroes is a valid value (kind 0: no exec, the binder ignores it).
         let records = (0..self.records_per_service.min(window.max_rows()))
@@ -9899,11 +9945,12 @@ fn startup_drain_holds_records_and_stages_them_first_in_drain_order() {
     let mut started = NativeLane::start(lane, &mut scene, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
-    let loaded = crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), || {
-        // Long enough for several drainer ticks (10 ms each).
-        std::thread::sleep(Duration::from_millis(80));
-        "loaded"
-    });
+    let loaded =
+        crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), None, || {
+            // Long enough for several drainer ticks (10 ms each).
+            std::thread::sleep(Duration::from_millis(80));
+            "loaded"
+        });
     assert_eq!(loaded, "loaded");
     let held: Vec<u64> = drained.lock().unwrap().clone();
     assert!(
@@ -9948,7 +9995,7 @@ fn startup_drain_releases_its_drainer_when_the_load_panics() {
         .map_err(|(_, reason)| reason)
         .unwrap();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::inventory::draining_lifecycle::<Pin, _, (), _>(Some(&mut started), || {
+        crate::inventory::draining_lifecycle::<Pin, _, (), _>(Some(&mut started), None, || {
             std::thread::sleep(Duration::from_millis(20));
             panic!("scripted load panic")
         })
@@ -9973,10 +10020,92 @@ fn startup_drain_releases_its_drainer_when_the_load_panics() {
 fn startup_drain_without_a_lane_runs_the_load_once() {
     let mut runs = 0;
     let caller = std::thread::current().id();
-    let ran_on = crate::inventory::draining_lifecycle::<Pin, DrainLane, _, _>(None, || {
+    let ran_on = crate::inventory::draining_lifecycle::<Pin, DrainLane, _, _>(None, None, || {
         runs += 1;
         std::thread::current().id()
     });
     assert_eq!(runs, 1);
     assert_eq!(ran_on, caller);
+}
+
+/// A stop during the semantic BPF load turns every later startup tick
+/// drain-only: the 600-endpoint pre-arm backlog stays queued for pass 0
+/// and zero drain extends start after the stop — while the ring drain
+/// continues. The lane classifies each extend by the flag at extend
+/// time, like the collection-tick twin; extends before the stop stay
+/// legal and uncounted.
+#[test]
+fn startup_drain_extends_nothing_after_a_stop_during_the_load() {
+    use std::sync::atomic::Ordering;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut lane = DrainLane::new(1);
+    lane.defer_next = 600;
+    lane.stop = Some(std::sync::Arc::clone(&stop));
+    let extends_after_stop = std::sync::Arc::clone(&lane.extends_after_stop);
+    let stopped_services = std::sync::Arc::clone(&lane.stopped_services);
+    let mut host = ReverseOrderHost {
+        set: InventoryAttachSet::new(InventoryBudget::new(4096, 4096 * 8).unwrap()),
+        delta: fabricated_delta(600),
+        start_pending: true,
+    };
+    let mut started = NativeLane::start(lane, &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    assert_eq!(
+        started.backlog.endpoints.len(),
+        600,
+        "the activation defers the whole pre-arm delta"
+    );
+    crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), Some(&*stop), || {
+        // The operator stop lands as the semantic load starts, like a
+        // Ctrl-C during the BPF load; the load then outlasts several
+        // 10 ms drainer ticks plus the final quantum.
+        stop.store(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(80));
+    });
+    assert!(
+        stopped_services.load(Ordering::SeqCst) >= 1,
+        "the drainer ticked while the stop pended"
+    );
+    assert_eq!(
+        extends_after_stop.load(Ordering::SeqCst),
+        0,
+        "zero drain extends start after the stop"
+    );
+}
+
+/// Healthy twin: with no stop the startup ticks extend the backlog, so
+/// the load window makes attach progress for the first pass to forward.
+#[test]
+fn startup_drain_extends_the_backlog_while_no_stop_pends() {
+    use std::sync::atomic::Ordering;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut lane = DrainLane::new(1);
+    lane.defer_next = 600;
+    lane.stop = Some(std::sync::Arc::clone(&stop));
+    let extends = std::sync::Arc::clone(&lane.extends);
+    let mut host = ReverseOrderHost {
+        set: InventoryAttachSet::new(InventoryBudget::new(4096, 4096 * 8).unwrap()),
+        delta: fabricated_delta(600),
+        start_pending: true,
+    };
+    let mut started = NativeLane::start(lane, &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    assert_eq!(
+        started.backlog.endpoints.len(),
+        600,
+        "the activation defers the whole pre-arm delta"
+    );
+    crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), Some(&*stop), || {
+        std::thread::sleep(Duration::from_millis(80));
+    });
+    assert!(
+        extends.load(Ordering::SeqCst) >= 2,
+        "the drainer extended during the load"
+    );
+    assert!(
+        started.backlog.endpoints.len() < 600,
+        "drain extends shrink the backlog before the first pass"
+    );
 }

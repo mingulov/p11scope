@@ -1700,7 +1700,7 @@ fn run_with_terminal_budget(
     let semantic = if manifests.is_empty() {
         None
     } else {
-        draining_lifecycle::<crate::process::PidPin, _, _, _>(lane.as_mut(), || {
+        draining_lifecycle::<crate::process::PidPin, _, _, _>(lane.as_mut(), None, || {
             start_semantic_lane(
                 &mut coordinator,
                 &engine_scope,
@@ -5790,7 +5790,11 @@ fn note_semantic_lane_sealed() {
 /// total absorbed before pass 0 ends stays held cap plus ring; the caps'
 /// size, not the drain, sets that headroom. Without a thread for the
 /// drainer, `start` runs undrained.
-pub(crate) fn draining_lifecycle<Pin, L, T, F>(lane: Option<&mut NativeLane<L>>, start: F) -> T
+pub(crate) fn draining_lifecycle<Pin, L, T, F>(
+    lane: Option<&mut NativeLane<L>>,
+    _stop: Option<&std::sync::atomic::AtomicUsize>,
+    start: F,
+) -> T
 where
     L: crate::inventory_capture::CaptureLane<Pin>,
     NativeLane<L>: Send,

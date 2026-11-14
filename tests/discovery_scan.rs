@@ -1341,15 +1341,17 @@ fn build_padded_fixture(dir: &Path, name: &str, pad_bytes: u64) -> PathBuf {
 }
 
 #[test]
-fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
+fn per_operation_allowance_degrades_as_a_named_gap_not_a_size_refusal() {
     let _guard = serial_guard();
     let dir = tmp("scan-cap");
-    // Admit earlier mount-table identity work, then refuse the memory
-    // snapshot at its exact data-size boundary. The sparse export check
-    // itself is ungated, so the module is still identified by its exports.
-    // The per-object cap also bounds the mount-table read, so the pad must
-    // dominate this host's table: a fixed 256 KiB pad failed the precondition
-    // below on a host with a larger mountinfo.
+    // Admit earlier mount-table identity work, then exhaust the allowance
+    // one byte short of the full data snapshot (v0.8.0: no whole-size
+    // gate; reads degrade incrementally). The sparse export check itself
+    // is ungated, so the module is still identified by its exports, and
+    // the nearly complete snapshot still decodes its tables.
+    // The per-operation allowance also bounds the mount-table read, so the
+    // pad must dominate this host's table: a fixed 256 KiB pad failed the
+    // precondition below on a host with a larger mountinfo.
     let mountinfo_bytes = u64::try_from(std::fs::read("/proc/self/mountinfo").unwrap().len())
         .expect("mountinfo length fits in u64");
     let so = build_padded_fixture(&dir, "capped", (256 * 1024).max(4 * mountinfo_bytes));
@@ -1367,7 +1369,7 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
         .max(mountinfo_bytes);
     assert!(
         per_object_bytes < data_bytes,
-        "the cap must bite the data snapshot: {per_object_bytes} < {data_bytes}"
+        "the allowance must bite the data snapshot: {per_object_bytes} < {data_bytes}"
     );
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::new(ScanLimits {
@@ -1397,19 +1399,20 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
         modules
             .iter()
             .filter(|m| m.path.ends_with("capped.so"))
-            .all(|m| m.tables.is_empty()),
-        "an unread snapshot cannot yield tables: {modules:?}"
+            .all(|m| !m.tables.is_empty()),
+        "a nearly complete snapshot still yields tables: {modules:?}"
     );
     assert!(
         skipped.iter().any(|skip| {
-            skip.subject.ends_with("capped.so")
-                && skip.reason
-                    == format!(
-                        "too_large ({data_bytes} readable data bytes; per-object cap is \
-                         {per_object_bytes})"
-                    )
+            skip.subject.ends_with("capped.so") && skip.reason.contains("attempted-I/O ceiling")
         }),
-        "the cap must be reported as too_large: {skipped:?}"
+        "the exhausted allowance keeps its named gap: {skipped:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .all(|skip| !skip.reason.contains("too_large")),
+        "no size wording may remain: {skipped:?}"
     );
     let mut exact_budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: data_bytes,

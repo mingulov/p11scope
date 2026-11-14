@@ -183,16 +183,10 @@ fn read_elf_snapshot_with(
     mut deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
     mut reader: impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize>,
 ) -> Result<ElfSnapshot, String> {
-    let size = file
-        .metadata()
-        .map_err(|error| format!("metadata failed: {error}"))?
-        .len();
-    if size > budget.limits().per_object_bytes {
-        return Err(format!(
-            "too_large ({size} bytes; per-object cap is {})",
-            budget.limits().per_object_bytes,
-        ));
-    }
+    // v0.8.0: no whole-size gate here. The chunked reads below enforce
+    // the per-operation and capture allowances incrementally, so a
+    // large object degrades through the I/O ceiling's named gap instead
+    // of a size refusal, and memory never exceeds the allowance.
     let mut operation_bytes = 0u64;
     ElfSnapshot::read_with_reader(file, |file, bytes, offset| {
         if let Some(reason) = deadline(budget) {
@@ -209,52 +203,13 @@ fn read_elf_snapshot_with(
     })
 }
 
-/// Inventory's conservative export unit: reserve and debit the complete
-/// logical mapped range before entering the indivisible dependency parser.
-/// Parse failure and a stop reached during parsing do not refund the debit.
-fn read_inventory_export_facts_budgeted_with<Now, ReadFacts>(
-    file: &File,
-    wanted: &[&str],
-    budget: &mut CaptureWorkBudget,
-    mut now: Now,
-    read_facts: ReadFacts,
-) -> Result<(ElfAbi, Vec<(String, u64)>), String>
-where
-    Now: FnMut() -> Option<u64>,
-    ReadFacts: FnOnce(&File, &[&str], u64) -> Result<(ElfAbi, Vec<(String, u64)>, u64), String>,
-{
-    if budget.active_scan.is_none() {
-        return Err("read failed: inventory discovery requires an active scan".into());
-    }
-    if let Some(reason) = budget.check_deadline(now()) {
-        return Err(format!("read failed: {reason}"));
-    }
-    let reservation = file
-        .metadata()
-        .map_err(|error| format!("metadata failed: {error}"))?
-        .len();
-    let reservation_usize = usize::try_from(reservation).map_err(|_| {
-        budget.set_scan_stop(IO_CEILING_REASON);
-        format!("read failed: {IO_CEILING_REASON}")
-    })?;
-    if reservation > budget.limits().per_object_bytes
-        || reservation > budget.remaining_window_io().unwrap_or(0)
-    {
-        budget.set_scan_stop(IO_CEILING_REASON);
-        return Err(format!("read failed: {IO_CEILING_REASON}"));
-    }
-    budget.record_io(reservation_usize);
-    let parsed = read_facts(file, wanted, reservation);
-    if let Some(reason) = budget.check_deadline(now()) {
-        return Err(format!("read failed: {reason}"));
-    }
-    let (abi, exports, structural_bytes) = parsed?;
-    if structural_bytes > reservation {
-        budget.set_scan_stop(IO_CEILING_REASON);
-        return Err(format!("read failed: {IO_CEILING_REASON}"));
-    }
-    Ok((abi, exports))
-}
+// v0.8.0: the inventory full-length mapped-byte reservation is retired
+// with the other size gates. Unretained export checks map demand-paged
+// under both policies and charge the structural table bytes after the
+// parse (the Detailed shape below), so a large object is examined for
+// the cost of its tables, not refused for the length of its file. File
+// growth across the parse stays fenced by the caller's pin-before/after
+// bracket; a stop reached during parsing keeps the window/deadline gap.
 
 /// A previously retained file may already be watched by the instance hooks.
 /// Read its exports without mapping it in the observer's shared mm. The
@@ -278,8 +233,7 @@ fn read_retained_export_facts_budgeted(
 
 /// Demand-paged export facts for unretained files; retained files use bounded
 /// reads to avoid invalidating the very instances the observer is watching.
-/// Detailed mode otherwise preserves its sparse structural post-read charge.
-/// Inventory pre-debits the unretained file's conservative mapped-byte bound.
+/// Both policies share the sparse structural post-read charge.
 #[cfg(test)]
 fn read_export_facts_budgeted(
     file: &File,
@@ -288,15 +242,6 @@ fn read_export_facts_budgeted(
 ) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
     if budget.retained_mapped_identity(file).is_some() {
         return read_retained_export_facts_budgeted(file, wanted, budget);
-    }
-    if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
-        return read_inventory_export_facts_budgeted_with(
-            file,
-            wanted,
-            budget,
-            crate::attach::monotonic_ns,
-            p11scope_manifest::elf::read_export_facts_bounded,
-        );
     }
     let (abi, exports, charged) = p11scope_manifest::elf::read_export_facts(file, wanted)?;
     let remaining = budget.remaining_window_io().unwrap_or(0);
@@ -324,34 +269,14 @@ fn read_raw_scan_facts_budgeted(
                 facts.getter_present,
                 facts.witness_fault,
             )
-        } else if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
-            let mut metadata = None;
-            let (abi, exports) = read_inventory_export_facts_budgeted_with(
-                file,
-                wanted,
-                budget,
-                crate::attach::monotonic_ns,
-                |file, wanted, reservation| {
-                    let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(
-                        file,
-                        wanted,
-                        reservation,
-                    )?;
-                    metadata = Some((
-                        facts.excluded_anchor_ranges,
-                        facts.work_units,
-                        facts.getter_present,
-                        facts.witness_fault,
-                    ));
-                    Ok((facts.abi, facts.exports, facts.structural_bytes))
-                },
-            )?;
-            let (ranges, work, getter_present, witness_fault) =
-                metadata.expect("successful raw ELF query returned metadata");
-            (abi, exports, ranges, work, getter_present, witness_fault)
         } else {
-            // Detailed retains its demand-paged structural post-read debit;
-            // no new whole-file gate is introduced for sparse objects.
+            // Both policies share the demand-paged structural post-read
+            // debit; no whole-file gate is introduced for sparse objects.
+            if matches!(budget.policy(), DiscoveryPolicy::Inventory(_))
+                && budget.active_scan.is_none()
+            {
+                return Err("read failed: inventory discovery requires an active scan".into());
+            }
             let facts =
                 p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
             let remaining = budget.remaining_window_io().unwrap_or(0);
@@ -664,14 +589,15 @@ impl WindowReceipt {
 impl Default for ScanLimits {
     fn default() -> Self {
         Self {
-            // Measured (cgroup-256 Task 5, 2026-09-17): libxul.so is
-            // 183,575,264 bytes on disk with 63,639,548 readable data bytes,
-            // so the old 64 MiB cap refused its snapshots and held its data
-            // at a 5% margin. 256 MiB bounds one object's budgeted snapshot
-            // reads here; the manifest open cap (`MAX_OBJECT_BYTES`) is
-            // wider, so a 256-512 MiB object opens but reads no snapshot
-            // on this path. The unchanged 512 MiB total keeps bounding the
-            // worst case.
+            // v0.8.0: both allowances are time/progress budgets enforced
+            // incrementally as bytes stream, never whole-size gates (no
+            // object is refused for its own size). 256 MiB bounds one
+            // operation's reads (a snapshot, a hash, one module's data
+            // pages); the 512 MiB total bounds the capture. Measured
+            // (cgroup-256 Task 5, 2026-09-17): libxul.so is 183,575,264
+            // bytes on disk with 63,639,548 readable data bytes, so the
+            // old 64 MiB allowance starved its snapshots; 256 MiB holds
+            // it with margin while still bounding the worst case.
             per_object_bytes: 256 * 1024 * 1024,
             total_bytes: 512 * 1024 * 1024,
         }
@@ -4129,8 +4055,8 @@ struct ForeignOpenFailure {
 /// Per-object gaps for foreign-root open failures: JSON and `-v`
 /// keep every object (the fold belongs to concise rendering only, grouped
 /// per distinct reason there). Only a retained-root open failure gains the
-/// target-root suffix that names the foreign root; a size-cap or
-/// precondition refusal keeps its exact wording and its own record.
+/// target-root suffix that names the foreign root; any other refusal keeps
+/// its exact wording and its own record.
 fn foreign_root_skips(failures: Vec<ForeignOpenFailure>) -> Vec<Skipped> {
     failures
         .into_iter()
@@ -4229,15 +4155,8 @@ fn map_files_open_proven(
             "map_files range {start:x}-{end:x} is not a regular file; refused"
         )));
     }
-    // The shared object size cap applies to the served file exactly as
-    // to a root-opened one: same limit, same wording, never lowered.
-    let size = metadata.len();
-    let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
-    if size > limit {
-        return Err(MapFilesRefusal::Refused(format!(
-            "object is {size} bytes; limit is {limit}"
-        )));
-    }
+    // v0.8.0: the served file joins at any size, like a root-opened
+    // one; downstream reads stream or map under time/progress budgets.
     // The like-for-like proof, read fresh on both sides: the served
     // fd's self-mapped `vm_file` against this range's `map_files`
     // stat. Only a proven same file joins; anything else keeps a
@@ -5248,8 +5167,8 @@ fn provider_facts_for(
     budget: &mut CaptureWorkBudget,
 ) -> Result<ElfExportFacts, String> {
     let before = pin_of(file)?;
-    // DetailedLegacy has no whole-size gate on this demand-paged export
-    // check. Inventory reserves the full logical mapped range below.
+    // Neither policy gates this demand-paged export check on whole size;
+    // both charge the structural table bytes after the parse.
     let cache_key = InspectedFileKey::for_open_file(file, key.device, key.inode, before)?;
     // On filesystems without unique inode numbers the key cannot name
     // one file, so the facts are never cached there: always read, never
@@ -7506,7 +7425,7 @@ fn scan_view_examined_mode(
         });
         // Per-module completeness for the sole-table gate: snapshot the
         // truncating signals before this module's tables scan. A module that
-        // never scans (no mem, over the per-object cap, or stopped) keeps
+        // never scans (no mem, allowance exhausted, or stopped) keeps
         // `tables_scan_finished` false.
         let refusals_before_module = budget.refusal_counts();
         let stop_before_module = budget.stopped_reason();
@@ -7522,24 +7441,10 @@ fn scan_view_examined_mode(
             .filter(|entry| entry.permissions[0] == b'r' && entry.permissions[2] != b'x')
             .copied()
             .collect();
-        // One object never aborts the scan: unrepresentable sizes fail the cap check
-        // below like any other over-budget object.
-        let object_bytes = data.iter().try_fold(0u64, |sum, entry| {
-            sum.checked_add(entry.end.checked_sub(entry.start)?)
-        });
-        if object_bytes.is_none_or(|bytes| bytes > budget.limits().per_object_bytes) {
-            let object_bytes = object_bytes.map_or("unrepresentable".into(), |b| b.to_string());
-            let limits = budget.limits();
-            skipped.push(Skipped {
-                subject,
-                reason: format!(
-                    "too_large ({object_bytes} readable data bytes; per-object cap is {})",
-                    limits.per_object_bytes
-                ),
-            });
-            modules.push(module);
-            continue;
-        }
+        // v0.8.0: no whole-size gate on the data range. The chunked
+        // mapping reads below enforce the allowances incrementally, so a
+        // large data range degrades through the I/O ceiling's named gap
+        // (one object still never aborts the scan).
         let sub_tables = Instant::now();
         let mut snapshots = Vec::with_capacity(data.len());
         let mut operation_bytes = 0u64;
@@ -12184,21 +12089,17 @@ mod tests {
     /// Foreign-root open failures stay per-object (JSON and `-v` keep
     /// every object; concise folds): only the retained-root prefix
     /// gains the target-root suffix, grouped per distinct reason by the
-    /// renderers. A size-cap refusal keeps its exact producer wording
-    /// so the `too_large` concise fold still recognizes it, and a
-    /// precondition refusal keeps its own record too.
+    /// renderers. A non-retained refusal keeps its exact producer
+    /// wording, and a precondition refusal keeps its own record too.
     #[test]
     fn foreign_root_skips_keep_every_object_with_its_root() {
         let enoent =
             "opening object within retained target root: No such file or directory (os error 2)";
+        let not_regular = "target-root object is not a regular file";
         let skips = foreign_root_skips(vec![
             foreign_failure("/lib/a.so", enoent, "/etc/avahi"),
             foreign_failure("/lib/b.so", enoent, "/etc/avahi"),
-            foreign_failure(
-                "/lib/big.so",
-                "object is 578755480 bytes; limit is 536870912",
-                "/etc/avahi",
-            ),
+            foreign_failure("/lib/data.so", not_regular, "/etc/avahi"),
             foreign_failure(
                 "relative/path.so",
                 "target-root object requires an absolute path without parent traversal",
@@ -12218,8 +12119,8 @@ mod tests {
         assert_eq!(skips[0].subject, "/lib/a.so");
         assert_eq!(skips[1].subject, "/lib/b.so");
         assert_eq!(
-            skips[2].reason, "object is 578755480 bytes; limit is 536870912",
-            "a size-cap refusal keeps its exact wording for the too_large fold: {:#?}",
+            skips[2].reason, not_regular,
+            "a non-retained refusal keeps its exact wording: {:#?}",
             skips[2]
         );
         assert_eq!(
@@ -14102,7 +14003,7 @@ mod tests {
         }
 
         /// A real hook-exporting provider, so sparse tests pin facts — not
-        /// just the absence of facts — on files the whole-size gate refused.
+        /// just the absence of facts — on files past the old whole-size gate.
         fn new_provider() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let c = dir.path().join("provider.c");
@@ -14266,11 +14167,10 @@ mod tests {
 
     #[test]
     fn oversize_file_exports_are_checked_sparsely() {
-        // A hook-exporting provider sparsely extended past the scan
-        // per-object cap (the libxul shape): the export check still reports
-        // facts, charging tables rather than the file. Explicit small limits:
-        // the default cap now equals the manifest pin gate, so sizing past
-        // the default would trip a different gate than the one tested here.
+        // A hook-exporting provider sparsely extended past the
+        // per-operation allowance (the libxul shape): the export check
+        // still reports facts, charging tables rather than the file.
+        // Explicit small limits keep the fixture fast.
         let mut fixture = ElfExportFactsFixture::new_provider();
         let oversize = 2 * 1024 * 1024;
         std::fs::OpenOptions::new()
@@ -16000,58 +15900,43 @@ mod tests {
         assert_eq!(error, format!("read failed: {IO_CEILING_REASON}"));
         assert_eq!(
             budget.attempted_io_bytes(),
-            0,
-            "inventory refuses before the unbounded dependency reads"
+            16,
+            "the refused window drains its remainder, spending nothing beyond it"
         );
         budget.finish_scan(scan).unwrap();
         budget.finish_window(token).unwrap();
     }
 
     #[test]
-    fn inventory_export_refuses_before_dependency_without_owned_live_work() {
+    fn inventory_export_refuses_without_owned_live_work() {
+        // v0.8.0: the structural post-read debit replaced the reservation.
+        // A window without a scan refuses before parsing (nothing spent);
+        // a past deadline or an exhausted work allowance refuses after the
+        // parse with its named stop (the structural debit is not refunded).
         let file = File::open("/bin/sh").unwrap();
         let size = file.metadata().unwrap().len();
         let wanted: [&str; 0] = [];
 
         let mut no_scan = CaptureWorkBudget::for_inventory(inventory_limits(size, 2, 1, 1, 1, 1));
         let window = no_scan.begin_window(WindowId::new(1), u64::MAX).unwrap();
-        let mut calls = 0;
-        assert!(
-            read_inventory_export_facts_budgeted_with(
-                &file,
-                &wanted,
-                &mut no_scan,
-                || Some(0),
-                |file, wanted, reserved| {
-                    calls += 1;
-                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
-                },
-            )
-            .is_err()
+        let error = read_raw_scan_facts_budgeted(&file, &wanted, &mut no_scan).unwrap_err();
+        assert_eq!(
+            error,
+            "read failed: inventory discovery requires an active scan"
         );
-        assert_eq!(calls, 0);
         assert_eq!(no_scan.attempted_io_bytes(), 0);
         no_scan.finish_window(window).unwrap();
 
-        let mut expired = CaptureWorkBudget::for_inventory(inventory_limits(size, 2, 1, 1, 1, 1));
+        let mut expired =
+            CaptureWorkBudget::for_inventory(inventory_limits(size, 1 << 20, 1, 1, 1, 1));
         let window = expired.begin_window(WindowId::new(1), 0).unwrap();
         let scan = expired.checkpoint(window.clone()).unwrap();
-        let mut calls = 0;
+        let error = read_raw_scan_facts_budgeted(&file, &wanted, &mut expired).unwrap_err();
+        assert_eq!(error, SCAN_DEADLINE_REASON);
         assert!(
-            read_inventory_export_facts_budgeted_with(
-                &file,
-                &wanted,
-                &mut expired,
-                || Some(0),
-                |file, wanted, reserved| {
-                    calls += 1;
-                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
-                },
-            )
-            .is_err()
+            expired.attempted_io_bytes() > 0,
+            "the structural debit is not refunded by the deadline"
         );
-        assert_eq!(calls, 0);
-        assert_eq!(expired.attempted_io_bytes(), 0);
         assert_eq!(expired.stopped_reason(), Some(SCAN_DEADLINE_REASON));
         expired.finish_scan(scan).unwrap();
         expired.finish_window(window).unwrap();
@@ -16061,179 +15946,117 @@ mod tests {
         let scan = stopped.checkpoint(window.clone()).unwrap();
         assert!(stopped.charge(1));
         assert!(!stopped.charge(1));
-        let mut calls = 0;
+        let error = read_raw_scan_facts_budgeted(&file, &wanted, &mut stopped).unwrap_err();
+        assert_eq!(error, WORK_CEILING_REASON);
         assert!(
-            read_inventory_export_facts_budgeted_with(
-                &file,
-                &wanted,
-                &mut stopped,
-                || Some(0),
-                |file, wanted, reserved| {
-                    calls += 1;
-                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
-                },
-            )
-            .is_err()
+            stopped.attempted_io_bytes() > 0,
+            "the structural debit is not refunded by the stop"
         );
-        assert_eq!(calls, 0);
-        assert_eq!(stopped.attempted_io_bytes(), 0);
         assert_eq!(stopped.stopped_reason(), Some(WORK_CEILING_REASON));
         stopped.finish_scan(scan).unwrap();
         stopped.finish_window(window).unwrap();
     }
 
+    /// v0.8.0: the inventory full-length reservation is retired. A
+    /// sparse provider past the old 512 MiB object cap is examined
+    /// under a window far smaller than the file, charging its tables
+    /// rather than its length.
     #[test]
-    fn inventory_export_reservation_is_debited_before_success_and_parse_failure() {
-        let wanted: [&str; 0] = [];
-        let good = File::open("/bin/sh").unwrap();
-        let good_size = good.metadata().unwrap().len();
-        let mut success =
-            CaptureWorkBudget::for_inventory(inventory_limits(good_size, 2, 1, 1, 1, 1));
-        let window = success.begin_window(WindowId::new(1), u64::MAX).unwrap();
-        let scan = success.checkpoint(window.clone()).unwrap();
-        let mut calls = 0;
-        read_inventory_export_facts_budgeted_with(
-            &good,
-            &wanted,
-            &mut success,
-            || Some(0),
-            |file, wanted, reserved| {
-                calls += 1;
-                assert_eq!(reserved, good_size);
-                p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
-            },
-        )
-        .unwrap();
-        assert_eq!(calls, 1);
-        assert_eq!(success.attempted_io_bytes(), good_size);
-        assert!(
-            read_inventory_export_facts_budgeted_with(
-                &good,
-                &wanted,
-                &mut success,
-                || Some(0),
-                |file, wanted, reserved| {
-                    calls += 1;
-                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
-                },
-            )
-            .is_err()
-        );
-        assert_eq!(calls, 1, "one-over refuses before dependency work");
-        assert_eq!(success.attempted_io_bytes(), good_size);
-        success.finish_scan(scan).unwrap();
-        success.finish_window(window).unwrap();
-
-        let malformed = tempfile::tempfile().unwrap();
-        malformed.set_len(4096).unwrap();
-        let mut failed = CaptureWorkBudget::for_inventory(inventory_limits(4096, 2, 1, 1, 1, 1));
-        let window = failed.begin_window(WindowId::new(1), u64::MAX).unwrap();
-        let scan = failed.checkpoint(window.clone()).unwrap();
-        let mut calls = 0;
-        assert!(
-            read_inventory_export_facts_budgeted_with(
-                &malformed,
-                &wanted,
-                &mut failed,
-                || Some(0),
-                |file, wanted, reserved| {
-                    calls += 1;
-                    assert_eq!(reserved, 4096);
-                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
-                },
-            )
-            .is_err()
-        );
-        assert_eq!(calls, 1);
-        assert_eq!(failed.attempted_io_bytes(), 4096);
-        assert!(
-            read_inventory_export_facts_budgeted_with(
-                &malformed,
-                &wanted,
-                &mut failed,
-                || Some(0),
-                |file, wanted, reserved| {
-                    calls += 1;
-                    p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
-                },
-            )
-            .is_err()
-        );
-        assert_eq!(calls, 1, "a failed parse still spends the window");
-        assert_eq!(failed.attempted_io_bytes(), 4096);
-        failed.finish_scan(scan).unwrap();
-        failed.finish_window(window).unwrap();
-    }
-
-    #[test]
-    fn inventory_export_rechecks_deadline_after_indivisible_dependency_work() {
-        let file = File::open("/bin/sh").unwrap();
-        let size = file.metadata().unwrap().len();
-        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(size, 2, 1, 1, 1, 1));
-        let window = budget.begin_window(WindowId::new(1), 5).unwrap();
-        let scan = budget.checkpoint(window.clone()).unwrap();
-        let mut clock = [Some(0), Some(5)].into_iter();
-        let mut calls = 0;
-
-        let error = read_inventory_export_facts_budgeted_with(
-            &file,
-            &[],
-            &mut budget,
-            || clock.next().unwrap(),
-            |file, wanted, reserved| {
-                calls += 1;
-                p11scope_manifest::elf::read_export_facts_bounded(file, wanted, reserved)
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error, format!("read failed: {SCAN_DEADLINE_REASON}"));
-        assert_eq!(calls, 1, "the parser remains one indivisible work unit");
-        assert_eq!(
-            budget.attempted_io_bytes(),
-            size,
-            "deadline refusal does not refund the mapped-byte reservation"
-        );
-        budget.finish_scan(scan).unwrap();
-        budget.finish_window(window).unwrap();
-    }
-
-    #[test]
-    fn inventory_export_growth_after_reservation_is_refused_by_dependency_bound() {
-        use std::io::Write as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("growing.so");
-        std::fs::copy("/bin/sh", &path).unwrap();
-        let file = File::open(&path).unwrap();
-        let reserved = file.metadata().unwrap().len();
-        let mut budget =
-            CaptureWorkBudget::for_inventory(inventory_limits(reserved, 2, 1, 1, 1, 1));
+    fn inventory_export_check_charges_tables_not_file_length() {
+        let fixture = ElfExportFactsFixture::new_provider();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap()
+            .set_len(600 * 1024 * 1024)
+            .unwrap();
+        let file_len = std::fs::metadata(&fixture.path).unwrap().len();
+        let wanted = ["C_GetFunctionList", "NSC_GetFunctionList", "not_exported"];
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+            8 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
         let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
         let scan = budget.checkpoint(window.clone()).unwrap();
-        let mut calls = 0;
-        let error = read_inventory_export_facts_budgeted_with(
-            &file,
-            &[],
-            &mut budget,
-            || Some(0),
-            |file, wanted, dependency_bound| {
-                calls += 1;
-                assert_eq!(dependency_bound, reserved);
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .unwrap()
-                    .write_all(&[0])
-                    .unwrap();
-                p11scope_manifest::elf::read_export_facts_bounded(file, wanted, dependency_bound)
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("reserved"), "{error}");
-        assert_eq!(calls, 1);
-        assert_eq!(budget.attempted_io_bytes(), reserved);
+        let file = File::open(&fixture.path).unwrap();
+        let facts = read_raw_scan_facts_budgeted(&file, &wanted, &mut budget).unwrap();
+        assert_eq!(facts.exports.len(), 2, "standard and vendor hooks");
+        let charged = budget.attempted_io_bytes();
+        assert!(
+            charged > 0 && charged < file_len,
+            "structural charge {charged} must sit between 0 and the {file_len}-byte file"
+        );
+        assert!(
+            charged < 1024 * 1024,
+            "tables of a small provider cost kilobytes, not {charged} bytes"
+        );
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();
+    }
+
+    /// v0.8.0: a failed export parse charges nothing (post-read debit),
+    /// and a starved window or a past deadline keeps its named gap —
+    /// never a size refusal.
+    #[test]
+    fn inventory_export_check_keeps_ceiling_and_deadline_gaps() {
+        let malformed = tempfile::tempfile().unwrap();
+        malformed.set_len(4096).unwrap();
+        let mut failed = CaptureWorkBudget::for_inventory(inventory_limits(
+            8 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = failed.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = failed.checkpoint(window.clone()).unwrap();
+        let error = read_raw_scan_facts_budgeted(&malformed, &[], &mut failed).unwrap_err();
+        assert!(
+            error.contains("not parseable") || error.contains("not an ELF"),
+            "a malformed image refuses by parse, got {error:?}"
+        );
+        assert_eq!(
+            failed.attempted_io_bytes(),
+            0,
+            "a failed parse debits nothing post-read"
+        );
+        failed.finish_scan(scan).unwrap();
+        failed.finish_window(window).unwrap();
+
+        let file = File::open("/bin/sh").unwrap();
+        let mut starved =
+            CaptureWorkBudget::for_inventory(inventory_limits(1, 1 << 20, 4096, 32768, 4096, 512));
+        let window = starved.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = starved.checkpoint(window.clone()).unwrap();
+        let error = read_raw_scan_facts_budgeted(&file, &[], &mut starved).unwrap_err();
+        assert_eq!(error, format!("read failed: {IO_CEILING_REASON}"));
+        starved.finish_scan(scan).unwrap();
+        starved.finish_window(window).unwrap();
+
+        let file = File::open("/bin/sh").unwrap();
+        let mut expired = CaptureWorkBudget::for_inventory(inventory_limits(
+            8 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = expired.begin_window(WindowId::new(1), 1).unwrap();
+        let scan = expired.checkpoint(window.clone()).unwrap();
+        let error = read_raw_scan_facts_budgeted(&file, &[], &mut expired).unwrap_err();
+        assert_eq!(error, SCAN_DEADLINE_REASON);
+        assert!(
+            expired.attempted_io_bytes() > 0,
+            "the structural debit is not refunded by the deadline"
+        );
+        expired.finish_scan(scan).unwrap();
+        expired.finish_window(window).unwrap();
     }
 
     #[test]
@@ -16245,6 +16068,11 @@ mod tests {
         // 18 MiB closure of distinct small ELFs through the real
         // export-facts debit path. Floor only: the window may be raised,
         // never lowered below the measured need.
+        //
+        // v0.8.0: the debit is the post-read structural table charge, not
+        // the retired full-length reservation (a full-length debit cannot
+        // both fit the window and examine large files). The floor stands:
+        // the closure's tables must still fit the production window.
         const MEASURED_NEED_BYTES: u64 = 18 * 1024 * 1024;
         const {
             assert!(INVENTORY_WINDOW_IO_BYTES >= 18 * 1024 * 1024);
@@ -16274,7 +16102,15 @@ mod tests {
             read_raw_scan_facts_budgeted(file, &wanted, &mut budget).unwrap();
         }
         assert_eq!(budget.stopped_reason(), None);
-        assert_eq!(budget.attempted_io_bytes(), total);
+        let charged = budget.attempted_io_bytes();
+        assert!(
+            charged > 0 && charged < total,
+            "structural charge {charged} must sit between 0 and the {total}-byte closure"
+        );
+        assert!(
+            charged <= INVENTORY_WINDOW_IO_BYTES,
+            "the closure's tables must fit the production window: {charged}"
+        );
         budget.finish_scan(scan).unwrap();
         budget.finish_window(token).unwrap();
     }
@@ -18042,7 +17878,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         let so_path = dir.path().join("libprov.so");
         // A small real ELF under a `.so` name (the test image itself is
-        // hundreds of megabytes and trips the whole-size gate).
+        // hundreds of megabytes and would blow the fixture's budget).
         let exe = std::fs::read("/bin/true").expect("a small system ELF reads");
         std::fs::write(&so_path, &exe).expect("the fixture provider writes");
         // The maps key comes from the same production function the
@@ -18995,35 +18831,38 @@ mod tests {
         );
     }
 
-    /// The shared object size cap applies to the served file exactly as
-    /// to a root-opened one: same limit, same wording, its own record.
+    /// v0.8.0: the served file joins at any size, like a root-opened
+    /// one. A sparse serve past the old 512 MiB object cap is examined
+    /// (demand-paged export check), never refused for its size.
     #[test]
-    fn map_files_fallback_applies_the_object_size_cap() {
+    fn map_files_fallback_examines_a_serve_past_the_old_size_cap() {
         use crate::discovery::identity::FileIdentity;
         let mut fixture = MapFilesFallbackFixture::new();
         let identity = FileIdentity { dev: 37, ino: 9 };
-        let big = fixture.path.parent().unwrap().join("big.so");
-        let file = File::create(&big).unwrap();
-        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
-        file.set_len(limit + 1).unwrap();
+        // Extend the fixture file itself (same inode the maps key names):
+        // a same-file serve past the old cap must join.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap()
+            .set_len(600 * 1024 * 1024)
+            .unwrap();
         fixture.root_failure = Some(MapFilesFallbackFixture::unreachable_root());
-        fixture.map_files = MapFilesScript::Serve(File::open(&big).unwrap());
+        fixture.map_files = MapFilesScript::Serve(File::open(&fixture.path).unwrap());
         fixture.mapped = Some((MapFilesFallbackFixture::scripted_held(identity), identity));
         let (outcome, examined, _, _) = fixture.run(&mut CaptureWorkBudget::default()).unwrap();
-        let subject = fixture.path.display().to_string();
         assert!(
-            examined.iter().all(|object| object.key != fixture.key),
-            "the over-limit serve must stay unexamined, got {examined:?}"
+            examined.iter().any(|object| object.key == fixture.key),
+            "the large serve must be examined, got examined={examined:?} skipped={:?}",
+            outcome.skipped()
         );
-        let skip = outcome
-            .skipped()
-            .iter()
-            .find(|skip| skip.subject == subject)
-            .unwrap_or_else(|| panic!("a named gap must remain, got {:?}", outcome.skipped()));
-        assert_eq!(
-            skip.reason,
-            format!("object is {} bytes; limit is {limit}", limit + 1),
-            "the size cap keeps its exact wording"
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains("limit is")),
+            "no size wording may remain, got {:?}",
+            outcome.skipped()
         );
     }
 

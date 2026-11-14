@@ -21127,6 +21127,21 @@ mod tests {
     }
 
     #[test]
+    fn joint_lane_stop_suffix_counts_rearms_at_the_rate_bound_stop() {
+        use crate::inventory_semantics::RunningRearmRefusal;
+        // The rate-bound stop names the window and its count: 32
+        // interruptions inside the last 10 minutes stopped the lane.
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(
+                Some("Auditing"),
+                crate::inventory_semantics::RUNNING_REARM_LIMIT,
+                Some(RunningRearmRefusal::BoundSpent),
+            ),
+            " at Auditing; the lane stops: it already continued past 32 interruptions in the last 10 minutes (the re-arm rate limit)",
+        );
+    }
+
+    #[test]
     fn joint_lane_stop_suffix_names_every_rearm_refusal_cause() {
         use crate::inventory_semantics::RunningRearmRefusal;
         // Every recorded re-arm refusal renders its plain clause in

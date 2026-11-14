@@ -14313,6 +14313,108 @@ fn joint_machine_running_rearms_are_bounded() {
     );
 }
 
+/// Rate twin: sparse re-arms over a long synthetic run never stop.
+/// Forty interruptions eleven minutes apart (posed clock) all
+/// re-arm: the window holds at most one, so the total passes the
+/// old per-run count without a stop, and the lane still recovers.
+#[test]
+fn joint_machine_sparse_rearms_over_a_long_run_never_stop() {
+    let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
+    let rounds = limit + 8;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let start = std::time::Instant::now();
+    fixture.machine.set_rearm_clock_for_test(Some(start));
+    assert_eq!(
+        fixture.machine.rearm_now(),
+        start,
+        "the twin drives the re-arm clock"
+    );
+    for round in 0..rounds {
+        fixture
+            .machine
+            .set_rearm_clock_for_test(Some(start + std::time::Duration::from_secs(660) * round));
+        if round % 2 == 0 {
+            fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 2 + round as u64);
+        } else {
+            fixture.refuse_at_audited(2 + round as u64);
+        }
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "sparse re-arm {round} of {rounds} continues past its interruption"
+        );
+    }
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        rounds,
+        "the total passes the old per-run count"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        None,
+        "no stop is recorded"
+    );
+    assert_eq!(
+        fixture
+            .all_gap_subjects()
+            .iter()
+            .filter(|seen| *seen == QUANTUM_ABANDONED)
+            .count(),
+        rounds as usize,
+        "one named gap per continued interruption"
+    );
+    fixture.assert_recovers("after sparse re-arms", 2 + rounds as u64);
+}
+
+/// Storm twin: a dense burst of re-arms back to back still stops.
+/// Thirty-two re-arms at one posed instant spend the window; the
+/// next refusal keeps the latch and names the spent rate bound.
+#[test]
+fn joint_machine_dense_rearm_storm_stops_at_the_rate_bound() {
+    let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .machine
+        .set_rearm_clock_for_test(Some(std::time::Instant::now()));
+    for round in 0..limit {
+        fixture.refuse_at_audited(2 + round as u64);
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "storm re-arm {round} is inside the window"
+        );
+    }
+    assert_eq!(fixture.machine.running_rearms_for_test(), limit);
+    fixture.refuse_at_audited(2 + limit as u64);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "the storm stops at the rate bound"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "the latch stands for the hold"
+    );
+    assert_eq!(
+        fixture.machine.latched_phase_label(),
+        Some("Audited"),
+        "the exhausted stop names its phase"
+    );
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        limit,
+        "the exhausted stop names its spent count"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent),
+        "the exhausted stop names the spent rate bound"
+    );
+}
+
 /// Reason twin: only the transient `Unavailable` re-arms. A permanent
 /// refusal at the same phase with the same retained frame keeps the
 /// latch; the driver holds the lane and names the stop as before.

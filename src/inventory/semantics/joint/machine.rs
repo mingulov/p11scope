@@ -1387,6 +1387,10 @@ pub(crate) struct LiveJointMachine {
     /// Running quanta abandoned and re-armed past, bounded by
     /// [`RUNNING_REARM_LIMIT`].
     running_rearms: u32,
+    /// Posed wall clock for the running re-arm window (tests only):
+    /// production always reads `Instant::now()`.
+    #[cfg(test)]
+    posed_rearm_now: Option<Instant>,
     /// Why the last attempted running re-arm was refused, for the
     /// stop gap. A success clears it; a call with no latched
     /// disposition attempts nothing and leaves it alone.
@@ -1482,6 +1486,8 @@ impl LiveJointMachine {
             audit_no_progress_trip: None,
             rearm_eligible: false,
             running_rearms: 0,
+            #[cfg(test)]
+            posed_rearm_now: None,
             rearm_refusal: None,
             audit_refusal: None,
             #[cfg(test)]
@@ -1532,6 +1538,25 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn set_finish_no_progress_since_for_test(&mut self, since: Option<Instant>) {
         self.finish_no_progress_since = since;
+    }
+
+    /// Pose (or clear) the wall clock the running re-arm window
+    /// reads, so the twin can age re-arms past the window without
+    /// waiting it out. Production never sets this.
+    #[cfg(test)]
+    pub(crate) fn set_rearm_clock_for_test(&mut self, now: Option<Instant>) {
+        self.posed_rearm_now = now;
+    }
+
+    /// Wall clock for the running re-arm window: the posed test
+    /// clock when set, else `Instant::now()`.
+    #[cfg_attr(not(test), allow(dead_code))] // The rate gate reads it; until then only the twins do.
+    pub(crate) fn rearm_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.posed_rearm_now {
+            return now;
+        }
+        Instant::now()
     }
 
     /// The recorded Audited no-progress trip, if the wall-time bound fired.

@@ -14,6 +14,11 @@ versioned separately and are opaque, exact dispatch keys.
   gap for a tracked process that exits but lingers unreaped: a
   still-listed zombie is the same ended generation, not a newcomer
   (was: re-marked on the next tick, then a prune gap at reap).
+- Exits of pre-existing kernel threads no longer file a
+  `pid_descendant_gaps` gap when they land before the first
+  live-tick walk: initial discovery already listed them, so their
+  exits are proved like walk-listed ones (was: unproved until
+  first listed, one gap each).
 
 ### Known limitations
 

@@ -8465,6 +8465,10 @@ fn discover_plan(
     discovered
         .scheduler
         .note_enumeration(&pids.iter().copied().collect());
+    // Prove the enumerated kernel threads up front: without this, an exit
+    // before the first live-tick walk gaps as unproved although the capture
+    // listed the thread from the start.
+    discovered.seed_initial_kernel_threads(Path::new("/proc"), &pids);
     // The pid the operator named is the capture; a cgroup's processes are many,
     // however few happen to be in it right now.
     let named = matches!(scope, Scope::Pid(_));
@@ -14393,6 +14397,21 @@ impl Engine {
         match self.scope {
             Scope::System => "system admission removal",
             _ => "cgroup admission removal",
+        }
+    }
+
+    /// Prove kernel-thread generations listed by initial discovery, so their
+    /// exits skip the gap ledger even before the first live-tick walk runs.
+    /// Newcomer bounds stay tick-owned: only the kthread ledger seeds here,
+    /// bounded like the tick classifier, at the capture origin.
+    fn seed_initial_kernel_threads(&mut self, proc_root: &Path, pids: &[u32]) {
+        for pid in pids {
+            if self.known_kernel_threads.len() >= MAX_SCAN_PIDS {
+                break;
+            }
+            if pid_is_kernel_thread(proc_root, *pid) {
+                self.known_kernel_threads.insert(*pid, 0);
+            }
         }
     }
 

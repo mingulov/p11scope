@@ -368,11 +368,19 @@ class RecordedLauncherTests(unittest.TestCase):
         return json.loads(path.read_text())
 
     def wait_path(self, path, timeout=3):
+        # Existence alone is not completeness: a truncate-then-write
+        # publication is visible before its bytes land. Wait for a non-empty
+        # file, but never for particular content: complete-but-unexpected
+        # bytes are returned as-is so the caller's assertions fail on them.
         deadline = time.monotonic() + slack(timeout)
-        while not path.exists():
+        while True:
+            try:
+                if path.stat().st_size > 0:
+                    return path
+            except FileNotFoundError:
+                pass
             self.assertLess(time.monotonic(), deadline, f"missing fixture boundary {path}")
             time.sleep(0.01)
-        return path
 
     def self_record(self, context, phase, proc):
         path = Path(json.loads(context)["path"]) / (phase + ".self")

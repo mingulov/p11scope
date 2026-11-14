@@ -18,7 +18,9 @@ ctx = json.loads(context)
 path = Path(ctx["path"])
 snapshot = {name: value for name, value in os.environ.items()
             if name.startswith(("ROOT_", "USER_"))}
-(work / "snapshot.json").write_text(json.dumps(snapshot))
+temporary = work / "snapshot.json.tmp"
+temporary.write_text(json.dumps(snapshot))
+temporary.replace(work / "snapshot.json")
 action = os.environ.get("HOOK_ACTION", "fail")
 if action == "snapshot":
     pass

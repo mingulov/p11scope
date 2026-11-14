@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 set -eu
-printf '%s\n' "$$" > "$CASE_DIR/waiting.pid"
+printf '%s\n' "$$" > "$CASE_DIR/waiting.pid.tmp"
+mv "$CASE_DIR/waiting.pid.tmp" "$CASE_DIR/waiting.pid"
 while [ ! -e "$CASE_DIR/go" ]; do sleep 0.01; done
 exec sh "$FIXTURE_DIR/target.sh" "$@"

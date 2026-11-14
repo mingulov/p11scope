@@ -37,7 +37,8 @@ EOF
         first=$ROOT_LAUNCH_PID first_start=$ROOT_LAUNCH_STARTTIME context=$ROOT_RECORD_IDENTITY
         launch_root_recorded_process "$CASE_DIR/second.pid" "$CASE_DIR/second.log" sleep 300 && exit 2
         [ "$ROOT_LAUNCH_PID:$ROOT_LAUNCH_STARTTIME:$ROOT_RECORD_IDENTITY" = "$first:$first_start:$context" ] || exit 3
-        printf '%s\n' "$ROOT_LAUNCH_PID" "$ROOT_LAUNCH_STARTTIME" "" "" > "$CASE_DIR/fields"
+        printf '%s\n' "$ROOT_LAUNCH_PID" "$ROOT_LAUNCH_STARTTIME" "" "" > "$CASE_DIR/fields.tmp"
+        mv "$CASE_DIR/fields.tmp" "$CASE_DIR/fields"
         exit 0 ;;
     signal) signal_pinned_process user "$2" "$3" "$4"; exit $? ;;
     sequential)
@@ -60,7 +61,8 @@ if [ "$mode" = split ]; then
         "$CASE_DIR/stderr space's.log" "$@"
     result=$?
     printf '%s\n' "${ROOT_LAUNCH_PID-}" "${ROOT_LAUNCH_STARTTIME-}" \
-        "${ROOT_PROCESS_PID-}" "${ROOT_PROCESS_STARTTIME-}" "${ROOT_RECORD_PHASE-}" > "$CASE_DIR/fields"
+        "${ROOT_PROCESS_PID-}" "${ROOT_PROCESS_STARTTIME-}" "${ROOT_RECORD_PHASE-}" > "$CASE_DIR/fields.tmp"
+    mv "$CASE_DIR/fields.tmp" "$CASE_DIR/fields"
     if [ "$result" -ne 0 ] && [ "${FINALIZE:-0}" = 1 ]; then
         finalize_root_recorded_process
         printf '%s\n' "$?" "${ROOT_LAUNCH_PID-}" "${ROOT_LAUNCH_STARTTIME-}" \
@@ -74,7 +76,8 @@ elif [ "$mode" = split-paths ]; then
     launch_root_recorded_process_split "$CASE_DIR/process.pid" "$split_stdout" "$split_stderr" "$@"
     result=$?
     printf '%s\n' "${ROOT_LAUNCH_PID-}" "${ROOT_LAUNCH_STARTTIME-}" \
-        "${ROOT_PROCESS_PID-}" "${ROOT_PROCESS_STARTTIME-}" "${ROOT_RECORD_PHASE-}" > "$CASE_DIR/fields"
+        "${ROOT_PROCESS_PID-}" "${ROOT_PROCESS_STARTTIME-}" "${ROOT_RECORD_PHASE-}" > "$CASE_DIR/fields.tmp"
+    mv "$CASE_DIR/fields.tmp" "$CASE_DIR/fields"
     if [ "$result" -ne 0 ] && [ "${FINALIZE:-0}" = 1 ]; then
         finalize_root_recorded_process
         printf '%s\n' "$?" "${ROOT_LAUNCH_PID-}" "${ROOT_LAUNCH_STARTTIME-}" \
@@ -86,7 +89,8 @@ elif [ "$mode" = root ]; then
     launch_root_recorded_process "$CASE_DIR/process.pid" "$CASE_DIR/target.log" "$@"
     result=$?
     printf '%s\n' "${ROOT_LAUNCH_PID-}" "${ROOT_LAUNCH_STARTTIME-}" \
-        "${ROOT_PROCESS_PID-}" "${ROOT_PROCESS_STARTTIME-}" "${ROOT_RECORD_PHASE-}" > "$CASE_DIR/fields"
+        "${ROOT_PROCESS_PID-}" "${ROOT_PROCESS_STARTTIME-}" "${ROOT_RECORD_PHASE-}" > "$CASE_DIR/fields.tmp"
+    mv "$CASE_DIR/fields.tmp" "$CASE_DIR/fields"
     if [ "$result" -ne 0 ] && [ "${FINALIZE:-0}" = 1 ]; then
         finalize_root_recorded_process
         printf '%s\n' "$?" "${ROOT_LAUNCH_PID-}" "${ROOT_LAUNCH_STARTTIME-}" \
@@ -98,7 +102,8 @@ else
     launch_user_recorded_process "$CASE_DIR/process.pid" "$CASE_DIR/target.log" "$@"
     result=$?
     printf '%s\n' "${USER_PROCESS_LAUNCH_PID-}" "${USER_PROCESS_LAUNCH_STARTTIME-}" \
-        "${USER_PROCESS_PID-}" "${USER_PROCESS_STARTTIME-}" "${USER_RECORD_PHASE-}" > "$CASE_DIR/fields"
+        "${USER_PROCESS_PID-}" "${USER_PROCESS_STARTTIME-}" "${USER_RECORD_PHASE-}" > "$CASE_DIR/fields.tmp"
+    mv "$CASE_DIR/fields.tmp" "$CASE_DIR/fields"
     [ "$result" -eq 0 ] || exit "$result"
     wait "$USER_PROCESS_LAUNCH_PID"
 fi

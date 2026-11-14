@@ -10303,6 +10303,639 @@ fn joint_machine_break_void_carries_pre_break_session_ends() {
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
+/// Keyrows T1 fix3 B1 twin: a void carried into an H3Pending frame
+/// still delivers before the frame retires. The pending
+/// continuation must not take a void-carrying frame while any
+/// consumer the void affects is undisposed (the void is taken
+/// once: retiring early drops its fence and its invalidations with
+/// it), and the fenced failure closes the feed on its fence
+/// instead of holding for a completeness the void already denied.
+/// Pre-fix the deferral retires the frame early with the void
+/// silently dropped (no fence recorded, the pre-break joins stay
+/// open); post-fix the void delivers first and the frame retires
+/// fenced with the pre-break joins lost.
+#[test]
+fn joint_pending_frame_delivers_carried_void_before_retiring() {
+    use crate::semantics_objects::journal::JournalGap;
+    use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    // Open per-key use on both feeds: a clean sealed quantum leaves
+    // each feed's session live with its join open.
+    fixture.push_two("C_SignInit", 2);
+    let clean = fixture.audited(2, 2, &BirthFault);
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        let mut clean = clean;
+        clean.bind_targets(&ports).unwrap();
+        fixture.finish_bounded_batch(clean, false);
+    }
+    let join_lost = |fixture: &CanonicalFanoutScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .evidence()
+            .join_lost
+    };
+    assert_eq!(join_lost(&fixture), 0, "the pre-break key use is open");
+    let live: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Live)
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(live.len(), 2, "each feed holds one live session");
+    // The idle break: the production void, riding the next audit.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .void_ingest_break(),
+        Ok(true),
+        "the broken stream voids"
+    );
+    let pending = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .pending_void_for_test()
+        .expect("the void awaits its audit frame");
+    assert_eq!(pending.gap, JournalGap::IngestBreakLoss);
+    assert!(pending.fence.is_some(), "the void carries a fence");
+    for session in &live {
+        assert!(
+            pending.effects.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    ObjectEffect::SessionEnded {
+                        session: ended,
+                        end: SessionEnd::Uncertain(ObjectGap::OutcomeLost),
+                    } if ended == session
+                )
+            }),
+            "the void keeps the pre-break session's Uncertain(OutcomeLost) end"
+        );
+    }
+    // The follow-up carries complete calls plus a call H0 cannot
+    // admit yet (failed cookie): its audit rides the void while H3
+    // still awaits the unadmitted call below the watermark.
+    let _child_c = OwnedStoppedChild::new();
+    let c = _child_c.id();
+    let c_image = ImageIdentity {
+        task_cookie: 73,
+        exec_id: 0,
+    };
+    fixture.scene.real.bind(c, c_image, 0);
+    fixture.push_two("C_SignInit", 3);
+    fixture.scene.push(c, 0, "C_SignInit", 1);
+    let mut raw = fixture.scene.collect_with_fault(&BirthFault);
+    let first = {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        io.script.fail_cookie = Some(c_image.task_cookie);
+        let first = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(
+            first.calls().count(),
+            2,
+            "both complete calls tick; the failed call waits"
+        );
+        assert!(
+            first.awaiting_floor().is_some(),
+            "the unadmitted call holds the H3 floor"
+        );
+        first
+    };
+    // The failed call admits on a retry of the same raw and moves
+    // to the lane stash: the retry clears the raw's H0-pending
+    // flag for ingestion, and the stash owns the floor the staged
+    // batch still reports for the continuation.
+    {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *h0;
+        io.script.fail_cookie = None;
+        let mut completed = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(
+            completed.calls().count(),
+            1,
+            "the retry admits the waiting call"
+        );
+        assert_eq!(
+            completed.awaiting_floor(),
+            None,
+            "nothing else pends behind it"
+        );
+        assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
+        assert!(
+            stash.min_outcome_position().is_some(),
+            "the admitted call waits in the lane stash"
+        );
+    }
+    let first = SemanticBatch::from_tick_report(
+        fixture.scene.real.lane.domain(),
+        first,
+        Vec::new(),
+        now_ns(),
+    )
+    .unwrap();
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        coordinator.stage_semantic_batch(first);
+        coordinator
+            .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .prepared_semantic_batch()
+                .unwrap()
+                .admissions()
+                .count(),
+            2,
+            "the two admitted calls prepare; the failed call waits"
+        );
+    }
+    let ingested = raw
+        .ingest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("same original ingestion: {reason:?}"));
+    assert_eq!(
+        claim_and_finish(&mut fixture.scene, &ingested).len(),
+        2,
+        "the two admitted calls claim"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let mut frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    let gaps: Vec<_> = frame
+        .original_failures_for_test()
+        .map(|failure| failure.gap)
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![JournalGap::IngestBreakLoss, JournalGap::H3Pending],
+        "the follow-up audit rides the void with H3 pending: {gaps:?}"
+    );
+    assert!(
+        matches!(
+            frame.audit_for_test().h3_for_test(),
+            crate::semantics_objects::journal::H3DispositionEvidence::Clean {
+                pending_floor: Some(_),
+                ..
+            }
+        ),
+        "the pending audit still awaits its H3 floor"
+    );
+    let fence = frame
+        .original_failures_for_test()
+        .find(|failure| failure.gap == JournalGap::IngestBreakLoss)
+        .expect("the void rides the frame")
+        .fence;
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    // The continuation waits for the carried void's consumers:
+    // retiring now would drop the void (taken once) with its fence
+    // and its invalidations.
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            frame.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::LocalPending),
+            "a void-carrying frame never retires before its void delivers"
+        );
+    }
+    // Deliver the void to both consumers: each feed closes on the
+    // fence and the open joins retire.
+    for _ in 0..64 {
+        if fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.staged == 0 && (feed.fallback || feed.degraded))
+        {
+            break;
+        }
+        fixture.deliver_one_work(&mut frame);
+    }
+    assert!(
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| feed.staged == 0 && (feed.fallback || feed.degraded)),
+        "the fenced failure closes every feed instead of holding: {:?}",
+        fixture.feeds()
+    );
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        // Every consumer is already LossDelivered (none Future),
+        // so the continuation completes rather than awaiting input;
+        // the commit path retires on either.
+        assert_eq!(
+            frame.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::Complete),
+            "the void's consumers disposed, the pending frame retires"
+        );
+        let (retained, reason) = frame
+            .finish_frame(&mut ports)
+            .err()
+            .expect("generic finish has no continuation authority");
+        assert_eq!(reason, RawQuantumRefusal::H3Undisposed);
+        frame = retained;
+        frame
+            .finish_pending_h3(&mut ports, &fixture.scene.real.lane)
+            .unwrap_or_else(|(_, reason)| {
+                panic!("the disposed pending frame must retire: {reason:?}")
+            });
+    }
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the follow-up audit frame took the void"
+    );
+    assert_eq!(
+        join_lost(&fixture),
+        2,
+        "the carried void's invalidations reached key-use before the frame retired"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.feed.segment_fence_for_test().is_some()),
+        "every feed records the carried void's fence"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.feed.segment_fence_for_test() == fence),
+        "every feed records the carried void's own fence"
+    );
+}
+
+/// Keyrows T1 fix3 B2 twin: a Joint feed holds a staged call across
+/// a pending frame, then an idle break happens. The prescribed
+/// fallback-verification trip ("Joint delivery refused") is
+/// unreachable: the pending frame's floor is stash-owned (capture
+/// floors block ingestion; the machine expires them pre-audit),
+/// and the stashed pre-void outcome loses its H8 to the void while
+/// its wire is already consumed, so the post-void quantum latches
+/// at claiming — before any audit or fallback delivery runs. This
+/// twin pins that pre-emption (premise plus latch site); if
+/// claiming ever soft-routes the orphaned outcome, the publish
+/// below fails and B2 must be revisited. See the idle-site comment.
+#[test]
+fn joint_machine_stranded_call_never_reaches_post_void_fallback() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::JournalGap;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    // The pending quantum: a complete call plus a call H0 cannot
+    // admit yet. The admitted call stages at commit; the frame
+    // retires through the pending continuation with it intact.
+    let _child_c = OwnedStoppedChild::new();
+    let c = _child_c.id();
+    let c_image = ImageIdentity {
+        task_cookie: 73,
+        exec_id: 0,
+    };
+    fixture.scene.real.bind(c, c_image, 0);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.push(c, 0, "C_SignInit", 1);
+    let mut raw = fixture.scene.collect_with_fault(&BirthFault);
+    let first = {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        io.script.fail_cookie = Some(c_image.task_cookie);
+        let first = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(
+            first.calls().count(),
+            1,
+            "the complete call ticks; the failed call waits"
+        );
+        assert!(
+            first.awaiting_floor().is_some(),
+            "the unadmitted call holds the H3 floor"
+        );
+        first
+    };
+    // The failed call admits on a retry and moves to the lane
+    // stash, so the post-void quantum resolves it instead of
+    // pending again.
+    {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *h0;
+        io.script.fail_cookie = None;
+        let mut completed = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(
+            completed.calls().count(),
+            1,
+            "the retry admits the waiting call"
+        );
+        assert_eq!(
+            completed.awaiting_floor(),
+            None,
+            "nothing else pends behind it"
+        );
+        assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
+        assert!(
+            stash.min_outcome_position().is_some(),
+            "the admitted call waits in the lane stash"
+        );
+    }
+    let first = SemanticBatch::from_tick_report(
+        fixture.scene.real.lane.domain(),
+        first,
+        Vec::new(),
+        now_ns(),
+    )
+    .unwrap();
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        coordinator.stage_semantic_batch(first);
+        coordinator
+            .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .prepared_semantic_batch()
+                .unwrap()
+                .admissions()
+                .count(),
+            1,
+            "the admitted call prepares; the failed call waits"
+        );
+    }
+    let grant = fixture
+        .machine
+        .retained_drain_grant_for_test()
+        .expect("prime bound the drain grant");
+    let ingested = raw
+        .ingest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.scene.producers,
+            grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("same original ingestion: {reason:?}"));
+    assert_eq!(
+        claim_and_finish(&mut fixture.scene, &ingested).len(),
+        1,
+        "the admitted call claims"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let attached = fixture.scene.attached.as_ref().unwrap();
+    let mut frame = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .audit_ingested_quantum(ingested, &fixture.scene.producers, attached, &BirthFault)
+        .unwrap_or_else(|(_, reason)| panic!("actual finished audit: {reason:?}"));
+    let gaps: Vec<_> = frame
+        .original_failures_for_test()
+        .map(|failure| failure.gap)
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![JournalGap::H3Pending],
+        "the quantum audits pending with no void aboard: {gaps:?}"
+    );
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            frame.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::AwaitFutureInput),
+            "the clean pending frame retires through the continuation"
+        );
+        let (retained, reason) = frame
+            .finish_frame(&mut ports)
+            .err()
+            .expect("generic finish has no continuation authority");
+        assert_eq!(reason, RawQuantumRefusal::H3Undisposed);
+        frame = retained;
+        frame
+            .finish_pending_h3(&mut ports, &fixture.scene.real.lane)
+            .unwrap_or_else(|(_, reason)| {
+                panic!("the clean pending frame must retire: {reason:?}")
+            });
+    }
+    let stranded: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| {
+            (
+                record.feed.staged_len(),
+                record.feed.mode(),
+                record.feed.segment_fence_for_test(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        stranded.len(),
+        1,
+        "one Joint feed holds the pending quantum's call"
+    );
+    assert!(
+        stranded[0].0 == 1 && stranded[0].1 == FeedMode::Joint && stranded[0].2.is_none(),
+        "the admitted call stays staged on its Joint feed: {stranded:?}"
+    );
+    // The idle break: the machine's own idle tick voids the lane.
+    // The post-void quantum latches at claiming (the orphaned stash
+    // outcome lost its H8) before any audit or fallback delivery
+    // runs, so the stranded call never reaches verification.
+    let disposed_before = fixture.disposed_total();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut latched = None;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                panic!(
+                    "the post-void quantum publishes despite the orphaned stash: fallback verification is reachable, revisit B2"
+                )
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                latched = Some(reason);
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        latched,
+        Some(SemanticRefusal::Unavailable),
+        "the post-void quantum latches on the orphaned stash"
+    );
+    assert_eq!(
+        fixture.machine.latched_phase_label(),
+        Some("Claiming"),
+        "the latch lands at claiming, before audit and delivery"
+    );
+    // Nothing audited, nothing delivered, nothing dropped: the
+    // stranded call is intact, the void still pends, and no feed
+    // closed — the trip cannot run.
+    let stranded_after: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| {
+            (
+                record.feed.staged_len(),
+                record.feed.mode(),
+                record.feed.segment_fence_for_test(),
+            )
+        })
+        .collect();
+    assert_eq!(stranded_after.len(), 1);
+    assert!(
+        stranded_after[0].0 == 1
+            && stranded_after[0].1 == FeedMode::Joint
+            && stranded_after[0].2.is_none(),
+        "the stranded call is intact after the latch: {stranded_after:?}"
+    );
+    assert_eq!(
+        fixture.disposed_total(),
+        disposed_before,
+        "no idle drop ran: none is needed"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "the void never rode: the latch is pre-audit"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+}
+
 /// The void's own slot with the raw slot occupied: after the first break
 /// ends the bound feed, the bound caller's next call is admitted S1-only
 /// and its journal original is refused into the audit frame's raw slot.
@@ -12563,7 +13196,8 @@ fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
         "replay disposes nothing"
     );
     // Journal history ingested in the abandoned quantum never certifies
-    // later rows: the next collect voided every existing key, named.
+    // later rows: the next collect fenced the abandoned history as
+    // an explicitly lost interval, named.
     let subjects = fixture.all_gap_subjects();
     assert!(
         subjects

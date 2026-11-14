@@ -4393,7 +4393,7 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     for plain in [
         "per-key tracking ended early",
         "per-key tracking fell back to plain counts",
-        "per-key tracking lost part of its history; function counts are unaffected",
+        "per-key tracking lost part of its history",
         "per-key tracking waits to restart after lost history",
     ] {
         assert!(out.contains(plain), "{plain} missing: {out}");
@@ -4416,7 +4416,7 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     // subjects in concise; the full subjects are pinned in verbose
     // below.)
     for reason in [
-        "per-key tracking lost part of its history; function counts are unaffected",
+        "per-key tracking lost part of its history",
         "per-key tracking waits to restart after lost history",
     ] {
         let line = out
@@ -4453,7 +4453,7 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     for full in [
         "Per-key tracking did not start for this process; function counts above are unaffected",
         "per-key tracking is off; function and mechanism counts are unaffected",
-        "Per-key tracking lost history for every process; function counts above are unaffected",
+        "Per-key tracking lost history for tracked processes; function counts above are unaffected",
         "Per-key tracking paused for this process; function counts above are unaffected",
     ] {
         assert!(verbose.contains(full), "{full} missing: {verbose}");

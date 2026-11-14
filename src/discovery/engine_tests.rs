@@ -82446,6 +82446,7 @@ fn handle_table_loader_arming_defers_for_refresh_on_budget_wait() {
     engine.scope = Scope::Pid(engine.views[0].pid());
     let dir = tempfile::tempdir().unwrap();
     let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let gaps_pre_first = engine.counters.object_skips.len();
     let direct = engine.arm_loader_for_view(
         1,
         &mut session,
@@ -82455,6 +82456,11 @@ fn handle_table_loader_arming_defers_for_refresh_on_budget_wait() {
     assert!(
         matches!(direct, Err(LoaderArmFailure::Deferred { changed: false })),
         "a full table defers arming: {direct:?}"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len() - gaps_pre_first,
+        1,
+        "the first budget-stop filing adds exactly one row"
     );
     let gaps_before = engine.counters.object_skips.len();
     let outcome = engine
@@ -82472,8 +82478,22 @@ fn handle_table_loader_arming_defers_for_refresh_on_budget_wait() {
     );
     assert_eq!(
         engine.counters.object_skips.len() - gaps_before,
-        1,
-        "exactly one gap row"
+        0,
+        "the repeat deferral adds no new row"
+    );
+    let waits = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| {
+            skip.subject == crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT
+                && skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE
+        })
+        .count();
+    assert_eq!(
+        waits, 1,
+        "the one live wait row exists exactly once: {:?}",
+        engine.counters.object_skips
     );
     engine.set_table_cap_for_test(1000);
     engine

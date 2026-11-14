@@ -2,7 +2,7 @@
 <!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # v0.8.0 Key Metadata: Inferred Family, Size Class, Creation Sources
 
-Status: design (spark lane, round 10). Base: task/v080-design-keymeta d347a1d77.
+Status: design (spark lane, round 11). Base: task/v080-design-keymeta c54492cdf.
 Branch: task/v080-design-keymeta. Plan: `docs/superpowers/plans/2026-11-14-v080-keymeta.md`.
 
 Owner direction (2026-11-14 07:05): v0.8.0 carries much more key
@@ -69,10 +69,11 @@ info carrier; the inventory info pair serves every native
 inventory mode including under `--key-operations`].
 
 Controller rulings (fix8, binding, dispose the Opus r3 review
-C1–C3, I1–I3 and minors): C3 takes the recommended fix — the
-journal info programs, the 760/600 END+info forms, the
-`EVIDENCE_START` info use and Task 7's co-ownership of the two
-journal files are dropped; the inventory info pair links in
+C1–C3, I1–I3 and minors; C2/I3/minors figures superseded by
+fix9 — see the fix9 rulings below): C3 takes the recommended
+fix — the journal info programs, the 760/600 END+info forms,
+the `EVIDENCE_START` info use and Task 7's co-ownership of the
+two journal files are dropped; the inventory info pair links in
 every native inventory mode including under `--key-operations`,
 and a refused journal start leaves Task 7 running on the
 ordinary retry's broad inventory (§17.4, §17.7). C1 — the info
@@ -80,7 +81,9 @@ entries run the unchanged `usage_entry` body in both flavors,
 then stash, with a Callers-flavor twin pinning `CALLER_USE`
 rows and counts at the 3 endpoints equal to baseline. C2 —
 `INFO_START` rows carry {info pointer, slot, mechanism,
-function kind, layout, generation}, the 160-B record header
+function kind, layout, generation [superseded by fix9 R8 —
+`generation` dropped]}, the 160-B record header [superseded by
+fix9 R2 — 48-B header, 176-B record with `ImageIdentity`]
 carries {endpoint id, host tgid + caller incarnation cookie,
 slot, mechanism, kind}, and the default-mode join keys by
 (module via endpoint, caller incarnation, slot[, mechanism])
@@ -90,16 +93,18 @@ and Singles), a per-group return program, and
 `entry_link_bound`/`fd_preflight` extended with the info return
 links and the `INFO` ring, pinned in the routing twins. I2 —
 full stash-map lifecycles (§8.2, §17.4). I3 — function kind via
-a frozen endpoint→kind map (cookie tag rejected, §17.4),
-function identity plumbed through `InventoryEndpoint`/
+a frozen endpoint→kind map [superseded by fix9 R1 —
+admission-published, never frozen] (cookie tag rejected,
+§17.4), function identity plumbed through `InventoryEndpoint`/
 `AttachEndpoint` routing, the info pair linked only where the
 endpoint's slot set is exactly one info function (named gap
 otherwise), with the map validators, the freeze sequence and
 Multi load mode covered. Minors — `JOURNAL_MAPS`/program
 inventory growth, a `check-bpf-load-journal.sh --key-sizes`
 run, the compact 488 form dropped (no producer), byte-for-byte
-ELF section identity for the base programs, and the P0
-inventory flavor list stated.
+ELF section identity for the base programs [superseded by fix9
+R6 — linked-instruction-stream hashes], and the P0 inventory
+flavor list stated.
 
 Controller rulings (fix9, binding, dispose the Opus r4 review
 R1–R8): R1 — `INFO_KIND` follows `ENDPOINT_OBJECT` exactly
@@ -722,10 +727,11 @@ ride the existing creation adapters, and no `--key-sizes` is
 needed to see them. The R2 BPF delta is finite-set const data on
 those cold paths; the §12.1 off-mode identity twin pins the
 journal programs' linked instruction streams byte-identical to
-the recorded hashes (§8.5), and if
-the Task 1 lane cannot hold that pin it restructures its delta
-(dedicated tables, no shared-helper growth — §8.6 rule) instead
-of moving the hashes.
+the baseline for the lane's rebased base (§8.5 — keymeta lanes
+never re-hash; the integrator re-records on non-keymeta base
+changes), and if the Task 1 lane cannot hold that pin it
+restructures its delta (dedicated tables, no shared-helper
+growth — §8.6 rule) instead of moving the hashes.
 
 ## 7. Other cheap facts, ranked by value/cost
 
@@ -901,11 +907,15 @@ return (`journal_roots.rs:320`), both sides Rust-readable, with
 no native accessor added). Lifecycle (fix8 I2): the
 entry always overwrites its key on retention and always deletes
 it on the unavailable path (a stale row is never trusted); the
-return matches the row's `ts_ns` against the START row's `ts_ns`
-and on mismatch deletes the row and emits the base
-END with the trailer status unavailable (counted, never a
-guessed length); every terminal/loss/cancellation/exec path
-clears the stash, exactly like the result-handle pointer row;
+length return deletes its `EVIDENCE_START` row on every return
+path — match, mismatch, unavailable shape, failure RV —
+mirroring fix9 R5 for `INFO_START`: it matches the row's `ts_ns`
+against the START row's `ts_ns` and on mismatch deletes the row
+and emits the base END with the trailer status unavailable
+(counted, never a guessed length), and on match deletes the row
+after emitting the trailered END; every terminal/loss/
+cancellation/exec path clears the stash, exactly like the
+result-handle pointer row;
 the stop scrub (`src/attach/object_stop.rs`, today
 OBJECT_START-only) is extended to zero-verify-remove
 `EVIDENCE_START` after quiescence; full-map insert failures and
@@ -1043,18 +1053,21 @@ base programs unchanged) and not by a per-section hash (fix9 R6
 subprograms that a section hash would not see, e.g.
 `capture_entry` / `begin` / `ordinary_return`
 (`journal_roots.rs:235, 256, 311`), plus the native noinline
-functions). The Task 2/7 lanes parse the objects with `aya_obj`
-(the `tests/inventory_caller_bpf_contracts.rs:45` precedent) and
-record hashes of each base program's fully linked instruction
-stream fresh at the fix9 base (the definition changed, so no
-fix8 hash carries over); the §12.1 identity contract compares
-the candidate's linked streams byte for byte:
-`p11_entry_journal` / `p11_return_journal` in the
-journal object, `p11_usage_entry_lp64` /
-`p11_usage_entry_ia32` in the inventory object. Any drift fails
-the contract and the lane restructures its delta (dedicated
-tables/maps, no shared-helper or shared-row growth — the §8.6
-rule) instead of re-hashing. Today's journal cells stay as
+functions). The integrator records the baseline hashes of each
+base program's fully linked instruction stream (parsed with
+`aya_obj`, the `tests/inventory_caller_bpf_contracts.rs:45`
+precedent) at the integration base; each keymeta lane builds its
+own rebased base commit and the §12.1 identity contract compares
+the candidate's linked streams byte for byte against that
+build's hashes: `p11_entry_journal` / `p11_return_journal` in
+the journal object, `p11_usage_entry_lp64` /
+`p11_usage_entry_ia32` in the inventory object. Keymeta lanes
+never re-hash — any drift fails the contract and the lane
+restructures its delta (dedicated tables/maps, no shared-helper
+or shared-row growth — the §8.6 rule); only the integrator
+re-records the baseline, when a non-keymeta lane (keyrows T1/T3
+on the co-owned journal files, §13) legitimately changes the
+base programs. Today's journal cells stay as
 reference numbers and a backstop (processed insns,
 115%-margined; limit
 1,000,000): `journal-gate1/p11_entry_journal` max 390,605
@@ -1170,15 +1183,15 @@ Off-mode identity (the §12.1 contract proves each, none is
 assumed): per-endpoint record bytes identical to the no-length
 baseline (base forms only, byte-identical BEGIN/ENDs, never
 648); linked program set at every endpoint exactly today's;
-base-program linked instruction streams byte-for-byte
-identical to the recorded hashes (§8.5 — the lanes must not
-re-hash); journal
-classification, census, sole-complete set and alias agreement
-byte-identical (the four existing pins); ring bytes/s at the
-gate workload equal to the baseline. If a lane cannot hold the
-byte identity it restructures its delta (dedicated tables/maps,
-no shared-helper or shared-row growth) instead of re-hashing —
-the hashes never move.
+base-program linked instruction streams byte-for-byte identical
+to the baseline for the lane's rebased base (§8.5 — keymeta
+lanes never re-hash); journal classification, census,
+sole-complete set and alias agreement byte-identical (the four
+existing pins); ring bytes/s at the gate workload equal to the
+baseline. If a lane cannot hold the byte identity it
+restructures its delta (dedicated tables/maps, no shared-helper
+or shared-row growth) instead of re-hashing — only the
+integrator re-records the baseline, on non-keymeta base changes.
 
 ## 9. Userspace join (N5 decided)
 
@@ -1594,8 +1607,10 @@ the no-length baseline; the attach plan links the base journal
 pair at every group (pinned name list = today's set; the length
 programs never load — asserted, not assumed); base-program
 linked instruction streams byte-for-byte identical to the
-recorded hashes (§8.5 — no re-hash) with the
-`journal-gate1/*` cells still checked as a backstop;
+baseline for the lane's rebased base (§8.5 — keymeta lanes
+never re-hash; the integrator re-records on non-keymeta base
+changes) with the `journal-gate1/*` cells still checked as a
+backstop;
 ring bytes/s equal the baseline. Routing twins: flag on → the
 11 length-endpoint groups link the length pair (entry+return
 always paired — a mixed-pair plan is refused), all other
@@ -1935,7 +1950,8 @@ R2 — Task 7 moves to the inventory-object info pair (stash map,
 per provider) with journal info programs under
 `--key-operations` keeping the `begin_decision` Call arm
 (§17.4/§17.6/§17.7); DAG edges unchanged (§13).
-Round 9 (fix8: Opus r3 C1–C3/I1–I3/minors, controller rulings):
+Round 9 (fix8: Opus r3 C1–C3/I1–I3/minors, controller rulings;
+C2/I3/minors figures superseded by fix9 — see Round 10):
 C3 — the journal info programs, the 760/600 forms, the
 `EVIDENCE_START` info use and Task 7's journal co-ownership are
 dropped; the inventory info pair links in every native inventory
@@ -1943,16 +1959,19 @@ mode including under `--key-operations`, with the refused-start
 fallback stated (§17.4/§17.7); C1 — info entries run the
 unchanged `usage_entry` body in both flavors, then stash, plus a
 Callers twin (§17.4/§17.6); C2 — `INFO_START` rows and the 160-B
-record header carry joinable identity, the default join keys
-onto `modules[]`/`edges[]` (§17.4/§17.5); I1 — per-backend link
-deltas, per-group returns, extended link-bound/fd-preflight
-(§8.3/§8.6/§17.4, routing twins); I2 — stash-map lifecycles
-(§8.2/§17.4); I3 — frozen endpoint→kind map, function-identity
-plumbing, single-info-function rule (§17.4, §13 +
-activation/attach-set files); minors — `JOURNAL_MAPS`/program
-inventory growth, a `--key-sizes` load-check run, 488 dropped,
-ELF section identity, P0 flavor lists (§8.5/§12); DAG edges
-unchanged (§13).
+record header [superseded by fix9 R2/R8 — 48-B header, 176-B
+record, no `generation`] carry joinable identity, the default
+join keys onto `modules[]`/`edges[]` (§17.4/§17.5); I1 —
+per-backend link deltas, per-group returns, extended
+link-bound/fd-preflight (§8.3/§8.6/§17.4, routing twins); I2 —
+stash-map lifecycles (§8.2/§17.4); I3 — frozen endpoint→kind
+map [superseded by fix9 R1 — admission-published, never frozen],
+function-identity plumbing, single-info-function rule (§17.4,
+§13 + activation/attach-set files); minors —
+`JOURNAL_MAPS`/program inventory growth, a `--key-sizes`
+load-check run, 488 dropped, ELF section identity [superseded
+by fix9 R6 — linked-instruction-stream hashes], P0 flavor lists
+(§8.5/§12); DAG edges unchanged (§13).
 Round 10 (fix9: Opus r4 R1–R8, controller rulings): R1 —
 `INFO_KIND` follows the `ENDPOINT_OBJECT` precedent (per-endpoint
 admission publication with read-back, re-publication refused,
@@ -1965,6 +1984,19 @@ hashes with the verifier cells as backstop; R7 — a static
 fd-preflight bound for info returns; R8 — `generation` dropped
 (§8.2/§8.5/§8.6/§11/§12.1/§17.1/§17.4/§17.5/§17.6/§17.7); DAG
 edges unchanged (§13).
+Round 11 (Opus r5 nits N1–N5, controller direction): N1 — the
+info return obtains the caller identity via
+`p11_link_current_identity` (same task; 32-B row kept; Global
+emits zero without the helper); N2 — the integrator re-records
+the hash baseline, keymeta lanes compare against a build of
+their own rebased base and never re-hash; N3 — the fix8 rulings
+and Round 9 history marked superseded by fix9; N4 — info return
+links on EMFILE defer with the named counted
+`info_return_deferred` gap (partial, never stop), excluded from
+the hard preflight (Singles N + 68; Multi +G/+G kept); N5 — the
+length return deletes `EVIDENCE_START` on every return path
+(§6/§8.2/§8.5/§8.6/§12.1/§17.4/§17.6/§17.7); DAG edges unchanged
+(§13).
 
 ## 17. Required: provider, token and mechanism info (Task 7)
 
@@ -2244,10 +2276,11 @@ the declared ABI, the config and cookie endpoint are valid, and
 (while the usage witness above still records).
 `p11_usage_entry_*` code is untouched and its bytes stay pinned
 (§8.5 linked-instruction identity). The return program always
-deletes the stash row, reads the §17.1 ranges on `CKR_OK` only
-(R5), and emits the 176-B info record on the dedicated
-`INFO` ring. +0 newly probed functions (all three already carry
-usage probes).
+deletes the stash row, obtains the caller identity via
+`p11_link_current_identity` (Callers flavor; Global emits zero),
+reads the §17.1 ranges on `CKR_OK` only (R5), and emits the
+176-B info record on the dedicated `INFO` ring. +0 newly probed
+functions (all three already carry usage probes).
 
 `INFO_START` stash map (fix8 C2/I2): `HashMap`, key 16 B
 (`pid_tgid: u64`, `endpoint: u32`, pad — the endpoint leg is
@@ -2255,9 +2288,11 @@ required because the p11-kit proxy nests info calls on the same
 thread across endpoints, so `pid_tgid` alone aliases), value
 32 B (`info_ptr: u64`, `slot: u64`, `mechanism: u64`, `kind:
 u8`, `layout: u8`, reserved 6 B — fix9 R8 drops the `generation`
-stamp, whose "control cell" named no map), capacity
-1024 (cold in-flight calls only; order of 64 KiB reservation
-with hash overhead, measured at load). Lifecycle: the entry
+stamp, whose "control cell" named no map; the row carries no
+caller-identity field — the return obtains it via
+`p11_link_current_identity`, below), capacity 1024 (cold
+in-flight calls only; order of 64 KiB reservation with hash
+overhead, measured at load). Lifecycle: the entry
 always overwrites its key on retention and always deletes it on
 the unavailable path (a stale row is never trusted — NULL-cell
 and refused-guard shapes delete, never leave); the return
@@ -2337,31 +2372,37 @@ extends to the info entries, and info returns attach per group
 
 Links (fix8 I1 — the old "+3 return links per provider" line
 assumed Singles): on Singles the info entries substitute usage
-entries (+0 entry links) and each info endpoint takes one
-return link (+1 per info endpoint). On Multi the info endpoints
-split out of their usage groups into their own groups per
-(object, info entry program) (`capture.rs:1822-1890` grouping):
-+G entry-group links and +G return-group links, where G is the
-number of distinct (object, ABI) pairs among the info endpoints
-(one provider object × one ABI in the fixture, pinned by the
-routing twin). `entry_link_bound`
-(`src/attach/inventory/capture.rs:225-229`) gains a STATIC
-info-return bound (fix9 R7 — the preflight runs in
-`prepare_with_host` with only the endpoint limit N, before any
-endpoint is known, `:2171-2176`, so the bound is in N only):
-info return links ≤ N on Singles (worst case: every endpoint is
-an info endpoint, one return link each) and ≤ min(N,
-`MULTI_LINK_BOUND`) on Multi (info groups never exceed info
-endpoints and share the group-link cap, `:132`). `fd_preflight`
-(`:235-261`) grows from links + 3 + 64 to entry links +
-info-return bound + 4 (2 roots + `DISCOVERY` + `INFO`) + 64 —
+entries (+0 entry links) and each info endpoint attempts one
+return link (+1 per info endpoint, attempted). On Multi the info
+endpoints split out of their usage groups into their own groups
+per (object, info entry program)
+(`capture.rs:1822-1890` grouping): +G entry-group links and +G
+return-group links, where G is the number of distinct (object,
+ABI) pairs among the info endpoints (one provider object × one
+ABI in the fixture, pinned by the routing twin — the Multi
+figure is kept). Info return links are NOT counted in the hard
+preflight (N4 deferral, superseding the fix9 R7 static
+info-return bound for preflight counting): `entry_link_bound`
+(`src/attach/inventory/capture.rs:225-229`) stays entry links
+only, and `fd_preflight` (`:235-261`) grows from links + 3 + 64
+to entry links + 4 (2 roots + `DISCOVERY` + `INFO`) + 64 —
 the §17.6 routing twins pin the exact link plan and the fd
 formula per backend, and the 4096-endpoint Singles cell stays
 passing: the guest load cell (`check-bpf-load-kernels.sh:50-51`,
 4163 fds today) and the host exact-arithmetic cell
 (`capture/tests.rs:2996-3024`) are updated to the new formula
-with review (Singles 4096 needs 2N + 68 = 8260, still far below
-the guest's raised 65536), never deleted or left red. The
+with review (Singles 4096 needs N + 68 = 4164, still far below
+the guest's raised 65536), never deleted or left red. Info
+return links attach opportunistically after the entries; on
+EMFILE the endpoint's (Singles) or group's (Multi) info return
+is left unlinked and reports the named counted gap
+`info_return_deferred` (per endpoint/group, surfaced in the Task
+7 section — the usage entry still records, the capture never
+stops: owner partial-never-stop, following the entry-deferral
+precedent `fd_exhausted` + `deferred`,
+`capture.rs:722-724/2299-2301`). A later extend with free fds
+retries the return attach; until then that endpoint's info is
+unavailable with the named gap, never silent. The
 `INFO` ring (64 KiB `RingBuf`, cold traffic)
 drains in the inventory session alongside `DISCOVERY`; loss
 accounting rides a new `PRODUCED_INFO = 2` cell with
@@ -2418,8 +2459,9 @@ observed info-call rates on the Task 5 matrix apps as coldness
 evidence); one stashed row per in-flight info call (bounded by
 the 1024-entry map); zero per-call record, ring or count delta
 at any non-info endpoint (covered by the §12.1 identity
-contract). No shared row grows, so the base-program hashes
-never move.
+contract). No shared row grows, so the Task 7 delta never moves
+the base-program hashes (§8.5 — keymeta lanes never re-hash;
+the integrator re-records on non-keymeta base changes).
 
 Wire: the 128-byte info trailer (`version: u16`, `kind: u8`,
 `status: u8`, `layout: u8`, `payload_len: u8`, 3 reserved bytes,
@@ -2438,10 +2480,16 @@ way `CALLER_USE` rows resolve, `callers.rs:473-480`; the old
 truncated 32-bit cookie with no exec id could not survive an
 exec); `slot: u64`, `mechanism: u64` (16 B, snapshotted at entry
 into `INFO_START` — §17.1 — because a uretprobe cannot read
-entry arguments). In the Callers flavor the entry stamps the
-calling image's identity; in the Global flavor (proof only, no
-caller witnesses) it emits a zero identity (cookie 0 =
-unavailable, `lib.rs:1594`). `mechanism` is 0 for
+entry arguments). In the Callers flavor the return obtains the
+calling image's identity via `p11_link_current_identity` (same
+task as the entry, so the same image; the helper already runs in
+return context — `ordinary_return`, `main.rs:4695-4696` — and is
+linked into the Callers inventory build,
+`main.rs:3247-3248`), so the 32-B `INFO_START` row carries no
+identity field; in the Global flavor (proof only, no caller
+witnesses) the return emits a zero identity without calling the
+helper (cookie 0 = unavailable, `lib.rs:1594`; the helper is not
+linked into the Global inventory-only build). `mechanism` is 0 for
 `C_GetInfo`/`C_GetTokenInfo` and `slot` is 0 for `C_GetInfo`.
 The join reads header words
 per the kind (the provider kind ignores slot) and keys by
@@ -2569,11 +2617,15 @@ twins: in every native inventory mode including under
 `--key-operations` the info endpoints link the inventory info
 pair while every other endpoint links usage entries
 (cold-only proof — no journal program links at an info
-endpoint in any mode); routing twins per backend (fix8 I1):
-Singles pins +0 entry links and +1 return link per info
-endpoint, Multi pins +G/+G with G = the distinct (object, ABI)
-info pairs, and both pin the extended fd formula (entry links
-+ info return links + 4 + 64); single-info-function twins
+endpoint in any mode); routing twins per backend (fix8 I1,
+N4 deferral): Singles pins +0 entry links and +1 attempted
+return link per info endpoint, Multi pins +G/+G with G = the
+distinct (object, ABI) info pairs, and both pin the extended fd
+formula (entry links + 4 + 64 — info returns excluded from the
+hard preflight); a deferral twin pins EMFILE leaving the info
+return unlinked with the named counted `info_return_deferred`
+gap while the usage entry still records and the capture
+continues; single-info-function twins
 (fix8 I3): an endpoint whose slot set is exactly one info
 function links the info pair with the right kind in
 `INFO_KIND`, while an info/non-info alias and an info/info
@@ -2632,10 +2684,11 @@ A refused journal start changes nothing for Task 7: the
 ordinary retry keeps the broad lane (and the info pair on it)
 running with an honest gap (§17.4 fallback). Cost per run: +0
 newly probed functions (all three already carry usage probes);
-links per backend (§17.4: Singles +1 return per info endpoint,
-Multi +G/+G); one 176-B record per info call (rare — apps poll
-tokens, not hot paths); one stashed row per in-flight info
-call. No `--key-operations` requirement, no object-lane
+links per backend (§17.4: Singles +1 attempted return per info
+endpoint, Multi +G/+G; EMFILE defers with the named counted
+`info_return_deferred` gap, never a stop); one 176-B record per
+info call (rare — apps poll tokens, not hot paths); one stashed
+row per in-flight info call. No `--key-operations` requirement, no object-lane
 dependency, no `--key-sizes` interaction: Task 7 output is
 identical with the flag on or off (§10.5; pinned by a
 both-modes twin in Task 7).

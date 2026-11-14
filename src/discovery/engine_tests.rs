@@ -4296,6 +4296,109 @@ fn batch_unattached_candidates_defer_to_one_tail_merge() {
     assert_publish_deferral_evidence_equal(&batched, &full);
 }
 
+/// Twin (§8.1 batching, fix1): an unpublished newcomer flushes. A
+/// candidate presenting a newcomer view with additions closed leaves
+/// it unpublished (the omitted proof-gate leg) and publishes per
+/// candidate — never deferring past the dropped newcomer sources —
+/// with outputs identical to the immediate control.
+#[test]
+fn batch_unpublished_newcomer_flushes_per_candidate() {
+    let mut raw0 = overlay_module(overlay_key(210));
+    raw0.tables[0].entries = overlay_entries(&raw0, first_offsets(1));
+    let mut big = overlay_module(overlay_key(211));
+    big.tables[0].entries = overlay_entries(&big, first_offsets(1));
+    let base_pins = overlay_pins(&[(raw0.key, OVERLAY_SHA, 1)]);
+    let build = || {
+        let mut pins = base_pins.clone();
+        assert!(
+            pins.absorb(overlay_pins(&[(big.key, OVERLAY_SHA, 1)]))
+                .is_empty(),
+            "newcomer pins absorb"
+        );
+        // Committed state knows only raw0: big arrives as a true
+        // newcomer with the candidate below.
+        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw0), &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        engine
+            .views
+            .push(ProcessView::open(raw0.view, std::process::id()).unwrap());
+        engine
+    };
+    // The newcomer view stays out of `views`: additions are closed, so
+    // the candidate leaves it unpublished.
+    let apply_newcomer = |engine: &mut Engine| {
+        let newcomer = ProcessView::open(big.view, std::process::id()).unwrap();
+        let candidate = engine
+            .live_candidate(
+                engine.pinned.clone(),
+                vec![raw0.clone(), big.clone()],
+                Vec::new(),
+            )
+            .unwrap();
+        let mut additions_allowed = false;
+        let outcome = engine
+            .apply_candidate(
+                &mut ScriptedSession::default(),
+                candidate,
+                &mut additions_allowed,
+                false,
+                &[&newcomer],
+            )
+            .unwrap();
+        assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+        assert_eq!(
+            outcome.unpublished_views,
+            BTreeSet::from([newcomer.id()]),
+            "the closed-additions newcomer stays unpublished"
+        );
+        outcome
+    };
+    let mut full = build();
+    let full_before = publication_operation_counts(&full);
+    let outcome = apply_newcomer(&mut full);
+    full.publish_batch_tail(outcome.changed).unwrap();
+    let full_counts = publication_operation_counts(&full);
+    assert_eq!(
+        (full_counts.0 - full_before.0, full_counts.1 - full_before.1),
+        (1, 1),
+        "control: the unpublished newcomer publishes per candidate"
+    );
+    let mut batched = build();
+    let batched_before = publication_operation_counts(&batched);
+    let stats_before = batched.deferral_gate_stats();
+    batched.defer_candidate_publication = true;
+    let outcome = apply_newcomer(&mut batched);
+    assert!(outcome.changed);
+    batched.publish_batch_tail(true).unwrap();
+    batched.defer_candidate_publication = false;
+    let batched_counts = publication_operation_counts(&batched);
+    assert_eq!(
+        (
+            batched_counts.0 - batched_before.0,
+            batched_counts.1 - batched_before.1
+        ),
+        (1, 1),
+        "batched: the unpublished newcomer flushes, then the tail skips"
+    );
+    let stats = batched.deferral_gate_stats();
+    assert_eq!(stats.batch_deferred - stats_before.batch_deferred, 0);
+    assert_eq!(
+        stats.batch_flushed_changed - stats_before.batch_flushed_changed,
+        1,
+        "the dropped newcomer sources change merge inputs, so the candidate flushes"
+    );
+    assert_publish_deferral_evidence_equal(&batched, &full);
+}
+
 /// Twin (§8.1 batching): marker-only candidates (same shapes, new loss
 /// markers between applies) defer to one tail merge: the markers are
 /// cumulative counters the tail folds whole. Identical outputs to three

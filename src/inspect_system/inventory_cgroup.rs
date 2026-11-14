@@ -1019,8 +1019,7 @@ pub(crate) fn collect_with(
     // Hold the count manifests' rows before the member scans below
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.
-    let staged_manifests =
-        parse_and_reserve_count_manifests(&mut handles, &request.count_manifests, &mut budget);
+    reserve_count_manifest_rows(&mut handles, &request.count_manifests, &budget);
     let mut members = Vec::new();
     for pid in &selected {
         checkpoint(CollectionStage::DeepScan);
@@ -1100,7 +1099,7 @@ pub(crate) fn collect_with(
     prepare_count_manifests(
         &mut collection,
         &mut bound,
-        staged_manifests,
+        &request.count_manifests,
         request.prearm_prior.0,
         request.prearm_prior.1,
         &mut handles,

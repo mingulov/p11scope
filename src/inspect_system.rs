@@ -1577,7 +1577,7 @@ fn collect_identity(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     identity: bool,
-    mut budget: CaptureWorkBudget,
+    budget: CaptureWorkBudget,
     scanned: &BTreeSet<u32>,
     manifests: &[PathBuf],
     prior_objects: usize,
@@ -1591,7 +1591,7 @@ fn collect_identity(
     // Hold the count manifests' rows before the member scans below
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.
-    let staged_manifests = parse_and_reserve_count_manifests(&mut handles, manifests, &mut budget);
+    reserve_count_manifest_rows(&mut handles, manifests, &budget);
     let (mut collection, mut custody) = if identity {
         collect_members_identity(
             hints,
@@ -1702,7 +1702,7 @@ fn collect_identity(
     prepare_count_manifests(
         &mut collection,
         &mut bound,
-        staged_manifests,
+        manifests,
         prior_objects,
         prior_bytes,
         &mut handles,
@@ -1804,7 +1804,7 @@ pub(crate) fn collect_pid_with_count_manifests(
     // Hold the count manifests' rows before the member scan below
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.
-    let staged_manifests = parse_and_reserve_count_manifests(&mut handles, manifests, &mut budget);
+    reserve_count_manifest_rows(&mut handles, manifests, &budget);
     let member = scan_member(
         pid,
         ProcessViewId(0),
@@ -1847,7 +1847,7 @@ pub(crate) fn collect_pid_with_count_manifests(
     prepare_count_manifests(
         &mut collection,
         &mut bound,
-        staged_manifests,
+        manifests,
         prior_objects,
         prior_bytes,
         &mut handles,
@@ -1982,40 +1982,58 @@ fn read_count_manifest_file(path: &Path, budget: &mut CaptureWorkBudget) -> Resu
     parse_manifest_text(&text, path)
 }
 
-/// One count manifest parsed before member collection, with its
-/// parse result: the pin phase gaps failures in path order exactly
-/// as today, while successes pin from these bytes.
-struct StagedCountManifest {
-    path: PathBuf,
-    parsed: Result<Manifest>,
+/// Count one manifest's pinnable objects without spending budget:
+/// a plain bounded read plus the shared parser. Advisory only (the
+/// reservation below): unreadable, over-allowance and invalid files
+/// count zero and gap in the pin phase exactly as today. Read-only
+/// on the pass budget — first-come ordering keeps scans ahead of
+/// manifest reads, and the pin phase re-reads authoritatively.
+fn count_manifest_objects_for_reservation(path: &Path, budget: &CaptureWorkBudget) -> usize {
+    let len = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.len())
+        .unwrap_or(u64::MAX);
+    if len > crate::manifest_input::MAX_MANIFEST_BYTES {
+        return 0;
+    }
+    // Mirror the pin-phase read gates read-only: a file that cannot
+    // fit the remaining allowance (or the per-object cap) gaps there,
+    // so it reserves nothing here.
+    if len > budget.remaining_window_io().unwrap_or(0) || len > budget.limits().per_object_bytes {
+        return 0;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return 0,
+    };
+    if bytes.len() as u64 != len {
+        return 0;
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return 0,
+    };
+    parse_manifest_text(&text, path)
+        .map(|manifest| manifest.objects.len())
+        .unwrap_or(0)
 }
 
-/// Parse count manifests before member pins take the collector
-/// table, and hold one row per parsed object: member pins file
-/// through the same table, and a full table would otherwise starve
-/// the Trusted manifest pins below. Only the parse moves early (and
-/// only its read charges with it); spends, binding, pinning and gap
-/// order stay in the pin phase. The table is per-pass, so the
-/// reservation dies with it — no release.
-fn parse_and_reserve_count_manifests(
+/// Hold one collector row per count-manifest object before member
+/// pins take the table: member pins file through the same table, and
+/// a full table would otherwise starve the Trusted manifest pins
+/// below. The counts are advisory (the pin phase re-reads and gaps
+/// authoritatively); the table is per-pass, so the reservation dies
+/// with it — no release.
+fn reserve_count_manifest_rows(
     table: &mut HandleTable,
     paths: &[PathBuf],
-    budget: &mut CaptureWorkBudget,
-) -> Vec<StagedCountManifest> {
-    let mut staged = Vec::with_capacity(paths.len());
+    budget: &CaptureWorkBudget,
+) {
     let mut rows = 0usize;
     for path in paths {
-        let parsed = read_count_manifest_file(path, budget);
-        if let Ok(manifest) = &parsed {
-            rows = rows.saturating_add(manifest.objects.len());
-        }
-        staged.push(StagedCountManifest {
-            path: path.clone(),
-            parsed,
-        });
+        rows = rows.saturating_add(count_manifest_objects_for_reservation(path, budget));
     }
     table.reserve_rows(rows);
-    staged
 }
 
 /// Validate explicit count inputs while the collection still owns its read
@@ -2028,16 +2046,15 @@ fn parse_and_reserve_count_manifests(
 fn prepare_count_manifests(
     collection: &mut Collection,
     bound: &mut Bound,
-    staged: Vec<StagedCountManifest>,
+    paths: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
     table: &mut HandleTable,
 ) {
-    for staged in staged {
-        let StagedCountManifest { path, parsed } = staged;
+    for path in paths {
         let accepted = (|| -> Result<Manifest> {
             collection.budget.spend(1).map_err(anyhow::Error::msg)?;
-            let mut manifest = parsed?;
+            let mut manifest = read_count_manifest_file(path, &mut collection.budget)?;
             let units = manifest
                 .objects
                 .len()
@@ -5081,7 +5098,7 @@ pub(crate) fn collect_system_with_identity(
     // Hold the count manifests' rows before the member scans below
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.
-    let staged_manifests = parse_and_reserve_count_manifests(&mut handles, manifests, &mut budget);
+    reserve_count_manifest_rows(&mut handles, manifests, &budget);
     let (mut collection, mut custody) = collect_members_identity(
         hints,
         hooks,
@@ -5235,7 +5252,7 @@ pub(crate) fn collect_system_with_identity(
     prepare_count_manifests(
         &mut collection,
         &mut bound,
-        staged_manifests,
+        manifests,
         prior_objects,
         prior_bytes,
         &mut handles,
@@ -5940,37 +5957,35 @@ mod tests {
     }
 
     #[test]
-    fn staged_count_manifests_reserve_one_row_per_parsed_object() {
-        // The pin-phase reservation: successfully parsed manifests
-        // hold one collector row per object before member pins take
-        // them; a bad path rides along for the pin phase to gap,
-        // reserving nothing.
+    fn count_manifest_reservation_holds_one_row_per_object() {
+        // The pin-phase reservation: a readable manifest holds one
+        // collector row per object before member pins take them; a
+        // bad path reserves nothing (the pin phase gaps it). Counting
+        // spends no budget: first-come ordering keeps scans ahead of
+        // manifest reads.
         let (_dir, doc) = count_manifest_doc();
-        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let budget = crate::discovery::scan::CaptureWorkBudget::default();
         let mut table = crate::discovery::handle_table::HandleTable::new(
             crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES,
         );
-        let staged = super::parse_and_reserve_count_manifests(
+        let io_before = budget.attempted_io_bytes();
+        super::reserve_count_manifest_rows(
             &mut table,
             &[
                 doc,
                 std::path::PathBuf::from("/nonexistent/count-manifest.json"),
             ],
-            &mut budget,
+            &budget,
         );
-        assert_eq!(staged.len(), 2);
-        let rows = staged[0]
-            .parsed
-            .as_ref()
-            .expect("the doc parses")
-            .objects
-            .len();
-        assert_eq!(rows, 1, "the fixture pins exactly one row");
-        assert!(staged[1].parsed.is_err(), "the bad path rides along");
         assert_eq!(
             table.scan_cap(),
-            crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES - rows,
-            "one reserved row per parsed object"
+            crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES - 1,
+            "the one-object doc holds one row; the bad path holds none"
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            io_before,
+            "counting spends no budget"
         );
     }
 
@@ -5979,18 +5994,20 @@ mod tests {
         // A count manifest deferred by a full collector table waits
         // for the next pass (retried every pass), never "skipped
         // permanently": the row carries the count-manifest wait text.
-        // The zero-cap table defers every Trusted filing, so no
+        // The zero-cap table defers every trusted-class filing, so no
         // prefill can mask the row text.
         let (_dir, doc) = count_manifest_doc();
         let mut collection = empty_collection();
         let mut bound = super::bind_collection(&mut collection);
         let mut table = crate::discovery::handle_table::HandleTable::new(0);
-        let staged = super::parse_and_reserve_count_manifests(
-            &mut table,
+        super::prepare_count_manifests(
+            &mut collection,
+            &mut bound,
             std::slice::from_ref(&doc),
-            &mut collection.budget,
+            0,
+            0,
+            &mut table,
         );
-        super::prepare_count_manifests(&mut collection, &mut bound, staged, 0, 0, &mut table);
         assert_eq!(collection.scope_gaps.len(), 1);
         assert!(
             collection.scope_gaps[0]
@@ -6010,12 +6027,14 @@ mod tests {
         let mut collection = empty_collection();
         let mut bound = super::bind_collection(&mut collection);
         let mut table = crate::discovery::handle_table::HandleTable::new(1000);
-        let staged = super::parse_and_reserve_count_manifests(
-            &mut table,
+        super::prepare_count_manifests(
+            &mut collection,
+            &mut bound,
             std::slice::from_ref(&doc),
-            &mut collection.budget,
+            512,
+            0,
+            &mut table,
         );
-        super::prepare_count_manifests(&mut collection, &mut bound, staged, 512, 0, &mut table);
         assert!(bound.count_manifests.is_empty());
         assert_eq!(collection.scope_gaps.len(), 1);
         assert!(
@@ -6028,12 +6047,14 @@ mod tests {
         let mut collection = empty_collection();
         let mut bound = super::bind_collection(&mut collection);
         let mut table = crate::discovery::handle_table::HandleTable::new(1000);
-        let staged = super::parse_and_reserve_count_manifests(
-            &mut table,
+        super::prepare_count_manifests(
+            &mut collection,
+            &mut bound,
             std::slice::from_ref(&doc),
-            &mut collection.budget,
+            0,
+            0,
+            &mut table,
         );
-        super::prepare_count_manifests(&mut collection, &mut bound, staged, 0, 0, &mut table);
         assert!(bound.count_manifests.is_empty());
         assert_eq!(collection.scope_gaps.len(), 1);
         let reason = &collection.scope_gaps[0].reason;

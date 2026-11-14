@@ -18528,6 +18528,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_ingest_break_void_raises_voided_through_at_once() {
+        // Like reject_audit: the ingest-break void binds future births
+        // at void time, not only at the next re-sync.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let consumed = scene.adapter.consumed_through;
+        assert!(consumed > 0, "the void covers consumed history");
+        assert_eq!(
+            scene.adapter.voided_through_for_test(),
+            0,
+            "nothing voided before the break"
+        );
+        let failure = scene
+            .adapter
+            .void_ingest_break_inner(&mut scene.model, JournalGap::IngestBreakLoss);
+        assert_eq!(failure.fence, Some(consumed), "the void records its fence");
+        assert_eq!(
+            scene.adapter.voided_through_for_test(),
+            consumed,
+            "the void binds future births at once, like reject_audit"
+        );
+    }
+
+    #[test]
     fn object_journal_ingest_break_void_fences_every_domain() {
         // Keyrows C1 twin 2: the reshaped void fences the consumed
         // history on EVERY key — registered and unregistered — and

@@ -26992,6 +26992,77 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn stop_disclosure_drains_audit_voids_whose_completion_never_ran() {
+        // The stop disclosure drains audit voids no completion ever
+        // drained (an unfinished publication stood in front of them):
+        // one counted scope gap per void, staged exactly once. A
+        // mutant dropping the stop-time drain call records nothing.
+        take_warned_for_test();
+        let mut coordinator = coordinator();
+        let carried = crate::semantics_objects::journal::JointVoidCounts {
+            break_dispose: 0,
+            break_ingest: 0,
+            void_audit: 1,
+            void_resync: 0,
+            seal_below_fence: 0,
+            audit_fault_changed_chain: 0,
+            audit_fault_changed_reread: 0,
+            audit_h3_loss: 0,
+            audit_discarded: 0,
+            audit_malformed: 1,
+            audit_counter_unprovable: 0,
+            audit_fault_unreadable: 0,
+            audit_resource_unavailable: 0,
+            voids_ended_joint_feed: 0,
+        };
+        coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .carry_joint_void_counts(&carried);
+        assert!(
+            coordinator
+                .registry()
+                .staged_scope_gaps_for_test()
+                .is_empty(),
+            "no completion drained before the stop"
+        );
+        let headless = headless_display();
+        let mut display = Some(headless.display);
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let counts = SemanticStopCounts {
+            refusals: [0; 12],
+            overflow_refusals: 0,
+            collected: 0,
+            joined: 0,
+            shed: 0,
+            lost: 0,
+            bindings: 0,
+            refused: 0,
+            hook_misses: 0,
+            eras: 0,
+            instances: 0,
+            admitted_reported: 0,
+            admitted_attached: 0,
+            marks_attempted: 0,
+            marks_refused_dup: 0,
+            marks_refused_cap: 0,
+            admission_binding_miss: 0,
+        };
+        disclose_semantic_stop(&counts, &mut coordinator, &mut warn);
+        assert_eq!(
+            coordinator.registry().staged_scope_gaps_for_test(),
+            [(
+                "Joint key operations unavailable; retained S1".to_string(),
+                "joint_void_malformed_history_loss".to_string(),
+            )],
+            "the stop disclosure records the undrained void"
+        );
+        let _ = take_warned_for_test();
+    }
+
+    #[test]
     fn hold_rediscloses_settlement_after_terminal_commit_applies_calls() {
         // The exit hold discloses the stop counts (with the
         // diagnostic settlement line) BEFORE the terminal abandon

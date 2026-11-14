@@ -4353,10 +4353,13 @@ fn gap_plain_reason_names_replaced_pinning_failure_for_deleted_subject() {
 }
 
 /// F1+F3: the concise gap summary uses plain words for the Joint
-/// seal/fallback gaps, never the raw `S1` / `joint_*` tokens. The
-/// journal gap reads on the key-operations line instead of here, so
-/// concise states "per-key tracking is off" once; verbose keeps its
-/// plain words with the machine tokens beside them.
+/// seal/fallback/void/deferral gaps, never the raw `S1` / `joint_*`
+/// tokens. The journal gap reads on the key-operations line instead
+/// of here, so concise states "per-key tracking is off" once;
+/// verbose keeps its plain words with the machine tokens beside
+/// them. The void gaps share the Joint-unavailable stored subject
+/// with the seal gaps but read scope-wide (no "did not start for
+/// this process" claim); the deferral reads paused, never unstarted.
 #[test]
 fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     let harness = varied_harness();
@@ -4367,6 +4370,9 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
         "joint_seal_h3_loss_history_loss",
         "joint_fallback_staging_full",
         "joint_journal_unavailable",
+        "joint_void_fault_changed_history_loss",
+        "joint_void_ingest_break_loss_history_loss",
+        "joint_resume_deferred_below_fence",
     ] {
         presentation.gaps.push(GapView {
             caller: None,
@@ -4387,6 +4393,8 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     for plain in [
         "per-key tracking ended early",
         "per-key tracking fell back to plain counts",
+        "per-key tracking lost part of its history; function counts are unaffected",
+        "per-key tracking waits to restart after lost history",
     ] {
         assert!(out.contains(plain), "{plain} missing: {out}");
     }
@@ -4402,12 +4410,30 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
         out.contains("Per-key tracking did not start"),
         "seal subject stem missing: {out}"
     );
+    // The void and deferral rows never claim a per-process
+    // non-start: each group line carrying the new plain reason must
+    // not contain the old sentence. (The long reasons truncate the
+    // subjects in concise; the full subjects are pinned in verbose
+    // below.)
+    for reason in [
+        "per-key tracking lost part of its history; function counts are unaffected",
+        "per-key tracking waits to restart after lost history",
+    ] {
+        let line = out
+            .lines()
+            .find(|line| line.contains(reason))
+            .unwrap_or_else(|| panic!("{reason} missing: {out}"));
+        assert!(
+            !line.contains("did not start"),
+            "void/deferral row claims a non-start: {line:?}:\n{out}"
+        );
+    }
     let lines: Vec<&str> = out.lines().collect();
     let start = lines
         .iter()
-        .position(|line| *line == "gaps: 3")
+        .position(|line| *line == "gaps: 6")
         .expect("gaps header");
-    for line in &lines[start..start + 4] {
+    for line in &lines[start..start + 6] {
         assert!(
             line.chars().count() <= 100,
             "over 100 chars: {line:?}:\n{out}"
@@ -4417,6 +4443,8 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
         "joint_seal_",
         "joint_fallback_",
         "joint_journal_unavailable",
+        "joint_void_",
+        "joint_resume_",
         "keeps S1",
     ] {
         assert!(!out.contains(machine), "{machine} leaked: {out}");
@@ -4425,8 +4453,18 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     for full in [
         "Per-key tracking did not start for this process; function counts above are unaffected",
         "per-key tracking is off; function and mechanism counts are unaffected",
+        "Per-key tracking lost history for every process; function counts above are unaffected",
+        "Per-key tracking paused for this process; function counts above are unaffected",
     ] {
         assert!(verbose.contains(full), "{full} missing: {verbose}");
+    }
+    // Verbose keeps each new machine token beside its plain words.
+    for token in [
+        "(joint_void_fault_changed_history_loss)",
+        "(joint_void_ingest_break_loss_history_loss)",
+        "(joint_resume_deferred_below_fence)",
+    ] {
+        assert!(verbose.contains(token), "{token} missing: {verbose}");
     }
 }
 

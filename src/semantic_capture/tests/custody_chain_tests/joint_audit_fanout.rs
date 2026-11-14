@@ -9428,6 +9428,162 @@ fn joint_machine_voided_feed_refuses_below_fence_resume() {
     );
 }
 
+/// Owner rule "calls happened => show data": after the re-arm's void
+/// delivers, a call staged above the fence replays through fallback
+/// — reduced +1 with its plain unknown-key row — instead of
+/// disposing; a later call below the fence still reduces direct
+/// (S1-only) without certifying or attesting anything.
+#[test]
+fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() {
+    use crate::semantics_objects::journal::{BirthRefusal, BootstrapReceipt, SessionBirthGrant};
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.refuse_at_audited(2);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "a running Audited refusal with its frame re-arms"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "the re-armed lane accepts the next commit"
+    );
+    let feed_state = |fixture: &MachineScene| {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let module = registry
+            .modules()
+            .find(|module| module.key == fixture.scene.real.modules[0].0)
+            .unwrap()
+            .id;
+        let edges: Vec<_> = registry
+            .instance_semantic_edges()
+            .filter(|record| record.module == module)
+            .collect();
+        assert_eq!(edges.len(), 1, "one incarnation per provider");
+        let feed = &edges[0].feed;
+        (
+            feed.mode(),
+            feed.fell_back(),
+            feed.degraded_loss(),
+            feed.reduced(),
+            feed.fallback_replayed(),
+            feed.history_disposed(),
+            feed.degraded_fallback_direct(),
+            feed.segment_fence_for_test(),
+        )
+    };
+    let reduced = fixture.reduced_for(0);
+    let disposed = fixture.disposed_total();
+    let unknown = fixture.unknown_terminals();
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 3);
+    fixture.published_labeled("after running re-arm", None);
+    // The recovery call replays: reduced +1, nothing disposed, and
+    // its observed completion stands as one unknown-key row.
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced + 1,
+        "the post-void call replays instead of disposing"
+    );
+    assert_eq!(
+        fixture.disposed_total(),
+        disposed,
+        "replay disposes nothing"
+    );
+    let unknown_after = fixture.unknown_terminals();
+    assert_eq!(
+        unknown_after[0] - unknown[0],
+        1,
+        "the replayed call keeps its plain unknown-key row"
+    );
+    assert_eq!(
+        (
+            unknown_after[1] - unknown[1],
+            unknown_after[2] - unknown[2],
+            unknown_after[3] - unknown[3],
+        ),
+        (0, 0, 0),
+        "replay adds no failed, cancelled or unknown outcomes"
+    );
+    let (mode, fell_back, degraded_loss, _, replayed, _, _, fence) = feed_state(&fixture);
+    assert_eq!(
+        mode,
+        crate::semantics_key_use::FeedMode::S1Only,
+        "the void ended the Joint segment"
+    );
+    assert!(fell_back, "the fenced void ends as fallback");
+    assert!(!degraded_loss, "replay is not loss");
+    assert_eq!(replayed, 1, "the recovery call replayed once");
+    assert!(
+        fence.is_some(),
+        "the fallback ending still records the void fence: {fence:?}"
+    );
+    // Nothing below the fence certifies or attests: no Joint feed
+    // remains, and the feed's own receipt refuses BelowVoidFence.
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "no Joint feed certifies past the void"
+    );
+    let receipt = *fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap()
+        .feed
+        .selected_receipt()
+        .expect("the voided feed retains its receipt");
+    let generation = fixture.scene.attached.as_ref().unwrap().generation();
+    assert_eq!(
+        BootstrapReceipt::attest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter(),
+            &SessionBirthGrant::scripted(
+                receipt.proof(),
+                receipt.birth(),
+                receipt.birth_cut(),
+                generation
+            )
+        ),
+        Err(BirthRefusal::BelowVoidFence),
+        "the below-fence receipt attests nothing"
+    );
+    // A call after the delivered void reduces direct under the
+    // fallback window: counted, S1-only, never replayed.
+    let (_, _, _, reduced_before, _, _, direct_before, _) = feed_state(&fixture);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    fixture.published_labeled("post-void-probe", None);
+    let (mode_after, _, _, reduced_after, _, _, direct_after, _) = feed_state(&fixture);
+    assert_eq!(
+        mode_after,
+        crate::semantics_key_use::FeedMode::S1Only,
+        "the probe never resumes onto the below-fence receipt"
+    );
+    assert_eq!(reduced_after, reduced_before, "no replay without a resume");
+    assert_eq!(
+        direct_after,
+        direct_before + 1,
+        "the probe reduces direct under the fallback window"
+    );
+}
+
 /// Scope-round I2 twin: the below-fence resume refusal discloses one
 /// counted per-feed reason — the first clean-point call after the void
 /// stages `joint_resume_deferred_below_fence`, and a second probe does
@@ -9669,6 +9825,163 @@ fn joint_audit_resource_void_ending_joint_feeds_counts_once() {
     );
 }
 
+/// Idle-feed fence twin: a Joint feed with nothing staged, hit by a
+/// resumable audit void through a real frame, records the void's
+/// fence at its empty-staging close (the production site, not the
+/// test-only seam); the next clean-point call stays S1-only and
+/// discloses one deferral per feed. A mutant recording no fence
+/// here fails the fence assert below.
+#[test]
+fn joint_audit_void_on_idle_feed_records_fence_and_defers_next_call() {
+    use crate::semantics_objects::journal::JournalGap;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        2,
+        "two Joint feeds from the clean first publication"
+    );
+    let fences_modes_staged = |fixture: &CanonicalFanoutScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| {
+                (
+                    record.feed.segment_fence_for_test(),
+                    record.feed.mode(),
+                    record.feed.staged_len(),
+                    record.feed.reduced(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        fences_modes_staged(&fixture)
+            .iter()
+            .all(
+                |(_, mode, staged, _)| *mode == crate::semantics_key_use::FeedMode::Joint
+                    && *staged == 0
+            ),
+        "both feeds are Joint and idle before the void: {:?}",
+        fences_modes_staged(&fixture)
+    );
+    // An unclaimed image: bound for encoding, never admitted, so its
+    // duplicate STARTs refuse resources without staging an H0 call —
+    // the audit voids as ResourceUnavailable (HistoryLoss after the
+    // original-audit upgrade) onto idle feeds.
+    let fresh = OwnedStoppedChild::new();
+    fixture.scene.real.bind(
+        fresh.id(),
+        ImageIdentity {
+            task_cookie: 76,
+            exec_id: 0,
+        },
+        0,
+    );
+    let (dup, _) = fixture.scene.encoded(fresh.id(), 0, "C_SignInit", 1);
+    fixture.scene.drain.source_mut().push_record(dup.to_vec());
+    fixture.scene.drain.source_mut().push_record(dup.to_vec());
+    let round = fixture.audited(0, 0, &BirthFault);
+    assert!(
+        round.audit_for_test().resource_refused_for_test(),
+        "the duplicate START refused collection resources"
+    );
+    let gaps: Vec<_> = round
+        .original_failures_for_test()
+        .map(|failure| failure.gap)
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![JournalGap::ResourceUnavailable],
+        "the refused collection voids as resource-only: {gaps:?}"
+    );
+    let fence = round
+        .original_failures_for_test()
+        .find(|failure| failure.gap == JournalGap::ResourceUnavailable)
+        .expect("the resource void rides the frame")
+        .fence;
+    assert!(fence.is_some(), "the audit void carries a fence");
+    finish_disposed_negative_frame(&mut fixture, round, &BirthFault);
+    let after = fences_modes_staged(&fixture);
+    assert!(
+        after.iter().all(|(recorded, mode, _, _)| *recorded == fence
+            && *mode == crate::semantics_key_use::FeedMode::S1Only),
+        "every idle feed records the void's fence at its close: {after:?} vs {fence:?}"
+    );
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(diagnosis.void_audit, 1, "the refused collection voids once");
+    assert_eq!(
+        diagnosis.audit_resource_unavailable, 1,
+        "the void counts in the resource bucket"
+    );
+    assert_eq!(
+        diagnosis.voids_ended_joint_feed, 1,
+        "one void ending two idle Joint feeds counts one ending"
+    );
+    // The next clean-point calls stay S1-only: below-fence receipts
+    // never resume, and each feed discloses its deferral exactly
+    // once (ResourceUnavailable is resumable, so the wait is real).
+    let reduced_before: Vec<u64> = after.iter().map(|(_, _, _, reduced)| *reduced).collect();
+    fixture.push_two("C_SignInit", 2);
+    let round = fixture.audited(2, 2, &BirthFault);
+    finish_disposed_negative_frame(&mut fixture, round, &BirthFault);
+    // Gaps stage at commit and apply at the next one, so a third
+    // round flushes the probes' deferrals into the published set.
+    fixture.push_two("C_SignInit", 3);
+    let round = fixture.audited(2, 2, &BirthFault);
+    finish_disposed_negative_frame(&mut fixture, round, &BirthFault);
+    let probed = fences_modes_staged(&fixture);
+    assert!(
+        probed
+            .iter()
+            .all(|(_, mode, _, _)| *mode == crate::semantics_key_use::FeedMode::S1Only),
+        "no resume onto the below-fence receipts: {probed:?}"
+    );
+    assert_eq!(
+        probed
+            .iter()
+            .map(|(_, _, _, reduced)| *reduced)
+            .collect::<Vec<_>>(),
+        reduced_before,
+        "the probes replay nothing"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let deferrals: Vec<(usize, u64)> = registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_repeats().iter())
+        .enumerate()
+        .filter(|(_, (gap, _))| gap.reason == "joint_resume_deferred_below_fence")
+        .map(|(at, (_, repeats))| (at, *repeats))
+        .collect();
+    assert_eq!(
+        deferrals.len(),
+        2,
+        "one deferral per feed, however many probes refuse: {:?}",
+        registry.gaps()
+    );
+    assert!(
+        deferrals.iter().all(|(_, repeats)| *repeats == 1),
+        "each feed discloses its deferral exactly once: {deferrals:?}"
+    );
+}
+
 /// Scope-round drain twin: each audit void discloses one counted scope
 /// gap for its sub-cause (`joint_void_<subcause>_history_loss`), like
 /// ingest-break voids do — staged exactly once by the voiding
@@ -9767,6 +10080,88 @@ fn joint_s1only_feed_records_later_void_fence() {
             .zip(first.iter())
             .all(|(later, earlier)| later > earlier),
         "the S1Only void raises every recorded fence: {first:?} -> {second:?}"
+    );
+}
+
+/// Deferral-scope twin: a below-fence resume refusal on a
+/// non-resumable segment (FaultChanged) discloses no deferral — only
+/// a resumable ending waits for re-selection. The I2 twin proves the
+/// same shape discloses after a resumable void, so silence here is
+/// the scope gate, not a shape that never resumes.
+#[test]
+fn joint_nonresumable_void_records_no_below_fence_deferral() {
+    let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject", "C_SignInit"],
+        PublicationReceipts::All,
+    );
+    let mut frame = Some(original);
+    let fault = FrameFault::clean();
+    fault.epoch.set(1);
+    let old_revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.complete_publication(&mut frame, &fault, old_revision);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "the FaultChanged void ended every Joint feed"
+    );
+    // Second round: clean-point calls refuse below the fence on a
+    // segment that can never resume. A third round flushes anything
+    // the second round's commit staged into the published set, so
+    // silence below is the scope gate, not an unapplied staging.
+    fixture.push_two("C_SignInit", 2);
+    fault.epoch.set(2);
+    let round = fixture.audited(2, 2, &fault);
+    finish_disposed_negative_frame(&mut fixture, round, &fault);
+    fixture.push_two("C_SignInit", 3);
+    let round = fixture.audited(2, 2, &fault);
+    finish_disposed_negative_frame(&mut fixture, round, &fault);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "no resume onto the non-resumable below-fence segment"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|record| record.feed.segment_fence_for_test().is_some()),
+        "the refused segment stands below a recorded fence"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.reason != "joint_resume_deferred_below_fence"),
+        "a never-resumable ending discloses no deferral: {:?}",
+        fixture.scene.real.scene.coordinator.registry().gaps()
     );
 }
 
@@ -10470,6 +10865,330 @@ fn joint_disposed_audit_takes_pending_void_with_raw_occupied() {
             .pending_void_for_test()
             .is_none(),
         "the disposed audit took the pending void"
+    );
+}
+
+/// Fence-max twin: a frame carrying the pending ingest-break void
+/// plus a fenceless higher-or-equal-rank failure records the void's
+/// fence on every feed — the maximum over the failures that apply —
+/// not the selected failure's missing fence. Reading only the
+/// selected failure would record no fence, and the void-ended feed
+/// would never count. Seals never run while a void rides the frame,
+/// so the fenceless failure (a saturated audit) arrives at acquire:
+/// the collect runs clean, then the fault cell saturates before the
+/// audit reads it.
+#[test]
+fn joint_frame_with_void_and_fenceless_failure_records_void_fence() {
+    use crate::semantics_objects::journal::JournalGap;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .void_ingest_break()
+            .expect("the idle tick voids the broken lane"),
+        "the void pends before the next audit"
+    );
+    let void_fence = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .pending_void_for_test()
+        .expect("the void pends")
+        .fence;
+    assert!(void_fence.is_some(), "the pending void carries a fence");
+    // The audited steps through commit (mirrored so the fault cell
+    // saturates after the clean collect but before the audit read).
+    fixture.push_two("C_SignInit", 2);
+    let fault = DisposedNativeFault(fixture.scene.real.h0.clone());
+    let raw = fixture.scene.collect_with_fault(&fault);
+    assert_eq!(
+        raw.h0_input(fixture.scene.real.lane.domain(), 64)
+            .unwrap()
+            .0
+            .len(),
+        2
+    );
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    assert_eq!(fixture.scene.real.h0.0.borrow().last_calls.len(), 2);
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(batch);
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .count(),
+        2
+    );
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("same original ingestion: {reason:?}"));
+    assert_eq!(claim_and_finish(&mut fixture.scene, &ingested).len(), 2);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow()
+        .io
+        .script
+        .fault_cell
+        .store(u64::from(u32::MAX) + 1, std::sync::atomic::Ordering::SeqCst);
+    let round = acquire(&mut fixture.scene, ingested, &fixture.attached, &fault);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the audit took the pending void into its own slot"
+    );
+    let gaps: Vec<_> = round
+        .original_failures_for_test()
+        .map(|failure| (failure.gap, failure.fence))
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![
+            (JournalGap::IngestBreakLoss, void_fence),
+            (JournalGap::FaultSaturated, None),
+        ],
+        "the frame carries the fenced void plus the fenceless audit failure: {gaps:?}"
+    );
+    finish_disposed_negative_frame(&mut fixture, round, &fault);
+    let fences: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| (record.feed.mode(), record.feed.segment_fence_for_test()))
+        .collect();
+    assert_eq!(fences.len(), 2, "two feeds behind one provider");
+    assert!(
+        fences.iter().all(
+            |(mode, fence)| *mode == crate::semantics_key_use::FeedMode::S1Only
+                && *fence == void_fence
+        ),
+        "every feed records the void's fence, not the selected failure's none: \
+         {fences:?} vs {void_fence:?}"
+    );
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(
+        diagnosis.voids_ended_joint_feed, 1,
+        "the fenced void ending Joint feeds counts its ending"
+    );
+}
+
+/// Pending-void twin: a second ingest-break void while one still
+/// pends keeps the first void's failure but raises its fence to the
+/// larger (later) one, so the delivered void covers both breaks.
+#[test]
+fn joint_second_pending_void_keeps_larger_fence() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let consumed = |fixture: &CanonicalFanoutScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .consumed_through_for_test()
+    };
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .void_ingest_break()
+            .expect("the first idle tick voids the broken lane"),
+        "the first void pends"
+    );
+    let first_fence = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .pending_void_for_test()
+        .expect("the first void pends")
+        .fence;
+    let first_effects = format!(
+        "{:?}",
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .expect("the first void pends")
+            .effects
+    );
+    // Advance consumption and re-sync without acquiring: the next
+    // audit frame has not run, so the first void still pends.
+    fixture.push_two("C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let raw = fixture.scene.collect_with_fault(&fault);
+    assert_eq!(
+        raw.h0_input(fixture.scene.real.lane.domain(), 64)
+            .unwrap()
+            .0
+            .len(),
+        2
+    );
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    assert_eq!(fixture.scene.real.h0.0.borrow().last_calls.len(), 2);
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(batch);
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .count(),
+        2
+    );
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("same original ingestion: {reason:?}"));
+    assert_eq!(claim_and_finish(&mut fixture.scene, &ingested).len(), 2);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    drop(ingested);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "no audit frame ran, so the first void still pends"
+    );
+    assert!(
+        consumed(&fixture) > first_fence.expect("the first void is fenced"),
+        "ingest advanced consumption past the first void"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .void_ingest_break()
+            .expect("the second idle tick voids the re-broken lane"),
+        "the second void applies while the first still pends"
+    );
+    let pending = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .pending_void_for_test()
+        .expect("one void still pends");
+    assert_eq!(
+        pending.fence,
+        Some(consumed(&fixture)),
+        "the pending void keeps the larger fence: first {first_fence:?}"
+    );
+    assert_eq!(
+        format!("{:?}", pending.effects),
+        first_effects,
+        "the pending void keeps the first void's failure"
     );
 }
 

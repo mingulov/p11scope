@@ -7345,22 +7345,24 @@ mod promotion_lifecycle_tests {
         // Scope-round drain pin: the drain discloses one gap per void
         // above its baseline (the two FaultChanged site buckets merge
         // into the one fault_changed gap), and a second drain with no
-        // new voids discloses nothing.
+        // new voids discloses nothing. Every bucket carries a
+        // distinct count, so a copy-paste mutant in the reason match
+        // (reading a sibling bucket) fails its own reason's count.
         let mut coordinator = coordinator();
         let carried = crate::semantics_objects::journal::JointVoidCounts {
             break_dispose: 0,
             break_ingest: 0,
-            void_audit: 6,
+            void_audit: 77,
             void_resync: 0,
             seal_below_fence: 0,
             audit_fault_changed_chain: 2,
             audit_fault_changed_reread: 3,
-            audit_h3_loss: 1,
-            audit_discarded: 0,
-            audit_malformed: 0,
-            audit_counter_unprovable: 0,
-            audit_fault_unreadable: 0,
-            audit_resource_unavailable: 0,
+            audit_h3_loss: 5,
+            audit_discarded: 7,
+            audit_malformed: 11,
+            audit_counter_unprovable: 13,
+            audit_fault_unreadable: 17,
+            audit_resource_unavailable: 19,
             voids_ended_joint_feed: 0,
         };
         coordinator
@@ -7369,21 +7371,25 @@ mod promotion_lifecycle_tests {
             .carry_joint_void_counts(&carried);
         coordinator.disclose_audit_void_gaps();
         let staged = coordinator.registry().staged_scope_gaps_for_test();
+        for (reason, expected) in [
+            ("joint_void_fault_changed_history_loss", 2 + 3),
+            ("joint_void_h3_loss_history_loss", 5),
+            ("joint_void_discarded_history_loss", 7),
+            ("joint_void_malformed_history_loss", 11),
+            ("joint_void_counter_unprovable_history_loss", 13),
+            ("joint_void_fault_unreadable_history_loss", 17),
+            ("joint_void_resource_unavailable_history_loss", 19),
+        ] {
+            assert_eq!(
+                staged.iter().filter(|(_, staged)| staged == reason).count(),
+                expected,
+                "{reason} discloses exactly its bucket: {staged:?}"
+            );
+        }
         assert_eq!(
-            staged
-                .iter()
-                .filter(|(_, reason)| reason == "joint_void_fault_changed_history_loss")
-                .count(),
-            5,
-            "both FaultChanged sites merge into one gap reason: {staged:?}"
-        );
-        assert_eq!(
-            staged
-                .iter()
-                .filter(|(_, reason)| reason == "joint_void_h3_loss_history_loss")
-                .count(),
-            1,
-            "each H3Loss void discloses its own gap: {staged:?}"
+            staged.len(),
+            2 + 3 + 5 + 7 + 11 + 13 + 17 + 19,
+            "no more and no fewer gaps than the buckets hold: {staged:?}"
         );
         coordinator.disclose_audit_void_gaps();
         let restaged = coordinator.registry().staged_scope_gaps_for_test();

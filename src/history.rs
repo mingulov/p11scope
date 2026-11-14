@@ -37,7 +37,17 @@ struct Task {
     /// `first_ts_ns` strictly before the exit hook, so a reused pid's
     /// successor (admitted after the old exit) is never retired with
     /// it. Reset on exec-id bump: a new generation, a new first time.
+    /// Zero means birth unknown (an unstamped pre-fix FORK): it never
+    /// matches an exit while ambiguous (see [`Registry::match_exit_tap`])
+    /// and upgrades to the first nonzero event time, which the
+    /// generation provably lived to see.
     first_ts_ns: u64,
+    /// A zero `first_ts_ns` that came from an exec-id bump (the first
+    /// post-exec event was an unstamped FORK): the pre-exec leader exit
+    /// must never retire the live post-exec generation, so an exit
+    /// never matches while this is set. Cleared by the upgrade above.
+    /// Only ever set with `first_ts_ns == 0`.
+    birth_unknown_from_exec: bool,
     /// Exit hook time recorded by exit-retire, never the `closed`
     /// flag (a closed task would refuse the reopened generation's
     /// next event). Cleared only by a reopen: a later event on this
@@ -165,10 +175,12 @@ impl Registry {
     /// field or a live process lookup. The producer authenticates the tuple.
     /// `event_ts_ns` is the admitting event's kernel time, recorded as
     /// the task generation's `first_ts_ns` for exit matching (reset on
-    /// exec-id bump). An event on an exit-retired cookie reopens the
-    /// task when timestamped after the exit (clearing the exit
-    /// timestamp, counted) or counts late when at or before it — the
-    /// exit path never sets `closed`, so both still admit.
+    /// exec-id bump). A zero first time is birth unknown: it upgrades to
+    /// the first nonzero event time on the same generation. An event on
+    /// an exit-retired cookie reopens the task when timestamped after
+    /// the exit (clearing the exit timestamp, counted) or counts late
+    /// when at or before it — the exit path never sets `closed`, so
+    /// both still admit.
     pub(crate) fn admit(
         &mut self,
         domain: u64,
@@ -190,6 +202,7 @@ impl Registry {
                 task.called = false;
                 task.forked = false;
                 task.first_ts_ns = event_ts_ns;
+                task.birth_unknown_from_exec = event_ts_ns == 0;
                 task.exit_ts_ns = None;
             } else if let Some(exit) = task.exit_ts_ns {
                 // A live thread on a retired cookie: after the exit the
@@ -202,6 +215,19 @@ impl Registry {
                 } else {
                     self.exit_retire_late = self.exit_retire_late.saturating_add(1);
                 }
+                // A birth-unknown generation provably lived to this
+                // event: upgrade, so a pre-birth exit can no longer
+                // match it while a later real exit still can.
+                if task.first_ts_ns == 0 && event_ts_ns != 0 {
+                    task.first_ts_ns = event_ts_ns;
+                    task.birth_unknown_from_exec = false;
+                }
+            } else if task.first_ts_ns == 0 && event_ts_ns != 0 {
+                // Same upgrade on the steady path: the generation outlived
+                // any exit older than this event, so matching those would
+                // retire a live task.
+                task.first_ts_ns = event_ts_ns;
+                task.birth_unknown_from_exec = false;
             }
             return (Some(task.key), retired);
         }
@@ -218,6 +244,7 @@ impl Registry {
                 forked: false,
                 root_positive: false,
                 first_ts_ns: event_ts_ns,
+                birth_unknown_from_exec: false,
                 exit_ts_ns: None,
             },
         );
@@ -391,11 +418,15 @@ impl Registry {
     /// Matches one due exit against this pid's open tasks by kernel
     /// time: tasks admitted strictly before the hook retire, ties
     /// skip with a counted gap, successors (admitted after the exit)
-    /// are spared. Returns the matched keys and whether any tie was
-    /// seen (the caller drops tied-but-unmatched exits immediately).
-    /// Matched tasks record the exit hook time — the
-    /// earliest observed, so any post-exit event reopens — never the
-    /// `closed` flag, so the next event is never refused.
+    /// are spared. A birth-unknown (`first_ts_ns == 0`) task matches
+    /// only when unambiguous — the pid's sole open cookie, and not
+    /// from an exec bump (whose pre-exec leader exit must never retire
+    /// the live post-exec generation); otherwise it counts as a tie.
+    /// Returns the matched keys and whether any tie was seen (the
+    /// caller drops tied-but-unmatched exits immediately). Matched
+    /// tasks record the exit hook time — the earliest observed, so any
+    /// post-exit event reopens — never the `closed` flag, so the next
+    /// event is never refused.
     fn match_exit_tap(&mut self, tap: &ExitTap) -> (Vec<ProcessKey>, bool) {
         let mut matched = Vec::new();
         let mut tie_seen = false;
@@ -403,7 +434,20 @@ impl Registry {
             return (matched, tie_seen);
         };
         // The cookie set is copied: matching mutates tasks below.
-        for cookie in cookies.iter().copied().collect::<Vec<_>>() {
+        let cookies = cookies.iter().copied().collect::<Vec<_>>();
+        let open = cookies
+            .iter()
+            .filter(|cookie| self.tasks.get(cookie).is_some_and(|task| !task.closed))
+            .count();
+        for cookie in cookies {
+            let unknown_ambiguous = self.tasks.get(&cookie).is_some_and(|task| {
+                !task.closed && task.first_ts_ns == 0 && (task.birth_unknown_from_exec || open >= 2)
+            });
+            if unknown_ambiguous {
+                self.exit_tie_skipped = self.exit_tie_skipped.saturating_add(1);
+                tie_seen = true;
+                continue;
+            }
             let Some(task) = self.tasks.get_mut(&cookie) else {
                 continue;
             };

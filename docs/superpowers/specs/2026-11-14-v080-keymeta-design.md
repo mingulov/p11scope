@@ -2,7 +2,7 @@
 <!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # v0.8.0 Key Metadata: Inferred Family, Size Class, Creation Sources
 
-Status: design (spark lane, round 7). Base: task/v080-design-keymeta 763b29998.
+Status: design (spark lane, round 8). Base: task/v080-design-keymeta 763b29998.
 Branch: task/v080-design-keymeta. Plan: `docs/superpowers/plans/2026-11-14-v080-keymeta.md`.
 
 Owner direction (2026-11-14 07:05): v0.8.0 carries much more key
@@ -44,6 +44,27 @@ endpoints, standard verifier counts and classification are
 exactly today's (§8.6, §12.1 identity contract). Task 7 stays ON
 by default (cold calls, §17.4/§17.7).
 
+Controller rulings (fix7, binding, dispose the Opus re-review R1
+and R2): R1 takes option 1 — the length capture lives in extra
+programs `p11_entry_journal_length`/`p11_return_journal_length`
+in the SAME journal object (mixed-ABI like the base journal
+pair, so no separate ia32 program there), sharing every map, the
+ring and the journal state; userspace loads/links them only with
+`--key-sizes` (aya verifies only loaded programs). Length
+trailers are specified on the journal END forms (632/472 B
+today); keyrows co-owns `object_journal.rs` and
+`journal_roots.rs` (serialized, §13); the new programs get
+budget cells and the flag-off identity pins against the journal
+programs' existing cells. The separate-object design is removed.
+R2 takes option (b) — a small info entry+return pair at the 3
+cold endpoints in the inventory object (stash map, small ring,
+drain in the inventory session, `inventory/*` budget cells,
+identity pin for `p11_usage_entry_*` unchanged), with the
+endpoint/link cost corrected (+3 return links per provider);
+under `--key-operations` the 3 endpoints use journal-program
+info variants keeping the journal entry's info-call handling
+(the `begin_decision` Call arm for proved-irrelevant calls).
+
 ## 1. Goal, non-goals, constraints
 
 Goal: per-key rows carry, beside established token-reported facts,
@@ -72,11 +93,11 @@ and metrics never carry object facts; observed-profile v2/v3 schemas
 untouched; bounded steps for I/O/close/join/scan; Linux x86-64 LP64
 first, ia32 claims require actual ABI cells; with `--key-sizes`
 off, hot-path records, ring/journal load, the linked program set
-at hot endpoints, standard verifier counts and classification are
-exactly today's (§8.6 — separate variant objects selected at
-load time, never a runtime branch inside the hot programs; the
-only linked-set additions are the cold-only Task 7 info
-variants).
+at hot endpoints, pinned verifier counts and classification are
+exactly today's (§8.6 — extra programs in the same journal
+object, loaded and linked only with the flag, never a runtime
+branch inside the hot programs; the only linked-set additions
+are the cold-only Task 7 info programs, §17.4).
 
 ## 2. Prior work and dispositions
 
@@ -121,8 +142,9 @@ variants).
   records growing ~70% with a classification change) is disposed by
   the owner 08:50 ruling (§15 K7), not by narrowing the capture:
   length capture on hot paths moves behind `--key-sizes` (off by
-  default, §10.5) in a separately loaded variant object (§8.6), the
-  §12.3 gate becomes the opt-in's acceptance, and family (§4),
+  default, §10.5) in extra journal-object programs loaded and
+  linked only with the flag (§8.6), the §12.3 gate becomes the
+  opt-in's acceptance, and family (§4),
   creation (§6) and Task 7 info (§17) stay on by default.
 
 ## 3. Provenance vocabulary: every fact carries its source
@@ -311,8 +333,8 @@ infer nothing.
 
 This whole section is the `--key-sizes` opt-in (owner 08:50,
 §15 K7, flag §10.5): every capture protocol below (§5.1) runs
-only when the flag is on, in the separately loaded length-variant
-object (§8.6). With the flag off no length word is acquired on
+only when the flag is on, in the journal length programs (§8.6).
+With the flag off no length word is acquired on
 any path, and `inferred_size` from lengths is absent (§9, §10.2).
 The maps (§5.2), the closed non-map list (§5.3) and the join
 rules (§5.4) are unchanged — they just never see evidence when
@@ -324,11 +346,14 @@ Arguments are zero-based. LP64: 8-byte words, args 0–5 in registers,
 arg 6 at entry SP+8 (existing `target_stack_arg_address` helper).
 ia32: 4-byte words on the stack, zero-extended after a successful
 four-byte read, high-bit refusal. All indices are ≤ 6: no new
-argument-7 exception is needed. FULL builds with `--key-sizes`
-only: the length adapters live in the separately loaded variant
-object (§8.6), so without the flag there is no length code on any
-loaded path at all (stronger than the `KEM_CAPTURE_WIRED`
-FULL/P0 split — P0 also refuses the flag, §10.5). No length-cell
+argument-7 exception is needed. FULL journal builds with
+`--key-sizes` only: the length adapters compile into the journal
+length programs only (§8.6), so without the flag there is no
+length code on any loaded path at all — and aya verifies only
+loaded programs, so the length code is never even verified
+without the flag (stronger than the `KEM_CAPTURE_WIRED`
+FULL/P0 split — the P0 journal flavor omits the length programs
+and P0 refuses the flag, §10.5). No length-cell
 pointer is retained beyond its matching call; every
 terminal/loss/cancellation/exec/teardown path clears it, exactly
 like the result-handle pointer row.
@@ -638,10 +663,10 @@ creation calls are cold (not hot per-call paths), the R2 reads
 ride the existing creation adapters, and no `--key-sizes` is
 needed to see them. The R2 BPF delta is finite-set const data on
 those cold paths; the §12.1 off-mode identity twin pins the
-standard programs' verifier counts equal to today's pins, and if
-the Task 1 lane cannot hold that pin it moves its BPF delta into
-a cold creation variant (§8.6 rule) instead of growing the
-standard programs.
+journal programs' verifier counts equal to today's pins, and if
+the Task 1 lane cannot hold that pin it restructures its delta
+(dedicated tables, no shared-helper growth — §8.6 rule) instead
+of moving the journal pins.
 
 ## 7. Other cheap facts, ranked by value/cost
 
@@ -690,7 +715,7 @@ Task 6 verifies the inheritance on one no-manifest `--system` run
 reports the row gap, if any, back to keyrows instead of working
 around it here.
 
-## 8. BPF design: evidence-only trailers (no object-lane contact)
+## 8. BPF design: evidence-only trailers (no descriptor contact)
 
 ### 8.1 Evidence positions (separate table — zero descriptor churn)
 
@@ -708,24 +733,26 @@ Evidence positions live in a SEPARATE frozen table,
 `crates/ebpf-common/src/evidence_table.rs`, keyed by function
 ordinal, exact-count test pins 14 rows): each row names
 `length_cell_arg` / `length_scalar_arg` (`ARG_NONE` when unused)
-and, for Task 7, the info kind + read ranges (§17.1). The 14 rows:
+and, for Task 7, the info kind + read ranges (§17.1). The table
+names positions only; record forms live in §8.3 (length) and
+§17.4 (info). The 14 rows:
 
-| Function | Existing record (unchanged base) | Evidence trailer |
+| Function | Evidence position | Record carrying the trailer |
 | --- | --- | --- |
-| `C_Sign` | ordinary 368 (key comes from the Init receipt, §9) | length, S-cell arg 4 |
-| `C_SignRecover` | ordinary 368 | length, S-cell arg 4 |
-| `C_SignFinal` | ordinary 368 | length, S-cell arg 2 |
-| `C_Verify` | ordinary 368 | length, V-scalar arg 4 |
-| `C_VerifyFinal` | ordinary 368 | length, V-scalar arg 2 |
-| `C_Encrypt` | ordinary 368 | length, S-cell arg 4 |
-| `C_Decrypt` | ordinary 368 | length, V-scalar arg 2 |
-| `C_WrapKey` | object 608 (inputs 2, 3; Access kept) | length, S-cell arg 5 |
-| `C_UnwrapKey` | object 608 (input 2, result 7, template (5, 6); Unwrap kept) | length, V-scalar arg 4 |
-| `C_EncapsulateKey` | object 608 (input 2, result 7; Encapsulate kept) | length, S-cell arg 6 |
-| `C_DecapsulateKey` | object 608 (input 2, result 7; Decapsulate kept) | length, V-scalar arg 6 |
-| `C_GetInfo` | ordinary 368 | info, pointer arg 0 (§17) |
-| `C_GetTokenInfo` | ordinary 368 | info, slot scalar 0 + pointer arg 1 (§17) |
-| `C_GetMechanismInfo` | ordinary 368 | info, slot scalar 0 + mechanism scalar 1 + pointer arg 2 (§17) |
+| `C_Sign` | length, S-cell arg 4 (key comes from the Init receipt, §9) | journal END + 16-B length trailer (§8.3) |
+| `C_SignRecover` | length, S-cell arg 4 | journal END + 16-B length trailer (§8.3) |
+| `C_SignFinal` | length, S-cell arg 2 | journal END + 16-B length trailer (§8.3) |
+| `C_Verify` | length, V-scalar arg 4 | journal END + 16-B length trailer (§8.3) |
+| `C_VerifyFinal` | length, V-scalar arg 2 | journal END + 16-B length trailer (§8.3) |
+| `C_Encrypt` | length, S-cell arg 4 | journal END + 16-B length trailer (§8.3) |
+| `C_Decrypt` | length, V-scalar arg 2 | journal END + 16-B length trailer (§8.3) |
+| `C_WrapKey` | length, S-cell arg 5 (Access inputs 2, 3 kept) | journal END + 16-B length trailer (§8.3) |
+| `C_UnwrapKey` | length, V-scalar arg 4 (input 2, result 7, template (5, 6); Unwrap kept) | journal END + 16-B length trailer (§8.3) |
+| `C_EncapsulateKey` | length, S-cell arg 6 (input 2, result 7; Encapsulate kept) | journal END + 16-B length trailer (§8.3) |
+| `C_DecapsulateKey` | length, V-scalar arg 6 (input 2, result 7; Decapsulate kept) | journal END + 16-B length trailer (§8.3) |
+| `C_GetInfo` | info, pointer arg 0 (§17) | inventory info record; journal END + 128-B info trailer under `--key-operations` (§17.4) |
+| `C_GetTokenInfo` | info, slot scalar 0 + pointer arg 1 (§17) | inventory info record; journal END + 128-B info trailer under `--key-operations` (§17.4) |
+| `C_GetMechanismInfo` | info, slot scalar 0 + mechanism scalar 1 + pointer arg 2 (§17) | inventory info record; journal END + 128-B info trailer under `--key-operations` (§17.4) |
 
 The `C_UnwrapKey` creation template (5, 6) stays acquired by the
 existing Unwrap adapter and stays authorized exactly as today
@@ -733,12 +760,13 @@ existing Unwrap adapter and stays authorized exactly as today
 and nothing in this design removes or re-gates it. Evidence rows
 carry no template pairs (T0-style: never authorized).
 
-Variant mapping (mechanism in §8.6): the 11 length rows link the
-length-variant object iff `--key-sizes` is on, else the standard
-programs exactly as today; the 3 info rows link the info variants
-in the standard object (default-on, §17.4). The table above names
-positions, never programs: which program runs at a position is an
-attach-time routing decision.
+Variant mapping (mechanism in §8.6, §17.4): the 11 length
+rows link the journal length programs iff `--key-sizes` is on,
+else the base journal pair exactly as today; the 3 info rows
+link the inventory info pair in default inventory and the journal
+info programs under `--key-operations` (default-on, §17.4). The
+table above names positions, never programs: which program runs
+at a position is an attach-time routing decision.
 
 Non-interference (why the four B7 pins stand — Task 2 re-runs
 each as a twin, §12.1):
@@ -752,8 +780,9 @@ each as a twin, §12.1):
   calls stay Neutral, Wrap/Unwrap/KEM stay modeled exactly as
   today. The no-tail path (`journal.rs:3127-3138`) is unchanged:
   evidence endpoints still produce no object row
-  (`tail_absent`, `object_journal.rs:361`), and trailers are
-  outside the journal payload.
+  (`tail_absent`, `object_journal.rs:361`), and trailers ride
+  outside the 608-byte payload (appended to the END record,
+  §8.3).
 - Journal census: `journal_class_for_descriptor` consults
   `endpoint_class` only (`attach/journal.rs:275-285`), so the
   pinned `[0,19,79,6]` (`attach/journal.rs:316-333` test) is
@@ -771,8 +800,8 @@ each as a twin, §12.1):
 ### 8.2 Adapters
 
 `adapter_length_entry` (shared source, host-tested with injected
-readers; BPF bindings compile into the length-variant object only,
-§8.6 — never into the standard entry/return programs):
+readers; BPF bindings compile into the journal length programs
+only, §8.6 — never into the base journal pair):
 V-scalars snapshot via `arg_u64` (LP64 regs / ia32 stack /
 LP64 arg 6 via the existing SP+8 helper); S-cells retained with the
 §5.1 entry guards (null → no retention; entry capacity read with
@@ -789,72 +818,87 @@ entry adapters still acquire their §8.1 existing positions
 (inputs, result pointers, the unwrap template), and the length
 adapters compose onto the same calls for the length positions only
 (the KEM entry adapter is NOT forked either). (There is no
-FULL/P0 runtime gate inside the adapters any more: the whole
-length path is absent unless the variant object loads, §8.6.)
+FULL/P0 runtime gate inside the adapters: the whole length path
+is absent unless the length programs load, §8.6.)
 
-Retention, split by object (still no new map KIND — each object
-carries its own instances of the two existing in-flight maps):
-the length-variant object carries its own `START`/`OBJECT_START`
-instances whose rows carry the evidence stash (`CallStart` +16 B:
-`ev_cell: u64` — retained S-cell pointer or V-scalar snapshot —
-plus `ev_kind: u8` and 7 pad bytes; `ObjectStart` +24 B:
-`length_cell: u64`, `length_scalar: u64`, `length_status: u8`, 7
-pad bytes; +256 KiB / +384 KiB worst case at 16384 entries — all
-reserved only when the variant object loads). The standard
-object's `OBJECT_START` is untouched; its `START` (`CallStart`)
-gains the same +16 B row ONLY for the Task 7 info-pointer stash
-(`ev_cell` = info pointer, §17.4 — cold retention, reservation
-cost only, zero per-call traffic delta at non-info endpoints).
-Every terminal/loss/cancellation/exec/teardown path clears the
-stash, exactly like the result-handle pointer row. Emission is
-reserve-and-fill (never stack-built), one record per completed
-call: base + trailer (§8.3).
+Retention (no shared row grows — still no new map KIND): the
+journal object gains one dedicated stash map, `EVIDENCE_START`
+(`HashMap<StartKey, EvidenceStart>`, 16384 entries, existing
+kinds only), used solely by the length programs (Task 2) and the
+journal info programs (Task 7, §17.4 — length and info endpoint
+sets are disjoint, so one map with an `ev_kind` tag serves both
+with no collision). Row: `ev_cell: u64` (retained S-cell pointer,
+V-scalar snapshot, or info pointer) plus `ev_kind: u8` and 7 pad
+bytes — 16 B, +256 KiB worst case at 16384 entries, reservation
+cost only with the flag off (no shared `START`/`OBJECT_START` row
+changes shape, so the base journal programs' verifier counts are
+untouched by construction). Every terminal/loss/cancellation/
+exec/teardown path clears the stash, exactly like the
+result-handle pointer row. Emission is reserve-and-fill (never
+stack-built): one END per completed call, base END + trailer
+(§8.3). The inventory info pair keeps its own stash map and ring
+(§17.4), never this one.
 
-### 8.3 Wire: trailer forms and sizes
+### 8.3 Wire: trailer forms on the journal END records
 
-Five exact record forms; dispatch is by exact length only:
+`--key-sizes` only works with `--key-operations`, and that mode
+loads the journal object (`src/attach.rs` journal selection,
+`src/attach/journal.rs:9-19`), where each call produces journal
+BEGIN (224 B) and END (632 / 472 B) records
+(`object_journal.rs:33-38`) — never 368/608 CALL records. Length
+trailers therefore ride the journal END forms. Six exact END
+lengths; dispatch is by exact length only (BEGIN 224 B is never
+trailered):
 
 | Form | Bytes | Layout |
 | --- | --- | --- |
-| ordinary | 368 | `EventRecord` (unchanged; `lib.rs:2507` assert) |
-| ordinary+length | 384 | 368 + 16-byte length trailer (`version: u16`, `kind: u8`, `status: u8`, `value: u64`, 4 reserved bytes) |
-| ordinary+info | 496 | 368 + 128-byte info trailer (§17.4) |
-| object | 608 | `EventRecord` + 240-byte v1 tail (UNCHANGED — `OBJECT_CALL_VERSION` stays 1, the `object_wire.rs:363` check and the v1 validator are byte-identical) |
-| object+length | 624 | 608 + the same 16-byte length trailer |
+| END full | 632 | `JournalEndFull`: 24-B header + 608-B payload (UNCHANGED — `JOURNAL_VERSION` stays 1, `validate_end` accepts it exactly as today) |
+| END compact | 472 | 24-B header + 448-B compact payload (UNCHANGED) |
+| END+length full | 648 | 632 + 16-byte length trailer (`version: u16`, `kind: u8`, `status: u8`, `value: u64`, 4 reserved bytes) |
+| END+length compact | 488 | 472 + the same 16-byte length trailer |
+| END+info full | 760 | 632 + 128-byte info trailer (§17.4) |
+| END+info compact | 600 | 472 + the same 128-byte info trailer (§17.4) |
 
-The length-variant programs emit the trailer form at their
+No END ever carries both trailers: length and info endpoint sets
+are disjoint, so each END carries at most one. The 608-B payload
+slice of a trailered END validates under the unchanged v1
+validator (full) or the unchanged compact reconstruction
+(compact); the header `length` field carries the total record
+bytes (the existing pattern: 632/472 today, 648/488/760/600 with
+trailers). The 368/608 ordinary/object CALL forms are untouched —
+keymeta adds no trailer to any non-journal record.
+
+The journal length programs emit the trailer form at their
 endpoints on every completed call (the status field marks
-unavailable shapes); the standard programs always emit the base
-form there, so with the flag off every length endpoint yields
-only 368/608-byte records exactly as today (§8.6 identity
-contract). P0 builds carry no variant object and refuse the flag
-(§10.5). Length-based dispatch (`object_record_form`,
-`object_wire.rs:614-633`, plus its userspace mirror
-`decode_object_record`, `src/events.rs:294-313`) gains the exact
-lengths 384/496/624; every other length stays malformed. The
-trailer validates against `EVIDENCE_POSITIONS` (exact version +
-kind, function-matched row, zero reserved); the object-tail slice
-`bytes[368..608]` still validates under the unchanged v1
-validator. Old readers refuse the new lengths loudly (no silent
-misparse). The `object_producer_compiled_frames_are_bounded`
-512-byte frame test must pass unmodified in limit (frames are
-adapter code, and records are reserve-filled, never stack-built;
-if frames do not fit, the lane stops and reports — no silent
-bound raise).
+unavailable shapes); the base journal pair always emits the
+base END there, so with the flag off every length endpoint yields
+only 632/472-byte ENDs exactly as today (§8.6 identity
+contract). The P0 journal flavor omits the length programs and
+P0 refuses the flag (§10.5). Length-based dispatch
+(`decode_journal_record` / `validate_end`,
+`object_journal.rs`, plus its userspace mirror in the
+`src/events.rs` poll dispatch) gains the exact lengths
+648/488/760/600; every other length stays malformed. The trailer
+validates against `EVIDENCE_POSITIONS` (exact version + kind,
+function-matched row, zero reserved). Old readers refuse the new
+lengths loudly (no silent misparse). The
+`object_producer_compiled_frames_are_bounded` 512-byte frame test
+must pass unmodified in limit (frames are adapter code, and
+records are reserve-filled, never stack-built; if frames do not
+fit, the lane stops and reports — no silent bound raise).
 
-No new map kinds, no new arg-7 exception (all indices ≤ 6, §5.1).
-Attach/plan: +0 newly probed functions and +0 endpoints — all 14
-evidence endpoints already carry S1 probes (info:
-`kinds.rs:184-191`; length: `kinds.rs:274-308`). The length cost
-is per-call bytes on already-hot endpoints (368→384 on `C_Sign`/
-`C_Encrypt`/`C_Decrypt` et al; 608→624 on Wrap/Unwrap/KEM —
-+16 B each: +4.3% / +2.6%, ≈ +160 kB/s ring per hot endpoint at
-10k calls/s) plus the variant-object in-flight rows (§8.2) —
-paid ONLY with `--key-sizes`, and sized by the ring-loss gate
-(§12.3, now the opt-in's acceptance), not by endpoint count. The 8192 slot budget
-is unchanged. Info cost (default-on): 368→496 on the three rare
-info calls plus the cold info-pointer stash — §17.4 sizes it as
-negligible and it never touches a hot program (§8.6).
+No new map kinds (`EVIDENCE_START` is a `HashMap`), no new arg-7
+exception (all indices ≤ 6, §5.1). Attach/plan: +0 newly
+probed functions, +0 endpoints, +0 links — the length programs
+substitute the journal pair at already-linked endpoints (§8.6).
+The length cost is per-call bytes on already-hot endpoints
+(END 632→648 / 472→488, BEGIN unchanged at 224 — +16 B each:
++2.5% / +3.4%, ≈ +160 kB/s ring per hot endpoint at 10k
+calls/s) plus the `EVIDENCE_START` reservation (§8.2) — paid
+ONLY with `--key-sizes`, and sized by the ring-loss gate (§12.3,
+now the opt-in's acceptance), not by endpoint count. The 8192
+slot budget is unchanged. Info cost (default-on) is sized in
+§17.4 and never touches a hot program (§8.6).
 
 ### 8.4 Authority: no decoder-read-set change (no condition-(c) edit)
 
@@ -869,123 +913,140 @@ with a named reason at that entry and never refuses the provider
 "per-entry-optional length descriptors" split is deleted: there is
 nothing to gate, because no entry is added. A provider with NULL
 `C_SignRecover` keeps working exactly as today (no evidence at a
-NULL entry — the entry does not exist). Variant selection (§8.6)
-changes no entry gating either: the same admitted endpoints link
-a different program, under the same admission rules.
+NULL entry — the entry does not exist). Variant selection (§8.6,
+§17.4) changes no entry gating either: the same admitted
+endpoints link a different program (length: substitution; info:
+entry substitution plus the §17.4 return links at already-
+admitted endpoints), under the same admission rules.
 
 ### 8.5 Verifier and size budget
 
 Per changed program: ≥5% verifier headroom on the 6.6 floor (R-52
 precedent), `object_producer_compiled_frames_are_bounded` green,
-`bpf-noninterference` baseline unchanged (no new map kinds, no new
-hook sites, no new endpoints — all 14 evidence endpoints ride
-their existing probes), `bpf loads` on vng 6.6/6.12 + host 7.x,
-LP64 + ia32 load cells. The 6.1 E2BIG-style refusal precedent
-applies: if a floor kernel refuses, the lane reports the named
-refusal instead of simplifying the program.
+`bpf loads` on vng 6.6/6.12 + host 7.x, LP64 + ia32 load cells.
+The 6.1 E2BIG-style refusal precedent applies: if a floor kernel
+refuses, the lane reports the named refusal instead of
+simplifying the program. The dedicated maps (`EVIDENCE_START`,
+the §17.4 info stash + ring) and the 3 cold info return hook
+sites (§17.4) go through the `bpf-noninterference` allowed-change
+record (`scripts/bpf-noninterference-allowed.json`, reviewed) —
+never a silent baseline move, and no hot-path contact.
 
-Standard programs (flag off): their verifier counts are pinned
-EQUAL to today's cells in `tests/bpf-verifier-budgets.json` — the
-Task 2/7 lanes must not re-pin them. Today's hot pins (processed
-insns, 115%-margined; limit 1,000,000): `detailed/p11_entry` max
-323,799 (32.4%; 6.6 floor 97,593), `detailed/p11_return` max
-175,663 (17.6%; 6.6 floor 77,950). The §12.1 identity contract
-enforces the equality; if the Task 1 const delta or the Task 7
-`CallStart` growth perturbs a standard count, that lane moves its
-retention to a dedicated map/object (§8.6 fallbacks) instead of
-re-pinning.
+Base programs (flag off): their verifier counts are pinned EQUAL
+to today's cells in `tests/bpf-verifier-budgets.json` — the Task
+2/7 lanes must not re-pin them. Today's journal pins (processed
+insns, 115%-margined; limit 1,000,000):
+`journal-gate1/p11_entry_journal` max 390,605 (39.1%; 6.6 floor
+145,313), `journal-gate1/p11_return_journal` max 186,862 (18.7%;
+6.6 floor 95,914). Today's inventory pins:
+`inventory/p11_usage_entry_lp64` and
+`inventory/p11_usage_entry_ia32`, max 1,025 each. The §12.1
+identity contract enforces the equality; keymeta adds no program
+to the Detailed object, so the `detailed/*` cells are out of
+scope (untouched, never re-pinned by a keymeta lane). If a lane's
+delta perturbs a pinned count, that lane restructures its delta
+(dedicated tables/maps, no shared-helper or shared-row growth —
+§8.6 rule) instead of re-pinning.
 
-Variant programs (flag on / info): each linked variant gets its
+New programs (flag on / info): each linked new program gets its
 own budget cell per measured kernel in
 `tests/bpf-verifier-budgets.json`, recorded via
 `scripts/record-verifier-budgets.py` (same 115% margin rule):
-`detailed/p11_entry_length`, `detailed/p11_return_length`,
-`detailed/p11_entry_info`, `detailed/p11_return_info` (plus gate1
-rows if those flavors link them — every linked variant on every
-measured kernel gets a cell; ia32 entry counterparts follow the
-`p11_entry_ia32` precedent, which carries no cell today but must
-still pass the LP64+ia32 `bpf loads` cells). BUD-1 applies to
-every new cell: any pin past 750,000 (75% of the 1M limit) is
-refused — growth past 75% needs restructuring, never a
-mechanical pin — and the 95% budgets-cap contract still
-enforces the file. The variants share helpers with the standard
+`journal-gate1/p11_entry_journal_length`,
+`journal-gate1/p11_return_journal_length` (mixed-ABI like the base
+journal pair — no separate ia32 program, following the
+journal-roots precedent), `journal-gate1/p11_entry_journal_info`,
+`journal-gate1/p11_return_journal_info` (§17.4), plus
+`inventory/p11_info_entry_lp64`,
+`inventory/p11_info_entry_ia32`, `inventory/p11_info_return`
+(§17.4, per-ABI entries following the usage-entry precedent).
+Every linked new program on every measured kernel gets a cell.
+BUD-1 applies to every new cell: any pin past 750,000 (75% of
+the 1M limit) is refused — growth past 75% needs restructuring,
+never a mechanical pin — and the 95% budgets-cap contract still
+enforces the file. The new programs share helpers with the base
 programs plus the §8.2 adapters, so their pins will sit above
-today's hot pins; the acceptance is recorded cells, every cell
-under 750,000, and ≥5% headroom on the 6.6 floor. The variant
-object's own `frames_are_bounded` 512-byte frame check must pass
-with the limit unmodified.
+today's pins; the acceptance is recorded cells, every cell under
+750,000, and ≥5% headroom on the 6.6 floor. The
+`frames_are_bounded` 512-byte frame check must pass with the
+limit unmodified.
 
-### 8.6 Opt-in variants: separate objects selected at load time
+### 8.6 Opt-in: extra programs in the same journal object
 
 Rule (owner 08:50): no keymeta length instruction executes in a
-standard program, and no runtime branch inside a hot program
-selects length behavior. Length capture lives in SEPARATE
-programs in a SEPARATELY LOADED object; attach-time routing
-decides which program links at each endpoint.
+base program, and no runtime branch inside a hot program selects
+length behavior. Length capture lives in EXTRA programs in the
+SAME journal object, sharing every map, the ring and the journal
+state; attach-time routing decides which program links at each
+endpoint, and userspace loads and links the length programs only
+when `--key-sizes` is on (aya verifies only loaded programs, so
+with the flag off the length code is never even verified).
 
-Objects and programs (names are this design's; the lane keeps
-them unless the integrator renames):
+Programs (names are this design's; the lane keeps them unless
+the integrator renames), all in the one journal object:
 
-- Standard Detailed object (as today, always loaded): the
-  standard `p11_entry` / `p11_entry_ia32` / `p11_return`
-  programs with today's code, plus the Task 7 info variants
-  `p11_entry_info` / `p11_return_info` (default-on, linked ONLY
-  at the 3 cold info endpoints, §17.4). The standard programs'
-  code is untouched: the variants are new entry points sharing
-  helpers (the `p11_entry_ia32` precedent), never edits inside
-  `p11_entry`/`p11_return`.
-- Length-variant object (new build flavor, FULL only): the
-  length entry/return programs `p11_entry_length` /
-  `p11_return_length` (+ ia32 entry counterpart) with their own
-  `START`/`OBJECT_START` map instances and their own ring
-  (§8.2). It is embedded beside the standard object (the
-  diagnostic/small/wide/inventory/counter flavor precedent in
-  `build.rs`) and loaded into the kernel ONLY when
-  `--key-sizes` is on. P0 builds carry no length object and
-  refuse the flag (§10.5).
+- Base pair (as today): `p11_entry_journal` /
+  `p11_return_journal` with today's code, untouched. The base
+  programs never reference the length adapters or the
+  `EVIDENCE_START` stash (§8.2).
+- Length pair (FULL journal flavor only):
+  `p11_entry_journal_length` / `p11_return_journal_length`,
+  mixed-ABI like the base pair. They run the same journal
+  BEGIN/END protocol as the base pair (same sequence, same
+  BEGIN/END pairing, same per-session call order, same `STATS`,
+  `RV_COUNTS`, `CONFIG`, filters, gates and loss counters —
+  nothing is split) and additionally run the §8.2 length
+  adapters, stashing into `EVIDENCE_START` and emitting the
+  END+length forms (§8.3).
+- Info pair (§17.4, default-on): `p11_entry_journal_info` /
+  `p11_return_journal_info`, same sharing rule, linked ONLY at
+  the 3 cold info endpoints.
+
+The P0 journal flavor omits the length programs (the SMALL
+flavor omits the whole journal object — the same flavor
+precedent in `build.rs`); P0 refuses `--key-sizes` with the
+named FULL-only reason (§10.5).
 
 Attach-time routing (Task 2, `src/attach.rs` group routing +
-planner mode input; `src/attach/journal.rs` and classification
-stay untouched): a multi-attach unit already pairs "one return
-link plus one entry link" per (attach path, entry program)
-(`attach.rs` static-group rule), so routing is per group, in
-both backends (multi and singles):
+`src/attach/journal.rs` program selection + planner mode input;
+classification stays untouched): a multi-attach unit already
+pairs "one return link plus one entry link" per (attach path,
+entry program) (`attach.rs` static-group rule), so routing is
+per group, in both backends (multi and singles):
 
 - Flag on (FULL): the 11 length-endpoint groups link the
-  length-variant entry/return pair (entry and return always as
-  a pair — a mixed pair would split the stash across objects
-  and is a planner bug, pinned by the routing twin); every
-  other non-info group links standard programs as today.
+  length pair (entry and return always as a pair — a mixed pair
+  would strand the stash and is a planner bug, pinned by the
+  routing twin); every other non-info group links the base pair
+  as today.
 - Flag off: every group EXCEPT the 3 cold info groups links
-  standard programs — the linked set at every hot endpoint is
-  exactly today's, the length-variant object never loads (no
-  verification, no maps, no ring, no floor-kernel refusal risk
-  from length code), and userspace drains only the standard
-  ring.
-- Both modes: the 3 info-endpoint groups link the info
-  variants (cold, default-on); no hot endpoint ever links a
-  non-standard program (pinned by the routing twin, §12.1).
+  the base pair — the linked set at every hot endpoint is
+  exactly today's, the length programs never load (no
+  verification, no floor-kernel refusal risk from length code),
+  and every length endpoint yields only base ENDs.
+- Both modes: the 3 info-endpoint groups link the info pair
+  (cold, default-on); with the flag off no endpoint links a
+  length program, and with the flag on no non-length endpoint
+  does (pinned by the routing twin, §12.1).
 
-Userspace drains the variant ring alongside the standard ring
-when the variant object loads; completed-call records are
-self-contained (no entry/return pairing, §9), so the two
-streams need no merge order. The lane sizes the variant
-object's maps/rings and records its on-disk bytes; growth
-there is flag-gated cost, sized by the §12.3 gate.
+Length evidence rides the END record of the call it measures,
+so the evidence itself needs no cross-record pairing — but
+session order still comes from the shared journal sequence
+(the operation machine's cross-call order within a session is
+unchanged, because the length programs share the journal state
+rather than splitting it).
 
 Off-mode identity (the §12.1 contract proves each, none is
 assumed): per-endpoint record bytes identical to the no-length
-baseline (368/608 forms only, byte-identical `EventRecord`s);
-linked program set at hot endpoints exactly today's; standard
+baseline (224/632/472 forms only, byte-identical BEGIN/ENDs);
+linked program set at hot endpoints exactly today's; journal
 verifier counts equal today's budget cells (§8.5 — the lanes
 must not re-pin them); journal classification, census,
 sole-complete set and alias agreement byte-identical (the four
 existing pins); ring bytes/s at the gate workload equal to the
-baseline. Fallbacks if a default-on lane cannot hold the
-standard-count pin: Task 7 info retention moves from the shared
-`CallStart` row to a dedicated info map (with a baseline update
-+ review), and any Task 1 BPF code delta moves to a cold
-creation variant — the standard counts never move.
+baseline. If a lane cannot hold a pinned count it restructures
+its delta (dedicated tables/maps, no shared-helper or
+shared-row growth) instead of re-pinning — the pins never move.
 
 ## 9. Userspace join (N5 decided)
 
@@ -999,11 +1060,14 @@ length trailer unclassified (`size_inference_off`, §5.4 — a
 stale or replayed trailer can never classify), while family
 evidence joins in both modes. The binding path, end to end:
 
-1. The completed-call record (base + length trailer, one record —
-   no pairing) decodes in `src/events.rs` (`decode_object_record`
-   extended with 384/624); the trailer's evidence rides the
-   record into `OpMachine` with (generation, fixed `KeyReceipt`,
-   `mechanism: Option<u64>`).
+1. The journal END (base + length trailer, one record)
+   dispatches in `src/events.rs` (gains 648/488/760/600) and
+   validates in `decode_journal_record` / `validate_end`
+   (`object_journal.rs`, co-owned with keyrows, §13); the
+   BEGIN/END pairing (`ingest_end`, keyed by (thread,
+   sequence)) is unchanged, and the trailer's evidence rides
+   the validated END into `OpMachine` with (generation, fixed
+   `KeyReceipt`, `mechanism: Option<u64>`).
 2. Init-based operations (Sign/Verify/Encrypt/Decrypt + Finals):
    `OperationEffect::Ended` (today: id, category, outcome, origin
    — `semantics_edge.rs:347-352`) gains (generation, receipt,
@@ -1031,7 +1095,10 @@ evidence joins in both modes. The binding path, end to end:
    PENDING, corroboration-mismatch and over-estimate-query
    controls are §12 twins.
 
-Files: `src/events.rs` (trailer decode), `src/semantics_edge.rs`
+Files: `src/events.rs` (journal dispatch), `object_journal.rs`
+(trailer validation + accessor, co-owned with keyrows, §13),
+`src/semantics_objects/journal.rs` (trailer carry through
+`ingest_end`/`completed_of`), `src/semantics_edge.rs`
 (machine corroboration slot + both effects carry evidence),
 `src/semantics_key_use.rs` (row accumulation, parking, compat),
 `src/key_operation_projection.rs` (row keys + render),
@@ -1197,8 +1264,9 @@ One flag (owner 08:50, §15 K7), on `p11scope inventory` beside
   without it the CLI refuses with `--key-sizes requires
   --key-operations` (the same refusal shape as `--key-operations
   requires --capture auto or native`, `cli.rs:2179-2183`).
-  Under P0 builds (no length-variant object, §8.6) it refuses
-  with a named FULL-only reason. Default off.
+  Under P0 builds (the P0 journal flavor omits the length
+  programs, §8.6) it refuses with a named FULL-only reason.
+  Default off.
 - Help/usage text (added beside the `--key-operations` line,
   `cli.rs:828` style; exact wording pinned by a twin):
   `--key-sizes also infers key sizes from operation lengths
@@ -1214,8 +1282,9 @@ One flag (owner 08:50, §15 K7), on `p11scope inventory` beside
   `size_inference_off`, §10.2); `-v` prints the one-line hint
   (§10.3). Task 7 provider/token/mechanism info is unaffected
   by the flag (§17.7).
-- What the flag adds: the length-variant object loads (§8.6),
-  length trailers flow, and `inferred_size` classifies per §5.2
+- What the flag adds: the journal length programs load and link
+  (§8.6), length trailers flow, and `inferred_size` classifies
+  per §5.2
   (concise `probably RSA 2048` tallies, §10.3). Family,
   creation and token-reported output are identical in both
   modes (pinned by the §12.1 mode twins).
@@ -1309,20 +1378,20 @@ New section body (normative):
 >
 > Length capture is opt-in (owner 08:50, §15 K7): the length words
 > above are acquired only under `--key-sizes` (valid only with
-> `--key-operations`, off by default), in the separately loaded
-> length-variant object (§8.6) — never in the standard hot
-> programs. Without the flag no length word is acquired on any
-> path, and family, creation-template and token-reported facts are
-> still published as above.
+> `--key-operations`, off by default), in extra journal-object
+> programs loaded and linked only with the flag (§8.6) — never
+> in the base journal pair. Without the flag no length word is
+> acquired on any path, and family, creation-template and
+> token-reported facts are still published as above.
 >
 > Required evidence before activation: the §12 twin tables (host
 > RED/GREEN at the journal seam, hostile-width, overlap/alias,
 > 2041-bit and DER/padding negative controls), the §12.1 off-mode
 > identity contract (byte-identical records, same linked set,
-> pinned standard counts), canary lanes with length-cell sentinel
+> pinned journal counts), canary lanes with length-cell sentinel
 > positions on every §5.1 shape (LP64+ia32) proving no payload byte
 > reaches output/maps/logs, verifier headroom + `bpf loads` for
-> standard AND variant programs (§8.5), full `artifact_contracts`,
+> base journal AND length programs (§8.5), full `artifact_contracts`,
 > and the Task 5 live matrix (Firefox/Chromium/pkcs11-tool/OpenSSL
 > provider, ≥5 runs each, 6.6+).
 
@@ -1382,22 +1451,23 @@ Non-interference twins (B7): journal census `[0,19,79,6]`
 re-run green, sole-complete test re-run green, alias-agreement
 twin (`C_Verify`/`C_VerifyFinal` still agree), journal-class
 snapshot (info still irrelevant, length still neutral),
-dispatch twins (384/496/624 accept, neighbors malformed, old
-lengths unchanged).
+dispatch twins (648/488/760/600 accept, neighbors malformed, old
+lengths — 224/632/472/368/608 — unchanged; 152-B info records
+dispatch on the INFO drain).
 Off-mode identity contract (§8.6, one `artifact_contracts` case
 plus host twins): with `--key-sizes` off on the scripted gate
 workload — every length-endpoint record is the base form
-(368/608, never 384/624) with byte-identical `EventRecord`s vs
-the no-length baseline; the attach plan links standard programs
-at every group except the 3 cold info groups (pinned name list =
-today's set there; the length-variant object never loads —
-asserted, not assumed); standard verifier counts equal today's
-budget cells (no re-pin); ring bytes/s equal the baseline. Routing twins: flag on → the 11
-length-endpoint groups link the variant pair (entry+return
+(632/472 ENDs, never 648/488) with byte-identical BEGIN/ENDs vs
+the no-length baseline; the attach plan links the base journal
+pair at every group except the 3 cold info groups (pinned name
+list = today's set there; the length programs never load —
+asserted, not assumed); journal verifier counts equal today's
+`journal-gate1/*` cells (no re-pin); ring bytes/s equal the
+baseline. Routing twins: flag on → the 11
+length-endpoint groups link the length pair (entry+return
 always paired — a mixed-pair plan is refused), all other
-non-info groups link standard programs, and no hot endpoint
-ever links a non-standard program in either mode (both
-backends).
+non-info groups link the base pair; with the flag off no
+endpoint links a length program (both backends).
 Mode twins (Task 3): flag off → `inferred_size` always
 `unknown`/`size_inference_off`, family/creation/token-reported
 output identical to flag-on output minus sizes, `-v` hint line
@@ -1425,7 +1495,7 @@ AES-GCM canary: a GCM encrypt of sentinel plaintext publishes no
 length anywhere (the captured word is dropped unclassified, §5.3).
 The positive control proves the scanner sees planted length values.
 The lane runs both modes: flag on (positions active, above) and
-flag off (no 384/624 record emitted, no length value published
+flag off (no 648/488 record emitted, no length value published
 anywhere — the off-mode canary is a negative control).
 
 ### 12.3 Gates and live proof (Task 5)
@@ -1437,8 +1507,9 @@ loads, public-CLI cells. Per-call overhead + ring-loss gate — now the OPT-IN's
 (Task 2 measures, Task 5 re-runs on the candidate): scripted
 `C_Encrypt` AES-GCM and `C_Sign` at 5k and 10k calls/s each, in
 three configurations: no-lane baseline, flag off, flag on.
-Record per-call ns delta, ring bytes/s (base vs 384/624-byte
-forms), and ring-loss counts. Flag off must EQUAL the baseline
+Record per-call ns delta, ring bytes/s (224/632/472-byte journal
+forms vs 648/488-byte trailer forms), and ring-loss counts. Flag
+off must EQUAL the baseline
 on all three (the identity contract, §12.1 — any delta stops the
 lane). Flag on passes if loss at 5k calls/s stays zero and loss
 at 10k calls/s does not regress vs the baseline (numbers
@@ -1476,7 +1547,7 @@ One DAG (keyrows plan `4cca0dd88`; keymeta tasks are this plan):
 keyrows T0 ──► keyrows T1 ──► keymeta T1 ──► keyrows T3 ──► keyrows T4 ──► keymeta T3 ──► keymeta T7 ──► keymeta T6
                   │                │                                                     ▲
                   │                └────► keymeta T2 ────────────────────────────────────┘
-                  │                   (variants + flag + routing; wire base for T3/T7)
+                  │                   (journal length programs + flag + routing; wire base for T3/T7)
                   ▼
              keymeta T0 ──► Task 7 Step 0 (§17.3 allowlist block)
              (docs; independent of code order)
@@ -1488,11 +1559,21 @@ keymeta T5 (live proof) after keymeta T4 + keymeta T7 + keyrows T4 (yield needs
   rows AND facts; on+off matrix per app + Task 7 info positives, §17.6).
 ```
 
+Keyrows co-owns the two journal files keymeta T2/T7 touch
+(`object_journal.rs`, `journal_roots.rs` — keyrows' void/fence/
+birth/seal ride BEGIN/END): keymeta T2 rebases onto the keyrows
+T1 merge for those files, re-runs the keyrows journal twins on
+its merge, and keymeta T7 follows keymeta T2 on the same files
+(serialized, never parallel with keyrows journal work).
+
 The order is unchanged by the 08:50 opt-in (round 7): Task 2
-produces the variants, the flag and the attach-time routing
-before Task 3 consumes the flag for join gating and rendering,
-which is already the T2→T3 direction above. No new edge, no new
-task — only wider node contents (plan Tasks 2/3/4/5/7).
+produces the length programs, the flag and the attach-time
+routing before Task 3 consumes the flag for join gating and
+rendering, which is already the T2→T3 direction above. No new
+edge, no new task — only wider node contents (plan Tasks
+2/3/4/5/7). Round 8 keeps the same edges: R1/R2 change node
+contents (same-object programs, END trailers, inventory info
+pair) and the file table below, not the order.
 
 Why this order: keymeta Task 1 edits `state.rs`,
 `semantics_key_use.rs` and `semantics_objects/journal.rs` — the
@@ -1501,12 +1582,16 @@ same files keyrows Tasks 0, 1, 3 and 4 edit (keyrows plan
 so the old "disjoint files" claim is dropped and the merge
 serializes. Keymeta T1 lands between keyrows T1 and T3 (its R2
 hunks are small and region-disjoint; keyrows T3 rebases over them
-and re-runs). Keymeta T2 (ebpf-common evidence table/trailers,
-variant object flavor, `CallStart`, `src/events.rs` dispatch,
-`--key-sizes` flag parse/refusal/help in `src/cli.rs`, attach-time
-routing in `src/attach.rs` + planner mode input) is file-disjoint
-from keyrows except the CLI/planner inputs (integrator checks
-keyrows writers there at merge) but consumes the T1 base (shared
+and re-runs). Keymeta T2 (ebpf-common evidence table, journal END
+trailers in `object_journal.rs`, journal length programs in
+`journal_roots.rs` — both co-owned with keyrows, serialized per
+the note above — `EVIDENCE_START` stash map, `src/events.rs`
+journal dispatch, `--key-sizes` flag parse/refusal/help in
+`src/cli.rs`, attach-time routing in `src/attach.rs` +
+`src/attach/journal.rs` + planner mode input) is file-disjoint
+from keyrows except the CLI/planner inputs and the two co-owned
+journal files (integrator checks keyrows writers there at merge)
+but consumes the T1 base (shared
 `object_policy.rs`/`object_flow.rs`/`object_wire.rs` — one writer
 at a time, never parallel with T1). Keymeta T3 (join + v7 +
 projection + flag consumption: join gating, family-only default,
@@ -1522,19 +1607,23 @@ twins on the merged SHA):
 
 | File | Ordered writers |
 | --- | --- |
-| `src/semantics_objects/journal.rs` | keyrows T0 → T1 → keymeta T1 → keyrows T3 |
+| `src/semantics_objects/journal.rs` | keyrows T0 → T1 → keymeta T1 → keyrows T3 → keymeta T3 (length carry) → keymeta T7 (info carry) |
 | `src/semantics_key_use.rs` | keyrows T0 → T1 → keymeta T1 → keyrows T3 → keymeta T3 |
 | `src/semantics_objects/state.rs` | keymeta T1 → keymeta T6 (EC arm, optional) |
 | `src/key_operation_projection.rs` | keymeta T1 → keyrows T4 → keymeta T3 |
 | `src/inventory/present.rs` | keyrows T0 → T1 → T3 → T4 → keymeta T3 → keymeta T7 |
 | `src/inventory/present_key_ops_tests.rs` | keyrows T0 → T3 → T4 → keymeta T3 → keymeta T7 |
-| `src/semantics_edge.rs`, `src/events.rs` | keymeta T2 (dispatch) → keymeta T3 (effects/compat) → keymeta T7 (info decode) |
-| `crates/ebpf-common/src/object_{policy,flow,wire}.rs` | keymeta T1 (R2 finite sets) → T2 (length) → T7 (info) |
+| `src/semantics_edge.rs`, `src/events.rs` | keymeta T2 (journal dispatch) → keymeta T3 (effects/compat) → keymeta T7 (info decode, journal + INFO drains) |
+| `crates/ebpf-common/src/object_{policy,flow,wire}.rs` | keymeta T1 (R2 finite sets) → T2 (length adapters) → T7 (info adapters) |
 | `crates/ebpf-common/src/evidence_table.rs` (new) | keymeta T2 → keymeta T7 |
-| `crates/ebpf/src/main.rs`, `ebpf-common/src/lib.rs` (`CallStart`) | keymeta T2 (length variants) → keymeta T7 (info variants) |
-| `build.rs` (length flavor), length-variant object (new) | keymeta T2 alone |
+| `crates/ebpf-common/src/object_journal.rs` | keymeta T2 (length END trailers) → keymeta T7 (info END trailers); keyrows co-owner (journal-wire consumer — twins re-run, serialized) |
+| `crates/ebpf/src/journal_roots.rs` | keymeta T2 (length programs) → keymeta T7 (info programs); keyrows co-owner (same) |
+| `crates/ebpf/src/main.rs` (`EVIDENCE_START`; `INFO_START` + `INFO` ring) | keymeta T2 (length stash) → keymeta T7 (info stash + ring) |
+| `crates/ebpf/src/inventory_info.rs` (new, info pair) | keymeta T7 alone |
+| `src/attach/inventory.rs`, `src/attach/inventory/capture.rs` (program list, +3 return links, INFO drain) | keymeta T7 alone |
+| `build.rs` (journal/inventory flavor program sets) | keymeta T2 (P0 journal omits length) → keymeta T7 (info programs) |
 | `src/cli.rs` (`--key-sizes`) | keymeta T2 (flag) — integrator checks keyrows writers at merge |
-| `src/attach.rs` (group routing), planner mode input | keymeta T2 (routing) — integrator checks keyrows writers at merge |
+| `src/attach.rs` (group routing), `src/attach/journal.rs` (program selection), planner mode input | keymeta T2 (routing) — integrator checks keyrows writers at merge |
 | `docs/privacy/allowlist-v3.md` | keymeta T0 (§11 + R2 block) → Task 7 Step 0 (§17.3) |
 | `docs/schema/inventory-v1.md`, `scripts/qualify-key-operations.py` | keymeta T1 (v6) → T3 (v7) → T7 (v8) → T6 |
 | `src/inventory/cbom/render.rs`, `docs/cbom-export.md` | keymeta T3 → keymeta T7 |
@@ -1561,18 +1650,19 @@ task depends on the postponed Task 8 (§18).
   reason (no yield loss vs today, which is 0 typed).
 - Section-version collision with keyrows gap subjects: mitigated by
   integrator allocation (§10.1).
-- Ring pressure from longer records (368→384, 608→624 on hot
-  endpoints): +0 endpoints, so slot budgets are untouched — the
-  cost is bytes/s, and only with `--key-sizes` (default runs are
-  unaffected by construction, §8.6). Sized by the §12.3 ring-loss
-  gate as the opt-in's acceptance; a regression stops the lane
-  for a design revisit, never a silent budget or threshold change.
-- Length-variant/standard skew: shared helpers evolve and the two
-  objects drift (a helper change alters variant behavior but not
-  standard, or vice versa). Mitigation: one shared source for
-  adapters/helpers (no forks, §8.2), the off-mode identity
-  contract re-run on every candidate (§12.1), and the routing
-  twin proving which object serves each group.
+- Ring pressure from longer records (END 632→648, 472→488 on hot
+  endpoints): +0 endpoints and +0 links, so slot budgets are
+  untouched — the cost is bytes/s, and only with `--key-sizes`
+  (default runs are unaffected by construction, §8.6). Sized by
+  the §12.3 ring-loss gate as the opt-in's acceptance; a
+  regression stops the lane for a design revisit, never a silent
+  budget or threshold change.
+- Length/base-program skew: shared helpers evolve and the length
+  pair drifts from the base pair (a helper change alters length
+  behavior but not base, or vice versa). Mitigation: one shared
+  source for adapters/helpers (no forks, §8.2), the off-mode
+  identity contract re-run on every candidate (§12.1), and the
+  routing twin proving which program serves each group.
 
 ## 15. Open decisions (DECIDED by controller rulings)
 
@@ -1610,8 +1700,9 @@ task depends on the postponed Task 8 (§18).
 - K7: Length capture on hot paths opt-in vs default-on. DECIDED
   OPT-IN by owner 2026-11-14 08:50 (after Opus B7): one flag,
   `--key-sizes`, valid only with `--key-operations`, off by
-  default (§10.5); separate length-variant object selected at
-  load time, never a runtime branch in the hot programs (§8.6).
+  default (§10.5); extra journal-object programs loaded and
+  linked only with the flag, never a runtime branch in the hot
+  programs (§8.6).
   Family-from-mechanism, creation-template facts and
   token-reported sizes stay on by default; Task 7 stays on by
   default (cold calls, §17.4/§17.7). The §12.3 gate is the
@@ -1680,6 +1771,21 @@ cells under BUD-1 750,000 with standard pins frozen (§8.5);
 flag-on); Task 7 stays default-on via cold-only info variants
 (§17.4, §17.7); family (§4.1) and creation (§6) stay default-on;
 DAG order unchanged, node contents widened (§13).
+Round 8 (fix7: Opus re-review R1/R2, controller options 1/(b)):
+R1 — the separate-object design is removed; length capture moves
+into `p11_entry_journal_length`/`p11_return_journal_length` in
+the same journal object (shared maps/ring/journal state,
+load/link only with the flag), trailers specified on the journal
+END forms (648/488), keyrows co-owns `object_journal.rs` and
+`journal_roots.rs` (serialized, §13 + plan file lists), new
+`journal-gate1/*` budget cells, flag-off identity pinned against
+the journal programs' cells (§8.2/§8.3/§8.5/§8.6, §9, §12);
+R2 — Task 7 moves to the inventory-object info pair (stash map,
+152-B records on a small ring, drain in the inventory session,
+`inventory/*` cells, usage-entry pins unchanged, +3 return links
+per provider) with journal info programs under
+`--key-operations` keeping the `begin_decision` Call arm
+(§17.4/§17.6/§17.7); DAG edges unchanged (§13).
 
 ## 17. Required: provider, token and mechanism info (Task 7)
 
@@ -1806,10 +1912,9 @@ scalars; return reads the fixed bytes on `CKR_OK` only. NULL
 pointer → unavailable; any other return → never (no
 BUFFER_TOO_SMALL/query-shape rule: these are not length cells).
 Every terminal/loss path clears the retained pointer, exactly like
-the S-protocol cell. FULL builds only: in P0 builds the info
-variants compile stubbed (base form, explicit unavailability —
-the `stub-object-attributes` precedent), so P0 acquires no info
-bytes.
+the S-protocol cell. FULL builds only: the P0 flavors omit the
+info programs (explicit unavailability, §17.4), so P0 acquires no
+info bytes.
 
 Padded fixed-width strings (`CK_INFO.manufacturerID`,
 `CK_INFO.libraryDescription`, `CK_TOKEN_INFO.manufacturerID`,
@@ -1862,7 +1967,7 @@ Edit 1 — field inventory (§Field inventory and retention): append
 rows: `Provider info struct (C_GetInfo)` (the two §17.1 field
 ranges — the struct pads are never fetched, not read-and-scrubbed;
 entry retention, full-span guard, CKR_OK return read only, clear on
-every terminal path; private in-flight + completed-call transport;
+every terminal path; private in-flight + info-record transport;
 public parsed fields only: cryptoki/library versions, manufacturer,
 description, flags); `Token info ranges (C_GetTokenInfo)` (the
 four §17.1 ranges — manufacturer, model, flags incl. the PIN-state
@@ -1910,50 +2015,97 @@ New section body (normative):
 No new `ObjectAction` (`OBJECT_ACTION_MAX` stays 14): the 3 info
 functions are rows 12–14 of `EVIDENCE_POSITIONS` (§8.1) with the
 §17.1 info kind + read ranges; no inputs, no templates (never
-authorized). The info adapters live ONLY in the info variants
-`p11_entry_info` / `p11_return_info` (new entry points in the
-standard object sharing helpers, §8.6 rule) — the standard
-`p11_entry`/`p11_return` code is untouched, so Task 7 never
-touches a hot program: the variants link only at the 3 cold info
-endpoints (pinned by the §17.6 selection twin). Retention is the
-info pointer only (`CallStart.ev_cell`, §8.2) — slot and
-mechanism scalars ride the base S1 record, never the stash. +0
-endpoints (all three already carry S1 probes,
-`kinds.rs:184-191`); no new map kinds. Entry-guard spans are the
-full struct sizes (88/76, 208/160, 24/12 LP64/ia32); bytes read
-are the field ranges only (76/72, 76/64, 24/12 — §17.1). The
-512-byte frame test must pass unmodified in limit. Verifier: the
-info variants get their own budget cells (§8.5: recorded,
-<750,000, ≥5% headroom on the 6.6 floor), `bpf loads` on vng
-6.6/6.12 + host 7.x, LP64 + ia32.
+authorized). Default inventory loads the inventory object, which
+carries only the usage entry probes and compiles out
+`START`/`CallStart`, `EVENTS`, `STATS` and `DESCRIPTORS`
+(`main.rs` `cfg(not(feature = "inventory-only"))`) — so Task 7
+brings its own entry+return pair, stash map and ring there, and
+journal info programs under `--key-operations`:
 
-Cold cost (default-on, negligible by construction): +128 record
-bytes per info call (368→496, §8.3) at application poll rates
-(Hz, not the kHz of hot paths — the Task 7 lane records the
-observed info-call rates on the Task 5 matrix apps as coldness
-evidence); one pointer stash per in-flight info call in the
-shared `CallStart` row (§8.2 reservation cost); zero per-call
+- Default inventory: `p11_info_entry_lp64` /
+  `p11_info_entry_ia32` / `p11_info_return` (new programs in the
+  inventory object; per-ABI entries follow the usage-entry
+  precedent). The entry programs mark usage for their endpoint
+  (same `USAGE` bitmap semantics as the usage entries they
+  substitute at the 3 endpoints — +0 entry links) and stash the
+  info pointer into the dedicated `INFO_START` map; the return
+  program reads the §17.1 ranges on `CKR_OK` and emits the 152-B
+  info record on the dedicated `INFO` ring. Slot and mechanism
+  scalars ride the record header, never the stash. +0 newly
+  probed functions (all three already carry usage probes); +3
+  return links per provider (the return side is new — the
+  inventory object has no return probe at these endpoints
+  today). `p11_usage_entry_*` code is untouched and its budget
+  cells stay pinned (§8.5).
+- Under `--key-operations`: `p11_entry_journal_info` /
+  `p11_return_journal_info` (mixed-ABI, same sharing rule as the
+  §8.6 length pair — same maps, ring and journal state, stash in
+  `EVIDENCE_START`). The entry program keeps the journal entry's
+  info-call handling: proved-irrelevant calls still take the
+  `begin_decision` Call arm (`journal_roots.rs`), so info calls
+  still produce BEGIN/END — the END carries the 128-B info
+  trailer (760/600 forms, §8.3). Substitution at already-linked
+  endpoints: +0 links.
+
+Feasibility inside the inventory-only build: the info pair needs
+none of the compiled-out items. It brings its own stash map and
+ring (existing `HashMap`/`RingBuf` kinds, without the
+`cfg(not(feature = "inventory-only"))` gate); entry/return probe
+support already exists in the inventory object (the
+`INVENTORY_PROGRAMS` table carries both `Entry` and `Return`
+kinds); `arg_u64`, `target_layout_from_cs`,
+`validate_target_span` and `read_word` are available outside the
+gate; the byte-range reader is a 2-line body the lane adds for
+the inventory flavor (the existing `read_bytes_user` is gated,
+its body is not special). `INVENTORY_PROGRAMS`
+(`src/attach/inventory.rs`) grows from 12 to 15 entries with
+review, and the inventory session drains the `INFO` ring
+alongside `DISCOVERY` (`src/attach/inventory/capture.rs` drain
+quantum). No fallback to key-operations-only is needed; Task 7
+ships in default inventory and CBOM as §17.7 requires.
+
+Entry-guard spans are the full struct sizes (88/76, 208/160,
+24/12 LP64/ia32); bytes read are the field ranges only (76/72,
+76/64, 24/12 — §17.1). The 512-byte frame test must pass
+unmodified in limit. Verifier: the info programs get their own
+budget cells (§8.5: recorded, <750,000, ≥5% headroom on the 6.6
+floor), `bpf loads` on vng 6.6/6.12 + host 7.x, LP64 + ia32.
+The P0 inventory and P0 journal flavors omit the info programs;
+Task 7 in P0 reports explicit unavailability (no info bytes
+acquired).
+
+Cold cost (default-on, negligible by construction): one 152-B
+record per info call (default inventory) or +128 END bytes per
+info call (760/600 under `--key-operations`) at application poll
+rates (Hz, not the kHz of hot paths — the Task 7 lane records
+the observed info-call rates on the Task 5 matrix apps as
+coldness evidence); one pointer stash per in-flight info call in
+the dedicated stash map (reservation cost); zero per-call
 record, ring or count delta at any non-info endpoint (covered
-by the §12.1 identity contract). If the shared-row growth
-perturbs a standard verifier count, the fallback in §8.6
-applies (dedicated info map) — the standard pins never move.
+by the §12.1 identity contract). No shared row grows, so no
+fallback is needed — the pins never move.
 
-Wire: the third 496-byte form (368-byte base + fixed 128-byte info
-trailer: `version: u16`, `kind: u8`, `status: u8`, `layout: u8`,
-`payload_len: u8`, 3 reserved bytes, `payload: [u8; 120]` —
-payload_len is exact per (kind, layout): 76/72 for `CK_INFO`,
-76/64 for token ranges, 24/12 for mechanism info). The trailer
-validator is exact length + version + kind + layout +
-payload_len + zero reserved. This beats the v2-tail-union
-alternative on validator surface: the union would put info
-endpoints in the object lane (journal/authority/sole-complete
-contact) and fork `validate_object_tail` with a union tag plus
-per-action offsets, while the third form adds one standalone
-exact-length check and leaves every existing validator,
-classification and pin byte-identical. Old readers refuse 496
-loudly. Task 7 merges after Task 3's merge commit and consumes
-the Task 2 wire base through that chain (shared files, one writer
-at a time — the §13 rule).
+Wire: the 128-byte info trailer (`version: u16`, `kind: u8`,
+`status: u8`, `layout: u8`, `payload_len: u8`, 3 reserved bytes,
+`payload: [u8; 120]` — payload_len is exact per (kind, layout):
+76/72 for `CK_INFO`, 76/64 for token ranges, 24/12 for mechanism
+info) rides two carriers: the 152-B inventory info record (24-B
+header — `slot: u64`, `mechanism: u64`, `reserved: u64` — with
+`mechanism` 0 for `C_GetInfo`/`C_GetTokenInfo` and `slot` 0 for
+`C_GetInfo`, followed by the trailer) on the `INFO` ring, and
+the journal END+info forms (760/600, §8.3) where slot and
+mechanism ride the END payload's base record. The join reads
+header words per the trailer kind (the provider kind ignores
+slot). The trailer validator is exact length + version + kind +
+layout + payload_len + zero reserved. This keeps the
+v2-tail-union alternative beaten on validator surface: the union
+would fork `validate_object_tail` with a union tag plus
+per-action offsets, while the trailer adds standalone
+exact-length checks and leaves every existing validator,
+classification and pin byte-identical. Old readers refuse
+152/760/600 loudly. Task 7 merges after Task 3's merge commit
+and consumes the Task 2 wire base through that chain (shared
+files, one writer at a time — the §13 rule).
 
 ### 17.5 Schema, output and CBOM
 
@@ -1981,9 +2133,11 @@ token inserted into the same slot is last-wins plus one `changes`
 bump — never a second entry, never a merge. Per-slot caps: tokens
 are 1 per slot by construction; mechanisms 128 per slot (above).
 
-Join: completed-call record → owning instance (slot/mechanism
-from the base S1 record, payload from the trailer); no `AggKey`
-contact (these are not key rows) and no `metadata_at_use` contact.
+Join: info record → owning instance (slot/mechanism from the
+152-B record header in default inventory, from the END payload's
+base record under `--key-operations`; payload from the trailer);
+no `AggKey` contact (these are not key rows) and no
+`metadata_at_use` contact.
 A provider with no completed Task 7 calls has no `provider_info`
 block: "provider never watched" is derivable from the JSON
 already (no rows for its instance beside coverage notes), so no
@@ -2033,10 +2187,14 @@ Serials never appear (no such key exists anywhere).
 
 Host twins per call (LP64 + ia32 layouts): CKR_OK positive
 (exact parsed fields), NULL-pointer negative, failure-RV
-negative, owner-mismatch negative; selection twin: the 3 info
-groups link the info variants in both flag modes while every hot
-endpoint links standard programs (cold-only proof); sentinel
-twin: a provider
+negative, owner-mismatch negative; selection twins: in default
+inventory the 3 info groups link the inventory info pair (+3
+return links present, usage entries substituted there, the USAGE
+bitmap still marks them used) while every other group links
+usage entries; under `--key-operations` the 3 info groups link
+the journal info pair in both flag modes while every hot
+endpoint links the base journal pair with the flag off
+(cold-only proof); sentinel twin: a provider
 returning sentinel serial/label/session/memory/utcTime bytes and
 sentinel `CK_INFO` pad bytes publishes none of those bytes
 anywhere (JSON/logs/maps scanned — the B6 padding-sentinel twin);
@@ -2058,25 +2216,31 @@ required): SoftHSM `C_GetInfo`/`C_GetTokenInfo`/
 `C_GetMechanismInfo` positives with parsed fields matching the
 provider's own reports.
 
-### 17.7 Mode scope: default inventory and CBOM (no object lane)
+### 17.7 Mode scope: default inventory and CBOM
 
-Task 7 rides the S1 lane, not the object lane: retention is one
-`CallStart` pointer (§8.2, §17.4), the record is the 368-byte base
-plus trailer (§8.3), and the join keys off the base S1 record's
-slot/mechanism. The object lane's `--key-operations` gate
-(`src/cli.rs:828`, `allowlist-v3.md:108-125`) therefore does not
-apply: provider/token/mechanism info appears in DEFAULT inventory
+Task 7 rides its own info lane in each mode: in default
+inventory the inventory info pair stashes one pointer per
+in-flight info call (`INFO_START`) and emits the 152-B record on
+the `INFO` ring (§17.4), drained in the inventory session; under
+`--key-operations` the journal info programs stash in
+`EVIDENCE_START` and the END carries the trailer (§8.3). The
+join keys off the record header's (default) or the END payload
+base's (key-operations) slot/mechanism. The object lane's
+`--key-operations` gate (`src/cli.rs:828`,
+`allowlist-v3.md:108-125`) therefore does not apply:
+provider/token/mechanism info appears in DEFAULT inventory
 (JSON + concise/`-v` text) and in CBOM whenever the Task 7
 amendment rows (§17.3) are approved and the calls are observed.
-Cost in default runs: +0 endpoints (all three already probed),
-+128 bytes per info call (rare — apps poll tokens, not hot paths),
-+16 bytes per in-flight S1 row (§8.2). No `--key-operations`
-requirement, no object-lane dependency, no `--key-sizes`
-interaction: Task 7 output is identical with the flag on or off
-(§10.5; pinned by a both-modes twin in Task 7). (Keymeta Tasks
-1–3 DO need `--key-operations`: inferred facts ride per-key rows,
-which exist only there; §5 sizes additionally need
-`--key-sizes`.)
+Cost in default runs: +0 newly probed functions (all three
+already carry usage probes), +3 return links per provider, one
+152-B record per info call (rare — apps poll tokens, not hot
+paths), one pointer stash per in-flight info call. No
+`--key-operations` requirement, no object-lane dependency, no
+`--key-sizes` interaction: Task 7 output is identical with the
+flag on or off (§10.5; pinned by a both-modes twin in Task 7).
+(Keymeta Tasks 1–3 DO need `--key-operations`: inferred facts
+ride per-key rows, which exist only there; §5 sizes additionally
+need `--key-sizes`.)
 
 ## 18. Later (not v0.8.0): small fixed-size mechanism parameters
 

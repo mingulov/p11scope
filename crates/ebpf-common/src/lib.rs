@@ -614,6 +614,13 @@ pub const PAUSE_ARMED: u64 = 1;
 pub const PAUSE_REQUESTED: u64 = 2;
 pub const COALESCED_NO_HELPER_RC: i64 = i64::MIN;
 
+/// Member rows in `PAUSE_PIDS` beside the one owned-chain row: the
+/// run-tree members whose loader events are stop-protected while armed.
+pub const MEMBER_PAUSE_ROWS: usize = 64;
+/// Total `PAUSE_PIDS` capacity: the owned child's chain plus the member
+/// rows. Userspace validation pins the same value.
+pub const MAX_PAUSE_PIDS: u32 = 1 + MEMBER_PAUSE_ROWS as u32;
+
 pub const DISCOVERY_POINTERS: usize = 104;
 pub const DISCOVERY_INTERFACES: u8 = 16;
 pub const TAIL_CALLS_INTERFACE_WORKER_SLOT: u32 = 0;
@@ -737,6 +744,22 @@ pub const fn valid_loader_binding(binding: u64) -> bool {
 
 pub const fn discovery_pause_enabled(eligible: bool, flags: u64, generation_token: u64) -> bool {
     eligible && flags & FLAG_PAUSE_ENABLED != 0 && generation_token != 0
+}
+
+/// Whether an EXEC record of a run-tree member stops the process before
+/// its first userspace instruction: a pause-armed cgroup-scope session
+/// (an owned `run` tree), an EXEC-kind record, and no `PID_FILTER`
+/// generation row for the tgid. The owned child and members with an
+/// armed authorization row carry a token and stay on the
+/// `PAUSE_PIDS` path instead; this rule catches only the first exec of
+/// a brand-new descendant so the controller can arm its row before it
+/// runs. It is deliberately not a general stop: system scope, PID
+/// scope, unpaused sessions, and every non-EXEC record refuse.
+pub const fn member_exec_pause_due(eligible: bool, flags: u64, generation_token: u64) -> bool {
+    eligible
+        && flags & FLAG_PAUSE_ENABLED != 0
+        && flags & FLAG_CGROUP_FILTER != 0
+        && generation_token == 0
 }
 
 pub const fn discovery_pause_coalesced(previous: u64, won: bool) -> bool {
@@ -3047,6 +3070,26 @@ mod tests {
         assert!(!discovery_state_take_failed(true, true));
         assert!(discovery_state_take_failed(false, true));
         assert!(discovery_state_take_failed(true, false));
+    }
+
+    #[test]
+    fn member_exec_pause_covers_only_rowless_cgroup_members() {
+        const RUN_FLAGS: u64 = FLAG_CGROUP_FILTER | FLAG_PAUSE_ENABLED;
+        // A rowless member exec under a pause-armed run cgroup stops.
+        assert!(member_exec_pause_due(true, RUN_FLAGS, 0));
+        // The owned child and armed members carry a generation token and
+        // stay on the PAUSE_PIDS authorization path instead.
+        assert!(!member_exec_pause_due(true, RUN_FLAGS, 7));
+        // No pause, no cgroup scope, or a non-exec record: never.
+        assert!(!member_exec_pause_due(true, FLAG_CGROUP_FILTER, 0));
+        assert!(!member_exec_pause_due(true, FLAG_PID_FILTER | FLAG_PAUSE_ENABLED, 0));
+        assert!(!member_exec_pause_due(true, FLAG_SYSTEM_FILTER | FLAG_PAUSE_ENABLED, 0));
+        assert!(!member_exec_pause_due(false, RUN_FLAGS, 0));
+    }
+
+    #[test]
+    fn pause_pids_capacity_covers_the_owned_chain_and_members() {
+        assert_eq!(MAX_PAUSE_PIDS, 1 + MEMBER_PAUSE_ROWS as u32);
     }
 
     /// A legacy acquisition describes the common ordinal catalog, independently

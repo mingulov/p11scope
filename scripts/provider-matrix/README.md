@@ -34,7 +34,9 @@ taking `$TASK_DIR`; creates the token/config), `PROVIDER_ENV_VARS`
 (space-separated `NAME=value`, `$TASK_DIR` allowed, never `P11TEST_*`),
 optional `PROVIDER_TEARDOWN`, optional `PROVIDER_PREFLIGHT` (a refusal
 records the provider UNRUN instead of failed), `PROVIDER_SUITE`
-(`yes`, or `no` for reader-less providers without suite legs). A setup
+(`yes`, or `no` for reader-less providers without suite legs), optional
+`PROVIDER_PIN`/`PROVIDER_SO_PIN` (override the cell PINs where the
+provider enforces a PIN policy). A setup
 with dynamic outputs (the p11-kit server address) writes `KEY=VALUE`
 lines to `$TASK_DIR/.provider-extra-env`; the cell exports them after a
 successful setup (the file is removed before setup, so nothing leaks
@@ -69,14 +71,21 @@ listed in the table), 1 a cell failed, 2 a harness/collect error.
   deliver as `--extra-deliver /path/to/freehsm` holding
   `libfreehsm.so`. Record the built commit in the run report.
 
-## Rows per cell
+## Legs and rows per cell
 
-`<provider>-identical-results`, `<provider>-observer-clean`,
-`<provider>-run-observed` (FAIL when the provider is not observed),
+Three legs: (a) alone, (b) under `p11scope run`, (c) under
+`p11scope run --manifest` with the cell's own discover manifest; then
+the paced workload under `p11scope inventory --pid`. Six rows:
+`<provider>-identical-results` (a/b/c),
+`<provider>-observer-clean`,
+`<provider>-run-observed` on the manifest leg (FAIL when the provider
+is not observed),
+`<provider>-default-run-coverage` (nonqualifying record of the
+no-manifest leg, which short-lived suite workers routinely blind),
 `<provider>-inventory-pid` (FAIL when the provider is not observed),
 and the discover row (`<provider>-discover`, or `kryoptic-multi-table`
 for kryoptic, which pins the exact 4-surface shape; an ambiguity
 refusal there becomes an expected-failure pointing at the static-progs
 I2 fix). Reader-less providers mark identical-results nonqualifying.
-Run coverage (`call_recall` over the rv-trace oracle) is printed in
-each cell's `summary.txt`.
+Run coverage (`call_recall` over the rv-trace oracle, manifest leg) is
+printed in each cell's `summary.txt`.

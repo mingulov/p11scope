@@ -4,17 +4,21 @@
 """Judge one provider-matrix cell (scripts/ci/provider-matrix-cell.sh).
 
 The cell runs the pinned pkcs11-check suite (or a pkcs11-tool probe for
-reader-less providers) against one provider in two legs ((a) alone,
-(b) under `p11scope run`), plus a `p11scope-discover` manifest assertion
-and a paced ctypes workload under `p11scope inventory --pid`. This helper
-judges five rows:
+reader-less providers) against one provider in three legs ((a) alone,
+(b) under `p11scope run`, (c) under `p11scope run --manifest`), plus a
+`p11scope-discover` manifest assertion and a paced ctypes workload under
+`p11scope inventory --pid`. This helper judges six rows:
 
-- <provider>-identical-results: suite result sets identical across a/b
+- <provider>-identical-results: suite result sets identical across a/b/c
   (summary counts, per-unit statuses/codes, when=call outcomes);
-- <provider>-observer-clean: exit_b == exit_a, observed.json valid v3;
-- <provider>-run-observed: calls attributed to the provider module in the
-  run leg are > 0, else FAIL as not observed (with the oracle call_recall
-  as the coverage figure when an rv-trace oracle exists);
+- <provider>-observer-clean: exits match the base leg, observed.json
+  valid v3 on both observer legs;
+- <provider>-run-observed: calls attributed to the provider module in
+  the manifest leg are > 0, else FAIL as not observed (with the oracle
+  call_recall as the coverage figure when an rv-trace oracle exists);
+- <provider>-default-run-coverage: nonqualifying record of the default
+  (no-manifest) leg's attribution and recall, which short-lived suite
+  workers routinely blind;
 - <provider>-inventory-pid: the workload pid is a caller AND the provider
   module carries edge calls, else FAIL as not observed;
 - the discover row (<provider>-discover, or kryoptic-multi-table for
@@ -64,6 +68,40 @@ EXPECTED_SURFACES = {
          ("interface", 3, 2, 104, "full"),
          ("interface", 3, 1, 92, "full"),
          ("interface", 3, 0, 92, "full")),
+    ),
+    ("softhsm2-2.7", "2.7"): (
+        "absent",
+        (("legacy_function_list", 3, 2, 68, "full"),),
+    ),
+    ("softhsm2-2.6", "2.6.1"): (
+        "absent",
+        (("legacy_function_list", 2, 40, 68, "full"),),
+    ),
+    ("bouncyhsm", "2.3.2"): (
+        "ok",
+        (("legacy_function_list", 2, 40, 68, "full"),
+         ("interface", 2, 40, 68, "full"),
+         ("interface", 3, 1, 92, "full"),
+         ("interface", 3, 2, 104, "full")),
+    ),
+    ("freehsm", "main"): (
+        "ok",
+        (("legacy_function_list", 2, 40, 68, "full"),
+         ("interface", 3, 2, 104, "full"),
+         ("interface", 3, 0, 92, "full")),
+    ),
+    ("opensc", "system"): (
+        "ok",
+        (("legacy_function_list", 2, 20, 68, "full"),
+         ("interface", 3, 2, 104, "full"),
+         ("interface", 3, 0, 92, "full"),
+         ("interface", 2, 20, 68, "known_prefix")),
+    ),
+    ("p11kit-proxy", "system"): (
+        "ok",
+        (("legacy_function_list", 2, 40, 68, "full"),
+         ("interface", 3, 2, 104, "full"),
+         ("interface", 2, 40, 68, "full")),
     ),
 }
 
@@ -280,7 +318,12 @@ def main(argv):
     parser.add_argument("--report-b", default=None)
     parser.add_argument("--exit-b", required=True, type=int)
     parser.add_argument("--wall-b", required=True, type=float)
+    parser.add_argument("--results-c", default=None)
+    parser.add_argument("--report-c", default=None)
+    parser.add_argument("--exit-c", required=True, type=int)
+    parser.add_argument("--wall-c", required=True, type=float)
     parser.add_argument("--observed-b", required=True)
+    parser.add_argument("--observed-c", required=True)
     parser.add_argument("--inventory", required=True)
     parser.add_argument("--workload-pid", required=True, type=int)
     parser.add_argument("--out-results", required=True)
@@ -290,26 +333,37 @@ def main(argv):
 
     try:
         if args.suite == "yes":
-            for name in ("results_a", "report_a", "results_b", "report_b"):
+            for name in ("results_a", "report_a", "results_b", "report_b",
+                         "results_c", "report_c"):
                 if getattr(args, name) is None:
                     raise SystemExit(f"--{name.replace('_', '-')} "
                                      f"is required with --suite yes")
-            ok_sets, detail_sets = _BASE.compare_results(
+            ok_ab, detail_ab = _BASE.compare_results(
                 args.results_a, args.results_b, "a-vs-b")
+            ok_ac, detail_ac = _BASE.compare_results(
+                args.results_a, args.results_c, "a-vs-c")
             outcomes_a = _BASE.call_outcomes(args.report_a)
             outcomes_b = _BASE.call_outcomes(args.report_b)
+            outcomes_c = _BASE.call_outcomes(args.report_c)
             only_ab, only_ba, diff_ab = _BASE.compare_outcomes(
                 outcomes_a, outcomes_b)
-            outcomes_ok = not (only_ab or only_ba or diff_ab)
-            identical_ok = ok_sets and outcomes_ok
+            only_ac, only_ca, diff_ac = _BASE.compare_outcomes(
+                outcomes_a, outcomes_c)
+            outcomes_ok = not (only_ab or only_ba or diff_ab
+                               or only_ac or only_ca or diff_ac)
+            identical_ok = ok_ab and ok_ac and outcomes_ok
             identical_qual = "qualified"
             identical_detail = (
-                f"result sets {'match' if ok_sets else 'DIFFER'}; "
+                f"result sets a-vs-b {'match' if ok_ab else 'DIFFER'}; "
+                f"a-vs-c {'match' if ok_ac else 'DIFFER'}; "
                 f"when=call outcomes n={len(outcomes_a)} "
-                f"only_a={len(only_ab)} only_b={len(only_ba)} "
-                f"diff={len(diff_ab)}")
-            if not ok_sets:
-                identical_detail += f"; {detail_sets[:200]}"
+                f"only_a_b={len(only_ab)} only_b={len(only_ba)} "
+                f"diff_b={len(diff_ab)} only_a_c={len(only_ac)} "
+                f"only_c={len(only_ca)} diff_c={len(diff_ac)}")
+            if not ok_ab:
+                identical_detail += f"; b: {detail_ab[:150]}"
+            if not ok_ac:
+                identical_detail += f"; c: {detail_ac[:150]}"
         else:
             identical_ok = True
             identical_qual = "nonqualifying"
@@ -319,25 +373,36 @@ def main(argv):
               f"{identical_detail}")
 
         capture_b, _, observed_b = _BASE.capture_counts(args.observed_b)
+        capture_c, _, observed_c = _BASE.capture_counts(args.observed_c)
         schema_b = observed_b.get("schema", "")
-        schema_ok = schema_b == "p11scope/observed-profile/v3"
-        exits_ok = args.exit_b == args.exit_a
+        schema_c = observed_c.get("schema", "")
+        schema_ok = schema_b == "p11scope/observed-profile/v3" \
+            and schema_c == schema_b
+        exits_ok = args.exit_b == args.exit_a and args.exit_c == args.exit_a
         observer_ok = exits_ok and schema_ok
         observer_detail = (
-            f"exits a/b={args.exit_a}/{args.exit_b} "
-            f"(wants b==a); observed schema {schema_b}")
+            f"exits a/b/c={args.exit_a}/{args.exit_b}/{args.exit_c} "
+            f"(wants b==a and c==a); observed schemas b/c={schema_b}/{schema_c}")
         print(f"observer-clean: {'PASS' if observer_ok else 'FAIL'} "
               f"{observer_detail}")
 
+        # The manifest leg carries the observed gate; the default leg is
+        # recorded alongside (short-lived suite workers routinely blind it).
         if args.suite == "yes":
             oracle_b, _, _ = _BASE.oracle_counts(args.report_b)
+            oracle_c, _, _ = _BASE.oracle_counts(args.report_c)
         else:
-            oracle_b, capture_b = None, None
+            oracle_b, oracle_c, capture_b, capture_c = None, None, None, None
         run_ok, run_detail, recall = judge_run_observed(
+            observed_c, args.module, oracle_c, capture_c)
+        _, cov_detail, cov_recall = judge_run_observed(
             observed_b, args.module, oracle_b, capture_b)
         if args.suite == "no":
             run_detail += "; no oracle (tool probe)"
+            cov_detail += "; no oracle (tool probe)"
         print(f"run-observed: {'PASS' if run_ok else 'FAIL'} {run_detail}")
+        cov_row_detail = f"informational default leg: {cov_detail}"
+        print(f"default-run-coverage: {cov_row_detail}")
 
         inventory = load_json(args.inventory, "inventory")
         pid_ok, pid_detail = judge_inventory_pid(
@@ -359,9 +424,11 @@ def main(argv):
               f"{'PASS' if disc_ok else 'EXPECTED-FAIL' if disc_qual == 'expected-failure' else 'FAIL'} "
               f"{disc_detail}")
 
-        overhead = args.wall_b - args.wall_a
-        print(f"wall: a={args.wall_a:.1f}s b={args.wall_b:.1f}s; "
-              f"overhead b-a={overhead:+.1f}s")
+        overhead_b = args.wall_b - args.wall_a
+        overhead_c = args.wall_c - args.wall_a
+        print(f"wall: a={args.wall_a:.1f}s b={args.wall_b:.1f}s "
+              f"c={args.wall_c:.1f}s; "
+              f"overhead b-a={overhead_b:+.1f}s c-a={overhead_c:+.1f}s")
 
         rows = [
             {"cell": f"{provider}-identical-results", "pass": identical_ok,
@@ -371,6 +438,9 @@ def main(argv):
              "qualification": "qualified", "detail": observer_detail[:500]},
             {"cell": f"{provider}-run-observed", "pass": run_ok,
              "qualification": "qualified", "detail": run_detail[:500]},
+            {"cell": f"{provider}-default-run-coverage", "pass": True,
+             "qualification": "nonqualifying",
+             "detail": cov_row_detail[:500]},
             {"cell": f"{provider}-inventory-pid", "pass": pid_ok,
              "qualification": "qualified", "detail": pid_detail[:500]},
             {"cell": disc_name, "pass": disc_ok,
@@ -379,21 +449,28 @@ def main(argv):
         Path(args.out_results).write_text(
             "\n".join(json.dumps(row) for row in rows) + "\n",
             encoding="utf-8")
-        recall_text = (f"{recall:.4f}" if recall is not None
-                       else "n/a (no oracle)" if args.suite == "no"
-                       else "n/a (oracle empty)")
+
+        def recall_text(value):
+            if value is not None:
+                return f"{value:.4f}"
+            if args.suite == "no":
+                return "n/a (no oracle)"
+            return "n/a (oracle empty)"
+
         summary = (
             f"provider={provider} version={args.provider_version} "
             f"suite={args.suite}\n"
             f"identical-results: {'PASS' if identical_ok else 'FAIL'}\n"
             f"observer-clean: {'PASS' if observer_ok else 'FAIL'}\n"
             f"run-observed: {'PASS' if run_ok else 'FAIL'}\n"
+            f"default-run-coverage: {recall_text(cov_recall)} "
+            f"(nonqualifying)\n"
             f"inventory-pid: {'PASS' if pid_ok else 'FAIL'}\n"
             f"{disc_name}: "
             f"{'PASS' if disc_ok else 'EXPECTED-FAIL' if disc_qual == 'expected-failure' else 'FAIL'}\n"
-            f"run coverage call_recall={recall_text}\n"
-            f"wall a/b={args.wall_a:.1f}/{args.wall_b:.1f}s "
-            f"overhead b-a={overhead:+.1f}s\n"
+            f"run coverage call_recall={recall_text(recall)}\n"
+            f"wall a/b/c={args.wall_a:.1f}/{args.wall_b:.1f}/{args.wall_c:.1f}s "
+            f"overhead b-a={overhead_b:+.1f}s c-a={overhead_c:+.1f}s\n"
         )
         Path(args.out_summary).write_text(summary, encoding="utf-8")
         print(summary, end="")

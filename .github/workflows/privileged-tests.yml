@@ -61,10 +61,12 @@ name: privileged-tests
 #   Haskoki matrix next to the SoftHSM smoke (pinned artifacts, ~10 min
 #   per leg on every push); pkcs11-check-providers-full runs the full
 #   suite per provider nightly plus manual dispatch, gated exactly like
-#   pkcs11-check-full but not release-gating. Per provider: suite alone
-#   vs under `p11scope run`, a discover manifest assertion (kryoptic's
-#   multi-table row is kryoptic-multi-table) and an inventory --pid
-#   workload; a provider that is not observed fails its cell.
+#   pkcs11-check-full but not release-gating. Per provider: suite alone,
+#   under `p11scope run` and under `p11scope run --manifest`, a discover
+#   manifest assertion (kryoptic's multi-table row is
+#   kryoptic-multi-table) and an inventory --pid workload; a provider
+#   that is not observed on the manifest leg or the inventory leg fails
+#   its cell.
 # Weekly lib campaign: workflow_dispatch input campaign selects default,
 # long (--include-long) or all (long plus the fixture-skip groups once
 # WP-2 adds them). GitHub schedules run only on the default branch, so the
@@ -2084,13 +2086,14 @@ jobs:
           retention-days: 30
   # Provider-matrix SMOKE under p11scope: kryoptic (pinned koji rpm, sha
   # in scripts/provider-matrix/pins.sh) and Haskoki (pinned release
-  # tarball, sha likewise) each run the smoke selection alone and under
-  # `p11scope run`, plus a discover manifest assertion and a paced
-  # workload under inventory --pid (scripts/ci/provider-matrix-cell.sh).
-  # A provider that is not observed fails its cell; kryoptic's discover
-  # row is kryoptic-multi-table. Runs on every push (host kernel) as a
-  # required cell, ~10 min per matrix leg; skips on schedule (the FULL
-  # job owns the nightly).
+  # tarball, sha likewise) each run the smoke selection alone, under
+  # `p11scope run` and under `p11scope run --manifest`, plus a discover
+  # manifest assertion and a paced workload under inventory --pid
+  # (scripts/ci/provider-matrix-cell.sh). A provider that is not observed
+  # on the manifest leg or the inventory leg fails its cell; kryoptic's
+  # discover row is kryoptic-multi-table. Runs on every push (host
+  # kernel) as a required cell, ~10 min per matrix leg; skips on schedule
+  # (the FULL job owns the nightly).
   pkcs11-check-providers:
     needs: release-build
     if: github.event_name != 'schedule'
@@ -2143,9 +2146,11 @@ jobs:
             PROVIDER="${{ matrix.provider }}" TASK_DIR="$RUNNER_TEMP/prov" \
             P11CHECK_MODE=smoke P11CHECK_BIN="$RUNNER_TEMP/p11check/bin/pkcs11-check" \
             scripts/ci/run-cell-script.sh provider-matrix-cell "$in/p11scope" "$out/cells" \
+            --allow-nonqualifying "${{ matrix.provider }}-default-run-coverage" \
             --require "${{ matrix.provider }}-identical-results" \
             --require "${{ matrix.provider }}-observer-clean" \
             --require "${{ matrix.provider }}-run-observed" \
+            --require "${{ matrix.provider }}-default-run-coverage" \
             --require "${{ matrix.provider }}-inventory-pid" \
             --require "${{ matrix.discover_row }}"
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
@@ -2165,7 +2170,7 @@ jobs:
     needs: release-build
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pkcs11_check_full)
     runs-on: ubuntu-26.04
-    timeout-minutes: 240
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
@@ -2213,9 +2218,11 @@ jobs:
             PROVIDER="${{ matrix.provider }}" TASK_DIR="$RUNNER_TEMP/prov" \
             P11CHECK_MODE=full P11CHECK_BIN="$RUNNER_TEMP/p11check/bin/pkcs11-check" \
             scripts/ci/run-cell-script.sh provider-matrix-cell "$in/p11scope" "$out/cells" \
+            --allow-nonqualifying "${{ matrix.provider }}-default-run-coverage" \
             --require "${{ matrix.provider }}-identical-results" \
             --require "${{ matrix.provider }}-observer-clean" \
             --require "${{ matrix.provider }}-run-observed" \
+            --require "${{ matrix.provider }}-default-run-coverage" \
             --require "${{ matrix.provider }}-inventory-pid" \
             --require "${{ matrix.discover_row }}"
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"

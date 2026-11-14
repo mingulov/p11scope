@@ -3,17 +3,19 @@
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # provider-matrix-cell.sh P11SCOPE OUTDIR: one provider-matrix cell.
 # Runs the pinned pkcs11-check suite (or a pkcs11-tool probe for
-# reader-less providers) against one provider in two legs ((a) alone,
-# (b) under `p11scope run`), plus a `p11scope-discover` manifest assertion
-# and a paced ctypes workload under `p11scope inventory --pid`. Judged by
+# reader-less providers) against one provider in three legs ((a) alone,
+# (b) under `p11scope run`, (c) under `p11scope run --manifest`), plus a
+# `p11scope-discover` manifest assertion and a paced ctypes workload under
+# `p11scope inventory --pid`. Judged by
 # provider_matrix_cell_compare.py: identical results, observer-clean,
-# run-observed (FAIL when the provider is not observed), inventory-pid
+# run-observed on the manifest leg (FAIL when the provider is not
+# observed), the informational default-leg coverage row, inventory-pid
 # (FAIL when the provider is not observed) and the discover row
 # (kryoptic-multi-table for kryoptic). Fresh token per cell; PINs via
-# P11TEST_PIN/P11TEST_SO_PIN env, never echoed; --rv-trace -o json oracle
-# for the coverage figure. DEFAULT crash isolation always (never
-# --isolation). Mode via P11CHECK_MODE=smoke (default, --marker smoke)
-# or full (no marker).
+# P11TEST_PIN/P11TEST_SO_PIN env (PROVIDER_PIN/PROVIDER_SO_PIN override
+# per provider), never echoed; --rv-trace -o json oracle for the coverage
+# figure. DEFAULT crash isolation always (never --isolation). Mode via
+# P11CHECK_MODE=smoke (default, --marker smoke) or full (no marker).
 # Provider comes from PROVIDER (scripts/provider-matrix/providers/*.env)
 # with TASK_DIR holding fetched artifacts and cell state; module paths
 # are probed from PROVIDER_CANDIDATES, never assumed.
@@ -87,6 +89,11 @@ command -v python3 >/dev/null 2>&1 || { echo "provider-matrix-cell: missing prer
 [ -x "$DISCOVER" ] || { echo "provider-matrix-cell: no executable discover helper: $DISCOVER" >&2; exit 77; }
 if [ "$PROVIDER_SUITE" = yes ]; then
   command -v "$P11CHECK_BIN" >/dev/null 2>&1 || { echo "provider-matrix-cell: missing prerequisite: $P11CHECK_BIN (pip install --require-hashes -r scripts/ci/pkcs11-check-requirements.txt)" >&2; exit 77; }
+  # Providers with PIN policies (FreeHSM rejects short SO PINs) override
+  # the cell PINs; the effective values drive token setup and the suite.
+  P11TEST_PIN=${PROVIDER_PIN:-${P11TEST_PIN:-}}
+  P11TEST_SO_PIN=${PROVIDER_SO_PIN:-${P11TEST_SO_PIN:-}}
+  export P11TEST_PIN P11TEST_SO_PIN
   [ -z "${P11TEST_PIN:-}" ] && { echo "provider-matrix-cell: P11TEST_PIN env must be set (throwaway token PIN, never echoed)" >&2; exit 2; }
   [ -z "${P11TEST_SO_PIN:-}" ] && { echo "provider-matrix-cell: P11TEST_SO_PIN env must be set (throwaway SO PIN, never echoed)" >&2; exit 2; }
   HAVE_VER=$("$P11CHECK_BIN" version 2>/dev/null) || { echo "provider-matrix-cell: cannot run $P11CHECK_BIN version" >&2; exit 77; }
@@ -259,60 +266,96 @@ run_leg_a() {
   wall_elapsed "$start" "$end" >"$dir/wall.txt"
   echo "provider-matrix-cell: leg (a) exit=$rc wall=$(cat "$dir/wall.txt")s"
 }
-run_leg_b() {
-  dir=$OUT/leg-b
+run_leg_obs() {
+  leg=$1; manifest=$2
+  dir=$OUT/leg-$leg
   if [ "$PROVIDER_SUITE" = yes ]; then
     # shellcheck disable=SC2086
-    set -- $1
-    echo "provider-matrix-cell: leg (b) under run"
+    set -- $3
+    if [ -n "$manifest" ]; then
+      echo "provider-matrix-cell: leg ($leg) under run --manifest"
+    else
+      echo "provider-matrix-cell: leg ($leg) under run (default)"
+    fi
   else
-    echo "provider-matrix-cell: leg (b) under run: $PKCS11_TOOL -L"
+    echo "provider-matrix-cell: leg ($leg) under run: $PKCS11_TOOL -L"
   fi
   start=$(wall_start)
   rc=0
   if [ "$PROVIDER_SUITE" = yes ]; then
-    (cd "$dir" && obs "$P" run -o "$dir/observed.json" -- "$P11CHECK_BIN" "$@" \
-      >"$dir/observer.out" 2>"$dir/observer.err") || rc=$?
+    if [ -n "$manifest" ]; then
+      (cd "$dir" && obs "$P" run --manifest "$manifest" -o "$dir/observed.json" -- "$P11CHECK_BIN" "$@" \
+        >"$dir/observer.out" 2>"$dir/observer.err") || rc=$?
+    else
+      (cd "$dir" && obs "$P" run -o "$dir/observed.json" -- "$P11CHECK_BIN" "$@" \
+        >"$dir/observer.out" 2>"$dir/observer.err") || rc=$?
+    fi
   else
-    (cd "$dir" && obs "$P" run -o "$dir/observed.json" -- "$PKCS11_TOOL" --module "$PKCS11_MODULE" -L \
-      >"$dir/observer.out" 2>"$dir/observer.err") || rc=$?
+    if [ -n "$manifest" ]; then
+      (cd "$dir" && obs "$P" run --manifest "$manifest" -o "$dir/observed.json" -- "$PKCS11_TOOL" --module "$PKCS11_MODULE" -L \
+        >"$dir/observer.out" 2>"$dir/observer.err") || rc=$?
+    else
+      (cd "$dir" && obs "$P" run -o "$dir/observed.json" -- "$PKCS11_TOOL" --module "$PKCS11_MODULE" -L \
+        >"$dir/observer.out" 2>"$dir/observer.err") || rc=$?
+    fi
   fi
   end=$(wall_start)
   echo "$rc" >"$dir/exit.txt"
   wall_elapsed "$start" "$end" >"$dir/wall.txt"
-  echo "provider-matrix-cell: leg (b) exit=$rc wall=$(cat "$dir/wall.txt")s"
+  echo "provider-matrix-cell: leg ($leg) exit=$rc wall=$(cat "$dir/wall.txt")s"
 }
 make_leg a || { echo "provider-matrix-cell: cannot prepare leg a" >&2; exit 2; }
 make_leg b || { echo "provider-matrix-cell: cannot prepare leg b" >&2; exit 2; }
+make_leg c || { echo "provider-matrix-cell: cannot prepare leg c" >&2; exit 2; }
+# Without a usable discover manifest (e.g. a future ambiguity refusal),
+# leg (c) falls back to a default run and says so: the discover row
+# carries the refusal verdict, and the observed gate judges leg (c) as
+# usual (a blind default leg then fails red, honestly).
+MANIFEST_C=$OUT/manifest.json
+if [ ! -s "$MANIFEST_C" ]; then
+  echo "provider-matrix-cell: no usable manifest; leg (c) falls back to default run" >&2
+  MANIFEST_C=
+fi
 if [ "$PROVIDER_SUITE" = yes ]; then
   if [ "$MODE" = smoke ]; then
     ARGS_A="test --module $PKCS11_MODULE --marker smoke --rv-trace -o json --output-file $OUT/leg-a/results.json"
     ARGS_B="test --module $PKCS11_MODULE --marker smoke --rv-trace -o json --output-file $OUT/leg-b/results.json"
+    ARGS_C="test --module $PKCS11_MODULE --marker smoke --rv-trace -o json --output-file $OUT/leg-c/results.json"
   else
     ARGS_A="test --module $PKCS11_MODULE --rv-trace -o json --output-file $OUT/leg-a/results.json"
     ARGS_B="test --module $PKCS11_MODULE --rv-trace -o json --output-file $OUT/leg-b/results.json"
+    ARGS_C="test --module $PKCS11_MODULE --rv-trace -o json --output-file $OUT/leg-c/results.json"
   fi
   run_leg_a "$ARGS_A"
-  run_leg_b "$ARGS_B"
-  for leg in a b; do
+  run_leg_obs b "" "$ARGS_B"
+  run_leg_obs c "$MANIFEST_C" "$ARGS_C"
+  for leg in a b c; do
     dir=$OUT/leg-$leg
     [ -s "$dir/results.json" ] || { echo "provider-matrix-cell: leg $leg missing results.json (suite did not finish)" >&2; exit 1; }
     [ -s "$dir/report.jsonl" ] || { echo "provider-matrix-cell: leg $leg missing report.jsonl" >&2; exit 1; }
   done
 else
   run_leg_a ""
-  run_leg_b ""
+  run_leg_obs b "" ""
+  run_leg_obs c "$MANIFEST_C" ""
 fi
 [ -s "$OUT/leg-b/observed.json" ] || { echo "provider-matrix-cell: leg b missing observed.json (observer abort)" >&2; exit 1; }
+[ -s "$OUT/leg-c/observed.json" ] || { echo "provider-matrix-cell: leg c missing observed.json (observer abort)" >&2; exit 1; }
 # Inventory leg: paced workload under inventory --pid. The workload runs
 # as the suite user without lane fds; the observer perms match leg (b).
-WORK_ITER=100
 READY=$OUT/workload.ready
+WORKLOAD_ARGV=(python3 -I "$WORKLOAD" --module "$PKCS11_MODULE" --ready "$READY" --iterations 100 --interval 1)
 rm -f "$READY"
+# Backgrounded directly, never through the as_user function: a function
+# call backgrounds a bash wrapper, and $! must be the workload itself
+# (setpriv execs in place, so $! is exact in both modes).
 set +e
-as_user python3 -I "$WORKLOAD" --module "$PKCS11_MODULE" --ready "$READY" \
-  --iterations $WORK_ITER --interval 1 \
-  </dev/null >"$OUT/workload.log" 2>&1 8>&- &
+if [ "$ROOTMODE" = yes ]; then
+  setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups \
+    "${WORKLOAD_ARGV[@]}" </dev/null >"$OUT/workload.log" 2>&1 8>&- &
+else
+  "${WORKLOAD_ARGV[@]}" </dev/null >"$OUT/workload.log" 2>&1 8>&- &
+fi
 WPID=$!
 set -e
 echo "$WPID" >"$OUT/workload.pid"
@@ -387,7 +430,10 @@ if [ "$PROVIDER_SUITE" = yes ]; then
     --exit-a "$(cat "$OUT/leg-a/exit.txt")" --wall-a "$(cat "$OUT/leg-a/wall.txt")" \
     --results-b "$OUT/leg-b/results.json" --report-b "$OUT/leg-b/report.jsonl" \
     --exit-b "$(cat "$OUT/leg-b/exit.txt")" --wall-b "$(cat "$OUT/leg-b/wall.txt")" \
+    --results-c "$OUT/leg-c/results.json" --report-c "$OUT/leg-c/report.jsonl" \
+    --exit-c "$(cat "$OUT/leg-c/exit.txt")" --wall-c "$(cat "$OUT/leg-c/wall.txt")" \
     --observed-b "$OUT/leg-b/observed.json" \
+    --observed-c "$OUT/leg-c/observed.json" \
     --inventory "$OUT/inventory.json" --workload-pid "$WPID" \
     --out-results "$OUT/results.jsonl" --out-summary "$OUT/summary.txt"
 else
@@ -398,7 +444,9 @@ else
     --suite no \
     --exit-a "$(cat "$OUT/leg-a/exit.txt")" --wall-a "$(cat "$OUT/leg-a/wall.txt")" \
     --exit-b "$(cat "$OUT/leg-b/exit.txt")" --wall-b "$(cat "$OUT/leg-b/wall.txt")" \
+    --exit-c "$(cat "$OUT/leg-c/exit.txt")" --wall-c "$(cat "$OUT/leg-c/wall.txt")" \
     --observed-b "$OUT/leg-b/observed.json" \
+    --observed-c "$OUT/leg-c/observed.json" \
     --inventory "$OUT/inventory.json" --workload-pid "$WPID" \
     --out-results "$OUT/results.jsonl" --out-summary "$OUT/summary.txt"
 fi

@@ -301,18 +301,48 @@ class DiscoverTests(unittest.TestCase):
         self.assertNotIn("expected-failure", detail)
 
     def test_unpinned_provider_records_nonqualifying(self):
+        # spy-softhsm2 has no pinned shape: the row records the surfaces
+        # for the pin commit instead of asserting them.
         manifest = {"interface_list": {"status": "ok"}, "surfaces": []}
         ok, qual, detail = _COMPARE.judge_discover(
-            "bouncyhsm", "2.3.2", 0, manifest, "")
+            "spy-softhsm2", "spy+2.7", 0, manifest, "")
         self.assertTrue(ok, detail)
         self.assertEqual("nonqualifying", qual)
         self.assertIn("not yet pinned", detail)
 
     def test_unpinned_provider_crash_still_fails(self):
         ok, qual, _ = _COMPARE.judge_discover(
-            "bouncyhsm", "2.3.2", 1, None, "discover: cannot dlopen: boom")
+            "spy-softhsm2", "spy+2.7", 1, None,
+            "discover: cannot dlopen: boom")
         self.assertFalse(ok)
         self.assertEqual("nonqualifying", qual)
+
+    def test_bouncyhsm_exact_shape_passes(self):
+        manifest = {
+            "interface_list": {"status": "ok"},
+            "surfaces": [
+                {"source": {"kind": "legacy_function_list"},
+                 "version": {"major": 2, "minor": 40},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(68)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 2, "minor": 40},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(68)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 3, "minor": 1},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(92)]},
+                {"source": {"kind": "interface"},
+                 "version": {"major": 3, "minor": 2},
+                 "walk": {"status": "full"},
+                 "functions": [{} for _ in range(104)]},
+            ],
+        }
+        ok, qual, detail = _COMPARE.judge_discover(
+            "bouncyhsm", "2.3.2", 0, manifest, "")
+        self.assertTrue(ok, detail)
+        self.assertEqual("qualified", qual)
 
     def test_haskoki_exact_shape_passes(self):
         manifest = {
@@ -346,19 +376,22 @@ class MainTests(unittest.TestCase):
     maxDiff = 3000
 
     def write_cell(self, tmp, provider="kryoptic", version="1.5.2",
-                   edge_calls=656, run_calls=61):
+                   edge_calls=656, run_calls=61, run_calls_b=0):
         base = Path(tmp)
         module = make_module(tmp)
-        (base / "results-a.json").write_text(
-            json.dumps(results_doc(base_units())), encoding="utf-8")
-        (base / "results-b.json").write_text(
-            json.dumps(results_doc(base_units())), encoding="utf-8")
-        (base / "report-a.jsonl").write_text("", encoding="utf-8")
-        (base / "report-b.jsonl").write_text("", encoding="utf-8")
-        rows = [function_row(["C_Initialize"], module_identity(module),
-                             run_calls, {"0x0000000000000000": run_calls})]
+        for leg in ("a", "b", "c"):
+            (base / f"results-{leg}.json").write_text(
+                json.dumps(results_doc(base_units())), encoding="utf-8")
+            (base / f"report-{leg}.jsonl").write_text("", encoding="utf-8")
+        rows_b = [function_row(["C_Initialize"], module_identity(module),
+                               run_calls_b,
+                               {"0x0000000000000000": run_calls_b})]
         (base / "observed-b.json").write_text(
-            json.dumps(observed_doc(rows)), encoding="utf-8")
+            json.dumps(observed_doc(rows_b)), encoding="utf-8")
+        rows_c = [function_row(["C_Initialize"], module_identity(module),
+                               run_calls, {"0x0000000000000000": run_calls})]
+        (base / "observed-c.json").write_text(
+            json.dumps(observed_doc(rows_c)), encoding="utf-8")
         (base / "inventory.json").write_text(
             json.dumps(inventory_doc(module, 4242, edge_calls)),
             encoding="utf-8")
@@ -376,14 +409,21 @@ class MainTests(unittest.TestCase):
                 "--results-b", str(base / "results-b.json"),
                 "--report-b", str(base / "report-b.jsonl"),
                 "--exit-b", "0", "--wall-b", "11.0",
+                "--results-c", str(base / "results-c.json"),
+                "--report-c", str(base / "report-c.jsonl"),
+                "--exit-c", "0", "--wall-c", "12.0",
                 "--observed-b", str(base / "observed-b.json"),
+                "--observed-c", str(base / "observed-c.json"),
                 "--inventory", str(base / "inventory.json"),
                 "--workload-pid", "4242",
                 "--out-results", str(base / "results.jsonl"),
                 "--out-summary", str(base / "summary.txt")]
         return base, args
 
-    def test_green_cell_exits_zero_with_five_rows(self):
+    def test_green_cell_exits_zero_with_six_rows(self):
+        # The manifest leg carries the observed gate; a blind default leg
+        # (short-lived workers, no manifest) records its coverage row
+        # without failing the cell.
         with tempfile.TemporaryDirectory() as tmp:
             base, args = self.write_cell(tmp)
             rc = _COMPARE.main(args)
@@ -391,15 +431,19 @@ class MainTests(unittest.TestCase):
             rows = [json.loads(line) for line in
                     (base / "results.jsonl").read_text(
                         encoding="utf-8").splitlines()]
-            self.assertEqual(5, len(rows))
-            names = [row["cell"] for row in rows]
-            self.assertIn("kryoptic-multi-table", names)
-            self.assertTrue(all(row["pass"] for row in rows),
+            self.assertEqual(6, len(rows))
+            by_cell = {row["cell"]: row for row in rows}
+            self.assertIn("kryoptic-multi-table", by_cell)
+            self.assertTrue(by_cell["kryoptic-run-observed"]["pass"])
+            self.assertEqual(
+                "nonqualifying",
+                by_cell["kryoptic-default-run-coverage"]["qualification"])
+            qualified = [row for row in rows
+                         if row["qualification"] == "qualified"]
+            self.assertTrue(all(row["pass"] for row in qualified),
                             json.dumps(rows, indent=1))
-            self.assertTrue(all(row["qualification"] == "qualified"
-                                for row in rows))
 
-    def test_unobserved_run_fails_the_cell(self):
+    def test_unobserved_manifest_leg_fails_the_cell(self):
         with tempfile.TemporaryDirectory() as tmp:
             base, args = self.write_cell(tmp, run_calls=0)
             rc = _COMPARE.main(args)
@@ -412,12 +456,30 @@ class MainTests(unittest.TestCase):
             self.assertFalse(observed["pass"])
             self.assertIn("not observed", observed["detail"])
 
+    def test_manifest_leg_divergence_fails_identical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, args = self.write_cell(tmp)
+            mutated = base_units()
+            mutated[0]["counts"]["passed"] = 1
+            (base / "results-c.json").write_text(
+                json.dumps(results_doc(mutated)), encoding="utf-8")
+            rc = _COMPARE.main(args)
+            self.assertEqual(1, rc)
+            rows = [json.loads(line) for line in
+                    (base / "results.jsonl").read_text(
+                        encoding="utf-8").splitlines()]
+            identical = next(row for row in rows
+                             if row["cell"] == "kryoptic-identical-results")
+            self.assertFalse(identical["pass"])
+
     def test_tool_mode_marks_identical_nonqualifying(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             module = make_module(tmp)
             rows = [function_row(["C_Initialize"], module_identity(module), 5)]
             (base / "observed-b.json").write_text(
+                json.dumps(observed_doc(rows)), encoding="utf-8")
+            (base / "observed-c.json").write_text(
                 json.dumps(observed_doc(rows)), encoding="utf-8")
             (base / "inventory.json").write_text(
                 json.dumps(inventory_doc(module, 4242, 12)),
@@ -433,7 +495,9 @@ class MainTests(unittest.TestCase):
                     "--suite", "no",
                     "--exit-a", "0", "--wall-a", "1.0",
                     "--exit-b", "0", "--wall-b", "2.0",
+                    "--exit-c", "0", "--wall-c", "3.0",
                     "--observed-b", str(base / "observed-b.json"),
+                    "--observed-c", str(base / "observed-c.json"),
                     "--inventory", str(base / "inventory.json"),
                     "--workload-pid", "4242",
                     "--out-results", str(base / "results.jsonl"),

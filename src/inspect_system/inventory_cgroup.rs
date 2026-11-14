@@ -752,6 +752,36 @@ impl CgroupCollection {
     pub(crate) fn used_work(&self) -> usize {
         self.work.budget.lock().unwrap().used.units
     }
+    /// Test-only: every deep-scan gap this collection recorded, as
+    /// `(pid, subject, reason)`, before any commit fold.
+    #[cfg(test)]
+    pub(crate) fn member_gaps_for_test(&self) -> Vec<(u32, String, String)> {
+        let Some(collection) = &self.collection else {
+            return Vec::new();
+        };
+        collection
+            .members
+            .iter()
+            .flat_map(|member| {
+                member
+                    .gaps
+                    .iter()
+                    .map(move |gap| (member.pid, gap.subject.clone(), gap.reason.clone()))
+            })
+            .collect()
+    }
+    /// Test-only: the paths of the modules this collection deep-scanned.
+    #[cfg(test)]
+    pub(crate) fn module_paths_for_test(&self) -> Vec<String> {
+        let Some(collection) = &self.collection else {
+            return Vec::new();
+        };
+        collection
+            .members
+            .iter()
+            .flat_map(|member| member.modules.iter().map(|module| module.path.clone()))
+            .collect()
+    }
     #[cfg(test)]
     pub(crate) fn original_weak(&self, pid: u32) -> Option<std::sync::Weak<ProcessView>> {
         self.originals

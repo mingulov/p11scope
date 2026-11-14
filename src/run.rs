@@ -10472,10 +10472,8 @@ fn capture_profile(
                     // drain tapped stamp the current producer position, and
                     // the terminal drain below retires what is due (there is
                     // no next drain, so this one cannot wait a tick).
-                    if profile {
-                        if let Ok(positions) = context.1.event_drain_positions() {
-                            transfer_exit_taps(context.0, consumers.tracker, positions.producer);
-                        }
+                    if profile && let Ok(positions) = context.1.event_drain_positions() {
+                        transfer_exit_taps(context.0, consumers.tracker, positions.producer);
                     }
                     if profile {
                         *consumers.malformed_records += drain_events(

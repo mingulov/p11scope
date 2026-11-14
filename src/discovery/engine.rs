@@ -23495,12 +23495,13 @@ impl Engine {
             &loader_path,
         );
         let pin_start = crate::attach::monotonic_ns();
-        let pinned = pin_scanned_view_objects_with_filing(
+        let pinned = pin_scanned_view_objects_with_table(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
             None,
-            Filing::Adopt(&mut self.handle_table),
+            &mut self.handle_table,
+            DeferredReason::Live,
         );
         self.stage_timings.span(
             crate::timing::StageKind::Pin,
@@ -23509,6 +23510,12 @@ impl Engine {
             crate::attach::monotonic_ns(),
         );
         let (loader_pins, loader_skips) = pinned.map_err(anyhow::Error::msg)?;
+        // A budget wait defers arming for a refresh with its counted
+        // gap: the view re-arms next tick instead of binding partial.
+        if pins_waited_for_handles_budget(&loader_skips) {
+            self.file_handles_wait_gap();
+            return Err(LoaderArmFailure::Deferred { changed: false });
+        }
         let skipped = loader_skips;
         for skip in &skipped {
             self.mark_partial(&skip.subject, &skip.reason);
@@ -23840,12 +23847,13 @@ impl Engine {
             interfaces: Vec::new(),
         };
         let pin_start = crate::attach::monotonic_ns();
-        let pinned = pin_scanned_view_objects_with_filing(
+        let pinned = pin_scanned_view_objects_with_table(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
             None,
-            Filing::Adopt(&mut self.handle_table),
+            &mut self.handle_table,
+            DeferredReason::Live,
         );
         self.stage_timings.span(
             crate::timing::StageKind::Pin,

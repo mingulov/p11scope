@@ -82426,6 +82426,119 @@ fn handle_table_loader_record_reparks_resolving_on_budget_wait() {
     drop(live);
 }
 
+/// B3-live twin: with the table full, loader arming defers for a
+/// refresh with one gap; after release the next arming succeeds.
+#[test]
+fn handle_table_loader_arming_defers_for_refresh_on_budget_wait() {
+    let (mut fixture, mut engine, _first, _record, mut session) = armed_seed_route(0);
+    let pid = fixture.spawn_peer();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), pid).unwrap());
+    // Pid scope: the arming gate passes (the budget deferral is
+    // scope-independent) and the refresh template below runs.
+    engine.scope = Scope::Pid(engine.views[0].pid());
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let direct = engine.arm_loader_for_view(
+        1,
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(
+        matches!(direct, Err(LoaderArmFailure::Deferred { changed: false })),
+        "a full table defers arming: {direct:?}"
+    );
+    let gaps_before = engine.counters.object_skips.len();
+    let outcome = engine
+        .arm_loader_or_partial(
+            1,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(!outcome, "a deferred arming changes nothing: {outcome:?}");
+    assert!(
+        engine.refresh_requested.contains_key(&pid),
+        "the refresh pends for the next tick"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len() - gaps_before,
+        1,
+        "exactly one gap row"
+    );
+    engine.set_table_cap_for_test(1000);
+    engine
+        .arm_loader_or_partial(
+            1,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        session.dynamic_loader_links.len(),
+        2,
+        "the next tick re-arms after release"
+    );
+    drop(live);
+}
+
+/// B3-owned twin: with the table full, the owned loader maps the
+/// deferral to Unavailable with the existing partial gap.
+#[test]
+fn handle_table_owned_loader_unavailable_on_budget_wait() {
+    let (fixture, _, _, _) = loaded_seed_provider();
+    let child = OwnedChild::spawn(
+        fixture._dir.path().join("seed-runner").into_os_string(),
+        vec![
+            fixture
+                ._dir
+                .path()
+                .join("seed-provider.so")
+                .into_os_string(),
+        ],
+    )
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(child.pid());
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), child.pid()).unwrap());
+    let mut session = ScriptedSession::default();
+    session.dynamic_loader_reports_added = true;
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let gaps_before = engine.counters.object_skips.len();
+    let outcome = engine
+        .arm_owned_loader_before_release(
+            &child,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, OwnedLoaderPrearmOutcome::Unavailable),
+        "a full table leaves the owned loader unavailable: {outcome:?}"
+    );
+    assert!(
+        engine.counters.object_skips[gaps_before..]
+            .iter()
+            .any(|skip| {
+                skip.subject == "owned initial-set discovery"
+                    && skip
+                        .reason
+                        .contains("could not be pinned through the owned child root")
+            }),
+        "the existing partial gap names the unpinned loader"
+    );
+    drop(live);
+}
+
 /// B2 site-4 twin (no resolving): a deferred memory scan with nothing
 /// parked restores its record and files one gap.
 #[test]

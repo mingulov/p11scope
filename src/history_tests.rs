@@ -516,6 +516,114 @@ fn trace_drain_retires_exits_like_profile() {
 }
 
 #[test]
+fn token_gated_root_completion_still_retires_exactly_once() {
+    // B1 step-6 twin: a root-completed (closed) task is excluded from
+    // exit matching, so an exit plus a token-gated root completion of
+    // the same key retires exactly once — sessions.closed moves once,
+    // rows are freed once, and the unmatched exit drops with its gap.
+    // The history path keeps the R10 entry (only the exit path frees
+    // it), so no second refund exists to double-spend.
+    let plan = plan();
+    let domain = crate::events::EventsDomain::test_standin(1);
+    let mut state =
+        semantics::State::for_capture(&plan, CapturePolicy::Allowlisted, domain.clone());
+    let mut tracker = process::Tracker::for_producer(domain.clone(), 64);
+    let mut positive = ev(100, 90, 0, 0);
+    positive.root_affiliation = 1;
+    positive.ts_ns = 100;
+    feed(&mut state, &mut tracker, [positive]);
+    let completed = key(90, 0);
+    assert!(state.has_process_state(completed));
+    // Token-gated root completion closes the task and retires it. The
+    // tail reduces a rowless call, not a second open of the same handle
+    // (re-observing an open supersede-closes it by existing semantics).
+    let mut tail_call = ev(100, 90, 0, 2);
+    tail_call.ts_ns = 150;
+    let mut drain = EventDrain::over_domain(
+        crate::events::root_fence_tests::source([tail_call]),
+        domain.clone(),
+    );
+    let mut tail = crate::events::OwnedRootTail::new(
+        OriginalRootExit::test_reaped(domain),
+        Instant::now() + Duration::from_secs(1),
+    );
+    drain.begin_root_tail(&mut tail).unwrap();
+    let domain_id = drain.domain_id();
+    assert_eq!(
+        drain
+            .poll_root_tail(&mut tail, 8, |event| reduce_profile_event(
+                domain_id,
+                &mut tracker,
+                &mut state,
+                &scope(),
+                event
+            ))
+            .unwrap(),
+        crate::events::RootTailProgress::Reached
+    );
+    apply_original_root_retirement(&mut tracker, &mut state, tail.complete().unwrap()).unwrap();
+    assert!(!state.has_process_state(completed));
+    assert_eq!(state.sessions().closed, 1);
+    assert_eq!(
+        state.memory_lens().reduced.len,
+        1,
+        "the history path keeps the R10 entry"
+    );
+    // A later exit for the pid matches no open task: the closed task
+    // is excluded, so the exit retries, then drops unmatched — and
+    // sessions.closed still counts the single retirement.
+    tracker.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    for _ in 0..2 {
+        let due = tracker.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+        assert!(due.is_empty(), "closed tasks never match an exit");
+    }
+    assert_eq!(tracker.pending_exit_taps_for_test(), 1);
+    let due = tracker.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    assert!(due.is_empty());
+    assert_eq!(tracker.pending_exit_taps_for_test(), 0);
+    assert_eq!(tracker.exit_counters_for_test(), (0, 1, 0, 0));
+    assert_eq!(state.sessions().closed, 1, "retired exactly once");
+}
+
+#[test]
+fn exit_retire_budget_carries_unexamined_exits_to_the_next_drain() {
+    // Budget twin: one retire call examines at most `budget` exits in
+    // tap order; due-but-unexamined exits carry over to the next drain
+    // instead of dropping.
+    let (mut s, mut t, _) = setup(64);
+    for (pid, cookie) in [(100u32, 90u64), (101, 91), (102, 92)] {
+        let mut first = ev(pid, cookie, 0, 0);
+        first.ts_ns = 100;
+        feed(&mut s, &mut t, [first]);
+    }
+    t.note_exit_taps(
+        (100u32..=102).map(|pid| crate::history::ExitTap {
+            pid,
+            hook_ts_ns: 200,
+        }),
+        1000,
+    );
+    let first = semantics::ProcessKey::history(1, 90, 0, 100);
+    let second = semantics::ProcessKey::history(1, 91, 0, 101);
+    let third = semantics::ProcessKey::history(1, 92, 0, 102);
+    let due = t.retire_exits_due(1000, 1000, 2);
+    assert_eq!(due, std::collections::BTreeSet::from([first, second]));
+    assert_eq!(t.pending_exit_taps_for_test(), 1);
+    s.retire_processes(&due);
+    let due = t.retire_exits_due(1000, 1000, 2);
+    assert_eq!(due, std::collections::BTreeSet::from([third]));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+    s.retire_processes(&due);
+    assert_eq!(s.sessions().closed, 3);
+}
+
+#[test]
 fn history_cookie_fd_and_pid_changes_never_order_independent_producer_histories() {
     let (mut s, mut t, a) = setup(16);
     feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);

@@ -2156,6 +2156,55 @@ mod corrective_tests {
     }
 
     #[test]
+    fn exit_then_history_retire_refunds_exactly_once() {
+        // Refund twin: an exit retire plus a history retire of the same
+        // key refunds the R10 entry exactly once — the batch removal
+        // refunds only on actual removal — in both orders, and repeating
+        // either retire refunds nothing further. The history path keeps
+        // R10 (only the exit path frees it), so no second refund exists
+        // to double-spend; the gate below pins the batch side.
+        let p = plan(&["C_OpenSession", "C_SignInit"]);
+        let process = ProcessKey::from_pid(100);
+        for exit_first in [false, true] {
+            let mut state = State::with_limit(&p, 64);
+            state.observe(&open(&p, 7, 1));
+            assert_eq!(
+                state.state_keys, 4,
+                "R10 + cgroup + open session + pseudonym counter"
+            );
+            assert!(state.reduced_histories.contains(&process));
+            if exit_first {
+                state.retire_processes(&BTreeSet::from([process]));
+                state.retire_process(process);
+            } else {
+                state.retire_process(process);
+                state.retire_processes(&BTreeSet::from([process]));
+            }
+            assert!(!state.has_process_state(process));
+            assert!(
+                !state.reduced_histories.contains(&process),
+                "the exit path frees R10 in both orders"
+            );
+            assert_eq!(
+                state.state_keys, 1,
+                "only the cgroup report row stays counted"
+            );
+            assert_eq!(
+                state.state_keys,
+                state.retained_dynamic_keys(),
+                "every retained key is counted exactly once"
+            );
+            let settled = state.state_keys;
+            state.retire_processes(&BTreeSet::from([process]));
+            state.retire_process(process);
+            assert_eq!(
+                state.state_keys, settled,
+                "repeating a retire refunds nothing"
+            );
+        }
+    }
+
+    #[test]
     fn every_live_state_removal_returns_its_budget_key() {
         // Site twin: every path that drops live state — session
         // cancel, operation-state import, error reconciliation,

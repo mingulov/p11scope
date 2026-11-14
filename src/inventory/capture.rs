@@ -4612,10 +4612,11 @@ pub(crate) enum ExitRelease {
 
 /// Singles detach estimate, ms per link: rounded from the 83 ms/link
 /// measured detaching 4683 per-offset links in 391 s on a loaded 7.0
-/// host (one close per link). Host-dependent (18 ms on 5.15, 32-35 ms
-/// idle on 6.12/7.x): a fast host finishes well under the estimate.
-/// Separate from the cleanup worker's 50 ms/link stop estimate, whose
-/// per-second progress lines correct it live; this line stands alone.
+/// host (one close per link). The top of the measured range (18 ms on
+/// 5.15, 32-35 ms idle on 6.12/7.x), so the line reads as an upper
+/// bound: a fast host finishes well under the estimate. Separate from
+/// the cleanup worker's 50 ms/link stop estimate, whose per-second
+/// progress lines correct it live; this line stands alone.
 const DETACH_ESTIMATE_MS_PER_LINK: u64 = 80;
 
 /// A remaining duration in plain English: seconds below a minute and
@@ -4637,11 +4638,14 @@ fn detach_duration_text(seconds: u64) -> String {
 
 /// The run's end after the stop (R-C51-4): `write` attempts final outputs
 /// (stream end, `-o`, stdout) first; then `outputs_attempted` arms the
-/// immediate exit on a second signal; only then does an unsettled
-/// retirement reach `release`, between two progress lines. A reclaimed
-/// owner keeps the blocking detach; a retained one stays alive without
-/// the closing progress line. An unsettled Singles detach names its
-/// estimated remaining wait; Multi detaches too fast for an estimate.
+/// second-signal exit; only then does an unsettled retirement reach
+/// `release`, between two progress lines. The exit stops the userspace
+/// wait — the kernel still releases the remaining probes on process
+/// exit, which may take as long as the detach. A reclaimed owner keeps
+/// the blocking detach; a retained one stays alive without the closing
+/// progress line. An unsettled Singles detach names its estimated
+/// remaining wait as an upper bound; Multi carries no estimate for
+/// lack of a measured per-link rate.
 pub(crate) fn finish_native<L, T>(
     stopped: Option<Stopped<L>>,
     write: impl FnOnce(Option<&LaneSummary>) -> T,
@@ -4655,21 +4659,35 @@ pub(crate) fn finish_native<L, T>(
         && let Retirement::Unsettled(_) = stopped.summary.retirement
     {
         // Singles closes one link per endpoint with no progress after
-        // this line, so it carries the wait estimate; Multi needs
-        // none. The estimate counts every attached endpoint while the
-        // pre-output wait already closed some, so a fast host finishes
-        // under it.
-        let estimate = match stopped.summary.backend.backend {
+        // this line, so it carries the wait estimate as an upper
+        // bound: 80 ms/link is the top of the measured range, and the
+        // count covers every attached endpoint while the pre-output
+        // wait already closed some. Multi carries no estimate for lack
+        // of a measured rate. Neither tail promises a prompt return:
+        // the second signal stops the userspace wait, and the kernel
+        // still releases the remaining probes on process exit.
+        let (estimate, hint) = match stopped.summary.backend.backend {
             AttachBackend::Singles => {
                 let ms =
                     (stopped.summary.attached as u64).saturating_mul(DETACH_ESTIMATE_MS_PER_LINK);
-                format!(", {} remaining", detach_duration_text(ms.div_ceil(1000)))
+                (
+                    format!(
+                        ", up to {} remaining",
+                        detach_duration_text(ms.div_ceil(1000))
+                    ),
+                    "press Ctrl-C again to stop waiting; \
+                     the kernel may still take this long to release the probes",
+                )
             }
-            AttachBackend::Multi => String::new(),
+            AttachBackend::Multi => (
+                String::new(),
+                "press Ctrl-C again to stop waiting; \
+                 the kernel releases the remaining probes on exit",
+            ),
         };
         progress(format!(
             "p11scope: output attempts finished; detaching the remaining native probes of {} \
-             endpoints{estimate} (press Ctrl-C again to exit now)",
+             endpoints{estimate} ({hint})",
             stopped.summary.attached
         ));
         if matches!(release(stopped), ExitRelease::Reclaimed) {

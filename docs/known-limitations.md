@@ -1849,12 +1849,15 @@ is available): attach 41 s, stop (link release) 339 s, about 41 ms per
 link.
 
 The inventory post-report detach line (`output attempts finished;
-detaching the remaining native probes …`) estimates the remaining
-Singles wait at 80 ms per link, rounded from 83 ms/link measured over
-4683 links in 391 s on a loaded 7.0 host; on a fast host the detach
-finishes well under the estimate. A second Ctrl-C (or SIGTERM/SIGHUP)
-after the report exits at once and leaves the kernel to release the
-remaining probes.
+detaching the remaining native probes …`) states the remaining
+Singles wait as an upper bound at 80 ms per link, rounded from
+83 ms/link measured over 4683 links in 391 s on a loaded 7.0 host
+(the top of the measured 18-83 ms/link range); on a fast host the
+detach finishes well under the estimate. A second Ctrl-C (or
+SIGTERM/SIGHUP) after the report stops the userspace wait (status
+128 + signal); the kernel still releases the remaining probes on
+process exit, which may take as long as the estimate, so the shell
+may wait too.
 
 ### 5.15: physical-identity controls and non-leader exec unqualified
 

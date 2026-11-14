@@ -7964,6 +7964,7 @@ fn select_user_pids_lazily(
         }
     }
     out
+}
 
 /// True when `pid` is provably a kernel thread with no user address
 /// space: the `PF_KTHREAD` flag in `{proc_root}/<pid>/stat` plus an

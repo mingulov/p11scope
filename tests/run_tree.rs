@@ -228,7 +228,9 @@ fn sum_ledgers(ledgers: &[PathBuf]) -> BTreeMap<String, u64> {
 
 /// Per-function completed-call counts for the module with `sha256` from
 /// the profile's `functions` rows (P2-8 join: rows carry the module as
-/// an identity object; `sha256` is stable across device domains).
+/// an identity object; `sha256` is stable across device domains). Each
+/// row counts once, under its first name: a row's calls are one
+/// function's completed calls however many aliases the row carries.
 fn function_calls(profile: &serde_json::Value, sha256: &str) -> BTreeMap<String, u64> {
     let rows = profile
         .get("functions")
@@ -255,10 +257,10 @@ fn function_calls(profile: &serde_json::Value, sha256: &str) -> BTreeMap<String,
             .and_then(|names| names.as_array())
             .expect("function names");
         let calls = row.get("calls").and_then(|c| c.as_u64()).unwrap_or(0);
-        for name in names {
-            let name = name.as_str().expect("function name");
-            *counts.entry(name.to_string()).or_insert(0) += calls;
-        }
+        let Some(first) = names.first().and_then(|name| name.as_str()) else {
+            continue;
+        };
+        *counts.entry(first.to_string()).or_insert(0) += calls;
     }
     counts
 }
@@ -279,6 +281,66 @@ fn record_sha256(profile: &serde_json::Value, module: &Path) -> String {
         .and_then(|sha| sha.as_str())
         .expect("record sha256")
         .to_string()
+}
+
+/// Coverage of the oracle after the first worker, excluding the first
+/// worker's masking effect: observed calls cannot be attributed per
+/// worker, so the numerator subtracts the first worker's whole oracle
+/// (the most its landed calls could inflate it). A sound lower bound
+/// on later-worker recall: it never hides their misses behind the
+/// first worker's landed calls (about 3 points at 32 workers).
+fn coverage_after_first_worker(
+    observed_total: u64,
+    oracle_first_total: u64,
+    oracle_rest_total: u64,
+) -> f64 {
+    observed_total.saturating_sub(oracle_first_total) as f64 / oracle_rest_total as f64
+}
+
+/// Each profile row counts once, under its first name: a row's calls
+/// are one function's completed calls however many aliases the row
+/// carries, so per-alias crediting would multiply them.
+#[test]
+fn function_calls_counts_each_row_once_not_per_alias() {
+    let profile = serde_json::json!({
+        "functions": [
+            {"module": {"sha256": "abc"}, "names": ["C_Sign"], "calls": 3},
+            {"module": {"sha256": "abc"}, "names": ["C_Verify", "C_VerifyAlias"], "calls": 5},
+            {"module": {"sha256": "other"}, "names": ["C_Sign"], "calls": 100},
+        ]
+    });
+    let counts = function_calls(&profile, "abc");
+    assert_eq!(counts.get("C_Sign"), Some(&3));
+    assert_eq!(counts.get("C_Verify"), Some(&5));
+    assert!(
+        !counts.contains_key("C_VerifyAlias"),
+        "an alias never double-counts its row: {counts:?}"
+    );
+    assert_eq!(
+        counts.values().sum::<u64>(),
+        8,
+        "totals count calls, not aliases: {counts:?}"
+    );
+}
+
+/// The after-first-worker bound excludes first-worker masking: landed
+/// first-worker calls never inflate later-worker recall, and missed
+/// later-worker calls always show.
+#[test]
+fn coverage_after_first_worker_excludes_first_worker_masking() {
+    // Later workers land all 31 calls and the first worker's 1 call
+    // also landed: recall is 1.0, not 32/31.
+    assert_eq!(coverage_after_first_worker(32, 1, 31), 1.0);
+    // Later workers miss 3 of 31 (true 0.903); the first worker's
+    // landed call must not hide it.
+    let bound = coverage_after_first_worker(28 + 1, 1, 31);
+    assert!(
+        (bound - 28.0 / 31.0).abs() < 1e-12,
+        "misses show through the bound: {bound}"
+    );
+    assert!(bound < 0.95, "a 3-point shortfall fails the floor: {bound}");
+    // Nothing landed: zero, never negative.
+    assert_eq!(coverage_after_first_worker(0, 1, 31), 0.0);
 }
 
 /// Exact counts in both directions: every ledger function observed
@@ -1094,6 +1156,7 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
     // under attached file-identity probes, so its calls must land.
     let oracle_rest = sum_ledgers(&ledgers[1..]);
     let oracle_rest_total: u64 = oracle_rest.values().sum();
+    let oracle_first_total: u64 = sum_ledgers(&ledgers[..1]).values().sum();
     assert!(oracle_rest_total > 0, "the oracle is non-empty");
     let sha = record_sha256(&profile, &module);
     let observed = function_calls(&profile, &sha);
@@ -1105,10 +1168,13 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
         observed_total <= oracle_all_total,
         "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
     );
-    let coverage = observed_total as f64 / oracle_rest_total as f64;
+    // The bound excludes the first worker's masking effect (its landed
+    // calls cannot inflate later-worker recall).
+    let coverage =
+        coverage_after_first_worker(observed_total, oracle_first_total, oracle_rest_total);
     assert!(
         coverage >= 0.95,
-        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total}): {observed:?}"
+        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total} less first-worker {oracle_first_total}): {observed:?}"
     );
     // Honesty half: the first mapper's miss stays disclosed, never silent.
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
@@ -1190,6 +1256,7 @@ fn privileged_run_tree_unprearmed_shortlived_never_pause_still_learns() {
     assert!(probes > 0, "the run attached probes: {profile}");
     let oracle_rest = sum_ledgers(&ledgers[1..]);
     let oracle_rest_total: u64 = oracle_rest.values().sum();
+    let oracle_first_total: u64 = sum_ledgers(&ledgers[..1]).values().sum();
     assert!(oracle_rest_total > 0, "the oracle is non-empty");
     let sha = record_sha256(&profile, &module);
     let observed = function_calls(&profile, &sha);
@@ -1200,10 +1267,13 @@ fn privileged_run_tree_unprearmed_shortlived_never_pause_still_learns() {
         observed_total <= oracle_all_total,
         "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
     );
-    let coverage = observed_total as f64 / oracle_rest_total as f64;
+    // The bound excludes the first worker's masking effect (its landed
+    // calls cannot inflate later-worker recall).
+    let coverage =
+        coverage_after_first_worker(observed_total, oracle_first_total, oracle_rest_total);
     assert!(
         coverage >= 0.95,
-        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total}): {observed:?}"
+        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total} less first-worker {oracle_first_total}): {observed:?}"
     );
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
     let learned = evidence
@@ -1342,6 +1412,7 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     // lands; file-identity probes need no loader context).
     let oracle_rest = sum_ledgers(&ledgers[1..]);
     let oracle_rest_total: u64 = oracle_rest.values().sum();
+    let oracle_first_total: u64 = sum_ledgers(&ledgers[..1]).values().sum();
     assert!(oracle_rest_total > 0, "the oracle is non-empty");
     let sha = record_sha256(&profile, &module);
     let observed = function_calls(&profile, &sha);
@@ -1352,10 +1423,13 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
         observed_total <= oracle_all_total,
         "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
     );
-    let coverage = observed_total as f64 / oracle_rest_total as f64;
+    // The bound excludes the first worker's masking effect (its landed
+    // calls cannot inflate later-worker recall).
+    let coverage =
+        coverage_after_first_worker(observed_total, oracle_first_total, oracle_rest_total);
     assert!(
         coverage >= 0.95,
-        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total}): {observed:?}"
+        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total} less first-worker {oracle_first_total}): {observed:?}"
     );
 }
 

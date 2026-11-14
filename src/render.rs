@@ -19170,6 +19170,159 @@ pub(crate) mod tests {
             &crate::cli::parse_duration("bogus").unwrap_err(),
         );
     }
+
+    fn large_reports(count: usize) -> Vec<SlotReport> {
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut row = report(&format!("C_Sign{i:05}"), 100 + i as u64, 0, false);
+            row.total_ns = 1_000 + i as u64;
+            row.max_ns = 100;
+            row.rv_counts.insert(0, 90 + i as u64);
+            row.rv_counts.insert(5, 10);
+            out.push(row);
+        }
+        out
+    }
+
+    fn large_state(mechanisms: u64) -> crate::semantics::State {
+        let mut state =
+            crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+        for id in 0..mechanisms {
+            let event = init_event(0, 0x1000 + id, shape::NONE, 0, 0, 0);
+            state.observe(&event);
+        }
+        state
+    }
+
+    fn large_evidence(skipped: usize) -> Evidence {
+        let mut ev = evidence();
+        ev.skipped = (0..skipped)
+            .map(|i| SkippedOut {
+                name: format!("skipped-{i:05}"),
+                reason: format!("reason-{i:05}"),
+            })
+            .collect();
+        ev.aliased = (0..100).map(|i| vec![format!("alias-{i}"), format!("target-{i}")]).collect();
+        ev.surfaces = vec![ok_surface(); 50];
+        ev.verdict();
+        ev
+    }
+
+    /// B2 step 1: streamed bytes must equal tree-built bytes at both
+    /// seal sites, both snapshot arms at the early site, on small and
+    /// large fixtures. RED before the streaming writer exists.
+    #[test]
+    fn streamed_report_is_byte_identical() {
+        use crate::metrics::ConsumerFixture;
+        use crate::metrics::selected_detail_driver::SelectionLedger;
+        let mut fixture = ConsumerFixture::new();
+        let snapshot_with_collection = fixture
+            .fresh(CounterMode::Counts, 1, 5, None)
+            .expect("counter fixture yields a snapshot");
+        assert!(
+            snapshot_with_collection.counter_collection().is_some(),
+            "the Some arm must actually run the counter transform"
+        );
+        let ledger = SelectionLedger::new();
+        let small_reports = reports_fixture();
+        let small_state = state_fixture();
+        let small_ev = {
+            let mut ev = evidence();
+            ev.verdict();
+            ev
+        };
+        let large_reports = large_reports(500);
+        let large_state = large_state(200);
+        let large_ev = large_evidence(500);
+        let capture = capture_fixture();
+        for (label, reports, state, ev) in [
+            ("profile-small", &small_reports, &small_state, &small_ev),
+            ("profile-large", &large_reports, &large_state, &large_ev),
+        ] {
+            for (arm, snapshot_opt, ledger_opt) in [
+                ("early-none", None, None),
+                ("early-some", Some(&snapshot_with_collection), None),
+                ("main-ledger", Some(&snapshot_with_collection), Some(&ledger)),
+            ] {
+                let versioned = VersionedEvidence::wrap(ev);
+                let mut tree = profile_json(reports, VersionedEvidence::wrap(ev), state, &capture);
+                if let Some(snapshot) = snapshot_opt {
+                    tree = with_counter_snapshot(tree, snapshot);
+                    tree = with_legacy_snapshot(tree, snapshot);
+                }
+                if let Some(ledger) = ledger_opt {
+                    tree = crate::metrics::selected_detail_driver::with_selected_detail(
+                        tree, ledger,
+                    );
+                }
+                if snapshot_opt.is_some() {
+                    assert!(
+                        tree["evidence"].get("counter_collection").is_some(),
+                        "{label}/{arm}: the counter transform must run"
+                    );
+                }
+                if ledger_opt.is_some() {
+                    assert!(
+                        tree["evidence"].get("selected_detail").is_some(),
+                        "{label}/{arm}: the ledger transform must run"
+                    );
+                }
+                let envelope = super::profile_evidence_envelope(
+                    &versioned,
+                    snapshot_opt,
+                    ledger_opt,
+                );
+                let streamed = super::StreamedProfileReport::new(
+                    reports,
+                    ev,
+                    envelope,
+                    state,
+                    &capture,
+                );
+                let mut tree_bytes = Vec::new();
+                serde_json::to_writer_pretty(&mut tree_bytes, &tree).unwrap();
+                let mut streamed_bytes = Vec::new();
+                serde_json::to_writer_pretty(&mut streamed_bytes, &streamed).unwrap();
+                assert_eq!(
+                    streamed_bytes, tree_bytes,
+                    "{label}/{arm}: streamed bytes must equal tree bytes"
+                );
+            }
+        }
+        for (label, reports, ev) in [
+            ("metrics-small", &small_reports, &small_ev),
+            ("metrics-large", &large_reports, &large_ev),
+        ] {
+            for (arm, snapshot_opt, ledger_opt) in [
+                ("early-none", None, None),
+                ("early-some", Some(&snapshot_with_collection), None),
+                ("main-ledger", Some(&snapshot_with_collection), Some(&ledger)),
+            ] {
+                let mut tree = json(reports, ev, &capture);
+                if let Some(snapshot) = snapshot_opt {
+                    tree = with_counter_snapshot(tree, snapshot);
+                    tree = with_legacy_snapshot(tree, snapshot);
+                }
+                if let Some(ledger) = ledger_opt {
+                    tree = crate::metrics::selected_detail_driver::with_selected_detail(
+                        tree, ledger,
+                    );
+                }
+                let envelope =
+                    super::metrics_evidence_envelope(ev, snapshot_opt, ledger_opt);
+                let streamed =
+                    super::StreamedMetricsReport::new(reports, ev, envelope, &capture);
+                let mut tree_bytes = Vec::new();
+                serde_json::to_writer_pretty(&mut tree_bytes, &tree).unwrap();
+                let mut streamed_bytes = Vec::new();
+                serde_json::to_writer_pretty(&mut streamed_bytes, &streamed).unwrap();
+                assert_eq!(
+                    streamed_bytes, tree_bytes,
+                    "{label}/{arm}: streamed bytes must equal tree bytes"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

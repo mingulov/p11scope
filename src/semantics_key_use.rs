@@ -490,6 +490,16 @@ impl JointStaging {
         })
     }
 
+    /// Take the below-fence deferral for disclosure (I2): true once per
+    /// recorded fence while the retained receipt cuts below it, so the
+    /// Task-1→3 interim (a voided but resumable feed that can only wait
+    /// for re-selection) names one counted per-feed reason instead of
+    /// refusing silently. A new void re-arms it; a clean resume clears
+    /// it.
+    pub(crate) fn take_below_fence_deferral(&mut self) -> bool {
+        self.receipt_below_recorded_fence()
+    }
+
     /// Whether a later birth may still select Joint for this feed: it
     /// was registered S1Only only because its sighting pass carried no
     /// birth, and nothing has touched it since (no selection, segment,

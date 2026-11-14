@@ -9428,6 +9428,55 @@ fn joint_machine_voided_feed_refuses_below_fence_resume() {
     );
 }
 
+/// Scope-round I2 twin: the below-fence resume refusal discloses one
+/// counted per-feed reason — the first clean-point call after the void
+/// stages `joint_resume_deferred_below_fence`, and a second probe does
+/// not repeat it while the same fence stands.
+#[test]
+fn joint_machine_below_fence_deferral_discloses_once_per_feed() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.refuse_at_audited(2);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "a running Audited refusal with its frame re-arms"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "the re-armed lane accepts the next commit"
+    );
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 3);
+    fixture.published_labeled("after running re-arm", None);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    fixture.published_labeled("below-fence-resume-probe", None);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("below-fence-resume-probe-again", None);
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let at = registry
+        .gaps()
+        .iter()
+        .position(|gap| gap.reason == "joint_resume_deferred_below_fence")
+        .expect("the below-fence deferral is disclosed");
+    assert_eq!(
+        registry.gap_repeats()[at],
+        1,
+        "one counted reason per feed per fence, however many probes refuse"
+    );
+    assert!(
+        registry.gaps()[at].caller.is_some(),
+        "the deferral names its feed"
+    );
+    assert_eq!(
+        registry.gaps()[at].subject,
+        "Joint key operations unavailable; retained S1",
+        "the deferral shares the Joint-unavailable subject"
+    );
+}
+
 /// Scope-round instrumentation twin: an audit void that ends Joint feeds
 /// counts once per void, however many feeds it ends; a later void that
 /// ends no Joint feed (every feed already degraded) counts no new ending.
@@ -9542,6 +9591,45 @@ fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
     assert!(
         saturated.feeds().iter().all(|feed| feed.degraded),
         "the saturation ended every Joint feed"
+    );
+}
+
+/// Scope-round drain twin: each audit void discloses one counted scope
+/// gap for its sub-cause (`joint_void_<subcause>_history_loss`), like
+/// ingest-break voids do — published with the voiding completion,
+/// exactly once per void.
+#[test]
+fn joint_audit_void_discloses_counted_subcause_gap() {
+    let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject", "C_SignInit"],
+        PublicationReceipts::All,
+    );
+    let mut frame = Some(original);
+    let fault = FrameFault::clean();
+    fault.epoch.set(1);
+    let old_revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.complete_publication(&mut frame, &fault, old_revision);
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let at = registry
+        .gaps()
+        .iter()
+        .position(|gap| gap.reason == "joint_void_fault_changed_history_loss")
+        .expect("the audit void discloses its sub-cause gap");
+    assert_eq!(
+        registry.gap_repeats()[at],
+        1,
+        "one counted gap per audit void"
+    );
+    assert!(
+        registry.gaps()[at].caller.is_none(),
+        "the void gap is scope-wide, not per process"
     );
 }
 

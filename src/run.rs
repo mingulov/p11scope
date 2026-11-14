@@ -5488,24 +5488,21 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
             ring_bytes: resolve_capture_ring_bytes(context.policy, false, context.ring_bytes),
             drain_interval_ms: context.drain.as_millis() as u64,
         };
-        let j = if profile {
-            render::profile_json(
-                &reports,
-                render::VersionedEvidence::wrap(&ev),
-                &state,
-                &capture,
-            )
+        // B2: stream sections; only the evidence envelope is
+        // materialized. The early site applies the two snapshot
+        // transforms only when a snapshot exists, never with a ledger.
+        if profile {
+            let versioned = render::VersionedEvidence::wrap(&ev);
+            let envelope =
+                render::profile_evidence_envelope(&versioned, snapshot_opt.as_ref(), None);
+            let streamed =
+                render::StreamedProfileReport::new(&reports, &ev, &envelope, &state, &capture);
+            write_json_report_streamed(out_file.file(), &streamed)?;
         } else {
-            render::json(&reports, &ev, &capture)
-        };
-        let j = match snapshot_opt.as_ref() {
-            Some(snapshot) => {
-                let j = render::with_counter_snapshot(j, snapshot);
-                render::with_legacy_snapshot(j, snapshot)
-            }
-            None => j,
-        };
-        write_json_report(out_file.file(), &j)?;
+            let envelope = render::metrics_evidence_envelope(&ev, snapshot_opt.as_ref(), None);
+            let streamed = render::StreamedMetricsReport::new(&reports, &ev, &envelope, &capture);
+            write_json_report_streamed(out_file.file(), &streamed)?;
+        }
         out_file.commit().map_err(anyhow::Error::msg)?;
         // The file is the report; a display-only stdout failure never
         // fails a sealed file.
@@ -10763,45 +10760,105 @@ fn capture_profile(
                 ring_bytes: resolve_capture_ring_bytes(policy, false, ring_bytes),
                 drain_interval_ms: drain.as_millis() as u64,
             };
-            let j = if profile {
-                render::profile_json(
+            // B2: stream sections; only the evidence envelope is
+            // materialized. The main site applies the two snapshot
+            // transforms unconditionally and the ledger when present,
+            // each in today's order. Both sinks (file pretty, rescue
+            // compact) share the section writer.
+            if profile {
+                let versioned = render::VersionedEvidence::wrap(&ev);
+                let envelope = render::profile_evidence_envelope(
+                    &versioned,
+                    Some(&snapshot),
+                    selection_ledger.as_deref(),
+                );
+                // B2 (R5): the streamed peak — envelope plus the largest
+                // section — only when diagnostics are on.
+                *seal_value_bytes =
+                    seal_value_bytes_if_diagnostics(capture_diagnostics_on(), || {
+                        render::profile_streamed_peak_bytes(
+                            reports,
+                            &ev,
+                            &envelope,
+                            consumers.state,
+                            &capture,
+                        )
+                    });
+                poll_terminal_cancellation();
+                let out_path = out_file.path().to_path_buf();
+                let streamed = render::StreamedProfileReport::new(
                     reports,
-                    render::VersionedEvidence::wrap(&ev),
+                    &ev,
+                    &envelope,
                     consumers.state,
                     &capture,
+                );
+                publish_streamed_report_with_drop_accounting(
+                    context.3,
+                    context.4,
+                    consumers.scheduling,
+                    Some(&out_path),
+                    || {
+                        write_json_report_streamed(out_file.file(), &streamed)?;
+                        poll_terminal_cancellation();
+                        out_file.commit().map_err(anyhow::Error::msg)?;
+                        poll_terminal_cancellation();
+                        Ok(())
+                    },
+                    |bytes, failed_path, out_error| {
+                        let delivery = delivery_value(failed_path, out_error);
+                        let inner = render::StreamedProfileReport::new(
+                            reports,
+                            &ev,
+                            &envelope,
+                            consumers.state,
+                            &capture,
+                        );
+                        let rescued =
+                            render::StreamedProfileReportWithDelivery::new(inner, delivery);
+                        serde_json::to_writer(&mut *bytes, &rescued)
+                    },
+                    frame_error,
                 )
+                .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
             } else {
-                render::json(reports, &ev, &capture)
-            };
-            let j = render::with_counter_snapshot(j, &snapshot);
-            let j = render::with_legacy_snapshot(j, &snapshot);
-            let j = match selection_ledger {
-                Some(ledger) => metrics::selected_detail_driver::with_selected_detail(j, ledger),
-                None => j,
-            };
-            // A0 (R5): measure the sealed tree before it streams to disk,
-            // only when diagnostics are on (the default path skips the walk).
-            *seal_value_bytes = seal_value_bytes_if_diagnostics(capture_diagnostics_on(), || {
-                crate::memory_counters::json_value_bytes(&j)
-            });
-            poll_terminal_cancellation();
-            let out_path = out_file.path().to_path_buf();
-            publish_profile_report_with_drop_accounting(
-                context.3,
-                context.4,
-                consumers.scheduling,
-                &j,
-                Some(&out_path),
-                || {
-                    write_json_report(out_file.file(), &j)?;
-                    poll_terminal_cancellation();
-                    out_file.commit().map_err(anyhow::Error::msg)?;
-                    poll_terminal_cancellation();
-                    Ok(())
-                },
-                frame_error,
-            )
-            .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
+                let envelope = render::metrics_evidence_envelope(
+                    &ev,
+                    Some(&snapshot),
+                    selection_ledger.as_deref(),
+                );
+                *seal_value_bytes =
+                    seal_value_bytes_if_diagnostics(capture_diagnostics_on(), || {
+                        render::metrics_streamed_peak_bytes(reports, &ev, &envelope, &capture)
+                    });
+                poll_terminal_cancellation();
+                let out_path = out_file.path().to_path_buf();
+                let streamed =
+                    render::StreamedMetricsReport::new(reports, &ev, &envelope, &capture);
+                publish_streamed_report_with_drop_accounting(
+                    context.3,
+                    context.4,
+                    consumers.scheduling,
+                    Some(&out_path),
+                    || {
+                        write_json_report_streamed(out_file.file(), &streamed)?;
+                        poll_terminal_cancellation();
+                        out_file.commit().map_err(anyhow::Error::msg)?;
+                        poll_terminal_cancellation();
+                        Ok(())
+                    },
+                    |bytes, failed_path, out_error| {
+                        let delivery = delivery_value(failed_path, out_error);
+                        let inner =
+                            render::StreamedMetricsReport::new(reports, &ev, &envelope, &capture);
+                        let rescued =
+                            render::StreamedMetricsReportWithDelivery::new(inner, delivery);
+                        serde_json::to_writer(&mut *bytes, &rescued)
+                    },
+                    frame_error,
+                )
+                .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
+            }
         } else if let Some(error) = frame_error {
             return Err(terminal_publication_error(terminal_error.take(), error));
         }
@@ -10832,6 +10889,9 @@ fn capture_profile(
 /// exited because `--duration` elapsed or because SIGINT set
 /// `interrupted`: finalization does not know or care which. Factored out
 /// so that fact is directly testable without standing up a real attach session.
+/// B2: production seal sites stream via `write_json_report_streamed`;
+/// this tree writer stays for its twins.
+#[cfg(test)]
 fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<()> {
     file.set_len(0).context("truncating profile output")?;
     file.seek(SeekFrom::Start(0))
@@ -10850,6 +10910,9 @@ fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<
 /// plus atomic commit. A rescued report still returns the `-o` error, so
 /// the run exits nonzero; drops under stdout backpressure stay the
 /// caller's `collect_sink_drops` accounting.
+/// B2: production uses `publish_streamed_report_with_fallback`; this
+/// tree publisher stays for its twins.
+#[cfg(test)]
 fn publish_profile_report_with_fallback<W>(
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
@@ -10889,6 +10952,8 @@ where
 /// the stdout rescue above, then the post-publish drain. The drain must
 /// run even when publication fails, and a rescue shed under backpressure
 /// must surface in the returned error (the JSON is already sealed).
+/// B2: production uses the streamed variant; this stays for its twins.
+#[cfg(test)]
 fn publish_profile_report_with_drop_accounting<W, F>(
     sink: &mut crate::sink::SinkWriter<W>,
     stdout_open: &mut bool,
@@ -10926,6 +10991,15 @@ where
     }
 }
 
+/// B2: the rescue `delivery` object shared by the tree rescue and
+/// the streamed rescue wrapper, so the two can never drift.
+fn delivery_value(failed_path: &Path, out_error: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "rescued_after_output_failure": failed_path.display().to_string(),
+        "output_error": format!("{out_error:#}"),
+    })
+}
+
 /// Marks a rescued report inside the document itself, so a consumer
 /// holding stdout alone (stderr lost) can still tell it is a rescue and
 /// which `-o` write failed. No existing top-level `errors`/`notes`/
@@ -10935,6 +11009,9 @@ where
 /// healthy `-o` files. Publication metadata only: it never feeds
 /// verdicts, shares, or completeness. See
 /// `docs/schema/observed-profile-v3.md`.
+/// B2: production rescue streams via the wrapper + `delivery_value`;
+/// this tree marker stays for its twins.
+#[cfg(test)]
 fn with_rescue_delivery_mark(
     json: &serde_json::Value,
     failed_path: &Path,
@@ -10942,13 +11019,7 @@ fn with_rescue_delivery_mark(
 ) -> serde_json::Value {
     let mut rescued = json.clone();
     if let Some(object) = rescued.as_object_mut() {
-        object.insert(
-            "delivery".into(),
-            serde_json::json!({
-                "rescued_after_output_failure": failed_path.display().to_string(),
-                "output_error": format!("{out_error:#}"),
-            }),
-        );
+        object.insert("delivery".into(), delivery_value(failed_path, out_error));
     }
     rescued
 }
@@ -10961,6 +11032,9 @@ fn with_rescue_delivery_mark(
 /// error (plus any rescue failure), so the run still exits nonzero.
 /// Skipped when stdout already closed (EPIPE): there is no second sink
 /// left to try.
+/// B2: production uses `fallback_streamed_report_to_stdout`; this stays
+/// for its twins.
+#[cfg(test)]
 fn fallback_profile_report_to_stdout(
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
@@ -10995,6 +11069,148 @@ fn fallback_profile_report_to_stdout(
             }
         }
         Err(rescue_error) => also_failed(out_error, rescue_error, "stdout fallback write"),
+    }
+}
+
+/// B2: the streamed `-o` write — same file discipline as
+/// `write_json_report` (truncate, seek, pretty, flush, sync), but the
+/// report serializes section by section from the streamer, never from
+/// a materialized tree. The old helper stays for its twins; production
+/// seal sites use this.
+fn write_json_report_streamed(
+    file: &mut std::fs::File,
+    report: &impl serde::Serialize,
+) -> Result<()> {
+    file.set_len(0).context("truncating profile output")?;
+    file.seek(SeekFrom::Start(0))
+        .context("seeking profile output")?;
+    serde_json::to_writer_pretty(&mut *file, report).context("writing profile output")?;
+    file.flush().context("flushing profile output")?;
+    file.sync_all().context("syncing profile output")
+}
+
+/// B2: the streamed stdout rescue — same framing and error contract as
+/// `fallback_profile_report_to_stdout` (one compact document on its own
+/// line, stderr names the failed path, always returns the `-o` error),
+/// but the rescue bytes stream from the section writer via
+/// `rescue_to_bytes`, never from a tree. That closure builds the
+/// lane's rescue wrapper with `delivery_value` and serializes compact.
+fn fallback_streamed_report_to_stdout(
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    rescue_to_bytes: impl FnOnce(&mut Vec<u8>, &Path, &anyhow::Error) -> Result<(), serde_json::Error>,
+    failed_path: &Path,
+    out_error: anyhow::Error,
+) -> anyhow::Error {
+    if !*stdout_open {
+        return out_error.context("stdout fallback unavailable: stdout is closed");
+    }
+    emit_capture_diagnostic(&format!(
+        "p11scope: output {} failed: {out_error:#}; the JSON report follows on stdout",
+        failed_path.display()
+    ));
+    let mut bytes = vec![b'\n'];
+    if let Err(error) = rescue_to_bytes(&mut bytes, failed_path, &out_error) {
+        return also_failed(
+            out_error,
+            anyhow::Error::msg(error),
+            "stdout fallback serialization",
+        );
+    }
+    bytes.push(b'\n');
+    match write_stdout(stdout, stdout_open, &bytes).and_then(|()| flush_stdout(stdout, stdout_open))
+    {
+        Ok(()) => {
+            if *stdout_open {
+                out_error
+            } else {
+                out_error.context("stdout fallback unavailable: stdout closed while writing")
+            }
+        }
+        Err(rescue_error) => also_failed(out_error, rescue_error, "stdout fallback write"),
+    }
+}
+
+/// B2: terminal publication for streamed reports across its two sinks —
+/// the same contract as `publish_profile_report_with_fallback` (the
+/// `-o` write runs even after a hard frame failure; a failed `-o`
+/// write rescues to stdout; a rescued report still returns the `-o`
+/// error), but both sinks stream sections. The file write runs via
+/// `write_out`; the rescue builds via `rescue_to_bytes`.
+fn publish_streamed_report_with_fallback<W, R>(
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out: Option<&Path>,
+    write_out: W,
+    rescue_to_bytes: R,
+    frame_error: Option<anyhow::Error>,
+) -> Result<()>
+where
+    W: FnOnce() -> Result<()>,
+    R: FnOnce(&mut Vec<u8>, &Path, &anyhow::Error) -> Result<(), serde_json::Error>,
+{
+    let Some(out_path) = out else {
+        return match frame_error {
+            None => Ok(()),
+            Some(error) => Err(error),
+        };
+    };
+    match write_out() {
+        Ok(()) => match frame_error {
+            None => Ok(()),
+            Some(error) => Err(error),
+        },
+        Err(out_error) => Err(match frame_error {
+            Some(frame) => also_failed(out_error, frame, "terminal stdout frame"),
+            None => fallback_streamed_report_to_stdout(
+                stdout,
+                stdout_open,
+                rescue_to_bytes,
+                out_path,
+                out_error,
+            ),
+        }),
+    }
+}
+
+/// B2: terminal publication with sink-drop accounting for streamed
+/// reports — the same contract as
+/// `publish_profile_report_with_drop_accounting`.
+fn publish_streamed_report_with_drop_accounting<W, F, R>(
+    sink: &mut crate::sink::SinkWriter<W>,
+    stdout_open: &mut bool,
+    scheduling: &mut SchedulingAccumulator,
+    out: Option<&Path>,
+    write_out: F,
+    rescue_to_bytes: R,
+    frame_error: Option<anyhow::Error>,
+) -> Result<()>
+where
+    W: Write + std::os::fd::AsRawFd,
+    F: FnOnce() -> Result<()>,
+    R: FnOnce(&mut Vec<u8>, &Path, &anyhow::Error) -> Result<(), serde_json::Error>,
+{
+    let published = publish_streamed_report_with_fallback(
+        sink as &mut dyn Write,
+        stdout_open,
+        out,
+        write_out,
+        rescue_to_bytes,
+        frame_error,
+    );
+    let drops = collect_sink_drops(sink, scheduling, &mut None, Instant::now());
+    match published {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if drops.dropped_bytes > 0 {
+                Err(error.context(format!(
+                    "stdout fallback shed {} bytes in {} flush timeouts under backpressure",
+                    drops.dropped_bytes, drops.timeouts
+                )))
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 

@@ -5659,7 +5659,7 @@ fn tick_does_not_remark_lingering_zombie_of_tracked_generation() {
 }
 
 /// An unreadable pid whose view pends removal this tick is the same dying
-/// generation, never a running newcomer (a new generation is always
+/// generation, never a running newcomer (a *running* new generation is always
 /// stat-readable): it must not mark either.
 #[test]
 fn tick_does_not_remark_unreadable_pid_with_pending_view() {
@@ -5799,7 +5799,8 @@ fn pre_walk_kthread_exit_skips_after_initial_seed() {
     let procdir = tempfile::tempdir().expect("fixture proc root");
     write_proc_stat_fixture(procdir.path(), 4242, "S", 4194304 | 0x200000, 100);
     std::fs::write(procdir.path().join("4242").join("maps"), "").expect("empty maps");
-    engine.seed_initial_kernel_threads(procdir.path(), &[4242]);
+    engine.proc_root = procdir.path().to_path_buf();
+    engine.seed_initial_kernel_threads(&[4242]);
     let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
     exit.kind = DISCOVERY_KIND_LEADER_EXIT;
     exit.pid_tgid = u64::from(4242u32) << 32;
@@ -5810,6 +5811,31 @@ fn pre_walk_kthread_exit_skips_after_initial_seed() {
         engine.pid_descendant_gaps(),
         0,
         "seeded kthread exit must skip the gap ledger"
+    );
+}
+
+/// Initial kthread seeding must read `engine.proc_root` rather than
+/// hardcoded `/proc`: an empty fixture `proc_root` seeds nothing, while a
+/// non-default fixture `proc_root` proves the kthread at origin 0.
+#[test]
+fn initial_kthread_seed_honours_engine_proc_root() {
+    let mut engine = Engine::empty();
+    engine.proc_root = test_empty_proc_root();
+    engine.seed_initial_kernel_threads(&[4242]);
+    assert!(
+        !engine.known_kernel_threads.contains_key(&4242),
+        "empty proc_root must not seed any kthread"
+    );
+
+    let procdir = tempfile::tempdir().expect("fixture proc root");
+    write_proc_stat_fixture(procdir.path(), 4242, "S", 4194304 | 0x200000, 100);
+    std::fs::write(procdir.path().join("4242").join("maps"), "").expect("empty maps");
+    engine.proc_root = procdir.path().to_path_buf();
+    engine.seed_initial_kernel_threads(&[4242]);
+    assert_eq!(
+        engine.known_kernel_threads.get(&4242),
+        Some(&0),
+        "non-default proc_root must seed the kthread at origin 0"
     );
 }
 

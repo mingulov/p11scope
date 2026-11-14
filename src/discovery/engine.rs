@@ -7911,10 +7911,14 @@ fn maps_is_empty(proc_root: &Path, pid: u32) -> bool {
 /// handles: re-marking it as a newcomer files a spurious prune gap at reap
 /// for a fully-tracked generation. An unreadable pid with a tracked
 /// generation — open admission, pending removal, or closed admission whose
-/// view already settled — is the same dying generation, never a running
-/// newcomer: a new generation is always stat-readable, so reuse always stays
-/// markable. A readdir race may still list a just-reaped pid after its view
-/// settled; the retained admission tells it apart from a true arrival.
+/// view already settled — is treated as the same dying generation: a
+/// *running* new generation is always stat-readable, so running reuse always
+/// stays markable. A reuse that already died and was reaped between ticks is
+/// unreadable and skips here; its exit gaps through the unmatched-exit path
+/// when the record drains (double-death plus reuse inside one tick is the
+/// documented residual edge). A readdir race may still list a just-reaped
+/// pid after its view settled; the retained admission tells it apart from a
+/// true arrival.
 /// `admitted_pids` carries every admitted pid, open or closed;
 /// `proc_root` is `/proc` live, a fixture tree in tests.
 pub(crate) fn newcomer_arrival_possible(
@@ -8468,7 +8472,7 @@ fn discover_plan(
     // Prove the enumerated kernel threads up front: without this, an exit
     // before the first live-tick walk gaps as unproved although the capture
     // listed the thread from the start.
-    discovered.seed_initial_kernel_threads(Path::new("/proc"), &pids);
+    discovered.seed_initial_kernel_threads(&pids);
     // The pid the operator named is the capture; a cgroup's processes are many,
     // however few happen to be in it right now.
     let named = matches!(scope, Scope::Pid(_));
@@ -14404,12 +14408,12 @@ impl Engine {
     /// exits skip the gap ledger even before the first live-tick walk runs.
     /// Newcomer bounds stay tick-owned: only the kthread ledger seeds here,
     /// bounded like the tick classifier, at the capture origin.
-    fn seed_initial_kernel_threads(&mut self, proc_root: &Path, pids: &[u32]) {
+    fn seed_initial_kernel_threads(&mut self, pids: &[u32]) {
         for pid in pids {
             if self.known_kernel_threads.len() >= MAX_SCAN_PIDS {
                 break;
             }
-            if pid_is_kernel_thread(proc_root, *pid) {
+            if pid_is_kernel_thread(&self.proc_root, *pid) {
                 self.known_kernel_threads.insert(*pid, 0);
             }
         }

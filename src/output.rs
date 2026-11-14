@@ -788,10 +788,11 @@ fn parse_sudo_id(value: &OsStr) -> Option<u32> {
 /// Run-scoped `--output-owner` UID:GID, set once at command entry and
 /// restored on exit (mirroring `cli::TEXT_VERBOSITY`), so the deep sink
 /// code needs no new parameter. `u64::MAX` is unset; otherwise the uid
-/// rides the high 32 bits and the gid the low 32. Lock-free, so a
-/// forked test child can set it without deadlocks. Only ids the
-/// parser accepts are ever stored, so neither half is `u32::MAX` and
-/// no pair collides with the unset value.
+/// rides the high 32 bits and the gid the low 32. Lock-free like the
+/// verbosity cell: `run` forks its child with this armed, and an
+/// atomic needs no lock that a fork could strand. Only ids the parser
+/// accepts are ever stored, so neither half is `u32::MAX` and no pair
+/// collides with the unset value.
 static OUTPUT_OWNER: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Sets the run-scoped output owner; returns the previous setting.

@@ -10179,6 +10179,31 @@ pub(crate) mod tests {
         assert!(capacity < folded, "{out}");
     }
 
+    /// Members disagreeing on a `lib<stem>.so` family fold into the
+    /// neutral "provider files" line instead of naming a wrong family.
+    #[test]
+    fn concise_gaps_fold_mixed_families_into_provider_files() {
+        const PROXY_AWAITING: &str = "a proxy closure array in a detailed capture attaches only its published tables, and none of its 67 lookalike function tables is published yet, so calls through it are not counted (a proxy closure array is admitted whole)";
+        let mut ev = evidence();
+        for name in ["/opt/liba.so", "/opt/libb.so"] {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: name.into(),
+                reason: PROXY_AWAITING.into(),
+            });
+        }
+        let out = concise_module_gap_lines(&ev, &reports_fixture());
+        assert!(out.contains("Module gaps (showing 2 of 2):"), "{out}");
+        assert!(
+            out.contains(
+                "2 provider files not attached (forwarding layer; the calls it forwards are counted at the providers)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("2 a files"), "{out}");
+        assert!(!out.contains("2 b files"), "{out}");
+        assert!(!out.contains("lookalike function tables"), "{out}");
+    }
+
     /// F2: the concise profile summary names a refused provider with
     /// its file and the `--module` remedy (not just the aggregate
     /// "1 provider file not watched" fragment).

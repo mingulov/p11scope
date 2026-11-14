@@ -471,11 +471,6 @@ pub struct Engine {
     /// A learned staging owes an expedited discovery frame so attach
     /// lands promptly instead of at the next cadence boundary.
     learned_frame_owed: bool,
-    /// Run-tree member load-pause state (see `member_pause`).
-    member_pauses: member_pause::MemberPauses,
-    /// A member stop owes an expedited discovery frame so its service
-    /// (admission, scan, attach, resume) runs promptly.
-    member_pause_frame_owed: bool,
     /// Unproven owned-tree members for the watch rescan rotation (E1).
     /// Members join at notice and leave once a scan proves a provider
     /// (then the file stages), they exit, or the rescan horizon
@@ -4202,26 +4197,6 @@ pub(crate) trait EngineSession {
     fn arm_pause(&mut self) -> Result<()>;
     fn pause_state(&self) -> Result<Option<u64>>;
     fn remove_pause(&mut self) -> Result<Option<u64>>;
-    /// Publishes one run-tree member's pause authorization rows. The
-    /// fail-closed default keeps scripted sessions (and any session
-    /// without the member pause feature) refusing, so members stay
-    /// unprotected rather than silently armed.
-    fn member_pause_publish(&mut self, _pid: u32, _token: u64) -> Result<()> {
-        bail!("member pause authorization is unavailable in this session")
-    }
-    /// The member row's state: `Ok(None)` when no row exists.
-    fn member_pause_state(&self, _pid: u32, _token: u64) -> Result<Option<u64>> {
-        Ok(None)
-    }
-    /// Re-arms the member row after a serviced stop.
-    fn member_pause_rearm(&mut self, _pid: u32, _token: u64) -> Result<()> {
-        bail!("member pause authorization is unavailable in this session")
-    }
-    /// Removes one member's rows; a no-op default for sessions that
-    /// never publish any.
-    fn member_pause_remove(&mut self, _pid: u32, _token: u64) -> Result<()> {
-        Ok(())
-    }
 }
 
 fn require_original_q(q: Option<&CollectedFinishQ>) -> Result<&CollectedFinishQ> {
@@ -4564,22 +4539,6 @@ impl EngineSession for Session {
 
     fn remove_pause(&mut self) -> Result<Option<u64>> {
         Session::remove_pause(self)
-    }
-
-    fn member_pause_publish(&mut self, pid: u32, token: u64) -> Result<()> {
-        Session::member_pause_publish(self, pid, token)
-    }
-
-    fn member_pause_state(&self, pid: u32, token: u64) -> Result<Option<u64>> {
-        Session::member_pause_state(self, pid, token)
-    }
-
-    fn member_pause_rearm(&mut self, pid: u32, token: u64) -> Result<()> {
-        Session::member_pause_rearm(self, pid, token)
-    }
-
-    fn member_pause_remove(&mut self, pid: u32, token: u64) -> Result<()> {
-        Session::member_pause_remove(self, pid, token)
     }
 }
 
@@ -13015,8 +12974,6 @@ impl Engine {
             learned_event_loss: 0,
             learned_cap_skipped: 0,
             learned_frame_owed: false,
-            member_pauses: member_pause::MemberPauses::default(),
-            member_pause_frame_owed: false,
             owned_watch_unproven: BTreeMap::new(),
             owned_watch_seen: BTreeMap::new(),
             owned_watch_last_ns: None,
@@ -14135,11 +14092,7 @@ impl Engine {
             return;
         }
         let pid = (record.pid_tgid >> 32) as u32;
-        // A member record is held when the kernel requested its stop at
-        // the record itself (an armed row flips before submit), exactly
-        // like a pause-owned batch holds the owned child's records.
-        let held = self.held_records.contains(&held_record_key(record))
-            || self.member_record_stop_held(pid, record.status_flags, record.send_signal_rc);
+        let held = self.held_records.contains(&held_record_key(record));
         let views: Vec<_> = self
             .views
             .iter()
@@ -21585,18 +21538,6 @@ impl Engine {
             // scan-owned slots persist, so its staging owes no
             // first-use gap when the key is scan-covered.
             let proving_retained = self.views.iter().any(|view| view.id() == proof.view);
-            // A proof taken by a stop-held armed member: the pause
-            // service holds that member until this file stages and its
-            // probes attach, so its proving calls were observed.
-            if let Some(pid) = self
-                .views
-                .iter()
-                .find(|view| view.id() == proof.view)
-                .map(|view| view.pid())
-                && self.member_pauses.rows.contains_key(&pid)
-            {
-                self.member_pauses.proven_protected.insert(identity, pid);
-            }
             let learned = crate::fanotify::LearnedCandidate {
                 file: held,
                 dev: identity.0,
@@ -22052,17 +21993,10 @@ impl Engine {
                 // already observes this long-lived mapper's calls, so a
                 // first-use gap row would mislead. Transient provers
                 // (whose slots retire with them) and uncovered keys
-                // still owe the row. So does a proof taken while its
-                // prover was stop-held: the service holds the member
-                // until this staging attached, so its calls were
-                // observed and the row would mislead the same way.
-                let protected_prover = self
-                    .member_pauses
-                    .proven_protected
-                    .contains_key(&(candidate.dev, candidate.ino));
+                // still owe the row.
                 if !(candidate.run_learned
-                    && ((candidate.proving_retained && scan_covered.contains_key(&input.key))
-                        || protected_prover))
+                    && candidate.proving_retained
+                    && scan_covered.contains_key(&input.key))
                 {
                     row_owed = true;
                 }
@@ -24065,10 +23999,6 @@ impl Engine {
                 self.loader_registry
                     .mark_attached(context)
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
-                // The committed loader arm is the member-pause arming
-                // point: the member's next loader or export-discovery
-                // event stops it like the owned chain's.
-                self.arm_member_pause_after_loader(session, view_id, pid);
                 // This arm read the loader and both revalidation brackets
                 // held: later arms of the unchanged file reuse its facts.
                 if let Some(key) = fresh_loader_facts {
@@ -26604,9 +26534,6 @@ impl Engine {
             // 6.14 Option A: seed the exec timing behind the
             // late-watch rule from the same EXEC.
             self.exit_map.note_exec(pid, record.hook_ts_ns);
-            // A rowless member's exec record stopped it in the kernel:
-            // the engine owes it admission, arming and a resume.
-            self.note_member_exec_stop(pid, None);
         }
         if let Some((view, cause)) = self.admitted_lifecycle_match(record) {
             // 7.10b: validate a target EXEC under exact-PID scope
@@ -39337,9 +39264,6 @@ impl Engine {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 pub(crate) mod tests;
-
-#[path = "member_pause.rs"]
-mod member_pause;
 
 #[cfg(test)]
 #[path = "prearm_witness_tests.rs"]

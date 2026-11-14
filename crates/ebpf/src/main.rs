@@ -127,9 +127,9 @@ use p11scope_ebpf_common::{
     FLAG_POLICY_ALLOWLISTED, FLAG_SYSTEM_FILTER, FLAG_TRACK_SHORT_LIVED,
     FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
     FunctionNameKey, ImageIdentity, InstanceContinuity, LOADER_STATE_PRESENT, LinuxLayout,
-    MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_PAUSE_PIDS, MAX_SLOTS, MECH_NONE,
-    NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED, PAUSE_REQUESTED, PRODUCED_CELLS, PRODUCED_DISCOVERY,
-    PRODUCED_EVENTS, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, STACK_GUARD_ENTRIES,
+    MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
+    PAUSE_REQUESTED, PRODUCED_CELLS, PRODUCED_DISCOVERY, PRODUCED_EVENTS, PauseKey, RING_BYTES,
+    RV_ENTRIES, RvKey, SESSION_NONE, STACK_GUARD_ENTRIES,
     START_ENTRIES, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, StartKey,
     StartState, StateKey, TAIL_CALLS_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
     TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE, capture, classify_exec_task,
@@ -138,10 +138,9 @@ use p11scope_ebpf_common::{
     discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
     discovery_version_class, event_type, finite_login_user_type, image_pair_matches,
     interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
-    interface_flags_class, lifecycle, member_exec_pause_due, normalize_target_word,
-    read_ia32_arg_with, return_allows_mechanism, semantic_flags, shape, stop_gate_admit_with,
-    target_layout_from_cs, target_stack_arg_address, target_word_end, valid_config,
-    valid_loader_cookie, WordReader,
+    interface_flags_class, lifecycle, normalize_target_word, read_ia32_arg_with,
+    return_allows_mechanism, semantic_flags, shape, stop_gate_admit_with, target_layout_from_cs,
+    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie, WordReader,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -358,7 +357,7 @@ static COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(DISCOVERY_COUN
 
 #[cfg(not(feature = "inventory-only"))]
 #[map]
-static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(MAX_PAUSE_PIDS, 0);
+static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(1, 0);
 
 /// Stop gate: bit 63 is the stop request, the low 63 bits count admitted
 /// bodies. Userspace mmaps the single cell, so the map stays unfrozen and
@@ -881,7 +880,6 @@ fn finish_discovery_record(
     eligible: bool,
     pid_tgid: u64,
     #[allow(unused_mut)] mut status_flags: u8,
-    member_exec_stop: bool,
 ) {
     let raw = entry.as_mut_ptr();
     #[cfg(not(feature = "inventory-only"))]
@@ -920,20 +918,6 @@ fn finish_discovery_record(
             } else {
                 (unsafe { helpers::bpf_ktime_get_ns() }, 0)
             }
-        } else if member_exec_pause_due(eligible, scope.flags, scope.generation_token)
-            && member_exec_stop
-        {
-            // A rowless member's first exec inside a pause-armed run
-            // cgroup: one finite SIGSTOP before the process runs any
-            // userspace, so the controller can arm the member's own
-            // authorization before it resumes. No map state flips — the
-            // record itself is the stop's receipt, and members acquire
-            // the normal PAUSE_PIDS path once armed.
-            // SAFETY: the causal timestamp is immediately before the one
-            // finite SIGSTOP request and both helpers take scalar inputs.
-            let hook_ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
-            let send_signal_rc = unsafe { helpers::bpf_send_signal(19) } as i64;
-            (hook_ts_ns, send_signal_rc)
         } else {
             (unsafe { helpers::bpf_ktime_get_ns() }, 0)
         };
@@ -1317,7 +1301,7 @@ fn emit_export(payload: &ExportPayload, scope: &ScopeAuth) {
     }
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     let pause_eligible = selection.pause_eligible;
-    finish_discovery_record(entry, *scope, pause_eligible, pid_tgid, status, false);
+    finish_discovery_record(entry, *scope, pause_eligible, pid_tgid, status);
 }
 
 #[inline(always)]
@@ -2008,7 +1992,6 @@ fn emit_loader_legacy_record(
             false,
             pid_tgid,
             DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
-            false,
         );
         return 0;
     }
@@ -2053,7 +2036,7 @@ fn emit_loader_legacy_record(
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), cookie);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).announced_count), r_state);
     }
-    finish_discovery_record(entry, scope, true, pid_tgid, 0, false);
+    finish_discovery_record(entry, scope, true, pid_tgid, 0);
     0
 }
 
@@ -2114,7 +2097,6 @@ fn emit_loader_token_record(
             false,
             pid_tgid,
             DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
-            false,
         );
         return 0;
     }
@@ -2138,7 +2120,7 @@ fn emit_loader_token_record(
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), cookie);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).announced_count), 0);
     }
-    finish_discovery_record(entry, scope, true, pid_tgid, status, false);
+    finish_discovery_record(entry, scope, true, pid_tgid, status);
     0
 }
 
@@ -2167,13 +2149,7 @@ const EXIT_MAP_NATIVE_OVERFLOW: u64 = p11scope_ebpf_common::instance::RECORD_OVE
 const EXIT_MAP_NATIVE_LOCAL_FAULT: u64 = p11scope_ebpf_common::instance::RECORD_LOCAL_FAULT;
 
 #[inline(never)]
-fn emit_lifecycle(
-    kind: u8,
-    case_id: u8,
-    scope: ScopeAuth,
-    pause_eligible: bool,
-    member_exec_stop: bool,
-) {
+fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool) {
     let Some(mut entry) = reserve_discovery() else {
         return;
     };
@@ -2264,7 +2240,7 @@ fn emit_lifecycle(
     #[cfg(any(feature = "inventory-only", feature = "counter-broad"))]
     let exit_map_status = 0u8;
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
-    finish_discovery_record(entry, scope, pause_eligible, pid_tgid, exit_map_status, member_exec_stop);
+    finish_discovery_record(entry, scope, pause_eligible, pid_tgid, exit_map_status);
 }
 
 #[raw_tracepoint(tracepoint = "sched_process_exec")]
@@ -2327,7 +2303,7 @@ fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
         if class == DISCOVERY_EXEC_SAME_TASK_CANDIDATE {
             class = classify_exec_task(old_pid, pid_tgid, unsafe { p11_exec_dumpability() });
         }
-        emit_lifecycle(DISCOVERY_KIND_EXEC, class, scope, true, true);
+        emit_lifecycle(DISCOVERY_KIND_EXEC, class, scope, true);
     }
     0
 }
@@ -2394,7 +2370,7 @@ fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
         };
         #[cfg(any(feature = "inventory-only", feature = "counter-broad"))]
         let kind = DISCOVERY_KIND_LEADER_EXIT;
-        emit_lifecycle(kind, DISCOVERY_EXEC_UNKNOWN, scope, false, false);
+        emit_lifecycle(kind, DISCOVERY_EXEC_UNKNOWN, scope, false);
     }
     0
 }

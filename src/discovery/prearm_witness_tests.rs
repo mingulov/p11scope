@@ -118,6 +118,7 @@ fn discover_prearm_never_mapped(
         select_endpoint: None,
         duration: None,
         out: None,
+        output_owner: None,
         out_is_stdout: false,
         max_events: None,
         max_scan_pids: None,

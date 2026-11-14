@@ -346,8 +346,8 @@ impl EventWriter {
     /// is retained without following a symlink, the final component is
     /// opened `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, a new file is `0600`, an
     /// existing target must be a regular file owned by the caller (or,
-    /// after a sudo handover, by the invoker) and is truncated and made
-    /// `0600`. A symlink, FIFO, device, socket or
+    /// after a handover, by the handover target) and is truncated and
+    /// made `0600`. A symlink, FIFO, device, socket or
     /// directory at the name is refused with a clear error and left
     /// untouched. Difference from `-o` trace: the truncate happens here,
     /// at stream creation, because the event stream writes synchronously
@@ -1027,9 +1027,21 @@ fn rename_noreplace(old: &Path, new: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Whether a retained victim owned by `owner` is evicted: the
+/// caller's own, or — as root — one this run handed over, to the sudo
+/// invoker or to the explicit `--output-owner`. Gids play no role.
+fn eviction_handover_accepts(
+    owner: u32,
+    current: u32,
+    sudo: Option<u32>,
+    named: Option<u32>,
+) -> bool {
+    owner == current || (current == 0 && (Some(owner) == sudo || Some(owner) == named))
+}
+
 /// Remove one retention victim without following a symlink. The victim
 /// must be a regular file owned by the caller — anything this run
-/// rotated there was — or, after a sudo handover, by the invoker;
+/// rotated there was — or, after a handover, by the handover target;
 /// otherwise it is refused and left as it was. A missing file is
 /// already evicted.
 fn remove_retained_file(victim: &Path) -> Result<(), String> {
@@ -1053,12 +1065,12 @@ fn remove_retained_file(victim: &Path) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt as _;
         let owner = metadata.uid();
         let current = unsafe { libc::geteuid() } as u32;
-        // Rotations this run handed to the sudo invoker are evicted like
-        // the caller's own; anything else keeps the refusal. Victims are
-        // always this run's rotations, whose ownership follows the live file.
-        let handed_over =
-            current == 0 && crate::output::sudo_invoker().is_some_and(|(uid, _)| uid == owner);
-        if owner != current && !handed_over {
+        // Rotations this run handed over are evicted like the caller's
+        // own; anything else keeps the refusal. Victims are always this
+        // run's rotations, whose ownership follows the live file.
+        let sudo = crate::output::sudo_invoker().map(|(uid, _)| uid);
+        let named = crate::output::output_owner().map(|(uid, _)| uid);
+        if !eviction_handover_accepts(owner, current, sudo, named) {
             return Err(format!(
                 "refusing to evict retained event file {}: owned by uid {owner}; refusing to remove it",
                 victim.display()

@@ -129,6 +129,11 @@ pub struct CaptureArgs {
     /// `-o -` on a trace: stdout takes the file's role as the complete
     /// sink, so the terminal EVIDENCE stays on stdout at default.
     pub out_is_stdout: bool,
+    /// `--output-owner UID[:GID]`: trust output directories owned by
+    /// UID and hand the report to UID:GID (GID defaults to UID). Root
+    /// only, refused without a file sink. None ⇒ the sudo handover
+    /// alone decides.
+    pub output_owner: Option<(u32, u32)>,
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 1024 default.
     pub max_scan_pids: Option<usize>,
@@ -194,6 +199,11 @@ pub struct RunArgs {
     /// `-o -` on a `--trace` run: stdout takes the file's role as the
     /// complete sink, so the terminal EVIDENCE stays on stdout at default.
     pub out_is_stdout: bool,
+    /// `--output-owner UID[:GID]`: trust output directories owned by
+    /// UID and hand the report to UID:GID (GID defaults to UID). Root
+    /// only, refused without a file sink. None ⇒ the sudo handover
+    /// alone decides.
+    pub output_owner: Option<(u32, u32)>,
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 1024 default.
     pub max_scan_pids: Option<usize>,
@@ -314,6 +324,11 @@ pub struct InventoryArgs {
     pub duration: Option<Duration>,
     /// `-o`: write the JSON inventory document to this file (atomic).
     pub out: Option<PathBuf>,
+    /// `--output-owner UID[:GID]`: trust output directories owned by
+    /// UID and hand the report to UID:GID (GID defaults to UID). Root
+    /// only, refused without a file sink. None ⇒ the sudo handover
+    /// alone decides.
+    pub output_owner: Option<(u32, u32)>,
     /// `--dashboard`: live dashboard on stdout when it is a terminal
     /// (scrollable edge table, coverage header, log tail; `d` requests
     /// Detailed capture for the selected pair, `x` cancels); degraded
@@ -450,6 +465,11 @@ pub struct InventoryDiffArgs {
     pub after: PathBuf,
     pub json: bool,
     pub out: Option<PathBuf>,
+    /// `--output-owner UID[:GID]`: trust output directories owned by
+    /// UID and hand the report to UID:GID (GID defaults to UID). Root
+    /// only, refused without a file sink. None ⇒ the sudo handover
+    /// alone decides.
+    pub output_owner: Option<(u32, u32)>,
     /// `-v`/`--verbose`: full text detail. Default off; refused beside
     /// `--quiet`.
     pub verbose: bool,
@@ -463,6 +483,11 @@ pub struct InventoryCbomArgs {
     pub input: PathBuf,
     pub json: bool,
     pub out: Option<PathBuf>,
+    /// `--output-owner UID[:GID]`: trust output directories owned by
+    /// UID and hand the report to UID:GID (GID defaults to UID). Root
+    /// only, refused without a file sink. None ⇒ the sudo handover
+    /// alone decides.
+    pub output_owner: Option<(u32, u32)>,
     /// `-v`/`--verbose`: full text detail. Default off; refused beside
     /// `--quiet`.
     pub verbose: bool,
@@ -599,7 +624,7 @@ exit codes: 0 ok; 1 the command failed; 2 wrong arguments. run exits with its co
 /// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <30|30s|5m|1h>] [-o <out.json>]
+                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <30|30s|5m|1h>] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
@@ -642,13 +667,14 @@ On --cgroup/--system captures it groups unmatched exits by linkage; on --pid it 
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
+--output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions.
 exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments.
 ";
 
 /// `p11scope trace --help`: scoped syntax, examples and evidence limits.
 const TRACE_HELP_HEAD: &str = "usage:
-  p11scope trace   [same scope and discovery options] [--duration <...>] [--max-events <n>] [-o <out.file>]
+  p11scope trace   [same scope and discovery options] [--duration <...>] [--max-events <n>] [-o <out.file>] [--output-owner <UID[:GID]>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
@@ -691,6 +717,7 @@ fn trace_cap_line() -> String {
 }
 
 const TRACE_HELP_TAIL: &str = "-o copies the trace to a file; -o - uses stdout only.
+--output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
 Ctrl-C or SIGTERM ends capture cleanly.
 Trace events print the same at every verbosity; -v, --verbose additionally shows informational stderr notes (discovery, timing) and restores the EVIDENCE record on stdout.
 exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments.
@@ -699,7 +726,7 @@ exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong argum
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
   p11scope run     [same discovery options] [--mode profile|metrics | --trace [--max-events <n>]] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <...>]
-                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--user <name|uid>]
+                   [-o <out>] [--output-owner <UID[:GID]>] [--pause never|auto|always] [--kill-on-timeout] [--user <name|uid>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
@@ -749,6 +776,7 @@ Ctrl-C or SIGTERM ends the capture cleanly.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions. Under --trace, events print the same at every level; -v adds stderr notes.
 -v/--verbose prints one line naming the run-as identity (running CMD as USER (uid N); the sudo-drop path adds (groups and home restored)).
 --user <name|uid> (root only, like strace -u) starts CMD as that account with its groups and home environment; --user root stays root on purpose.
+--output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o.
 exit codes: the command's exit status; 1 if observing failed; 2 for wrong arguments.
 ";
 
@@ -791,25 +819,25 @@ exit codes: 0 every requested lane passed; 1 a requested lane is unavailable (--
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP_HEAD: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
-  p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [-v] [--quiet]
+  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [--output-owner <UID[:GID]>] [-v] [--quiet]
+  p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [--output-owner <UID[:GID]>] [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
   p11scope inventory --pid 4242 --capture scan --json -o inventory.json
@@ -853,6 +881,7 @@ only; explicit use under --pid/--cgroup is refused.
 --quiet prints only the summary head (totals plus application/module edges) and silences scan progress; --json, -o and logs are unchanged.
 Default text output is concise: the summary head plus the limits line. -v, --verbose shows full detail (every gap and reason, per-caller/module/edge data, budgets, timing) plus informational stderr notes.
 --json and -o contain the same inventory facts; --event-log appends bounded JSONL history with rotation.
+--output-owner UID[:GID] trusts output directories owned by UID and hands files to UID:GID (GID defaults to UID); root only, for a container bind mount owned by the host user. Needs -o, --event-log or --diagnostics.
 --event-log - streams that history to stdout instead (no rotation; refused beside --json and --dashboard; the text summary moves to stderr). --event-interval <dur> adds periodic totals events to either sink.
 --diagnostics writes bounded native count decisions after capture stops; requires auto or native and a separate regular file.
 --diagnostics-pid selects that PID's diagnostics without changing capture scope; global health records remain included.
@@ -874,12 +903,13 @@ fn inventory_help() -> String {
 
 /// Offline diff help is separate from capture scope and privileges.
 const INVENTORY_DIFF_HELP_HEAD: &str = "usage:
-  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
+  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [--output-owner <UID[:GID]>] [-v] [--quiet]
 
 Compare saved p11scope/inventory/v1 files offline, without privileges.
 Default stdout is readable text; --json writes one inventory-diff/v1 JSON document.
 Default text output is concise: counts plus caveats. -v, --verbose shows full detail; --quiet omits the detail hint.
 -o saves the same JSON atomically before stdout. Use -- before dash-prefixed inputs.
+--output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only. Needs -o.
 Stdin (-) and -o - are unsupported; use --json for JSON on stdout.
 exit codes: differences and unknown evidence exit 0; input/output failures exit 1; usage exits 2.
 Counts describe independent windows; absence does not prove removal.
@@ -910,12 +940,13 @@ fn inventory_diff_help() -> String {
 
 /// Offline CBOM help is separate from capture scope and privileges.
 const INVENTORY_CBOM_HELP_HEAD: &str = "usage:
-  p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [-v] [--quiet]
+  p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [--output-owner <UID[:GID]>] [-v] [--quiet]
 
 Convert one saved p11scope/inventory/v1 or observed-profile file offline, without privileges, into a CycloneDX 1.6 cryptographic bill of materials.
 Default stdout is readable text; --json writes one CycloneDX JSON document.
 Default text output is concise: counts plus caveats. -v, --verbose shows full detail; --quiet omits the detail hint.
 -o saves the same JSON atomically before stdout. Use -- before a dash-prefixed input.
+--output-owner UID[:GID] trusts -o directories owned by UID and hands the report to UID:GID (GID defaults to UID); root only. Needs -o.
 Stdin (-) and -o - are unsupported; use --json for JSON on stdout.
 Only fields already present in the saved file are converted; nothing new is captured and unknowns stay explicit.
 exit codes: unknown evidence exits 0; input/output failures exit 1; usage exits 2.
@@ -1346,6 +1377,7 @@ struct Common {
     select_endpoint: Option<String>,
     duration: Option<Duration>,
     out: Option<PathBuf>,
+    output_owner: Option<(u32, u32)>,
     max_events: Option<u64>,
     max_scan_pids: Option<usize>,
     ring_bytes: Option<u32>,
@@ -1532,6 +1564,13 @@ fn capture_option(
             }
             common.out = Some(require_path(args, "-o")?);
         }
+        "--output-owner" => {
+            if common.output_owner.is_some() {
+                return Err(usage_err("--output-owner given twice"));
+            }
+            let v = require_value(args, "--output-owner")?;
+            common.output_owner = Some(crate::output::parse_output_owner(&v).map_err(usage_err)?);
+        }
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
         "--allow-uretprobe-on-confined-target" => common.allow_confined_uretprobe = true,
         "--track-short-lived" => common.track_short_lived = true,
@@ -1706,6 +1745,7 @@ fn parse_inventory_diff(
     let mut inputs = Vec::new();
     let mut json = false;
     let mut out = None;
+    let mut output_owner: Option<(u32, u32)> = None;
     let mut verbose = false;
     let mut quiet = false;
     let mut positional = false;
@@ -1746,6 +1786,21 @@ fn parse_inventory_diff(
                     out = Some(PathBuf::from(path));
                     continue;
                 }
+                Some("--output-owner") => {
+                    if output_owner.is_some() {
+                        return Err(error("--output-owner given twice"));
+                    }
+                    let raw = args
+                        .next()
+                        .ok_or_else(|| error("--output-owner requires a value"))?;
+                    let v = raw
+                        .to_str()
+                        .ok_or_else(|| error("--output-owner: invalid value: not valid UTF-8"))?;
+                    output_owner = Some(
+                        crate::output::parse_output_owner(v).map_err(|message| error(&message))?,
+                    );
+                    continue;
+                }
                 _ if value.as_bytes().starts_with(b"-") && value != "-" => {
                     return Err(error(&format!("unknown inventory diff option: {value:?}")));
                 }
@@ -1776,11 +1831,17 @@ fn parse_inventory_diff(
         .map_err(|error| error.with_topic(HelpTopic::InventoryDiff))?;
     let after = inputs.pop().expect("two input paths validated");
     let before = inputs.pop().expect("two input paths validated");
+    if output_owner.is_some() && out.is_none() {
+        return Err(error(
+            "--output-owner needs -o <file> (it trusts the report's directories and hands the report over)",
+        ));
+    }
     Ok(InventoryDiffArgs {
         before,
         after,
         json,
         out,
+        output_owner,
         verbose,
         quiet,
     })
@@ -1796,6 +1857,7 @@ fn parse_inventory_cbom(
     let mut input = None;
     let mut json = false;
     let mut out = None;
+    let mut output_owner: Option<(u32, u32)> = None;
     let mut verbose = false;
     let mut quiet = false;
     let mut positional = false;
@@ -1836,6 +1898,21 @@ fn parse_inventory_cbom(
                     out = Some(PathBuf::from(path));
                     continue;
                 }
+                Some("--output-owner") => {
+                    if output_owner.is_some() {
+                        return Err(error("--output-owner given twice"));
+                    }
+                    let raw = args
+                        .next()
+                        .ok_or_else(|| error("--output-owner requires a value"))?;
+                    let v = raw
+                        .to_str()
+                        .ok_or_else(|| error("--output-owner: invalid value: not valid UTF-8"))?;
+                    output_owner = Some(
+                        crate::output::parse_output_owner(v).map_err(|message| error(&message))?,
+                    );
+                    continue;
+                }
                 _ if value.as_bytes().starts_with(b"-") && value != "-" => {
                     return Err(error(&format!("unknown inventory cbom option: {value:?}")));
                 }
@@ -1860,10 +1937,16 @@ fn parse_inventory_cbom(
     };
     TextVerbosity::resolve(verbose, quiet)
         .map_err(|error| error.with_topic(HelpTopic::InventoryCbom))?;
+    if output_owner.is_some() && out.is_none() {
+        return Err(error(
+            "--output-owner needs -o <file> (it trusts the report's directories and hands the report over)",
+        ));
+    }
     Ok(InventoryCbomArgs {
         input,
         json,
         out,
+        output_owner,
         verbose,
         quiet,
     })
@@ -1888,6 +1971,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut max_endpoints: Option<u64> = None;
     let mut duration: Option<Duration> = None;
     let mut out: Option<PathBuf> = None;
+    let mut output_owner: Option<(u32, u32)> = None;
     let mut dashboard = false;
     let mut event_log: Option<PathBuf> = None;
     let mut event_rotate_bytes: Option<u64> = None;
@@ -2100,6 +2184,13 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                 }
                 out = Some(require_path(&mut args, "-o")?);
             }
+            "--output-owner" => {
+                if output_owner.is_some() {
+                    return Err(usage_err("--output-owner given twice"));
+                }
+                let v = require_value(&mut args, "--output-owner")?;
+                output_owner = Some(crate::output::parse_output_owner(&v).map_err(usage_err)?);
+            }
             other => return Err(unknown_arg(other)),
         }
     }
@@ -2168,6 +2259,13 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             "--diagnostics does not support stdout; pass a regular file path",
         ));
     }
+    let file_sink =
+        out.is_some() || (!event_stdout && event_log.is_some()) || diagnostics.is_some();
+    if output_owner.is_some() && !file_sink {
+        return Err(usage_err(
+            "--output-owner needs an output file (-o, --event-log or --diagnostics)",
+        ));
+    }
     if !manifests.is_empty() && capture == Some(CaptureMode::Scan) {
         return Err(usage_err("--manifest requires --capture auto or native"));
     }
@@ -2214,6 +2312,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         max_endpoints,
         duration,
         out,
+        output_owner,
         dashboard,
         event_log,
         event_rotate_bytes,
@@ -2354,6 +2453,11 @@ pub fn parse_capture(
 
     let metrics = common.metrics_for(kind, "trace")?;
     let (out, out_is_stdout) = resolve_dash_out(kind, "profile", common.out)?;
+    if common.output_owner.is_some() && out.is_none() {
+        return Err(usage_err(
+            "--output-owner needs -o <file> (it trusts the report's directories and hands the report over)",
+        ));
+    }
     Ok(CaptureArgs {
         kind,
         modules: common.modules,
@@ -2369,6 +2473,7 @@ pub fn parse_capture(
         duration: common.duration,
         out,
         out_is_stdout,
+        output_owner: common.output_owner,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -2466,6 +2571,11 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
     TextVerbosity::resolve(common.verbose, common.quiet)?;
     let metrics = common.metrics_for(kind, "run --trace")?;
     let (out, out_is_stdout) = resolve_dash_out(kind, "run without --trace", common.out)?;
+    if common.output_owner.is_some() && out.is_none() {
+        return Err(usage_err(
+            "--output-owner needs -o <file> (it trusts the report's directories and hands the report over)",
+        ));
+    }
     Ok(RunArgs {
         kind,
         modules: common.modules,
@@ -2480,6 +2590,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         duration: common.duration,
         out,
         out_is_stdout,
+        output_owner: common.output_owner,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -2836,6 +2947,248 @@ mod tests {
             panic!("expected run")
         };
         assert!(!run_plain.out_is_stdout);
+    }
+
+    #[test]
+    fn output_owner_parses_uid_and_optional_gid_on_every_output_surface() {
+        // UID alone hands the report to UID:UID; UID:GID names both.
+        let Command::Profile(p) = parse(args(&[
+            "profile",
+            "--pid",
+            "42",
+            "-o",
+            "p.json",
+            "--output-owner",
+            "1000",
+        ]))
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(p.output_owner, Some((1000, 1000)));
+        // Flag order never matters: the sink check runs at the end.
+        let Command::Profile(swapped) = parse(args(&[
+            "profile",
+            "--pid",
+            "42",
+            "--output-owner",
+            "1000:1001",
+            "-o",
+            "p.json",
+        ]))
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(swapped.output_owner, Some((1000, 1001)));
+        let Command::Trace(t) = parse(args(&[
+            "trace",
+            "--pid",
+            "42",
+            "-o",
+            "t.log",
+            "--output-owner",
+            "1000",
+        ]))
+        .unwrap() else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.output_owner, Some((1000, 1000)));
+        let Command::Run(r) = parse(args(&[
+            "run",
+            "-o",
+            "r.json",
+            "--output-owner",
+            "1000:1001",
+            "--",
+            "/bin/true",
+        ]))
+        .unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(r.output_owner, Some((1000, 1001)));
+        let Command::Inventory(i) = parse(args(&[
+            "inventory",
+            "--pid",
+            "7",
+            "-o",
+            "i.json",
+            "--output-owner",
+            "1000",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(i.output_owner, Some((1000, 1000)));
+        // Inventory's other file sinks count too: the event stream and
+        // the diagnostics file share the same trust gate and handover.
+        let Command::Inventory(logged) = parse(args(&[
+            "inventory",
+            "--pid",
+            "7",
+            "--event-log",
+            "e.jsonl",
+            "--output-owner",
+            "1000",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(logged.output_owner, Some((1000, 1000)));
+        let Command::Inventory(diagnosed) = parse(args(&[
+            "inventory",
+            "--system",
+            "--diagnostics",
+            "d.jsonl",
+            "--output-owner",
+            "1000:1001",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(diagnosed.output_owner, Some((1000, 1001)));
+        let Command::InventoryDiff(d) = parse(args(&[
+            "inventory",
+            "diff",
+            "before.json",
+            "after.json",
+            "-o",
+            "d.json",
+            "--output-owner",
+            "1000:1001",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory diff")
+        };
+        assert_eq!(d.output_owner, Some((1000, 1001)));
+        let Command::InventoryCbom(c) = parse(args(&[
+            "inventory",
+            "cbom",
+            "input.json",
+            "-o",
+            "c.json",
+            "--output-owner",
+            "1000",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory cbom")
+        };
+        assert_eq!(c.output_owner, Some((1000, 1000)));
+        // Omission stays omission on every surface.
+        let Command::Profile(plain) =
+            parse(args(&["profile", "--pid", "42", "-o", "p.json"])).unwrap()
+        else {
+            panic!("expected profile")
+        };
+        assert_eq!(plain.output_owner, None);
+    }
+
+    #[test]
+    fn output_owner_refuses_bad_values_repeats_and_sinkless_use() {
+        // Malformed ids are refused by name, on every value shape.
+        for bad in [
+            "",
+            "0",
+            "1000:0",
+            "0:1000",
+            "4294967295",
+            "1000:4294967295",
+            "4294967296",
+            "abc",
+            "10x",
+            "-1",
+            " 1000",
+            "1000 ",
+            "1000:",
+            ":1000",
+            ":",
+            "1000:1001:5",
+        ] {
+            assert!(
+                matches!(
+                    parse(args(&["profile", "--pid", "42", "-o", "p.json", "--output-owner", bad])),
+                    Err(CliError::Usage { message: m, .. })
+                        if m.contains("--output-owner") && m.contains("UID[:GID]"),
+                ),
+                "{bad:?} must be refused with the UID[:GID] shape"
+            );
+        }
+        // A missing value and a repeat are refused like every scalar.
+        assert!(matches!(
+            parse(args(&["profile", "--pid", "42", "-o", "p.json", "--output-owner"])),
+            Err(CliError::Usage { message: m, .. }) if m.contains("--output-owner requires a value"),
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "profile",
+                "--pid",
+                "42",
+                "-o",
+                "p.json",
+                "--output-owner",
+                "1000",
+                "--output-owner",
+                "1001",
+            ])),
+            Err(CliError::Usage { message: m, .. }) if m.contains("--output-owner given twice"),
+        ));
+        // Without a file sink the flag would silently do nothing, so it
+        // is refused: capture surfaces and the offline converters need
+        // -o, inventory needs -o, --event-log or --diagnostics.
+        for argv in [
+            vec!["profile", "--pid", "42", "--output-owner", "1000"],
+            vec!["trace", "--pid", "42", "-o", "-", "--output-owner", "1000"],
+            vec!["run", "--output-owner", "1000", "--", "/bin/true"],
+            vec![
+                "inventory",
+                "diff",
+                "before.json",
+                "after.json",
+                "--output-owner",
+                "1000",
+            ],
+            vec!["inventory", "cbom", "input.json", "--output-owner", "1000"],
+        ] {
+            assert!(
+                matches!(
+                    parse(args(&argv)),
+                    Err(CliError::Usage { message: m, .. }) if m.contains("--output-owner needs -o"),
+                ),
+                "{argv:?} must refuse a sinkless --output-owner"
+            );
+        }
+        for argv in [
+            vec!["inventory", "--pid", "7", "--output-owner", "1000"],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--event-log",
+                "-",
+                "--output-owner",
+                "1000",
+            ],
+        ] {
+            assert!(
+                matches!(
+                    parse(args(&argv)),
+                    Err(CliError::Usage { message: m, .. })
+                        if m.contains("--output-owner needs an output file"),
+                ),
+                "{argv:?} must refuse a sinkless --output-owner"
+            );
+        }
+        // Commands without -o refuse the flag outright.
+        for argv in [
+            vec!["inspect", "--pid", "42", "--output-owner", "1000"],
+            vec!["doctor", "--output-owner", "1000"],
+        ] {
+            assert!(
+                matches!(
+                    parse(args(&argv)),
+                    Err(CliError::Usage { message: m, .. }) if m.contains("unknown argument"),
+                ),
+                "{argv:?} must refuse --output-owner"
+            );
+        }
     }
 
     #[test]
@@ -5758,6 +6111,7 @@ mod tests {
             "--quiet",
             "--json",
             "-o",
+            "--output-owner",
         ] {
             assert!(all.contains(flag), "no help documents {flag}");
         }
@@ -5782,7 +6136,7 @@ mod tests {
     /// `every_flag_is_documented_in_some_help` list with `--user`,
     /// `--forwarding-module` and `--event-interval`, which that older
     /// list predates.
-    const HELP_PROBE_FLAGS: [(&str, Option<&str>); 48] = [
+    const HELP_PROBE_FLAGS: [(&str, Option<&str>); 49] = [
         ("--help", None),
         ("-h", None),
         ("--version", None),
@@ -5831,6 +6185,7 @@ mod tests {
         ("--quiet", None),
         ("--json", None),
         ("-o", Some("out.json")),
+        ("--output-owner", Some("1000")),
     ];
 
     const HELP_PROBE_TOPICS: [HelpTopic; 9] = [
@@ -5848,7 +6203,8 @@ mod tests {
     /// Companion options a probe needs so the probed flag — and only it —
     /// decides the outcome: `--counter-mode` needs `--mode metrics`,
     /// `--select-endpoint` needs both, the event-file tunables need
-    /// `--event-log`, and `--diagnostics-pid` needs `--diagnostics`.
+    /// `--event-log`, `--diagnostics-pid` needs `--diagnostics`, and
+    /// `--output-owner` needs `-o`.
     fn help_probe_prereq(flag: &str) -> &'static [&'static str] {
         match flag {
             "--counter-mode" => &["--mode", "metrics"],
@@ -5857,6 +6213,7 @@ mod tests {
                 &["--event-log", "events.jsonl"]
             }
             "--diagnostics-pid" => &["--diagnostics", "diag.jsonl"],
+            "--output-owner" => &["-o", "out.json"],
             _ => &[],
         }
     }

@@ -70,6 +70,39 @@ impl Drop for VerbosityGuard {
     }
 }
 
+/// RAII guard arming the run-scoped `--output-owner` handover target
+/// for one command, so the deep sink code needs no new parameter.
+/// Restored on drop; commands without `-o` never arm it.
+struct OutputOwnerGuard {
+    previous: Option<(u32, u32)>,
+}
+
+impl OutputOwnerGuard {
+    fn arm(owner: Option<(u32, u32)>) -> Self {
+        Self {
+            previous: p11scope::output::set_output_owner(owner),
+        }
+    }
+}
+
+impl Drop for OutputOwnerGuard {
+    fn drop(&mut self) {
+        p11scope::output::set_output_owner(self.previous);
+    }
+}
+
+/// `--output-owner` hands the report to another user, which only root
+/// can do: refuse it for anyone else like a usage error (exit 2),
+/// before anything runs. Returns the exit code when refused.
+fn refuse_output_owner_without_root(
+    owner: Option<(u32, u32)>,
+    topic: cli::HelpTopic,
+) -> Option<i32> {
+    let message = p11scope::output::output_owner_root_refusal(owner)?;
+    let _ = p11scope::try_stderr_line(&format!("{message}\n{}", topic.hint()));
+    Some(2)
+}
+
 fn run() -> Result<i32> {
     // Before any handler installs: the owned command inherits exactly the
     // dispositions captured here for every signal the observer changes.
@@ -104,15 +137,19 @@ fn run() -> Result<i32> {
         // one arm as well as one parser.
         Ok(Command::Profile(a) | Command::Trace(a)) => {
             let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            let topic = match a.kind {
+                cli::Kind::Profile => cli::HelpTopic::Profile,
+                cli::Kind::Trace => cli::HelpTopic::Trace,
+            };
+            if let Some(code) = refuse_output_owner_without_root(a.output_owner, topic) {
+                return Ok(code);
+            }
+            let _output_owner = OutputOwnerGuard::arm(a.output_owner);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
                 .and_then(|()| cli::validate_forwarding(&a.forwarding_modules, &a.exclude_modules))
             {
-                let topic = match a.kind {
-                    cli::Kind::Profile => cli::HelpTopic::Profile,
-                    cli::Kind::Trace => cli::HelpTopic::Trace,
-                };
                 let _ = p11scope::try_stderr_line(&format!("{message}\n{}", topic.hint()));
                 return Ok(2);
             }
@@ -124,6 +161,12 @@ fn run() -> Result<i32> {
         // observer, so it exits 0.
         Ok(Command::Run(a)) => {
             let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            if let Some(code) =
+                refuse_output_owner_without_root(a.output_owner, cli::HelpTopic::Run)
+            {
+                return Ok(code);
+            }
+            let _output_owner = OutputOwnerGuard::arm(a.output_owner);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
@@ -187,10 +230,22 @@ fn run() -> Result<i32> {
         }
         Ok(Command::InventoryDiff(a)) => {
             let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            if let Some(code) =
+                refuse_output_owner_without_root(a.output_owner, cli::HelpTopic::InventoryDiff)
+            {
+                return Ok(code);
+            }
+            let _output_owner = OutputOwnerGuard::arm(a.output_owner);
             inventory_diff::run(&a)
         }
         Ok(Command::InventoryCbom(a)) => {
             let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            if let Some(code) =
+                refuse_output_owner_without_root(a.output_owner, cli::HelpTopic::InventoryCbom)
+            {
+                return Ok(code);
+            }
+            let _output_owner = OutputOwnerGuard::arm(a.output_owner);
             inventory_cbom::run(&a)
         }
         // `inventory`'s hard failures — an unreadable target, an
@@ -198,6 +253,12 @@ fn run() -> Result<i32> {
         // here, exit 1, never a panic and never an empty-success report.
         Ok(Command::Inventory(a)) => {
             let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            if let Some(code) =
+                refuse_output_owner_without_root(a.output_owner, cli::HelpTopic::Inventory)
+            {
+                return Ok(code);
+            }
+            let _output_owner = OutputOwnerGuard::arm(a.output_owner);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))

@@ -530,6 +530,7 @@ fn destination_replaced_by_an_input_hardlink_at_precommit_is_refused() {
         input: input.clone(),
         json: false,
         out: Some(out.clone()),
+        output_owner: None,
         verbose: false,
         quiet: false,
     };

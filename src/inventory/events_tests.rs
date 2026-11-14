@@ -1090,6 +1090,26 @@ fn event_log_eviction_refuses_a_symlink_victim() {
     remove_retained_file(&dir.path().join("events.jsonl.9")).unwrap();
 }
 
+/// A retained victim this run handed over — to the sudo invoker or to
+/// the explicit `--output-owner` — evicts like the caller's own, but
+/// only as root; any other foreign owner keeps the refusal.
+#[test]
+fn eviction_accepts_handed_over_owners_only_as_root() {
+    assert!(eviction_handover_accepts(1000, 1000, None, None));
+    assert!(eviction_handover_accepts(1000, 0, Some(1000), None));
+    assert!(eviction_handover_accepts(1001, 0, None, Some(1001)));
+    assert!(eviction_handover_accepts(1001, 0, Some(1002), Some(1001)));
+    assert!(!eviction_handover_accepts(1001, 1000, None, Some(1001)));
+    assert!(!eviction_handover_accepts(
+        1001,
+        1000,
+        Some(1001),
+        Some(1001)
+    ));
+    assert!(!eviction_handover_accepts(1002, 0, Some(1000), Some(1001)));
+    assert!(!eviction_handover_accepts(1002, 0, None, None));
+}
+
 /// Review R-1 (margins): the dump fit bound holds exactly at its
 /// boundary. With the records an emitter carries, the smallest rotate
 /// size whose contiguous capacity covers carried bytes + per-edge slack +

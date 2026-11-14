@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
@@ -94,7 +95,7 @@ impl AtomicFile {
             .ok_or_else(|| format!("output {} has no file name", final_path.display()))?;
         let final_name = c_name(final_name, "output file name")?;
         check_final_name(&directory, &final_name, &final_path)?;
-        let handover = sudo_handover_target(&directory, &final_path)?;
+        let handover = handover_target_for(&directory, &final_path)?;
         for sequence in 0..128u32 {
             let temp_name =
                 CString::new(format!(".p11scope.{}.{}.tmp", std::process::id(), sequence))
@@ -238,7 +239,7 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
-        // The owner recorded at creation: the sudo invoker after a
+        // The owner recorded at creation: the handover target after a
         // handover, otherwise the creator.
         if !metadata.is_file()
             || metadata.identity != self.identity
@@ -316,11 +317,11 @@ pub struct PrivateStream {
     final_path: PathBuf,
     identity: FileIdentity,
     origin: StreamOrigin,
-    /// The sudo handover decided at preflight from the retained
+    /// The handover decided at preflight from the retained
     /// directory: files this stream created are handed to it, and a
-    /// pre-existing file the invoker owns is accepted like the
+    /// pre-existing file the target owns is accepted like the
     /// caller's own. Never handed to a file the stream did not create.
-    sudo_target: Option<(u32, u32)>,
+    handover_target: Option<(u32, u32)>,
 }
 
 /// How a trace sink's file reaches its name.
@@ -391,13 +392,13 @@ impl PrivateStream {
                     &self.final_name,
                     &file,
                     origin,
-                    self.sudo_target,
+                    self.handover_target,
                     &self.final_path,
                 )?;
                 let identity = check_stream_file(
                     &file,
                     &self.final_path,
-                    self.sudo_target.map(|(uid, _)| uid),
+                    self.handover_target.map(|(uid, _)| uid),
                 )?;
                 self.file = Some(file);
                 self.identity = identity;
@@ -426,7 +427,7 @@ impl std::fmt::Debug for PrivateStream {
 impl Drop for PrivateStream {
     fn drop(&mut self) {
         let expected = self
-            .sudo_target
+            .handover_target
             .map(|(uid, _)| uid)
             .unwrap_or_else(|| unsafe { libc::geteuid() });
         if self.file.is_some()
@@ -470,7 +471,7 @@ fn create_private_stream_with(path: &Path, unnamed: bool) -> Result<PrivateStrea
         .file_name()
         .ok_or_else(|| format!("output {} has no file name", final_path.display()))?;
     let final_name = c_name(final_name, "output file name")?;
-    let handover = sudo_handover_target(&directory, &final_path)?;
+    let handover = handover_target_for(&directory, &final_path)?;
     let (file, origin) = openat_stream(&directory, &final_name, unnamed)
         .map_err(|error| format!("opening output {} failed: {error}", final_path.display()))?;
     handover_stream_file(
@@ -492,7 +493,7 @@ fn create_private_stream_with(path: &Path, unnamed: bool) -> Result<PrivateStrea
         final_name,
         final_path,
         origin,
-        sudo_target: handover,
+        handover_target: handover,
     })
 }
 
@@ -521,13 +522,13 @@ fn handover_stream_file(
 }
 
 /// A trace sink must be a regular file the caller owns — or, after a
-/// sudo handover was decided for this directory, a regular file the
-/// invoker owns, so a later run can append to a report an earlier
+/// handover was decided for this directory, a regular file the
+/// target owns, so a later run can append to a report an earlier
 /// run handed over. Anything else is refused and left as it was.
 fn check_stream_file(
     file: &std::fs::File,
     final_path: &Path,
-    sudo_owner: Option<u32>,
+    handover_owner: Option<u32>,
 ) -> Result<FileIdentity, String> {
     let metadata = file
         .metadata()
@@ -539,7 +540,7 @@ fn check_stream_file(
         ));
     }
     let owner = metadata.uid();
-    if owner != unsafe { libc::geteuid() } && Some(owner) != sudo_owner {
+    if owner != unsafe { libc::geteuid() } && Some(owner) != handover_owner {
         return Err(format!(
             "output {} exists and is owned by uid {}; refusing to overwrite it",
             final_path.display(),
@@ -724,15 +725,10 @@ fn validate_trusted_directory(directory: &std::fs::File, path: &Path) -> std::io
     }
     let euid = unsafe { libc::geteuid() } as u32;
     let owner = metadata.uid();
-    let owner_trusted = owner == euid || owner == 0 || (euid == 0 && sudo_uid() == Some(owner));
-    if !owner_trusted {
+    if !directory_owner_trusted(owner, euid, sudo_uid(), output_owner()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!(
-                "output directory ancestor {} is untrusted: owned by uid {}",
-                path.display(),
-                owner
-            ),
+            owner_refusal_message(path, owner, euid),
         ));
     }
     Ok(())
@@ -789,6 +785,117 @@ fn parse_sudo_id(value: &OsStr) -> Option<u32> {
     Some(id)
 }
 
+/// Run-scoped `--output-owner` UID:GID, set once at command entry and
+/// restored on exit (mirroring `cli::TEXT_VERBOSITY`), so the deep sink
+/// code needs no new parameter. `u64::MAX` is unset; otherwise the uid
+/// rides the high 32 bits and the gid the low 32. Lock-free, so a
+/// forked test child can set it without deadlocks. Only ids the
+/// parser accepts are ever stored, so neither half is `u32::MAX` and
+/// no pair collides with the unset value.
+static OUTPUT_OWNER: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Sets the run-scoped output owner; returns the previous setting.
+pub fn set_output_owner(owner: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    debug_assert!(!matches!(owner, Some((u32::MAX, _)) | Some((_, u32::MAX))));
+    let next = owner.map_or(u64::MAX, |(uid, gid)| {
+        (u64::from(uid) << 32) | u64::from(gid)
+    });
+    match OUTPUT_OWNER.swap(next, Ordering::SeqCst) {
+        u64::MAX => None,
+        raw => Some(((raw >> 32) as u32, raw as u32)),
+    }
+}
+
+/// Parses `--output-owner UID[:GID]`: two numeric non-root ids below
+/// `u32::MAX`, the GID defaulting to the UID. Unlike the sudo pair,
+/// the ids need no passwd entry — a container bind mount's host owner
+/// normally has none inside the image.
+pub(crate) fn parse_output_owner(value: &str) -> Result<(u32, u32), String> {
+    let shape =
+        || format!("--output-owner expects UID[:GID] with numeric non-root ids (got {value:?})");
+    let (uid, gid) = match value.split_once(':') {
+        Some((uid, gid)) => (uid, Some(gid)),
+        None => (value, None),
+    };
+    let uid = parse_sudo_id(OsStr::new(uid)).ok_or_else(shape)?;
+    let gid = match gid {
+        None => uid,
+        Some(gid) => parse_sudo_id(OsStr::new(gid)).ok_or_else(shape)?,
+    };
+    Ok((uid, gid))
+}
+
+/// Refuses `--output-owner` away from root: only root can hand the
+/// report to another user. `None` when the flag is absent or the
+/// caller is root.
+pub fn output_owner_root_refusal(owner: Option<(u32, u32)>) -> Option<String> {
+    let (uid, gid) = owner?;
+    if unsafe { libc::geteuid() } == 0 {
+        return None;
+    }
+    Some(format!(
+        "--output-owner {uid}:{gid} needs root: only root can hand the report to another user. Run as root or omit the flag."
+    ))
+}
+
+/// The run-scoped `--output-owner` pair, if the command armed one.
+pub(crate) fn output_owner() -> Option<(u32, u32)> {
+    match OUTPUT_OWNER.load(Ordering::SeqCst) {
+        u64::MAX => None,
+        raw => Some(((raw >> 32) as u32, raw as u32)),
+    }
+}
+
+/// Whether an output directory owned by `owner` passes the ownership
+/// leg: the caller, root, the validated sudo uid (root only), or the
+/// explicit `--output-owner` uid (root only, exact match — the gid
+/// plays no role in trust). The mode, type and symlink checks are
+/// separate and unchanged.
+fn directory_owner_trusted(
+    owner: u32,
+    euid: u32,
+    sudo_uid: Option<u32>,
+    named: Option<(u32, u32)>,
+) -> bool {
+    owner == euid
+        || owner == 0
+        || (euid == 0 && sudo_uid == Some(owner))
+        || (euid == 0 && named.is_some_and(|(uid, _)| uid == owner))
+}
+
+/// The ownership refusal for one ancestor: the legacy shape, plus —
+/// for root only, where the flag can help — the exact fix naming the
+/// ancestor's owner. Away from root the text is byte-identical to the
+/// legacy shape.
+fn owner_refusal_message(path: &Path, owner: u32, euid: u32) -> String {
+    let base = format!(
+        "output directory ancestor {} is untrusted: owned by uid {}",
+        path.display(),
+        owner
+    );
+    if euid != 0 {
+        return base;
+    }
+    format!(
+        "{base}. To write here as root, repeat with --output-owner {owner} to trust that owner and hand the report to them"
+    )
+}
+
+/// The handover target for newly created sink files: the explicit
+/// `--output-owner` wins over the ambient sudo pair (root only, with
+/// no parent-ownership tie — the operator named this handover),
+/// otherwise the sudo rule decides.
+fn handover_target(
+    euid: u32,
+    invoker: Option<(u32, u32)>,
+    parent_owner: u32,
+    named: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    named
+        .filter(|_| euid == 0)
+        .or_else(|| sudo_output_target(euid, invoker, parent_owner))
+}
+
 /// The validated sudo invoker: root only, and `SUDO_UID`/`SUDO_GID`
 /// name one existing non-root account (the `run` account-pair rule,
 /// without `run`'s set-id continuity check — a setuid install is
@@ -823,11 +930,11 @@ fn sudo_output_target(
     Some(target)
 }
 
-/// The handover target for a sink in `directory`: root plus a
-/// validated sudo pair plus a parent the invoker owns. The parent
-/// owner comes from the retained directory descriptor, never from a
-/// path lookup.
-fn sudo_handover_target(
+/// The handover target for a sink in `directory`: root plus the
+/// explicit `--output-owner` (which wins) or a validated sudo pair
+/// with a parent the invoker owns. The parent owner comes from the
+/// retained directory descriptor, never from a path lookup.
+fn handover_target_for(
     directory: &std::fs::File,
     final_path: &Path,
 ) -> Result<Option<(u32, u32)>, String> {
@@ -835,8 +942,9 @@ fn sudo_handover_target(
     if euid != 0 {
         return Ok(None);
     }
+    let named = output_owner();
     let invoker = sudo_invoker();
-    if invoker.is_none() {
+    if named.is_none() && invoker.is_none() {
         return Ok(None);
     }
     let parent_owner = directory
@@ -848,11 +956,11 @@ fn sudo_handover_target(
             )
         })?
         .uid();
-    Ok(sudo_output_target(euid, invoker, parent_owner))
+    Ok(handover_target(euid, invoker, parent_owner, named))
 }
 
-/// Hands a newly created sink file to the sudo invoker: `fchown` on
-/// the open descriptor, never by path, so no symlink can redirect
+/// Hands a newly created sink file to its handover target: `fchown`
+/// on the open descriptor, never by path, so no symlink can redirect
 /// it. The creation mode (`0600`) is unchanged by `fchown`. `None`
 /// keeps the caller's ownership. Callers unlink a file they just
 /// created when this fails.
@@ -866,7 +974,7 @@ fn handover_new_file(
     };
     if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } == -1 {
         return Err(format!(
-            "handing output {} to the invoking user (uid {uid}, gid {gid}) failed: {}",
+            "handing output {} to uid {uid}, gid {gid} failed: {}",
             final_path.display(),
             std::io::Error::last_os_error()
         ));
@@ -1772,6 +1880,126 @@ mod tests {
         assert_eq!(sudo_output_target(0, None, 1000), None);
         assert_eq!(sudo_output_target(0, Some((1000, 1000)), 0), None);
         assert_eq!(sudo_output_target(0, Some((1000, 1000)), 1001), None);
+    }
+
+    #[test]
+    fn output_owner_parsing_accepts_uid_with_optional_gid() {
+        assert_eq!(parse_output_owner("1000"), Ok((1000, 1000)));
+        assert_eq!(parse_output_owner("1000:1001"), Ok((1000, 1001)));
+        assert_eq!(parse_output_owner("1:2"), Ok((1, 2)));
+        for bad in [
+            "",
+            "0",
+            "1000:0",
+            "0:1000",
+            "4294967295",
+            "1000:4294967295",
+            "4294967296",
+            "abc",
+            "10x",
+            "-1",
+            " 1000",
+            "1000 ",
+            "1000:",
+            ":1000",
+            ":",
+            "1000:1001:5",
+        ] {
+            assert!(parse_output_owner(bad).is_err(), "{bad:?} must not parse");
+        }
+        let error = parse_output_owner("abc").unwrap_err();
+        assert!(error.contains("--output-owner"), "{error}");
+        assert!(error.contains("UID[:GID]"), "{error}");
+    }
+
+    #[test]
+    fn directory_owner_trust_adds_only_the_named_owner_for_root() {
+        // Status-quo legs, unchanged: self, root, and the validated sudo uid.
+        assert!(directory_owner_trusted(1000, 1000, None, None));
+        assert!(directory_owner_trusted(0, 1000, None, None));
+        assert!(directory_owner_trusted(1000, 0, Some(1000), None));
+        assert!(!directory_owner_trusted(1001, 0, Some(1000), None));
+        assert!(!directory_owner_trusted(1001, 1000, None, None));
+        // The named leg: root only, the exact uid, the gid plays no role.
+        assert!(directory_owner_trusted(1001, 0, None, Some((1001, 1001))));
+        assert!(directory_owner_trusted(1001, 0, None, Some((1001, 9999))));
+        assert!(!directory_owner_trusted(
+            1001,
+            1000,
+            None,
+            Some((1001, 1001))
+        ));
+        assert!(!directory_owner_trusted(1002, 0, None, Some((1001, 1001))));
+        // Sudo and named compose: either leg trusts its own owner.
+        assert!(directory_owner_trusted(
+            1001,
+            0,
+            Some(1002),
+            Some((1001, 1001))
+        ));
+        assert!(directory_owner_trusted(
+            1002,
+            0,
+            Some(1002),
+            Some((1001, 1001))
+        ));
+    }
+
+    #[test]
+    fn handover_target_prefers_the_explicit_owner_over_sudo() {
+        // The explicit flag wins over ambient sudo, root only, with no
+        // parent-ownership tie: the operator named this handover.
+        assert_eq!(
+            handover_target(0, Some((1000, 1000)), 1000, Some((1001, 1001))),
+            Some((1001, 1001))
+        );
+        assert_eq!(
+            handover_target(0, Some((1000, 1000)), 0, Some((1001, 1001))),
+            Some((1001, 1001))
+        );
+        assert_eq!(
+            handover_target(0, None, 0, Some((1001, 1001))),
+            Some((1001, 1001))
+        );
+        assert_eq!(
+            handover_target(1000, Some((1000, 1000)), 1000, Some((1001, 1001))),
+            None
+        );
+        // Without the flag the sudo rule is exactly as before.
+        assert_eq!(
+            handover_target(0, Some((1000, 1000)), 1000, None),
+            Some((1000, 1000))
+        );
+        assert_eq!(handover_target(0, Some((1000, 1000)), 0, None), None);
+        assert_eq!(handover_target(0, None, 1000, None), None);
+        assert_eq!(handover_target(1000, Some((1000, 1000)), 1000, None), None);
+    }
+
+    #[test]
+    fn owner_refusal_names_the_flag_and_fix_only_for_root() {
+        let path = Path::new("/out");
+        let root = owner_refusal_message(path, 1000, 0);
+        assert!(root.contains("untrusted"), "{root}");
+        assert!(root.contains("--output-owner 1000"), "{root}");
+        // Away from root the message is byte-identical to the legacy
+        // shape: the flag cannot help there, so it is not offered.
+        assert_eq!(
+            owner_refusal_message(path, 1000, 1000),
+            "output directory ancestor /out is untrusted: owned by uid 1000"
+        );
+    }
+
+    #[test]
+    fn output_owner_without_root_is_refused_by_name() {
+        assert_eq!(output_owner_root_refusal(None), None);
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(output_owner_root_refusal(Some((1000, 1000))), None);
+        } else {
+            let refusal =
+                output_owner_root_refusal(Some((1000, 1000))).expect("non-root must refuse");
+            assert!(refusal.contains("--output-owner 1000:1000"), "{refusal}");
+            assert!(refusal.contains("needs root"), "{refusal}");
+        }
     }
 
     #[test]

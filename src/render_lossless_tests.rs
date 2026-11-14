@@ -552,6 +552,7 @@ fn diff_report_schema() -> String {
         after,
         json: true,
         out: None,
+        output_owner: None,
         verbose: false,
         quiet: false,
     };

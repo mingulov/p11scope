@@ -42,6 +42,7 @@ fn run(
         after: after.to_path_buf(),
         json,
         out,
+        output_owner: None,
         verbose: false,
         quiet: false,
     };

@@ -32304,6 +32304,29 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// The counted `table decode` summary is an aggregate, not a mapped
+    /// file: with one refused file beside its summary the line counts
+    /// one unexamined file and never pairs the summary as a file.
+    #[test]
+    fn an_empty_plan_with_a_refused_file_and_its_counted_gap_counts_one_file() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        plan.skipped.push(Skipped {
+            subject: "/opt/provider/lib1.so".into(),
+            reason: "provider file was not decoded: table decode ceiling reached".into(),
+        });
+        plan.skipped.push(Skipped {
+            subject: "table decode".into(),
+            reason: "1 provider file was not decoded: table decode ceiling reached".into(),
+        });
+        let hint = empty_plan_hint(&ScopeArg::Pid(42), &plan);
+        assert!(
+            hint.contains("but 1 mapped file could not be examined"),
+            "{hint}"
+        );
+        assert!(!hint.contains("table decode - "), "{hint}");
+    }
+
     /// P1-3 twin: a refused whole module is a confirmed provider by
     /// construction (it was admitted, then refused), so it counts as
     /// found-but-refused too.

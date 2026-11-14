@@ -9435,6 +9435,122 @@ mod tests {
         );
     }
 
+    /// Mixed-leg twin of the refusal above: the maps-B read starves the
+    /// DetailedLegacy I/O allowance (which sets no sticky stop) while
+    /// the generation check genuinely fails. The keep needs EVERY
+    /// failing half to name a budget reason, so the lost generation
+    /// keeps the fail-closed clear even though the other half starved.
+    #[test]
+    fn io_starved_bracket_with_a_proven_generation_loss_still_drops_modules() {
+        let mut control = BracketFixture::new(8, true);
+        let mut measured = CaptureWorkBudget::default();
+        assert_eq!(control.run(&mut measured).unwrap().modules().len(), 1);
+        let mut f = BracketFixture::new(8, true);
+        f.fail_generation = true;
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: control
+                .before_b
+                .map_or(measured.attempted_io_bytes(), |b| b.0)
+                + f.maps_b.len() as u64 / 2,
+        });
+        let outcome = f.run(&mut budget).unwrap();
+        assert_eq!(
+            budget.stopped_reason(),
+            None,
+            "DetailedLegacy I/O exhaustion sets no sticky stop: {outcome:?}"
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "a proven generation loss clears even when the other half starved: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable")),
+            "the starved half stays named: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("capture attempted-I/O ceiling")),
+            "the IO exhaustion stays named: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| skip
+                .reason
+                .contains("process generation changed during acquisition")),
+            "the loss stays named: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    /// Sticky-stop twin: maps B hits its entry ceiling (a truncated
+    /// snapshot, never a budget reason) and the generation proof's
+    /// first spend then trips the work ceiling, setting the sticky
+    /// stop. A sticky-stop keep would publish here; the
+    /// every-failing-half rule clears.
+    #[test]
+    fn maps_entry_ceiling_with_a_starved_generation_proof_still_drops_modules() {
+        // Measure this shape's pre-generation work: the entry ceiling
+        // fails maps B before any validation spend, so a healthy-budget
+        // run of the same shape ends exactly where the proof's spend
+        // must trip.
+        let mut control = BracketFixture::new(8, true);
+        control
+            .maps_b
+            .push_str(&"d000-e000 r--p 0 0:0 0\n".repeat(MAX_MAP_ENTRIES + 1));
+        let mut measured = CaptureWorkBudget::default();
+        let control_outcome = control.run(&mut measured).unwrap();
+        assert!(
+            control_outcome.modules().is_empty(),
+            "the entry ceiling alone clears: {control_outcome:?}"
+        );
+        assert_eq!(
+            measured.stopped_reason(),
+            None,
+            "the maps entry ceiling sets no stop: {control_outcome:?}"
+        );
+        let mut f = BracketFixture::new(8, true);
+        f.maps_b
+            .push_str(&"d000-e000 r--p 0 0:0 0\n".repeat(MAX_MAP_ENTRIES + 1));
+        f.final_generation_spend = 1;
+        let mut budget = CaptureWorkBudget {
+            work_ceiling: measured.work_units,
+            ..CaptureWorkBudget::default()
+        };
+        let outcome = f.run(&mut budget).unwrap();
+        assert_eq!(
+            budget.stopped_reason(),
+            Some(WORK_CEILING_REASON),
+            "the proof's spend trips the work ceiling: {outcome:?}"
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "a truncated maps snapshot clears even under a sticky budget stop: {outcome:?}"
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| skip
+                .reason
+                .contains(MAPS_ENTRY_CEILING_REASON)),
+            "the truncated snapshot stays named: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| skip
+                .reason
+                .contains("process generation changed during acquisition")),
+            "the starved proof stays named: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
     /// The counted gap does not need a starved bracket: with a healthy
     /// work budget the refused file is still counted beside the decoded
     /// one, and the passing bracket validates the decoded module.

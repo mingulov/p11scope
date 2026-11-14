@@ -20452,6 +20452,79 @@ int main(int argc, char **argv) {
         assert!(classify_launch_file(&file).is_err());
     }
 
+    /// fix3: a pandoc-shaped ELF (11.5 MB `.dynsym` / 43.7 MB `.dynstr`,
+    /// 55 MB sparse) classifies as ELF for launch: span size never
+    /// refuses an owned command.
+    #[test]
+    fn pandoc_shaped_elf_classifies_as_elf_for_launch() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pandoc-shaped");
+        const DYNSYM_BYTES: u64 = 11_497_776;
+        const DYNSTR_BYTES: u64 = 43_660_724;
+        const DYNSYM_OFF: u64 = 4096;
+        const DYNSTR_OFF: u64 = DYNSYM_OFF + DYNSYM_BYTES;
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[6] = 1;
+        header[16..18].copy_from_slice(&2u16.to_le_bytes());
+        header[18..20].copy_from_slice(&62u16.to_le_bytes());
+        header[20..24].copy_from_slice(&1u32.to_le_bytes());
+        header[40..48].copy_from_slice(&64u64.to_le_bytes());
+        header[52..54].copy_from_slice(&64u16.to_le_bytes());
+        header[54..56].copy_from_slice(&56u16.to_le_bytes());
+        header[58..60].copy_from_slice(&64u16.to_le_bytes());
+        header[60..62].copy_from_slice(&4u16.to_le_bytes());
+        header[62..64].copy_from_slice(&3u16.to_le_bytes());
+        let mut shdr1 = [0u8; 64];
+        shdr1[4..8].copy_from_slice(&11u32.to_le_bytes());
+        shdr1[8..16].copy_from_slice(&2u64.to_le_bytes());
+        shdr1[24..32].copy_from_slice(&DYNSYM_OFF.to_le_bytes());
+        shdr1[32..40].copy_from_slice(&DYNSYM_BYTES.to_le_bytes());
+        shdr1[40..44].copy_from_slice(&2u32.to_le_bytes());
+        shdr1[48..56].copy_from_slice(&8u64.to_le_bytes());
+        shdr1[56..64].copy_from_slice(&24u64.to_le_bytes());
+        let mut shdr2 = [0u8; 64];
+        shdr2[4..8].copy_from_slice(&3u32.to_le_bytes());
+        shdr2[8..16].copy_from_slice(&2u64.to_le_bytes());
+        shdr2[24..32].copy_from_slice(&DYNSTR_OFF.to_le_bytes());
+        shdr2[32..40].copy_from_slice(&DYNSTR_BYTES.to_le_bytes());
+        shdr2[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let mut shdr3 = [0u8; 64];
+        shdr3[4..8].copy_from_slice(&3u32.to_le_bytes());
+        shdr3[24..32].copy_from_slice(&320u64.to_le_bytes());
+        shdr3[32..40].copy_from_slice(&11u64.to_le_bytes());
+        shdr3[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let file = std::fs::File::create(&path).unwrap();
+        use std::io::Write as _;
+        let mut out = std::io::BufWriter::new(&file);
+        out.write_all(&header).unwrap();
+        out.write_all(&[0u8; 64]).unwrap();
+        out.write_all(&shdr1).unwrap();
+        out.write_all(&shdr2).unwrap();
+        out.write_all(&shdr3).unwrap();
+        out.write_all(b"\0.shstrtab\0").unwrap();
+        out.flush().unwrap();
+        drop(out);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(DYNSTR_OFF + DYNSTR_BYTES)
+            .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            classify_launch_file(&file).unwrap().0,
+            LaunchKind::Elf,
+            "pandoc-sized spans must not refuse launch classification"
+        );
+    }
+
     /// Hermetic long-running child: this host's `/bin/sleep` is a uutils
     /// multicall shim that dispatches on AT_EXECFN, which fd-pinned exec
     /// (`execveat` + `AT_EMPTY_PATH`) leaves as an fd-based name — so it

@@ -2023,3 +2023,156 @@ fn sparse_bigendian_elf_refuses_before_parse_with_header_only_reads() {
     assert_eq!(reported, 64);
     assert_eq!(calls, 1);
 }
+
+// ---- fix3: pandoc-sized spans admit (no fixed 8 MiB cap) --------------------
+
+/// Sparse ELF64 with pandoc-sized dynamic spans: `.dynsym` 11,497,776 B
+/// at offset 4096 linked to `.dynstr` 43,660,724 B, plus a tiny
+/// `.shstrtab`. Total spans 55,158,500 B fit a 64 MiB window. Sparse
+/// hole, so 4 KiB on disk for a 55 MB file.
+fn write_pandoc_sized_dynsym_elf(path: &Path) {
+    const DYNSYM_BYTES: u64 = 11_497_776;
+    const DYNSTR_BYTES: u64 = 43_660_724;
+    const DYNSYM_OFF: u64 = 4096;
+    const DYNSTR_OFF: u64 = DYNSYM_OFF + DYNSYM_BYTES;
+    const SHSTRTAB_OFF: u64 = 320;
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&3u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    header[60..62].copy_from_slice(&4u16.to_le_bytes());
+    header[62..64].copy_from_slice(&3u16.to_le_bytes());
+    let mut shdr1 = [0u8; 64];
+    shdr1[4..8].copy_from_slice(&11u32.to_le_bytes());
+    shdr1[8..16].copy_from_slice(&2u64.to_le_bytes());
+    shdr1[24..32].copy_from_slice(&DYNSYM_OFF.to_le_bytes());
+    shdr1[32..40].copy_from_slice(&DYNSYM_BYTES.to_le_bytes());
+    shdr1[40..44].copy_from_slice(&2u32.to_le_bytes());
+    shdr1[48..56].copy_from_slice(&8u64.to_le_bytes());
+    shdr1[56..64].copy_from_slice(&24u64.to_le_bytes());
+    let mut shdr2 = [0u8; 64];
+    shdr2[4..8].copy_from_slice(&3u32.to_le_bytes());
+    shdr2[8..16].copy_from_slice(&2u64.to_le_bytes());
+    shdr2[24..32].copy_from_slice(&DYNSTR_OFF.to_le_bytes());
+    shdr2[32..40].copy_from_slice(&DYNSTR_BYTES.to_le_bytes());
+    shdr2[48..56].copy_from_slice(&1u64.to_le_bytes());
+    let mut shdr3 = [0u8; 64];
+    shdr3[4..8].copy_from_slice(&3u32.to_le_bytes());
+    shdr3[24..32].copy_from_slice(&SHSTRTAB_OFF.to_le_bytes());
+    shdr3[32..40].copy_from_slice(&11u64.to_le_bytes());
+    shdr3[48..56].copy_from_slice(&1u64.to_le_bytes());
+    let file = std::fs::File::create(path).unwrap();
+    use std::io::Write as _;
+    let mut out = std::io::BufWriter::new(&file);
+    out.write_all(&header).unwrap();
+    out.write_all(&[0u8; 64]).unwrap();
+    out.write_all(&shdr1).unwrap();
+    out.write_all(&shdr2).unwrap();
+    out.write_all(&shdr3).unwrap();
+    out.write_all(b"\0.shstrtab\0").unwrap();
+    out.flush().unwrap();
+    drop(out);
+    file.set_len(DYNSTR_OFF + DYNSTR_BYTES).unwrap();
+}
+
+/// Sparse ELF64 with a 2 GiB `.shstrtab` hole (tiny tables, 4 KiB on
+/// disk): section 1 is a 16-byte ALLOC PROGBITS, section 2 is the
+/// 2 GiB STRTAB the header names as the section-name table.
+fn write_sparse_huge_shstrtab_elf(path: &Path) {
+    const SHSTRTAB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const SHSTRTAB_OFF: u64 = 4096;
+    const PROGBITS_OFF: u64 = 256;
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&3u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    header[60..62].copy_from_slice(&3u16.to_le_bytes());
+    header[62..64].copy_from_slice(&2u16.to_le_bytes());
+    let mut shdr1 = [0u8; 64];
+    shdr1[0..4].copy_from_slice(&1u32.to_le_bytes());
+    shdr1[4..8].copy_from_slice(&1u32.to_le_bytes());
+    shdr1[8..16].copy_from_slice(&2u64.to_le_bytes());
+    shdr1[24..32].copy_from_slice(&PROGBITS_OFF.to_le_bytes());
+    shdr1[32..40].copy_from_slice(&16u64.to_le_bytes());
+    shdr1[48..56].copy_from_slice(&1u64.to_le_bytes());
+    let mut shdr2 = [0u8; 64];
+    shdr2[4..8].copy_from_slice(&3u32.to_le_bytes());
+    shdr2[24..32].copy_from_slice(&SHSTRTAB_OFF.to_le_bytes());
+    shdr2[32..40].copy_from_slice(&SHSTRTAB_BYTES.to_le_bytes());
+    shdr2[48..56].copy_from_slice(&1u64.to_le_bytes());
+    let file = std::fs::File::create(path).unwrap();
+    use std::io::Write as _;
+    let mut out = std::io::BufWriter::new(&file);
+    out.write_all(&header).unwrap();
+    out.write_all(&[0u8; 64]).unwrap();
+    out.write_all(&shdr1).unwrap();
+    out.write_all(&shdr2).unwrap();
+    out.write_all(&[0u8; 16]).unwrap();
+    out.flush().unwrap();
+    drop(out);
+    file.set_len(SHSTRTAB_OFF + SHSTRTAB_BYTES).unwrap();
+}
+
+/// fix3: pandoc-sized spans admit on every already-read path: the
+/// snapshot, the pin, and the demand-paged facts all parse the
+/// 11.5 MB / 43.7 MB spans instead of refusing them for size.
+#[test]
+fn pandoc_sized_spans_admit_on_snapshot_pin_and_mmap() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-pandoc-spans");
+    let path = d.join("pandoc-sized.so");
+    write_pandoc_sized_dynsym_elf(&path);
+    let file = std::fs::File::open(&path).unwrap();
+    ElfSnapshot::read(&file).expect("the snapshot must admit pandoc-sized spans");
+    p11scope_manifest::identity::inspect_file(&file)
+        .expect("the pin must admit pandoc-sized spans");
+    read_raw_scan_facts_bounded(&file, &[], u64::MAX)
+        .expect("the mmap facts must admit pandoc-sized spans");
+}
+
+/// fix3: a 2 GiB sparse `.shstrtab` charges only the examined name
+/// bytes, never the whole table: the structural charge stays under
+/// 1 MiB for a 2 GiB file.
+#[test]
+fn huge_shstrtab_charges_only_examined_name_bytes() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-huge-shstrtab-charge");
+    let path = d.join("huge-shstrtab.so");
+    write_sparse_huge_shstrtab_elf(&path);
+    let file = std::fs::File::open(&path).unwrap();
+    let facts = read_raw_scan_facts_bounded(&file, &[], u64::MAX)
+        .expect("a huge shstrtab must not refuse the parse");
+    assert!(
+        facts.structural_bytes < 1 << 20,
+        "structural {} must be examined bytes, not the 2 GiB table",
+        facts.structural_bytes
+    );
+}
+
+/// fix3 nit: a PE file keeps the legacy refusal text through the
+/// 64-byte gate, byte-exact with the full parser.
+#[test]
+fn pe_file_keeps_the_legacy_not_an_elf_refusal() {
+    use p11scope_manifest::elf::table_bounds_from_header;
+    let mut header = [0u8; 64];
+    header[0..2].copy_from_slice(b"MZ");
+    header[60..64].copy_from_slice(&128u32.to_le_bytes());
+    let error = table_bounds_from_header(&header, None).unwrap_err();
+    assert_eq!(error, "not an ELF object (Pe)");
+}

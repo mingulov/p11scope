@@ -83,6 +83,13 @@ const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 /// still fence worst-case passes. May be raised when measured, never
 /// lowered: the closure-fit test below pins the floor.
 pub(crate) const INVENTORY_WINDOW_IO_BYTES: u64 = 64 << 20;
+/// Production Detailed-capture attempted-I/O total: the whole window a
+/// demand-paged export walk is charged to under `DetailedLegacy`
+/// (same value as `ScanLimits::default().total_bytes`). Together with
+/// [`INVENTORY_WINDOW_IO_BYTES`] this is the refusal threshold for
+/// dynamic spans: a span (or walked total) larger than the policy's
+/// production window refuses cached per object, without draining.
+pub(crate) const DETAILED_CAPTURE_IO_BYTES: u64 = 512 << 20;
 pub(crate) const IO_CEILING_REASON: &str =
     "capture attempted-I/O ceiling reached; remaining provider bytes were not read";
 /// A single object outgrew its own allowance while the capture window
@@ -307,8 +314,14 @@ fn read_raw_scan_facts_budgeted(
         {
             return Err("read failed: inventory discovery requires an active scan".into());
         }
-        // The header probe refuses over-cap tables with the named gap
-        // before any mapping, charging only the probe bytes it read.
+        // The header probe refuses over-cap header tables with the named
+        // gap before any mapping, charging only the probe bytes it read.
+        // Spans are only sized there; they refuse here, against the whole
+        // production window the walk would be charged to — never a fixed
+        // per-span cap, and never the remaining bytes (a refusal cached
+        // under a drained window would skip a real file later). The
+        // refusal charges only the probe and caches per object, so a
+        // later object in the same pass still scans.
         let (gated, probe_bytes) = p11scope_manifest::elf::read_table_bounds(file);
         let bounds = match gated {
             Ok(bounds) => bounds,
@@ -317,6 +330,14 @@ fn read_raw_scan_facts_budgeted(
                 return Err(reason);
             }
         };
+        let window_bytes = match budget.policy() {
+            DiscoveryPolicy::Inventory(_) => INVENTORY_WINDOW_IO_BYTES,
+            DiscoveryPolicy::DetailedLegacy => DETAILED_CAPTURE_IO_BYTES,
+        };
+        if let Some(reason) = bounds.span_refusal(window_bytes) {
+            budget.record_io(usize::try_from(probe_bytes).unwrap_or(usize::MAX));
+            return Err(reason);
+        }
         let pre_bytes = bounds.table_bytes();
         if pre_bytes > 0 {
             debit_window_io(budget, pre_bytes)?;
@@ -641,7 +662,7 @@ impl Default for ScanLimits {
             // old 64 MiB allowance starved its snapshots; 256 MiB holds
             // it with margin while still bounding the worst case.
             per_object_bytes: 256 * 1024 * 1024,
-            total_bytes: 512 * 1024 * 1024,
+            total_bytes: DETAILED_CAPTURE_IO_BYTES,
         }
     }
 }
@@ -16527,8 +16548,8 @@ mod tests {
         let first = provider_facts_for(&huge, huge_key, &[], &mut budget).unwrap_err();
         assert!(
             first.contains("dynamic-symbol table is 2147483648 bytes")
-                && first.contains("limit is 8388608"),
-            "the oversized span names itself, got {first:?}"
+                && first.contains("limit is 67108864"),
+            "the oversized span names the whole 64 MiB window, got {first:?}"
         );
         assert!(
             !first.contains("ceiling"),
@@ -16547,6 +16568,190 @@ mod tests {
             budget.attempted_io_bytes(),
             after_huge + header_table_bytes(&small),
             "the cached span refusal rereads nothing beyond the small object"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
+    }
+
+    /// Sparse ELF64 with pandoc-sized dynamic spans: `.dynsym`
+    /// 11,497,776 B at offset 4096 linked to `.dynstr` 43,660,724 B,
+    /// plus a tiny `.shstrtab`. Total spans 55,158,500 B fit a 64 MiB
+    /// window. Sparse hole, so 4 KiB on disk for a 55 MB file.
+    fn write_pandoc_sized_dynsym_elf(path: &Path) {
+        const DYNSYM_BYTES: u64 = 11_497_776;
+        const DYNSTR_BYTES: u64 = 43_660_724;
+        const DYNSYM_OFF: u64 = 4096;
+        const DYNSTR_OFF: u64 = DYNSYM_OFF + DYNSYM_BYTES;
+        const SHSTRTAB_OFF: u64 = 320;
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[6] = 1;
+        header[16..18].copy_from_slice(&3u16.to_le_bytes());
+        header[18..20].copy_from_slice(&62u16.to_le_bytes());
+        header[20..24].copy_from_slice(&1u32.to_le_bytes());
+        header[40..48].copy_from_slice(&64u64.to_le_bytes());
+        header[52..54].copy_from_slice(&64u16.to_le_bytes());
+        header[54..56].copy_from_slice(&56u16.to_le_bytes());
+        header[58..60].copy_from_slice(&64u16.to_le_bytes());
+        header[60..62].copy_from_slice(&4u16.to_le_bytes());
+        header[62..64].copy_from_slice(&3u16.to_le_bytes());
+        let mut shdr1 = [0u8; 64];
+        shdr1[4..8].copy_from_slice(&11u32.to_le_bytes());
+        shdr1[8..16].copy_from_slice(&2u64.to_le_bytes());
+        shdr1[24..32].copy_from_slice(&DYNSYM_OFF.to_le_bytes());
+        shdr1[32..40].copy_from_slice(&DYNSYM_BYTES.to_le_bytes());
+        shdr1[40..44].copy_from_slice(&2u32.to_le_bytes());
+        shdr1[48..56].copy_from_slice(&8u64.to_le_bytes());
+        shdr1[56..64].copy_from_slice(&24u64.to_le_bytes());
+        let mut shdr2 = [0u8; 64];
+        shdr2[4..8].copy_from_slice(&3u32.to_le_bytes());
+        shdr2[8..16].copy_from_slice(&2u64.to_le_bytes());
+        shdr2[24..32].copy_from_slice(&DYNSTR_OFF.to_le_bytes());
+        shdr2[32..40].copy_from_slice(&DYNSTR_BYTES.to_le_bytes());
+        shdr2[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let mut shdr3 = [0u8; 64];
+        shdr3[4..8].copy_from_slice(&3u32.to_le_bytes());
+        shdr3[24..32].copy_from_slice(&SHSTRTAB_OFF.to_le_bytes());
+        shdr3[32..40].copy_from_slice(&11u64.to_le_bytes());
+        shdr3[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let file = std::fs::File::create(path).unwrap();
+        use std::io::Write as _;
+        let mut out = std::io::BufWriter::new(&file);
+        out.write_all(&header).unwrap();
+        out.write_all(&[0u8; 64]).unwrap();
+        out.write_all(&shdr1).unwrap();
+        out.write_all(&shdr2).unwrap();
+        out.write_all(&shdr3).unwrap();
+        out.write_all(b"\0.shstrtab\0").unwrap();
+        out.flush().unwrap();
+        drop(out);
+        file.set_len(DYNSTR_OFF + DYNSTR_BYTES).unwrap();
+    }
+
+    /// Sparse ELF64 with a 2 GiB `.shstrtab` hole (tiny tables, 4 KiB
+    /// on disk): section 1 is a 16-byte ALLOC PROGBITS, section 2 is
+    /// the 2 GiB STRTAB the header names as the section-name table.
+    fn write_sparse_huge_shstrtab_elf(path: &Path) {
+        const SHSTRTAB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+        const SHSTRTAB_OFF: u64 = 4096;
+        const PROGBITS_OFF: u64 = 256;
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[6] = 1;
+        header[16..18].copy_from_slice(&3u16.to_le_bytes());
+        header[18..20].copy_from_slice(&62u16.to_le_bytes());
+        header[20..24].copy_from_slice(&1u32.to_le_bytes());
+        header[40..48].copy_from_slice(&64u64.to_le_bytes());
+        header[52..54].copy_from_slice(&64u16.to_le_bytes());
+        header[54..56].copy_from_slice(&56u16.to_le_bytes());
+        header[58..60].copy_from_slice(&64u16.to_le_bytes());
+        header[60..62].copy_from_slice(&3u16.to_le_bytes());
+        header[62..64].copy_from_slice(&2u16.to_le_bytes());
+        let mut shdr1 = [0u8; 64];
+        shdr1[0..4].copy_from_slice(&1u32.to_le_bytes());
+        shdr1[4..8].copy_from_slice(&1u32.to_le_bytes());
+        shdr1[8..16].copy_from_slice(&2u64.to_le_bytes());
+        shdr1[24..32].copy_from_slice(&PROGBITS_OFF.to_le_bytes());
+        shdr1[32..40].copy_from_slice(&16u64.to_le_bytes());
+        shdr1[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let mut shdr2 = [0u8; 64];
+        shdr2[4..8].copy_from_slice(&3u32.to_le_bytes());
+        shdr2[24..32].copy_from_slice(&SHSTRTAB_OFF.to_le_bytes());
+        shdr2[32..40].copy_from_slice(&SHSTRTAB_BYTES.to_le_bytes());
+        shdr2[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let file = std::fs::File::create(path).unwrap();
+        use std::io::Write as _;
+        let mut out = std::io::BufWriter::new(&file);
+        out.write_all(&header).unwrap();
+        out.write_all(&[0u8; 64]).unwrap();
+        out.write_all(&shdr1).unwrap();
+        out.write_all(&shdr2).unwrap();
+        out.write_all(&[0u8; 16]).unwrap();
+        out.flush().unwrap();
+        drop(out);
+        file.set_len(SHSTRTAB_OFF + SHSTRTAB_BYTES).unwrap();
+    }
+
+    /// fix3: pandoc-sized spans admit in the scan: the 11.5 MB / 43.7 MB
+    /// spans total 55 MB inside a 64 MiB window, so the file scans and a
+    /// later object in the same pass still scans.
+    #[test]
+    fn inventory_pandoc_sized_spans_admit_in_the_same_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let pandoc_path = dir.path().join("pandoc-sized.so");
+        write_pandoc_sized_dynsym_elf(&pandoc_path);
+        let small_path = dir.path().join("small.so");
+        write_many_phdr_elf(&small_path, 1);
+        let pandoc = File::open(&pandoc_path).unwrap();
+        let small = File::open(&small_path).unwrap();
+        assert!(
+            crate::discovery::identity::file_inodes_are_unique(&pandoc)
+                && crate::discovery::identity::file_inodes_are_unique(&small),
+            "the lane TMPDIR must name one file per (device, inode)"
+        );
+        let pandoc_key = object_key_of(&pandoc);
+        let small_key = object_key_of(&small);
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+            64 << 20,
+            16 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        provider_facts_for(&pandoc, pandoc_key, &[], &mut budget)
+            .expect("pandoc-sized spans must admit in the scan");
+        provider_facts_for(&small, small_key, &[], &mut budget)
+            .expect("a later object in the same pass still scans");
+        assert_eq!(budget.stopped_reason(), None);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
+    }
+
+    /// fix3: a 2 GiB sparse `.shstrtab` next to a real library leaves
+    /// the pass running: both the crafted file and the real library
+    /// scan in the same window without tripping the I/O ceiling.
+    #[test]
+    fn inventory_huge_shstrtab_leaves_the_pass_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let crafted_path = dir.path().join("huge-shstrtab.so");
+        write_sparse_huge_shstrtab_elf(&crafted_path);
+        let library_path = dir.path().join("real-library.so");
+        std::fs::copy("/bin/sh", &library_path).unwrap();
+        let crafted = File::open(&crafted_path).unwrap();
+        let library = File::open(&library_path).unwrap();
+        assert!(
+            crate::discovery::identity::file_inodes_are_unique(&crafted)
+                && crate::discovery::identity::file_inodes_are_unique(&library),
+            "the lane TMPDIR must name one file per (device, inode)"
+        );
+        let crafted_key = object_key_of(&crafted);
+        let library_key = object_key_of(&library);
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+            64 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        provider_facts_for(&crafted, crafted_key, &[], &mut budget)
+            .expect("the crafted shstrtab file must scan without draining");
+        provider_facts_for(&library, library_key, &[], &mut budget)
+            .expect("the real library still scans in the same pass");
+        assert_eq!(budget.stopped_reason(), None);
+        assert!(
+            budget.attempted_io_bytes() < (64 << 20),
+            "the window must not drain, charged {}",
+            budget.attempted_io_bytes()
         );
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();

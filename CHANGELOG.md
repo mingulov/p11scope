@@ -1520,7 +1520,7 @@ provider during capture.
   (`slots` vs `active_slots`).
 - 256 loader contexts per capture for late-load (`dlopen`) tracking.
 - One capture-wide 512 MiB attempted-I/O budget for memory scans and
-  scan-sourced file hashes, at most 256 MiB per scan operation; 512
+  scan-sourced file hashes, at most 256 MiB per scan/hash operation; 512
   accepted table candidates, 53,248 decoded table entries and 512 interface
   records. `--cgroup` and `--system` deep-scan at most 256 processes per pass
   by default (`--max-scan-pids`). Manifest inputs are capped at 16 MiB per

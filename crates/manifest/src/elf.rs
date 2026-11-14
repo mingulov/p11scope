@@ -30,13 +30,14 @@ pub const MAX_PROGRAM_TABLE_BYTES: u64 = 64 * 1024;
 /// files — never a size gate on the file itself.
 pub const MAX_SECTION_TABLE_BYTES: u64 = 1024 * 1024;
 
-/// Bound on any one dynamic span (`.dynsym`, its linked `.dynstr`,
-/// `.dynamic`) any export walk may iterate: 8 MiB. Real spans are
-/// kilobytes, so the cap refuses only crafted files — never a size
-/// gate on the file itself. Matches the smallest per-object allowance
-/// (inventory's 8 MiB per-operation), so an admitted span always fits
-/// the operation that walks it.
-pub const MAX_DYN_SPAN_BYTES: u64 = 8 * 1024 * 1024;
+// Dynamic spans carry no fixed cap here: they are only sized, and the
+// scan refuses them against the whole window it charges them to (see
+// `ElfTableBounds::span_refusal`), cached per object on the demand-paged
+// path. Paths that already read and charged every byte (snapshots, pins)
+// and run's launch classification never apply span refusals, so real
+// spans (pandoc: 11.5 MB `.dynsym`, 43.7 MB `.dynstr`) parse on every
+// path. There is deliberately no `MAX_DYN_SPAN_BYTES`: a fixed per-span
+// cap refuses real files.
 
 /// Header-table and dynamic-span sizes one ELF parse will walk, read
 /// from the ELF header (plus section 0 for extended counts, plus the
@@ -79,6 +80,33 @@ impl ElfTableBounds {
         self.program_entries.saturating_add(self.section_entries)
     }
 
+    /// The cached per-object refusal when these bounds exceed the whole
+    /// window the walk would be charged to (`window_bytes`: the scan
+    /// policy's production window, never the remaining bytes — a refusal
+    /// cached under a drained window would skip a real file on later
+    /// passes). Checks each dynamic span first, then the walked total,
+    /// so the reason names the oversized span when one exists. Returns
+    /// `None` when everything fits: real spans (pandoc's 11.5 MB
+    /// `.dynsym` / 43.7 MB `.dynstr`, 55 MB total) fit a 64 MiB window.
+    /// Only the demand-paged scan path applies this; snapshots, pins
+    /// and run's launch classification admit whatever fits here.
+    pub fn span_refusal(&self, window_bytes: u64) -> Option<String> {
+        if self.dynsym_bytes > window_bytes {
+            return Some(dynsym_span_reason(self.dynsym_bytes, window_bytes));
+        }
+        if self.dynstr_bytes > window_bytes {
+            return Some(dynstr_span_reason(self.dynstr_bytes, window_bytes));
+        }
+        if self.dynamic_bytes > window_bytes {
+            return Some(dynamic_span_reason(self.dynamic_bytes, window_bytes));
+        }
+        let total = self.table_bytes();
+        if total > window_bytes {
+            return Some(tables_span_reason(total, window_bytes));
+        }
+        None
+    }
+
     /// Bounds for a header this gate cannot read: admit with nothing
     /// owed and let the legacy parser rule with its historical errors.
     fn unreadable() -> Self {
@@ -103,27 +131,33 @@ fn section_table_reason(table_bytes: u64) -> String {
     format!("ELF section-header table is {table_bytes} bytes; limit is {MAX_SECTION_TABLE_BYTES}")
 }
 
-fn dynsym_table_reason(table_bytes: u64) -> String {
-    format!("ELF dynamic-symbol table is {table_bytes} bytes; limit is {MAX_DYN_SPAN_BYTES}")
+fn dynsym_span_reason(span_bytes: u64, window_bytes: u64) -> String {
+    format!("ELF dynamic-symbol table is {span_bytes} bytes; limit is {window_bytes}")
 }
 
-fn dynstr_table_reason(table_bytes: u64) -> String {
-    format!("ELF dynamic-string table is {table_bytes} bytes; limit is {MAX_DYN_SPAN_BYTES}")
+fn dynstr_span_reason(span_bytes: u64, window_bytes: u64) -> String {
+    format!("ELF dynamic-string table is {span_bytes} bytes; limit is {window_bytes}")
 }
 
-fn dynamic_table_reason(table_bytes: u64) -> String {
-    format!("ELF dynamic table is {table_bytes} bytes; limit is {MAX_DYN_SPAN_BYTES}")
+fn dynamic_span_reason(span_bytes: u64, window_bytes: u64) -> String {
+    format!("ELF dynamic table is {span_bytes} bytes; limit is {window_bytes}")
 }
 
-/// Whether a refusal reason names an over-cap header table: the scan
-/// caches exactly these per file identity, so the prefix match cannot
-/// drift from the reasons above.
+fn tables_span_reason(table_bytes: u64, window_bytes: u64) -> String {
+    format!("ELF tables are {table_bytes} bytes; limit is {window_bytes}")
+}
+
+/// Whether a refusal reason names an over-cap table: the fixed header
+/// caps plus the whole-window dynamic-span (and walked-total) refusals.
+/// The scan caches exactly these per file identity, so the prefix match
+/// cannot drift from the reasons above.
 pub fn is_table_cap_reason(reason: &str) -> bool {
     reason.starts_with("ELF program-header table is ")
         || reason.starts_with("ELF section-header table is ")
         || reason.starts_with("ELF dynamic-symbol table is ")
         || reason.starts_with("ELF dynamic-string table is ")
         || reason.starts_with("ELF dynamic table is ")
+        || reason.starts_with("ELF tables are ")
 }
 
 /// Whether a refusal reason names a file the gate refuses before any
@@ -207,9 +241,10 @@ fn elf_header_layout(class: u8) -> Option<ElfHeaderLayout> {
 /// `object::File::parse` walks a table. Anything else this gate
 /// cannot read (short ELF header, wrong entry sizes, missing
 /// section 0) admits with zero bounds: the legacy parser fails fast
-/// on those without a per-entry walk. Over-cap tables refuse with the
-/// named gap reason, identical on every entry point so identical
-/// files fold.
+/// on those without a per-entry walk. Over-cap header tables refuse
+/// with the named gap reason, identical on every entry point so
+/// identical files fold; dynamic spans are only sized by the callers
+/// and refused scan-side against the whole window.
 pub fn table_bounds_from_header(
     header: &[u8],
     section0: Option<&[u8]>,
@@ -221,9 +256,23 @@ pub fn table_bounds_from_header(
         Some(u64::from_le_bytes(padded))
     }
     // C1: refuse before any parse. `FileKind::parse` reads only the
-    // 16-byte magic, so the legacy texts stay byte-exact.
-    let kind = object::FileKind::parse(header)
-        .map_err(|error| format!("not parseable as an ELF object: {error}"))?;
+    // 16-byte magic, so the legacy texts stay byte-exact — except PE,
+    // whose signature sits past the 64 header bytes the gate passes it
+    // (`e_lfanew` points beyond them), so the kind parse fails with
+    // "Unknown MS-DOS file" where the full parser says Pe. DOS magic
+    // keeps the legacy Pe text byte-exact for Wine/Proton DLLs.
+    let kind = match object::FileKind::parse(header) {
+        Ok(kind) => kind,
+        Err(error) => {
+            if header.starts_with(b"MZ") {
+                return Err(format!(
+                    "not an ELF object ({:?})",
+                    object::BinaryFormat::Pe
+                ));
+            }
+            return Err(format!("not parseable as an ELF object: {error}"));
+        }
+    };
     match kind {
         object::FileKind::Elf32 | object::FileKind::Elf64 => {}
         object::FileKind::MachO32 | object::FileKind::MachO64 => {
@@ -339,8 +388,9 @@ pub fn table_bounds_from_header(
         program_table_bytes,
         section_table_bytes,
         // Dynamic spans are sized from the section table by the callers
-        // (`read_table_bounds_with`, `gate_table_bounds`), which refuse
-        // oversized spans before any walk.
+        // (`read_table_bounds_with`, `gate_table_bounds`); only the
+        // demand-paged scan path refuses them, against the whole window
+        // (`span_refusal`), before any walk.
         dynsym_bytes: 0,
         dynstr_bytes: 0,
         dynamic_bytes: 0,
@@ -393,18 +443,17 @@ fn section0_location(header: &[u8]) -> Option<(u64, usize)> {
 /// Dynamic spans from one already-bounded section table (little-endian
 /// only; big-endian never reaches here): the summed `SHT_DYNSYM` and
 /// `SHT_DYNAMIC` sizes plus each `SHT_DYNSYM`'s linked string-table
-/// size. `file_len` is the file (or mapped) length: a span claiming
-/// more than the file is lying (I-1) — the lazy walk skips it and it
-/// charges nothing, so it admits with zero. A span within the file but
-/// over [`MAX_DYN_SPAN_BYTES`] is really huge (sparse, walked) and
-/// refuses with its named gap before any walk. A truncated table admits
-/// with zeros and the parser fails fast.
+/// size. Only sizes, never refuses: `file_len` is the file (or mapped)
+/// length, and a span claiming more than the file is lying (I-1) — the
+/// lazy walk skips it and it charges nothing, so it sizes as zero. A
+/// truncated table sizes as zeros and the parser fails fast. The scan
+/// refuses oversized spans against the whole window (`span_refusal`).
 fn dyn_span_sizes(
     section_table: &[u8],
     layout: ElfHeaderLayout,
     shnum: u64,
     file_len: u64,
-) -> Result<(u64, u64, u64), String> {
+) -> (u64, u64, u64) {
     let ElfHeaderLayout {
         shdr,
         o_size,
@@ -415,7 +464,7 @@ fn dyn_span_sizes(
     let o_link = o_info.saturating_sub(4);
     let shnum_usize = usize::try_from(shnum).unwrap_or(usize::MAX);
     if section_table.len() < shnum_usize.saturating_mul(shdr) {
-        return Ok((0, 0, 0));
+        return (0, 0, 0);
     }
     let mut dynsym_bytes = 0u64;
     let mut dynamic_bytes = 0u64;
@@ -433,9 +482,8 @@ fn dyn_span_sizes(
             padded[..w_size].copy_from_slice(slice);
             u64::from_le_bytes(padded)
         };
-        // Lying spans (bigger than the file) charge nothing and admit:
-        // the lazy walk skips them (I-1). Real spans within the file
-        // refuse over the cap before any walk.
+        // Lying spans (bigger than the file) size as zero: the lazy
+        // walk skips them (I-1), so they charge nothing.
         let sh_size = if sh_size_raw > file_len {
             0
         } else {
@@ -443,9 +491,6 @@ fn dyn_span_sizes(
         };
         if sh_type == 11 {
             dynsym_bytes = dynsym_bytes.saturating_add(sh_size);
-            if dynsym_bytes > MAX_DYN_SPAN_BYTES {
-                return Err(dynsym_table_reason(dynsym_bytes));
-            }
             let link = u32::from_le_bytes(
                 section_table[base + o_link..base + o_link + 4]
                     .try_into()
@@ -454,9 +499,6 @@ fn dyn_span_sizes(
             dynsym_links.push(link);
         } else if sh_type == 6 {
             dynamic_bytes = dynamic_bytes.saturating_add(sh_size);
-            if dynamic_bytes > MAX_DYN_SPAN_BYTES {
-                return Err(dynamic_table_reason(dynamic_bytes));
-            }
         }
     }
     let mut dynstr_bytes = 0u64;
@@ -483,11 +525,8 @@ fn dyn_span_sizes(
             sh_size_raw
         };
         dynstr_bytes = dynstr_bytes.saturating_add(sh_size);
-        if dynstr_bytes > MAX_DYN_SPAN_BYTES {
-            return Err(dynstr_table_reason(dynstr_bytes));
-        }
     }
-    Ok((dynsym_bytes, dynstr_bytes, dynamic_bytes))
+    (dynsym_bytes, dynstr_bytes, dynamic_bytes)
 }
 
 /// Section-table file range from one admitted header: `(offset, bytes)`
@@ -518,9 +557,11 @@ fn section_table_range(header: &[u8], bounds: &ElfTableBounds) -> Option<(u64, u
 /// header, plus section 0 for extended counts, plus the already-bounded
 /// section table for the dynamic spans. At most 128 bytes move for the
 /// header probe, plus at most 1 MiB for the section table; over-cap
-/// tables and spans refuse with their named gap reasons, and non-ELF,
+/// header tables refuse with their named gap reasons, and non-ELF,
 /// unknown-class, and big-endian files refuse with the legacy texts
-/// before any parse. A header read failure refuses as a read error; a
+/// before any parse. Spans are only sized here; the scan refuses them
+/// against the whole window. A header read failure refuses as a read
+/// error; a
 /// short section table admits and the parser fails fast. Returns the
 /// outcome plus the probe bytes read, so refusals charge exactly what
 /// moved.
@@ -580,15 +621,12 @@ pub fn read_table_bounds_with(
     if at != bytes {
         return (Ok(bounds), moved);
     }
-    match dyn_span_sizes(&table, layout, bounds.section_entries, file_len) {
-        Ok((dynsym, dynstr, dynamic)) => {
-            bounds.dynsym_bytes = dynsym;
-            bounds.dynstr_bytes = dynstr;
-            bounds.dynamic_bytes = dynamic;
-            (Ok(bounds), moved)
-        }
-        Err(reason) => (Err(reason), moved),
-    }
+    let (dynsym, dynstr, dynamic) =
+        dyn_span_sizes(&table, layout, bounds.section_entries, file_len);
+    bounds.dynsym_bytes = dynsym;
+    bounds.dynstr_bytes = dynstr;
+    bounds.dynamic_bytes = dynamic;
+    (Ok(bounds), moved)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -636,10 +674,11 @@ pub struct ElfSnapshot {
 /// Table bounds for bytes already in memory (mappings, snapshots):
 /// the ELF header prefix plus section 0 sliced from the same bytes,
 /// plus the already-bounded section table for the dynamic spans.
-/// Refuses over-cap tables and spans with their named gap reasons and
+/// Refuses over-cap header tables with their named gap reasons and
 /// non-ELF, unknown-class, and big-endian files with the legacy texts
-/// before any parse; anything else unreadable admits for the legacy
-/// parser's fast failure.
+/// before any parse; spans are only sized, never refused here, so
+/// snapshots, pins and run's launch classification admit real spans.
+/// Anything else unreadable admits for the legacy parser's fast failure.
 fn gate_table_bounds(data: &[u8]) -> Result<ElfTableBounds, String> {
     let header = data.get(..64).unwrap_or(data);
     let section0 = section0_location(header).and_then(|(offset, size)| {
@@ -665,8 +704,7 @@ fn gate_table_bounds(data: &[u8]) -> Result<ElfTableBounds, String> {
         return Ok(bounds);
     };
     let file_len = data.len() as u64;
-    let (dynsym, dynstr, dynamic) =
-        dyn_span_sizes(table, layout, bounds.section_entries, file_len)?;
+    let (dynsym, dynstr, dynamic) = dyn_span_sizes(table, layout, bounds.section_entries, file_len);
     bounds.dynsym_bytes = dynsym;
     bounds.dynstr_bytes = dynstr;
     bounds.dynamic_bytes = dynamic;
@@ -677,8 +715,9 @@ fn gate_table_bounds(data: &[u8]) -> Result<ElfTableBounds, String> {
 /// segment ranges are unchecked. Never translate addresses or offsets from
 /// the returned object — use `classified_validated_object` for any export
 /// walk or range query. The table gate runs first, so every entry point
-/// funnelling here refuses over-cap tables and non-ELF, unknown-class,
-/// and big-endian files before the parser walks them; the checks below
+/// funnelling here refuses over-cap header tables and non-ELF,
+/// unknown-class, and big-endian files before the parser walks them;
+/// dynamic spans are only sized here, never refused. The checks below
 /// are defense in depth for what the gate admits.
 pub fn classified_object(data: &[u8]) -> Result<(object::File<'_>, ElfAbi), String> {
     gate_table_bounds(data)?;
@@ -1087,7 +1126,10 @@ fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfF
                 .saturating_add((programs.len() as u64).saturating_mul(index_work));
             // The existing parser handles ELF32/64 and extended indexes.
             // Only exact GOT names need strings, and each check examines
-            // at most nine bytes rather than searching an unbounded name.
+            // at most nine bytes rather than searching an unbounded name —
+            // so the charge below counts examined bytes, never the whole
+            // name table (a 2 GiB sparse `.shstrtab` costs bytes, and a
+            // later real object still scans in the same pass).
             let names = elf
                 .elf_header()
                 .section_strings_index(endian, elf.data())
@@ -1095,12 +1137,16 @@ fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfF
                 .and_then(|index| sections.section(index).ok())
                 .and_then(|section| section.data(endian, elf.data()).ok())
                 .unwrap_or(&[]);
+            let mut got_checks = 0u64;
             for section in sections.iter() {
                 let flags: u64 = section.sh_flags(endian).into();
                 if flags & u64::from(elf::SHF_ALLOC) == 0 {
                     continue;
                 }
                 let kind = section.sh_type(endian);
+                if kind == elf::SHT_PROGBITS {
+                    got_checks = got_checks.saturating_add(1);
+                }
                 let got = kind == elf::SHT_PROGBITS
                     && names
                         .get(section.sh_name(endian) as usize..)
@@ -1168,10 +1214,10 @@ fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfF
             merge_raw_metadata_ranges(&mut ranges, &mut work_units);
             merge_raw_metadata_ranges(&mut zero_fill, &mut work_units);
             ranges = subtract_raw_zero_fill_projections(ranges, &zero_fill, &mut work_units);
-            names.len() as u64
+            got_checks.saturating_mul(9).min(names.len() as u64)
         }};
     }
-    let names_bytes = match &object {
+    let examined_names_bytes = match &object {
         object::File::Elf32(elf) => collect!(elf),
         object::File::Elf64(elf) => collect!(elf),
         _ => unreachable!("classified ELF"),
@@ -1185,7 +1231,7 @@ fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfF
         excluded_anchor_ranges: ranges,
         // export_table_bytes already includes the ELF/program headers.
         structural_bytes: export_table_bytes(&object, data.len() as u64)
-            .saturating_add(names_bytes)
+            .saturating_add(examined_names_bytes)
             .min(data.len() as u64),
         work_units,
     })

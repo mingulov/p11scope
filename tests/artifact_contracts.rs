@@ -10193,9 +10193,11 @@ fn release_docs_describe_the_built_version() {
     }
 }
 
-/// The per-operation scan cap the docs quote is the one the code applies.
-/// Hashing draws only on the window allowance (no per-operation leg), so the
-/// docs name a per-scan cap, never per-scan/hash.
+/// The per-operation scan cap the current docs quote is the one the code
+/// applies. Hashing draws only on the window allowance (no per-operation
+/// leg), so current docs name a per-scan cap, never per-scan/hash.
+/// Released CHANGELOG entries keep their historical wording and stay out
+/// of this contract.
 #[test]
 fn documented_scan_operation_cap_matches_the_code() {
     let scan = read("src/discovery/scan.rs");
@@ -10210,7 +10212,7 @@ fn documented_scan_operation_cap_matches_the_code() {
         .product();
     assert_eq!(bytes % (1024 * 1024), 0, "{expression}");
     let quoted = format!("{} MiB per scan operation", bytes / (1024 * 1024));
-    for path in ["docs/overview.md", "docs/usage.md", "CHANGELOG.md"] {
+    for path in ["docs/overview.md", "docs/usage.md"] {
         let flat = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             !flat.contains("per scan/hash operation"),

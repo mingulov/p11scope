@@ -220,6 +220,21 @@ rss_sampler() {
     done
 }
 
+# cleanup_sample: refuse-path reaper for one sample. A refuse exits
+# immediately, so without this the sudo'd observer and the RSS sampler
+# outlive the campaign; the next campaign then refuses on the live
+# capture until they end. run_sample arms this as the EXIT trap once
+# the observer exists and disarms it after both are waited. sudo
+# forwards the TERM to the observer; empty-safe so a refuse before
+# either pid exists reaps nothing.
+cleanup_sample() {
+    for pid in "${sudo_pid:-}" "${sampler_pid:-}"; do
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
 # run_sample DIR ARM BIN: one measured sample. Starts the observer,
 # waits for the `capturing:` line, runs the churn window, waits for the
 # observer to end, then gates and records. Prints the SAMPLE line on
@@ -251,6 +266,11 @@ run_sample() {
     sudo -n "$bin" profile --system --duration "${obs_dur}s" -v \
         -o "$dir/report.json" >"$dir/stdout.txt" 2>"$dir/stderr.txt" &
     sudo_pid=$!
+    # A refuse below exits immediately: arm the reaper now, with the
+    # sampler pid cleared (it still names the previous sample's reaped
+    # sampler, whose pid may already be reused).
+    sampler_pid=
+    trap cleanup_sample EXIT
     # The observer pid, resolved through the sudo parentage (never a
     # global first-match: another lane's capture must not be sampled).
     obs_pid=
@@ -288,6 +308,8 @@ run_sample() {
     wait "$sudo_pid" || obs_rc=$?
     obs_end=$(date +%s)
     wait "$sampler_pid" 2>/dev/null || true
+    # Both sample processes are waited: later refuses carry no orphans.
+    trap - EXIT
     [ "$obs_rc" -eq 0 ] || refuse "sample $arm: observer exited $obs_rc"
     if grep -q "attach failed" "$dir/stderr.txt" 2>/dev/null; then
         refuse "sample $arm: attach failure on stderr"
@@ -368,6 +390,28 @@ EOF
         || { echo "self-test: rss delta wrong: $out" >&2; return 1; }
     [ "$(round_arms 1)" = "base cand cand base" ] || return 1
     [ "$(round_arms 2)" = "cand base base cand" ] || return 1
+    # The refuse-path trap reaps the in-flight sample pids: a subshell
+    # with two probe sleepers, the trap armed, and an exit-3 refuse
+    # must leave neither sleeper alive.
+    rc=0
+    ( sleep 60 & echo $! > "$tmp/probe-a"
+      sleep 60 & echo $! > "$tmp/probe-b"
+      sudo_pid=$(cat "$tmp/probe-a")
+      sampler_pid=$(cat "$tmp/probe-b")
+      trap cleanup_sample EXIT
+      exit 3 ) || rc=$?
+    [ "$rc" -eq 3 ] || { echo "self-test: trap probe exited $rc, want 3" >&2; return 1; }
+    tries=0
+    while [ -d "/proc/$(cat "$tmp/probe-a")" ] || [ -d "/proc/$(cat "$tmp/probe-b")" ]; do
+        if [ "$tries" -ge 50 ]; then break; fi
+        sleep 0.1
+        tries=$(( tries + 1 ))
+    done
+    if [ -d "/proc/$(cat "$tmp/probe-a")" ] || [ -d "/proc/$(cat "$tmp/probe-b")" ]; then
+        echo "self-test: refuse-path trap left a probe sleeper alive" >&2
+        kill -9 "$(cat "$tmp/probe-a")" "$(cat "$tmp/probe-b")" 2>/dev/null || true
+        return 1
+    fi
     trap - EXIT
     rm -rf "$tmp"
     echo "bench-profile-overhead: self-test OK"

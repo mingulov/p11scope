@@ -9771,18 +9771,6 @@ fn capture_profile(
                 },
                 |context, consumers| {
                     if profile {
-                        // Exit transfer ahead of the EVENTS drain: exits
-                        // the discovery pass just tapped stamp the
-                        // current producer position, and the drain below
-                        // retires what is due. A positions failure skips
-                        // the transfer; the drain below fails loudly.
-                        if let Ok(positions) = context.1.event_drain_positions() {
-                            transfer_exit_taps(
-                                context.0,
-                                consumers.tracker,
-                                positions.producer,
-                            );
-                        }
                         *consumers.malformed_records += drain_events(
                             context.1,
                             consumers.state,
@@ -9790,6 +9778,20 @@ fn capture_profile(
                             consumers.scheduling,
                             EventsDrainBound::Live,
                         )?;
+                        // Exit transfer after the EVENTS drain, inside the
+                        // same gate: exits the discovery pass just tapped
+                        // stamp the current producer position and retire on
+                        // the next drain (newly tapped exits wait one tick;
+                        // the terminal transfer below has no next drain, so
+                        // it runs ahead instead). A positions failure skips
+                        // the transfer; the drain above already ran.
+                        if let Ok(positions) = context.1.event_drain_positions() {
+                            transfer_exit_taps(
+                                context.0,
+                                consumers.tracker,
+                                positions.producer,
+                            );
+                        }
                     }
                     if !consumers.scheduling.longrun_first_loss_sampled {
                         let event_loss = if profile {
@@ -10419,14 +10421,17 @@ fn capture_profile(
                     poll_terminal_cancellation();
                     context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut post_q_record = false;
+                    // Terminal exit transfer in its own gate, ahead of the
+                    // terminal EVENTS drain: exits the terminal discovery
+                    // drain tapped stamp the current producer position, and
+                    // the terminal drain below retires what is due (there is
+                    // no next drain, so this one cannot wait a tick).
                     if profile {
-                        // Terminal exit transfer: exits the terminal
-                        // discovery drain tapped stamp the current
-                        // producer position ahead of the terminal EVENTS
-                        // drain, which retires what is due.
                         if let Ok(positions) = context.1.event_drain_positions() {
                             transfer_exit_taps(context.0, consumers.tracker, positions.producer);
                         }
+                    }
+                    if profile {
                         *consumers.malformed_records += drain_events(
                             context.1,
                             consumers.state,
@@ -11553,14 +11558,6 @@ fn capture_trace(
                     Ok(end)
                 },
                 |context, consumers| {
-                    // Exit transfer ahead of the EVENTS drain: exits the
-                    // discovery pass just tapped stamp the current producer
-                    // position, and the drain below retires what is due. A
-                    // positions failure skips the transfer; the drain below
-                    // fails loudly.
-                    if let Ok(positions) = context.1.event_drain_positions() {
-                        transfer_exit_taps(context.0, consumers.tracker, positions.producer);
-                    }
                     *consumers.malformed_records += drain_trace_events(
                         context.1,
                         context.3,
@@ -11579,6 +11576,15 @@ fn capture_trace(
                         },
                         EventsDrainBound::Live,
                     )?;
+                    // Exit transfer after the EVENTS drain: exits the
+                    // discovery pass just tapped stamp the current producer
+                    // position and retire on the next drain (newly tapped
+                    // exits wait one tick; the terminal transfer has no next
+                    // drain, so it runs ahead instead). A positions failure
+                    // skips the transfer; the drain above already ran.
+                    if let Ok(positions) = context.1.event_drain_positions() {
+                        transfer_exit_taps(context.0, consumers.tracker, positions.producer);
+                    }
                     if !consumers.scheduling.longrun_first_loss_sampled {
                         consumers.scheduling.note_longrun_first_loss(
                             metrics::lost_events(context.1).ok(),
@@ -12038,9 +12044,11 @@ fn capture_trace(
                     poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let mut post_q_record = false;
-                    // Terminal exit transfer: exits the terminal discovery
-                    // drain tapped stamp the current producer position ahead
-                    // of the terminal EVENTS drain, which retires what is due.
+                    // Terminal exit transfer ahead of the terminal EVENTS
+                    // drain: exits the terminal discovery drain tapped stamp
+                    // the current producer position, and the terminal drain
+                    // below retires what is due (there is no next drain, so
+                    // this one cannot wait a tick).
                     if let Ok(positions) = context.1.event_drain_positions() {
                         transfer_exit_taps(context.0, consumers.tracker, positions.producer);
                     }

@@ -101,9 +101,12 @@ pub(crate) struct Registry {
     pending_exits: VecDeque<PendingExit>,
     /// Exit-matched tasks skipped on a `first_ts_ns == hook_ts_ns`
     /// tie: neither generation is provably older, so neither retires.
+    /// The exit drops immediately with this counted outcome — no retry,
+    /// never unmatched.
     exit_tie_skipped: u64,
-    /// Due exits dropped after [`EXIT_UNMATCHED_RETRIES`] retries
-    /// with no matching task (never-admitted processes own no rows).
+    /// Due exits dropped after [`EXIT_UNMATCHED_RETRIES`] retries with no
+    /// matching task and no tie (never-admitted processes own no rows).
+    /// Ties drop immediately and never count here.
     exit_retire_unmatched: u64,
     /// Events on a retired cookie timestamped after the exit: the
     /// task reopens, the exit timestamp clears, the event is admitted.
@@ -337,8 +340,9 @@ impl Registry {
     /// read past the tap-time producer position with no uncommitted
     /// record before it. Examines at most `budget` exits per call;
     /// the rest carry over to the next drain. Matched tasks record
-    /// the exit hook time (never `closed`); ties skip with a counted
-    /// gap; unmatched exits retry, then drop with a counted gap.
+    /// the exit hook time (never `closed`); ties drop immediately with
+    /// their own counted outcome (no retry, never unmatched); other
+    /// unmatched exits retry, then drop with a counted gap.
     pub(crate) fn retire_exits_due(
         &mut self,
         consumer_now: usize,
@@ -359,8 +363,16 @@ impl Registry {
                 break;
             }
             examined += 1;
-            let matched = self.match_exit_tap(&pending.tap);
-            if matched.is_empty() {
+            let (matched, tie_seen) = self.match_exit_tap(&pending.tap);
+            if !matched.is_empty() {
+                due.extend(matched);
+            } else if tie_seen {
+                // A tie can never match on retry: the tied task's
+                // `first_ts` never becomes `< hook`, and any later admit
+                // is a successor (`first_ts > hook`). The exit falls out
+                // of scope here: dropped immediately with the counted tie
+                // outcome, no requeue, never unmatched.
+            } else {
                 let mut pending = pending;
                 pending.passes += 1;
                 if pending.passes > EXIT_UNMATCHED_RETRIES {
@@ -368,8 +380,6 @@ impl Registry {
                 } else {
                     keep.push(pending);
                 }
-            } else {
-                due.extend(matched);
             }
         }
         for pending in keep.into_iter().rev() {
@@ -381,13 +391,16 @@ impl Registry {
     /// Matches one due exit against this pid's open tasks by kernel
     /// time: tasks admitted strictly before the hook retire, ties
     /// skip with a counted gap, successors (admitted after the exit)
-    /// are spared. Matched tasks record the exit hook time — the
+    /// are spared. Returns the matched keys and whether any tie was
+    /// seen (the caller drops tied-but-unmatched exits immediately).
+    /// Matched tasks record the exit hook time — the
     /// earliest observed, so any post-exit event reopens — never the
     /// `closed` flag, so the next event is never refused.
-    fn match_exit_tap(&mut self, tap: &ExitTap) -> Vec<ProcessKey> {
+    fn match_exit_tap(&mut self, tap: &ExitTap) -> (Vec<ProcessKey>, bool) {
         let mut matched = Vec::new();
+        let mut tie_seen = false;
         let Some(cookies) = self.pid_index.get(&tap.pid) else {
-            return matched;
+            return (matched, tie_seen);
         };
         // The cookie set is copied: matching mutates tasks below.
         for cookie in cookies.iter().copied().collect::<Vec<_>>() {
@@ -405,9 +418,10 @@ impl Registry {
                 matched.push(task.key);
             } else if task.first_ts_ns == tap.hook_ts_ns {
                 self.exit_tie_skipped = self.exit_tie_skipped.saturating_add(1);
+                tie_seen = true;
             }
         }
-        matched
+        (matched, tie_seen)
     }
 
     /// `(tie_skipped, unmatched, reopened, late)` exit gap counters.

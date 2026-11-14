@@ -1143,11 +1143,14 @@ pub struct Engine {
     initial_arming_window_ms_for_test: Option<u64>,
     /// Tapped `LEADER_EXIT`/`_MAPPINGS` records awaiting transfer to the
     /// process tracker, in dispatch order. Bounded: past
-    /// [`crate::history::EXIT_TAP_QUEUE_LIMIT`] the incoming tap drops
-    /// and `exit_tap_overflow` counts it. Drained every profile/trace
-    /// tick; other commands never transfer, so theirs counts overflow.
+    /// [`crate::history::EXIT_TAP_QUEUE_LIMIT`] an incoming tap for an
+    /// already-queued pid replaces that pid's oldest tap (counted), so
+    /// the newest generation is kept; otherwise the incoming tap drops
+    /// (counted). Drained every profile/trace tick; other commands never
+    /// transfer, so theirs counts overflow.
     exit_taps: VecDeque<crate::history::ExitTap>,
-    /// Tapped exits dropped with a full tap queue (never silent).
+    /// Full-queue tap drops, never silent: incoming drops for new pids,
+    /// oldest same-pid evictions for reused pids.
     exit_tap_overflow: u64,
 }
 
@@ -25993,13 +25996,23 @@ impl Engine {
     /// Taps one `LEADER_EXIT`/`_MAPPINGS` record for the process-exit
     /// retire path: the tracker frees the exiting process's semantic
     /// rows once the EVENTS drain reads past the tap-time producer
-    /// position. Past [`crate::history::EXIT_TAP_QUEUE_LIMIT`] the
-    /// incoming tap drops and `exit_tap_overflow` counts it — the
-    /// process keeps its rows, never silently.
+    /// position. Past [`crate::history::EXIT_TAP_QUEUE_LIMIT`] an incoming
+    /// tap for an already-queued pid evicts that pid's oldest tap
+    /// (counted) and is kept — the later hook matches both generations;
+    /// otherwise the incoming tap drops and `exit_tap_overflow` counts
+    /// it — the process keeps its rows, never silently.
     pub(crate) fn note_exit_tap(&mut self, pid: u32, hook_ts_ns: u64) {
         if self.exit_taps.len() >= crate::history::EXIT_TAP_QUEUE_LIMIT {
-            self.exit_tap_overflow = self.exit_tap_overflow.saturating_add(1);
-            return;
+            // Keep the newest generation for a reused pid: the later hook
+            // matches every generation the evicted older hook matched, so
+            // nothing leaks for that pid. New pids still drop incoming.
+            if let Some(index) = self.exit_taps.iter().position(|tap| tap.pid == pid) {
+                self.exit_taps.remove(index);
+                self.exit_tap_overflow = self.exit_tap_overflow.saturating_add(1);
+            } else {
+                self.exit_tap_overflow = self.exit_tap_overflow.saturating_add(1);
+                return;
+            }
         }
         self.exit_taps
             .push_back(crate::history::ExitTap { pid, hook_ts_ns });

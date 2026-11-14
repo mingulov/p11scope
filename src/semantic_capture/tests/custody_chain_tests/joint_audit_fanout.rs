@@ -11248,6 +11248,47 @@ impl MachineScene {
             .collect()
     }
 
+    /// Summed staged-call depth across every retained feed: the
+    /// re-arm drain must count exactly these as disposed history.
+    fn staged_total(&self) -> usize {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| record.feed.staged_len())
+            .sum()
+    }
+
+    /// Summed disposed-history counts across every retained feed.
+    fn disposed_total(&self) -> u64 {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| record.feed.history_disposed())
+            .sum()
+    }
+
+    /// Summed unknown-key terminal outcomes preserved into joint
+    /// key-use: the drain's preservation (not pure counts) lands
+    /// here.
+    fn unknown_terminals_total(&self) -> u64 {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .unknown_counters()
+            .iter()
+            .map(|row| row.completed + row.failed + row.cancelled + row.unknown)
+            .sum()
+    }
+
     /// The re-arm drain's load-bearing premise: a published quantum
     /// leaves no staged seals on any retained feed, so everything
     /// the drain drops is the abandoned quantum's.
@@ -11652,6 +11693,7 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
     };
     let baseline_returns = api_returns(&fixture);
     let reduced = fixture.reduced_for(0);
+    let disposed_prime = fixture.disposed_total();
     let pid = std::process::id();
     fixture.scene.push(pid, 0, "C_SignInit", 2);
     fixture.scene.push(pid, 0, "C_SignUpdate", 3);
@@ -11698,11 +11740,43 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
         fixture.machine.disposition_reason(),
         Some(SemanticRefusal::Unavailable)
     );
+    // The refused quantum's staged, unreduced calls stand before the
+    // drain; nothing disposes between the prime publish and the
+    // re-arm, so the drain owns the whole delta below.
+    let staged_before = fixture.staged_total();
+    assert!(
+        staged_before > 0,
+        "the refused quantum stages its calls before the re-arm"
+    );
+    let disposed_before = fixture.disposed_total();
+    assert_eq!(
+        disposed_before, disposed_prime,
+        "nothing disposes between the prime publish and the re-arm"
+    );
+    let unknown_before = fixture.unknown_terminals_total();
     let preparations = fixture.native.preparations.len();
     assert_eq!(
         fixture.rearm("semantic_unavailable"),
         Some(true),
         "the applied quantum re-arms as published"
+    );
+    // The drain counts every staged call as disposed history and
+    // preserves its observed completion as unknown-key rows beside
+    // the loss count; staging stands empty only after that counted
+    // disposal.
+    let staged_after = fixture.staged_total();
+    assert_eq!(
+        staged_after, 0,
+        "the drain empties staging after its counted disposal"
+    );
+    assert_eq!(
+        fixture.disposed_total() - disposed_before,
+        staged_before as u64,
+        "disposed history rises by exactly the staged depth"
+    );
+    assert!(
+        fixture.unknown_terminals_total() > unknown_before,
+        "the drain preserves observed completions as unknown-key rows"
     );
     assert_eq!(
         fixture.machine.disposition_reason(),
@@ -11757,6 +11831,11 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
         api_returns(&fixture),
         baseline_returns + 4,
         "S1 joins every call including the abandoned three: nothing is lost across the applied abandon"
+    );
+    assert_eq!(
+        fixture.reduced_for(0) - reduced + (fixture.disposed_total() - disposed_prime),
+        api_returns(&fixture) - baseline_returns,
+        "reduced and disposed calls cover every call across the re-arm"
     );
     let subjects = fixture.all_gap_subjects();
     assert!(

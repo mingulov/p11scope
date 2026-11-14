@@ -32459,6 +32459,49 @@ fn exploratory_eviction_clears_rebuild_stability() {
     );
 }
 
+/// Two single-view exploratory evictions file the same message. The
+/// second is a dedup hit in `object_skips`, but it still removed a view,
+/// its pins and its scan inputs, so the facts revision must move
+/// (engine.rs commit-path comment: "Every merge-input mutation (...
+/// evictions ...) bumps the revision").
+#[test]
+fn repeated_single_view_eviction_still_dirties_facts() {
+    let sleeps = e06_spawn_sleeps(3);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let victims: Vec<ProcessViewId> = engine
+        .views
+        .iter()
+        .map(|view| view.id())
+        .filter(|id| engine.exploratory_evictable(*id))
+        .collect();
+    assert!(victims.len() >= 2, "two evictable sleep views: {victims:?}");
+    engine.evict_exploratory_views(&BTreeSet::from([victims[0]]));
+    let revision_after_first = engine.facts_revision;
+    let skips_after_first = engine.counters.object_skips.len();
+    let views_after_first = engine.views.len();
+    engine.evict_exploratory_views(&BTreeSet::from([victims[1]]));
+    assert_eq!(
+        engine.views.len(),
+        views_after_first - 1,
+        "the second eviction displaced a view"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips_after_first,
+        "the second eviction message is a dedup hit"
+    );
+    assert!(
+        engine.facts_revision > revision_after_first,
+        "a real eviction must dirty the facts revision even when its message repeats: {} -> {}",
+        revision_after_first,
+        engine.facts_revision
+    );
+}
+
 /// The unchanged-tick equivalence twin. Two identical cgroup captures — one
 /// on the fast path, one forced onto full rebuilds — run the same tick
 /// battery: idle ticks, a reconcile eviction plus admission, an early
@@ -82579,7 +82622,12 @@ fn handle_table_refresh_rescan_defers_on_budget_wait() {
     let dir = tempfile::tempdir().unwrap();
     let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
     let entries_before = engine.pinned.pinned().count();
-    let gaps_before = engine.counters.object_skips.len();
+    let gaps_before = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE)
+        .count();
     let mut tick_now = crate::attach::monotonic_ns;
     let (scans, _, _, _) = engine.scan_inventory_views(&views, "test refresh", &mut tick_now);
     assert!(scans.is_empty(), "the waited rescan drops its candidate");
@@ -82592,10 +82640,17 @@ fn handle_table_refresh_rescan_defers_on_budget_wait() {
         engine.refresh_requested.contains_key(&pid),
         "the refresh pends for the next tick"
     );
+    let gaps_after = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE)
+        .count();
     assert_eq!(
-        engine.counters.object_skips.len() - gaps_before,
+        gaps_after - gaps_before,
         1,
-        "exactly one gap row"
+        "exactly one gap row: {:?}",
+        engine.counters.object_skips
     );
     drop(live);
     drop(provider);

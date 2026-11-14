@@ -455,12 +455,16 @@ impl Registry {
     /// record the exit hook time (never `closed`); ties drop
     /// immediately with their own counted outcome (no retry, never
     /// unmatched); other unmatched exits retry, then drop with a
-    /// counted gap. Synthetic re-arms that match nothing drop silently.
+    /// counted gap — except in `final_drain` mode, where no later
+    /// record can admit a match, so they drop counted on first look
+    /// instead of requeueing. Synthetic re-arms that match nothing
+    /// drop silently.
     pub(crate) fn retire_exits_due(
         &mut self,
         consumer_now: usize,
         producer_now: usize,
         budget: usize,
+        final_drain: bool,
     ) -> BTreeSet<ProcessKey> {
         // Late-event re-arms become synthetic exits stamped with the
         // current producer position (the producer only grows, so the
@@ -507,6 +511,13 @@ impl Registry {
                 // is a successor (`first_ts > hook`). The exit falls out
                 // of scope here: dropped immediately with the counted tie
                 // outcome, no requeue, never unmatched.
+            } else if final_drain {
+                // End of run: no later record can admit a match, so
+                // retrying cannot help — and requeueing would stall the
+                // terminal loop behind the unmatched block. Drop on
+                // first look, counted like an exhausted retry, never
+                // silently.
+                self.exit_retire_unmatched = self.exit_retire_unmatched.saturating_add(1);
             } else {
                 let mut pending = pending;
                 pending.passes += 1;

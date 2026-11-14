@@ -13614,17 +13614,21 @@ fn transfer_exit_taps(engine: &mut Engine, tracker: &mut process::Tracker, event
 /// Retires transferred exits due at the drain's current EVENTS ring
 /// positions: past-tap exits free their processes' semantic rows in
 /// one batch. Runs at the end of every profile/trace EVENTS drain,
-/// live and terminal alike.
+/// live and terminal alike. `final_drain` is the end-of-run mode:
+/// unmatched exits drop counted on first look, since no later record
+/// can admit a match; mid-run drains retry them instead.
 fn retire_due_exits<S: crate::events::BoundedRecordSource>(
     drain: &crate::events::EventDrain<S>,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
+    final_drain: bool,
 ) {
     let positions = crate::events::event_drain_positions(drain);
     let due = tracker.retire_exits_due(
         positions.consumer,
         positions.producer,
         EXIT_RETIRE_PER_DRAIN_BUDGET,
+        final_drain,
     );
     if !due.is_empty() {
         state.retire_processes(&due);
@@ -13633,9 +13637,11 @@ fn retire_due_exits<S: crate::events::BoundedRecordSource>(
 
 /// End-of-run retire: retires due exits until nothing is due. A single
 /// 1024-budget pass would strand the rest with no later drain to carry
-/// them, leaving dead processes "still open". Stops early only when a
-/// pass makes no progress (only not-yet-due exits remain). Terminal
-/// drains only; live drains carry over to the next tick by design.
+/// them, leaving dead processes "still open". Runs in final-drain mode,
+/// so an unmatched block ahead of tracked exits drops (counted) instead
+/// of stalling the loop. Stops early only when a pass makes no progress
+/// (only not-yet-due exits remain). Terminal drains only; live drains
+/// carry over to the next tick by design.
 fn retire_due_exits_until_quiescent<S: crate::events::BoundedRecordSource>(
     drain: &crate::events::EventDrain<S>,
     state: &mut semantics::State,
@@ -13647,7 +13653,7 @@ fn retire_due_exits_until_quiescent<S: crate::events::BoundedRecordSource>(
             tracker.pending_exit_marks(),
             tracker.exit_gap_counts(),
         );
-        retire_due_exits(drain, state, tracker);
+        retire_due_exits(drain, state, tracker, true);
         let after = (
             tracker.pending_exit_taps(),
             tracker.pending_exit_marks(),
@@ -13721,7 +13727,7 @@ fn drain_profile_events<S: crate::events::BoundedRecordSource>(
     if let Some(error) = failure {
         return Err(error);
     }
-    retire_due_exits(drain, state, tracker);
+    retire_due_exits(drain, state, tracker, false);
     Ok((drain.take_malformed_delta(), may_remain))
 }
 
@@ -13760,7 +13766,7 @@ fn drain_profile_events_to_position<S: crate::events::BoundedRecordSource>(
     if let Some(error) = failure {
         return Err(error);
     }
-    retire_due_exits(drain, state, tracker);
+    retire_due_exits(drain, state, tracker, false);
     Ok((drain.take_malformed_delta(), post_q_record))
 }
 
@@ -13824,7 +13830,7 @@ fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Writ
         }
     }
     combine_trace_errors(reduction_error.map_or(Ok(()), Err), write_error)?;
-    retire_due_exits(drain, state, tracker);
+    retire_due_exits(drain, state, tracker, false);
     Ok((drain.take_malformed_delta(), post_q_record))
 }
 
@@ -14155,7 +14161,7 @@ fn drain_trace_events_from_with_identities<S: crate::events::BoundedRecordSource
         }
     });
     combine_trace_errors(reduction_error.map_or(Ok(()), Err), write_error)?;
-    retire_due_exits(drain, state, tracker);
+    retire_due_exits(drain, state, tracker, false);
     // A reached live limit owns no more live work: the readiness loop must
     // not re-poll past it, and the terminal drain owns the remainder.
     let live_limited = quantum.is_some() && matches!(*remaining, Some(0));

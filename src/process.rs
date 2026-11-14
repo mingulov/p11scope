@@ -179,14 +179,17 @@ impl Tracker {
     }
     /// Process keys whose exits are due at these EVENTS ring
     /// positions; at most `budget` exits examined, the rest carried.
+    /// `final_drain` drops unmatched exits counted on first look (end
+    /// of run: no later record can admit a match); otherwise they retry.
     pub(crate) fn retire_exits_due(
         &mut self,
         consumer_now: usize,
         producer_now: usize,
         budget: usize,
+        final_drain: bool,
     ) -> std::collections::BTreeSet<ProcessKey> {
         self.history
-            .retire_exits_due(consumer_now, producer_now, budget)
+            .retire_exits_due(consumer_now, producer_now, budget, final_drain)
     }
     /// `(tie_skipped, unmatched, reopened, late)` exit gap counters,
     /// for the A0 sampler.

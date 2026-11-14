@@ -5599,7 +5599,7 @@ fn exit_tap_overflow_keeps_newest_same_pid_generation() {
     let successor = successor.unwrap();
     let kept: Vec<_> = taps.into_iter().filter(|tap| tap.pid == 100).collect();
     registry.note_exit_taps(kept, 8);
-    let due = registry.retire_exits_due(8, 8, 10);
+    let due = registry.retire_exits_due(8, 8, 10, false);
     assert_eq!(
         due,
         std::collections::BTreeSet::from([old, successor]),

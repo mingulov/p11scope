@@ -315,7 +315,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     // The drain reads past the tap position: the old generation's
     // maps are freed and its R10 entry is gone, while the successor's
     // rows are intact.
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert_eq!(due, std::collections::BTreeSet::from([old]));
     s.retire_processes(&due);
     assert!(!s.has_process_state(old));
@@ -340,7 +340,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert!(due.is_empty(), "ties never retire");
     assert!(s.has_process_state(tied_key));
     assert_eq!(t.pending_exit_taps_for_test(), 0);
@@ -355,7 +355,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert!(due.is_empty(), "pruned generations never re-collect");
     let closed = s.sessions().closed;
     s.retire_processes(&due);
@@ -385,7 +385,7 @@ fn tie_exit_drops_immediately_with_single_count() {
     );
     assert_eq!(t.pending_exit_taps_for_test(), 1);
     for drain in 1..=3 {
-        let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+        let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
         assert!(due.is_empty(), "ties never retire (drain {drain})");
         assert_eq!(
             t.pending_exit_taps_for_test(),
@@ -514,7 +514,7 @@ fn exec_bump_resets_exit_matching_generation() {
         }],
         8,
     );
-    let due = registry.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = registry.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert!(due.is_empty(), "the post-exec generation is spared");
 }
 
@@ -543,7 +543,7 @@ fn pid_index_prune_shrinks_the_task_lens_bytes() {
         }],
         8,
     );
-    let due = registry.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = registry.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert_eq!(due.len(), 2);
     let after = registry.memory_tasks_row();
     assert_eq!(after.len, 2, "tasks never evict");
@@ -590,7 +590,7 @@ fn retired_cookie_reopens_and_clears_exit_timestamp() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert_eq!(due, std::collections::BTreeSet::from([cookie]));
     s.retire_processes(&due);
     assert!(!s.has_process_state(cookie));
@@ -620,7 +620,7 @@ fn retired_cookie_reopens_and_clears_exit_timestamp() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert_eq!(due, std::collections::BTreeSet::from([cookie]));
     s.retire_processes(&due);
     assert!(!s.has_process_state(cookie));
@@ -760,11 +760,11 @@ fn token_gated_root_completion_still_retires_exactly_once() {
         1000,
     );
     for _ in 0..2 {
-        let due = tracker.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+        let due = tracker.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
         assert!(due.is_empty(), "closed tasks never match an exit");
     }
     assert_eq!(tracker.pending_exit_taps_for_test(), 1);
-    let due = tracker.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = tracker.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert!(due.is_empty());
     assert_eq!(tracker.pending_exit_taps_for_test(), 0);
     assert_eq!(tracker.exit_counters_for_test(), (0, 1, 0, 0));
@@ -792,11 +792,11 @@ fn exit_retire_budget_carries_unexamined_exits_to_the_next_drain() {
     let first = semantics::ProcessKey::history(1, 90, 0, 100);
     let second = semantics::ProcessKey::history(1, 91, 0, 101);
     let third = semantics::ProcessKey::history(1, 92, 0, 102);
-    let due = t.retire_exits_due(1000, 1000, 2);
+    let due = t.retire_exits_due(1000, 1000, 2, false);
     assert_eq!(due, std::collections::BTreeSet::from([first, second]));
     assert_eq!(t.pending_exit_taps_for_test(), 1);
     s.retire_processes(&due);
-    let due = t.retire_exits_due(1000, 1000, 2);
+    let due = t.retire_exits_due(1000, 1000, 2, false);
     assert_eq!(due, std::collections::BTreeSet::from([third]));
     assert_eq!(t.pending_exit_taps_for_test(), 0);
     s.retire_processes(&due);
@@ -940,7 +940,7 @@ fn retired_sessions_count_as_closed_declared_diff() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     let json_after = render_json(&s);
     let text_after = render_text(&s);
@@ -3040,7 +3040,7 @@ fn probe_fork_admitted_reuse_successor_is_spared() {
     let child = semantics::ProcessKey::history(1, 91, 0, 100);
     assert!(s.has_process_state(child), "child inherited the session");
     let closed_before = s.sessions().closed;
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     eprintln!(
         "PROBE1 due={due:?} closed {closed_before}->{} child_state={}",
@@ -3083,7 +3083,7 @@ fn probe_exec_bump_via_fork_spares_post_exec_generation() {
     let live = key(90, 1);
     assert!(s.has_process_state(live));
     let closed_before = s.sessions().closed;
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     eprintln!(
         "PROBE2 due={due:?} closed {closed_before}->{} live_state={}",
@@ -3112,7 +3112,7 @@ fn probe_leader_exit_with_live_threads_session_continuity() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     // A worker opens session 8 at 300, then closes session 7 at 310.
     let mut open8 = ev(100, 90, 0, 0);
@@ -3168,7 +3168,7 @@ fn probe_fork_exec_child_exit_frees_every_r10_entry() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     let parent_alive = |pid: u32| pid == 50;
     let (_, dead, dead_rows, _) = s.memory_sample(&parent_alive);
@@ -3200,7 +3200,7 @@ fn probe_exit_retire_keeps_pending_at_end() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     eprintln!(
         "PROBE5 pending_at_end before={before} after={}",
@@ -3256,7 +3256,7 @@ fn rv2_trace_path_keeps_pseudonym_continuity() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     let mut open8 = ev(100, 90, 0, 0);
     open8.session = 8;
@@ -3315,7 +3315,7 @@ fn exit_retired_session_keeps_its_label_for_late_calls() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     assert_eq!(s.session_pseudonym_process(k, 0, 7), Some(1));
     // A surviving thread's late operational call: still labeled, but
@@ -3360,7 +3360,7 @@ fn exec_bump_keeps_no_tombstones() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     assert_eq!(s.memory_lens().retired_sessions.len, 1);
     assert_eq!(s.session_pseudonym_process(key(90, 1), 0, 8), Some(1));
@@ -3439,7 +3439,7 @@ fn synthetic_exit_waits_for_drain_past_its_stamp() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     assert!(!s.has_process_state(k));
     // Late admit (ts 150): counted, reseeded from the stash, and the
@@ -3465,13 +3465,13 @@ fn synthetic_exit_waits_for_drain_past_its_stamp() {
     // The first retire stamps the synthetic with its then-current
     // producer (1008); the drain has not read past it, so nothing is
     // due and the rows stay.
-    let due = t.retire_exits_due(1000, 1008, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1008, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert!(due.is_empty(), "synthetic reaped before its stamp");
     assert!(s.has_process_state(k));
     assert_eq!(t.pending_exit_taps_for_test(), 1);
     // Past the stamp the synthetic matches and reaps: R10, session and
     // counter all freed, nothing pending.
-    let due = t.retire_exits_due(1008, 1008, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1008, 1008, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     assert_eq!(due, std::collections::BTreeSet::from([k]));
     s.retire_processes(&due);
     assert!(!s.has_process_state(k));
@@ -3590,7 +3590,7 @@ fn rv3_synthetic_exit_spares_pid_reuse_successor() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     let mut b = ev(100, 91, 0, 0);
     b.session = 9;
@@ -3636,7 +3636,7 @@ fn rv3_synthetic_exit_spares_reopened_live_task() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     let mut late = ev(100, 90, 0, 0);
     late.session = 8;
@@ -3687,7 +3687,7 @@ fn trace_open_event_skips_retired_label() {
         }],
         1000,
     );
-    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET, false);
     s.retire_processes(&due);
     assert_eq!(s.session_pseudonym_process(k, 0, 7), Some(1));
     let mut fin = ev(100, 90, 0, 3);

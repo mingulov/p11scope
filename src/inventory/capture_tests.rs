@@ -519,6 +519,10 @@ struct ScriptedLane {
     /// The worst single-attach wall time this lane reports per extend
     /// (the flush-fold twin varies it across ticks).
     attach_ns_max: u64,
+    /// Hit EMFILE on every non-activating extend (the descriptor twin):
+    /// the receipt carries `fd_exhausted` and defers the whole delta,
+    /// like the production facade's exhaustion arm.
+    exhaust_fds: bool,
 }
 
 impl Drop for ScriptedLane {
@@ -573,6 +577,7 @@ impl ScriptedLane {
             check_targets: false,
             refuse_extends: false,
             attach_ns_max: 0,
+            exhaust_fds: false,
         }
     }
 
@@ -660,6 +665,11 @@ impl CaptureLane<Pin> for ScriptedLane {
             receipt.deferred = delta;
             return receipt;
         }
+        if self.exhaust_fds && self.activated {
+            receipt.fd_exhausted = true;
+            receipt.deferred = delta;
+            return receipt;
+        }
         if !self.activated {
             if self.refuse_activation {
                 receipt.refused = Some("scripted activation refusal".into());
@@ -683,6 +693,14 @@ impl CaptureLane<Pin> for ScriptedLane {
                 .endpoints
                 .extend(delta.endpoints.split_off(keep));
             self.defer_next = 0;
+        }
+        // Like the production facade, the deferred objects list every
+        // deferred endpoint's object exactly once.
+        let deferred = receipt.deferred.endpoints.clone();
+        for endpoint in deferred {
+            if !receipt.deferred.objects.contains(&endpoint.object) {
+                receipt.deferred.objects.push(endpoint.object);
+            }
         }
         for endpoint in delta.endpoints {
             receipt.attached.push(AttachedEndpoint {
@@ -1775,6 +1793,24 @@ fn fabricated_delta(count: u32) -> TargetDelta {
     }
 }
 
+/// `per_object` endpoints each of two scripted objects, in ID order: the
+/// first object's endpoints drain first, so a partial tick drain leaves
+/// one object fully drained while the other still queues.
+fn two_object_delta(per_object: u32) -> TargetDelta {
+    use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
+    TargetDelta {
+        endpoints: (0..2 * per_object)
+            .map(|id| AttachEndpoint {
+                id: EndpointId(id),
+                object: AttachObjectId::scripted(id / per_object),
+                file_offset: 0x1000 + u64::from(id) * 16,
+                abi: p11scope_manifest::elf::ElfAbi::Lp64,
+            })
+            .collect(),
+        objects: vec![AttachObjectId::scripted(0), AttachObjectId::scripted(1)],
+    }
+}
+
 fn multi_lane(log: &Log) -> ScriptedLane {
     let mut lane = ScriptedLane::new(log);
     lane.backend = LaneBackend {
@@ -2278,6 +2314,123 @@ fn multi_lane_tick_refusal_skips_later_ticks_and_reports_one_gap() {
         host.gaps
     );
     assert_eq!(host.gaps[0].0, "native capture refused an extend");
+}
+
+/// Descriptor twin: after EMFILE the ticks latch — one exhausting extend,
+/// then no more until the next pass — and each pass re-probes once. 40000
+/// demand: one pass attaches 32768, one tick pair attaches 2048, then the
+/// exhaustion latches with 5184 still deferred; the pass re-probes and
+/// defers honestly, and exhaustion reports no refusal gap.
+#[test]
+fn multi_lane_tick_exhaustion_latches_until_the_next_pass() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_absorbed_provider(40000);
+    let mut lane = NativeLane::start(
+        checking_lane(&log, AttachBackend::Multi),
+        &mut host,
+        windows(),
+        None,
+    )
+    .map_err(|(_, reason)| reason)
+    .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts[1], (32768, 7232));
+    lane.tick(&mut host);
+    lane.collecting_tick(true);
+    assert_eq!(
+        lane.backlog.endpoints.len(),
+        5184,
+        "one tick pair drains 2048 before the exhaustion"
+    );
+    lane.capture.exhaust_fds = true;
+    for _ in 0..5 {
+        lane.tick(&mut host);
+        lane.collecting_tick(true);
+    }
+    assert_eq!(
+        extend_calls(&log),
+        5,
+        "activation plus one pass plus the draining pair plus one exhausting \
+         tick: every later tick skips without extending"
+    );
+    assert_eq!(
+        lane.backlog.endpoints.len(),
+        5184,
+        "latched ticks attach nothing and lose nothing"
+    );
+    lane.after_pass(&mut host);
+    assert_eq!(
+        extend_calls(&log),
+        6,
+        "the next pass re-probes descriptors once"
+    );
+    assert_eq!(
+        host.receipts,
+        vec![(0, 0), (32768, 7232), (2048, 0), (0, 5184)],
+        "the flush forwards the 2048 pre-exhaustion tick attaches, and the \
+         exhausted pass keeps the 5184 remainder deferred: {:?}",
+        host.receipts
+    );
+    assert!(
+        host.gaps.is_empty(),
+        "exhaustion defers without a refusal gap: {:?}",
+        host.gaps
+    );
+    for _ in 0..3 {
+        lane.tick(&mut host);
+        lane.collecting_tick(true);
+    }
+    assert_eq!(
+        extend_calls(&log),
+        6,
+        "the exhausted pass latches the ticks again until the next pass"
+    );
+    assert_eq!(lane.backlog.endpoints.len(), 5184);
+}
+
+/// Ticks that drain one object fully keep the backlog objects as a
+/// superset: after two Singles ticks the 560 queued endpoints all belong
+/// to the second object, while the objects still list the drained first
+/// one — no per-tick rebuild over the whole backlog.
+#[test]
+fn tick_drains_keep_backlog_objects_as_a_superset() {
+    use crate::discovery::inventory_attach_set::AttachObjectId;
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(two_object_delta(600));
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts[1],
+        (512, 688),
+        "one Singles pass attaches 512 and defers the rest: {:?}",
+        host.receipts
+    );
+    assert_eq!(
+        lane.backlog.objects,
+        vec![AttachObjectId::scripted(0), AttachObjectId::scripted(1),],
+        "the pass receipt lists the deferred objects exactly"
+    );
+    lane.collecting_tick(true);
+    lane.collecting_tick(true);
+    assert_eq!(
+        lane.backlog.endpoints.len(),
+        560,
+        "two 64-entry ticks drain 128 endpoints"
+    );
+    assert!(
+        lane.backlog
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.object == AttachObjectId::scripted(1)),
+        "the first object's 88 deferred endpoints drained fully"
+    );
+    assert_eq!(
+        lane.backlog.objects,
+        vec![AttachObjectId::scripted(0), AttachObjectId::scripted(1),],
+        "the drained first object stays listed: a superset, not a rebuild"
+    );
 }
 
 /// The flush folds the buffered ticks' worst single-attach wall time into

@@ -799,6 +799,10 @@ pub(crate) struct NativeLane<L> {
     /// The worst single-attach wall time across the buffered ticks,
     /// forwarded with their receipt.
     pending_tick_attach_ns_max: u64,
+    /// A tick (or the last pass) hit EMFILE: later ticks skip their
+    /// extend until the next pass re-probes descriptors once, instead
+    /// of retrying the failing attach at tick rate.
+    tick_fd_exhausted: bool,
 }
 
 impl<L> NativeLane<L> {
@@ -872,6 +876,7 @@ impl<L> NativeLane<L> {
             pending_tick_custody: None,
             pending_tick_refused: None,
             pending_tick_attach_ns_max: 0,
+            tick_fd_exhausted: false,
         };
         lane.cache_backlog_targets(host);
         Ok(lane)
@@ -956,6 +961,10 @@ impl<L> NativeLane<L> {
             host.capture_targets(),
             self.windows.extend_for(self.capture.backend().backend),
         );
+        // Each pass re-probes descriptors once: a pass that exhausts them
+        // latches the ticks until the next pass, a pass that does not
+        // unlatches them.
+        self.tick_fd_exhausted = receipt.fd_exhausted;
         host.note_extend_receipt(&receipt);
         self.attached += receipt.attached.len();
         self.failed += receipt.failed.len();
@@ -1074,6 +1083,7 @@ impl<L> NativeLane<L> {
             &mut self.pending_tick_custody,
             &mut self.pending_tick_refused,
             &mut self.pending_tick_attach_ns_max,
+            &mut self.tick_fd_exhausted,
             &self.windows,
             self.refusal_reported,
             targets,
@@ -1099,6 +1109,7 @@ impl<L> NativeLane<L> {
             pending_custody,
             pending_refused,
             pending_attach_ns_max,
+            fd_exhausted_latch,
             windows,
             refusal_reported,
         ) = (
@@ -1109,6 +1120,7 @@ impl<L> NativeLane<L> {
             &mut self.pending_tick_custody,
             &mut self.pending_tick_refused,
             &mut self.pending_tick_attach_ns_max,
+            &mut self.tick_fd_exhausted,
             &self.windows,
             self.refusal_reported,
         );
@@ -1120,6 +1132,7 @@ impl<L> NativeLane<L> {
             pending_custody,
             pending_refused,
             pending_attach_ns_max,
+            fd_exhausted_latch,
             windows,
             refusal_reported,
             &cached,
@@ -1136,13 +1149,18 @@ impl<L> NativeLane<L> {
         pending_custody: &mut Option<ScopeCustody>,
         pending_refused: &mut Option<String>,
         pending_attach_ns_max: &mut u64,
+        fd_exhausted_latch: &mut bool,
         windows: &LaneWindows,
         refusal_reported: bool,
         targets: &dyn CaptureTargets,
     ) where
         C: CaptureLane<Pin>,
     {
-        if backlog.endpoints.is_empty() || refusal_reported || pending_refused.is_some() {
+        if backlog.endpoints.is_empty()
+            || refusal_reported
+            || pending_refused.is_some()
+            || *fd_exhausted_latch
+        {
             return;
         }
         let backend = capture.backend().backend;
@@ -1167,6 +1185,9 @@ impl<L> NativeLane<L> {
         let prefix = TargetDelta { endpoints, objects };
         let receipt = capture.extend(prefix, targets, window);
         *pending_attach_ns_max = (*pending_attach_ns_max).max(receipt.attach_ns_max);
+        if receipt.fd_exhausted {
+            *fd_exhausted_latch = true;
+        }
         if let Some(custody) = receipt.custody.clone() {
             *pending_custody = Some(custody);
         }
@@ -1178,15 +1199,11 @@ impl<L> NativeLane<L> {
         let mut rest = backlog.endpoints.split_off(take);
         let mut endpoints = receipt.deferred.endpoints;
         endpoints.append(&mut rest);
-        // Deduplicate objects via a set: the backlog can hold tens of
-        // thousands of endpoints, so a quadratic scan would blow the tick.
-        let mut seen: std::collections::BTreeSet<AttachObjectId> =
-            receipt.deferred.objects.into_iter().collect();
-        for endpoint in &endpoints {
-            seen.insert(endpoint.object);
-        }
-        let objects: Vec<AttachObjectId> = seen.into_iter().collect();
-        *backlog = TargetDelta { endpoints, objects };
+        // Ticks only shrink the endpoint list, so the old objects stay a
+        // valid superset: no per-tick rebuild over the whole backlog
+        // (extends look up only their delta; the next pass receipt makes
+        // the objects exact again).
+        backlog.endpoints = endpoints;
     }
 
     fn stage_pass_evidence<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>

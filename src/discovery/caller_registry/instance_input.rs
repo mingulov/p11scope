@@ -2838,9 +2838,10 @@ impl CallerRegistry {
     /// the recovery's fallback verification would trip over them. In
     /// the running-rearm case those calls come from the abandoned
     /// quantum (or earlier calls still awaiting a seal); in the idle
-    /// case they are calls held behind a still-running same-process
-    /// call that survived a finished frame and are dropped here
-    /// before the next collect. Joint feeds dispose through the
+    /// case they are calls still awaiting a seal across a finished
+    /// frame, for example calls held behind a still-running
+    /// same-process call, and are dropped here before the next
+    /// collect. Joint feeds dispose through the
     /// counted preservation helper (their observed completions stand
     /// as unknown-key rows beside the `record_lost` count, as on the
     /// loss path); any other feed's leftovers dispose as counted

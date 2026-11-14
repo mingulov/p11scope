@@ -10656,11 +10656,11 @@ fn joint_pending_frame_delivers_carried_void_before_retiring() {
 /// counted history, but the stashed pre-void outcome loses its H8
 /// to the void while its wire is already consumed, so the
 /// post-void quantum still latches at claiming — before any audit
-/// or fallback delivery runs — and costs one re-arm per
-/// coincidence. This pin records the premise, the drop, and the
+/// or fallback delivery runs — and stops the semantic lane (re-arm
+/// rejects `Claiming` with `WrongPhase` rather than spending a
+/// continuation). This pin records the premise, the drop, and the
 /// latch site; if claiming ever soft-routes the orphaned outcome,
-/// the publish below fails and N1 must be revisited. A running
-/// call that returns after the void latches the same way. See the
+/// the publish below fails and N1 must be revisited. See the
 /// idle-site comment.
 #[test]
 fn joint_machine_stashed_pre_void_call_latches_post_void_claiming() {

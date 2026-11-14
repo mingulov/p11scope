@@ -453,13 +453,54 @@ impl HandleTable {
     /// The pruning pre-open check: on a hit, reap dead rows and
     /// recheck (like [`HandleTable::acquire`]'s prune-then-retry), so
     /// a table that only *looks* full never files a false budget
-    /// stop. A `Deferred` is filed only against a pruned table.
+    /// stop. A `Deferred` is filed only against a pruned table. A stop
+    /// counts in the census defers exactly like an acquire refusal —
+    /// the caller files the budget-stop gap on `true`.
     pub(crate) fn preopen_defers_pruned(&mut self, maps: &ObjectKey) -> bool {
         if !self.preopen_defers(maps) {
             return false;
         }
         self.prune(usize::MAX);
-        self.preopen_defers(maps)
+        if !self.preopen_defers(maps) {
+            return false;
+        }
+        self.defers = self.defers.saturating_add(1);
+        true
+    }
+
+    /// The learned-retry wait check: prune-then-recheck room (like
+    /// [`HandleTable::acquire`]), then a lendable resident row shares
+    /// first — only a full table with no lendable row under the
+    /// candidate's maps key waits. Fstat-only, no reads: the retry
+    /// proves only when room or a share can take it, so the
+    /// capture-wide I/O ceiling stands still across hopeless retries.
+    /// On filesystems whose rows never lend (btrfs, tmpfs, overlay),
+    /// a full table always waits, exactly as before.
+    pub(crate) fn learned_retry_waits(&mut self, maps: &ObjectKey) -> bool {
+        if !crate::fd_budget::library_handle_budget_exhausted(self.len(), self.scan_cap()) {
+            return false;
+        }
+        self.prune(usize::MAX);
+        if !crate::fd_budget::library_handle_budget_exhausted(self.len(), self.scan_cap()) {
+            return false;
+        }
+        !self.lendable_row_under(maps)
+    }
+
+    /// A live row under `maps` whose mapped proof the lender
+    /// predicates accept for that key: proving may share it. Fstat
+    /// only (the pin re-read); the full-key match stays with the
+    /// acquire below, which defers on a twin-key miss.
+    fn lendable_row_under(&self, maps: &ObjectKey) -> bool {
+        self.rows.iter().any(|((key, _), row)| {
+            key.maps == *maps
+                && !row.overlay
+                && !row.collapsed
+                && row.file.upgrade().is_some_and(|live| {
+                    row.reusable_mapped(&live)
+                        .is_some_and(|lender| lender.key_is_identity(*maps))
+                })
+        })
     }
 
     /// Route one proven pin: its table key plus whether it may share.
@@ -693,6 +734,52 @@ mod tests {
         assert!(
             !table.preopen_defers(&key),
             "a routed key may still share; only the acquire decides"
+        );
+    }
+
+    #[test]
+    fn learned_retry_waits_only_without_a_lendable_row() {
+        // The learned-retry wait check: room never waits; a full
+        // table with a lendable row under the key shares first; a
+        // full table with no row — or only an unlendable row (no
+        // mapped proof, like a learned row) — waits without proving.
+        let (_dir, path) = fixture_bytes("lib.so", b"shared-bytes");
+        let key = maps_key_for(&path);
+        let other = ObjectKey {
+            device: Device { major: 9, minor: 9 },
+            inode: 4242,
+        };
+        let mut table = HandleTable::new(1);
+        assert!(!table.learned_retry_waits(&key), "room never waits");
+        let held = acquire(
+            &mut table,
+            proved(&path, key, "aa", Some(mapped_proof_for(key))),
+            DeferredReason::Live,
+        )
+        .held("the lendable row admits");
+        assert!(
+            !table.learned_retry_waits(&key),
+            "a lendable resident row shares first"
+        );
+        assert!(
+            table.learned_retry_waits(&other),
+            "no row under the key waits"
+        );
+        drop(held);
+        assert!(
+            !table.learned_retry_waits(&key),
+            "a dead row prunes into room"
+        );
+        let mut table = HandleTable::new(1);
+        let _held = acquire(
+            &mut table,
+            proved(&path, key, "aa", None),
+            DeferredReason::Live,
+        )
+        .held("the unlendable row admits");
+        assert!(
+            table.learned_retry_waits(&key),
+            "an unlendable resident row waits without proving"
         );
     }
 

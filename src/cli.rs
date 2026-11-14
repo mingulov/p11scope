@@ -1247,9 +1247,17 @@ pub fn validate_manifest_excludes(
 /// reports a malformed manifest precisely); unreadable or unparsable
 /// input yields no candidates.
 fn manifest_attested_paths(manifest: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(manifest) else {
+    // Pinned before reading: a FIFO here must not hang startup, and
+    // the read consumes the same inode the open verified. No size
+    // bound: this is a fail-closed conflict check, so even an
+    // oversized (elsewhere unusable) manifest still names its paths.
+    let Ok(mut file) = p11scope_manifest::identity::open_regular(manifest) else {
         return Vec::new();
     };
+    let mut text = String::new();
+    if std::io::Read::read_to_string(&mut file, &mut text).is_err() {
+        return Vec::new();
+    }
     let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
@@ -7610,7 +7618,18 @@ mod tests {
             }
         });
         let paths = manifest_attested_paths(&fifo);
+        // A transient self-reader, opened only after the code ran: it
+        // releases a writer the code never read from (the fixed path
+        // refuses without opening), so the join below always completes.
+        // When the code consumed the writer, this open and close is a
+        // no-op on an empty writerless fifo.
+        let releaser = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
         writer.join().unwrap();
+        drop(releaser);
         assert!(paths.is_empty(), "a FIFO attests no paths: {paths:?}");
     }
 }

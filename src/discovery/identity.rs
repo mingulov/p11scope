@@ -7568,6 +7568,38 @@ fn object_key(mapping: MappingFileKey) -> ObjectKey {
     }
 }
 
+/// The maps key a deferred learned candidate retries under: the
+/// mount-resolved key the prove path files, so the retry's wait
+/// check tests the same routing. Resolved from a fresh mountinfo
+/// read — first stagings already prove, so retries stay free. When
+/// the mount table cannot resolve the held fd, the fstat-derived
+/// key: exact on ordinary filesystems, a safe miss elsewhere
+/// (Btrfs subvolume devices differ from the mapped device), where
+/// the retry waits exactly as before.
+pub(crate) fn learned_retry_maps_key(
+    file: &std::fs::File,
+    dev: u64,
+    ino: u64,
+    budget: &mut CaptureWorkBudget,
+) -> ObjectKey {
+    let derived = ObjectKey {
+        device: Device {
+            major: u64::from(libc::major(dev)),
+            minor: u64::from(libc::minor(dev)),
+        },
+        inode: ino,
+    };
+    let mountinfo = std::fs::File::open("/proc/self/mountinfo")
+        .map_err(|error| format!("cannot open observer mount table: {error}"))
+        .and_then(|table| read_mountinfo(table, budget));
+    let Ok(mountinfo) = mountinfo else {
+        return derived;
+    };
+    identity_of_manifest(file, Some(&mountinfo))
+        .map(object_key)
+        .unwrap_or(derived)
+}
+
 /// The pre-6.8 overlayfs maps-identity split, and its exact fallback.
 ///
 /// The one shared implementation lives in `p11scope_manifest::identity`
@@ -8112,7 +8144,8 @@ fn batch_byte_allowance(spent: u64, wanted: usize) -> Result<usize, String> {
 /// passes [`DeferredReason::CountManifest`] for its operator-supplied
 /// manifest (the manifest chain only refuses trusted/learned/count
 /// inputs); the caller's strict `skipped.is_empty()` refusal turns any
-/// deferral into the run's hard error, unchanged.
+/// deferral into a scope gap (the `count manifest refused` row), never
+/// the run's hard error.
 pub(crate) fn pin_count_manifest_objects_in_views_with_prior_and_table(
     m: &Manifest,
     views: &[ProcessView],

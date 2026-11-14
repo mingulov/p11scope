@@ -468,12 +468,13 @@ pub struct Engine {
     /// (a re-staged candidate dedupes by pinned identity instead).
     learned_settled: BTreeSet<(u64, u64)>,
     /// Learned identities the table deferred at least once and not
-    /// yet staged-or-refused: their retries requeue without
-    /// re-proving while the table stays full. Bounded: an identity
-    /// enters only beside its requeue into the bounded
-    /// `pending_learned` (or settles straight out past the bound)
-    /// and leaves at settle.
-    learned_waited: BTreeSet<(u64, u64)>,
+    /// yet staged-or-refused, each with the maps key its first prove
+    /// filed under: their retries requeue without re-proving while
+    /// the table stays full, and share a lendable resident row
+    /// first. Bounded: an identity enters only beside its requeue
+    /// into the bounded `pending_learned` (or settles straight out
+    /// past the bound) and leaves at settle.
+    learned_waited: BTreeMap<(u64, u64), ObjectKey>,
     /// Candidates past the per-tick pin bound: staged first next tick.
     /// Queue entries, not library handles: fanotify event fds stay
     /// outside the table by design (D2) and only file a row once
@@ -12887,7 +12888,7 @@ impl Engine {
             learned_notes: BTreeMap::new(),
             learned_load_tally: BTreeMap::new(),
             learned_settled: BTreeSet::new(),
-            learned_waited: BTreeSet::new(),
+            learned_waited: BTreeMap::new(),
             pending_learned: Vec::new(),
             learned_staged_files: 0,
             learned_event_loss: 0,
@@ -15091,11 +15092,11 @@ impl Engine {
         attribution::note(&skipped);
         if !self.counters.object_skips.contains(&skipped) {
             self.counters.object_skips.push(skipped);
+            // Only a new row dirties the publication inputs: a repeated
+            // marker (a second wait under a still-full table) changes
+            // nothing, so it must not force a republish.
+            self.note_facts_mutated();
         }
-        // The batch-tail merge folds `object_skips` into the published
-        // history: any marker (even a dedup hit after a real mutation, like
-        // a repeated eviction message) dirties the publication inputs.
-        self.note_facts_mutated();
     }
 
     /// Pass containment (P1-5): one tick's candidate or apply failing
@@ -21567,16 +21568,13 @@ impl Engine {
         // the table stays full — prune-then-recheck (like `acquire`),
         // then requeue with no re-hash, no mountinfo re-read and no
         // new row (the first deferral filed the one wait row), so the
-        // capture-wide I/O ceiling stands still across retries. With
+        // capture-wide I/O ceiling stands still across retries that
+        // cannot share. A lendable resident row shares first; with
         // room the wait lifts and the candidate proves below. First
         // stagings always prove: the wait row comes from the prove
         // path, and a shareable file stages at once.
-        if self.learned_waited.contains(&identity) {
-            self.handle_table.prune(usize::MAX);
-            if crate::fd_budget::library_handle_budget_exhausted(
-                self.handle_table.len(),
-                self.handle_table.scan_cap(),
-            ) {
+        if let Some(maps) = self.learned_waited.get(&identity).copied() {
+            if self.handle_table.learned_retry_waits(&maps) {
                 self.requeue_learned_candidate(candidate);
                 return;
             }
@@ -21662,11 +21660,18 @@ impl Engine {
             // Past the pending bound the requeue refuses loudly instead
             // (never an unbounded queue, never a silent close).
             if learned_wait {
-                // The first deferral files the wait row above; mark
-                // the identity waited so retries requeue without
-                // re-proving while the table stays full. Settle (or
-                // the pending bound's loud refusal) clears the mark.
-                self.learned_waited.insert(identity);
+                // The first deferral files the wait row above; remember
+                // the filed maps key so retries requeue without
+                // re-proving while the table stays full, and share a
+                // lendable resident row first. Settle (or the pending
+                // bound's loud refusal) clears the entry.
+                let maps = crate::discovery::identity::learned_retry_maps_key(
+                    &candidate.file,
+                    candidate.dev,
+                    candidate.ino,
+                    &mut self.budget,
+                );
+                self.learned_waited.insert(identity, maps);
                 self.requeue_learned_candidate(candidate);
                 return;
             }

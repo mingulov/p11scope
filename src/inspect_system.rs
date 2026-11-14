@@ -1989,7 +1989,15 @@ fn read_count_manifest_file(path: &Path, budget: &mut CaptureWorkBudget) -> Resu
 /// on the pass budget — first-come ordering keeps scans ahead of
 /// manifest reads, and the pin phase re-reads authoritatively.
 fn count_manifest_objects_for_reservation(path: &Path, budget: &CaptureWorkBudget) -> usize {
-    let len = std::fs::metadata(path)
+    // Pinned like the pin phase: the O_PATH open never blocks on a
+    // FIFO, the regular-file check refuses one, and the fstat length
+    // below names the same inode the bounded read consumes — no
+    // pathname TOCTOU, no unbounded slurp on post-fstat growth.
+    let Ok(file) = p11scope_manifest::identity::open_regular(path) else {
+        return 0;
+    };
+    let len = file
+        .metadata()
         .ok()
         .map(|metadata| metadata.len())
         .unwrap_or(u64::MAX);
@@ -2002,16 +2010,11 @@ fn count_manifest_objects_for_reservation(path: &Path, budget: &CaptureWorkBudge
     if len > budget.remaining_window_io().unwrap_or(0) || len > budget.limits().per_object_bytes {
         return 0;
     }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(_) => return 0,
-    };
-    if bytes.len() as u64 != len {
+    let Ok(bytes) = crate::manifest_input::read_bounded(file, len) else {
         return 0;
-    }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => return 0,
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return 0;
     };
     parse_manifest_text(&text, path)
         .map(|manifest| manifest.objects.len())
@@ -2121,7 +2124,8 @@ fn prepare_count_manifests(
                 views.push(view);
             }
             // Manifest objects file into the run's table; the strict
-            // refusal below turns any deferral into the run's hard
+            // refusal below turns any deferral into a scope gap (the
+            // `count manifest refused` row), never the run's hard
             // error, unchanged.
             let pinning = pin_count_manifest_objects_in_views_with_prior_and_table(
                 &manifest,
@@ -6048,7 +6052,18 @@ mod tests {
             0,
             "the consumed first pass counts nothing (length mismatch)"
         );
+        // A transient self-reader, opened only after the code ran: it
+        // releases a writer the code never read from (the fixed path
+        // refuses without opening), so the join below always completes.
+        // When the code consumed the writer, this open and close is a
+        // no-op on an empty writerless fifo.
+        let releaser = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
         writer.join().unwrap();
+        drop(releaser);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let probe = std::thread::spawn({
             let fifo = fifo.clone();
@@ -6088,7 +6103,17 @@ mod tests {
         let raw = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: NUL-free path, mode bits only.
         assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o644) }, 0);
+        // A transient self-reader: the writer's open succeeds
+        // whether or not the code under test ever reads, then it drops
+        // once half the bytes are in — the writer itself holds the
+        // fifo open past the size check from there.
+        let releaser = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let (half_tx, half_rx) = std::sync::mpsc::channel::<()>();
         let writer = std::thread::spawn({
             let fifo = fifo.clone();
             let bytes = bytes.clone();
@@ -6096,9 +6121,12 @@ mod tests {
                 let mut file = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
                 file.write_all(&bytes[..bytes.len() / 2]).unwrap();
                 file.flush().unwrap();
+                let _ = half_tx.send(());
                 let _ = stop_rx.recv();
             }
         });
+        half_rx.recv().unwrap();
+        drop(releaser);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let probe = std::thread::spawn({
             let fifo = fifo.clone();

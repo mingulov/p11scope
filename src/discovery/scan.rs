@@ -8305,6 +8305,8 @@ mod tests {
     struct BracketFixture {
         _dir: tempfile::TempDir,
         path: PathBuf,
+        extra: Vec<PathBuf>,
+        width: usize,
         view: ProcessView,
         maps_a: String,
         maps_b: String,
@@ -8510,6 +8512,8 @@ mod tests {
             Self {
                 _dir: dir,
                 path,
+                extra: Vec::new(),
+                width,
                 view,
                 maps_b: maps_a.clone(),
                 maps_a,
@@ -8526,13 +8530,27 @@ mod tests {
         }
 
         fn run(&mut self, budget: &mut CaptureWorkBudget) -> Result<ScanOutcome, String> {
-            let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
             let hints = [self.path.clone()];
+            self.run_with_hints(&hints, budget)
+        }
+
+        fn provider_paths(&self) -> Vec<PathBuf> {
+            std::iter::once(self.path.clone())
+                .chain(self.extra.iter().cloned())
+                .collect()
+        }
+
+        fn run_with_hints(
+            &mut self,
+            hints: &[PathBuf],
+            budget: &mut CaptureWorkBudget,
+        ) -> Result<ScanOutcome, String> {
+            let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
             let hooks = HookRegistry::builtin();
             let outcome = scan_process_view_with_io(
                 &ScanRequest {
                     pid: view.pid(),
-                    hints: &hints,
+                    hints,
                     hooks: &hooks,
                 },
                 &view,
@@ -8541,6 +8559,121 @@ mod tests {
             );
             self.log.borrow_mut().push("publication".into());
             outcome
+        }
+
+        fn run_examined_with_hints(
+            &mut self,
+            hints: &[PathBuf],
+            budget: &mut CaptureWorkBudget,
+        ) -> (ScanOutcome, Vec<ExaminedObject>) {
+            let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
+            let hooks = HookRegistry::builtin();
+            let (outcome, examined, _, _) = scan_view_with_examined(
+                &ScanRequest {
+                    pid: view.pid(),
+                    hints,
+                    hooks: &hooks,
+                },
+                &view,
+                budget,
+                self,
+                true,
+            )
+            .unwrap();
+            self.log.borrow_mut().push("publication".into());
+            (outcome, examined)
+        }
+
+        /// A further populated provider file in fresh address ranges, for
+        /// ceiling tests: the first provider keeps its layout, each added
+        /// one mirrors it (executable, writable data with the table,
+        /// readable interface triple, executable name bytes) at
+        /// `0x10000` per addition. Both maps snapshots gain the ranges,
+        /// so the bracket passes unless the test mutates it.
+        fn add_provider(&mut self, name: &str) {
+            let base = 0x10000u64 * (self.extra.len() as u64 + 1);
+            let width = self.width;
+            // Minimal independent ELF header, mirroring `new`.
+            let mut elf = vec![0u8; 64];
+            elf[..7].copy_from_slice(&[
+                0x7f,
+                b'E',
+                b'L',
+                b'F',
+                if width == 8 { 2 } else { 1 },
+                1,
+                1,
+            ]);
+            elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+            elf[18..20].copy_from_slice(&(if width == 8 { 62u16 } else { 3 }).to_le_bytes());
+            elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+            if width == 8 {
+                elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+                elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+                elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+            } else {
+                elf[40..42].copy_from_slice(&52u16.to_le_bytes());
+                elf[42..44].copy_from_slice(&32u16.to_le_bytes());
+                elf[46..48].copy_from_slice(&40u16.to_le_bytes());
+            }
+            let path = self._dir.path().join(name);
+            std::fs::write(&path, elf).unwrap();
+            let file = File::open(&path).unwrap();
+            let key = crate::discovery::identity::retained_object_key(
+                &self.view,
+                &file,
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            let identity = format!(
+                "{:x}:{:x} {} {}",
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                path.display()
+            );
+            let lines = format!(
+                "{:x}-{:x} r-xp 00000000 {identity}\n\
+                 {:x}-{:x} rw-p 00002000 {identity}\n\
+                 {:x}-{:x} r--p 00004000 {identity}\n\
+                 {:x}-{:x} r-xp 00005000 {identity}\n",
+                base + 0x1000,
+                base + 0x2000,
+                base + 0x4000,
+                base + 0x6000,
+                base + 0x7000,
+                base + 0x8000,
+                base + 0xb000,
+                base + 0xc000,
+            );
+            self.maps_a.push_str(&lines);
+            self.maps_b.push_str(&lines);
+            self.mem.set_len(base + 0x10000).unwrap();
+            let mut table = vec![0u8; 69 * width];
+            table[..2].copy_from_slice(&[2, 40]);
+            for slot in 0..68 {
+                // Null slot plus own and dependency function targets.
+                let pointer: u64 = match slot {
+                    0 => base + 0x1100,
+                    1 => 0,
+                    _ => 0x9100,
+                };
+                table[(slot + 1) * width..(slot + 2) * width]
+                    .copy_from_slice(&pointer.to_le_bytes()[..width]);
+            }
+            self.mem.write_all_at(&table, base + 0x4800).unwrap();
+            for (slot, value) in [base + 0xb100, base + 0x4800, 0].into_iter().enumerate() {
+                self.mem
+                    .write_all_at(
+                        &value.to_le_bytes()[..width],
+                        base + 0x7100 + (slot * width) as u64,
+                    )
+                    .unwrap();
+            }
+            self.mem
+                .write_all_at(b"PKCS 11\0PRIVATE_READ_AHEAD_CANARY", base + 0xb100)
+                .unwrap();
+            self.extra.push(path);
         }
 
         fn assert_refused(&mut self, budget: &mut CaptureWorkBudget, reason: &str) {
@@ -8860,6 +8993,238 @@ mod tests {
             ..CaptureWorkBudget::default()
         };
         f.assert_refused(&mut budget, "final mapping validation unavailable");
+    }
+
+    extern "C" fn ceiling_anchor() {}
+
+    /// Fill `count` table-candidate slots with distinct crafted tables
+    /// decoded from this binary's own data mapping, so the scan under
+    /// test meets a nearly saturated 512-candidate ceiling. The direct
+    /// decodes charge walk work like any decode, so callers sizing a
+    /// tight work ceiling must saturate first and add the control run's
+    /// `before_b` figure on top of the spent saturation work.
+    fn saturate_table_candidates(budget: &mut CaptureWorkBudget, count: usize) {
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
+        let data = maps
+            .iter()
+            .find(|mapping| {
+                mapping.permissions.starts_with(b"rw-") && mapping.end - mapping.start >= 4096
+            })
+            .expect("the test process has a writable data mapping");
+        let mut snapshot = vec![0u8; 2048];
+        snapshot[..8].copy_from_slice(&0x2802u64.to_le_bytes());
+        for slot in 0..255 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8]
+                .copy_from_slice(&(ceiling_anchor as *const () as usize as u64).to_le_bytes());
+        }
+        for table in 0..count {
+            let address = data.start + table as u64 * 8;
+            let decoded = decode_exact_table(
+                &snapshot,
+                address,
+                LinuxLayout::Lp64,
+                &map_index,
+                budget,
+                None,
+            )
+            .expect("a valid table decodes")
+            .expect("all slots walkable");
+            assert!(!decoded.entries.is_empty());
+        }
+        assert_eq!(
+            budget.table_candidates_count(),
+            count,
+            "every saturation decode charges exactly one candidate"
+        );
+    }
+
+    /// The table-decode ceiling names its remainder and keeps what it
+    /// decoded: one provider fills the 512th candidate slot, the other
+    /// two are refused, the work budget starves the final bracket, and
+    /// the live view still pins the process. The decoded module must
+    /// be published with the bracket failure named — never an empty
+    /// view — plus one counted gap for the two undecoded files.
+    #[test]
+    fn work_starved_bracket_keeps_decoded_tables_with_counted_undecoded_gap() {
+        // Control: the same saturated ceiling with a healthy work budget.
+        // One provider fills the 512th candidate slot, two are refused
+        // per-file, and the bracket passes. Its scan-only work figure
+        // sizes the test ceiling so exactly the bracket starves: refused
+        // files break their sweep early, so a fully-decoding control
+        // would oversize the ceiling and the bracket would pass.
+        let mut control = BracketFixture::new(8, true);
+        control.add_provider("provider2.so");
+        control.add_provider("provider3.so");
+        let mut control_budget = CaptureWorkBudget::default();
+        saturate_table_candidates(&mut control_budget, MAX_TABLE_CANDIDATES - 1);
+        let control_sat_work = control_budget.work_units_count();
+        let control_outcome = control
+            .run_with_hints(&control.provider_paths(), &mut control_budget)
+            .unwrap();
+        assert_eq!(
+            control_outcome
+                .modules()
+                .iter()
+                .filter(|module| !module.tables.is_empty())
+                .count(),
+            1,
+            "the control decodes exactly the 512th candidate: {control_outcome:?}"
+        );
+        assert!(
+            control_outcome.mapping_scan_completed(),
+            "the control bracket passes: {control_outcome:?}"
+        );
+
+        let mut f = BracketFixture::new(8, true);
+        f.add_provider("provider2.so");
+        f.add_provider("provider3.so");
+        let mut budget = CaptureWorkBudget::default();
+        saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES - 1);
+        let scan_work =
+            control.before_b.map_or(control_budget.work_units, |b| b.1) - control_sat_work;
+        budget.work_ceiling = budget.work_units_count() + scan_work + 1;
+        let hints = f.provider_paths();
+        let (outcome, examined) = f.run_examined_with_hints(&hints, &mut budget);
+
+        let decoded: Vec<_> = outcome
+            .modules()
+            .iter()
+            .filter(|module| !module.tables.is_empty())
+            .collect();
+        assert_eq!(
+            decoded.len(),
+            1,
+            "the 512th candidate survives its starved bracket: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == "capture discovery"
+                    && skip.reason
+                        == "2 provider files were not decoded: table decode ceiling reached"),
+            "one named, counted gap for the refused files: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("table decode ceiling reached")),
+            "the ceiling itself stays named: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable")),
+            "the starved bracket stays explicit evidence: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            examined.is_empty(),
+            "absence evidence still needs the full bracket: {examined:?}"
+        );
+        assert!(
+            !outcome.mapping_scan_completed(),
+            "a starved bracket never claims a completed mapping scan"
+        );
+    }
+
+    /// Healthy twin: with no ceiling pressure every provider decodes,
+    /// the bracket passes, and no undecoded gap is invented.
+    #[test]
+    fn healthy_scan_decodes_all_providers_without_an_undecoded_gap() {
+        let mut f = BracketFixture::new(8, true);
+        f.add_provider("provider2.so");
+        f.add_provider("provider3.so");
+        let mut budget = CaptureWorkBudget::default();
+        let hints = f.provider_paths();
+        let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
+        assert_eq!(outcome.modules().len(), 3, "{outcome:?}");
+        assert!(
+            outcome
+                .modules()
+                .iter()
+                .all(|module| module.tables.len() == 1),
+            "{outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains("were not decoded")
+                    && !skip.reason.contains("was not decoded")),
+            "no undecoded gap without a refusal: {:?}",
+            outcome.skipped()
+        );
+        assert!(outcome.mapping_scan_completed(), "{outcome:?}");
+    }
+
+    /// Refusal twin: a proven generation loss on a healthy budget still
+    /// drops every module — the work-starved keep never rescues a
+    /// genuinely unprovable scan — and refuses nothing spuriously.
+    #[test]
+    fn proven_generation_loss_still_drops_modules_without_an_undecoded_gap() {
+        let mut f = BracketFixture::new(8, true);
+        f.fail_generation = true;
+        let outcome = f.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            outcome.modules().is_empty(),
+            "a proven loss keeps the fail-closed bracket: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains("were not decoded")
+                    && !skip.reason.contains("was not decoded")),
+            "no undecoded gap without a refusal: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| skip
+                .reason
+                .contains("process generation changed during acquisition")),
+            "the loss stays named: {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// The counted gap does not need a starved bracket: with a healthy
+    /// work budget the refused file is still counted beside the decoded
+    /// one, and the passing bracket validates the decoded module.
+    #[test]
+    fn table_ceiling_counts_refused_files_when_the_bracket_passes() {
+        let mut f = BracketFixture::new(8, true);
+        f.add_provider("provider2.so");
+        let mut budget = CaptureWorkBudget::default();
+        saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES - 1);
+        let hints = f.provider_paths();
+        let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
+        let decoded: Vec<_> = outcome
+            .modules()
+            .iter()
+            .filter(|module| !module.tables.is_empty())
+            .collect();
+        assert_eq!(decoded.len(), 1, "{outcome:?}");
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == "capture discovery"
+                    && skip.reason
+                        == "1 provider file was not decoded: table decode ceiling reached"),
+            "singular counted gap for the refused file: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.mapping_scan_completed(),
+            "a passing bracket still completes: {outcome:?}"
+        );
     }
 
     #[test]

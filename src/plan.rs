@@ -932,16 +932,18 @@ impl CapacityRefusal<'_> {
 pub enum AdmissionScope {
     /// One named process (`--pid`, `run`), or a capture the operator aimed
     /// with `--module`: providers are admitted first-come in discovery order,
-    /// and an unresolved heuristic object admits its strongest
-    /// [`MAX_TABLES_PER_OBJECT`] tables (K4). A recognized proxy closure
-    /// array is decided after every provider: an unnamed one admits only
-    /// its published tables (Route A), while an operator-named one keeps
-    /// its reserve-capped leading-templates prefix (whole first when
-    /// late-start) — the prefix never takes the [`shared_scope_reserve`]
-    /// slots, so at least the reserve (128 of 512 slots) stays free and one
-    /// later standard function list (at most 104 entries) always fits. A
-    /// second later provider may not fit; it is refused by name with the
-    /// `--exclude-module` remedy.
+    /// and a Detailed unresolved heuristic object admits its strongest
+    /// [`MAX_TABLES_PER_OBJECT`] tables (K4), outside the reserve once churn
+    /// has retired slots (initial builds keep full capacity;
+    /// Inventory/Counters Named keep no reserve). A recognized proxy closure
+    /// array is decided after every provider: an
+    /// unnamed one admits only its published tables (Route A), while an
+    /// operator-named one keeps its reserve-capped leading-templates prefix
+    /// (whole first when late-start) — the prefix never takes the
+    /// [`shared_scope_reserve`] slots, so at least the reserve (128 of 512
+    /// slots) stays free and one later standard function list (at most 104
+    /// entries) always fits. A second later provider may not fit; it is
+    /// refused by name with the `--exclude-module` remedy.
     #[default]
     Named,
     /// Cgroup or system scope without `--module` (GT-5). Every process in
@@ -2002,6 +2004,7 @@ impl AttachPlan {
                 slots: self.slots.len(),
                 active: &self.slot_by_key,
                 revivable: &self.revivable,
+                prior_slots: &self.slots,
                 owned: &owned,
                 first_plan: Some(&self.first_plan_objects),
                 first_plan_had_provider: self.first_plan_had_provider,
@@ -2380,34 +2383,84 @@ impl AttachPlan {
         if self.slot_by_key.contains_key(key) {
             return None;
         }
-        let position = *self.revivable.get(key)?;
-        if self.retired_keys.get(key) != Some(&position) {
-            return None;
+        if let Some(position) = self.revivable.get(key) {
+            let position = *position;
+            if self.retired_keys.get(key) != Some(&position) {
+                return None;
+            }
+            if !self.retired_slots.contains(&position) {
+                return None;
+            }
+            let retired = self.slots.get(position)?;
+            if AttachKey::of(retired) != *key {
+                return None;
+            }
+            if retired.descriptor_index != slot.descriptor_index || retired.names != slot.names {
+                return None;
+            }
+            let previous = self.aggregate_owners.get(position).copied()?;
+            let candidate = if rebuilt.slot_is_module_ambiguous(slot.index) {
+                AggregateOwner::Ambiguous
+            } else {
+                AggregateOwner::from_module_ids(&slot.module_ids)
+            };
+            if previous.merge(candidate) != previous && slot.descriptor_index != 0 {
+                return None;
+            }
+            return Some(position);
         }
-        if !self.retired_slots.contains(&position) {
-            return None;
+        // Cross-ID same-file reclaim: a new pin for the same file reuses a
+        // revivable retired index with the same file offset + same path +
+        // same names/descriptor, so short-lived churn (new pin IDs) stops
+        // burning fresh slots. Counts continue (same function, same file).
+        // Every inconsistency fails closed to a fresh slot. File identity
+        // (dev/ino/sha) must match when both sides carry it; synthetic
+        // plans without identities rely on path + offset + names.
+        let new_identity = rebuilt.object_identities.get(&slot.object);
+        for (old_key, position) in &self.revivable {
+            if old_key.file_offset != key.file_offset {
+                continue;
+            }
+            let position = *position;
+            if self.retired_keys.get(old_key) != Some(&position) {
+                continue;
+            }
+            if !self.retired_slots.contains(&position) {
+                continue;
+            }
+            let Some(retired) = self.slots.get(position) else {
+                continue;
+            };
+            if AttachKey::of(retired) != *old_key {
+                continue;
+            }
+            if retired.object_path != slot.object_path {
+                continue;
+            }
+            if retired.descriptor_index != slot.descriptor_index || retired.names != slot.names {
+                continue;
+            }
+            if let (Some(old_identity), Some(new_identity)) = (
+                self.object_identities.get(&retired.object),
+                new_identity,
+            ) && old_identity != new_identity
+            {
+                continue;
+            }
+            let Some(previous) = self.aggregate_owners.get(position).copied() else {
+                continue;
+            };
+            let candidate = if rebuilt.slot_is_module_ambiguous(slot.index) {
+                AggregateOwner::Ambiguous
+            } else {
+                AggregateOwner::from_module_ids(&slot.module_ids)
+            };
+            if previous.merge(candidate) != previous && slot.descriptor_index != 0 {
+                continue;
+            }
+            return Some(position);
         }
-        let retired = self.slots.get(position)?;
-        if AttachKey::of(retired) != *key {
-            return None;
-        }
-        if retired.descriptor_index != slot.descriptor_index || retired.names != slot.names {
-            return None;
-        }
-        // A newly ambiguous aggregate on a semantic descriptor must not
-        // reuse the cookie: like the kept path it would downgrade, and a
-        // downgrade is a fresh slot, never a revival. Count-only and
-        // already-ambiguous aggregates revive unchanged.
-        let previous = self.aggregate_owners.get(position).copied()?;
-        let candidate = if rebuilt.slot_is_module_ambiguous(slot.index) {
-            AggregateOwner::Ambiguous
-        } else {
-            AggregateOwner::from_module_ids(&slot.module_ids)
-        };
-        if previous.merge(candidate) != previous && slot.descriptor_index != 0 {
-            return None;
-        }
-        Some(position)
+        None
     }
 
     /// The slot index for one exact attach target, if this plan holds it
@@ -2746,10 +2799,12 @@ impl AttachPlan {
                 }
                 slots[position] = updated;
             } else if let Some(position) = self.revival_target(&key, &rebuilt, slot) {
-                // Same-target revival: the key cleared revivable and still
-                // matches its retired slot, so it reoccupies its old index
-                // instead of burning a fresh one. Counts continue in
-                // place — revive zeroes nothing.
+                // Same-target revival (or cross-ID same-file reclaim): the
+                // key cleared revivable and still matches its retired slot
+                // (same key, or same file offset + path + names for a new
+                // pin ID), so it reoccupies the old index instead of
+                // burning a fresh one. Counts continue in place — revive
+                // zeroes nothing.
                 let mut updated = slot.clone();
                 updated.index = position as u32;
                 let previous_owner = aggregate_owners[position];
@@ -2762,6 +2817,18 @@ impl AttachPlan {
                 slots[position] = updated.clone();
                 slot_by_key.insert(key, position);
                 retired_slots.remove(&position);
+                // Cross-ID reclaim consumes the old retired key (same
+                // position, different pin ID), not just the new key.
+                let old_keys: Vec<AttachKey> = retired_keys
+                    .iter()
+                    .filter_map(|(old_key, old_position)| {
+                        (*old_position == position).then_some(*old_key)
+                    })
+                    .collect();
+                for old_key in old_keys {
+                    retired_keys.remove(&old_key);
+                    revivable.remove(&old_key);
+                }
                 retired_keys.remove(&key);
                 revivable.remove(&key);
                 delta.new.push(updated);
@@ -3721,9 +3788,13 @@ fn merge(
     // Same-target revival (Detailed only): cleared retired keys reoccupy
     // their old positions at extend, so they cost no new slot. Counters
     // publish by position and Inventory owns its own budget — neither
-    // revives, and their revivable input stays empty.
+    // revives, and their revivable input stays empty. Cross-ID same-file
+    // reclaim reads the same clearance plus `prior_slots` paths: a new pin
+    // for the same file reuses a revivable retired index with the same
+    // file offset and path.
     let revival_allowed = matches!(admission_policy, AdmissionPolicy::Detailed(_));
     let revivable = allocated.revivable;
+    let prior_slots = allocated.prior_slots;
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
     let mut group_positions: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
     for module in discovered {
@@ -3882,8 +3953,11 @@ fn merge(
             || (shared && class != AdmissionClass::Operator);
         // A Detailed closure's whole and prefix budgets leave the reserve
         // free (M4); its published-only retry below uses the full budget, as
-        // do corroborated tables. Shared uncorroborated modules keep the
-        // reserve as before.
+        // do corroborated tables. Detailed uncorroborated modules keep the
+        // reserve in Shared always, and in Named once churn has retired
+        // slots, so a provider corroborated later still fits; initial Named
+        // builds keep first-come full capacity. Inventory/Counters keep
+        // their scoped rule (Shared reserves, Named does not).
         let reserved = if is_detailed_closure {
             // A late-start named closure starts whole (reserve-capped,
             // M4); anything else starts published-only (full budget,
@@ -3891,6 +3965,8 @@ fn merge(
             // which starts at the reserve-capped prefix attempt. The
             // passes below re-cap accordingly.
             closure_late_start
+        } else if matches!(admission_policy, AdmissionPolicy::Detailed(_)) {
+            class.leaves_reserve() && (shared || retired > 0)
         } else {
             shared && class.leaves_reserve()
         };
@@ -4141,10 +4217,41 @@ fn merge(
                         }
                     }
                 }
+                // New pin path per exact key, for cross-ID same-file reclaim:
+                // same file offset + same path as a revivable retired index
+                // reuses it, so short-lived churn (new pin IDs for the same
+                // file) stops burning fresh slots. First wins; same key
+                // implies same file.
+                let mut new_paths: BTreeMap<AttachKey, &str> = BTreeMap::new();
+                for module in group.iter() {
+                    for target in &module.targets {
+                        new_paths
+                            .entry(AttachKey {
+                                object: target.object,
+                                file_offset: target.file_offset,
+                            })
+                            .or_insert(target.object_path);
+                    }
+                }
+                let cross_reclaimable = |key: &AttachKey| -> bool {
+                    if !revival_allowed {
+                        return false;
+                    }
+                    let Some(new_path) = new_paths.get(key) else {
+                        return false;
+                    };
+                    revivable.iter().any(|(old_key, position)| {
+                        old_key.file_offset == key.file_offset
+                            && prior_slots
+                                .get(*position)
+                                .is_some_and(|slot| slot.object_path == *new_path)
+                    })
+                };
                 let is_fresh = |key: &AttachKey| {
                     !claimed.contains(key)
                         && !existing_slots.contains_key(key)
                         && !(revival_allowed && revivable.contains_key(key))
+                        && !cross_reclaimable(key)
                 };
                 // A table the module already has attached must never spill:
                 // its kept endpoints would vanish from the snapshot and
@@ -4586,7 +4693,8 @@ fn merge(
                             revived.extend(
                                 keys.iter()
                                     .filter(|key| {
-                                        revivable.contains_key(key)
+                                        (revivable.contains_key(key)
+                                            || cross_reclaimable(key))
                                             && partial_pick
                                                 .as_ref()
                                                 .is_none_or(|(chosen, _, _)| chosen.contains(key))
@@ -4601,7 +4709,7 @@ fn merge(
                                 object: target.object,
                                 file_offset: target.file_offset,
                             };
-                            if revivable.contains_key(&key) {
+                            if revivable.contains_key(&key) || cross_reclaimable(&key) {
                                 revived.insert(key);
                             }
                         }
@@ -5286,6 +5394,7 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            prior_slots: &[],
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -5507,6 +5616,7 @@ pub(crate) fn build_from_sources_scan_authorized(
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            prior_slots: &[],
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -5735,6 +5845,7 @@ fn build_from_sources_with_policy(
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            prior_slots: &[],
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -5756,8 +5867,15 @@ struct ExistingAllocation<'a> {
     active: &'a BTreeMap<AttachKey, usize>,
     /// Absence-retired targets cleared for same-target revival this
     /// rebuild (see [`AttachPlan::revivable`): they reoccupy their old
-    /// positions at extend, so merge charges them no new slot.
+    /// positions at extend, so merge charges them no new slot. Cross-ID
+    /// same-file reclaim (slot reclaim) also reads this: a new pin for the
+    /// same file reuses a revivable retired index with the same file
+    /// offset and path, so short-lived churn stops burning fresh slots.
     revivable: &'a BTreeMap<AttachKey, usize>,
+    /// Allocated slots by index, for cross-ID reclaim path comparison
+    /// (old retired index path vs new target path). Empty for an initial
+    /// build; borrowed from the prior plan for a rebuild.
+    prior_slots: &'a [Slot],
     /// `active`, under the object of each module that currently owns a
     /// target: a module listed here is already admitted (G-03).
     owned: &'a BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
@@ -5946,6 +6064,7 @@ fn build_from_test_sources_with_policy(
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            prior_slots: &[],
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -6549,6 +6668,7 @@ fn build(m: &Manifest) -> AttachPlan {
             slots: 0,
             active: &BTreeMap::new(),
             revivable: &BTreeMap::new(),
+            prior_slots: &[],
             owned: &BTreeMap::new(),
             first_plan: None,
             first_plan_had_provider: false,
@@ -13089,6 +13209,7 @@ pub(crate) mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                prior_slots: &[],
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -13227,6 +13348,7 @@ pub(crate) mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                prior_slots: &[],
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -13274,6 +13396,7 @@ pub(crate) mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                prior_slots: &[],
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -16398,6 +16521,7 @@ pub(crate) mod tests {
                 slots: plan.slots.len(),
                 active: &plan.slot_by_key,
                 revivable: &plan.revivable,
+                prior_slots: &plan.slots,
                 owned: &plan.active_keys_by_owner(),
                 first_plan: Some(&plan.first_plan_objects),
                 first_plan_had_provider: plan.first_plan_had_provider,
@@ -17653,6 +17777,7 @@ pub(crate) mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                prior_slots: &[],
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -17697,6 +17822,7 @@ pub(crate) mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                prior_slots: &[],
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,
@@ -19488,6 +19614,7 @@ pub(crate) mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 revivable: &BTreeMap::new(),
+                prior_slots: &[],
                 owned: &BTreeMap::new(),
                 first_plan: None,
                 first_plan_had_provider: false,

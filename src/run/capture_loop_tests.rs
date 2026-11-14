@@ -2877,6 +2877,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         prearm: Vec::new(),
         key_operations_requested: false,
         manifests_present: false,
+        joint_audit_subjects: None,
         budgets: BudgetView {
             callers_limit: 8,
             callers_occupied: 1,

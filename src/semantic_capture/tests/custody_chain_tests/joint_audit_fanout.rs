@@ -13199,6 +13199,10 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
 
 const QUANTUM_ABANDONED: &str = "semantic quantum abandoned; lane continues";
 
+/// Posed boot-clock base (nanoseconds) for the re-arm window twins:
+/// an arbitrary instant; spacings are added in nanoseconds.
+const POSED_REARM_START: u64 = 1_000_000_000_000;
+
 impl MachineScene {
     /// Re-arm the latched machine through the real lane and coordinator.
     fn rearm(&mut self, reason: &str) -> Option<bool> {
@@ -14085,6 +14089,9 @@ fn joint_machine_auditing_and_audited_rearms_share_the_bound() {
     let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
+    fixture
+        .machine
+        .set_rearm_clock_for_test(Some(POSED_REARM_START));
     for round in 0..limit {
         if round % 2 == 0 {
             fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 2 + round as u64);
@@ -14274,7 +14281,7 @@ fn joint_machine_running_rearms_are_bounded() {
     fixture.prime(1);
     fixture
         .machine
-        .set_rearm_clock_for_test(Some(std::time::Instant::now()));
+        .set_rearm_clock_for_test(Some(POSED_REARM_START));
     for round in 0..limit {
         fixture.refuse_at_audited(2 + round as u64);
         assert_eq!(
@@ -14326,17 +14333,17 @@ fn joint_machine_sparse_rearms_over_a_long_run_never_stop() {
     let rounds = limit + 8;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    let start = std::time::Instant::now();
+    let start = POSED_REARM_START;
     fixture.machine.set_rearm_clock_for_test(Some(start));
     assert_eq!(
         fixture.machine.rearm_now(),
-        start,
+        Some(start),
         "the twin drives the re-arm clock"
     );
     for round in 0..rounds {
         fixture
             .machine
-            .set_rearm_clock_for_test(Some(start + std::time::Duration::from_secs(660) * round));
+            .set_rearm_clock_for_test(Some(start + 660_000_000_000 * u64::from(round)));
         if round % 2 == 0 {
             fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 2 + round as u64);
         } else {
@@ -14380,7 +14387,7 @@ fn joint_machine_dense_rearm_storm_stops_at_the_rate_bound() {
     fixture.prime(1);
     fixture
         .machine
-        .set_rearm_clock_for_test(Some(std::time::Instant::now()));
+        .set_rearm_clock_for_test(Some(POSED_REARM_START));
     for round in 0..limit {
         fixture.refuse_at_audited(2 + round as u64);
         assert_eq!(
@@ -14420,7 +14427,7 @@ fn joint_machine_dense_rearm_storm_stops_at_the_rate_bound() {
 
 /// Slide twin: a full window expires and admits again. Thirty-two
 /// re-arms at one posed instant fill the window; advancing the posed
-/// clock past the 600 s window expires every stamp, so the next
+/// clock past the 120 s window expires every stamp, so the next
 /// refusal re-arms (total 33) and names one more gap. The slid stamp
 /// starts a fresh window: 31 more rapid re-arms refill it, and the
 /// next refusal stops at the rate bound again.
@@ -14429,7 +14436,7 @@ fn joint_machine_full_rearm_window_expiry_admits_again() {
     let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    let start = std::time::Instant::now();
+    let start = POSED_REARM_START;
     fixture.machine.set_rearm_clock_for_test(Some(start));
     for round in 0..limit {
         fixture.refuse_at_audited(2 + round as u64);
@@ -14442,7 +14449,7 @@ fn joint_machine_full_rearm_window_expiry_admits_again() {
     assert_eq!(fixture.machine.running_rearms_for_test(), limit);
     fixture
         .machine
-        .set_rearm_clock_for_test(Some(start + std::time::Duration::from_secs(601)));
+        .set_rearm_clock_for_test(Some(start + 121_000_000_000));
     fixture.refuse_at_audited(2 + limit as u64);
     assert_eq!(
         fixture.rearm("semantic_unavailable"),
@@ -14486,6 +14493,225 @@ fn joint_machine_full_rearm_window_expiry_admits_again() {
         fixture.machine.rearm_refusal_for_test(),
         Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent),
         "the second stop names the spent rate bound"
+    );
+}
+
+/// Soak2 twin: the heavy-soak cadence continues past its old stop
+/// point. Soak2 runs A and B re-armed 32 times over 520 s and 496 s
+/// (about 16 s apart); replaying that cadence for one re-arm past
+/// the old per-run total must not stop: the 120 s window holds only
+/// about 8 stamps at this pace.
+#[test]
+fn joint_machine_soak2_cadence_rearms_continue_past_thirty_two() {
+    let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
+    for spacing in [16_000_000_000u64, 17_000_000_000u64] {
+        let mut fixture = MachineScene::new(1);
+        fixture.prime(1);
+        let start = POSED_REARM_START;
+        for round in 0..=limit {
+            fixture
+                .machine
+                .set_rearm_clock_for_test(Some(start + spacing * u64::from(round)));
+            fixture.refuse_at_audited(2 + round as u64);
+            assert_eq!(
+                fixture.rearm("semantic_unavailable"),
+                Some(false),
+                "soak2-cadence re-arm {round} at {}s spacing continues",
+                spacing / 1_000_000_000,
+            );
+        }
+        assert_eq!(
+            fixture.machine.running_rearms_for_test(),
+            limit + 1,
+            "the soak2 cadence passes its old stop point at {}s spacing",
+            spacing / 1_000_000_000,
+        );
+        assert_eq!(
+            fixture.machine.rearm_refusal_for_test(),
+            None,
+            "no stop is recorded at {}s spacing",
+            spacing / 1_000_000_000,
+        );
+    }
+}
+
+/// Stuck twin: a lane re-arming every pass still stops. At one
+/// re-arm per 2.5 s pass, 32 re-arms land inside 80 s, within the
+/// 120 s window, so the next refusal stops at the rate bound.
+#[test]
+fn joint_machine_every_pass_rearm_storm_stops_within_the_window() {
+    let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let start = POSED_REARM_START;
+    for round in 0..limit {
+        fixture
+            .machine
+            .set_rearm_clock_for_test(Some(start + 2_500_000_000 * u64::from(round)));
+        fixture.refuse_at_audited(2 + round as u64);
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "every-pass re-arm {round} is inside the window"
+        );
+    }
+    fixture
+        .machine
+        .set_rearm_clock_for_test(Some(start + 2_500_000_000 * u64::from(limit)));
+    fixture.refuse_at_audited(2 + limit as u64);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "the every-pass storm stops at the rate bound"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent),
+        "the every-pass stop names the spent rate bound"
+    );
+}
+
+/// Clock twin: unposed, the re-arm window reads the boot clock, so
+/// the window keeps wall time across a suspend.
+#[test]
+fn joint_machine_unposed_rearm_clock_reads_boottime() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.machine.set_rearm_clock_for_test(None);
+    let before = crate::discovery::pause::boot_ns().expect("the boot clock reads");
+    let now = fixture
+        .machine
+        .rearm_now()
+        .expect("the unposed re-arm clock reads");
+    let after = crate::discovery::pause::boot_ns().expect("the boot clock reads");
+    assert!(
+        before <= now && now <= after,
+        "the unposed re-arm clock is a boot-clock reading"
+    );
+}
+
+/// Count twin: N continuations publish one re-arm row whose repeats
+/// is N. The staged gaps merge at publish time; the text names the
+/// row once with its count, and JSON carries `repeats`.
+#[test]
+fn joint_machine_rearm_gaps_publish_one_row_with_repeats() {
+    const REARMS: u64 = 5;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .machine
+        .set_rearm_clock_for_test(Some(POSED_REARM_START));
+    for round in 0..REARMS {
+        fixture.refuse_at_audited(2 + round);
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "re-arm {round} continues past its interruption"
+        );
+    }
+    fixture.assert_recovers("after counted re-arms", 2 + REARMS);
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let rows: Vec<u64> = registry
+        .gaps()
+        .iter()
+        .zip(registry.gap_repeats().iter())
+        .filter(|(gap, _)| gap.subject == QUANTUM_ABANDONED)
+        .map(|(_, repeats)| *repeats)
+        .collect();
+    assert_eq!(
+        rows,
+        [REARMS],
+        "the continuations publish one row counting every re-arm"
+    );
+}
+
+/// Audit twin: the recovery past a re-arm audits again without an
+/// audit refusal. The latched quantum's audit passed before the native
+/// refusal, the re-arm notes itself, and the recovery quantum audits
+/// once more; native refusals never count as audit refusals.
+#[test]
+fn joint_rearm_recovery_audits_twice_without_audit_refusals() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    let base = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_audit_subject_diagnosis();
+    fixture.refuse_at_audited(5);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "the transient refusal re-arms"
+    );
+    fixture.scene.push(pid, 0, "C_SignInit", 6);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 7);
+    fixture.assert_recovers("after marks", 8);
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_audit_subject_diagnosis();
+    assert_eq!(
+        diagnosis.audits - base.audits,
+        2,
+        "the latched and the recovery quantum each audit once"
+    );
+    assert_eq!(
+        (
+            diagnosis.refusals_before_first_rearm - base.refusals_before_first_rearm,
+            diagnosis.refusals_after_first_rearm - base.refusals_after_first_rearm,
+        ),
+        (0, 0),
+        "native refusals are not audit refusals"
+    );
+}
+
+/// Marks twin: birth staging with disposition marks its subjects and
+/// counts every mark. Each staged birth call commits exactly one mark.
+#[test]
+fn joint_birth_staging_with_disposition_counts_subject_marks() {
+    let (mut scene, mut ingested, _attached, _grant) = prepared_birth_originals(1, false, false);
+    let base = scene
+        .real
+        .scene
+        .coordinator
+        .joint_audit_subject_diagnosis()
+        .marks;
+    let mut staged = 0;
+    while scene
+        .real
+        .scene
+        .coordinator
+        .stage_next_prepared_admission_with_disposition(&scene.producers, &mut ingested)
+        .unwrap()
+    {
+        staged += 1;
+    }
+    assert!(staged > 0, "staging ran");
+    assert!(
+        scene
+            .real
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&scene.real.lane)
+    );
+    assert_eq!(
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_audit_subject_diagnosis()
+            .marks
+            - base,
+        staged,
+        "every staged birth call marks exactly once"
     );
 }
 

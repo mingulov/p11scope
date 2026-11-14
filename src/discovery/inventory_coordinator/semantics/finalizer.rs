@@ -463,10 +463,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         fault: &impl crate::semantics_objects::journal::FaultEpoch,
     ) -> crate::semantics_objects::journal::joint_audit::AuditAcquisition {
         use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+        // Diagnostic-only: every audit call counts; refusals split by
+        // whether a running re-arm happened yet.
+        self.joint_subject_audits = self.joint_subject_audits.saturating_add(1);
         if let Err(reason) = ingested.validate_owner(self.joint_capture.adapter(), producers) {
+            self.note_joint_subject_audit_refusal();
             return Err((ingested, reason));
         }
         let Some(state) = self.semantic_finalizer.as_mut() else {
+            self.note_joint_subject_audit_refusal();
             return Err((ingested, RawQuantumRefusal::H3Undisposed));
         };
         if state.domain != producers.native_domain()
@@ -475,6 +480,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .as_ref()
                 .is_some_and(|held| !held.same_producers(producers))
         {
+            self.note_joint_subject_audit_refusal();
             return Err((ingested, RawQuantumRefusal::ForeignCapture));
         }
         let finalizer = SessionH3Finalizer { state, producers };
@@ -484,9 +490,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             finalizer,
             producers,
         };
-        crate::semantics_objects::journal::joint_audit::IngestedJointQuantum::audit(
+        let outcome = crate::semantics_objects::journal::joint_audit::IngestedJointQuantum::audit(
             authorized, attachment, fault,
-        )
+        );
+        if outcome.is_err() {
+            self.note_joint_subject_audit_refusal();
+        }
+        outcome
+    }
+
+    /// Record one refused ingested-quantum audit (diagnostics): before
+    /// or after the first running re-arm. Instrumentation only.
+    fn note_joint_subject_audit_refusal(&mut self) {
+        if self.joint_first_rearm_seen {
+            self.joint_subject_refusals_after_rearm =
+                self.joint_subject_refusals_after_rearm.saturating_add(1);
+        } else {
+            self.joint_subject_refusals_before_rearm =
+                self.joint_subject_refusals_before_rearm.saturating_add(1);
+        }
     }
 
     /// Take the H3 disposition an ingested quantum's refused audit left

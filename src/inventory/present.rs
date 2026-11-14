@@ -651,6 +651,12 @@ pub(crate) struct Presentation {
     /// Whether the run carries manifests (text only: without one no
     /// semantic start is attempted, so no refusal gap exists).
     pub manifests_present: bool,
+    /// Audit-subject telemetry (additive): staging marks, audits and
+    /// refusals split by the first running re-arm. Renders as the
+    /// top-level `joint_audit_subjects` object; absent when the run
+    /// observed nothing. Counts only, never authority.
+    pub joint_audit_subjects:
+        Option<crate::discovery::engine::inventory_coordinator::JointAuditSubjectDiagnosis>,
 }
 
 /// What an edge's activity label answers (Choice 3).
@@ -1075,6 +1081,10 @@ impl Presentation {
             },
             key_operations_requested: coordinator.key_operations_requested(),
             manifests_present: coordinator.has_manifests(),
+            joint_audit_subjects: {
+                let diagnosis = coordinator.joint_audit_subject_diagnosis();
+                (!diagnosis.is_empty()).then_some(diagnosis)
+            },
         })
     }
 
@@ -4686,6 +4696,12 @@ fn render_snapshot_inner(
         if plain_reason != gap.reason {
             reason = format!("{reason} ({})", escape_controls(&gap.reason));
         }
+        // The re-arm gap merges every continuation into one row: show
+        // its count in text, so a long run cannot hide hundreds of
+        // interruptions behind one line. (JSON carries `repeats` for
+        // every row.)
+        let merged_rearms =
+            gap.subject == crate::inventory_semantics::RUNNING_REARM_SUBJECT && gap.repeats > 1;
         match gap.budget {
             Some(refusal) => {
                 let _ = writeln!(
@@ -4693,6 +4709,9 @@ fn render_snapshot_inner(
                     "gap [{subject}] {reason} (budget {}: limit {}, requested {})",
                     refusal.resource, refusal.limit, refusal.requested,
                 );
+            }
+            None if merged_rearms => {
+                let _ = writeln!(out, "gap [{subject}] {reason} ({} times)", gap.repeats);
             }
             None => {
                 let _ = writeln!(out, "gap [{subject}] {reason}");

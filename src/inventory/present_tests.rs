@@ -2295,6 +2295,103 @@ fn verbose_details_fold_leaves_budgeted_size_gaps_unfolded() {
 }
 
 #[test]
+fn snapshot_merged_rearm_gap_row_shows_its_repeat_count() {
+    // Merged re-arm continuations render once with their count, so
+    // text cannot hide N interruptions behind one line; other
+    // repeated rows keep their single-line shape.
+    let (mut harness, _caller) = single_caller_harness("present-rearm-count", 1);
+    let rearm = RegistryGap {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: crate::inventory_semantics::RUNNING_REARM_SUBJECT.into(),
+        reason: "semantic_unavailable; processes already running keep exact call counts but lose per-key rows for the rest of the run; processes started later are tracked".into(),
+        budget: None,
+    };
+    for _ in 0..5 {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(rearm.clone());
+    }
+    let other = RegistryGap {
+        subject: "fixture repeated row".into(),
+        reason: "the same row twice".into(),
+        ..rearm.clone()
+    };
+    for _ in 0..2 {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(other.clone());
+    }
+    harness.commit();
+    let document = harness.render();
+    let gaps = document["gaps"].as_array().unwrap();
+    let row = gaps
+        .iter()
+        .find(|gap| gap["subject"] == crate::inventory_semantics::RUNNING_REARM_SUBJECT)
+        .expect("the re-arm row publishes");
+    assert_eq!(row["repeats"], 5, "JSON carries the merged count");
+    let presentation = capture_for(&harness, &document);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let gap_lines: Vec<&str> = snapshot
+        .lines()
+        .filter(|line| line.starts_with("gap ["))
+        .collect();
+    assert_eq!(gap_lines.len(), 2, "one line per merged row:\n{snapshot}");
+    let rearm_line = gap_lines
+        .iter()
+        .find(|line| line.contains(crate::inventory_semantics::RUNNING_REARM_SUBJECT))
+        .expect("the re-arm row renders");
+    assert!(
+        rearm_line.ends_with("(5 times)"),
+        "the re-arm row shows its count: {rearm_line}"
+    );
+    let other_line = gap_lines
+        .iter()
+        .find(|line| line.contains("fixture repeated row"))
+        .expect("the other row renders");
+    assert!(
+        !other_line.contains("times)"),
+        "other repeated rows keep their shape: {other_line}"
+    );
+}
+
+#[test]
+fn json_carries_joint_audit_subjects_only_when_observed() {
+    // The additive key is omitted when the run observed nothing and
+    // carries the four counters otherwise.
+    let (mut harness, _caller) = single_caller_harness("present-audit-subjects", 1);
+    harness.commit();
+    let document = harness.render();
+    assert!(
+        document.get("joint_audit_subjects").is_none(),
+        "omitted when unobserved"
+    );
+    let mut presentation = capture_for(&harness, &document);
+    presentation.joint_audit_subjects = Some(
+        crate::discovery::engine::inventory_coordinator::JointAuditSubjectDiagnosis {
+            marks: 7,
+            audits: 11,
+            refusals_before_first_rearm: 3,
+            refusals_after_first_rearm: 5,
+        },
+    );
+    let observed = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(
+        observed["joint_audit_subjects"],
+        serde_json::json!({
+            "marks": 7,
+            "audits": 11,
+            "refusals_before_first_rearm": 3,
+            "refusals_after_first_rearm": 5,
+        })
+    );
+}
+
+#[test]
 fn uncovered_edges_read_neither_idle_nor_armed() {
     // I3 (review): quiet is a fact only under a loss-free count or a
     // watch; armed only where usage is actually covered. Every other

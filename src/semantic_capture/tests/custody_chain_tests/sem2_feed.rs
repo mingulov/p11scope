@@ -15,8 +15,9 @@ use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
-    image_query_refusal_label, joint_audit_refusal_line, joint_births_line, joint_seals_line,
-    joint_taints_line, joint_voids_line, scan_refusals_gap_reason, semantic_stop_line,
+    image_query_refusal_label, joint_audit_refusal_line, joint_audit_subjects_line,
+    joint_births_line, joint_seals_line, joint_taints_line, joint_voids_line,
+    scan_refusals_gap_reason, semantic_stop_line,
 };
 
 #[test]
@@ -380,13 +381,35 @@ fn joint_voids_line_format_is_exact() {
 }
 
 #[test]
+fn joint_audit_subjects_line_format_is_exact() {
+    assert_eq!(
+        joint_audit_subjects_line(0, 0, 0, 0),
+        "p11scope: joint audit subjects: marks=0 audits=0 \
+         refusals_before_first_rearm=0 refusals_after_first_rearm=0"
+    );
+    assert_eq!(
+        joint_audit_subjects_line(7, 11, 3, 5),
+        "p11scope: joint audit subjects: marks=7 audits=11 \
+         refusals_before_first_rearm=3 refusals_after_first_rearm=5"
+    );
+}
+
+#[test]
 fn joint_audit_refusal_line_format_is_exact() {
     assert_eq!(
-        joint_audit_refusal_line("Resource", "Auditing"),
+        joint_audit_refusal_line("Resource", "Auditing", None),
         "p11scope: joint audit refusal: code=Resource at Auditing"
     );
     assert_eq!(
-        joint_audit_refusal_line("H3Undisposed", "Auditing"),
+        joint_audit_refusal_line("H3Undisposed", "Auditing", None),
         "p11scope: joint audit refusal: code=H3Undisposed at Auditing"
+    );
+    assert_eq!(
+        joint_audit_refusal_line("DispositionMismatch", "Auditing", Some("ledger")),
+        "p11scope: joint audit refusal: code=DispositionMismatch at Auditing check=ledger"
+    );
+    assert_eq!(
+        joint_audit_refusal_line("DispositionMismatch", "Audited", Some("origin_frontier")),
+        "p11scope: joint audit refusal: code=DispositionMismatch at Audited check=origin_frontier"
     );
 }

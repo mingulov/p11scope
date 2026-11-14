@@ -1001,6 +1001,14 @@ and never proves an app identity. See the app identity rows of
   `--module` is passed and at least one input matched no mapped file.
   Lists those inputs in operator order. A declared operator choice,
   never a gap or a loss.
+- `joint_audit_subjects` (additive within v1): audit-subject
+  telemetry, present only when the run observed a staging mark, an
+  ingested-quantum audit or an audit refusal. `{marks, audits,
+  refusals_before_first_rearm, refusals_after_first_rearm}` count
+  staging marks committed, audits run, and audit refusals split by
+  whether a running re-arm had happened yet. Counts only, never
+  authority; the verbose text carries the same counts on the
+  `joint audit subjects:` stderr line.
 
 ## Semantic instances (additive within v1)
 

@@ -604,6 +604,25 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// define owner replace/reset semantics; no transfer runs here.
     joint_capture: crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
     joint_publication: Option<PendingJointPublication>,
+    /// Marked S1-only subjects this run (diagnostics): every staging
+    /// mark that committed, for marks-per-audit with
+    /// [`Self::joint_subject_audits`]. Saturating; instrumentation
+    /// only, never authority.
+    joint_subject_marks: u64,
+    /// Ingested-quantum audits this run (diagnostics): every
+    /// [`Self::audit_ingested_quantum`] call. Saturating.
+    joint_subject_audits: u64,
+    /// Audit refusals before the first running re-arm (diagnostics):
+    /// every refused [`Self::audit_ingested_quantum`] call while no
+    /// re-arm had happened yet. Saturating.
+    joint_subject_refusals_before_rearm: u64,
+    /// Audit refusals after the first running re-arm (diagnostics).
+    /// Saturating.
+    joint_subject_refusals_after_rearm: u64,
+    /// A running re-arm happened this run (diagnostics): splits the
+    /// refusal counters above, so a soak can tell whether re-arms
+    /// make later refusals more likely.
+    joint_first_rearm_seen: bool,
     #[cfg(test)]
     refuse_joint_finish_publication_once: bool,
     /// Optional hints retain only their own identity-qualified source state.
@@ -1080,6 +1099,34 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
     }
 }
 
+/// Audit-subject telemetry (diagnostics): staging marks committed,
+/// ingested-quantum audits run, and audit refusals split by whether
+/// a running re-arm had happened yet. Counts only; no identities.
+/// Disclosed on stderr when verbose text is requested and as the
+/// additive `joint_audit_subjects` JSON key, never a contract.
+/// Instrumentation only: it changes no Joint decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct JointAuditSubjectDiagnosis {
+    /// Staging marks that committed.
+    pub(crate) marks: u64,
+    /// Ingested-quantum audits run.
+    pub(crate) audits: u64,
+    /// Audit refusals before the first running re-arm.
+    pub(crate) refusals_before_first_rearm: u64,
+    /// Audit refusals after the first running re-arm.
+    pub(crate) refusals_after_first_rearm: u64,
+}
+
+impl JointAuditSubjectDiagnosis {
+    /// No mark, audit or refusal observed yet.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.marks == 0
+            && self.audits == 0
+            && self.refusals_before_first_rearm == 0
+            && self.refusals_after_first_rearm == 0
+    }
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     // Retain the default constructor for existing internal harness callers;
     // the public runtime always supplies its already-resolved budget.
@@ -1170,6 +1217,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             semantic_finalizer: None,
             joint_capture,
             joint_publication: None,
+            joint_subject_marks: 0,
+            joint_subject_audits: 0,
+            joint_subject_refusals_before_rearm: 0,
+            joint_subject_refusals_after_rearm: 0,
+            joint_first_rearm_seen: false,
             #[cfg(test)]
             refuse_joint_finish_publication_once: false,
             caller_metadata: None,
@@ -3179,6 +3231,37 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 );
             }
         }
+    }
+
+    /// First failing audit conjunct for a marked S1-only subject, if
+    /// any (diagnostics): re-reads live adapter state at the refused
+    /// quantum's frontier, so the verbose audit-refusal line names
+    /// which check disagreed with the mark.
+    pub(crate) fn joint_s1only_mismatch_detail(
+        &self,
+        frontier: crate::semantics_objects::journal::ConsumptionOrdinal,
+    ) -> Option<&'static str> {
+        self.joint_capture
+            .adapter()
+            .s1only_subject_mismatch_detail(frontier)
+    }
+
+    /// Audit-subject telemetry: marks, audits and refusals split by
+    /// the first running re-arm (diagnostics).
+    pub(crate) fn joint_audit_subject_diagnosis(&self) -> JointAuditSubjectDiagnosis {
+        JointAuditSubjectDiagnosis {
+            marks: self.joint_subject_marks,
+            audits: self.joint_subject_audits,
+            refusals_before_first_rearm: self.joint_subject_refusals_before_rearm,
+            refusals_after_first_rearm: self.joint_subject_refusals_after_rearm,
+        }
+    }
+
+    /// Record that a running re-arm happened (diagnostics): later
+    /// audit refusals count as after the first re-arm. Called by the
+    /// machine on every re-arm success; instrumentation only.
+    pub(crate) fn note_joint_running_rearm(&mut self) {
+        self.joint_first_rearm_seen = true;
     }
 
     /// First birth-registration `Capacity` arm and table sizes

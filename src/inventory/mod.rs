@@ -2049,6 +2049,13 @@ fn run_with_terminal_budget(
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
+        let subjects = coordinator.joint_audit_subject_diagnosis();
+        inventory_diagnostic(&crate::inventory_semantics::joint_audit_subjects_line(
+            subjects.marks,
+            subjects.audits,
+            subjects.refusals_before_first_rearm,
+            subjects.refusals_after_first_rearm,
+        ));
     }
     // Output attempts first; only then may an unsettled retirement's drop
     // block (invariant 5), and a further signal then exits at once
@@ -4910,21 +4917,23 @@ impl ClassicDriver<'_> {
     /// Verbose-only audit-refusal disclosure for a latched Joint
     /// lane: when the audit step itself refused, name its internal
     /// preflight code (`Resource`, `H3Undisposed`, ...) so a soak can
-    /// tell a full pool from an undisposed slot. Stderr only (never a
-    /// gap or report field) and only under verbose text or capture
-    /// diagnostics; silent when the refusal came from the native
-    /// construction instead of the audit.
+    /// tell a full pool from an undisposed slot, plus which subject
+    /// check disagreed with a mark for the subject check. Stderr only
+    /// (never a gap or report field) and only under verbose text or
+    /// capture diagnostics; silent when the refusal came from the
+    /// native construction instead of the audit.
     fn disclose_joint_audit_refusal(
         warn: &mut WarnSink<'_>,
         code: Option<&str>,
         phase: Option<&str>,
+        detail: Option<&str>,
     ) {
         let (Some(code), Some(phase)) = (code, phase) else {
             return;
         };
         if crate::run::capture_diagnostics_on() {
             warn.emit(&crate::inventory_semantics::joint_audit_refusal_line(
-                code, phase,
+                code, phase, detail,
             ));
         }
     }
@@ -4953,10 +4962,15 @@ impl ClassicDriver<'_> {
         }
         match refusal {
             Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent) => {
+                let limit = crate::inventory_semantics::RUNNING_REARM_LIMIT;
                 suffix.push_str(&format!(
-                    "; the lane stops: it already continued past {} in the last 10 minutes (the re-arm rate limit)",
-                    interruptions(crate::inventory_semantics::RUNNING_REARM_LIMIT)
+                    "; the lane stops: it already continued past {} in the last 2 minutes (the limit is {} per 2 minutes)",
+                    interruptions(limit),
+                    interruptions(limit),
                 ));
+                if rearms > limit {
+                    suffix.push_str(&format!("; {rearms} in this run"));
+                }
             }
             Some(reason) => {
                 if rearms != 0 {
@@ -5016,9 +5030,13 @@ impl ClassicDriver<'_> {
         let coordinator = &mut *self.coordinator;
         // The verbose-only audit code, read before the re-arm attempt:
         // a success clears the latch it names.
-        let (audit_code, audit_phase) = match self.semantic.as_ref() {
-            Some(lane) => (lane.joint_audit_refusal(), lane.joint_latched_phase()),
-            None => (None, None),
+        let (audit_code, audit_phase, audit_detail) = match self.semantic.as_ref() {
+            Some(lane) => (
+                lane.joint_audit_refusal(),
+                lane.joint_latched_phase(),
+                lane.joint_audit_refusal_detail(),
+            ),
+            None => (None, None, None),
         };
         let rearmed = self
             .semantic
@@ -5038,7 +5056,12 @@ impl ClassicDriver<'_> {
                 let mut warn = WarnSink {
                     display: &mut self.display,
                 };
-                Self::disclose_joint_audit_refusal(&mut warn, audit_code, audit_phase);
+                Self::disclose_joint_audit_refusal(
+                    &mut warn,
+                    audit_code,
+                    audit_phase,
+                    audit_detail,
+                );
             }
             if published {
                 self.joint_commit_pending = false;
@@ -5050,7 +5073,7 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut self.display,
         };
-        Self::disclose_joint_audit_refusal(&mut warn, audit_code, audit_phase);
+        Self::disclose_joint_audit_refusal(&mut warn, audit_code, audit_phase, audit_detail);
         let lane = self.semantic.take().expect("a joint lane is seated");
         let rearms = lane.joint_running_rearms();
         let latched_at = lane.joint_latched_phase();
@@ -5237,6 +5260,7 @@ impl ClassicDriver<'_> {
                         &mut *warn,
                         inner.joint_audit_refusal(),
                         inner.joint_latched_phase(),
+                        inner.joint_audit_refusal_detail(),
                     );
                     let live = lane.take().expect("a failed lane holds");
                     let (_, summary) = Self::hold_joint_lane_for_exit(
@@ -9118,6 +9142,13 @@ fn run_dashboard(
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
+        let subjects = coordinator.joint_audit_subject_diagnosis();
+        display.notice(&crate::inventory_semantics::joint_audit_subjects_line(
+            subjects.marks,
+            subjects.audits,
+            subjects.refusals_before_first_rearm,
+            subjects.refusals_after_first_rearm,
+        ));
     }
     // Output attempts first (R-C51-4), silent text: the live view showed it.
     let previously_reported = stream.first_error().map(str::to_string);
@@ -10007,6 +10038,17 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
     if !presentation.unmatched_modules.is_empty() {
         document["unmatched_modules"] =
             serde_json::to_value(&presentation.unmatched_modules).unwrap_or_default();
+    }
+    // Additive: audit-subject telemetry (staging marks, audits and
+    // refusals split by the first running re-arm). Omitted when the
+    // run observed nothing. Counts only, never authority.
+    if let Some(subjects) = &presentation.joint_audit_subjects {
+        document["joint_audit_subjects"] = serde_json::json!({
+            "marks": subjects.marks,
+            "audits": subjects.audits,
+            "refusals_before_first_rearm": subjects.refusals_before_first_rearm,
+            "refusals_after_first_rearm": subjects.refusals_after_first_rearm,
+        });
     }
     // Additive (B17 leg 2): the staged reload disclosure, absent without
     // a producer. One call site; the helper owns the shape.
@@ -21097,7 +21139,7 @@ mod tests {
                 crate::inventory_semantics::RUNNING_REARM_LIMIT,
                 Some(RunningRearmRefusal::BoundSpent),
             ),
-            " at Audited; the lane stops: it already continued past 32 interruptions in the last 10 minutes (the re-arm rate limit)",
+            " at Audited; the lane stops: it already continued past 32 interruptions in the last 2 minutes (the limit is 32 interruptions per 2 minutes)",
         );
         assert_eq!(
             ClassicDriver::joint_lane_stop_suffix(
@@ -21130,14 +21172,29 @@ mod tests {
     fn joint_lane_stop_suffix_counts_rearms_at_the_rate_bound_stop() {
         use crate::inventory_semantics::RunningRearmRefusal;
         // The rate-bound stop names the window and its count: 32
-        // interruptions inside the last 10 minutes stopped the lane.
+        // interruptions inside the last 2 minutes stopped the lane.
+        // A run whose total passed the window count discloses the
+        // run total too, so a later stop cannot understate it.
+        assert_eq!(
+            crate::inventory_semantics::RUNNING_REARM_WINDOW,
+            std::time::Duration::from_secs(120),
+            "the stop sentence's 2-minute window matches the bound"
+        );
         assert_eq!(
             ClassicDriver::joint_lane_stop_suffix(
                 Some("Auditing"),
                 crate::inventory_semantics::RUNNING_REARM_LIMIT,
                 Some(RunningRearmRefusal::BoundSpent),
             ),
-            " at Auditing; the lane stops: it already continued past 32 interruptions in the last 10 minutes (the re-arm rate limit)",
+            " at Auditing; the lane stops: it already continued past 32 interruptions in the last 2 minutes (the limit is 32 interruptions per 2 minutes)",
+        );
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(
+                Some("Auditing"),
+                crate::inventory_semantics::RUNNING_REARM_LIMIT + 13,
+                Some(RunningRearmRefusal::BoundSpent),
+            ),
+            " at Auditing; the lane stops: it already continued past 32 interruptions in the last 2 minutes (the limit is 32 interruptions per 2 minutes); 45 in this run",
         );
     }
 
@@ -21185,7 +21242,7 @@ mod tests {
             ),
             (
                 RunningRearmRefusal::H3SlotHeld,
-                "the refused audit's evidence was still held for another producer",
+                "the interrupted work was still held for another part of the capture",
             ),
         ] {
             assert_eq!(
@@ -21196,12 +21253,12 @@ mod tests {
         }
         assert_eq!(
             ClassicDriver::joint_lane_stop_suffix(None, 0, Some(RunningRearmRefusal::BoundSpent),),
-            "; the lane stops: it already continued past 32 interruptions in the last 10 minutes (the re-arm rate limit)",
+            "; the lane stops: it already continued past 32 interruptions in the last 2 minutes (the limit is 32 interruptions per 2 minutes)",
             "the bound renders the count sentence",
         );
         assert_eq!(
             RunningRearmRefusal::BoundSpent.describe(),
-            "the re-arm rate limit was already spent",
+            "the interruption limit was already spent",
             "the bound keeps its standalone clause",
         );
     }
@@ -21240,7 +21297,7 @@ mod tests {
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
             stops[0].1,
-            "semantic_unavailable at Audited; the lane stops: it already continued past 32 interruptions in the last 10 minutes (the re-arm rate limit); broad inventory continues; semantic probes stay attached until exit",
+            "semantic_unavailable at Audited; the lane stops: it already continued past 32 interruptions in the last 2 minutes (the limit is 32 interruptions per 2 minutes); broad inventory continues; semantic probes stay attached until exit",
             "the gap names the spent limit as the stop cause"
         );
     }

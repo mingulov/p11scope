@@ -2888,30 +2888,71 @@ impl JournalAdapter {
     /// changing the model. A marker never excuses an incomplete, converted,
     /// foreign or colliding original; only its exact own claim may remain.
     fn s1only_subjects_are_owned(&self, frontier: ConsumptionOrdinal) -> bool {
-        self.open.values().all(|entry| {
-            let Some(key) = entry.s1only_subject else {
-                return true;
-            };
+        self.s1only_subject_mismatch_detail(frontier).is_none()
+    }
+
+    /// First failing audit conjunct for a marked S1-only subject, if
+    /// any: the same checks as [`Self::s1only_subjects_are_owned`], in
+    /// the same order, naming the disagreement instead of refusing
+    /// silently. The mark read a subset of these (no frontier bounds,
+    /// the admitted reservation instead of the entry's, fingerprint
+    /// shape instead of event shape), so the label tells the next
+    /// soak which side's premise broke. Diagnostic only: a re-read
+    /// of live state, never authority.
+    pub(crate) fn s1only_subject_mismatch_detail(
+        &self,
+        frontier: ConsumptionOrdinal,
+    ) -> Option<&'static str> {
+        self.open.values().find_map(|entry| {
+            let key = entry.s1only_subject?;
             let (Some(end), Some(origin), Some(resource)) =
                 (entry.end, entry.collected_origin, entry.raw_resource)
             else {
-                return false;
+                return Some("end_origin_resource");
             };
-            entry.image == (key.cookie, key.exec)
-                && origin.position() <= frontier.0
-                && end.ordinal <= frontier.0
-                && end_agrees_with_begin(&entry.begin, &end.end)
-                && event_names_shape(&shape_of_entry(entry), &end.end.payload_base().event)
-                && entry.call_key.is_none()
-                && entry.converted_ticket.is_none()
-                && entry.converted_for.is_none()
-                && !entry.end_converted
-                && entry.abandon.is_none()
-                && entry.corroborated_return.is_none()
-                && self.s1only_original_claim(entry, key).is_some()
-                && self
-                    .ledger
-                    .matches_unconverted_original(entry.begin_ordinal, &resource, None)
+            if entry.image != (key.cookie, key.exec) {
+                return Some("image");
+            }
+            if origin.position() > frontier.0 {
+                return Some("origin_frontier");
+            }
+            if end.ordinal > frontier.0 {
+                return Some("end_frontier");
+            }
+            if !end_agrees_with_begin(&entry.begin, &end.end) {
+                return Some("end_begin");
+            }
+            if !event_names_shape(&shape_of_entry(entry), &end.end.payload_base().event) {
+                return Some("event_shape");
+            }
+            if entry.call_key.is_some() {
+                return Some("call_key");
+            }
+            if entry.converted_ticket.is_some() {
+                return Some("converted_ticket");
+            }
+            if entry.converted_for.is_some() {
+                return Some("converted_for");
+            }
+            if entry.end_converted {
+                return Some("end_converted");
+            }
+            if entry.abandon.is_some() {
+                return Some("abandon");
+            }
+            if entry.corroborated_return.is_some() {
+                return Some("corroborated_return");
+            }
+            if self.s1only_original_claim(entry, key).is_none() {
+                return Some("claim");
+            }
+            if !self
+                .ledger
+                .matches_unconverted_original(entry.begin_ordinal, &resource, None)
+            {
+                return Some("ledger");
+            }
+            None
         })
     }
 

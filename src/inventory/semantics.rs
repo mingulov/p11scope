@@ -16,7 +16,7 @@ pub(crate) use joint::{
     EVENTS_STAGE_SATURATED_REASON, EVENTS_STAGE_SATURATED_SUBJECT,
     JOINT_FINISH_NO_PROGRESS_TIMEOUT, JOINT_FINISH_SETTLE_TIMEOUT, JointCommitRefusal,
     JointServiceMode, JointServiceProgress, JointWorkBudget, RUNNING_REARM_LIMIT,
-    RunningRearmRefusal,
+    RUNNING_REARM_SUBJECT, RUNNING_REARM_WINDOW, RunningRearmRefusal,
 };
 pub(crate) use joint::{
     JointCommitIo, JointContinuationView, RetainedJointBirths, bind_semantic_callers_inner,
@@ -1898,16 +1898,43 @@ pub(crate) fn joint_voids_line(
     )
 }
 
+/// One stderr line for the diagnostic audit-subject summary:
+/// staging marks committed, ingested-quantum audits run, and audit
+/// refusals split by whether a running re-arm had happened yet.
+/// Counts only; no identities, paths or payloads. Diagnostic-only:
+/// printed beside the Joint-void summary only when verbose text is
+/// requested, never a contract. The additive `joint_audit_subjects`
+/// JSON key carries the same counts.
+pub(crate) fn joint_audit_subjects_line(
+    marks: u64,
+    audits: u64,
+    refusals_before_first_rearm: u64,
+    refusals_after_first_rearm: u64,
+) -> String {
+    format!(
+        "p11scope: joint audit subjects: marks={marks} audits={audits} \
+         refusals_before_first_rearm={refusals_before_first_rearm} \
+         refusals_after_first_rearm={refusals_after_first_rearm}"
+    )
+}
+
 /// One stderr line for the diagnostic audit-refusal code: the audit
 /// step's internal preflight refusal (`Resource`, `H3Undisposed`,
-/// ...) at the latched phase. One frozen code plus one frozen phase
-/// label only; no identities, paths or payloads. Diagnostic-only:
-/// printed beside the re-arm note or the stop gap only when verbose
-/// text or capture diagnostics are requested, never a contract and
-/// never in reports. Absent when the refusal came from the native
-/// construction instead of the audit itself.
-pub(crate) fn joint_audit_refusal_line(code: &str, phase: &str) -> String {
-    format!("p11scope: joint audit refusal: code={code} at {phase}")
+/// ...) at the latched phase, plus which subject check disagreed
+/// with a mark when the code is the subject check
+/// (`DispositionMismatch`). Frozen labels only; no identities, paths
+/// or payloads. Diagnostic-only: printed beside the re-arm note or
+/// the stop gap only when verbose text or capture diagnostics are
+/// requested, never a contract and never in reports. Absent when the
+/// refusal came from the native construction instead of the audit
+/// itself.
+pub(crate) fn joint_audit_refusal_line(code: &str, phase: &str, detail: Option<&str>) -> String {
+    match detail {
+        Some(check) => {
+            format!("p11scope: joint audit refusal: code={code} at {phase} check={check}")
+        }
+        None => format!("p11scope: joint audit refusal: code={code} at {phase}"),
+    }
 }
 
 /// One stderr line for the diagnostic ingest-taint summary:

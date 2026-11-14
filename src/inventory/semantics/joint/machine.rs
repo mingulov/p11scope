@@ -66,13 +66,16 @@ pub(crate) const MAX_UNPAID_VOID_YIELDS: u32 = 64;
 /// and the lane is held, named. A rate, not a run total: a long run
 /// with sparse interruptions never stops for its age, while a dense
 /// storm (back-to-back re-arms) still stops. Sized from the heavy
-/// soaks: runs that stopped hit 32 re-arms within nine minutes, runs
-/// that finished stayed at 27 per sixteen minutes or fewer, and a
-/// truly stuck lane re-arms every pass (tens per minute).
+/// soaks: the stopping runs re-armed about 4 times per minute (32
+/// over eight minutes), so the window admits that pace, while a
+/// truly stuck lane re-arming every pass (tens per minute) still
+/// stops within about 80 s.
 pub(crate) const RUNNING_REARM_LIMIT: u32 = 32;
 /// Rolling window of the running re-arm bound: at most
-/// [`RUNNING_REARM_LIMIT`] re-arms per window.
-pub(crate) const RUNNING_REARM_WINDOW: Duration = Duration::from_secs(600);
+/// [`RUNNING_REARM_LIMIT`] re-arms per window, measured on the
+/// suspend-tolerant boot clock, so "in the last 2 minutes" stays
+/// true in wall time across a suspend.
+pub(crate) const RUNNING_REARM_WINDOW: Duration = Duration::from_secs(120);
 /// Gap subject of one abandoned running quantum the lane continued past.
 pub(crate) const RUNNING_REARM_SUBJECT: &str = "semantic quantum abandoned; lane continues";
 
@@ -131,11 +134,13 @@ impl RunningRearmRefusal {
             Self::WatchdogTripped => "a no-progress trip was already standing",
             Self::FrameMissing => "the audited pass had nothing left to abandon",
             Self::WrongPhase => "only a refusal at the audit step can be continued past",
-            Self::BoundSpent => "the re-arm rate limit was already spent",
+            Self::BoundSpent => "the interruption limit was already spent",
             Self::LaneNotLive => "the lane was no longer live",
             Self::CannotResync => "the journal stream could not re-sync",
             Self::PublicationPending => "the unfinished pass was still standing after the abandon",
-            Self::H3SlotHeld => "the refused audit's evidence was still held for another producer",
+            Self::H3SlotHeld => {
+                "the interrupted work was still held for another part of the capture"
+            }
         }
     }
 }
@@ -1396,14 +1401,15 @@ pub(crate) struct LiveJointMachine {
     /// Running quanta abandoned and re-armed past in this run: the
     /// stop gap's count. The rate window bounds, not this total.
     running_rearms: u32,
-    /// Stamps of the re-arms inside the current [`RUNNING_REARM_WINDOW`]:
-    /// a fixed ring, so the window costs no heap past the machine's own
-    /// pool reservation. `None` slots are free or expired.
-    rearm_window: [Option<Instant>; RUNNING_REARM_LIMIT as usize],
-    /// Posed monotonic clock for the running re-arm window (tests only):
-    /// production always reads `Instant::now()`.
+    /// Stamps of the re-arms inside the current [`RUNNING_REARM_WINDOW`],
+    /// in boot-clock nanoseconds: a fixed ring, so the window costs no
+    /// heap past the machine's own pool reservation. `None` slots are
+    /// free or expired.
+    rearm_window: [Option<u64>; RUNNING_REARM_LIMIT as usize],
+    /// Posed boot clock for the running re-arm window (tests only):
+    /// production always reads the boot clock.
     #[cfg(test)]
-    posed_rearm_now: Option<Instant>,
+    posed_rearm_now: Option<u64>,
     /// Why the last attempted running re-arm was refused, for the
     /// stop gap. A success clears it; a call with no latched
     /// disposition attempts nothing and leaves it alone.
@@ -1417,6 +1423,13 @@ pub(crate) struct LiveJointMachine {
     /// later audit success or re-arm clears it, so no later stop can
     /// show a stale code.
     audit_refusal: Option<&'static str>,
+    /// Which audit conjunct disagreed with a mark when the latched
+    /// refusal is the subject check (`DispositionMismatch`): the
+    /// first failing check's frozen label (`ledger`, `claim`,
+    /// `origin_frontier`, ...), re-read at the refused quantum's
+    /// frontier. `None` for every other code. Cleared with
+    /// [`Self::audit_refusal`]; diagnostic only, never in reports.
+    audit_refusal_detail: Option<&'static str>,
     #[cfg(test)]
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
@@ -1504,6 +1517,7 @@ impl LiveJointMachine {
             posed_rearm_now: None,
             rearm_refusal: None,
             audit_refusal: None,
+            audit_refusal_detail: None,
             #[cfg(test)]
             refuse_finish_q_merge_once: false,
             #[cfg(test)]
@@ -1554,29 +1568,33 @@ impl LiveJointMachine {
         self.finish_no_progress_since = since;
     }
 
-    /// Pose (or clear) the monotonic clock the running re-arm window
+    /// Pose (or clear) the boot clock the running re-arm window
     /// reads, so the twin can age re-arms past the window without
     /// waiting it out. Production never sets this.
     #[cfg(test)]
-    pub(crate) fn set_rearm_clock_for_test(&mut self, now: Option<Instant>) {
+    pub(crate) fn set_rearm_clock_for_test(&mut self, now: Option<u64>) {
         self.posed_rearm_now = now;
     }
 
-    /// Monotonic clock for the running re-arm window: the posed
-    /// monotonic test clock when set, else `Instant::now()`.
-    pub(crate) fn rearm_now(&self) -> Instant {
+    /// Boot clock for the running re-arm window, in nanoseconds: the
+    /// posed test clock when set, else `CLOCK_BOOTTIME`, which keeps
+    /// ticking across a suspend. `None` exactly when the clock read
+    /// fails; the gate then fails closed.
+    pub(crate) fn rearm_now(&self) -> Option<u64> {
         #[cfg(test)]
         if let Some(now) = self.posed_rearm_now {
-            return now;
+            return Some(now);
         }
-        Instant::now()
+        crate::discovery::pause::boot_ns()
     }
 
     /// Drop the re-arm stamps older than [`RUNNING_REARM_WINDOW`], so
     /// only the current rate counts against the bound.
-    fn prune_rearm_window(&mut self, now: Instant) {
+    fn prune_rearm_window(&mut self, now: u64) {
         for slot in &mut self.rearm_window {
-            if slot.is_some_and(|stamp| now.duration_since(stamp) >= RUNNING_REARM_WINDOW) {
+            if slot.is_some_and(|stamp| {
+                Duration::from_nanos(now.saturating_sub(stamp)) >= RUNNING_REARM_WINDOW
+            }) {
                 *slot = None;
             }
         }
@@ -1767,7 +1785,12 @@ impl LiveJointMachine {
             self.rearm_refusal = Some(refusal);
             return None;
         }
-        let now = self.rearm_now();
+        // An unreadable clock fails closed: without a stamp the
+        // window cannot bound, so the lane stops, named.
+        let Some(now) = self.rearm_now() else {
+            self.rearm_refusal = Some(RunningRearmRefusal::BoundSpent);
+            return None;
+        };
         self.prune_rearm_window(now);
         if self.rearm_window.iter().all(Option::is_some) {
             self.rearm_refusal = Some(RunningRearmRefusal::BoundSpent);
@@ -1844,6 +1867,8 @@ impl LiveJointMachine {
         self.unpaid_void_yields = 0;
         // The window bounds; the total only counts, so it saturates, never wraps.
         self.running_rearms = self.running_rearms.saturating_add(1);
+        // Diagnostic-only: later audit refusals count as after re-arm.
+        coordinator.note_joint_running_rearm();
         let slot = self
             .rearm_window
             .iter_mut()
@@ -1853,6 +1878,7 @@ impl LiveJointMachine {
         self.rearm_refusal = None;
         // The re-arm consumed the latch; a later stop must not show its code.
         self.audit_refusal = None;
+        self.audit_refusal_detail = None;
         coordinator.note_scope_gap(
             RUNNING_REARM_SUBJECT.to_string(),
             format!(
@@ -1927,6 +1953,13 @@ impl LiveJointMachine {
     /// The driver discloses it on the verbose-only diagnostic line.
     pub(crate) fn audit_refusal(&self) -> Option<&'static str> {
         self.audit_refusal
+    }
+
+    /// Which audit conjunct disagreed with a mark, when the latched
+    /// refusal is the subject check. The driver discloses it beside
+    /// the code on the verbose-only diagnostic line.
+    pub(crate) fn audit_refusal_detail(&self) -> Option<&'static str> {
+        self.audit_refusal_detail
     }
 
     /// Whether a Finish began and still owns its control.
@@ -4062,6 +4095,7 @@ impl LiveJointMachine {
                 match result {
                     Ok(Ok(frame)) => {
                         self.audit_refusal = None;
+                        self.audit_refusal_detail = None;
                         (
                             Phase::Audited {
                                 frame: Some(frame),
@@ -4073,6 +4107,15 @@ impl LiveJointMachine {
                     }
                     Ok(Err((ingested, reason))) => {
                         self.audit_refusal = Some(reason.code());
+                        // Name which subject check disagreed with the
+                        // mark, re-read at the refused quantum's
+                        // frontier; other codes carry no subject.
+                        self.audit_refusal_detail =
+                            if reason == RawQuantumRefusal::DispositionMismatch {
+                                coordinator.joint_s1only_mismatch_detail(ingested.frontier())
+                            } else {
+                                None
+                            };
                         (
                             Phase::Auditing {
                                 original: ingested,
@@ -5316,6 +5359,16 @@ impl AttestedSemanticLane {
             .as_deref()
             .and_then(|live| live.joint_machine.as_ref())
             .and_then(LiveJointMachine::audit_refusal)
+    }
+
+    /// Which audit conjunct disagreed with a mark, when the latched
+    /// refusal is the subject check. The driver discloses it beside
+    /// the code on the verbose-only diagnostic line.
+    pub(crate) fn joint_audit_refusal_detail(&self) -> Option<&'static str> {
+        self.live
+            .as_deref()
+            .and_then(|live| live.joint_machine.as_ref())
+            .and_then(LiveJointMachine::audit_refusal_detail)
     }
 
     /// Re-arm this lane's latched running machine past one transient

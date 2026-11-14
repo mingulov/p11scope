@@ -1378,16 +1378,21 @@ fn riding_gaps<'a>(
 }
 
 /// One gap as its snapshot line verbatim (`gap [{subject}] {reason}`
-/// plus the budget clause when the gap records a refusal),
+/// plus the budget clause when the gap records a refusal, or the
+/// `(N times)` count when merged re-arms share one row),
 /// control-escaped for the terminal.
 fn gap_item(gap: &crate::inventory_present::GapView) -> String {
     let subject = escape_controls(&gap.subject);
     let reason = escape_controls(&gap.reason);
+    // Like the snapshot text: a merged re-arm row shows its count.
+    let merged_rearms =
+        gap.subject == crate::inventory_semantics::RUNNING_REARM_SUBJECT && gap.repeats > 1;
     match gap.budget {
         Some(refusal) => format!(
             "gap [{subject}] {reason} (budget {}: limit {}, requested {})",
             refusal.resource, refusal.limit, refusal.requested,
         ),
+        None if merged_rearms => format!("gap [{subject}] {reason} ({} times)", gap.repeats),
         None => format!("gap [{subject}] {reason}"),
     }
 }

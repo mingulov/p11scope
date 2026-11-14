@@ -157,6 +157,229 @@ fn joint_h8_absent_s1only_stages_without_disposition() {
     assert!(coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
 }
 
+/// Retained twin: a mark through an older allocation agrees with the
+/// audit. The first quantum's admission still owns its exact physical
+/// H8 entry when the second quantum ingests, so the seam admits it as
+/// retained, the disposition marks it exactly once, and the audit
+/// check reports no disagreement.
+#[test]
+fn joint_retained_older_allocation_mark_agrees_with_audit() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let older = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .unwrap()
+        .clone();
+    let (ingested1, _proof, grant) = fixture.ingest_with_grant(raw1);
+    assert!(
+        ingested1.matches_admission(&older),
+        "the older admission is the first quantum's own"
+    );
+    // The second quantum ingests over the same grant without a second
+    // prepared batch (the first is still pending): its identity is
+    // newer, while the older entry stays open and unclaimed. The tick
+    // delivers H0 into the raw; its batch is discarded, since staging
+    // would backpressure on the still-pending first batch.
+    fixture.push(pid, 0, "C_SignInit", 2);
+    let raw2 = fixture.collect_with_fault(&BirthFault);
+    fixture.real.h0.0.borrow_mut().collected = Some(raw2);
+    let _batch2 = fixture.real.tick();
+    let raw2 = fixture
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .expect("the tick returns the collected raw");
+    let ingested2 = raw2
+        .ingest(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.producers,
+            &grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("the second quantum ingests: {reason:?}"));
+    assert!(
+        !ingested2.matches_admission(&older),
+        "the older admission belongs to the first allocation"
+    );
+    assert!(
+        ingested2.matches_retained_admission(
+            &older,
+            fixture.real.scene.coordinator.joint_capture().adapter()
+        ),
+        "the older admission still owns its exact H8 entry"
+    );
+    {
+        let coordinator = &mut fixture.real.scene.coordinator;
+        let (_, owner) = coordinator.prepared_joint_parts().unwrap();
+        ingested2
+            .disposition_s1only_original(owner.adapter_mut(), &fixture.producers, &older)
+            .expect("the retained admission marks")
+            .consume_for(&older)
+            .expect("the mark commits");
+    }
+    {
+        let coordinator = &mut fixture.real.scene.coordinator;
+        let (_, owner) = coordinator.prepared_joint_parts().unwrap();
+        let refusal = match ingested2.disposition_s1only_original(
+            owner.adapter_mut(),
+            &fixture.producers,
+            &older,
+        ) {
+            Ok(_) => panic!("the retained entry is already marked"),
+            Err(refusal) => refusal,
+        };
+        assert_eq!(
+            refusal,
+            RawQuantumRefusal::DispositionMismatch,
+            "the retained entry is marked exactly once"
+        );
+    }
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .joint_s1only_mismatch_detail(ingested2.frontier()),
+        None,
+        "the retained mark agrees with the audit check"
+    );
+}
+
+/// Label twin: the audit check names its disagreement. After two
+/// quanta, a current-allocation mark agrees at the newer frontier;
+/// at the older frontier the same state reports the end check, whose
+/// ordinal the older frontier still bounds.
+#[test]
+fn joint_audit_subject_check_names_the_frontier_disagreement() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let (ingested1, _proof) = fixture.ingest(raw1);
+    let frontier1 = ingested1.frontier();
+    audit_handoff::claim_and_finish(&mut fixture, &ingested1);
+    fixture.push(pid, 0, "C_SignInit", 2);
+    let raw2 = fixture.prepare(1);
+    let current = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .unwrap()
+        .clone();
+    let (ingested2, _proof2) = fixture.ingest(raw2);
+    let frontier2 = ingested2.frontier();
+    assert!(
+        ingested2.matches_admission(&current),
+        "the second admission is the second quantum's own"
+    );
+    {
+        let coordinator = &mut fixture.real.scene.coordinator;
+        let (_, owner) = coordinator.prepared_joint_parts().unwrap();
+        ingested2
+            .disposition_s1only_original(owner.adapter_mut(), &fixture.producers, &current)
+            .expect("the current admission marks")
+            .consume_for(&current)
+            .expect("the mark commits");
+    }
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .joint_s1only_mismatch_detail(frontier2),
+        None,
+        "the mark agrees with the audit check"
+    );
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .joint_s1only_mismatch_detail(frontier1),
+        Some("end_frontier"),
+        "the older frontier names its check"
+    );
+}
+
+/// Counter twin: audits count every call and refusals split by the
+/// first running re-arm. Two undisposed audits with a re-arm note
+/// between them count 2 audits, 1 refusal before and 1 after.
+#[test]
+fn joint_audit_subject_counters_split_refusals_by_first_rearm() {
+    let mut fixture = JointScene::for_audit(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw = fixture.prepare(1);
+    let (ingested, _proof) = fixture.ingest(raw);
+    let attached = audit_handoff::attachment(&mut fixture);
+    let (ingested, reason) = match fixture.real.scene.coordinator.audit_ingested_quantum(
+        ingested,
+        &fixture.producers,
+        &attached,
+        &BirthFault,
+    ) {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("the pre-claim audit refuses undisposed"),
+    };
+    assert_eq!(
+        reason,
+        RawQuantumRefusal::H3Undisposed,
+        "the pre-claim audit refuses undisposed"
+    );
+    fixture.real.scene.coordinator.note_joint_running_rearm();
+    let (_ingested, reason) = match fixture.real.scene.coordinator.audit_ingested_quantum(
+        ingested,
+        &fixture.producers,
+        &attached,
+        &BirthFault,
+    ) {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("the second audit refuses the same way"),
+    };
+    assert_eq!(
+        reason,
+        RawQuantumRefusal::H3Undisposed,
+        "the second audit refuses the same way"
+    );
+    let diagnosis = fixture
+        .real
+        .scene
+        .coordinator
+        .joint_audit_subject_diagnosis();
+    assert_eq!(diagnosis.marks, 0, "no staging mark ran");
+    assert_eq!(diagnosis.audits, 2, "both audits count");
+    assert_eq!(
+        diagnosis.refusals_before_first_rearm, 1,
+        "the first refusal predates the re-arm"
+    );
+    assert_eq!(
+        diagnosis.refusals_after_first_rearm, 1,
+        "the second refusal follows it"
+    );
+}
+
 impl JointScene {
     fn new(providers: usize) -> Self {
         Self::from_held(

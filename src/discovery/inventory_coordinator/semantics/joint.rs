@@ -1791,6 +1791,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ingested
                 .disposition_s1only_original(adapter, producers, input)?
                 .consume_for(input)?;
+            // Diagnostic-only: the mark committed.
+            self.joint_subject_marks = self.joint_subject_marks.saturating_add(1);
         }
         Ok(
             batch.stage_next(&mut self.registry, &mut state.seal_admission, |caller| {

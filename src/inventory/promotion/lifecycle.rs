@@ -1354,6 +1354,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         prearm: Vec::new(),
         key_operations_requested: false,
         manifests_present: false,
+        joint_audit_subjects: None,
     };
     std::sync::Arc::new(super::PromotionView::new(
         super::CaptureId::new(11),

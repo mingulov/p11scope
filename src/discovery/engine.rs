@@ -1141,6 +1141,14 @@ pub struct Engine {
     /// through this seam instead of racing the clock.
     #[cfg(test)]
     initial_arming_window_ms_for_test: Option<u64>,
+    /// Tapped `LEADER_EXIT`/`_MAPPINGS` records awaiting transfer to the
+    /// process tracker, in dispatch order. Bounded: past
+    /// [`crate::history::EXIT_TAP_QUEUE_LIMIT`] the incoming tap drops
+    /// and `exit_tap_overflow` counts it. Drained every profile/trace
+    /// tick; other commands never transfer, so theirs counts overflow.
+    exit_taps: VecDeque<crate::history::ExitTap>,
+    /// Tapped exits dropped with a full tap queue (never silent).
+    exit_tap_overflow: u64,
 }
 
 /// Consecutive drops that keep serviced requests queued for retry
@@ -13068,6 +13076,8 @@ impl Engine {
             view_log: Vec::new(),
             #[cfg(test)]
             initial_arming_window_ms_for_test: None,
+            exit_taps: VecDeque::new(),
+            exit_tap_overflow: 0,
         }
     }
 
@@ -25978,6 +25988,30 @@ impl Engine {
                         })
             },
         )
+    }
+
+    /// Taps one `LEADER_EXIT`/`_MAPPINGS` record for the process-exit
+    /// retire path: the tracker frees the exiting process's semantic
+    /// rows once the EVENTS drain reads past the tap-time producer
+    /// position. Past [`crate::history::EXIT_TAP_QUEUE_LIMIT`] the
+    /// incoming tap drops and `exit_tap_overflow` counts it — the
+    /// process keeps its rows, never silently.
+    pub(crate) fn note_exit_tap(&mut self, pid: u32, hook_ts_ns: u64) {
+        let _ = (pid, hook_ts_ns);
+    }
+
+    /// Takes up to `max` tapped exits, oldest first, for transfer to
+    /// the process tracker. The caller passes the tracker's free
+    /// space, so the tracker queue never overflows.
+    pub(crate) fn take_exit_taps(&mut self, max: usize) -> Vec<crate::history::ExitTap> {
+        let _ = max;
+        Vec::new()
+    }
+
+    /// `(queued taps, overflow drops)` for tests.
+    #[cfg(test)]
+    pub(crate) fn exit_taps_for_test(&self) -> (usize, u64) {
+        (self.exit_taps.len(), self.exit_tap_overflow)
     }
 
     fn dispatch_lifecycle_record(

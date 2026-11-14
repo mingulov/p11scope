@@ -7412,7 +7412,8 @@ fn identify_tracked(
         state.reject_history(ev);
         return None;
     }
-    let (key, retired) = tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image);
+    let (key, retired) =
+        tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image, ev.ts_ns);
     for old in retired {
         state.retire_process(old);
     }
@@ -7637,7 +7638,8 @@ fn observe_fork(
         state.reject_history(ev);
         return true;
     }
-    let (parent, retired) = tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image);
+    let (parent, retired) =
+        tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image, ev.ts_ns);
     for old in retired {
         state.retire_process(old);
     }
@@ -7647,7 +7649,8 @@ fn observe_fork(
     if ev.event_type == event_type::FORK_INTO_CGROUP || !multi_scope {
         return true;
     }
-    let (child, retired) = tracker.admit_history(domain, ev.session as u32, ev.child_image);
+    let (child, retired) =
+        tracker.admit_history(domain, ev.session as u32, ev.child_image, ev.ts_ns);
     for old in retired {
         state.retire_process(old);
     }
@@ -31988,7 +31991,7 @@ int main(int argc, char **argv) {
             task_cookie: 90,
             exec_id: 0,
         };
-        let (parent, _) = tracker.admit_history(domain, 100, parent_image);
+        let (parent, _) = tracker.admit_history(domain, 100, parent_image, 0);
         let parent = parent.expect("parent generation admits");
         // Parent opens one session before forking.
         let mut call: p11scope_ebpf_common::Event = unsafe { std::mem::zeroed() };

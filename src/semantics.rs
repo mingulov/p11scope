@@ -2112,6 +2112,50 @@ mod corrective_tests {
     }
 
     #[test]
+    fn retire_processes_sweeps_each_process_like_retire_process() {
+        // Batch twin for the exit path: one `retire_processes` call
+        // frees every listed process's live maps exactly as
+        // `retire_process` would, each open session counts closed,
+        // and each `reduced_histories` entry is removed with its key
+        // refunded. Fails while the batch retire is unwired: nothing
+        // is swept and the count stays zero.
+        let p = plan(&["C_OpenSession", "C_SignInit", "C_FindObjectsInit"]);
+        let a = ProcessKey::from_pid(100);
+        let b = ProcessKey::from_pid(101);
+        let mut state = State::new(&p);
+        state.observe(&open(&p, 7, 1));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        let mut b_open = open(&p, 8, 1);
+        b_open.pid_tgid = 101u64 << 32;
+        state.observe(&b_open);
+        assert!(state.has_process_state(a));
+        assert!(state.has_process_state(b));
+        assert_eq!(state.sessions().closed, 0);
+        let swept = state.retire_processes(&BTreeSet::from([a, b]));
+        assert_eq!(swept, 2, "both processes held swept state");
+        assert!(!state.has_process_state(a));
+        assert!(!state.has_process_state(b));
+        assert_eq!(
+            state.sessions().closed,
+            2,
+            "each open session counts closed"
+        );
+        assert!(
+            !state.reduced_histories.contains(&a),
+            "the exit path frees the R10 entry"
+        );
+        assert!(
+            !state.reduced_histories.contains(&b),
+            "the exit path frees the R10 entry"
+        );
+        assert_eq!(
+            state.state_keys,
+            state.retained_dynamic_keys(),
+            "every retained key is counted exactly once"
+        );
+    }
+
+    #[test]
     fn every_live_state_removal_returns_its_budget_key() {
         // Site twin: every path that drops live state — session
         // cancel, operation-state import, error reconciliation,
@@ -4267,6 +4311,18 @@ impl State {
 
     pub fn retire_process(&mut self, process: ProcessKey) -> u64 {
         self.retire_scope(process, None)
+    }
+
+    /// Retires whole processes in one pass per map: the exit path's
+    /// batch form of [`Self::retire_process`]. Each process's live
+    /// maps are swept exactly as `retire_process` sweeps them (open
+    /// sessions count closed), and its `reduced_histories` entry is
+    /// removed with the key refunded only on actual removal — so an
+    /// exit retire plus a history retire of the same key refunds once.
+    /// Returns how many input processes held swept state.
+    pub fn retire_processes(&mut self, processes: &BTreeSet<ProcessKey>) -> u64 {
+        let _ = processes;
+        0
     }
 
     /// Drops session-scoped state for `process`. `None` retires the whole

@@ -151,8 +151,43 @@ impl Tracker {
         domain: u64,
         pid: u32,
         image: p11scope_ebpf_common::ImageIdentity,
+        event_ts_ns: u64,
     ) -> (Option<ProcessKey>, Vec<ProcessKey>) {
-        self.history.admit(domain, pid, image)
+        self.history.admit(domain, pid, image, event_ts_ns)
+    }
+    /// Free slots in the tracker's pending-exit queue (transfer cap).
+    pub(crate) fn exit_tap_space(&self) -> usize {
+        self.history.exit_tap_space()
+    }
+    /// Queues engine-tapped exits stamped with the EVENTS producer
+    /// position read at transfer time.
+    pub(crate) fn note_exit_taps(
+        &mut self,
+        taps: impl IntoIterator<Item = crate::history::ExitTap>,
+        tap_producer: usize,
+    ) {
+        self.history.note_exit_taps(taps, tap_producer);
+    }
+    /// Process keys whose exits are due at these EVENTS ring
+    /// positions; at most `budget` exits examined, the rest carried.
+    pub(crate) fn retire_exits_due(
+        &mut self,
+        consumer_now: usize,
+        producer_now: usize,
+        budget: usize,
+    ) -> std::collections::BTreeSet<ProcessKey> {
+        self.history
+            .retire_exits_due(consumer_now, producer_now, budget)
+    }
+    /// `(tie_skipped, unmatched, reopened, late)` exit gap counters.
+    #[cfg(test)]
+    pub(crate) fn exit_counters_for_test(&self) -> (u64, u64, u64, u64) {
+        self.history.exit_counters_for_test()
+    }
+    /// Pending (transferred, not yet retired) exit taps.
+    #[cfg(test)]
+    pub(crate) fn pending_exit_taps_for_test(&self) -> usize {
+        self.history.pending_exit_taps_for_test()
     }
     pub(crate) fn history_call(&mut self, key: ProcessKey) {
         self.history.mark_call(key);
@@ -1893,11 +1928,11 @@ mod tests {
             task_cookie: cookie,
             exec_id: 1,
         };
-        assert!(tracker.admit_history(id, 4242, image(1)).0.is_some());
-        assert!(tracker.admit_history(id, 4243, image(2)).0.is_some());
+        assert!(tracker.admit_history(id, 4242, image(1), 0).0.is_some());
+        assert!(tracker.admit_history(id, 4243, image(2), 0).0.is_some());
         assert_eq!(tracker.memory_tasks_row().len, 2);
         // Re-admitting a live cookie admits no second task.
-        assert!(tracker.admit_history(id, 4242, image(1)).0.is_some());
+        assert!(tracker.admit_history(id, 4242, image(1), 0).0.is_some());
         assert_eq!(tracker.memory_tasks_row().len, 2);
         assert!(tracker.memory_tasks_row().bytes > 0);
     }

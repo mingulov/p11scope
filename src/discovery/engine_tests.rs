@@ -5476,6 +5476,65 @@ fn leader_exit_dispatch_is_two_phase_and_uses_the_admitted_view() {
     assert_eq!(engine.task_uprobe_link_losses, 1);
 }
 
+fn exit_record_for(pid: u32, hook_ts_ns: u64) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_LEADER_EXIT;
+    record.pid_tgid = u64::from(pid) << 32;
+    record.hook_ts_ns = hook_ts_ns;
+    record
+}
+
+#[test]
+fn exit_tap_captures_leader_exit_before_view_routing() {
+    // Exit-tap twin: every LEADER_EXIT/_MAPPINGS record is tapped at
+    // the top of dispatch, before view or ledger routing — so a
+    // viewless pid (--pid captures included) is covered too. Other
+    // lifecycle kinds never tap. Fails while dispatch taps nothing.
+    let mut engine = Engine::empty();
+    let mut pending_views = PendingViewRetirements::new();
+    let mut exit = exit_record_for(4242, 200);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending_views);
+    assert_eq!(engine.exit_taps_for_test(), (1, 0));
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT_MAPPINGS;
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending_views);
+    assert_eq!(engine.exit_taps_for_test(), (2, 0));
+    exit.kind = DISCOVERY_KIND_EXEC;
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending_views);
+    assert_eq!(
+        engine.exit_taps_for_test(),
+        (2, 0),
+        "only exits tap, never EXEC"
+    );
+}
+
+#[test]
+fn exit_tap_queue_bounds_at_16384_with_counted_overflow() {
+    // Tap-cap twin: the queue holds 16,384 taps, then drops the
+    // incoming tap with a counted overflow; `take_exit_taps` drains
+    // oldest-first. Fails while the intake is unwired.
+    let mut engine = Engine::empty();
+    for pid in 0..crate::history::EXIT_TAP_QUEUE_LIMIT as u32 {
+        engine.note_exit_tap(1000 + pid, u64::from(pid));
+    }
+    assert_eq!(engine.exit_taps_for_test(), (16384, 0));
+    engine.note_exit_tap(9999, 9999);
+    assert_eq!(
+        engine.exit_taps_for_test(),
+        (16384, 1),
+        "the drop is counted, never silent"
+    );
+    let taps = engine.take_exit_taps(usize::MAX);
+    assert_eq!(taps.len(), 16384);
+    assert_eq!(
+        taps[0],
+        crate::history::ExitTap {
+            pid: 1000,
+            hook_ts_ns: 0
+        }
+    );
+    assert_eq!(engine.exit_taps_for_test(), (0, 1));
+}
+
 #[test]
 fn cgroup_ingress_admission_and_delayed_exit_are_generation_bounded() {
     let first = ProcessView::open(ProcessViewId(31), std::process::id()).unwrap();

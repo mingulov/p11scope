@@ -215,11 +215,12 @@ fn history_registry_exec_bump_clears_forked_latch() {
                     task_cookie: 90,
                     exec_id: 0,
                 },
+                0,
             )
             .0,
         Some(parent)
     );
-    assert_eq!(registry.admit(1, 200, child_image).0, Some(child));
+    assert_eq!(registry.admit(1, 200, child_image, 0).0, Some(child));
     assert!(registry.birth(parent, child));
 
     let current = semantics::ProcessKey::history(1, 20, 1, 200);
@@ -232,6 +233,7 @@ fn history_registry_exec_bump_clears_forked_latch() {
                     task_cookie: 20,
                     exec_id: 1,
                 },
+                0,
             )
             .0,
         Some(current)
@@ -262,6 +264,73 @@ fn history_same_cookie_exec_closes_before_open_and_late_old_never_reduces() {
     assert!(s.session_pseudonym_process(key(90, 1), 0, 7).is_some());
     feed(&mut s, &mut t, [ev(100, 90, 1, 3), ev(100, 90, 1, 0)]);
     assert_eq!(vector(&s), (3, 0, 2, 1, 1, 0));
+}
+
+#[test]
+fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
+    // B1 step-1 twin: a tapped exit retires the old generation's
+    // maps by kernel time (`first_ts_ns` strictly before the hook),
+    // frees its R10 entry with keys refunded, and spares a reused
+    // pid's successor admitted after the exit; a `first_ts_ns ==
+    // hook_ts_ns` tie retires nothing and counts the skip. Fails
+    // while exit matching is unwired: nothing is due.
+    let (mut s, mut t, _) = setup(64);
+    let mut first = ev(100, 90, 0, 0);
+    first.ts_ns = 100;
+    feed(&mut s, &mut t, [first]);
+    assert_eq!(vector(&s), (1, 0, 0, 1, 1, 0));
+    let old = key(90, 0);
+    assert!(s.has_process_state(old));
+    assert_eq!(s.memory_lens().reduced.len, 1);
+    // The old generation exits at hook 200; the transfer stamps the
+    // EVENTS producer position the drain must read past.
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        8,
+    );
+    assert_eq!(t.pending_exit_taps_for_test(), 1);
+    // The pid is reused before the exit retires: the successor's
+    // first CALL (ts 300, after the old exit) admits a new generation.
+    let mut reborn = ev(100, 91, 0, 0);
+    reborn.ts_ns = 300;
+    feed(&mut s, &mut t, [reborn]);
+    let successor = semantics::ProcessKey::history(1, 91, 0, 100);
+    assert!(s.has_process_state(successor));
+    assert_eq!(vector(&s), (2, 0, 0, 2, 2, 0));
+    // The drain reads past the tap position: the old generation's
+    // maps are freed and its R10 entry is gone, while the successor's
+    // rows are intact.
+    let due = t.retire_exits_due(8, 8, 1024);
+    assert_eq!(due, std::collections::BTreeSet::from([old]));
+    s.retire_processes(&due);
+    assert!(!s.has_process_state(old));
+    assert!(s.has_process_state(successor));
+    assert_eq!(vector(&s), (2, 0, 1, 1, 2, 0));
+    let lens = s.memory_lens();
+    assert_eq!(lens.reduced.len, 1, "only the successor keeps R10");
+    assert_eq!(lens.open.len, 1, "only the successor keeps a session");
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 0, 0));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+    // A first_ts_ns == hook_ts_ns tie retires neither generation and
+    // counts the skip instead.
+    let mut tied = ev(101, 92, 0, 0);
+    tied.ts_ns = 200;
+    feed(&mut s, &mut t, [tied]);
+    let tied_key = semantics::ProcessKey::history(1, 92, 0, 101);
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 101,
+            hook_ts_ns: 200,
+        }],
+        8,
+    );
+    let due = t.retire_exits_due(8, 8, 1024);
+    assert!(due.is_empty(), "ties never retire");
+    assert!(s.has_process_state(tied_key));
+    assert_eq!(t.exit_counters_for_test(), (1, 0, 0, 0));
 }
 
 #[test]
@@ -488,7 +557,10 @@ fn ar13_stale_generation_call_mark_cannot_suppress_successor_first_fork() {
         let (mut s, mut t, _) = setup(16);
         feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 7)]);
         // Task 20 execs: generation 1 is admitted with no CALL of its own.
-        assert_eq!(t.admit_history(1, 200, birth.child_image).0, Some(child(1)));
+        assert_eq!(
+            t.admit_history(1, 200, birth.child_image, birth.ts_ns).0,
+            Some(child(1))
+        );
         if let Some(key) = mark {
             t.history_call(key);
         }
@@ -847,10 +919,30 @@ fn root_fence_retires_delayed_positive_and_exec_but_preserves_unknown() {
         crate::events::RootTailProgress::Reached
     );
     apply_original_root_retirement(&mut tracker, &mut state, tail.complete().unwrap()).unwrap();
-    assert!(tracker.admit_history(1, 100, first.image).0.is_none());
-    assert!(tracker.admit_history(1, 100, exec.image).0.is_none());
-    assert!(tracker.admit_history(1, 200, delayed.image).0.is_none());
-    assert!(tracker.admit_history(1, 100, unknown.image).0.is_some());
+    assert!(
+        tracker
+            .admit_history(1, 100, first.image, first.ts_ns)
+            .0
+            .is_none()
+    );
+    assert!(
+        tracker
+            .admit_history(1, 100, exec.image, exec.ts_ns)
+            .0
+            .is_none()
+    );
+    assert!(
+        tracker
+            .admit_history(1, 200, delayed.image, delayed.ts_ns)
+            .0
+            .is_none()
+    );
+    assert!(
+        tracker
+            .admit_history(1, 100, unknown.image, unknown.ts_ns)
+            .0
+            .is_some()
+    );
     assert!(reduce_profile_event(1, &mut tracker, &mut state, &scope(), delayed).is_err());
 }
 
@@ -916,9 +1008,24 @@ fn root_fence_trace_reduces_parent_only_and_preserves_unknown_pending_and_write_
         assert_eq!(tracer.raw_calls(), 3);
         apply_original_root_retirement(&mut tracker, &mut state, tail.complete().unwrap()).unwrap();
         assert_eq!(state.pending_at_end(), 1);
-        assert!(tracker.admit_history(1, 100, positive.image).0.is_none());
-        assert!(tracker.admit_history(1, 200, unknown.image).0.is_some());
-        assert!(tracker.admit_history(1, 300, fork.child_image).0.is_some());
+        assert!(
+            tracker
+                .admit_history(1, 100, positive.image, positive.ts_ns)
+                .0
+                .is_none()
+        );
+        assert!(
+            tracker
+                .admit_history(1, 200, unknown.image, unknown.ts_ns)
+                .0
+                .is_some()
+        );
+        assert!(
+            tracker
+                .admit_history(1, 300, fork.child_image, fork.ts_ns)
+                .0
+                .is_some()
+        );
         assert!(out.iter().filter(|&&b| b == b'\n').count() <= 1);
         if let Some(error) = write_error {
             assert!(format!("{error:#}").contains("history output failure"));
@@ -950,7 +1057,12 @@ fn root_fence_unknown_after_positive_stays_bound_and_incomplete_keeps_state() {
             assert!(tail.check(true, Instant::now()).is_err());
             assert!(tail.complete().is_err());
             assert_eq!(state.sessions().closed, 0);
-            assert!(tracker.admit_history(1, 100, positive.image).0.is_some());
+            assert!(
+                tracker
+                    .admit_history(1, 100, positive.image, positive.ts_ns)
+                    .0
+                    .is_some()
+            );
         } else {
             drain
                 .poll_root_tail(&mut tail, 8, |event| {
@@ -1134,8 +1246,18 @@ fn root_cancel_output_case(is_trace: bool, partial: bool) {
         assert_eq!(signals.first_signal(), Some(signal));
         assert!(signals.interrupted());
         assert_eq!(vector(&state), before);
-        assert!(tracker.admit_history(1, 100, positive.image).0.is_some());
-        assert!(tracker.admit_history(1, 200, unknown.image).0.is_some());
+        assert!(
+            tracker
+                .admit_history(1, 100, positive.image, positive.ts_ns)
+                .0
+                .is_some()
+        );
+        assert!(
+            tracker
+                .admit_history(1, 200, unknown.image, unknown.ts_ns)
+                .0
+                .is_some()
+        );
         if !is_trace {
             let json: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -1915,7 +2037,7 @@ fn producer_tracker_admits_past_16384_to_the_wide_budget() {
         };
         #[allow(clippy::cast_possible_truncation)]
         let pid = cookie as u32;
-        let (key, retired) = tracker.admit_history(1, pid, image);
+        let (key, retired) = tracker.admit_history(1, pid, image, 0);
         assert!(retired.is_empty(), "cookie={cookie}");
         if key.is_some() {
             admitted += 1;

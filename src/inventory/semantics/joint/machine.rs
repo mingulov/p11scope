@@ -1751,7 +1751,7 @@ impl LiveJointMachine {
             return None;
         }
         // An applied abandon strands staged-but-unreduced calls whose
-        // keys the void refused; dispose them as counted history
+        // history the void fenced; dispose them as counted history
         // (preserving their observed completions) so the recovery
         // verifies against exactly its own history. An unapplied
         // abandon staged nothing, so this is a no-op there.
@@ -3245,6 +3245,20 @@ impl LiveJointMachine {
                         Err(_) => return (Phase::Idle, Err(SemanticRefusal::Unavailable)),
                     };
                     if voided {
+                        // No staged-drop here (B2): stranded pre-void
+                        // calls cannot reach the recovery's fallback
+                        // verification. Stranded staging needs a
+                        // pending-retired frame, which needs a
+                        // stash-owned H3 floor (capture-held floors
+                        // block ingestion; the machine expires them
+                        // pre-audit; ownerless shed/cut floors never
+                        // match the continuation). The stashed
+                        // pre-void outcome survives the void, but its
+                        // H8 is wiped and its wire consumed, so the
+                        // post-void quantum latches at claiming
+                        // (fail-closed) before any fallback delivery
+                        // runs; the re-arm abandon then drains it as
+                        // S1. Pinned by the B2 twin.
                         coordinator.note_scope_gap(
                             "Joint key operations unavailable; retained S1".to_string(),
                             format!(

@@ -5798,11 +5798,18 @@ impl JournalAdapter {
         let key = proof.key;
         let H3DispositionEvidence::Clean {
             staged_max,
-            pending_floor: None,
+            pending_floor,
         } = &audit.h3
         else {
             return Err(RawQuantumRefusal::DispositionMismatch);
         };
+        // The caller routes fenced voids here despite the floor (the
+        // void bounds the replay, and per-head H8 consumption keeps
+        // the pending census exact); anything else still needs clean
+        // H3. `staged_max` binds the preflight below.
+        if pending_floor.is_some() && batch.audited().fence().is_none() {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
         if !std::ptr::eq(bootstrap, target.bootstrap())
             || key.caller != target.caller().0
             || self

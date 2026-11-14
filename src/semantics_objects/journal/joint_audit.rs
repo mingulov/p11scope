@@ -361,6 +361,17 @@ impl AuditedFailure<'_> {
             .filter_map(|failure| failure.fence)
             .max()
     }
+    /// The gap of the failure carrying the largest applicable fence
+    /// (first in slot order on ties): pairs with [`Self::fence`] so
+    /// one void fanning out counts once however selection ranked it.
+    pub(crate) fn fenced_gap(&self) -> Option<super::JournalGap> {
+        let fence = self.fence()?;
+        self.originals
+            .iter()
+            .flatten()
+            .find(|failure| failure.fence == Some(fence))
+            .map(|failure| failure.gap)
+    }
     pub(crate) fn h3(&self) -> &H3DispositionEvidence {
         &self.audit.h3
     }
@@ -1285,6 +1296,21 @@ impl IngestedJointQuantum {
                 failure.h3_voided.is_some()
                     || disposition_of(failure.gap) == SealFailureDisposition::HistoryLoss
             })
+            // A frame carrying a void (fenced, Fallback since the
+            // ingest-break replay) enters the pending continuation
+            // only after every consumer the void affects is
+            // LossDelivered: the void is taken once, so retiring
+            // early would drop its fence and its invalidations with
+            // it, leaving pre-void associations closable across the
+            // hole. The void slot is the only fenced original that
+            // can ride a continuation-eligible frame (audit voids
+            // fail the gap check above; raw taints are fenceless).
+            || self.void_failure.as_ref().is_some_and(|void| {
+                self.consumers.iter().any(|consumer| {
+                    void.affects_domain(consumer.target.bootstrap().domain())
+                        && consumer.state != ConsumerState::LossDelivered
+                })
+            })
             || self.raw_failure.as_ref().is_some_and(|raw| {
                 !matches!(
                     raw.gap,
@@ -1912,15 +1938,24 @@ impl IngestedJointQuantum {
         // selected failure's rank need not carry it.
         let void_ending = audited.fence().is_some()
             && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint);
+        let (h3_clean, h3_clean_floor) = match audited.h3() {
+            H3DispositionEvidence::Clean { pending_floor, .. } => {
+                (true, pending_floor.is_none())
+            }
+            H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted => {
+                (false, false)
+            }
+        };
+        // A fenced void replays through the H8-aware fallback even
+        // while H3 pends: the void, not H3 completeness, bounds this
+        // replay, and consuming each replayed head's H8 keeps the
+        // pending continuation's census exact so the frame still
+        // retires after its void delivers. Unfenced fallbacks still
+        // wait for clean H3.
         let fallback = audited.disposition() == SealFailureDisposition::Fallback
             && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint)
-            && matches!(
-                audited.h3(),
-                H3DispositionEvidence::Clean {
-                    pending_floor: None,
-                    ..
-                }
-            );
+            && h3_clean
+            && (h3_clean_floor || audited.fence().is_some());
         // A retry replays this visit from the start next time, so what it
         // spends here is refunded below: it delivers nothing.
         let before = *remaining;
@@ -1972,8 +2007,15 @@ impl IngestedJointQuantum {
                 // Joint feed. One void fanning out to many feeds counts
                 // once (deduped by fence and gap).
                 if void_ending {
-                    let ended = batch.audited().failure();
-                    let key = (ended.fence, ended.gap);
+                    // Dedup by the void's own (fence, gap): the
+                    // selected failure's rank need not carry the
+                    // fence, so keying on the selection would count
+                    // one void twice across feeds.
+                    let audited = batch.audited();
+                    let key = (
+                        audited.fence(),
+                        audited.fenced_gap().expect("a void ending carries a fence"),
+                    );
                     if !self.void_feed_ends_counted.contains(&Some(key)) {
                         // Four slots always suffice (see the field);
                         // a full set still counts the ending rather

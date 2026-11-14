@@ -1232,9 +1232,14 @@ impl JointStaging {
                 0,
             );
         }
+        // A fenced failure is a void: the lost interval is explicit,
+        // so the feed closes on its fence instead of holding for a
+        // completeness the void already denied. Only an unfenced
+        // fallback waits.
         if self.mode == FeedMode::Joint
             && disposition == SealFailureDisposition::Fallback
             && !covered
+            && fence.is_none()
         {
             return (
                 FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness),

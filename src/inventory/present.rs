@@ -3188,7 +3188,7 @@ fn key_observation_plain_reason(reason: &str) -> &str {
 fn gap_plain_subject<'a>(subject: &'a str, reason: &'a str) -> &'a str {
     if subject == "Joint key operations unavailable; retained S1" {
         if reason.strip_prefix("joint_void_").is_some() {
-            return "Per-key tracking lost history for every process; function counts above are unaffected";
+            return "Per-key tracking lost history for tracked processes; function counts above are unaffected";
         }
         if reason == "joint_resume_deferred_below_fence" {
             return "Per-key tracking paused for this process; function counts above are unaffected";
@@ -3237,7 +3237,7 @@ fn gap_plain_reason<'a>(subject: &str, reason: &'a str) -> &'a str {
     // below-fence deferral: history loss with retained counts, and
     // the wait to restart past it.
     if reason.strip_prefix("joint_void_").is_some() {
-        return "per-key tracking lost part of its history; function counts are unaffected";
+        return "per-key tracking lost part of its history";
     }
     if reason == "joint_resume_deferred_below_fence" {
         return "per-key tracking waits to restart after lost history";

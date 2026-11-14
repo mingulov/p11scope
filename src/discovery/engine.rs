@@ -936,6 +936,12 @@ pub struct Engine {
     // Both ledgers are capture-local and bounded by the process-view ceiling;
     // only the scalar crosses the render boundary.
     admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
+    /// Per-pid admission counts behind `admitted_cgroup_views`: one entry
+    /// per pid on record (open or closed), counting its admissions. The
+    /// tick reads the keys instead of rebuilding the pid set from every
+    /// admission, so per-tick newcomer work stays proportional to live
+    /// admissions, not to admissions since capture start.
+    admitted_cgroup_pid_counts: BTreeMap<u32, usize>,
     unmatched_leader_exit_events: BTreeSet<(u32, u64)>,
     /// Ledger exits already attributed to one generation (a live newcomer
     /// mark, a pruned generation, or an admitted view by coalescing): each
@@ -12989,6 +12995,7 @@ impl Engine {
             run_tree_handed_back: 0,
             multi_rebuild_gaps: 0,
             admitted_cgroup_views: BTreeMap::new(),
+            admitted_cgroup_pid_counts: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
             consumed_leader_exit_events: BTreeSet::new(),
             cgroup_ingress_overflow: false,

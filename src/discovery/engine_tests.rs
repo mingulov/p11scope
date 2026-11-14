@@ -5998,6 +5998,107 @@ int main(void) {
     child.wait().ok();
 }
 
+/// The admitted-pid count map mirrors `admitted_cgroup_views` exactly
+/// through admit/close churn: keys match the recorded pids (open or
+/// closed), counts match admissions per pid, and a pid whose last
+/// admission goes leaves the map (no growth past live admissions).
+#[test]
+fn admitted_pid_counts_match_views_after_admit_close_churn() {
+    fn counts_of(engine: &Engine) -> BTreeMap<u32, usize> {
+        let mut counts = BTreeMap::new();
+        for admission in engine.admitted_cgroup_views.values() {
+            *counts.entry(admission.pid).or_insert(0) += 1;
+        }
+        counts
+    }
+    fn assert_mirrored(engine: &Engine, step: &str) {
+        assert_eq!(
+            engine.admitted_cgroup_pid_counts,
+            counts_of(engine),
+            "count map drifts from the recorded admissions ({step})"
+        );
+    }
+    let mut first = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .expect("spawn sleeper");
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .expect("spawn sleeper");
+    let pid_a = first.id();
+    let pid_b = second.id();
+    let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid_a, pid_b]);
+    for (id, pid) in [(7101u32, pid_a), (7102, pid_a), (7103, pid_b)] {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(id), pid).expect("track the sleeper"));
+    }
+    engine.next_view_id = 7104;
+    engine.seed_initial_cgroup_views();
+    assert_eq!(
+        engine.admitted_cgroup_pid_counts,
+        BTreeMap::from([(pid_a, 2usize), (pid_b, 1usize)]),
+        "seed must count two admissions for the shared pid"
+    );
+    assert_mirrored(&engine, "seed");
+    // Re-seeding the same views overwrites the same ids: counts stay put.
+    engine.seed_initial_cgroup_views();
+    assert_eq!(
+        engine.admitted_cgroup_pid_counts,
+        BTreeMap::from([(pid_a, 2usize), (pid_b, 1usize)]),
+        "re-seed must not double-count"
+    );
+    assert_mirrored(&engine, "re-seed");
+    // One more admission through the record path.
+    engine.views.push(
+        ProcessView::open(ProcessViewId(7104), pid_b).expect("track the sleeper"),
+    );
+    engine.next_view_id = 7105;
+    engine.record_cgroup_view_admissions([ProcessViewId(7104)]);
+    assert_eq!(
+        engine.admitted_cgroup_pid_counts,
+        BTreeMap::from([(pid_a, 2usize), (pid_b, 2usize)]),
+        "record must count the fresh admission"
+    );
+    assert_mirrored(&engine, "record");
+    // Closing is not removal: the closed admission stays on record.
+    engine.close_cgroup_admission(ProcessViewId(7101), 100);
+    assert_eq!(
+        engine.admitted_cgroup_pid_counts,
+        BTreeMap::from([(pid_a, 2usize), (pid_b, 2usize)]),
+        "close must keep the retained admission counted"
+    );
+    assert_mirrored(&engine, "close");
+    // Removing a closed admission keeps it; removing open ones drops
+    // their counts, and the last admission takes its pid out of the map.
+    engine.update_cgroup_admissions_at_removal(&BTreeSet::from([ProcessViewId(7101)]), None);
+    assert_mirrored(&engine, "remove-closed");
+    engine.update_cgroup_admissions_at_removal(&BTreeSet::from([ProcessViewId(7102)]), None);
+    assert_eq!(
+        engine.admitted_cgroup_pid_counts,
+        BTreeMap::from([(pid_a, 1usize), (pid_b, 2usize)]),
+        "removal must drop one count for the shared pid"
+    );
+    assert_mirrored(&engine, "remove-open");
+    engine.update_cgroup_admissions_at_removal(
+        &BTreeSet::from([ProcessViewId(7103), ProcessViewId(7104)]),
+        None,
+    );
+    assert_eq!(
+        engine.admitted_cgroup_pid_counts,
+        BTreeMap::from([(pid_a, 1usize)]),
+        "the last admission takes its pid out of the map"
+    );
+    assert_mirrored(&engine, "remove-last");
+    first.kill().ok();
+    second.kill().ok();
+    first.wait().ok();
+    second.wait().ok();
+}
+
 /// One drained leader exit for `pid` at `hook_ts` (unadmitted, so it
 /// reaches the generation ledger).
 fn drain_newcomer_exit(engine: &mut Engine, pid: u32, hook_ts: u64) {

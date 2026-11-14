@@ -2419,6 +2419,60 @@ impl PinnedObjects {
         }
     }
 
+    /// File every entry through the production acquire step (fd-debit
+    /// twin funnel): each entry's own file and meta take a real row,
+    /// reinserted under the same id, so view ownership is untouched.
+    /// Inode-uniqueness is recomputed on the same file; the verified
+    /// stamp rides along. Panics on a deferral or a share: the twin
+    /// never fills the table and files one row per admission.
+    #[cfg(test)]
+    pub(crate) fn acquire_existing_handles_into(
+        &mut self,
+        table: &mut HandleTable,
+        reason: DeferredReason,
+    ) {
+        let entries = std::mem::take(&mut self.by_id);
+        for (id, mut entry) in entries {
+            let null = std::fs::File::open("/dev/null").unwrap();
+            let old = std::mem::replace(&mut entry.file, TableHandle::for_test(Arc::new(null)));
+            let sole = old.arc().clone();
+            drop(old);
+            let file = Arc::try_unwrap(sole).expect("acquire_existing_handles_into owns its files");
+            let meta = EntryMeta {
+                raw: entry.raw.clone(),
+                mapping: entry.mapping,
+                fd_dev: entry.fd_dev,
+                pin: entry.pin,
+                mapped: entry.mapped,
+                path: entry.path.clone(),
+                sha256: entry.sha256.clone(),
+                build_id: entry.build_id.clone(),
+                abi: entry.abi,
+                exports: entry.exports.clone(),
+                getter_present: entry.getter_present,
+                witness_fault: entry.witness_fault,
+                overlay: entry.overlay,
+                pre_copy_up: entry.pre_copy_up,
+                collapsed: entry.collapsed,
+                probed_maps_unproven: entry.probed_maps_unproven,
+                probed_maps_key: entry.probed_maps_key,
+                verified_ns: entry.last_ok_ns.get(),
+                unique: file_inodes_are_unique(&file),
+            };
+            match table.acquire(file, &meta, reason) {
+                AcquireOutcome::Held(held) => {
+                    assert!(held.inserted, "one row per admission");
+                    entry.file = held.handle;
+                    entry.mapped = held.mapped;
+                }
+                AcquireOutcome::Deferred(reason) => {
+                    panic!("the fd-debit twin never fills the table: deferred with {reason:?}")
+                }
+            }
+            self.by_id.insert(id, entry);
+        }
+    }
+
     /// Every distinct held fd number in this set (test-only): entries
     /// sharing one `Arc` report once. For twins asserting a filed
     /// handle is the proved fd, never a reopen.

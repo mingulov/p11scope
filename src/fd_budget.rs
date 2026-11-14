@@ -606,8 +606,6 @@ mod tests {
         let mut tick = FdReserveTick::sample().expect("a readable snapshot under 512");
         assert_eq!(tick.soft, 512);
         let dir = tempfile::tempdir().expect("a pin file directory");
-        let pin_path = dir.path().join("pin.so");
-        std::fs::write(&pin_path, b"pin").expect("a pin file");
         let mut table =
             crate::discovery::handle_table::HandleTable::new(MAX_CONCURRENT_LIBRARY_HANDLES);
         let mut held_views: Vec<std::fs::File> = Vec::new();
@@ -619,14 +617,16 @@ mod tests {
             }
             // One admission: its pidfd plus one real retained scan pin,
             // debited through the production path — the pidfd directly,
-            // the pin via its inserted table rows. The pin is the
-            // original `real_scan_pin` fixture (same file, same 64-hex
-            // digest); each admission opens anew, so each files its own
-            // row exactly like the scripted proof it replaces.
+            // the pin via its inserted table rows. Each admission pins
+            // its own file (like distinct providers in production)
+            // through the production acquire step, so the cap check,
+            // the prune-then-retry and the row filing are all real.
             let pidfd = std::fs::File::open("/dev/null")
                 .expect("a pidfd stand-in must open before the reserve trips");
             held_views.push(pidfd);
             tick.note_opened();
+            let pin_path = dir.path().join(format!("pin{admitted:04}.so"));
+            std::fs::write(&pin_path, b"pin").expect("a pin file per admission");
             let mut pins = crate::discovery::identity::test_fixture::real_scan_pin(
                 &pin_path,
                 None,
@@ -634,7 +634,10 @@ mod tests {
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             );
             let admits_before = table.stats().admits;
-            pins.adopt_existing_handles_into(&mut table);
+            pins.acquire_existing_handles_into(
+                &mut table,
+                crate::discovery::handle_table::DeferredReason::Live,
+            );
             held_pins.push(pins);
             tick.note_opened_n(table.stats().admits - admits_before);
             admitted = admitted.saturating_add(1);

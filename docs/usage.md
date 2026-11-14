@@ -1800,7 +1800,11 @@ Limits that matter in pods:
   stderr lines `p11scope: output attempts finished; detaching the remaining native
   probes …` and `p11scope: native probes detached`, and a second
   SIGINT, SIGTERM or SIGHUP after output attempts return exits at once
-  (status 128 + signal; the kernel releases the remaining probes).
+  (status 128 + signal; the kernel releases the remaining probes). On
+  Singles the first line estimates the remaining wait
+  (`… 4683 endpoints, about 6 minutes remaining (press Ctrl-C again to
+  exit now)`), computed at 80 ms per link; the wait is host-dependent,
+  so a fast host finishes well under the estimate.
   Every exec and process exit in scope sends a 920-byte record through
   the native lane's 2 MiB lifecycle ring (about 2,260 records). The lane
   drains it every 10 ms, also while a pass collects `/proc` on a worker

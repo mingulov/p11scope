@@ -1848,6 +1848,14 @@ singles path; `--attach-backend singles` selects it where multi-attach
 is available): attach 41 s, stop (link release) 339 s, about 41 ms per
 link.
 
+The inventory post-report detach line (`output attempts finished;
+detaching the remaining native probes …`) estimates the remaining
+Singles wait at 80 ms per link, rounded from 83 ms/link measured over
+4683 links in 391 s on a loaded 7.0 host; on a fast host the detach
+finishes well under the estimate. A second Ctrl-C (or SIGTERM/SIGHUP)
+after the report exits at once and leaves the kernel to release the
+remaining probes.
+
 ### 5.15: physical-identity controls and non-leader exec unqualified
 
 Historical measurements below predate v0.5 host admission. Stock non-Multi

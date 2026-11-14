@@ -4610,12 +4610,38 @@ pub(crate) enum ExitRelease {
     RetainedForExit,
 }
 
+/// Singles detach estimate, ms per link: rounded from the 83 ms/link
+/// measured detaching 4683 per-offset links in 391 s on a loaded 7.0
+/// host (one close per link). Host-dependent (18 ms on 5.15, 32-35 ms
+/// idle on 6.12/7.x): a fast host finishes well under the estimate.
+/// Separate from the cleanup worker's 50 ms/link stop estimate, whose
+/// per-second progress lines correct it live; this line stands alone.
+const DETACH_ESTIMATE_MS_PER_LINK: u64 = 80;
+
+/// A remaining duration in plain English: seconds below a minute and
+/// a half, minutes below an hour and a half, hours past that.
+fn detach_duration_text(seconds: u64) -> String {
+    if seconds < 90 {
+        let plural = if seconds == 1 { "" } else { "s" };
+        return format!("about {seconds} second{plural}");
+    }
+    let minutes = seconds.saturating_add(30) / 60;
+    if minutes < 90 {
+        let plural = if minutes == 1 { "" } else { "s" };
+        return format!("about {minutes} minute{plural}");
+    }
+    let hours = minutes.saturating_add(30) / 60;
+    let plural = if hours == 1 { "" } else { "s" };
+    format!("about {hours} hour{plural}")
+}
+
 /// The run's end after the stop (R-C51-4): `write` attempts final outputs
 /// (stream end, `-o`, stdout) first; then `outputs_attempted` arms the
 /// immediate exit on a second signal; only then does an unsettled
 /// retirement reach `release`, between two progress lines. A reclaimed
 /// owner keeps the blocking detach; a retained one stays alive without
-/// the closing progress line.
+/// the closing progress line. An unsettled Singles detach names its
+/// estimated remaining wait; Multi detaches too fast for an estimate.
 pub(crate) fn finish_native<L, T>(
     stopped: Option<Stopped<L>>,
     write: impl FnOnce(Option<&LaneSummary>) -> T,
@@ -4628,9 +4654,22 @@ pub(crate) fn finish_native<L, T>(
     if let Some(stopped) = stopped
         && let Retirement::Unsettled(_) = stopped.summary.retirement
     {
+        // Singles closes one link per endpoint with no progress after
+        // this line, so it carries the wait estimate; Multi needs
+        // none. The estimate counts every attached endpoint while the
+        // pre-output wait already closed some, so a fast host finishes
+        // under it.
+        let estimate = match stopped.summary.backend.backend {
+            AttachBackend::Singles => {
+                let ms =
+                    (stopped.summary.attached as u64).saturating_mul(DETACH_ESTIMATE_MS_PER_LINK);
+                format!(", {} remaining", detach_duration_text(ms.div_ceil(1000)))
+            }
+            AttachBackend::Multi => String::new(),
+        };
         progress(format!(
             "p11scope: output attempts finished; detaching the remaining native probes of {} \
-             endpoints (a second SIGINT/SIGTERM exits at once)",
+             endpoints{estimate} (press Ctrl-C again to exit now)",
             stopped.summary.attached
         ));
         if matches!(release(stopped), ExitRelease::Reclaimed) {

@@ -9348,6 +9348,86 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
     );
 }
 
+/// Keyrows B1 machine twin: after a re-arm's void closes the feed with
+/// loss, a clean-point probe does NOT resume Joint onto the below-fence
+/// receipt — it reduces direct under the loss window, staging nothing.
+/// Without the gate the feed would resume onto its stale receipt.
+#[test]
+fn joint_machine_voided_feed_refuses_below_fence_resume() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.refuse_at_audited(2);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "a running Audited refusal with its frame re-arms"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "the re-armed lane accepts the next commit"
+    );
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 3);
+    fixture.published_labeled("after running re-arm", None);
+    // Precondition: the void failure closed the feed with loss.
+    let feed_state = |fixture: &MachineScene| {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let module = registry
+            .modules()
+            .find(|module| module.key == fixture.scene.real.modules[0].0)
+            .unwrap()
+            .id;
+        let edges: Vec<_> = registry
+            .instance_semantic_edges()
+            .filter(|record| record.module == module)
+            .collect();
+        assert_eq!(edges.len(), 1, "one incarnation per provider");
+        let feed = &edges[0].feed;
+        (
+            feed.mode(),
+            feed.degraded_loss(),
+            feed.fell_back(),
+            feed.reduced(),
+            feed.history_disposed(),
+            feed.degraded_loss_direct(),
+        )
+    };
+    let (mode_before, degraded_before, fell_back_before, _, _, _) = feed_state(&fixture);
+    assert_eq!(
+        mode_before,
+        crate::semantics_key_use::FeedMode::S1Only,
+        "the void failure closed the feed"
+    );
+    assert!(
+        degraded_before,
+        "the void failure closed the feed with loss"
+    );
+    assert!(!fell_back_before, "no fallback precedes the probe");
+    let (_, _, _, reduced_before, disposed_before, direct_before) = feed_state(&fixture);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    fixture.published_labeled("below-fence-resume-probe", None);
+    let (mode_after, _, fell_back_after, reduced_after, disposed_after, direct_after) =
+        feed_state(&fixture);
+    assert_eq!(
+        mode_after,
+        crate::semantics_key_use::FeedMode::S1Only,
+        "no resume onto the below-fence receipt"
+    );
+    assert!(!fell_back_after, "the probe never replays through fallback");
+    assert_eq!(reduced_after, reduced_before, "no replay without a resume");
+    assert_eq!(
+        disposed_after, disposed_before,
+        "the probe stages nothing to dispose"
+    );
+    assert_eq!(
+        direct_after,
+        direct_before + 1,
+        "the probe reduces direct under the loss window"
+    );
+}
+
 /// The ingest-break void fences every pre-break key's history: its live
 /// sessions end Uncertain(OutcomeLost), its objects retire, its bootstrap
 /// voids. Those effects are the void's own original failure; they ride

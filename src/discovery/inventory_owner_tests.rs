@@ -1156,3 +1156,128 @@ fn handle_table_owner_scan_holds_len_within_cap() {
     assert!(!commit.complete, "the deferred commit stays incomplete");
     drop(live);
 }
+
+/// Owner-scan budget-only twin: the same stopped owner scan as the
+/// invariant twin above, but the scan also reports a non-budget skip
+/// (an unmatched `--module` hint, the production shape). The budget
+/// stop still files its named gap; the non-budget skip stays where
+/// it always was — dropped, never newly published.
+#[test]
+fn handle_table_owner_scan_files_only_budget_stop_rows() {
+    use std::os::unix::fs::MetadataExt as _;
+    const CAP: usize = 6;
+    const PREFILL: usize = 4;
+    const MODULES: usize = 6;
+    let mut engine = engine(2, 1);
+    engine.set_table_cap_for_test(CAP);
+    let dir = tempfile::tempdir().unwrap();
+    let mut live = Vec::new();
+    for n in 0..PREFILL {
+        let path = dir.path().join(format!("fill{n:02}.so"));
+        std::fs::write(&path, format!("fill-{n}")).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let maps = p11scope_manifest::maps::ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        };
+        let proved = crate::discovery::identity::ProvedEntry::for_test(
+            std::fs::File::open(&path).unwrap(),
+            maps,
+            &format!("fill-{n:02}"),
+            None,
+        );
+        let crate::discovery::identity::ProvedEntry { file, meta } = proved;
+        match engine.handle_table_mut().acquire(
+            file,
+            &meta,
+            crate::discovery::handle_table::DeferredReason::Live,
+        ) {
+            crate::discovery::handle_table::AcquireOutcome::Held(held) => {
+                assert!(held.inserted);
+                live.push(held);
+            }
+            crate::discovery::handle_table::AcquireOutcome::Deferred(reason) => {
+                panic!("prefill must admit below the cap: {reason:?}")
+            }
+        }
+    }
+    let owner = open(&mut engine);
+    let modules = {
+        let view = engine
+            .views
+            .iter()
+            .find(|view| view.id() == owner)
+            .expect("the opened owner retains its view");
+        let bytes = std::fs::read("/bin/true").unwrap();
+        let mut mounts = crate::process::MountTableCache::default();
+        let mut fixture_budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let mut modules = Vec::new();
+        for n in 0..MODULES {
+            let path = dir.path().join(format!("lib{n:02}.so"));
+            std::fs::write(&path, &bytes).unwrap();
+            let (_file, key) = crate::discovery::identity::open_view_object_cached(
+                view,
+                &path,
+                &mut mounts,
+                &mut fixture_budget,
+            )
+            .unwrap();
+            let mut module = crate::discovery::identity::test_fixture::module(key);
+            module.view = view.id();
+            module.mount_namespace = view.mount_namespace();
+            module.key = key;
+            module.path = path.to_str().unwrap().to_string();
+            module.tables = Vec::new();
+            modules.push(module);
+        }
+        modules
+    };
+    let mut guard = ScriptedImage(ImageCheck::Exact);
+    let lease = engine.acquire_inventory_scan(owner).unwrap();
+    let window = engine
+        .budget
+        .begin_window(WindowId::new(0), u64::MAX)
+        .unwrap();
+    let checkpoint = engine.budget.checkpoint(window.clone()).unwrap();
+    let receipt = engine
+        .scan_inventory_owner_with(&lease, &mut guard, |_, _, _| {
+            Ok(ScanOutcome::Scanned {
+                modules,
+                skipped: vec![crate::discovery::scan::Skipped {
+                    subject: "/opt/hint-probe.so".into(),
+                    reason: crate::discovery::scan::HINT_NOT_MAPPED_REASON.into(),
+                }],
+                scan_ms: 0,
+            })
+        })
+        .unwrap();
+    engine.budget.finish_scan(checkpoint).unwrap();
+    engine.budget.finish_window(window).unwrap();
+    let ScanReceipt::AdditionsOnly(_) = receipt else {
+        panic!("a deferred owner scan stays partial, never complete");
+    };
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == crate::discovery::identity::PIN_WAIT_SUBJECT
+                && skip
+                    .reason
+                    .contains(crate::discovery::identity::PIN_BUDGET_STOP_DETAIL)
+        }),
+        "the stop files its named budget gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.reason == crate::discovery::scan::HINT_NOT_MAPPED_REASON }),
+        "the non-budget scan skip is not newly published: {:?}",
+        engine.counters.object_skips
+    );
+    engine.release_inventory_scan(&lease).unwrap();
+    drop(live);
+}

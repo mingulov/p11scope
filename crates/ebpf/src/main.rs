@@ -5244,6 +5244,10 @@ pub unsafe extern "C" fn p11_link_emit_fork(
         pid_tgid: creator_tgid << 32,
         session: child_pid as u64,
         event_type,
+        // Userspace exit matching orders generations by this stamp; an
+        // unstamped (zero) FORK predates every exit and would retire a
+        // live reuse successor with the dead generation.
+        ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
         ..Event::default()
     };
     // Every EVENTS record is an `EventRecord`; a FORK carries no call, so

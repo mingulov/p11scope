@@ -11547,7 +11547,7 @@ impl MachineScene {
 /// slot is taken exactly as the audit takes it, the raw quantum drops,
 /// and the next collect voids every key open across it (named) and
 /// re-syncs above a fence. The next quantum publishes, and every call
-/// stays accounted: reduced plus disposed equals the S1 returns.
+/// stays accounted: reduced plus disposed plus not-attributed direct equals the S1 returns.
 #[test]
 fn joint_machine_running_auditing_refusal_rearms_and_next_quantum_publishes() {
     let mut fixture = MachineScene::new(1);
@@ -11857,6 +11857,152 @@ fn joint_machine_auditing_foreign_h3_hold_refuses_the_rearm() {
     assert_eq!(
         fixture.machine.disposition_reason(),
         Some(SemanticRefusal::Unavailable)
+    );
+}
+
+/// Back-to-back twin at the audit step: two consecutive Auditing
+/// refusals re-arm without a recovery between them. The first void is
+/// still pending when the second void applies, so the pending-void
+/// guard keeps the first and drops the second's failure record; the
+/// recovery then delivers the first, drains the pending void, and
+/// publishes, with every call accounted across both re-arms.
+#[test]
+fn joint_machine_auditing_back_to_back_rearms_recover_and_drain_the_void() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.assert_no_staged_calls("the prime publish");
+    let baseline_returns = fixture.api_returns_total();
+    let reduced = fixture.reduced_for(0);
+    let disposed_prime = fixture.disposed_total();
+    let direct_prime = fixture.direct_fallback_total();
+    let unknown_before = fixture.unknown_terminals();
+    // First interruption: refuse at Auditing, re-arm. Nothing is
+    // voided yet: the re-arm only breaks the stream.
+    fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 2);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "the first Auditing refusal re-arms"
+    );
+    assert_eq!(fixture.machine.running_rearms_for_test(), 1);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the first re-arm breaks the stream but voids nothing yet"
+    );
+    // Second interruption without a recovery between: the second
+    // quantum's collect voids the first quantum's open keys, so a
+    // void is already pending when its audit refuses.
+    fixture.refuse_at_auditing_with(SemanticRefusal::Unavailable, 3);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "the second quantum's collect carries the first void"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "the second Auditing refusal re-arms"
+    );
+    assert_eq!(fixture.machine.running_rearms_for_test(), 2);
+    assert!(
+        !fixture.h3_pending(),
+        "the second re-arm took the second quantum's untaken H3 slot"
+    );
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the second abandon cancelled its unapplied publication"
+    );
+    // The refused audit took nothing: the first void is still pending
+    // when the recovery's void applies, so the guard keeps it and
+    // drops the second failure record.
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "the refused audit leaves the first void pending"
+    );
+    assert_eq!(
+        fixture
+            .all_gap_subjects()
+            .iter()
+            .filter(|seen| *seen == QUANTUM_ABANDONED)
+            .count(),
+        2,
+        "one staged gap per abandoned quantum"
+    );
+    fixture.assert_recovers("after back-to-back auditing re-arms", 4);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the recovery's audit frame delivered the carried void"
+    );
+    assert_eq!(
+        fixture.api_returns_total(),
+        baseline_returns + 3,
+        "S1 joins every call including both abandoned quanta"
+    );
+    assert_eq!(
+        fixture.reduced_for(0) - reduced
+            + (fixture.disposed_total() - disposed_prime)
+            + (fixture.direct_fallback_total() - direct_prime),
+        fixture.api_returns_total() - baseline_returns,
+        "reduced, disposed and not-attributed calls cover every call across both re-arms"
+    );
+    let unknown_after = fixture.unknown_terminals();
+    assert_eq!(
+        (
+            unknown_after[1] - unknown_before[1],
+            unknown_after[2] - unknown_before[2],
+            unknown_after[3] - unknown_before[3],
+        ),
+        (0, 0, 0),
+        "the re-arms invent no failed, cancelled or unknown outcomes"
+    );
+    // The recovery published: identical staged gaps collapse into one
+    // published row each, with repeats counting both occurrences.
+    let repeats_for = |subject: &str| {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject == subject)
+            .map(|(_, repeats)| *repeats)
+            .sum::<u64>()
+    };
+    assert_eq!(
+        repeats_for(QUANTUM_ABANDONED),
+        2,
+        "the publish discloses both abandoned quanta"
+    );
+    assert_eq!(
+        repeats_for("Joint key operations unavailable; retained S1"),
+        2,
+        "both voids applied, one per follow-up collect"
     );
 }
 

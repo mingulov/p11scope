@@ -16698,10 +16698,12 @@ impl Engine {
     /// Merges a watch scan's counters without dirtying publication: a
     /// transient watch scan changes no plan input, so its telemetry
     /// (time, noise) must not invalidate the loader-plan cache nor
-    /// force a tail republish every 10 ms. Loud loss still publishes:
-    /// a newly unavailable scan dirties the revision, and
-    /// memory-refused skips file through the loud path exactly like
-    /// frame scans.
+    /// force a tail republish every 10 ms. Memory-refused races count
+    /// per cause in the merged scan noise (the scan already noted
+    /// each) and file no gap row: a transient member's mid-scan exit
+    /// is already counted exactly as an exit, and a live member's race
+    /// retries on backoff. Only a newly unavailable scan dirties the
+    /// revision.
     fn absorb_watch_scan_counters(&mut self, counters: DiscoveryCounters) {
         let unavailable_new =
             counters.scan_unavailable.is_some() && self.counters.scan_unavailable.is_none();
@@ -16709,14 +16711,7 @@ impl Engine {
             self.counters.scan_unavailable.or(counters.scan_unavailable);
         self.counters.scan_ms = self.counters.scan_ms.saturating_add(counters.scan_ms);
         self.counters.noise.merge(&counters.noise);
-        let mut marked = false;
-        for skipped in &counters.object_skips {
-            if skipped.reason.starts_with("memory scan refused: ") {
-                self.mark_partial(&skipped.subject, &skipped.reason);
-                marked = true;
-            }
-        }
-        if unavailable_new && !marked {
+        if unavailable_new {
             self.note_facts_mutated();
         }
     }

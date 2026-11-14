@@ -20435,6 +20435,39 @@ fn owned_child_arm_priority_moves_the_scheduled_child_first() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// Watch scans count memory-refused races per cause instead of marking
+/// generic gaps: the scan already noted the refusal in its noise tally,
+/// so the watch merges the count and files no row (a transient member's
+/// mid-scan exit is already counted exactly as an exit, and a live
+/// member's race retries on backoff — a permanent row for either would
+/// mislead).
+#[test]
+fn absorb_watch_scan_counters_counts_refusals_without_marking_gaps() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    let mut engine = Engine::empty();
+    let mut counters = DiscoveryCounters::default();
+    let skipped = Skipped {
+        subject: "capture discovery".into(),
+        reason: "memory scan refused: process generation changed during acquisition".into(),
+    };
+    // The scan notes every skip it returns (scan_and_pin_with_proof).
+    counters.noise.note_skip(&skipped.subject, &skipped.reason);
+    counters.object_skips.push(skipped);
+    engine.absorb_watch_scan_counters(counters);
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a watch refusal files no gap row"
+    );
+    assert_eq!(
+        engine
+            .counters
+            .noise
+            .count(DiscoveryNoiseClass::ProcessEnded),
+        1,
+        "the refusal cause still counts exactly once"
+    );
+}
+
 /// The watch run budget binds time and I/O: either ceiling stops the
 /// run's further scans, while a failed clock read alone stops nothing.
 #[test]

@@ -8430,6 +8430,13 @@ mod tests {
         fail_read_b: bool,
         fail_generation: bool,
         expire_at_b: bool,
+        /// Monotonic-clock reads fail during the maps-B snapshot, so the
+        /// bracket meets `SCAN_CLOCK_REASON` instead of a deadline.
+        fail_clock_at_b: bool,
+        /// Work units `final_generation` spends before proving the
+        /// generation (0 spends nothing, like before): production proves
+        /// the filesystem there, which spends budget work.
+        final_generation_spend: u64,
         /// Scripted `vm_file` identities (held fd, every target range); `None`
         /// reads the real ones.
         mapped: Option<(
@@ -8499,7 +8506,9 @@ mod tests {
             })
         }
         fn maps_now(&self) -> Option<u64> {
-            if self.expire_at_b && self.maps_reads == 2 {
+            if self.fail_clock_at_b && self.maps_reads == 2 {
+                None
+            } else if self.expire_at_b && self.maps_reads == 2 {
                 Some(u64::MAX)
             } else {
                 crate::attach::monotonic_ns()
@@ -8534,9 +8543,14 @@ mod tests {
         fn final_generation(
             &mut self,
             view: &ProcessView,
-            _: &mut CaptureWorkBudget,
+            budget: &mut CaptureWorkBudget,
         ) -> Result<(), String> {
             self.log.borrow_mut().push("final generation".into());
+            if self.final_generation_spend > 0 {
+                budget
+                    .spend(self.final_generation_spend)
+                    .map_err(str::to_owned)?;
+            }
             if self.fail_generation {
                 Err("injected generation loss".into())
             } else {
@@ -8637,6 +8651,8 @@ mod tests {
                 fail_read_b: false,
                 fail_generation: false,
                 expire_at_b: false,
+                fail_clock_at_b: false,
+                final_generation_spend: 0,
                 mapped: None,
             }
         }
@@ -9086,7 +9102,31 @@ mod tests {
                 .map_or(measured.attempted_io_bytes(), |b| b.0)
                 + f.maps_b.len() as u64 / 2,
         });
-        f.assert_refused(&mut budget, "final mapping validation unavailable");
+        // Data-always (controller R1): an IO-starved bracket over a live
+        // view keeps the decoded module with the failure named, never an
+        // empty view — the same keep as the work-starved twin.
+        let outcome = f.run(&mut budget).unwrap();
+        assert_eq!(outcome.modules().len(), 1);
+        assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            !outcome.modules()[0].tables_scan_finished,
+            "a kept module never claims a finished tables scan: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable"))
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("capture attempted-I/O ceiling")),
+            "the IO exhaustion stays named: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
     }
 
     #[test]
@@ -9109,6 +9149,10 @@ mod tests {
         let outcome = f.run(&mut budget).unwrap();
         assert_eq!(outcome.modules().len(), 1);
         assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            !outcome.modules()[0].tables_scan_finished,
+            "a kept module never claims a finished tables scan: {outcome:?}"
+        );
         assert!(
             outcome
                 .skipped()
@@ -9225,7 +9269,7 @@ mod tests {
             outcome
                 .skipped()
                 .iter()
-                .any(|skip| skip.subject == "capture discovery"
+                .any(|skip| skip.subject == "table decode"
                     && skip.reason
                         == "2 provider files were not decoded: table decode ceiling reached"),
             "one named, counted gap for the refused files: {:?}",
@@ -9357,7 +9401,7 @@ mod tests {
             outcome
                 .skipped()
                 .iter()
-                .any(|skip| skip.subject == "capture discovery"
+                .any(|skip| skip.subject == "table decode"
                     && skip.reason
                         == "1 provider file was not decoded: table decode ceiling reached"),
             "singular counted gap for the refused file: {:?}",
@@ -9403,7 +9447,7 @@ mod tests {
             let outcome = probe.run_with_hints(&hints, &mut budget).unwrap();
             (outcome.modules().len() == 1
                 && outcome.skipped().iter().any(|skip| {
-                    skip.subject == "capture discovery"
+                    skip.subject == "table decode"
                         && skip.reason
                             == "1 provider file was not decoded: table decode ceiling reached"
                 }))
@@ -9475,7 +9519,7 @@ mod tests {
                 return None;
             };
             let gap = outcome.skipped().iter().any(|skip| {
-                skip.subject == "capture discovery"
+                skip.subject == "table decode"
                     && skip.reason
                         == "1 provider file was not decoded: table decode ceiling reached"
             });
@@ -9503,7 +9547,7 @@ mod tests {
             outcome
                 .skipped()
                 .iter()
-                .any(|skip| skip.subject == "capture discovery"
+                .any(|skip| skip.subject == "table decode"
                     && skip.reason
                         == "1 provider file was not decoded: table decode ceiling reached"),
             "the refused file is counted: {:?}",
@@ -9571,6 +9615,505 @@ mod tests {
         );
         budget.finish_scan(scan).unwrap();
         budget.finish_window(token).unwrap();
+    }
+
+    /// C1 twin (two providers): the check proves the first provider's
+    /// mapping changed (`Ok(false)`), then the second provider's
+    /// validation spend starves the work ceiling. The proven-changed
+    /// module must be dropped with its mapping-changed row; the later,
+    /// never-validated module keeps with an unfinished scan.
+    #[test]
+    fn starved_bracket_drops_a_proven_changed_module_and_keeps_the_later_unproven_one() {
+        fn changed_first() -> BracketFixture {
+            let mut fixture = BracketFixture::new(8, true);
+            fixture.add_provider("provider2.so");
+            fixture.maps_b = fixture
+                .maps_b
+                .replacen("4000-6000 rw-p", "4000-4810 rw-p", 1);
+            fixture
+        }
+        // Healthy control: no stop, the changed module drops with its row.
+        let mut control = changed_first();
+        let hints = control.provider_paths();
+        let changed_path = hints[0].display().to_string();
+        let kept_path = hints[1].display().to_string();
+        let mut measured = CaptureWorkBudget::default();
+        let control_outcome = control.run_with_hints(&hints, &mut measured).unwrap();
+        assert!(
+            control_outcome
+                .modules()
+                .iter()
+                .all(|m| m.path != changed_path),
+            "healthy control drops the changed module: {control_outcome:?}"
+        );
+        assert!(
+            control_outcome
+                .skipped()
+                .iter()
+                .any(|s| s.subject == changed_path && s.reason == MAPPING_CHANGED_REASON),
+            "healthy control names the change: {control_outcome:?}"
+        );
+        assert_eq!(control_outcome.modules().len(), 1);
+        assert!(control_outcome.mapping_scan_completed());
+        // One work unit short of the healthy total starves the last spend
+        // of the second validation — after the first returned `Ok(false)`.
+        let mut f = changed_first();
+        let hints = f.provider_paths();
+        let changed_path = hints[0].display().to_string();
+        let kept_path = hints[1].display().to_string();
+        let mut budget = CaptureWorkBudget {
+            work_ceiling: measured.work_units - 1,
+            ..CaptureWorkBudget::default()
+        };
+        let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
+        assert_eq!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
+        assert!(
+            outcome.modules().iter().all(|m| m.path != changed_path),
+            "a proven-changed module is dropped, never published: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|s| s.subject == changed_path && s.reason == MAPPING_CHANGED_REASON),
+            "the proven change stays named: {outcome:?}"
+        );
+        let kept: Vec<_> = outcome
+            .modules()
+            .iter()
+            .filter(|m| m.path == kept_path)
+            .collect();
+        assert_eq!(kept.len(), 1, "the unproven module keeps: {outcome:?}");
+        assert_eq!(kept[0].tables.len(), 1);
+        assert!(
+            !kept[0].tables_scan_finished,
+            "a kept module never claims a finished tables scan: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable")),
+            "the starved bracket stays explicit evidence: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    /// C1 twin (generation stop): the check passes — one validation proves
+    /// a mapping change — then `final_generation` spends the last work
+    /// unit (production proves the filesystem there). The `(Ok, Err)` arm
+    /// must still drop the proven-changed module with its row, and keep
+    /// an unproven module unfinished.
+    #[test]
+    fn generation_stop_after_a_passed_check_still_drops_a_proven_changed_module() {
+        for changed in [false, true] {
+            let mut control = BracketFixture::new(8, true);
+            if changed {
+                control.maps_b = control.maps_b.replace("4000-6000", "4000-4810");
+            }
+            let mut measured = CaptureWorkBudget::default();
+            let control_outcome = control.run(&mut measured).unwrap();
+            let control_path = control.path.display().to_string();
+            if changed {
+                assert!(
+                    control_outcome
+                        .modules()
+                        .iter()
+                        .all(|m| m.path != control_path),
+                    "healthy control drops the changed module: {control_outcome:?}"
+                );
+            } else {
+                assert_eq!(control_outcome.modules().len(), 1);
+            }
+            // The hook's single unit is exactly over the healthy total, so
+            // every validation passes and only the generation proof starves.
+            let mut f = BracketFixture::new(8, true);
+            if changed {
+                f.maps_b = f.maps_b.replace("4000-6000", "4000-4810");
+            }
+            let path = f.path.display().to_string();
+            f.final_generation_spend = 1;
+            let mut budget = CaptureWorkBudget {
+                work_ceiling: measured.work_units,
+                ..CaptureWorkBudget::default()
+            };
+            let outcome = f.run(&mut budget).unwrap();
+            assert_eq!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
+            assert!(
+                outcome.skipped().iter().any(|skip| skip
+                    .reason
+                    .contains("process generation changed during acquisition")),
+                "the starved generation proof stays named: {:?}",
+                outcome.skipped()
+            );
+            if changed {
+                assert!(
+                    outcome.modules().is_empty(),
+                    "a proven-changed module is dropped, never published: {outcome:?}"
+                );
+                assert!(
+                    outcome
+                        .skipped()
+                        .iter()
+                        .any(|s| s.subject == path && s.reason == MAPPING_CHANGED_REASON),
+                    "the proven change stays named: {outcome:?}"
+                );
+            } else {
+                assert_eq!(outcome.modules().len(), 1);
+                assert_eq!(outcome.modules()[0].tables.len(), 1);
+                assert!(
+                    !outcome.modules()[0].tables_scan_finished,
+                    "a kept module never claims a finished tables scan: {outcome:?}"
+                );
+            }
+            assert!(!outcome.mapping_scan_completed());
+        }
+    }
+
+    /// I2 (window stop): an Inventory window table-decode refusal stops
+    /// the scan, and the bracket fails on the sticky stop. The keep must
+    /// publish the decoded module beside the counted gap — the window
+    /// noun ("1 provider file was not decoded") is true only when the
+    /// other file WAS decoded.
+    #[test]
+    fn window_stop_keeps_decoded_modules_with_a_true_undecoded_count() {
+        let mut f = BracketFixture::new(8, true);
+        f.add_provider("provider2.so");
+        let mut budget =
+            CaptureWorkBudget::for_inventory(inventory_limits(1 << 26, 1 << 24, 1, 4096, 64, 64));
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        let hints = f.provider_paths();
+        let result = f.run_with_hints(&hints, &mut budget);
+        let stop = budget.stopped_reason();
+        let _ = budget.finish_scan(scan);
+        let _ = budget.finish_window(token);
+        let outcome = result.unwrap();
+        assert_eq!(stop, Some(TABLE_WINDOW_CEILING_REASON));
+        assert_eq!(
+            outcome.modules().len(),
+            2,
+            "both visited providers keep: {outcome:?}"
+        );
+        let decoded: Vec<_> = outcome
+            .modules()
+            .iter()
+            .filter(|m| !m.tables.is_empty())
+            .collect();
+        assert_eq!(
+            decoded.len(),
+            1,
+            "the decoded file publishes beside the gap: {outcome:?}"
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| skip.subject == "table decode"
+                && skip.reason
+                    == "1 provider file was not decoded: discovery window table decode allowance reached"),
+            "one named, counted window gap: {:?}",
+            outcome.skipped()
+        );
+        let refused = hints[1].display().to_string();
+        assert!(
+            outcome.skipped().iter().any(|skip| skip.subject == refused
+                && skip.reason
+                    == "provider file was not decoded: discovery window table decode allowance reached"),
+            "the refused file keeps its plain row: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.modules().iter().all(|m| !m.tables_scan_finished),
+            "kept modules never claim a finished tables scan: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable")),
+            "the starved bracket stays explicit evidence: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    /// I2 (interface-window stop): the window interface allowance refuses
+    /// the second provider's interface triple and stops the scan. Both
+    /// decoded tables keep with the bracket failure named.
+    #[test]
+    fn interface_window_stop_keeps_decoded_tables() {
+        let mut f = BracketFixture::new(8, true);
+        f.add_provider("provider2.so");
+        let mut budget =
+            CaptureWorkBudget::for_inventory(inventory_limits(1 << 26, 1 << 24, 64, 4096, 1, 64));
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        let hints = f.provider_paths();
+        let result = f.run_with_hints(&hints, &mut budget);
+        let stop = budget.stopped_reason();
+        let _ = budget.finish_scan(scan);
+        let _ = budget.finish_window(token);
+        let outcome = result.unwrap();
+        assert_eq!(stop, Some(INTERFACE_WINDOW_CEILING_REASON));
+        assert_eq!(
+            outcome.modules().len(),
+            2,
+            "both decoded providers keep: {outcome:?}"
+        );
+        assert!(
+            outcome.modules().iter().all(|m| m.tables.len() == 1),
+            "both tables decoded: {outcome:?}"
+        );
+        assert!(
+            outcome.modules().iter().all(|m| !m.tables_scan_finished),
+            "kept modules never claim a finished tables scan: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable")),
+            "the starved bracket stays explicit evidence: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    /// I2 (collection stop) with C1 safety: two providers, the first
+    /// changed; the shared collection allowance fails exactly at the
+    /// bracket's closing poll (the last collection checkpoint of the
+    /// identical control run). The proven-changed module drops with its
+    /// row; the validated later module keeps, unfinished.
+    #[test]
+    fn collection_stop_in_the_check_keeps_validated_modules() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        fn changed_first() -> BracketFixture {
+            let mut fixture = BracketFixture::new(8, true);
+            fixture.add_provider("provider2.so");
+            fixture.maps_b = fixture
+                .maps_b
+                .replacen("4000-6000 rw-p", "4000-4810 rw-p", 1);
+            fixture
+        }
+        // Control: count the collection checkpoints of the identical shape.
+        let mut control = changed_first();
+        let control_hints = control.provider_paths();
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = calls.clone();
+        let mut control_budget = CaptureWorkBudget::default();
+        control_budget.set_collection_work(CollectionWork::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        let control_outcome = control
+            .run_with_hints(&control_hints, &mut control_budget)
+            .unwrap();
+        assert!(control_outcome.mapping_scan_completed());
+        let total = calls.load(Ordering::SeqCst);
+        assert!(total > 0, "the control must checkpoint collection work");
+        // Fail exactly the last checkpoint: the closing poll after both
+        // validations ran (the first proved its change).
+        let mut f = changed_first();
+        let hints = f.provider_paths();
+        let changed_path = hints[0].display().to_string();
+        let kept_path = hints[1].display().to_string();
+        let fired = Arc::new(AtomicU64::new(0));
+        let gate = fired.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(CollectionWork::new(move |_| {
+            gate.fetch_add(1, Ordering::SeqCst) + 1 < total
+        }));
+        let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
+        assert_eq!(
+            budget.stopped_reason(),
+            Some("cgroup collection stopped or shared work allowance exhausted")
+        );
+        assert!(
+            outcome.modules().iter().all(|m| m.path != changed_path),
+            "a proven-changed module is dropped, never published: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|s| s.subject == changed_path && s.reason == MAPPING_CHANGED_REASON),
+            "the proven change stays named: {outcome:?}"
+        );
+        let kept: Vec<_> = outcome
+            .modules()
+            .iter()
+            .filter(|m| m.path == kept_path)
+            .collect();
+        assert_eq!(kept.len(), 1, "the validated module keeps: {outcome:?}");
+        assert_eq!(kept[0].tables.len(), 1);
+        assert!(
+            !kept[0].tables_scan_finished,
+            "a kept module never claims a finished tables scan: {outcome:?}"
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| skip
+                .reason
+                .contains("final mapping validation unavailable")
+                && skip.reason.contains("cgroup collection stopped")),
+            "the starved bracket stays explicit evidence: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    /// I2 (clock failure): monotonic-clock reads fail during the maps-B
+    /// snapshot, so the bracket meets `SCAN_CLOCK_REASON`. The decoded
+    /// module keeps with the failure named, unfinished.
+    #[test]
+    fn clock_failure_in_the_check_keeps_decoded_modules() {
+        let mut f = BracketFixture::new(8, true);
+        f.fail_clock_at_b = true;
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(u64::MAX));
+        let outcome = f.run(&mut budget).unwrap();
+        assert_eq!(budget.stopped_reason(), Some(SCAN_CLOCK_REASON));
+        assert_eq!(outcome.modules().len(), 1);
+        assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            !outcome.modules()[0].tables_scan_finished,
+            "a kept module never claims a finished tables scan: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable")),
+            "the starved bracket stays explicit evidence: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    /// I2 (Inventory IO stop): the window IO allowance exhausts inside
+    /// the maps-B snapshot — after a complete decode — so the bracket
+    /// fails on the sticky IO stop. The decoded module keeps, unfinished.
+    #[test]
+    fn inventory_io_stop_in_the_check_keeps_decoded_modules() {
+        // Control: the identical shape with a generous window; its IO
+        // total sizes the test window to exhaust mid-B-snapshot.
+        let mut control = BracketFixture::new(8, true);
+        let mut control_budget =
+            CaptureWorkBudget::for_inventory(inventory_limits(1 << 26, 1 << 24, 64, 4096, 64, 64));
+        let token = control_budget
+            .begin_window(WindowId::new(1), u64::MAX)
+            .unwrap();
+        let scan = control_budget.checkpoint(token.clone()).unwrap();
+        let control_hints = control.provider_paths();
+        let control_outcome = control
+            .run_with_hints(&control_hints, &mut control_budget)
+            .unwrap();
+        assert!(control_outcome.mapping_scan_completed());
+        let total_io = control_budget.attempted_io_bytes();
+        let maps_b_len = control.maps_b.len() as u64;
+        control_budget.finish_scan(scan).unwrap();
+        control_budget.finish_window(token).unwrap();
+
+        let mut f = BracketFixture::new(8, true);
+        assert_eq!(f.maps_b.len() as u64, maps_b_len);
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+            total_io - maps_b_len / 2,
+            1 << 24,
+            64,
+            4096,
+            64,
+            64,
+        ));
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        let hints = f.provider_paths();
+        let result = f.run_with_hints(&hints, &mut budget);
+        let stop = budget.stopped_reason();
+        let _ = budget.finish_scan(scan);
+        let _ = budget.finish_window(token);
+        let outcome = result.unwrap();
+        assert_eq!(stop, Some(IO_CEILING_REASON));
+        assert_eq!(outcome.modules().len(), 1);
+        assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            !outcome.modules()[0].tables_scan_finished,
+            "a kept module never claims a finished tables scan: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable")),
+            "the starved bracket stays explicit evidence: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.mapping_scan_completed());
+    }
+
+    /// M1: every counted undecoded file carries its per-file row, for
+    /// every work ceiling (sweeps the stop position through the scan —
+    /// tables loop, interface loop, and between modules). Gaps parse by
+    /// reason shape alone: only the counted summary starts with a number
+    /// (per-file rows start with "provider"), and the summary subject is
+    /// pinned by the named-gap tests, not here.
+    #[test]
+    fn refused_rows_match_the_counted_gap_at_every_stop_position() {
+        let mut mismatches = Vec::new();
+        let mut shapes = std::collections::BTreeMap::new();
+        for delta in 1u64..=3000 {
+            let mut f = BracketFixture::new(8, true);
+            f.add_provider("provider2.so");
+            let mut budget = CaptureWorkBudget::default();
+            budget.table_candidates = MAX_TABLE_CANDIDATES;
+            budget.work_ceiling = budget.work_units_count() + delta;
+            let hints = f.provider_paths();
+            let Ok(outcome) = f.run_with_hints(&hints, &mut budget) else {
+                continue;
+            };
+            let counted: usize = outcome
+                .skipped()
+                .iter()
+                .filter_map(|s| {
+                    let (n, rest) = s.reason.split_once(' ')?;
+                    if rest.starts_with("provider file was not decoded")
+                        || rest.starts_with("provider files were not decoded")
+                    {
+                        n.parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .sum();
+            let rows = outcome
+                .skipped()
+                .iter()
+                .filter(|s| s.reason.starts_with("provider file was not decoded: "))
+                .count();
+            *shapes
+                .entry((counted, rows, outcome.modules().len()))
+                .or_insert(0u32) += 1;
+            if counted != rows {
+                if mismatches.len() < 2 {
+                    eprintln!(
+                        "MISMATCH delta {delta}: counted {counted} rows {rows} modules {} stop {:?} skipped {:?}",
+                        outcome.modules().len(),
+                        budget.stopped_reason(),
+                        outcome
+                            .skipped()
+                            .iter()
+                            .map(|s| (s.subject.as_str(), s.reason.as_str()))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                mismatches.push((delta, counted, rows));
+            }
+        }
+        eprintln!("shapes (counted, rows, modules) -> runs: {shapes:?}");
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches, first: {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(5)]
+        );
     }
 
     /// The retained file-key cause noun: an Inventory budget with only its
@@ -9754,6 +10297,10 @@ mod tests {
         let (outcome, examined) = f.run_examined_with_hints(&hints, &mut budget);
         assert_eq!(outcome.modules().len(), 1);
         assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            !outcome.modules()[0].tables_scan_finished,
+            "a kept module never claims a finished tables scan: {outcome:?}"
+        );
         assert!(
             outcome
                 .skipped()

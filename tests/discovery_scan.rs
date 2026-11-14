@@ -1196,7 +1196,8 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
     // The native child blocks with both providers loaded, so test-worker maps
     // cannot alter acquisition costs between these scans. Measure all identity
     // work, then remove the final object's data allowance. The replay cannot
-    // finish maps B, so even the earlier object's private result must be refused.
+    // finish maps B, so both decoded objects keep with the failure named
+    // (data-always, controller R1) — never an empty view.
     let mut calibration_budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: 64 * 1024 * 1024,
         total_bytes: 512 * 1024 * 1024,
@@ -1229,15 +1230,33 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
         per_object_bytes: 64 * 1024 * 1024,
         total_bytes,
     });
+    let outcome = scan_pid(&request, &mut budget).unwrap();
     let ScanOutcome::Scanned {
         modules, skipped, ..
-    } = scan_pid(&request, &mut budget).unwrap()
+    } = &outcome
     else {
         panic!("scan must be available")
     };
+    // Data-always (controller R1): the IO-starved bracket keeps what the
+    // scan decoded. The first-scanned object decoded fully before the
+    // allowance ran out; the second keeps unproven and unfinished.
+    assert_eq!(
+        modules.len(),
+        2,
+        "both decoded objects keep past an IO-starved bracket: {modules:?}"
+    );
+    let first_path = Path::new(&calibrated[0].path);
+    let first = modules
+        .iter()
+        .find(|m| Path::new(&m.path) == first_path)
+        .expect("the fully decoded object keeps");
     assert!(
-        modules.is_empty(),
-        "no object can be published without maps B: {modules:?}"
+        !first.tables.is_empty(),
+        "the first object decoded before exhaustion: {first:?}"
+    );
+    assert!(
+        modules.iter().all(|m| !m.tables_scan_finished),
+        "kept modules never claim a finished tables scan: {modules:?}"
     );
     assert!(
         skipped
@@ -1463,9 +1482,23 @@ fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
         total_bytes,
         "only the bytes actually read before the next refused read are charged"
     );
+    // Data-always (controller R1): the IO-starved bracket keeps what the
+    // scan decoded, unfinished, with the failure named — never an empty view.
+    assert_eq!(
+        outcome.modules().len(),
+        1,
+        "the decoded object keeps past an IO-starved bracket: {:?}",
+        outcome.modules()
+    );
     assert!(
-        outcome.modules().is_empty(),
-        "unvalidated ELF/memory inventory must stay private"
+        !outcome.modules()[0].tables.is_empty(),
+        "the table decoded before exhaustion: {:?}",
+        outcome.modules()
+    );
+    assert!(
+        !outcome.modules()[0].tables_scan_finished,
+        "a kept module never claims a finished tables scan: {:?}",
+        outcome.modules()
     );
     assert!(
         outcome.skipped().iter().any(|skip| skip

@@ -5810,7 +5810,9 @@ mod tests {
                 .unwrap();
             caps::needs_line(cap)
         };
-        let Status::Warn(detail) = capabilities_status(Ok(1u64 << caps::CAP_SYS_ADMIN_BIT), Some(true)) else {
+        let Status::Warn(detail) =
+            capabilities_status(Ok(1u64 << caps::CAP_SYS_ADMIN_BIT), Some(true))
+        else {
             panic!("admin alone must warn");
         };
         assert!(
@@ -5832,7 +5834,10 @@ mod tests {
     fn partial_capabilities_warn_with_each_missing_capability() {
         use crate::caps;
         let full = caps::minimal_live_mask();
-        assert!(matches!(capabilities_status(Ok(full), Some(true)), Status::Ok(_)));
+        assert!(matches!(
+            capabilities_status(Ok(full), Some(true)),
+            Status::Ok(_)
+        ));
         assert!(matches!(
             capabilities_status(Ok(u64::MAX), Some(true)),
             Status::Ok(_)

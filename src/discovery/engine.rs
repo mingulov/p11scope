@@ -7905,17 +7905,22 @@ fn maps_is_empty(proc_root: &Path, pid: u32) -> bool {
 }
 
 /// True when `pid` may arrive as a newcomer this tick: its task is provably
-/// running, or it is unreadable without a tracked generation on record (a
-/// reaped racer or a transient glitch — fail-closed, as before).
-/// A zombie/dying task is an ended generation whose exit the ledger already
-/// handles: re-marking it as a newcomer files a spurious prune gap at reap
-/// for a fully-tracked generation. An unreadable pid with a tracked
+/// running — any non-dead state, or a zombie/dying state whose own stat
+/// line still counts live threads (field 20 >= 2, a leader that called
+/// `pthread_exit` while workers run) — or its stat line cannot prove death
+/// (unreadable without a tracked generation, malformed, or field 20
+/// missing — fail-closed, as before). Dead only when the same line reads
+/// `Z`/`X` with field 20 (`num_threads`) at 1 or less: a whole-group
+/// zombie, reaped or lingering, never a live leader. Re-marking an ended
+/// generation as a newcomer files a spurious prune gap at reap for a
+/// fully-tracked generation. An unreadable pid with a tracked
 /// generation — open admission, pending removal, or closed admission whose
 /// view already settled — is treated as the same dying generation: a
 /// *running* new generation is always stat-readable, so running reuse always
 /// stays markable. A reuse that already died and was reaped between ticks is
 /// unreadable and skips here; its exit gaps through the unmatched-exit path
-/// when the record drains (double-death plus reuse inside one tick is the
+/// when the record drains, and may be absorbed silently when the record
+/// never drains (double-death plus reuse inside one tick is the
 /// documented residual edge). A readdir race may still list a just-reaped
 /// pid after its view settled; the retained admission tells it apart from a
 /// true arrival.
@@ -7932,11 +7937,20 @@ pub(crate) fn newcomer_arrival_possible(
     let Some(end) = stat.rfind(')') else {
         return !admitted_pids.contains(&pid);
     };
-    let dead = stat[end + 1..]
-        .split_whitespace()
+    let mut fields = stat[end + 1..].split_whitespace();
+    if !fields
         .next()
-        .is_some_and(crate::process::stat_state_is_dead);
-    !dead
+        .is_some_and(crate::process::stat_state_is_dead)
+    {
+        return true;
+    }
+    // A zombie/dying state word alone does not prove the generation ended:
+    // a leader that called `pthread_exit` while workers run reads `Z` for
+    // its whole life. Dead only when the same line's field 20
+    // (`num_threads`) reads 1 or less; a missing or malformed field
+    // arrives (fail-closed: the exit record still judges the gap).
+    let threads = fields.nth(16).and_then(|field| field.parse::<u64>().ok());
+    !matches!(threads, Some(count) if count <= 1)
 }
 
 /// Deep-scan selection with kernel threads excluded first: threads with
@@ -14407,7 +14421,10 @@ impl Engine {
     /// Prove kernel-thread generations listed by initial discovery, so their
     /// exits skip the gap ledger even before the first live-tick walk runs.
     /// Newcomer bounds stay tick-owned: only the kthread ledger seeds here,
-    /// bounded like the tick classifier, at the capture origin.
+    /// bounded like the tick classifier, at the capture origin. Residual
+    /// window (discovery -> end of first walk): a kernel thread born after
+    /// discovery that exits before the first walk lists it is never proved,
+    /// so its exit still gaps.
     fn seed_initial_kernel_threads(&mut self, pids: &[u32]) {
         for pid in pids {
             if self.known_kernel_threads.len() >= MAX_SCAN_PIDS {

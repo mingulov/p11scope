@@ -566,6 +566,76 @@ owner.close()
     def test_parent_death_kills_and_reaps_the_birth_blocked_child(self):
         self.supervisor_death("birth")
 
+    def test_birth_gate_eof_before_parent_death_reaps_exit_125_without_main(self):
+        # Pins the designed fail-closed outcome of the birth-gate EOF path:
+        # closing the birth write end wakes the blocked child with EOF, it
+        # exits 125 without executing, and that status is stable when the
+        # parent then dies (the parent-death SIGKILL cannot land on an
+        # exited child). No timing assumption: the supervisor dies only
+        # after the child is observably a zombie.
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        code = r'''
+import json, os, runpy, select, sys
+module = runpy.run_path(sys.argv[1])
+Pin = runpy.run_path(sys.argv[2])["Pin"]
+caller, setarch = Pin(sys.argv[3]), Pin(sys.argv[4])
+owners = []
+owner = module["_spawn_initial_exec"](
+    owners, [str(caller.path), sys.argv[5]], caller_pin=caller, setarch_pin=setarch,
+    uid=os.getuid(), gid=os.getgid(), supplementary_groups=tuple(os.getgroups()),
+    env=dict(os.environ), deadline_ns=__import__("time").monotonic_ns() + 5_000_000_000)
+print(json.dumps({"pid": owner.pid}), flush=True)
+owner._close_fd(owner.birth_fd)
+owner.birth_fd = None
+pidfd = os.pidfd_open(owner.pid)
+if not select.select([pidfd], [], [], 2)[0]:
+    os._exit(17)
+os._exit(0)
+'''
+        supervisor = None
+        child_fd = None
+        reaped = False
+        try:
+            supervisor = subprocess.Popen(
+                [sys.executable, "-I", "-c", code, str(SCRIPT), str(Path(__file__).resolve()),
+                 str(self.caller_path), str(self.setarch_pin.path), str(self.marker)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True)
+            self.assertTrue(select.select([supervisor.stdout], [], [], 2)[0])
+            line = supervisor.stdout.readline()
+            self.assertTrue(line, supervisor.stderr.read() if supervisor.poll() is not None else "missing PID")
+            child = json.loads(line)["pid"]
+            child_fd = os.pidfd_open(child)
+            self.assertFalse(self.marker.exists())
+            self.assertEqual(supervisor.wait(timeout=2), 0)
+            self.assertTrue(select.select([child_fd], [], [], 2)[0], "owned child survived parent death")
+            pid, status = os.waitpid(child, 0)
+            reaped = True
+            self.assertEqual(pid, child)
+            self.assertTrue(os.WIFEXITED(status))
+            self.assertEqual(os.WEXITSTATUS(status), 125)
+            self.assertFalse(Path(f"/proc/{child}").exists())
+            self.assertFalse(self.marker.exists())
+        finally:
+            if supervisor is not None:
+                if supervisor.poll() is None:
+                    supervisor.kill()
+                supervisor.wait(timeout=2)
+                for stream in (supervisor.stdout, supervisor.stderr):
+                    stream.close()
+            if child_fd is not None:
+                if not reaped:
+                    try:
+                        signal.pidfd_send_signal(child_fd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    os.waitpid(child, 0)
+                os.close(child_fd)
+            self.assertEqual(libc.prctl(36, previous.value, 0, 0, 0), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

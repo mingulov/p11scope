@@ -16723,3 +16723,50 @@ fn every_bpf_ring_emit_site_counts_its_produced_record() {
         "PRODUCED_DISCOVERY bumps must stay exactly the discovery submit: {discovery_bumps:?}",
     );
 }
+
+/// The architecture-guard set runs in CI: `tests/architecture_guards.rs`
+/// holds the allowlist-v1 sha pin, Cargo auto-discovers it (no `[[test]]`
+/// disables it), and the hosted pipeline runs every non-sharded integration
+/// target through the `rest` partition, which enumerates `--test` targets
+/// from `cargo metadata` (so the guard joins `rest` with no workflow edit).
+#[test]
+fn architecture_guards_run_in_ci() {
+    let guards = read("tests/architecture_guards.rs");
+    assert!(
+        guards.contains("fn allowlist_v1_sha256_pin"),
+        "tests/architecture_guards.rs lost the allowlist-v1 sha pin test"
+    );
+    assert!(
+        guards.contains("26940546a4962008778650f66550d93e62f6228decc166fe8fba845a70b0df6e"),
+        "tests/architecture_guards.rs lost the pinned allowlist-v1 sha256"
+    );
+    assert!(
+        guards.contains("docs/privacy/allowlist-v1.md"),
+        "tests/architecture_guards.rs lost the allowlist-v1 path"
+    );
+    let manifest = read("Cargo.toml");
+    for section in manifest.split("[[test]]").skip(1) {
+        let block = section.split("\n[").next().unwrap_or(section);
+        if block.contains("architecture_guards") {
+            assert!(
+                !block.contains("test = false"),
+                "Cargo.toml disables the architecture_guards test target"
+            );
+        }
+    }
+    let helper = read("scripts/ci-test-partition.py");
+    assert!(
+        helper.contains("\nSHARDED_TARGET = \"artifact_contracts\"\n"),
+        "the partition helper no longer shards only artifact_contracts"
+    );
+    assert!(
+        helper.contains("selection += [\"--test\", name]"),
+        "the rest partition no longer enumerates every --test target"
+    );
+    let ci = read(".github/workflows/ci.yml");
+    let expected = format!("{PARTITION_RUN}rest -- {WORKSPACE_TEST_GATE} --no-fail-fast");
+    assert!(
+        step_calls(job_block(&ci, "tests")).any(|call| call == expected),
+        "the tests job no longer runs the rest partition as `{expected}`"
+    );
+}

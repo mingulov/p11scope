@@ -77,6 +77,10 @@ and [foreign target root path in gap reasons](#foreign-target-root-path-in-gap-r
 which documents the implemented chroot/container gap publication below; owner approval pending,
 and [learned provider file first loader](#learned-provider-file-first-loader-v070),
 which names the fanotify-learned file's first loading program below (owner direction 2026-11-11: program paths publish).**
+The [New-site key metadata (R2, 2026-11-13)](#new-site-key-metadata-r2-2026-11-13)
+(re-proposed with the per-field `source` refinement) and
+[Key metadata: inferred family and size class (v0.8.0 keymeta)](#key-metadata-inferred-family-and-size-class-v080-keymeta)
+sections below are PROPOSED and carry no capture authority until reviewed.
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -240,6 +244,9 @@ The initial scalar-result set is exactly:
 | `CKM_SHA256_KEY_DERIVATION` | 0x00000393 | One handle through arg 5 |
 | `CKM_ECDH1_DERIVE` | 0x00001050 | One handle through arg 5 |
 | `CKM_ECDH1_COFACTOR_DERIVE` | 0x00001051 | One handle through arg 5 |
+| `CKM_CONCATENATE_BASE_AND_KEY` | 0x00000360 | One handle through arg 5 |
+| `CKM_HKDF_DERIVE` | 0x0000402a | One handle through arg 5 |
+| `CKM_HKDF_DATA` | 0x0000402b | One handle through arg 5 |
 
 These scalar-result mechanisms are specified in PKCS #11 Current Mechanisms
 3.0 sections 2.4.10, 2.22.5, 2.3.17 and 2.3.18. In contrast, its sections
@@ -251,7 +258,9 @@ Numeric IDs are pinned by the
 
 Before reading/retaining arg 5 or reading the requested template, classify
 one target-width `CK_MECHANISM.mechanism` word at arg 1's pointer by exact
-equality to this four-member set. This is an explicitly proposed entry-time
+equality to this seven-member set (four initial plus the R2 HKDF/concat
+rows, all standard derives outside the may-leave-`phKey`-untouched
+family). This is an explicitly proposed entry-time
 read, separate from v1's return-time mechanism read. Retain only the finite
 accepted mechanism enum. At the matching CKR_OK return, reuse the existing
 guarded return-time captured mechanism scalar: it must have
@@ -295,7 +304,7 @@ explicit, narrow internal exceptions, not finite attribute values.
 | Entry instruction pointer | Probe context of an authorized named call; normalize for the qualified ABI and require the exact attached file offset in one executable mapping of the retained image. No user-memory read. | Private `CallStart`, completed-call transport and join queue only; discard after routing. No serialized address, address-derived hash, or persistent ID. | No unique current mapping: unattributable-instance gap, no semantic join. C1/C2. |
 | Mapping continuity epoch and state | Kernel/observer-owned per-image monotonic epoch, mutation-in-progress/uncertain flags, and bounded continuity checks; never inferred from equal maps alone. No syscall pointer, length or path is read for this witness. | Private entry/return and join state; public capture-local instance ID and finite continuity/loss status only. | Missing tracking, overflow, missed event or incomplete scan invalidates the affected associations. C2/C7. |
 | Input object/key handle | Only the scalar positions in the descriptor table; reject zero except optional absent `C_SetOperationState` keys. Successful use may establish first-observed accessibility, not creation. | Private call and session-binding state; public `object#N` plus finite role and provenance. | Unreadable or authority failure cannot join; invalid-handle return ends accessibility, not presumed destruction. C1/C3. |
-| DeriveKey result-protocol discriminator | Only `C_DeriveKey`, arg 1: one bounded target-word entry read of `CK_MECHANISM.mechanism`; exact full-width membership in the four scalar-result mechanisms above before arg 5/template access. At matched CKR_OK return, compare the existing guarded captured mechanism scalar/status with that entry enum; no extra return-time read. Never read `pParameter` or `ulParameterLen`. | Four-member accepted mechanism enum or unavailable state in private in-flight state; clear on every terminal/loss path. Public result-unavailable reason only; existing mechanism output retains its existing guards. | Missing/changed/unlisted evidence prevents a result read/identity; an ignored nonzero `phKey` sentinel gets no exception. C1/C3/C6. |
+| DeriveKey result-protocol discriminator | Only `C_DeriveKey`, arg 1: one bounded target-word entry read of `CK_MECHANISM.mechanism`; exact full-width membership in the seven scalar-result mechanisms above before arg 5/template access. At matched CKR_OK return, compare the existing guarded captured mechanism scalar/status with that entry enum; no extra return-time read. Never read `pParameter` or `ulParameterLen`. | Seven-member accepted mechanism enum or unavailable state in private in-flight state; clear on every terminal/loss path. Public result-unavailable reason only; existing mechanism output retains its existing guards. | Missing/changed/unlisted evidence prevents a result read/identity; an ignored nonzero `phKey` sentinel gets no exception. C1/C3/C6. |
 | Result-handle pointer | Only the named out positions, captured at entry; `C_DeriveKey` additionally requires its finite entry protocol guard before retention. Equal image/owner/descriptor at CKR_OK return, the matched derive mechanism where applicable, and full-span validation precede one result read. | Private in-flight state only; clear on every terminal, loss, cancellation, exec or teardown path. Never copied into the public projection. | Null/read failure or unavailable result protocol: result unavailable; no retry after return. C1/C3. |
 | Returned object/key handle | One target word from the preceding pointer; nonzero opaque handle. No finite whitelist is possible for valid handles; this is an explicit internal scalar exception analogous to v1 session handles. | Private call transport and generation-scoped registry only; fresh capture-local pseudonym on accepted creation. | Failed/ambiguous reads create no association. Duplicate pair handles or overlapping pair-result spans invalidate the pair; one unreadable independent result does not invent its sibling. C1/C3. |
 | Find array pointer | `C_FindObjects` arg 1 only, retained at entry; used only at matched CKR_OK return with valid entry capacity and returned count. | Private in-flight state only. | Null with nonzero count, overlap with count word, invalid span or read failure gives unavailable results. C1/C4. |
@@ -313,12 +322,15 @@ explicit, narrow internal exceptions, not finite attribute values.
 | Attribute entry capacity / returned length | Read the named selector's `ulValueLen`; target word, exact accepted value size and full-span checks. GetAttribute retains capacity and reads returned length. | Private in-flight validation; only finite state such as `size_only`, `unavailable`, `invalid_length`, `changed`, `unreadable` is public. | Width-correct unavailable sentinel, growing length, zero/wrong length, insufficient entry capacity, read failure: no value read. C5/C6. |
 | `CKA_CLASS` | Exact selector 0x0000; one target word, exact width, finite set below. | Six-field request/result snapshot (seven with F16); public finite class plus source/state. Raw unmatched word discarded in probe scratch. | Unsupported/conflicting value stays unknown. C5/C6. |
 | `CKA_KEY_TYPE` | Exact selector 0x0100; one target word, exact width, finite set below. | As class, with finite key-type label. No vendor numeric fallback. | Unsupported/conflicting value stays unknown. C5/C6. |
-| `CKA_TOKEN` | Exact selector 0x0001; exactly one byte and exact equality to 0 or 1. | Requested or established `session`/`token`, with provenance; only established result may drive object lifetime. | Other byte/length is unknown; a request is never promoted by CKR_OK creation alone. C3/C5/C6. |
-| `CKA_VALUE_LEN` | Exact selector 0x0161; one target word equal to 16, 24 or 32 only. | Finite byte-size code; label as AES 128/192/256 bits only with independently established AES type for established metadata. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
+| `CKA_TOKEN` | Exact selector 0x0001; exactly one byte and exact equality to 0 or 1. | Requested or established `session`/`token`, with provenance; only established result may drive object lifetime. | Other byte/length is unknown; a TOKEN request is never promoted by CKR_OK creation alone (R2 new-site: other finite facts promote; TOKEN stays query-established). C3/C5/C6. |
+| `CKA_VALUE_LEN` | Exact selector 0x0161; one target word equal to 12, 16, 24, 32 or 48 only. | Finite byte-size code; label in bits only with an independently established matching AES/HKDF/generic-secret type. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
 | `CKA_MODULUS_BITS` | Exact selector 0x0121; one target word equal to a selected RSA size below. | Finite size code; RSA label requires matching RSA type/provenance. | Other values unknown; no modulus or exponent buffer read. C5/C6. |
-| `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 7 or 10 and byte-for-byte equality to one complete encoding below. At most ten bytes in probe scratch. | Only curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve label requires matching EC type/provenance. | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
+| `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 5, 7, 10 or 11 and byte-for-byte equality to one complete encoding below. At most eleven bytes in probe scratch. | Only curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve label requires matching EC type/provenance. | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
 | Public identities and derived facts | Monotonic capture-local allocation plus accepted reducer transitions; never raw handle, IP or digest of either. | `instance#N`, `sess#N`, `object#N`; finite origin/lifecycle/metadata states, times within observation, and saturating counts. JSON, JSONL and dashboard use the same immutable projection. | Allocation exhaustion refuses new association, records loss, and never reuses an ID. C3/C7/C8. |
 | Per-module `C_Initialize` roll-up | New aggregation over already-captured fields only: the attested slot name (`C_Initialize`, single-named, authorized, unambiguous probe) plus the verbatim return code, from joined and shed semantic Events since the lane sealed. No new capture: no argv, env, keys, PINs, payloads, handles or addresses are read or retained for this roll-up. | Saturating per-module counts (`calls`, `ok`, `already_initialized`), the last non-OK/non-already return as a `returns`-shaped row, and a finite status (`initialised`, `failed`, `unseen`, `unknown`) with its detail line, in JSON and verbose text. | The verdict fails closed: `unknown` when the lane never sealed or EVENTS loss (or an unreadable loss counter) may have hidden evidence; zero observed calls word the absence, never "never initialised". |
+| Operation length cell (S-protocol) | Named out positions only (the §5.1 S-cells); entry retention with an entry capacity read plus the `1<<20` cap, full-span validation of the cell word and disjointness against the call's own output buffer (NULL base skips the check: query shapes read); return read on terminal CKR_OK, BUFFER_TOO_SMALL and query-shape OK only; PENDING and every other return never. | Private in-flight plus completed-call transport; cleared on every terminal path; public numeric value only from CLASSIFIED shapes per §5.2 — query values never classify, BUFFER_TOO_SMALL corroborates only (§5.4). | Null cell, absurd capacity, overlap, overflow or refused shape: unavailable with a named reason, never a guessed bound. Gated by `--key-sizes` (off by default, §10.5): without the flag no length word is acquired on any path. |
+| Operation length scalar (V-protocol) | Named in positions only (the §5.1 V-scalars); entry snapshot of the register or stack word; no dereference, no pointer retention. | Private in-flight plus completed-call transport; cleared on every terminal path; admitted userspace-side on CKR_OK only (SIGNATURE_INVALID excluded); same publication as the S-cell row. | Non-OK or ambiguous evidence: unavailable, never classified. Gated by `--key-sizes` as above. |
+| KEM length lift | `C_EncapsulateKey` arg 6 cell and `C_DecapsulateKey` arg 6 scalar snapshot as evidence under the S/V guards above; T0 stays for template headers, values, ciphertext bytes and bounds — arg 6 as a bound stays forbidden, as evidence it is snapshotted. | Same retention and publication as the S/V rows. | Same failure rules; T0 withholds still apply. Gated by `--key-sizes` as above. |
 
 ## Finite attribute vocabulary
 
@@ -336,23 +348,25 @@ a reviewed policy change, not numeric passthrough.
 | Field | Exact accepted values and labels |
 | --- | --- |
 | Class | 0 `data`, 1 `certificate`, 2 `public_key`, 3 `private_key`, 4 `secret_key` |
-| Key type | 0x00 `rsa`, 0x01 `dsa`, 0x02 `dh`, 0x03 `ec`, 0x04 `x9_42_dh`, 0x10 `generic_secret`, 0x1f `aes`, 0x40 `ec_edwards`, 0x41 `ec_montgomery`; 0x49/0x4a/0x4b PQC qualifier (PKCS #11 3.2, no standalone label) |
+| Key type | 0x00 `rsa`, 0x01 `dsa`, 0x02 `dh`, 0x03 `ec`, 0x04 `x9_42_dh`, 0x10 `generic_secret`, 0x1f `aes`, 0x40 `ec_edwards`, 0x41 `ec_montgomery`, 0x42 `hkdf`; 0x49/0x4a/0x4b PQC qualifier (PKCS #11 3.2, no standalone label) |
 | Parameter set | 1..=12, the `CKP_*` union across ML-DSA, ML-KEM and SLH-DSA (PKCS #11 3.2); uninterpretable without the same-view key type |
 | Token flag | 0 `session`, 1 `token` |
-| AES byte sizes | 16, 24, 32, presented as 128, 192, 256 bits with the type guard |
+| Value byte sizes | 12, 16, 24, 32, 48, presented in bits with the matching-type guard |
 | RSA bit sizes | 1024, 2048, 3072, 4096, 8192; an observer support set, not a cryptographic-strength recommendation |
-| EC curve | `secp256r1`: `06 08 2a 86 48 ce 3d 03 01 07`; `secp384r1`: `06 05 2b 81 04 00 22`; `secp521r1`: `06 05 2b 81 04 00 23` |
+| EC curve | `secp256r1`: `06 08 2a 86 48 ce 3d 03 01 07`; `secp384r1`: `06 05 2b 81 04 00 22`; `secp521r1`: `06 05 2b 81 04 00 23`; `x25519`: `06 09 2b 06 01 04 01 da 47 0f 01` or `06 03 2b 65 6e`; `x448`: `06 03 2b 65 6f`; `ed25519`: `06 03 2b 65 70`; `ed448`: `06 03 2b 65 71` |
 
-The curve identifiers follow [RFC 5480 section 2.1.1.1](https://www.rfc-editor.org/rfc/rfc5480.html#section-2.1.1.1);
-the complete DER octets above are the observer's exact equality set. Edwards
-and Montgomery key-type labels do not authorize curve decoding for those
-types. Unsupported sizes/curves stay unknown rather than weakening the
+The secp identifiers follow [RFC 5480 section 2.1.1.1](https://www.rfc-editor.org/rfc/rfc5480.html#section-2.1.1.1);
+the 5-byte Montgomery/Edwards OIDs follow [RFC 8410](https://www.rfc-editor.org/rfc/rfc8410.html);
+the 11-byte X25519 OID is the draft-josefsson Curve25519 identifier NSS
+passes for ephemeral TLS keypairs (measured). The complete DER octets
+above are the observer's exact equality set.
+Unsupported sizes/curves stay unknown rather than weakening the
 finite set. The AES byte-size policy follows the 128/192/256-bit key sizes in
 [FIPS 197](https://doi.org/10.6028/NIST.FIPS.197-upd1). Public JSON carries
 the accepted numeric code; labels are presentation names. The projection's
 `rsa_other` fallback label can only mean 8192 (every other accepted RSA size
-has its own label), and `aes_other` can never occur (every accepted AES size
-has its own label).
+has its own label); `aes_other`, `hkdf_other` and `generic_other` can never
+occur (every accepted size has its own label).
 
 Pointer aliasing can still place an exact permitted constant at a readable
 address. Finite equality limits the value disclosed; it does not prove C type
@@ -363,10 +377,28 @@ handle exceptions above must not be reused to transport attribute bytes.
 
 Entry-time values from creation templates are **requested** metadata, kept
 separately for each resulting object and separately for each key-pair member.
-Missing or duplicate-conflicting requests stay unknown. Successful creation,
-mechanism choice, key-pair membership, copy/derive ancestry and requested
-`CKA_TOKEN` do not establish resulting attributes. Failed creation must not
-attach its requested facts to an existing handle incarnation.
+Missing or duplicate-conflicting requests stay unknown. Mechanism choice,
+key-pair membership and copy/derive ancestry do not establish resulting
+attributes. Requested `CKA_TOKEN` never promotes: token persistence stays
+query-established. Failed creation must not attach its requested facts to
+an existing handle incarnation.
+
+R2 new-site promotion: a successful creation return (`CKR_OK` with a
+retained result handle) promotes the fresh view's finite requested
+facts — class, key type, value length, modulus bits, curve, parameter
+set — to **established**, except `CKA_TOKEN`. Promoted fields carry
+per-field `source: creation_success`; queried fields carry `source:
+query` (keymeta §6/K5 refinement of R2's sourceless promotion).
+Soundness: success means the provider honored the exact finite
+template or failed the call (`CKR_TEMPLATE_INCOMPLETE`,
+`CKR_TEMPLATE_INCONSISTENT` and friends refuse); unknown/conflict
+shapes never promote, no fact is derived from the mechanism, and
+later queries still conflict with or invalidate promoted facts
+through the unchanged path. Queries stay `not_queried`: promotion
+records the creation result, never a read-back. The `CKA_TOKEN`
+exclusion is deliberate: token/session persistence drives
+cross-session lifetime reasoning and keeps its stronger
+query-established bar.
 
 For `C_GetAttributeValue`, accept per-attribute result processing only on
 `CKR_OK`, `CKR_ATTRIBUTE_SENSITIVE`, `CKR_ATTRIBUTE_TYPE_INVALID`, or
@@ -400,13 +432,16 @@ For each selected slot, in order:
    A lifecycle uncertainty or successful `C_SetAttributeValue` does invalidate
    current facts. Keep historical provenance separate from current validity.
 
-Only the observed result may establish the six fields (seven with F16). Incomplete, unsupported
-or unreadable values never acquire a label from another attribute, another
-object, requested metadata or a recognized mechanism. For a known size without
+Only an observed result may establish the six fields (seven with F16):
+a `C_GetAttributeValue` result, or — since R2 — a successful creation
+return promoting its own finite template (never another object's, never
+a mechanism-derived value). Incomplete, unsupported or unreadable values
+never acquire a label from another attribute, another object, an
+incomplete request or a recognized mechanism. For a known size without
 a known matching key type, retain the finite field fact but show type/size
 association as unknown. A combined label requires an established,
 non-conflicting key type and is withheld when class conflicts or an
-established class is incompatible (AES and generic_secret need
+established class is incompatible (AES, generic_secret and HKDF need
 `secret_key`; RSA and EC need `public_key` or `private_key`). No default
 token/session classification is assumed.
 
@@ -2210,3 +2245,119 @@ the post-setup capability shed, so it holds no transient `CAP_SYS_ADMIN`;
 re-marking a filesystem first mounted mid-capture may then fail, which
 the retained-mark coverage check turns into the unavailable gap instead
 of silence, whatever traffic already-marked filesystems produce.
+
+## New-site key metadata (R2, 2026-11-13)
+
+**Status: PROPOSED (v0.8.0 keymeta Task 0 2026-11-14; R2 re-proposed
+with the per-field `source` refinement, keymeta §6/K5); owner/Opus
+privacy review and Codex re-review required before activation.**
+This section scopes section version 6 of
+[docs/schema/inventory-v1-object-observations-v6.schema.json](../schema/inventory-v1-object-observations-v6.schema.json)
+(to be created in Task 1): the finite rows below plus the
+sixteen-label publication. It partially supersedes the "requested
+metadata never labels" clause: complete finite creation templates
+establish on success (see the promotion rule above); `CKA_TOKEN`,
+unknown/conflict shapes and incomplete triples still never label.
+Promoted fields carry per-field `source: creation_success`;
+queried fields carry `source: query`. KEM T0, the terminal states
+and every other exclusion stay in force. Allowlist-v1 bytes are
+unchanged.
+
+New reads (all inside the already-authorized attribute selectors —
+no new selector, no new call, no payload read):
+
+- `CKA_EC_PARAMS` lengths 5 and 11 (was 7/10 only): the five
+  Montgomery/Edwards encodings in the finite table (one measured
+  11-byte draft-josefsson X25519 OID, four RFC 8410 5-byte OIDs).
+  Probe scratch grows from ten to eleven bytes; unmatched bytes
+  never leave probe scratch, as before.
+- `CKA_KEY_TYPE` value 0x42 (`CKK_HKDF`); `CKA_VALUE_LEN` values 12
+  and 48 (measured HKDF/AES schedule sizes).
+- `C_DeriveKey` result protocol: `CKM_HKDF_DERIVE` (0x402a),
+  `CKM_HKDF_DATA` (0x402b) and `CKM_CONCATENATE_BASE_AND_KEY`
+  (0x360) join the closed set. All three are standard derives
+  outside the may-leave-`phKey`-untouched SSL3/TLS12/WTLS family:
+  `CKR_OK` writes the handle, and the entry/return mechanism-match
+  guard applies unchanged.
+
+The observed values are provider-reported template words from
+application buffers, not independent proof of a physical key's
+properties. Promotion soundness rests on provider compliance (a
+compliant provider honors the finite template or fails the call);
+a provider that lies in templates could equally lie in query
+results, which the observer already trusts. Labels still join an
+established key type with an established size/curve from the same
+view; a size alone, a curve alone, or a recognized mechanism never
+labels. Printable-string curve names, secp256k1/brainpool curves
+and ChaCha20 key types were not measured and stay refused.
+Version 6 is emitted exactly when new-site content is present;
+versions 1–5 stay frozen and byte-stable.
+
+## Key metadata: inferred family and size class (v0.8.0 keymeta)
+
+**Status: PROPOSED (v0.8.0 keymeta design 2026-11-14); owner/Opus
+privacy review and Codex re-review required before activation.**
+This section scopes section version 7 of
+`inventory-v1-object-observations-v7.schema.json`: the
+`inferred_family`/`inferred_size` row keys and the finite
+family/length vocabulary below (per-field `source` on
+established/requested blocks is v6, via the R2 block above). It
+partially supersedes "requested metadata never labels" only via
+the R2 promotion (§6, v6); it partially supersedes the F16 rule
+"a code alone, a type alone, or a recognized mechanism never
+labels" for inferred facts only: a recognized mechanism infers a
+family (§4.2, display "probably …"), never an established label.
+Inferred facts never label `metadata_at_use` and never overwrite
+established facts. KEM T0 stays except the length lift above;
+terminal states, `CKA_ID`/payload/PIN prohibitions and every
+other exclusion stay in force. Allowlist-v1 bytes are unchanged.
+
+What is captured: one output-length WORD per completed call at
+the §8.1 evidence endpoints (signature, ciphertext and wrap
+lengths), plus the already-captured mechanism id the family
+inference reuses (no new read). BPF cannot see the mechanism
+family at `C_Encrypt`/`C_Decrypt`, so those words are read for
+every mechanism — for AES-GCM/CBC the word IS the message length
+plus tag or padding. This lane therefore partially supersedes
+`allowlist-v1.md:99-101` ("message/data/PIN/signature lengths
+are not captured") for its own words only: length words are
+within the owner privacy line (lengths, mechanism ids, curve
+OIDs and parameter-set ids are not secrets — owner stance
+2026-11-14), v1 bytes are unchanged, and every other v1
+statement stands. Unclassified length values are dropped in
+userspace: never published, never logged, never written to
+JSONL — only the §5.2 classified shapes publish, with the
+`length` source and the named evidence tag.
+
+Length words are scalars under the v1 hostile-caller boundary: a
+malicious caller can place any number in one, so classification is
+full-width (§5.2 finite triples) and only the numeric value publishes.
+Payload, key-material, PIN and environment bytes are never read;
+the length value is the only new word. Standard RSA octet lengths
+(128/256/384/512) name the standard size with the `length` source;
+other admitted octets show a masked class with the byte count;
+ECDSA raw lengths name P-256/P-384/P-521 with the `length` source;
+PQC lengths name the parameter set; no bit range is rendered
+anywhere (owner 07:52). Wrapped-material lengths size the wrapped
+key, never the wrapping key. Family inference uses
+already-captured mechanism ids and the §4.2 explicit sets;
+unlisted and vendor ids infer nothing.
+
+Length capture is opt-in (owner 08:50, §15 K7): the length words
+above are acquired only under `--key-sizes` (valid only with
+`--key-operations`, off by default), in extra journal-object
+programs loaded and linked only with the flag (§8.6) — never
+in the base journal pair. Without the flag no length word is
+acquired on any path, and family, creation-template and
+token-reported facts are still published as above.
+
+Required evidence before activation: the §12 twin tables (host
+RED/GREEN at the journal seam, hostile-width, overlap/alias,
+2041-bit and DER/padding negative controls), the §12.1 off-mode
+identity contract (byte-identical records, same linked set,
+base-program linked-instruction identity), canary lanes with length-cell sentinel
+positions on every §5.1 shape (LP64+ia32) proving no payload byte
+reaches output/maps/logs, verifier headroom + `bpf loads` for
+base journal AND length programs (§8.5), full `artifact_contracts`,
+and the Task 5 live matrix (Firefox/Chromium/pkcs11-tool/OpenSSL
+provider, ≥5 runs each, 6.6+).

@@ -16059,6 +16059,174 @@ mod tests {
         expired.finish_window(window).unwrap();
     }
 
+    /// Synthetic ELF64 with `phnum` zero program headers: PT_NULL, so
+    /// the legacy parser accepts any count and only the table gate
+    /// refuses the over-cap file.
+    fn write_many_phdr_elf(path: &Path, phnum: u16) {
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[6] = 1;
+        header[16..18].copy_from_slice(&2u16.to_le_bytes());
+        header[18..20].copy_from_slice(&62u16.to_le_bytes());
+        header[20..24].copy_from_slice(&1u32.to_le_bytes());
+        header[32..40].copy_from_slice(&64u64.to_le_bytes());
+        header[52..54].copy_from_slice(&64u16.to_le_bytes());
+        header[54..56].copy_from_slice(&56u16.to_le_bytes());
+        header[56..58].copy_from_slice(&phnum.to_le_bytes());
+        header[58..60].copy_from_slice(&64u16.to_le_bytes());
+        let mut bytes = header.to_vec();
+        bytes.resize(64 + phnum as usize * 56, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn object_key_of(file: &File) -> ObjectKey {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = file.metadata().unwrap();
+        ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(meta.dev())),
+                minor: u64::from(libc::minor(meta.dev())),
+            },
+            inode: meta.ino(),
+        }
+    }
+
+    /// Table bytes the gate pre-charges for one file: the ELF header
+    /// plus both header tables, from the file's own header words.
+    fn header_table_bytes(file: &File) -> u64 {
+        use std::os::unix::fs::FileExt as _;
+        let mut header = [0u8; 64];
+        file.read_at(&mut header, 0).unwrap();
+        let phnum = u16::from_le_bytes(header[56..58].try_into().unwrap()) as u64;
+        let phentsize = u16::from_le_bytes(header[54..56].try_into().unwrap()) as u64;
+        let shnum = u16::from_le_bytes(header[60..62].try_into().unwrap()) as u64;
+        let shentsize = u16::from_le_bytes(header[58..60].try_into().unwrap()) as u64;
+        64 + phnum * phentsize + shnum * shentsize
+    }
+
+    /// B1: a program-header table over 64 KiB refuses with its named
+    /// gap before any parse, charging only the header probe it read.
+    #[test]
+    fn inventory_table_gate_refuses_huge_tables_without_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-phdr.so");
+        write_many_phdr_elf(&path, 2048);
+        let file = File::open(&path).unwrap();
+        let key = object_key_of(&file);
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+            8 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        let error = provider_facts_for(&file, key, &[], &mut budget).unwrap_err();
+        assert_eq!(
+            error,
+            "ELF program-header table is 114688 bytes; limit is 65536"
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            64,
+            "the refusal charges its 64-byte header probe only"
+        );
+        assert_eq!(budget.work_units_count(), 0);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
+    }
+
+    /// B1: table work spends against the window before the parse: a
+    /// work allowance smaller than the table entries refuses with the
+    /// work ceiling owing only the tables, never the full structural
+    /// charge (dynsym, dynstr and dynamic ride the post-parse
+    /// remainder).
+    #[test]
+    fn inventory_table_precharge_spends_work_before_parsing() {
+        let fixture = ElfExportFactsFixture::new_provider();
+        let file = File::open(&fixture.path).unwrap();
+        let key = object_key_of(&file);
+        let tables = header_table_bytes(&file);
+        let mut budget =
+            CaptureWorkBudget::for_inventory(inventory_limits(8 << 20, 1, 4096, 32768, 4096, 512));
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        let error =
+            provider_facts_for(&file, key, &["C_GetFunctionList"], &mut budget).unwrap_err();
+        assert_eq!(error, WORK_CEILING_REASON);
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            tables,
+            "the work refusal owes the pre-charged tables only"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
+        let mut whole = CaptureWorkBudget::for_inventory(inventory_limits(
+            8 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = whole.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = whole.checkpoint(window.clone()).unwrap();
+        provider_facts_for(&file, key, &["C_GetFunctionList"], &mut whole).unwrap();
+        assert!(
+            whole.attempted_io_bytes() > tables,
+            "structural {} must exceed tables {tables}",
+            whole.attempted_io_bytes()
+        );
+        whole.finish_scan(scan).unwrap();
+        whole.finish_window(window).unwrap();
+    }
+
+    /// B1: the table refusal caches per file identity: the repeat
+    /// names the same gap owing nothing more — no re-read, no
+    /// re-spend.
+    #[test]
+    fn inventory_table_refusal_is_cached_per_file_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-phdr.so");
+        write_many_phdr_elf(&path, 2048);
+        let file = File::open(&path).unwrap();
+        assert!(
+            crate::discovery::identity::file_inodes_are_unique(&file),
+            "the lane TMPDIR must name one file per (device, inode)"
+        );
+        let key = object_key_of(&file);
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+            8 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        let first = provider_facts_for(&file, key, &[], &mut budget).unwrap_err();
+        assert_eq!(
+            first,
+            "ELF program-header table is 114688 bytes; limit is 65536"
+        );
+        assert_eq!(budget.attempted_io_bytes(), 64);
+        let second = provider_facts_for(&file, key, &[], &mut budget).unwrap_err();
+        assert_eq!(second, first);
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            64,
+            "the cached refusal rereads nothing"
+        );
+        assert_eq!(budget.work_units_count(), 0);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
+    }
+
     #[test]
     fn production_inventory_window_fits_a_measured_real_world_closure() {
         // The trivial nodata harness maps 16.3 MiB of sub-8-MiB objects on

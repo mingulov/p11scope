@@ -1482,3 +1482,366 @@ fn needed_libraries_refuses_a_non_elf_file() {
     let file = std::fs::File::open(&bad).unwrap();
     needed_libraries(&file).unwrap_err();
 }
+
+// ---- ELF table caps (B1): bound the tables, never the file ----------
+
+/// The gate's named reasons, byte-exact: every entry point refuses an
+/// over-cap table with the same string, so identical files fold.
+fn program_table_reason(table_bytes: u64) -> String {
+    format!("ELF program-header table is {table_bytes} bytes; limit is 65536")
+}
+
+fn section_table_reason(table_bytes: u64) -> String {
+    format!("ELF section-header table is {table_bytes} bytes; limit is 1048576")
+}
+
+/// Minimal synthetic ELF64: `phnum` zero program headers at offset 64,
+/// no section table. Zero headers are PT_NULL, so the legacy parser
+/// accepts any count — only the table gate refuses the over-cap file.
+fn write_many_phdr_elf(path: &Path, phnum: u16) {
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[32..40].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[56..58].copy_from_slice(&phnum.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    let mut bytes = header.to_vec();
+    bytes.resize(64 + phnum as usize * 56, 0);
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Minimal synthetic ELF64: `shnum` section headers at offset 64
+/// (section 0 null, section 1 a string table, the rest SHT_NULL), no
+/// program headers. Any section table needs its string table: the
+/// parser refuses a zero `e_shstrndx` with sections present.
+fn write_many_shdr_elf(path: &Path, shnum: u16) {
+    assert!(shnum >= 2, "the table needs section 0 and a string table");
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    header[60..62].copy_from_slice(&shnum.to_le_bytes());
+    header[62..64].copy_from_slice(&1u16.to_le_bytes());
+    let table_end = 64 + shnum as usize * 64;
+    let mut bytes = header.to_vec();
+    bytes.resize(table_end, 0);
+    // Section 1: SHT_STRTAB over the 11 string bytes past the table.
+    bytes[64 + 64 + 4..64 + 64 + 8].copy_from_slice(&3u32.to_le_bytes());
+    bytes[64 + 64 + 24..64 + 64 + 32].copy_from_slice(&(table_end as u64).to_le_bytes());
+    bytes[64 + 64 + 32..64 + 64 + 40].copy_from_slice(&11u64.to_le_bytes());
+    bytes.extend_from_slice(b"\0.shstrtab\0");
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Synthetic ELF64 with `e_phnum == PN_XNUM`: the real program count
+/// rides section 0's `sh_info`. The file holds only the header and
+/// section 0: an over-cap count refuses on the counts alone.
+fn write_extended_phnum_elf(path: &Path, real_phnum: u32) {
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[32..40].copy_from_slice(&128u64.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[56..58].copy_from_slice(&0xffffu16.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    let mut section0 = [0u8; 64];
+    section0[44..48].copy_from_slice(&real_phnum.to_le_bytes());
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&section0);
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Synthetic ELF64 with `e_shnum == 0` and a section table present:
+/// the real section count rides section 0's `sh_size`.
+fn write_extended_shnum_elf(path: &Path, real_shnum: u64) {
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    let mut section0 = [0u8; 64];
+    section0[32..40].copy_from_slice(&real_shnum.to_le_bytes());
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&section0);
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Minimal synthetic ELF32 (i386): `phnum` zero program headers at
+/// offset 52, no section table.
+fn write_many_phdr_elf32(path: &Path, phnum: u16) {
+    let mut header = [0u8; 52];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 1;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&3u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[28..32].copy_from_slice(&52u32.to_le_bytes());
+    header[40..42].copy_from_slice(&52u16.to_le_bytes());
+    header[42..44].copy_from_slice(&32u16.to_le_bytes());
+    header[44..46].copy_from_slice(&phnum.to_le_bytes());
+    header[46..48].copy_from_slice(&40u16.to_le_bytes());
+    let mut bytes = header.to_vec();
+    bytes.resize(52 + phnum as usize * 32, 0);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn program_table_over_64kib_refuses_on_every_entry_point() {
+    use p11scope_manifest::elf::{needed_libraries, read_raw_scan_facts_bounded};
+    let d = tmp("elf-table-cap-phdr");
+    let path = d.join("many-phdr.so");
+    write_many_phdr_elf(&path, 2048);
+    let expected = program_table_reason(2048 * 56);
+    let file = std::fs::File::open(&path).unwrap();
+    assert_eq!(
+        read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err(),
+        expected
+    );
+    assert_eq!(read_export_facts(&file, &[]).unwrap_err(), expected);
+    assert_eq!(ElfSnapshot::read(&file).unwrap_err(), expected);
+    assert_eq!(needed_libraries(&file).unwrap_err(), expected);
+}
+
+#[test]
+fn program_table_at_64kib_parses_and_one_entry_over_refuses() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-table-cap-phdr-edge");
+    // 1170 * 56 = 65520: the largest table at or under the cap.
+    let admitted = d.join("phdr-edge-ok.so");
+    write_many_phdr_elf(&admitted, 1170);
+    let file = std::fs::File::open(&admitted).unwrap();
+    let facts = read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap();
+    assert!(facts.exports.is_empty());
+    // 1171 * 56 = 65576: one entry over the cap refuses.
+    let refused = d.join("phdr-edge-no.so");
+    write_many_phdr_elf(&refused, 1171);
+    let file = std::fs::File::open(&refused).unwrap();
+    assert_eq!(
+        read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err(),
+        program_table_reason(1171 * 56)
+    );
+}
+
+#[test]
+fn section_table_over_1mib_refuses_on_every_entry_point() {
+    use p11scope_manifest::elf::{needed_libraries, read_raw_scan_facts_bounded};
+    let d = tmp("elf-table-cap-shdr");
+    let path = d.join("many-shdr.so");
+    write_many_shdr_elf(&path, 16385);
+    let expected = section_table_reason(16385 * 64);
+    let file = std::fs::File::open(&path).unwrap();
+    assert_eq!(
+        read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err(),
+        expected
+    );
+    assert_eq!(read_export_facts(&file, &[]).unwrap_err(), expected);
+    assert_eq!(ElfSnapshot::read(&file).unwrap_err(), expected);
+    assert_eq!(needed_libraries(&file).unwrap_err(), expected);
+}
+
+#[test]
+fn section_table_at_1mib_parses_and_one_entry_over_refuses() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-table-cap-shdr-edge");
+    // 16384 * 64 = 1048576: exactly the cap, admitted.
+    let admitted = d.join("shdr-edge-ok.so");
+    write_many_shdr_elf(&admitted, 16384);
+    let file = std::fs::File::open(&admitted).unwrap();
+    let facts = read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap();
+    assert!(facts.exports.is_empty());
+    let refused = d.join("shdr-edge-no.so");
+    write_many_shdr_elf(&refused, 16385);
+    let file = std::fs::File::open(&refused).unwrap();
+    assert_eq!(
+        read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err(),
+        section_table_reason(16385 * 64)
+    );
+}
+
+#[test]
+fn extended_program_count_in_section0_is_gated() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-table-cap-pnxum");
+    let path = d.join("pnxnum.so");
+    write_extended_phnum_elf(&path, 100_000);
+    let file = std::fs::File::open(&path).unwrap();
+    assert_eq!(
+        read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err(),
+        program_table_reason(100_000 * 56)
+    );
+}
+
+#[test]
+fn extended_section_count_in_section0_is_gated() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-table-cap-shnum0");
+    let path = d.join("shnum0.so");
+    write_extended_shnum_elf(&path, 100_000);
+    let file = std::fs::File::open(&path).unwrap();
+    assert_eq!(
+        read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err(),
+        section_table_reason(100_000 * 64)
+    );
+}
+
+/// Small extended counts parse: the gate refuses over-cap tables,
+/// never the extended encoding itself. `e_shnum == 0` with three
+/// real sections (null, string table, null).
+#[test]
+fn extended_section_count_small_parses() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-table-cap-shnum0-ok");
+    let path = d.join("shnum0-ok.so");
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    header[62..64].copy_from_slice(&1u16.to_le_bytes());
+    let mut bytes = header.to_vec();
+    bytes.resize(64 + 3 * 64, 0);
+    bytes[64 + 32..64 + 40].copy_from_slice(&3u64.to_le_bytes());
+    bytes[128 + 4..128 + 8].copy_from_slice(&3u32.to_le_bytes());
+    bytes[128 + 24..128 + 32].copy_from_slice(&256u64.to_le_bytes());
+    bytes[128 + 32..128 + 40].copy_from_slice(&11u64.to_le_bytes());
+    bytes.extend_from_slice(b"\0.shstrtab\0");
+    std::fs::write(&path, bytes).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let facts = read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap();
+    assert!(facts.exports.is_empty());
+}
+
+/// Small extended program count parses: `e_phnum == PN_XNUM` with
+/// two real program headers plus the section-0 count carrier.
+#[test]
+fn extended_program_count_small_parses() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-table-cap-pnxnum-ok");
+    let path = d.join("pnxnum-ok.so");
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[32..40].copy_from_slice(&192u64.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[56..58].copy_from_slice(&0xffffu16.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    header[62..64].copy_from_slice(&1u16.to_le_bytes());
+    let mut bytes = header.to_vec();
+    bytes.resize(192 + 2 * 56, 0);
+    bytes[64 + 32..64 + 40].copy_from_slice(&2u64.to_le_bytes());
+    bytes[64 + 44..64 + 48].copy_from_slice(&2u32.to_le_bytes());
+    bytes[128 + 4..128 + 8].copy_from_slice(&3u32.to_le_bytes());
+    bytes[128 + 24..128 + 32].copy_from_slice(&304u64.to_le_bytes());
+    bytes[128 + 32..128 + 40].copy_from_slice(&11u64.to_le_bytes());
+    bytes.extend_from_slice(b"\0.shstrtab\0");
+    std::fs::write(&path, bytes).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let facts = read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap();
+    assert!(facts.exports.is_empty());
+}
+
+#[test]
+fn elf32_program_table_is_gated() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-table-cap-32");
+    let path = d.join("many-phdr32.so");
+    write_many_phdr_elf32(&path, 3000);
+    let file = std::fs::File::open(&path).unwrap();
+    assert_eq!(
+        read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err(),
+        program_table_reason(3000 * 32)
+    );
+}
+
+#[test]
+fn corrupt_headers_keep_their_legacy_refusals() {
+    use p11scope_manifest::elf::read_raw_scan_facts_bounded;
+    let d = tmp("elf-table-cap-legacy");
+    // Zeroes: not parseable, never a table refusal.
+    let zeros = d.join("zeros.so");
+    std::fs::write(&zeros, vec![0u8; 4096]).unwrap();
+    let file = std::fs::File::open(&zeros).unwrap();
+    let error = read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err();
+    assert!(
+        error.contains("not parseable") && !error.contains("table is"),
+        "legacy refusal stands: {error}"
+    );
+    // Big-endian: the gate must not misread the counts.
+    let big = d.join("bigendian.so");
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 2;
+    header[6] = 1;
+    std::fs::write(&big, header).unwrap();
+    let file = std::fs::File::open(&big).unwrap();
+    let error = read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err();
+    assert!(
+        error.contains("little-endian") && !error.contains("table is"),
+        "legacy refusal stands: {error}"
+    );
+    // Foreign machine with small tables: the ABI refusal stands.
+    let arm = d.join("arm.so");
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&183u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    std::fs::write(&arm, header).unwrap();
+    let file = std::fs::File::open(&arm).unwrap();
+    let error = read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err();
+    assert!(
+        error.contains("conventional x86") && !error.contains("table is"),
+        "legacy refusal stands: {error}"
+    );
+}

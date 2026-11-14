@@ -1651,6 +1651,9 @@ fn run_with_terminal_budget(
     if let Some(diagnostics) = diagnostics.as_mut() {
         diagnostics.enable(&mut coordinator, capture, scope, request.pid_filter);
     }
+    // The startup drain below gates its extends on the same signal
+    // counter; clone it before the cgroup driver moves the original.
+    let drain_stop_source = operator_stop_source.clone();
     let cgroup = matches!(scope, InventoryRunScope::Cgroup)
         .then(|| CgroupDriverState::new(deadline_for_duration(duration), operator_stop_source))
         .transpose()?;
@@ -1700,16 +1703,20 @@ fn run_with_terminal_budget(
     let semantic = if manifests.is_empty() {
         None
     } else {
-        draining_lifecycle::<crate::process::PidPin, _, _, _>(lane.as_mut(), None, || {
-            start_semantic_lane(
-                &mut coordinator,
-                &engine_scope,
-                attach_backend,
-                key_operations,
-                false,
-                None,
-            )
-        })
+        draining_lifecycle::<crate::process::PidPin, _, _, _>(
+            lane.as_mut(),
+            drain_stop_source.as_deref(),
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &engine_scope,
+                    attach_backend,
+                    key_operations,
+                    false,
+                    None,
+                )
+            },
+        )
     };
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
@@ -5790,9 +5797,16 @@ fn note_semantic_lane_sealed() {
 /// total absorbed before pass 0 ends stays held cap plus ring; the caps'
 /// size, not the drain, sets that headroom. Without a thread for the
 /// drainer, `start` runs undrained.
+///
+/// `stop` is the operator-stop signal counter: every tick extends only
+/// while it is still zero, like the collection-tick gate, so a stop
+/// during the load turns every later tick drain-only and pass 0
+/// attaches the backlog instead. The drain itself always runs. `None`
+/// keeps the old always-extend behavior for seams without a stop
+/// source.
 pub(crate) fn draining_lifecycle<Pin, L, T, F>(
     lane: Option<&mut NativeLane<L>>,
-    _stop: Option<&std::sync::atomic::AtomicUsize>,
+    stop: Option<&std::sync::atomic::AtomicUsize>,
     start: F,
 ) -> T
 where
@@ -5810,16 +5824,20 @@ where
         return start();
     };
     let done = std::sync::atomic::AtomicBool::new(false);
+    // A stop during the load turns every later tick drain-only; the
+    // check runs per tick, like the collection-tick gate.
+    let may_extend =
+        || stop.is_none_or(|stop| stop.load(std::sync::atomic::Ordering::Acquire) == 0);
     std::thread::scope(|threads| {
         let drainer = std::thread::Builder::new()
             .name("p11scope-lifecycle-drain".into())
             .spawn_scoped(threads, || {
                 while !done.load(std::sync::atomic::Ordering::Acquire) {
-                    lane.collecting_tick::<Pin>(true);
+                    lane.collecting_tick::<Pin>(may_extend());
                     std::thread::sleep(SERVICE_TICK);
                 }
                 // One last quantum after the load: the first pass follows.
-                lane.collecting_tick::<Pin>(true);
+                lane.collecting_tick::<Pin>(may_extend());
             });
         // No drainer thread: the load runs undrained, exactly as before
         // the startup drain (the ring keeps what it can and counts the

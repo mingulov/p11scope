@@ -4586,6 +4586,11 @@ mod stop_latch_tests {
         staged: Vec<(String, String)>,
         /// Staged gaps a commit published (the settle-owed probe).
         committed: Vec<(String, String)>,
+        /// A pending activation delta (the stopped-collection twin seeds
+        /// a backlog before pass 0).
+        pending_delta: Option<TargetDelta>,
+        /// Every extend receipt's (attached, deferred) shape, in order.
+        receipts: Vec<(usize, usize)>,
     }
     impl F9Host {
         fn new() -> Self {
@@ -4598,16 +4603,24 @@ mod stop_latch_tests {
                 gaps: Vec::new(),
                 staged: Vec::new(),
                 committed: Vec::new(),
+                pending_delta: None,
+                receipts: Vec::new(),
             }
         }
     }
     impl LaneHost<F9Pin> for F9Host {
         fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
         fn abandon_capture_coverage(&mut self) {}
-        fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt) {}
+        fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
+            self.receipts
+                .push((receipt.attached.len(), receipt.deferred.endpoints.len()));
+        }
         fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
+        fn has_pending_targets(&self) -> bool {
+            self.pending_delta.is_some()
+        }
         fn take_target_delta(&mut self) -> TargetDelta {
-            TargetDelta::default()
+            self.pending_delta.take().unwrap_or_default()
         }
         fn capture_targets(&self) -> &dyn CaptureTargets {
             &self.targets
@@ -4740,6 +4753,16 @@ mod stop_latch_tests {
         activated: bool,
         begin_stops: usize,
         extends: usize,
+        /// Defer every delta whole, so a backlog forms and only ticks
+        /// could drain it (the stopped-collection twin).
+        defer_all: bool,
+        /// The run's stop flag: extends while set count separately, so
+        /// the twin asserts zero extends after the stop precisely.
+        stop: Option<Rc<Cell<bool>>>,
+        extends_after_stop: usize,
+        /// Each extend's delta size, in order: the twin pins that no
+        /// tick ever took a backlog prefix after the stop.
+        extend_deltas: Vec<usize>,
     }
     impl F9Lane {
         fn new() -> Self {
@@ -4748,6 +4771,10 @@ mod stop_latch_tests {
                 activated: false,
                 begin_stops: 0,
                 extends: 0,
+                defer_all: false,
+                stop: None,
+                extends_after_stop: 0,
+                extend_deltas: Vec::new(),
             }
         }
     }
@@ -4768,15 +4795,22 @@ mod stop_latch_tests {
         }
         fn extend(
             &mut self,
-            _delta: TargetDelta,
+            delta: TargetDelta,
             _targets: &dyn CaptureTargets,
             _window: ExtendWindow,
         ) -> ExtendReceipt {
             self.extends += 1;
+            self.extend_deltas.push(delta.endpoints.len());
+            if self.stop.as_ref().is_some_and(|stop| stop.get()) {
+                self.extends_after_stop += 1;
+            }
             let mut receipt = ExtendReceipt {
                 custody: Some(ScopeCustody::System),
                 ..ExtendReceipt::default()
             };
+            if self.defer_all {
+                receipt.deferred = delta;
+            }
             if !self.activated {
                 self.activated = true;
                 receipt.activated_roots = true;
@@ -4845,6 +4879,24 @@ mod stop_latch_tests {
             interval: Duration::from_secs(60),
             tick: Duration::from_millis(10),
             collection_tick: Duration::from_millis(10),
+        }
+    }
+
+    /// `count` fabricated endpoints of one scripted object: the
+    /// stopped-collection twin's activation backlog (no retained pins;
+    /// the deferring lane resolves no targets).
+    fn f9_delta(count: u32) -> TargetDelta {
+        use crate::discovery::inventory_attach_set::EndpointId;
+        TargetDelta {
+            endpoints: (0..count)
+                .map(|id| AttachEndpoint {
+                    id: EndpointId(id),
+                    object: AttachObjectId::scripted(0),
+                    file_offset: 0x1000 + u64::from(id) * 16,
+                    abi: p11scope_manifest::elf::ElfAbi::Lp64,
+                })
+                .collect(),
+            objects: vec![AttachObjectId::scripted(0)],
         }
     }
 
@@ -5167,6 +5219,89 @@ mod stop_latch_tests {
         assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"
+        );
+        assert!(driver.host.stages > 0, "the terminal sweep still stages");
+        assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
+    }
+
+    #[test]
+    fn collection_ticks_after_a_stop_start_no_new_extension() {
+        // The stop lands when pass 0's collection starts (armed on
+        // collect) with a 200-endpoint backlog already deferred at
+        // activation. The collection outlasts several 10 ms ticks, so
+        // every collection tick runs with the stop pending: each must
+        // drain only — zero extends after the stop, the backlog
+        // untouched — while the kept pass still applies scan-only and
+        // the owned stop still drains.
+        let mut driver = F9Driver::new();
+        let stop_flag = Rc::new(Cell::new(false));
+        driver.arm_stop_on_collect = Some(Rc::clone(&stop_flag));
+        driver.on_collect = Some(Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(60));
+        }));
+        driver.host.pending_delta = Some(f9_delta(200));
+        let mut lane = F9Lane::new();
+        lane.defer_all = true;
+        lane.stop = Some(Rc::clone(&stop_flag));
+        let started = NativeLane::start(lane, driver.host(), LaneWindows::PROVISIONAL, None)
+            .map_err(|(_, reason)| reason)
+            .unwrap();
+        let stop = || stop_flag.get();
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome =
+            run_classic_finalizing(&mut driver, Some(started), &clock, None, &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            });
+        assert!(outcome.error.is_none());
+        let stopped = outcome.stopped.expect("the owned stop still drains");
+        assert_eq!(stopped.summary.passes, 1, "the kept pass is the run");
+        assert_eq!(driver.collects, 1, "the in-flight collection already ran");
+        assert_eq!(
+            driver.applies, 1,
+            "the completed collection applies once, scan-only"
+        );
+        assert_eq!(
+            driver.commits, 2,
+            "the kept pass commits, then the stop's terminal commit runs"
+        );
+        assert_eq!(
+            pass_publications, 1,
+            "the completed collection publishes as one pass"
+        );
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+        assert!(
+            outcome.zero_pass.is_none(),
+            "a kept pass is not a zero-pass run"
+        );
+        assert_eq!(driver.host.gaps.len(), 1, "{:?}", driver.host.gaps);
+        assert_eq!(driver.host.gaps[0].0, STOPPED_BEFORE_ATTACH_SUBJECT);
+        assert_eq!(
+            stopped.capture.extends, 1,
+            "only the activation extend runs: no tick extends after the stop"
+        );
+        assert_eq!(
+            stopped.capture.extends_after_stop, 0,
+            "zero extends start after the stop, however many ticks the collection outlasts"
+        );
+        assert_eq!(
+            stopped.capture.extend_deltas,
+            vec![200],
+            "no tick ever took a backlog prefix after the stop: the 200-endpoint \
+             activation backlog is untouched"
+        );
+        assert_eq!(
+            driver.host.receipts,
+            vec![(0, 200)],
+            "only the activation receipt forwards: no tick progress was ever \
+             buffered after the stop: {:?}",
+            driver.host.receipts
         );
         assert!(driver.host.stages > 0, "the terminal sweep still stages");
         assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");

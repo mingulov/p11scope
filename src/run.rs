@@ -4173,6 +4173,11 @@ struct Owned {
     /// Never read: the `Drop` removal is the whole point.
     #[allow(dead_code)]
     run_cgroup_retired: Option<crate::scope::RunCgroup>,
+    /// Run-tree first-map stop (`None` unless the pause chain armed on
+    /// the run's own cgroup): members stop at their first map of an
+    /// uncleared executable file until its provider probes attach.
+    /// Dropping it resumes every member it still holds.
+    member_stops: Option<crate::attach::member_stop::MemberStopHooks>,
 }
 
 /// Non-cloneable terminal authority: exact original reap AND that owner's
@@ -4278,6 +4283,11 @@ impl Owned {
         // settlement below reaps the direct child. The count rides in
         // the gap reason; `None` (degraded exact-PID path) discloses
         // nothing on top of the degradation gap.
+        // No member stays stopped past the capture: new stops switch
+        // off and every held member resumes before settlement.
+        if let Some(mut hooks) = self.member_stops.take() {
+            engine.release_member_stops(&mut hooks);
+        }
         if let Some(group) = self.run_cgroup.as_ref() {
             let (count, gap) = run_tree_survivors_gap(group.survivors_excluding(self.pid));
             if let Some(reason) = gap {
@@ -6696,6 +6706,7 @@ fn run_owned_inner_with_host(
         prearm_release_ns: None,
         run_cgroup,
         run_cgroup_retired: retired_cgroup,
+        member_stops: None,
     };
 
     // Arm before the barrier: the owned window has to be protected from the
@@ -6758,6 +6769,27 @@ fn run_owned_inner_with_host(
             })?;
             if always {
                 owned.coordinator.note_unavailable();
+            }
+        }
+    }
+
+    // The pause chain stops only the owned child; its descendants stop
+    // at their first map of each uncleared executable file instead, so
+    // a short-lived member's provider attaches before its first call.
+    // Started before the barrier release, so no member predates it. A
+    // load refusal keeps the run (learning still covers later mappers).
+    if owned.coordinator.is_armed()
+        && owned.run_cgroup.is_some()
+        && let Scope::Cgroup { dir, .. } = &scope
+    {
+        match crate::attach::member_stop::MemberStopHooks::start(dir, pid) {
+            Ok(hooks) => owned.member_stops = Some(hooks),
+            Err(error) => {
+                if capture_diagnostics_on() {
+                    emit_capture_diagnostic(&format!(
+                        "p11scope: run member first-map stop unavailable: {error:#}"
+                    ));
+                }
             }
         }
     }
@@ -9764,6 +9796,15 @@ fn capture_profile(
                 &mut context,
                 &mut consumers,
                 |context: &mut ProfileTickContext<'_, '_>, consumers: &mut CaptureConsumers<'_>| {
+                    // Stopped run members first: their providers stage
+                    // and attach before they run (no-op without stops).
+                    if let Some(hooks) = context
+                        .2
+                        .as_deref_mut()
+                        .and_then(|owned| owned.member_stops.as_mut())
+                    {
+                        context.0.service_member_stops(hooks, context.1, None);
+                    }
                     // Learned files stage before the pass decision, so a
                     // staging owed this tick can expedite this tick's frame.
                     context.0.service_learned_files();
@@ -11545,6 +11586,14 @@ fn capture_trace(
             session.stop_gate().request_stop();
             observe_capture_cancel(interrupted, &cancellation, ticks, CancellationPhase::Capture);
             break Ok(CaptureEnd::Signal);
+        }
+        // Stopped run members first: their providers stage and attach
+        // before they run (no-op without stops).
+        if let Some(hooks) = owned
+            .as_deref_mut()
+            .and_then(|owned| owned.member_stops.as_mut())
+        {
+            engine.service_member_stops(hooks, session, None);
         }
         // Learned files stage before the pass decision, so a staging
         // owed this tick can expedite this tick's frame.

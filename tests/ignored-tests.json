@@ -2024,6 +2024,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/attach/member_stop.rs",
+      "path": "attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_map",
+      "reason": "privileged: loads the member-stop object on the host kernel",
+      "cell": "privileged"
+    },
+    {
       "file": "src/attach/prearm_witness.rs",
       "path": "attach::prearm_witness::tests::privileged_prearm_witness_loads_and_attaches",
       "reason": "privileged: loads the witness object on the host kernel",

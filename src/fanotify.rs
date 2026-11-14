@@ -240,7 +240,7 @@ pub(crate) fn check_elf_provider(file: &std::fs::File) -> Result<bool, String> {
 }
 
 /// A loader's program, or the finite reason it is unknown.
-type LoaderNaming = (Option<String>, Option<&'static str>);
+pub(crate) type LoaderNaming = (Option<String>, Option<&'static str>);
 
 /// The provider test with loader naming in the middle: the cheap byte
 /// tests (file type, ELF magic, the export-name prefilter) run first, so
@@ -251,7 +251,7 @@ type LoaderNaming = (Option<String>, Option<&'static str>);
 /// `Ok(None)` is a certain negative; `Ok(Some(loader))` a proved provider
 /// with whatever `name_loader` returned; `Err` an I/O failure the caller
 /// must not cache.
-fn prove_with_loader(
+pub(crate) fn prove_with_loader(
     file: &std::fs::File,
     name_loader: impl FnOnce() -> LoaderNaming,
 ) -> Result<Option<LoaderNaming>, String> {

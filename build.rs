@@ -439,6 +439,8 @@ fn main() {
     build_identity_object();
     // Pre-arm witness object (WU-13 P-C phase 2): standalone, like identity.
     build_prearm_witness_object();
+    // Run-tree first-map stop object: standalone, like the witness.
+    build_member_stop_object();
     if counter_artifacts {
         for flavor in [
             BpfFlavor::CounterCounts,
@@ -1565,4 +1567,48 @@ fn build_prearm_witness_object() {
     ));
     std::fs::write(out_dir.join("p11scope-prearm-witness-build-info.txt"), info)
         .expect("writing witness build info");
+}
+
+/// Run-tree first-map stop object: `crates/ebpf/native/member_stop.c`
+/// compiled by clang-18 straight to a BPF ELF, like the witness object.
+/// Only an owned, pause-armed `run` loads it; no other object changes.
+fn build_member_stop_object() {
+    println!("cargo:rerun-if-changed=crates/ebpf/native/member_stop.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/member_stop.h");
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    let compiler_path = resolve_clang18();
+    let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
+        Ok("big") => "bpfeb",
+        _ => "bpfel",
+    };
+    let mut file_prefix_map = OsString::from("-ffile-prefix-map=");
+    file_prefix_map.push(manifest_dir.as_os_str());
+    file_prefix_map.push("=/p11scope");
+    let status = Command::new(&compiler_path)
+        .current_dir(&out_dir)
+        .args([
+            "-target",
+            target,
+            "-mcpu=v3",
+            "-O2",
+            "-g",
+            "-gno-record-gcc-switches",
+            "-fdebug-compilation-dir=/p11scope/native",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-c",
+        ])
+        .arg(file_prefix_map)
+        .arg(manifest_dir.join("crates/ebpf/native/member_stop.c"))
+        .arg("-o")
+        .arg("p11scope-ebpf-member-stop")
+        .status()
+        .expect("failed to spawn clang-18 for the member-stop object");
+    assert!(
+        status.success(),
+        "building the member-stop object failed: {status}"
+    );
 }

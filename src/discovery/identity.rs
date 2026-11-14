@@ -7939,6 +7939,11 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
 /// [`pin_manifest_objects_deferred_in_views_with_budget`] with an injected
 /// self-mapping probe, so unit tests can script the kernel side of a
 /// pre-6.8 overlay split. Production always passes the kernel probe.
+///
+/// Test support: pins through an unbounded per-call table (one module
+/// can file several pins, so no finite cap reproduces the old
+/// never-refuse behavior). Production manifest pinning files through
+/// the lane tables instead.
 pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
     m: &Manifest,
     views: &[ProcessView],
@@ -9072,6 +9077,11 @@ pub fn pin_scanned_objects(
     Ok((aggregate, skipped))
 }
 
+/// Pin scanned modules without a lane table: test support for the
+/// public integration-test API (plus in-crate fixture seeders).
+/// Files through an unbounded per-call table, so every module
+/// acquires exactly like the old row-less path but through a row.
+/// Production scans file through the lane tables instead.
 pub fn pin_scanned_view_objects(
     view: &ProcessView,
     modules: &[ScannedModule],

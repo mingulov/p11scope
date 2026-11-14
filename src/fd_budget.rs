@@ -611,40 +611,23 @@ mod tests {
             }
             // One admission: its pidfd plus one real retained scan pin,
             // debited through the production path — the pidfd directly,
-            // the pin via its inserted table rows.
+            // the pin via its inserted table rows. The pin is the
+            // original `real_scan_pin` fixture (same file, same 64-hex
+            // digest); each admission opens anew, so each files its own
+            // row exactly like the scripted proof it replaces.
             let pidfd = std::fs::File::open("/dev/null")
                 .expect("a pidfd stand-in must open before the reserve trips");
             held_views.push(pidfd);
             tick.note_opened();
-            use std::os::unix::fs::MetadataExt as _;
-            let metadata = std::fs::metadata(&pin_path).unwrap();
-            let maps = p11scope_manifest::maps::ObjectKey {
-                device: p11scope_manifest::maps::Device {
-                    major: u64::from(libc::major(metadata.dev())),
-                    minor: u64::from(libc::minor(metadata.dev())),
-                },
-                inode: metadata.ino(),
-            };
-            let proved = crate::discovery::identity::ProvedEntry::for_test(
-                std::fs::File::open(&pin_path).unwrap(),
-                maps,
-                "aa",
+            let mut pins = crate::discovery::identity::test_fixture::real_scan_pin(
+                &pin_path,
                 None,
+                0,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             );
             let admits_before = table.stats().admits;
-            let crate::discovery::identity::ProvedEntry { file, meta } = proved;
-            match table.acquire(
-                file,
-                &meta,
-                crate::discovery::handle_table::DeferredReason::Live,
-            ) {
-                crate::discovery::handle_table::AcquireOutcome::Held(held) => {
-                    held_pins.push(held);
-                }
-                crate::discovery::handle_table::AcquireOutcome::Deferred(reason) => {
-                    panic!("the table holds room: deferred with {reason:?}")
-                }
-            }
+            pins.adopt_existing_handles_into(&mut table);
+            held_pins.push(pins);
             tick.note_opened_n(table.stats().admits - admits_before);
             admitted = admitted.saturating_add(1);
             assert!(admitted < 2000, "the reserve never deferred");

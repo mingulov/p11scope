@@ -332,7 +332,8 @@ impl SemanticInputs {
                     // Never-stop: per-object skips keep the good pins and
                     // record one manifest-input refusal for the bad objects.
                     // Trusted deferrals land here as skips too (their
-                    // permanent gap is already filed); no `Deferred` is
+                    // per-object rows drop with the pinning; only the
+                    // generic refusal records the loss); no `Deferred` is
                     // ever stored, never retried.
                     Ok((input, true)) => {
                         inputs.push(input);

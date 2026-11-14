@@ -15975,7 +15975,6 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn scan_retained_view(
         view: &ProcessView,
         module_hints: &[PathBuf],
@@ -27765,6 +27764,15 @@ impl Engine {
                         let pid = self.views[position].pid();
                         self.request_refresh(pid, crate::attach::monotonic_ns());
                         self.file_handles_wait_gap();
+                        // Deliberately `continue`, where the loader
+                        // services `break`: this loop serves a
+                        // caller-passed snapshot, so each view needs
+                        // its own retry registration and outcome row,
+                        // and refreshes are latency-sensitive exec
+                        // events whose filed rows share without room.
+                        // The loader queues persist in engine state,
+                        // so ending the service at the first wait
+                        // leaves the remainder safely queued.
                         continue;
                     }
                     self.note_scan_observed(

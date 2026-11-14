@@ -5803,10 +5803,12 @@ impl JournalAdapter {
         else {
             return Err(RawQuantumRefusal::DispositionMismatch);
         };
-        // The caller routes fenced voids here despite the floor (the
-        // void bounds the replay, and per-head H8 consumption keeps
-        // the pending census exact); anything else still needs clean
-        // H3. `staged_max` binds the preflight below.
+        // The caller routes fenced voids here despite the floor
+        // (admission failures are per process and the rows carry no
+        // key identity, so above-floor staged calls may reduce
+        // before the pending call; per-head H8 consumption keeps the
+        // pending census exact); anything else still needs clean H3.
+        // `staged_max` binds the preflight below.
         if pending_floor.is_some() && batch.audited().fence().is_none() {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }

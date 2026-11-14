@@ -10500,10 +10500,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Dispose the abandoned quantum's stranded staged Joint calls
-    /// (running-rearm recovery only; the exit hold never recovers so
-    /// it never needs this): an applied abandon strands
-    /// staged-but-unreduced calls, and the recovery's fallback
-    /// verification trips over them. Every call counts as disposed
+    /// (running-rearm and idle-void recovery only; the exit hold
+    /// never recovers so it never needs this): an applied abandon —
+    /// or an idle ingest-break void — strands staged-but-unreduced
+    /// calls, and the recovery's fallback verification trips over
+    /// them. Every call counts as disposed
     /// history, with observed completions preserved as
     /// unknown-key rows. A no-op unless calls were staged.
     pub(crate) fn drop_abandoned_joint_staged(&mut self) {

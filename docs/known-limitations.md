@@ -483,6 +483,19 @@ inventory keeps running to the end of the window with exact counts
 and no lost calls. Workaround: rerun the capture, or narrow the
 scope (`--pid`).
 
+### A call caught mid-flight by a tracking interruption can spend one continuation
+
+When per-key tracking hits a transient interruption, a call that was
+admitted just before the interruption but never joined to its key —
+or a slow call, such as key generation or smart-card signing, that
+returns after the interruption — can stall the recovery's first
+step: the recovery cannot match the orphaned call to its proof, so
+it refuses that step loudly and the lane continues past it on one of
+its 32 continuations per run. The orphaned call is still counted,
+tracking resumes afterwards, and nothing is silently dropped. Each
+such coincidence spends one continuation; repeated coincidences
+spend one each.
+
 ### Calls through the p11-kit proxy can publish no mechanism names
 
 Since v0.7.0, ELF interposition under p11-kit-proxy no longer

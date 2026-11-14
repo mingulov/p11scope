@@ -10649,19 +10649,21 @@ fn joint_pending_frame_delivers_carried_void_before_retiring() {
     );
 }
 
-/// Keyrows T1 fix3 B2 twin: a Joint feed holds a staged call across
-/// a pending frame, then an idle break happens. The prescribed
-/// fallback-verification trip ("Joint delivery refused") is
-/// unreachable: the pending frame's floor is stash-owned (capture
-/// floors block ingestion; the machine expires them pre-audit),
-/// and the stashed pre-void outcome loses its H8 to the void while
-/// its wire is already consumed, so the post-void quantum latches
-/// at claiming — before any audit or fallback delivery runs. This
-/// twin pins that pre-emption (premise plus latch site); if
-/// claiming ever soft-routes the orphaned outcome, the publish
-/// below fails and B2 must be revisited. See the idle-site comment.
+/// Keyrows T1 N1 pin: a Joint feed holds a staged call across a
+/// pending frame whose floor is stash-owned (capture floors block
+/// ingestion; the machine expires them pre-audit), then an idle
+/// break happens. The idle drop disposes the stranded staging as
+/// counted history, but the stashed pre-void outcome loses its H8
+/// to the void while its wire is already consumed, so the
+/// post-void quantum still latches at claiming — before any audit
+/// or fallback delivery runs — and costs one re-arm per
+/// coincidence. This pin records the premise, the drop, and the
+/// latch site; if claiming ever soft-routes the orphaned outcome,
+/// the publish below fails and N1 must be revisited. A running
+/// call that returns after the void latches the same way. See the
+/// idle-site comment.
 #[test]
-fn joint_machine_stranded_call_never_reaches_post_void_fallback() {
+fn joint_machine_stashed_pre_void_call_latches_post_void_claiming() {
     use crate::inventory_semantics::JointServiceProgress;
     use crate::semantics_key_use::FeedMode;
     use crate::semantics_objects::journal::JournalGap;
@@ -10850,10 +10852,10 @@ fn joint_machine_stranded_call_never_reaches_post_void_fallback() {
         stranded[0].0 == 1 && stranded[0].1 == FeedMode::Joint && stranded[0].2.is_none(),
         "the admitted call stays staged on its Joint feed: {stranded:?}"
     );
-    // The idle break: the machine's own idle tick voids the lane.
-    // The post-void quantum latches at claiming (the orphaned stash
-    // outcome lost its H8) before any audit or fallback delivery
-    // runs, so the stranded call never reaches verification.
+    // The idle break: the machine's own idle tick voids the lane
+    // (disposing the stranded staging) and the post-void quantum
+    // latches at claiming (the orphaned stash outcome lost its H8)
+    // before any audit or fallback delivery runs.
     let disposed_before = fixture.disposed_total();
     fixture
         .scene
@@ -10869,7 +10871,7 @@ fn joint_machine_stranded_call_never_reaches_post_void_fallback() {
         match fixture.service(1) {
             Ok(JointServiceProgress::Published) => {
                 panic!(
-                    "the post-void quantum publishes despite the orphaned stash: fallback verification is reachable, revisit B2"
+                    "the post-void quantum publishes despite the orphaned stash: the claiming latch is gone, revisit N1"
                 )
             }
             Ok(_) => {}
@@ -10889,9 +10891,9 @@ fn joint_machine_stranded_call_never_reaches_post_void_fallback() {
         Some("Claiming"),
         "the latch lands at claiming, before audit and delivery"
     );
-    // Nothing audited, nothing delivered, nothing dropped: the
-    // stranded call is intact, the void still pends, and no feed
-    // closed — the trip cannot run.
+    // Nothing audited, nothing delivered: the idle drop disposed
+    // the stranded staging as counted history, the void still
+    // pends, and no feed closed.
     let stranded_after: Vec<_> = fixture
         .scene
         .real
@@ -10909,15 +10911,15 @@ fn joint_machine_stranded_call_never_reaches_post_void_fallback() {
         .collect();
     assert_eq!(stranded_after.len(), 1);
     assert!(
-        stranded_after[0].0 == 1
+        stranded_after[0].0 == 0
             && stranded_after[0].1 == FeedMode::Joint
             && stranded_after[0].2.is_none(),
-        "the stranded call is intact after the latch: {stranded_after:?}"
+        "the idle drop disposed the stranded staging: {stranded_after:?}"
     );
     assert_eq!(
         fixture.disposed_total(),
-        disposed_before,
-        "no idle drop ran: none is needed"
+        disposed_before + 1,
+        "the idle drop counts the stranded call as disposed history"
     );
     assert!(
         fixture
@@ -11080,19 +11082,18 @@ fn joint_machine_idle_void_drops_call_held_behind_running_call() {
         .evidence()
         .join_lost;
     assert_eq!(
-        join_lost_after,
-        join_lost_before + 3,
-        "the held call plus both pre-break sessions count lost"
+        join_lost_after, join_lost_before,
+        "no open joins to lose: nothing reduced before the void"
     );
     assert_eq!(
         fixture.unknown_terminals(),
         [
-            unknown_before[0] + 1,
+            unknown_before[0],
             unknown_before[1],
             unknown_before[2],
-            unknown_before[3]
+            unknown_before[3] + 1
         ],
-        "the held call's observed completion stands as an unknown-key row"
+        "the held call's truncated open stands as an unknown-key row"
     );
     let held = feed_state(&fixture, 1);
     assert_eq!(

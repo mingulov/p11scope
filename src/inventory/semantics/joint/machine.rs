@@ -3245,20 +3245,22 @@ impl LiveJointMachine {
                         Err(_) => return (Phase::Idle, Err(SemanticRefusal::Unavailable)),
                     };
                     if voided {
-                        // No staged-drop here (B2): stranded pre-void
-                        // calls cannot reach the recovery's fallback
-                        // verification. Stranded staging needs a
-                        // pending-retired frame, which needs a
-                        // stash-owned H3 floor (capture-held floors
-                        // block ingestion; the machine expires them
-                        // pre-audit; ownerless shed/cut floors never
-                        // match the continuation). The stashed
-                        // pre-void outcome survives the void, but its
-                        // H8 is wiped and its wire consumed, so the
-                        // post-void quantum latches at claiming
-                        // (fail-closed) before any fallback delivery
-                        // runs; the re-arm abandon then drains it as
-                        // S1. Pinned by the B2 twin.
+                        // An idle void strands staged-but-unreduced
+                        // calls: a Joint feed's seal can wait
+                        // (BoundNotReady) behind a long call from the
+                        // same process that is still running, so its
+                        // completed calls stay staged while the frame
+                        // finishes normally — no failure, no floor.
+                        // The void wipes their H8 and claims, and the
+                        // next frame's fallback verification would
+                        // trip over them, so dispose them as counted
+                        // history here, preserving their observed
+                        // completions. A no-op unless calls were
+                        // staged. Pinned by the held-call twin. (A
+                        // stashed pre-void outcome instead latches the
+                        // post-void quantum at claiming; see the N1
+                        // pin.)
+                        coordinator.drop_abandoned_joint_staged();
                         coordinator.note_scope_gap(
                             "Joint key operations unavailable; retained S1".to_string(),
                             format!(

@@ -1939,19 +1939,18 @@ impl IngestedJointQuantum {
         let void_ending = audited.fence().is_some()
             && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint);
         let (h3_clean, h3_clean_floor) = match audited.h3() {
-            H3DispositionEvidence::Clean { pending_floor, .. } => {
-                (true, pending_floor.is_none())
-            }
+            H3DispositionEvidence::Clean { pending_floor, .. } => (true, pending_floor.is_none()),
             H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted => {
                 (false, false)
             }
         };
         // A fenced void replays through the H8-aware fallback even
-        // while H3 pends: the void, not H3 completeness, bounds this
-        // replay, and consuming each replayed head's H8 keeps the
-        // pending continuation's census exact so the frame still
-        // retires after its void delivers. Unfenced fallbacks still
-        // wait for clean H3.
+        // while H3 pends: admission failures are per process, and
+        // the rows carry no key identity, so staged calls above the
+        // floor may reduce before the pending call; consuming each
+        // replayed head's H8 keeps the pending continuation's
+        // census exact so the frame still retires after its void
+        // delivers. Unfenced fallbacks still wait for clean H3.
         let fallback = audited.disposition() == SealFailureDisposition::Fallback
             && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint)
             && h3_clean

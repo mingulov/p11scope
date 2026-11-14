@@ -81704,6 +81704,222 @@ fn loader_exhaustion_names_once_and_watch_still_stages() {
     );
 }
 
+/// The owned-child loader-context reserve: under owned runs,
+/// non-child members refuse past 248 contexts so the direct child's
+/// exec chain keeps 8; the child itself, and every view outside owned
+/// runs, draws to 256.
+#[test]
+fn loader_reserve_holds_contexts_for_the_owned_child() {
+    use crate::discovery::loader::{
+        LOADER_CAPACITY_EXHAUSTED_REASON, MAX_LOADER_CONTEXTS, OWNED_CHILD_CONTEXT_RESERVE,
+    };
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    let me = std::process::id();
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+    let fill = |engine: &mut Engine, count: usize| {
+        use crate::discovery::loader::LoaderContextSpec;
+        for _ in 0..count {
+            let prepared = engine
+                .loader_registry
+                .preflight(LoaderContextSpec {
+                    view: ProcessViewId(0),
+                    loader: PinnedObjectId(9),
+                    mapping: None,
+                    hook: p11scope_manifest::elf::SymbolFact {
+                        virtual_address: 0x2100,
+                        file_offset: 0x2100,
+                    },
+                    state_address: None,
+                })
+                .expect("reserve fill must preflight below capacity");
+            engine
+                .loader_registry
+                .prepare(prepared)
+                .expect("reserve fill must prepare");
+        }
+    };
+    // One below the reserve line nobody refuses.
+    fill(
+        &mut engine,
+        MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE - 1,
+    );
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(1)).is_none(),
+        "a member below the reserve line draws normally"
+    );
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(0)).is_none(),
+        "the child below the reserve line draws normally"
+    );
+    // At the line members refuse with the capacity reason while the
+    // child still draws.
+    fill(&mut engine, 1);
+    assert_eq!(
+        engine.loader_reserve_refusal(ProcessViewId(1)).as_deref(),
+        Some(LOADER_CAPACITY_EXHAUSTED_REASON),
+        "a member past the line refuses with the capacity reason"
+    );
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(0)).is_none(),
+        "the child past the line still draws from the reserve"
+    );
+    // Outside owned runs nobody refuses, however full the registry.
+    engine.owned_run_pid = None;
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(1)).is_none(),
+        "an unowned scope draws to capacity"
+    );
+    engine.owned_run_pid = Some(me);
+    engine.scope = Scope::Pid(me);
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(1)).is_none(),
+        "a non-tree scope draws to capacity"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// End to end through the real arm path: with 248 contexts spent, the
+/// owned child's arm still binds the 249th context while a member arm
+/// refuses with the one deduped capacity row.
+#[test]
+fn loader_reserve_refuses_member_arms_but_arms_the_child() {
+    use crate::discovery::loader::{MAX_LOADER_CONTEXTS, OWNED_CHILD_CONTEXT_RESERVE};
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    let me = std::process::id();
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 3;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let mut first_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn first sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), first_sleeper.id()).expect("sleeper view opens"));
+    let mut second_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn second sleeper");
+    engine.views.push(
+        ProcessView::open(ProcessViewId(2), second_sleeper.id()).expect("sleeper view opens"),
+    );
+    let mut session = ScriptedSession::default();
+    // Bind one real context first: the fill below reuses its loader
+    // object, so later admissions still resolve every context (a fill
+    // on a phantom loader object would poison admission for all of
+    // them, and a fill on a real view would short-circuit its arm).
+    engine
+        .arm_loader_or_partial(
+            1,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect("the establishing arm binds");
+    assert_eq!(
+        engine.loader_registry.allocated_contexts(),
+        1,
+        "the establishing arm minted one context"
+    );
+    let loader = engine
+        .loader_registry
+        .context(crate::discovery::loader::LoaderContextId::from_case_id(0))
+        .expect("one bound context")
+        .spec
+        .loader;
+    for _ in 1..(MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE) {
+        let prepared = engine
+            .loader_registry
+            .preflight(crate::discovery::loader::LoaderContextSpec {
+                view: ProcessViewId(7),
+                loader,
+                mapping: None,
+                hook: p11scope_manifest::elf::SymbolFact {
+                    virtual_address: 0x2100,
+                    file_offset: 0x2100,
+                },
+                state_address: None,
+            })
+            .expect("reserve fill must preflight below capacity");
+        engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("reserve fill must prepare");
+    }
+    // The child binds past the line from the reserve.
+    engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect("the child arms past the reserve line");
+    assert_eq!(
+        engine.loader_registry.allocated_contexts(),
+        MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE + 1,
+        "the child minted past the reserve line"
+    );
+    // A member arm then refuses with the capacity row.
+    engine
+        .arm_loader_or_partial(
+            2,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect("a refused member arm is ordinary, never fatal");
+    assert!(
+        engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(2))
+            .is_empty(),
+        "the refused member bound no context"
+    );
+    first_sleeper.kill().expect("kill first sleeper");
+    first_sleeper.wait().expect("reap first sleeper");
+    second_sleeper.kill().expect("kill second sleeper");
+    second_sleeper.wait().expect("reap second sleeper");
+    let exhaustion_rows = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| {
+            skip.subject == "live loader arming"
+                && skip.reason == "loader context capacity 256 is exhausted"
+        })
+        .count();
+    assert_eq!(
+        exhaustion_rows, 1,
+        "the reserve refusal names itself once: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// The file-only apply attaches a staged learned file without any
 /// discovery batch or inventory refresh: the plan gains the module in
 /// the same service tick, and the shallow-idle latch discharges.

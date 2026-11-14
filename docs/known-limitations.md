@@ -242,7 +242,11 @@ the first worker; the pkcs11-check smoke suite reaches oracle recall
 1.0); members too short-lived to scan at all (a few milliseconds)
 stay counted in `pid_descendant_gaps` like the other never-admitted
 members. The 32-file per-capture cap is shared with system file
-learning.
+learning. Of the 256 loader contexts, 8 stay reserved for the direct
+child's exec chain: member arms past 248 refuse with the capacity gap
+(their later calls still land via file-identity probes once the file
+stages), so a fork burst cannot spend the child's own re-arm
+contexts.
 
 ### File learning sees only the observer's mount namespace
 

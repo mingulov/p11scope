@@ -4843,6 +4843,30 @@ impl State {
         slot: u32,
         raw: u64,
     ) -> Option<u64> {
+        self.session_pseudonym_inner(process, slot, raw, true)
+    }
+
+    /// Live-only pseudonym: like [`Self::session_pseudonym_process`]
+    /// but without the exit-retired tombstone fallback. An open event
+    /// never operates on an existing session — a reopened handle is a
+    /// new session — so its trace line must never print a retired
+    /// label.
+    pub fn live_session_pseudonym_process(
+        &self,
+        process: ProcessKey,
+        slot: u32,
+        raw: u64,
+    ) -> Option<u64> {
+        self.session_pseudonym_inner(process, slot, raw, false)
+    }
+
+    fn session_pseudonym_inner(
+        &self,
+        process: ProcessKey,
+        slot: u32,
+        raw: u64,
+        include_retired: bool,
+    ) -> Option<u64> {
         let module = self
             .slots
             .get(slot as usize)
@@ -4855,9 +4879,11 @@ impl State {
                 handle: raw,
             },
         );
-        self.open
-            .get(&key)
-            .map(|info| info.pseudonym)
+        let live = self.open.get(&key).map(|info| info.pseudonym);
+        if !include_retired {
+            return live;
+        }
+        live
             // Exit-retired sessions keep their label in the tombstone,
             // so surviving threads' late calls still print `sess#N`.
             .or_else(|| self.retired_sessions.get(&key).copied())

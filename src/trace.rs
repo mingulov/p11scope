@@ -14,7 +14,7 @@ use crate::plan::AttachPlan;
 use crate::render;
 use crate::semantics::ProcessKey;
 use crate::semantics::State;
-use p11scope_ebpf_common::{Event, SESSION_NONE, capture, shape};
+use p11scope_ebpf_common::{Event, SESSION_NONE, capture, lifecycle, shape};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -750,6 +750,23 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
     slots
 }
 
+/// The session label a trace line shows: open events use the live-only
+/// lookup (a reopened handle is a new session), every other event the
+/// tombstone-backed one (late calls on retired sessions keep `sess#N`).
+fn line_pseudonym(
+    state: &State,
+    opens: bool,
+    process: ProcessKey,
+    slot: u32,
+    raw: u64,
+) -> Option<u64> {
+    if opens {
+        state.live_session_pseudonym_process(process, slot, raw)
+    } else {
+        state.session_pseudonym_process(process, slot, raw)
+    }
+}
+
 pub struct Tracer {
     slots: Vec<Option<TraceSlot>>,
     raw_calls: u64,
@@ -899,13 +916,19 @@ impl Tracer {
         let semantic = slot
             .as_ref()
             .is_some_and(|slot| slot.semantics != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY);
+        // An open event never operates on an existing session, so its
+        // line skips the retired-tombstone fallback: a reopened handle
+        // prints its fresh label, never the retired one.
+        let opens = slot
+            .as_ref()
+            .is_some_and(|slot| slot.semantics.lifecycle == lifecycle::OPEN_SESSION);
         let pre = (semantic && ev.session != SESSION_NONE)
-            .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
+            .then(|| line_pseudonym(state, opens, process, ev.slot, ev.session))
             .flatten();
         let moved = state.observe_process(process, ev);
         let session = pre.or_else(|| {
             (semantic && ev.session != SESSION_NONE)
-                .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
+                .then(|| line_pseudonym(state, opens, process, ev.slot, ev.session))
                 .flatten()
         });
         let wall_ns = self.wall_ns_for(ev.ts_ns);

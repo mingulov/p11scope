@@ -886,6 +886,21 @@ mod tests {
         assert!(library_handle_budget_defers_next_new(0, 0, 0));
     }
 
+    /// The trusted/learned refusal reasons are fixed vocabulary: pin
+    /// their exact wording so a rewording fails loudly instead of
+    /// drifting the gap rows and the push-back match apart.
+    #[test]
+    fn handle_budget_trusted_and_learned_reasons_keep_their_wording() {
+        assert_eq!(
+            LIBRARY_HANDLE_BUDGET_REASON_TRUSTED,
+            "capture library-handle budget exhausted (1000 concurrent handles); trusted input object skipped permanently"
+        );
+        assert_eq!(
+            LIBRARY_HANDLE_BUDGET_REASON_LEARNED,
+            "capture library-handle budget exhausted (1000 concurrent handles); learned candidate deferred to the next tick"
+        );
+    }
+
     /// Failure pair: absurd counts saturate into deferral, never wrap
     /// into admission.
     #[test]

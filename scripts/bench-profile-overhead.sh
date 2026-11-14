@@ -201,7 +201,9 @@ EOF
 rss_sampler() {
     out=$1
     pid=$2
-    while kill -0 "$pid" 2>/dev/null; do
+    # Liveness via /proc presence, never `kill -0`: the observer runs
+    # as root and signal 0 fails across users on this host.
+    while [ -d "/proc/$pid" ]; do
         awk '/^VmRSS:/{rss=$2} /^VmHWM:/{hwm=$2} END{if (rss != "") print "rss " rss " hwm " hwm}' \
             "/proc/$pid/status" >> "$out" 2>/dev/null || true
         sleep 2
@@ -246,7 +248,7 @@ run_sample() {
             obs_pid=$(pgrep -P "$sudo_pid" -x p11scope | head -n 1 || true)
             [ -n "$obs_pid" ] && break
         fi
-        kill -0 "$sudo_pid" 2>/dev/null || break
+        [ -d "/proc/$sudo_pid" ] || break
         sleep 2
     done
     grep -qF "$READY_MARK" "$dir/stderr.txt" 2>/dev/null \
@@ -260,16 +262,18 @@ run_sample() {
     rss_sampler "$dir/rss.txt" "$obs_pid" &
     sampler_pid=$!
 
+    # Every fallible step guards `set -e` and refuses loudly: a bare
+    # nonzero exit here would end the campaign with no message.
+    churn_rc=0
     "$CHURN" --rate "$RATE" --fail-share "$FAIL_SHARE" \
         --fork-every "$FORK_EVERY" --duration "$SECS" \
-        >"$dir/churn.txt" 2>&1
-    churn_rc=$?
+        >"$dir/churn.txt" 2>&1 || churn_rc=$?
     [ "$churn_rc" -eq 0 ] || refuse "sample $arm: churn exited $churn_rc"
-    kill -0 "$sudo_pid" 2>/dev/null \
+    [ -d "/proc/$sudo_pid" ] \
         || refuse "sample $arm: observer ended before the churn window closed (attach ${attach_secs}s ate the ${OBS_SPARE}s spare)"
 
-    wait "$sudo_pid"
-    obs_rc=$?
+    obs_rc=0
+    wait "$sudo_pid" || obs_rc=$?
     obs_end=$(date +%s)
     wait "$sampler_pid" 2>/dev/null || true
     [ "$obs_rc" -eq 0 ] || refuse "sample $arm: observer exited $obs_rc"
@@ -288,7 +292,8 @@ run_sample() {
     else
         [ "$mem_lines" -eq 0 ] || refuse "sample base: $mem_lines memory lines (not a pre-A0 build?)"
     fi
-    peak_rss=$(awk '$1 == "rss" {if ($2 > max) max = $2} END{print max + 0}' "$dir/rss.txt" 2>/dev/null)
+    [ -f "$dir/rss.txt" ] || refuse "sample $arm: RSS sampler wrote nothing"
+    peak_rss=$(awk '$1 == "rss" {if ($2 > max) max = $2} END{print max + 0}' "$dir/rss.txt")
     obs_wall=$(( obs_end - obs_start ))
     line="SAMPLE arm=$arm iters=$iters rate=$rate obs_wall=$obs_wall attach_secs=$attach_secs peak_rss_kb=$peak_rss mem_lines=$mem_lines dir=$(basename "$dir")"
     say "$line"
@@ -298,7 +303,9 @@ run_sample() {
 # lines. Prints the DELTA summary (also appended to the log). No verdict:
 # the < 1% / 3% gate runs in A1 and B4.
 analyze() {
-    python3 -I - "$1" <<'EOF' | tee -a "$1"
+    # No pipe: the pipeline exit would be tee's and mask a python
+    # failure. A failed analysis refuses loudly instead.
+    if ! out=$(python3 -I - "$1" <<'EOF'
 import statistics, sys
 
 base, cand = [], []
@@ -323,6 +330,10 @@ for key in ("rate", "obs_wall", "peak_rss_kb"):
     delta = (c - b) / b * 100 if b else float("nan")
     print(f"DELTA {key}: base_med={b:.1f} cand_med={c:.1f} delta_pct={delta:+.2f} n={len(base)}")
 EOF
+    ); then
+        refuse "analysis failed"
+    fi
+    printf '%s\n' "$out" | tee -a "$1"
 }
 
 # self_test: validate the SAMPLE parsing and delta math on fixture lines
@@ -366,6 +377,9 @@ main() {
     # is the caller's TMPDIR, whose mode is the caller's business.
     # shellcheck disable=SC2174
     mkdir -p -m 0700 "$OUTDIR"
+    if [ -e "$OUTDIR/campaign.log" ]; then
+        refuse "OUTDIR $OUTDIR already holds a campaign; use a fresh dir"
+    fi
     LOG=$OUTDIR/campaign.log
     : > "$LOG"
     say "bench-profile-overhead ts=$ts base=$BASE_BIN cand=$CAND_BIN rate=$RATE fail_share=$FAIL_SHARE fork_every=$FORK_EVERY secs=$SECS rounds=$ROUNDS obs_spare=$OBS_SPARE"

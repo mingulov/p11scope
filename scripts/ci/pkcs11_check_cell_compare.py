@@ -8,7 +8,8 @@ Three legs run the same pkcs11-check selection against fresh SoftHSM tokens:
 `p11scope run --manifest`. This helper judges the hard checks:
 
 - identical pkcs11-check result sets across a/b/c (summary counts, per-unit
-  statuses, and per-test when=call outcomes from report.jsonl);
+  statuses and return codes, and per-test when=call outcomes from
+  report.jsonl);
 - observer clean (exits match the base leg, observed.json valid v3);
 - leg (c) oracle subset (teardown rv-trace calls ⊆ captured counts);
 - leg (b) default coverage ratio vs a pinned floor, or a named
@@ -132,10 +133,14 @@ def compare_results(base_path, other_path, label):
         if extra:
             problems.append(f"units only in other: {', '.join(extra[:5])}")
     for name in sorted(set(base_units) & set(other_units)):
-        base_status, base_counts, _ = base_units[name]
-        other_status, other_counts, _ = other_units[name]
-        if base_status != other_status or base_counts != other_counts:
-            problems.append(f"unit {name}: base {(base_status, base_counts)} != other {(other_status, other_counts)}")
+        base_status, base_counts, base_rc = base_units[name]
+        other_status, other_counts, other_rc = other_units[name]
+        if (base_status != other_status or base_counts != other_counts
+                or base_rc != other_rc):
+            problems.append(
+                f"unit {name}: base {(base_status, base_counts, base_rc)} != "
+                f"other {(other_status, other_counts, other_rc)}"
+            )
     info = (
         f"summary total={base_summary.get('total')} "
         f"passed={base_summary.get('passed')} failed={base_summary.get('failed')} "

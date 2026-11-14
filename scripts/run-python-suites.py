@@ -69,6 +69,7 @@ RUN = [
     ("test_browser_cells.py", []),
     ("test_cargo_wrapper.py", []),
     ("test_cell_results.py", []),
+    ("test_pkcs11_check_cell.py", []),
     ("test_e16_oracle.py", []),
     ("test_event_stdout_judge.py", []),
     ("test_first_use_oracle.py", []),

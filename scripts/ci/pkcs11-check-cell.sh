@@ -33,7 +33,7 @@ DISCOVER=${P11SCOPE_DISCOVER_BIN:-$(dirname "$P")/p11scope-discover}
 for tool in softhsm2-util python3 setpriv; do
   command -v "$tool" >/dev/null 2>&1 || { echo "pkcs11-check-cell: missing prerequisite: $tool" >&2; exit 77; }
 done
-command -v "$P11CHECK_BIN" >/dev/null 2>&1 || { echo "pkcs11-check-cell: missing prerequisite: $P11CHECK_BIN (pip install 'pkcs11-check==0.2.3')" >&2; exit 77; }
+command -v "$P11CHECK_BIN" >/dev/null 2>&1 || { echo "pkcs11-check-cell: missing prerequisite: $P11CHECK_BIN (pip install --require-hashes -r scripts/ci/pkcs11-check-requirements.txt)" >&2; exit 77; }
 [ -x "$DISCOVER" ] || { echo "pkcs11-check-cell: no executable discover helper: $DISCOVER" >&2; exit 77; }
 [ -z "${P11TEST_PIN:-}" ] && { echo "pkcs11-check-cell: P11TEST_PIN env must be set (throwaway token PIN, never echoed)" >&2; exit 2; }
 [ -z "${P11TEST_SO_PIN:-}" ] && { echo "pkcs11-check-cell: P11TEST_SO_PIN env must be set (throwaway SO PIN, never echoed)" >&2; exit 2; }
@@ -93,7 +93,11 @@ chown "$RUNUID:$RUNGID" "$OUT" 2>/dev/null || true
 suite_args() {
   leg=$1
   dir=$OUT/leg-$leg
-  rm -f "$dir/.pkcs11-check-isolation-state.json" "$dir/.pkcs11-check-isolation-state-policy.json"
+  # Drop stale verdict files first: a re-run into a reused OUT must not judge
+  # the previous run's outputs when a leg aborts before overwriting them.
+  rm -f "$dir/results.json" "$dir/report.jsonl" "$dir/observed.json" \
+    "$dir/observer.out" "$dir/observer.err" \
+    "$dir/.pkcs11-check-isolation-state.json" "$dir/.pkcs11-check-isolation-state-policy.json"
   if [ "$MODE" = smoke ]; then
     echo "test --module $MODULE --marker smoke --rv-trace -o json --output-file $dir/results.json"
   else

@@ -360,6 +360,7 @@
   "pkcs11_check": {
     "note": "External pkcs11-check suite under p11scope (scripts/ci/pkcs11-check-cell.sh, not lib tests). SMOKE (--marker smoke) on every push, FULL (no marker) nightly plus dispatch; FULL green on the exact SHA gates release tags. Inventoried here for the version/marker/cell/floor pins the workflow and the cell script must match.",
     "version": "0.2.3",
+    "requirements": "scripts/ci/pkcs11-check-requirements.txt",
     "smoke_marker": "smoke",
     "cells": [
       "pkcs11-check-identical-results",

@@ -903,6 +903,51 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                 self.assertIn("rm -rf", job)
                 self.assertIn("tokens", job)
 
+    def test_pkcs11_check_install_uses_hashed_requirements(self):
+        # Both jobs install through --require-hashes from the campaign-pinned
+        # requirements file (never a bare version-only pip install), and every
+        # requirement there is ==-pinned with sha256 hashes, including
+        # pkcs11-check at the campaign version.
+        campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
+        requirements = campaign["pkcs11_check"]["requirements"]
+        self.assertEqual(requirements,
+                         "scripts/ci/pkcs11-check-requirements.txt")
+        text = (ROOT / requirements).read_text(encoding="utf-8")
+        stanzas = []
+        current = ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.endswith("\\"):
+                current += stripped[:-1] + " "
+                continue
+            current += stripped
+            stanzas.append(current)
+            current = ""
+        self.assertEqual(current, "", "dangling backslash in the requirements")
+        self.assertTrue(stanzas, "no requirements found")
+        seen = {}
+        for stanza in stanzas:
+            match = re.match(r"([A-Za-z0-9_.-]+)==([^ \t]+)", stanza)
+            self.assertIsNotNone(match, f"unpinned requirement: {stanza[:80]}")
+            hashes = re.findall(r"--hash=sha256:[0-9a-f]{64}", stanza)
+            self.assertTrue(hashes, f"unhashed requirement: {stanza[:80]}")
+            seen[match.group(1).lower().replace("_", "-")] = match.group(2)
+        self.assertEqual(seen.get("pkcs11-check"),
+                         campaign["pkcs11_check"]["version"])
+        for job_name in ("pkcs11-check-smoke", "pkcs11-check-full"):
+            with self.subTest(job=job_name):
+                job = job_body(self.yml, job_name)
+                self.assertIn("--require-hashes", job)
+                self.assertIn(f"-r {requirements}", job)
+                installs = [line for line in job.splitlines()
+                            if "pip" in line and "install" in line]
+                self.assertTrue(installs, f"{job_name} has no pip install")
+                for line in installs:
+                    self.assertIn("--require-hashes", line,
+                                  "bare unhashed pip install remains")
+
     def test_schedule_runs_only_release_build_and_full(self):
         # Every job except release-build and pkcs11-check-full skips on
         # schedule, so the nightly runs only the FULL suite on main.

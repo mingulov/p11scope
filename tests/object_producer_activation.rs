@@ -3346,12 +3346,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// with the decision hoisted before the reservation discard, plus
 /// their comment lines): 150308 B, measured with this same lexer on
 /// the integrated source; the previous pin matches its parent.
-/// Re-baselined for the retirement-failure unmatched repair (the only
-/// BPF source changes: the two main.rs refused arms OR the final
-/// unmatched decision with `outcome == RetirementFailed`; the journal
-/// copy lives outside this reader's main.rs-only dump): 150410 B,
-/// measured with this same lexer on the integrated source; the
-/// previous pin matches its parent.
+/// Re-baselined through the refused-join accounting gate (150775 B at
+/// `70556a680`) and the `p11_link_emit_fork` hook timestamp (`745362b51`,
+/// +82 B for `ts_ns: unsafe { helpers::bpf_ktime_get_ns() },` plus three
+/// comment lines stripped to indentation/newlines): 150857 B, measured
+/// with this same lexer on the integrated source; the earlier pins
+/// match their parent commits.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3361,8 +3361,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            150775,
-            "7ee8059dfb25dfd523cbd52f5ab859a3131c2f479ee9e772fa716e9a44c316be"
+            150857,
+            "a2d61c6a9953df996f90f6fced18a89d6acdf18d007507586f12b77c2b9562c3"
         ),
         "stripped BPF dump must stay byte-identical"
     );

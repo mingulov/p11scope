@@ -11,9 +11,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 /// Per-capture cap on staged learned files (spike C2 plan): beyond it the
 /// engine refuses loudly with the aggregate cap gap, never silently.
@@ -850,12 +850,13 @@ pub(crate) fn loader_exe_for_pidfd(pidfd: &OwnedFd) -> (Option<String>, Option<&
 /// stops its further marks through a shared cancel flag and removes
 /// the marks it already placed: a duplicate of the group names the
 /// same group, and flushing the filesystem marks through it (the
-/// startup `CAP_SYS_ADMIN` grant is still held here) leaves the
-/// detached group with nothing queued behind it — no unbounded
-/// kernel queue, no pinned mounts — before the duplicate is closed.
-/// The `mark` closure receives the group and the cancel flag;
-/// production marks every visible filesystem, tests inject a stalled
-/// pass.
+/// startup `CAP_SYS_ADMIN` grant is still held here) plus draining
+/// the events queued before the flush down to `EAGAIN` (closing their
+/// fds, releasing their mount pins) leaves the detached group with
+/// nothing queued behind it — no unbounded kernel queue, no pinned
+/// mounts — before the duplicate is closed. The `mark` closure
+/// receives the group and the cancel flag; production marks every
+/// visible filesystem, tests inject a stalled pass.
 fn arm_with_bound(
     group: OwnedFd,
     mark: impl FnOnce(&OwnedFd, &AtomicBool) -> (BTreeSet<MountIdentity>, usize) + Send + 'static,
@@ -871,11 +872,35 @@ fn arm_with_bound(
         cancel.store(true, Ordering::Release);
         if let Some(dup) = dup {
             flush_filesystem_marks(dup.as_raw_fd());
+            drain_group_closing_to_eagain(dup.as_raw_fd());
         }
         return None;
     };
     drop(dup);
     Some(result)
+}
+
+/// Reads a group down to `EAGAIN`, closing every event's fds: after
+/// the arming-timeout flush, the events queued before the flush still
+/// pin their mounts until the hung helper exits — draining them
+/// through the duplicate releases the pins now instead of waiting.
+/// The group is non-blocking, so an empty queue ends the drain.
+fn drain_group_closing_to_eagain(raw: std::os::unix::io::RawFd) {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
+        let got = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if got < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if got == 0 {
+            return;
+        }
+        close_unread_tail(&buf, 0, got as usize);
+    }
 }
 
 /// The drain thread with its exit signal: the handle joins only after
@@ -1417,6 +1442,61 @@ fn try_mark_filesystem(
     point: &std::path::Path,
     mounts: &[MountToMark],
 ) -> MarkOutcome {
+    try_mark_filesystem_with(point, mounts, |held| {
+        // SAFETY: libc call; the group and held descriptors are valid,
+        // and a NULL pathname marks the held descriptor's object.
+        0 == unsafe {
+            libc::fanotify_mark(
+                group.as_raw_fd(),
+                libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
+                libc::FAN_OPEN,
+                held,
+                std::ptr::null(),
+            )
+        }
+    })
+}
+
+/// The periodic re-mark's mark step over the shared group: locks it
+/// only around the `fanotify_mark` call, so a helper hung in a mount
+/// open holds no group reference. After drain exit took the group,
+/// every mark is refused (that pass result is unadopted anyway).
+/// Poison is benign: the guarded value carries no invariant, so a
+/// panicked helper never wedges a later pass.
+fn try_mark_filesystem_shared(
+    shared: &Arc<Mutex<Option<OwnedFd>>>,
+    point: &std::path::Path,
+    mounts: &[MountToMark],
+) -> MarkOutcome {
+    try_mark_filesystem_with(point, mounts, |held| {
+        let guard = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(group) = guard.as_ref() else {
+            return false;
+        };
+        // SAFETY: as above; the guard keeps the group alive across it.
+        0 == unsafe {
+            libc::fanotify_mark(
+                group.as_raw_fd(),
+                libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
+                libc::FAN_OPEN,
+                held,
+                std::ptr::null(),
+            )
+        }
+    })
+}
+
+/// Marks one mount point's filesystem through a held descriptor (see
+/// `try_mark_filesystem`): opens and resolves first, then marks
+/// through `mark`, which receives the held descriptor and reports
+/// whether the kernel took the mark.
+fn try_mark_filesystem_with(
+    point: &std::path::Path,
+    mounts: &[MountToMark],
+    mark: impl FnOnce(std::os::unix::io::RawFd) -> bool,
+) -> MarkOutcome {
     let Some(held) = open_mount_for_mark(point).or_else(|| open_file_for_mark(point)) else {
         return MarkOutcome {
             resolved: None,
@@ -1424,27 +1504,12 @@ fn try_mark_filesystem(
         };
     };
     let resolved = mount_identity_of_fd(&held, mounts);
-    // SAFETY: libc call; the group and held descriptors are valid,
-    // and a NULL pathname marks the held descriptor's object.
-    let rc = unsafe {
-        libc::fanotify_mark(
-            group.as_raw_fd(),
-            libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
-            libc::FAN_OPEN,
-            held.as_raw_fd(),
-            std::ptr::null(),
-        )
+    let marked = if mark(held.as_raw_fd()) {
+        resolved
+    } else {
+        None
     };
-    if rc != 0 {
-        return MarkOutcome {
-            resolved,
-            marked: None,
-        };
-    }
-    MarkOutcome {
-        resolved,
-        marked: resolved,
-    }
+    MarkOutcome { resolved, marked }
 }
 
 /// One (re-)mark pass over the visible filesystems, retaining the
@@ -1468,6 +1533,22 @@ fn mark_visible_filesystems(
             };
         }
         try_mark_filesystem(group, point, &mounts)
+    })
+}
+
+/// One periodic re-mark pass over the visible filesystems through the
+/// shared group, retaining the coverage earlier passes established.
+/// Returns the next covered set and how many visible filesystems it
+/// leaves uncovered. Never cancelled: the helper runs to completion
+/// (locking the group only around each mark), and drain exit takes
+/// the group instead of waiting for it.
+fn mark_visible_filesystems_shared(
+    shared: &Arc<Mutex<Option<OwnedFd>>>,
+    previously_covered: &BTreeSet<MountIdentity>,
+) -> (BTreeSet<MountIdentity>, usize) {
+    let mounts = visible_mounts();
+    evaluate_mark_coverage(previously_covered, &mounts, |point| {
+        try_mark_filesystem_shared(shared, point, &mounts)
     })
 }
 
@@ -2187,67 +2268,68 @@ fn drain_final_tail_with(
     true
 }
 
-/// One periodic re-mark pass: runs `mark` on a bounded helper unless
-/// a previous pass is still running — a hung mount must not stack a
-/// thread and a duplicate fd every period. `pending` carries the
-/// in-flight pass's receiver across ticks. Returns the coverage to
-/// adopt: `Some` when a pass finished (just now or on an earlier tick)
-/// or when no pass could run (keeping the previous set with one
-/// uncovered), `None` when the previous pass is still running and this
-/// tick is skipped.
-fn run_remark_pass(
-    group: &OwnedFd,
+/// Starts one periodic re-mark pass on a helper thread and returns
+/// at once — the drain never waits for it, not even bounded: a wait
+/// here would eat the stop-tail budget before the drain sees the stop.
+/// The helper holds no group fd of its own, only the shared slot,
+/// which it locks solely around each `fanotify_mark`, so a helper hung
+/// in a mount open pins nothing. `pending` carries the in-flight
+/// pass's receiver across ticks. Returns false only when no pass could
+/// start (spawn failure), which files the gap at once; a pass already
+/// in flight skips this tick (`true`, nothing started) instead of
+/// stacking another thread every period.
+fn spawn_remark_pass(
+    shared: &Arc<Mutex<Option<OwnedFd>>>,
     previous: &BTreeSet<MountIdentity>,
     pending: &mut Option<Receiver<(BTreeSet<MountIdentity>, usize)>>,
-    bound: std::time::Duration,
-    mark: impl FnOnce(&OwnedFd, &BTreeSet<MountIdentity>) -> (BTreeSet<MountIdentity>, usize)
+    mark: impl FnOnce(
+        Arc<Mutex<Option<OwnedFd>>>,
+        BTreeSet<MountIdentity>,
+    ) -> (BTreeSet<MountIdentity>, usize)
     + Send
     + 'static,
-) -> Option<(BTreeSet<MountIdentity>, usize)> {
-    if let Some(rx) = pending.as_ref() {
-        match rx.try_recv() {
-            Ok(result) => {
-                *pending = None;
-                return Some(result);
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                *pending = None;
-                return Some((previous.clone(), 1));
-            }
-        }
+) -> bool {
+    if pending.is_some() {
+        return true;
     }
-    let dup = match group.try_clone() {
-        Ok(dup) => dup,
-        Err(_) => return Some((previous.clone(), 1)),
-    };
+    let helper_shared = Arc::clone(shared);
     let prev = previous.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let helper = std::thread::Builder::new()
         .name("p11scope-learn-remark".to_string())
         .spawn(move || {
-            let _ = tx.send(mark(&dup, &prev));
+            let _ = tx.send(mark(helper_shared, prev));
         });
     let helper = match helper {
         Ok(helper) => helper,
-        Err(_) => return Some((previous.clone(), 1)),
+        Err(_) => return false,
     };
-    match rx.recv_timeout(bound) {
+    // Dropping the handle detaches the helper; forgetting it would
+    // leave the thread joinable (leaked) instead. Its receiver stays
+    // pending so a later tick adopts its result.
+    drop(helper);
+    *pending = Some(rx);
+    true
+}
+
+/// Adopts a landed re-mark result without blocking: `Some` when a pass
+/// finished (adopt its coverage) or died (keep the previous set with
+/// one uncovered — coverage unproven), `None` when a pass is still
+/// running or none is in flight. Called every drain tick so a result
+/// lands promptly; only spawning waits for the 30 s period.
+fn adopt_remark_result(
+    previous: &BTreeSet<MountIdentity>,
+    pending: &mut Option<Receiver<(BTreeSet<MountIdentity>, usize)>>,
+) -> Option<(BTreeSet<MountIdentity>, usize)> {
+    let rx = pending.as_ref()?;
+    match rx.try_recv() {
         Ok(result) => {
-            let _ = helper.join();
+            *pending = None;
             Some(result)
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = helper.join();
-            Some((previous.clone(), 1))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // Dropping the handle detaches the helper; forgetting it
-            // would leave the thread joinable (leaked) instead. Its
-            // receiver stays pending so later ticks adopt its result
-            // instead of stacking another pass.
-            drop(helper);
-            *pending = Some(rx);
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            *pending = None;
             Some((previous.clone(), 1))
         }
     }
@@ -2295,6 +2377,12 @@ fn drain_loop(
     // nice, and an invoker-niced observer degrades naming latency
     // honestly instead of misnaming.
     let raw = group.as_raw_fd();
+    // The group lives in the mutex from now on: `raw` borrows it for
+    // the whole loop (poll, read, ignore marks), re-mark helpers lock
+    // it only around each `fanotify_mark`, and drain exit takes and
+    // drops it — killing the group even while a helper is still stuck
+    // in a mount open. The take below is the last fd use.
+    let shared_group = Arc::new(Mutex::new(Some(group)));
     let mut ctx = DrainCtx {
         group: raw,
         tx: &tx,
@@ -2328,6 +2416,19 @@ fn drain_loop(
             stopped = true;
             break 'drain;
         }
+        // A landed re-mark result is adopted on the tick it lands (the
+        // spawn never waits for it), so coverage stays fresh without
+        // the drain ever blocking on a mount.
+        if let Some((next_covered, uncovered)) = adopt_remark_result(&covered, &mut pending_remark)
+        {
+            covered = next_covered;
+            if uncovered > 0 && !unavailable_sent {
+                unavailable_sent = true;
+                if !send_learn(&tx, &state, LearnMsg::Unavailable) {
+                    break 'drain;
+                }
+            }
+        }
         let mut polled = libc::pollfd {
             fd: raw,
             events: libc::POLLIN,
@@ -2358,32 +2459,24 @@ fn drain_loop(
             // post-shed drain cannot mark — files the finite
             // unavailable-learning gap once, however busy the covered
             // filesystems are. The capture continues (data-always).
-            // The pass runs on a bounded helper with a duplicate of the
-            // group: a hung mount must never stall the drain, because
-            // the unlimited queue would grow behind it. A pass that
-            // does not finish (or cannot start) leaves coverage
-            // unproven, which files the unavailable-learning gap; a
-            // pass still running from the previous period skips this
-            // tick instead of stacking another thread and duplicate.
-            let previous = covered.clone();
-            if let Some((next_covered, uncovered)) = run_remark_pass(
-                &group,
-                &previous,
+            // The pass runs on a detached helper sharing the group: a
+            // hung mount must never stall the drain, because the
+            // unlimited queue would grow behind it. The spawn never
+            // waits — the result lands through the pending receiver on
+            // a later tick — and a pass still running from the previous
+            // period skips this tick instead of stacking another. A
+            // pass that cannot start leaves coverage unproven, which
+            // files the unavailable-learning gap.
+            if !spawn_remark_pass(
+                &shared_group,
+                &covered,
                 &mut pending_remark,
-                LEARN_WORKER_BOUND,
-                |dup, prev| {
-                    // The periodic pass is never cancelled: it runs to
-                    // completion or the bound detaches it whole.
-                    let never = std::sync::atomic::AtomicBool::new(false);
-                    mark_visible_filesystems(dup, prev, &never)
-                },
-            ) {
-                covered = next_covered;
-                if uncovered > 0 && !unavailable_sent {
-                    unavailable_sent = true;
-                    if !send_learn(&tx, &state, LearnMsg::Unavailable) {
-                        break 'drain;
-                    }
+                |shared, prev| mark_visible_filesystems_shared(&shared, &prev),
+            ) && !unavailable_sent
+            {
+                unavailable_sent = true;
+                if !send_learn(&tx, &state, LearnMsg::Unavailable) {
+                    break 'drain;
                 }
             }
             if crate::run::capture_diagnostics_on() {
@@ -2428,6 +2521,20 @@ fn drain_loop(
             state.lost_tail.store(true, Ordering::Release);
         }
     }
+    // The group dies here even when a re-mark helper is still stuck in
+    // a mount open: taking the shared fd drops the last reference
+    // (helpers lock it only around each mark, never across the open),
+    // so no filesystem marks and no unread unlimited queue survive the
+    // drain. A stuck helper that later finishes finds no group and
+    // skips its marks; its result is unadopted. The take never blocks
+    // on a mount — a helper mid-mark holds the lock only for the
+    // syscall — and poison is benign (no invariant on the value).
+    drop(
+        shared_group
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take(),
+    );
     // Exiting past the join bound means the engine already gave up the
     // join: count the join timeout with the other loss sources before
     // the final line, which always prints the run's totals.
@@ -4062,54 +4169,68 @@ mod tests {
         );
     }
 
-    /// A re-mark pass still running from the previous period is never
-    /// stacked: the tick skips starting another thread while one is in
-    /// flight, and adopts its result when it lands. (Unprivileged: the
-    /// mark is injected and the group is a dummy fd.)
+    /// A re-mark spawn never waits for the pass: with an injected
+    /// mark slower than any bound, the spawn returns at once with the
+    /// pass in flight and nothing adopted; ticks while it runs adopt
+    /// nothing and start nothing; when it lands, the next adopt
+    /// collects it without spawning. A pass that dies keeps the
+    /// previous coverage with one uncovered. (Unprivileged: the mark is
+    /// injected and the group is a dummy fd behind the shared slot.)
     #[test]
-    fn learn_remark_skips_while_a_pass_is_still_running() {
+    fn learn_remark_spawn_never_waits_and_later_tick_adopts() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dummy = std::fs::File::open("/dev/null").unwrap();
         let group = std::os::fd::OwnedFd::from(dummy);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(group)));
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let mut pending = None;
         let prev = std::collections::BTreeSet::new();
-        let bound = std::time::Duration::from_millis(100);
-        // The first pass sleeps past the bound: it times out, files its
-        // gap, and stays pending.
+        // The first pass sleeps 2 s: the spawn returns at once.
         let first = std::sync::Arc::clone(&calls);
-        let out = super::run_remark_pass(&group, &prev, &mut pending, bound, move |_, _| {
-            first.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            (std::collections::BTreeSet::new(), 7)
-        });
-        assert_eq!(
-            out,
-            Some((std::collections::BTreeSet::new(), 1)),
-            "a timed-out pass keeps coverage with a gap"
+        let at = std::time::Instant::now();
+        assert!(
+            super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
+                first.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                (std::collections::BTreeSet::new(), 7)
+            }),
+            "the spawn starts the pass"
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(1),
+            "the spawn never waits for the pass"
         );
         assert!(pending.is_some(), "the pass stays in flight");
-        // An immediate second tick starts nothing while it runs.
+        // The spawn returns before the helper runs: wait for the pass
+        // to start before asserting start counts.
+        let started = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) != 1 && std::time::Instant::now() < started {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the pass started");
+        assert_eq!(
+            super::adopt_remark_result(&prev, &mut pending),
+            None,
+            "a running pass adopts nothing"
+        );
+        // An immediate second spawn starts nothing while it runs.
         let second = std::sync::Arc::clone(&calls);
-        let out = super::run_remark_pass(&group, &prev, &mut pending, bound, move |_, _| {
-            second.fetch_add(1, Ordering::SeqCst);
-            (std::collections::BTreeSet::new(), 0)
-        });
-        assert_eq!(out, None, "a tick while a pass runs is skipped");
+        assert!(
+            super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
+                second.fetch_add(1, Ordering::SeqCst);
+                (std::collections::BTreeSet::new(), 0)
+            }),
+            "a tick while a pass runs is skipped, not failed"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "no second thread starts while one runs"
         );
-        // Once the pass lands, its result is adopted without spawning.
+        // Once the pass lands, the next adopt collects it.
         std::thread::sleep(std::time::Duration::from_secs(3));
-        let third = std::sync::Arc::clone(&calls);
-        let out = super::run_remark_pass(&group, &prev, &mut pending, bound, move |_, _| {
-            third.fetch_add(1, Ordering::SeqCst);
-            (std::collections::BTreeSet::new(), 0)
-        });
         assert_eq!(
-            out,
+            super::adopt_remark_result(&prev, &mut pending),
             Some((std::collections::BTreeSet::new(), 7)),
             "the landed pass result is adopted"
         );
@@ -4119,20 +4240,86 @@ mod tests {
             1,
             "adopting starts no new thread"
         );
-        // The next tick starts fresh again.
+        // A pass that dies keeps the previous coverage with a gap.
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        pending = Some(rx);
+        assert_eq!(
+            super::adopt_remark_result(&prev, &mut pending),
+            Some((std::collections::BTreeSet::new(), 1)),
+            "a dead pass keeps coverage with one uncovered"
+        );
+        // The next spawn starts fresh again.
         let fourth = std::sync::Arc::clone(&calls);
-        let out = super::run_remark_pass(
-            &group,
+        assert!(super::spawn_remark_pass(
+            &shared,
             &prev,
             &mut pending,
-            std::time::Duration::from_secs(5),
             move |_, _| {
                 fourth.fetch_add(1, Ordering::SeqCst);
                 (std::collections::BTreeSet::new(), 0)
             },
-        );
-        assert_eq!(out, Some((std::collections::BTreeSet::new(), 0)));
+        ));
+        let restarted = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) != 2 && std::time::Instant::now() < restarted {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A re-mark helper whose group drain exit already took marks
+    /// nothing and panics nowhere: the slot is empty, so every mark
+    /// step is refused — the pass resolves what it can and credits
+    /// nothing. (Unprivileged: the mount table is the test host's.)
+    #[test]
+    fn learn_remark_with_taken_group_marks_nothing() {
+        let shared: std::sync::Arc<std::sync::Mutex<Option<std::os::fd::OwnedFd>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (covered, uncovered) =
+            super::mark_visible_filesystems_shared(&shared, &std::collections::BTreeSet::new());
+        assert!(covered.is_empty(), "no group means no marks: {covered:?}");
+        assert!(uncovered > 0, "unmarked mounts count as uncovered");
+    }
+
+    /// The arming-timeout dup is read down to `EAGAIN`: the events
+    /// queued before the flush are consumed and their fds closed, so
+    /// their mounts unpin without waiting for the hung helper.
+    /// (Unprivileged: a non-blocking pipe stands in for the group; the
+    /// records carry no fds. Completing at all proves the `EAGAIN`
+    /// end: a drain that ignored it would spin forever.)
+    #[test]
+    fn learn_arming_dup_drains_to_eagain_closing() {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let mut fds = [0; 2];
+        // SAFETY: libc pipe into a live array; checked before use.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: fresh owned fds from the pipe above.
+        let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        let mut queued = Vec::new();
+        for _ in 0..3 {
+            queued.extend_from_slice(&synthetic_open_record());
+        }
+        // SAFETY: libc write of a live buffer to the pipe.
+        let written = unsafe {
+            libc::write(
+                writer.as_raw_fd(),
+                queued.as_ptr() as *const libc::c_void,
+                queued.len(),
+            )
+        };
+        assert_eq!(written, queued.len() as libc::ssize_t);
+        // SAFETY: fcntl on our own pipe end; the group is non-blocking.
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        super::drain_group_closing_to_eagain(reader.as_raw_fd());
+        assert_eq!(
+            super::queued_event_bytes(reader.as_raw_fd()),
+            Some(0),
+            "the dup is drained down to EAGAIN"
+        );
     }
 
     /// The tally pid falls back to the metadata capture when the

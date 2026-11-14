@@ -1406,8 +1406,9 @@ fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves()
 /// member arms a loader context (E1, even provider-free sleepers), and
 /// contexts are 256 lifetime IDs never reused, so admissions past the
 /// 248-context reserve line refuse: 8 stay held for the direct child's
-/// exec chain while members name `loader context capacity 256 is
-/// exhausted` exactly once (mark dedupes), the capture stays PARTIAL,
+/// exec chain while members name the reserve (`loader contexts 249-256
+/// are reserved for the run's own command; ...`) exactly once (mark
+/// dedupes), the capture stays PARTIAL,
 /// yet the watch still stages the provider by scan (staging needs no
 /// loader context) and the later SoftHSM mappers' calls still land via
 /// the file-identity probes (coverage after the first provider
@@ -1496,12 +1497,12 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
             entry
                 .get("reason")
                 .and_then(|reason| reason.as_str())
-                .is_some_and(|reason| reason.contains("loader context capacity 256 is exhausted"))
+                .is_some_and(|reason| reason.contains("loader contexts 249-256 are reserved"))
         })
         .count();
     assert_eq!(
         exhaustion, 1,
-        "the 256-context exhaustion names itself once: {skipped:?}"
+        "the 248-context member reserve names itself once: {skipped:?}"
     );
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
     // The watch still stages the provider despite exhaustion.

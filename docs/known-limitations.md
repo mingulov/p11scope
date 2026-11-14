@@ -260,7 +260,7 @@ the first worker; the pkcs11-check smoke suite reaches oracle recall
 stay counted in `pid_descendant_gaps` like the other never-admitted
 members. The 32-file per-capture cap is shared with system file
 learning. Of the 256 loader contexts, 8 stay reserved for the direct
-child's exec chain: member arms past 248 refuse with the capacity gap
+child's exec chain: member arms past 248 refuse with the named reserve gap
 (their later calls still land via file-identity probes once the file
 stages), so a fork burst cannot spend the child's own re-arm
 contexts.
@@ -2332,7 +2332,10 @@ The old bounds are measurements, not a product startup SLA.
   refuses the 257th with a named gap: `evidence.discovery_truncated`
   counts it (`N discovery records truncated`), `evidence.skipped` keeps
   the entry (`live loader arming`, or `owned initial-set discovery` on
-  the owned path, with `loader context capacity 256 is exhausted`),
+  the owned path, with `loader context capacity 256 is exhausted`; an
+  owned run's descendant refused at the 248-context reserve line names
+  the reserve instead: `loader contexts 249-256 are reserved for the
+  run's own command; a descendant arm past 248 was refused`),
   `evidence.loader_discovery.strategies.unavailable` counts it, and the
   report reads `PARTIAL`.
 - Kernels/conditions: all kernels; compounds per-process loader hooks

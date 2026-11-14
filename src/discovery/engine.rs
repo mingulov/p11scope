@@ -35414,41 +35414,6 @@ impl Engine {
                 required_complete: false,
             });
         }
-        let outcome = self.apply_discovery_batch_stages(
-            session,
-            queued,
-            additions_allowed,
-            terminal_dispatch,
-            malformed,
-            collect,
-        );
-        if outcome.is_err() {
-            // Best-effort tail on the error path (§8.1): an error
-            // after a deferred finalize must not leave its merge
-            // unpublished until the next batch. `publish_batch_tail`
-            // is infallible (a failing merge drops with a gap like a
-            // tick candidate), so the original error propagates
-            // unchanged. The pre-finalize early error above stays
-            // tail-free: nothing deferred yet.
-            let _ = self.publish_batch_tail(false);
-        }
-        outcome
-    }
-
-    /// The batch stages past the pre-finalize preamble: record
-    /// dispatch, loader service, inventory tick and the success-path
-    /// tail. Errors propagate to [`apply_discovery_batch_inner`],
-    /// which best-effort publishes the tail before returning them, so
-    /// a deferred finalize never waits for the next batch.
-    fn apply_discovery_batch_stages(
-        &mut self,
-        session: &mut dyn EngineSession,
-        queued: Vec<QueuedDiscoveryRecord>,
-        additions_allowed: bool,
-        terminal_dispatch: bool,
-        malformed: u64,
-        collect: &mut DiscoveryCollector<'_>,
-    ) -> Result<DiscoveryBatchOutcome> {
         // Only an actual ordinary frame can discharge the owed frame; a
         // backlog poll and consuming the run hint cannot make it disappear.
         self.global_retirement_frame_owed = false;

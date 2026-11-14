@@ -107,6 +107,7 @@ pub(crate) mod host_btf;
 pub(crate) mod image_query;
 #[allow(dead_code)]
 mod instance;
+pub(crate) mod member_stop;
 pub(crate) mod prearm_witness;
 #[cfg(test)]
 pub(crate) fn raise_fault_test_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {

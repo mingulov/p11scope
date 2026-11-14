@@ -82833,3 +82833,342 @@ fn review_cgroup_unknown_lower_bound_counts() {
         "an exit predating a failed start sample must count"
     );
 }
+
+/// Scripted kernel half of the run-member first-map stop: the pending
+/// rows the test places, and everything the service cleared, withdrew
+/// or deactivated.
+#[derive(Default)]
+struct ScriptedMemberStops {
+    rows: BTreeMap<u32, p11scope_ebpf_common::MemberStop>,
+    cleared: BTreeSet<p11scope_ebpf_common::MemberFileKey>,
+    withdrawn: Vec<u32>,
+    deactivated: bool,
+}
+
+impl MemberStopIo for ScriptedMemberStops {
+    fn pending(&mut self) -> Result<Vec<(u32, p11scope_ebpf_common::MemberStop)>, String> {
+        Ok(self
+            .rows
+            .iter()
+            .map(|(tgid, stop)| (*tgid, *stop))
+            .collect())
+    }
+    fn clear(&mut self, file: p11scope_ebpf_common::MemberFileKey) -> Result<(), String> {
+        self.cleared.insert(file);
+        Ok(())
+    }
+    fn withdraw(&mut self, tgid: u32) -> Result<(), String> {
+        self.rows.remove(&tgid);
+        self.withdrawn.push(tgid);
+        Ok(())
+    }
+    fn counters(&mut self) -> Result<[u64; 4], String> {
+        Ok([0; 4])
+    }
+    fn deactivate(&mut self) -> Result<(), String> {
+        self.deactivated = true;
+        Ok(())
+    }
+}
+
+/// Stops `pid` with SIGSTOP and waits until every task reports `T`.
+fn stop_member_for_test(pid: u32) {
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+    for _ in 0..500 {
+        let states = crate::discovery::pause::read_task_states(pid).unwrap();
+        if states.values().all(|state| *state == b'T') {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("member {pid} never stopped");
+}
+
+/// Whether `pid` runs again (no task in `T`) within a bounded wait.
+fn member_resumed_for_test(pid: u32) -> bool {
+    for _ in 0..500 {
+        let states = crate::discovery::pause::read_task_states(pid).unwrap();
+        if states.values().all(|state| *state != b'T') {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    false
+}
+
+/// The kernel identity (maps `dev` as `MKDEV`, inode) of the first
+/// executable row naming `path` in `pid`'s maps.
+fn member_exec_key_for_test(
+    pid: u32,
+    path: &std::path::Path,
+) -> p11scope_ebpf_common::MemberFileKey {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    let wanted = path.to_string_lossy();
+    for line in maps.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 6 && fields[1].contains('x') && fields[5] == wanted {
+            let (major, minor) = fields[3].split_once(':').unwrap();
+            let major = u64::from_str_radix(major, 16).unwrap();
+            let minor = u64::from_str_radix(minor, 16).unwrap();
+            return p11scope_ebpf_common::MemberFileKey {
+                dev: (major << 20) | minor,
+                ino: fields[4].parse().unwrap(),
+            };
+        }
+    }
+    panic!("{wanted} has no executable row in {pid}'s maps");
+}
+
+fn member_stop_row(key: p11scope_ebpf_common::MemberFileKey) -> p11scope_ebpf_common::MemberStop {
+    p11scope_ebpf_common::MemberStop {
+        file: key,
+        hook_ts_ns: 1,
+    }
+}
+
+fn member_stop_engine() -> Engine {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine
+}
+
+/// A member stopped at a file that is no PKCS#11 provider resumes in the
+/// same pass, and every executable file it maps (the stopping file and
+/// its neighbors) is cleared, so no later mapper stops on them.
+#[test]
+fn member_stop_clears_non_provider_files_and_resumes_at_once() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    // Wait for the exec to land before reading its maps.
+    let exe = loop {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            && exe.file_name().is_some_and(|name| name == "sleep")
+        {
+            break exe;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &exe);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(io.cleared.contains(&key), "the stopping file is cleared");
+    assert!(
+        io.cleared.len() >= 2,
+        "neighbor executable files clear too: {:?}",
+        io.cleared
+    );
+    assert_eq!(
+        io.withdrawn,
+        vec![pid],
+        "the row is withdrawn before the resume"
+    );
+    assert!(!engine.member_stops_held(), "no hold for a non-provider");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert_eq!(engine.learned_staged_files_for_test(), 0);
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "no gap row for a non-provider"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Twin: without a service pass the stopped member stays stopped (the
+/// resume above is the service's, not the fixture's).
+#[test]
+fn member_stop_member_stays_stopped_without_a_service_pass() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    stop_member_for_test(pid);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let states = crate::discovery::pause::read_task_states(pid).unwrap();
+    assert!(states.values().all(|state| *state == b'T'));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A member stopped with a provider mapped stays stopped while the
+/// provider stages (no first-use row: its first call has not run), and
+/// resumes once the staging is attached; the provider file is cleared
+/// only then.
+#[test]
+fn member_stop_holds_a_provider_mapper_until_its_staging_attaches() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(key));
+    let mut engine = member_stop_engine();
+    // A pause-owned batch defers the event-driven apply: the staging
+    // stays unattached until the batch ends.
+    engine.pause_owned_batch = true;
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the provider stages"
+    );
+    assert!(engine.member_stops_held(), "the provider mapper is held");
+    assert!(
+        !io.cleared.contains(&key),
+        "the provider is not cleared before its attach"
+    );
+    assert!(io.withdrawn.is_empty(), "the row stays while held");
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .all(|skip| skip.name != "learned provider file"),
+        "a held first mapper owes no first-use row: {public:?}"
+    );
+    let states = crate::discovery::pause::read_task_states(pid).unwrap();
+    assert!(
+        states.values().all(|state| *state == b'T'),
+        "still stopped while unattached"
+    );
+    // The batch ends: the next pass applies the staging and resumes.
+    engine.pause_owned_batch = false;
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(!engine.learned_unapplied, "the staging applied");
+    assert!(!engine.member_stops_held());
+    assert!(
+        io.cleared.contains(&key),
+        "the attached provider is cleared"
+    );
+    assert_eq!(io.withdrawn, vec![pid]);
+    assert!(
+        member_resumed_for_test(pid),
+        "the member resumes after the attach"
+    );
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 1);
+    assert_eq!(engine.member_stop_stats_for_test().timed_out, 0);
+}
+
+/// Twin: a provider staging that never attaches resumes the member at
+/// the hold bound and files the named first-use row (never silent,
+/// never a wedged member).
+#[test]
+fn member_stop_resumes_at_the_bound_and_files_the_first_use_row() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.pause_owned_batch = true;
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held());
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(10 + super::member_stop::MEMBER_STOP_HOLD_NS / 2),
+    );
+    assert!(
+        engine.member_stops_held(),
+        "inside the bound the hold stays"
+    );
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(10 + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(!engine.member_stops_held());
+    assert!(member_resumed_for_test(pid), "the bound resumes the member");
+    assert_eq!(engine.member_stop_stats_for_test().timed_out, 1);
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was learned after its first use; \
+                         its earlier calls were not observed"
+        }),
+        "an unattached resume files the first-use row: {public:?}"
+    );
+}
+
+/// Capture end resumes every held member and every untaken row, after
+/// switching new stops off.
+#[test]
+fn member_stop_release_resumes_held_and_untaken_members() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut other = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let other_pid = other.id();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    stop_member_for_test(other_pid);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(key));
+    let mut engine = member_stop_engine();
+    engine.pause_owned_batch = true;
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held());
+    // A row the service never took (it arrived after the last pass).
+    io.rows.insert(other_pid, member_stop_row(key));
+    engine.release_member_stops(&mut io);
+    assert!(io.deactivated, "new stops switch off first");
+    assert!(!engine.member_stops_held());
+    assert!(io.rows.is_empty(), "every row is withdrawn");
+    assert!(member_resumed_for_test(pid));
+    assert!(member_resumed_for_test(other_pid));
+    let _ = other.kill();
+    let _ = other.wait();
+}
+
+/// When the event-driven apply can run, a provider mapper's whole hold
+/// is one pass: staged, attached and resumed before the next tick.
+#[test]
+fn member_stop_attaches_and_resumes_a_provider_mapper_in_one_pass() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert!(!engine.learned_unapplied, "the staging applied in the pass");
+    assert!(!engine.member_stops_held());
+    assert!(io.cleared.contains(&key));
+    assert!(member_resumed_for_test(pid));
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 1);
+}

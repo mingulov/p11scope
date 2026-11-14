@@ -5540,24 +5540,40 @@ fn module_refused_undecoded(
     module.tables.is_empty() && refusals_after.0 > refusals_before.0
 }
 
-/// The counted remainder gap for provider files a table-decode ceiling
-/// left with no decoded table. The cause names the ceiling that refused
-/// them: the discovery-window allowance under the Inventory policy, the
-/// retained table-key budget when admission passed but retention refused,
-/// else the capture-wide candidate ceiling.
-fn undecoded_files_reason(count: usize, budget: &CaptureWorkBudget) -> String {
-    let cause = if matches!(budget.stopped_reason(), Some(TABLE_WINDOW_CEILING_REASON)) {
+/// The ceiling that refused table decodes: the discovery-window
+/// allowance under the Inventory policy, the retained table-key budget
+/// when admission passed but retention refused, else the capture-wide
+/// candidate ceiling. Shared by the counted remainder gap and the
+/// per-file rows so the two name one cause.
+fn undecoded_cause(budget: &CaptureWorkBudget) -> &'static str {
+    if matches!(budget.stopped_reason(), Some(TABLE_WINDOW_CEILING_REASON)) {
         "discovery window table decode allowance reached"
     } else if budget.inventory_limits().is_some() {
         "retained table-key budget reached"
     } else {
         "table decode ceiling reached"
-    };
+    }
+}
+
+/// The counted remainder gap for provider files a table-decode ceiling
+/// left with no decoded table.
+fn undecoded_files_reason(count: usize, budget: &CaptureWorkBudget) -> String {
+    let cause = undecoded_cause(budget);
     if count == 1 {
         format!("1 provider file was not decoded: {cause}")
     } else {
         format!("{count} provider files were not decoded: {cause}")
     }
+}
+
+/// Plain per-file row for a visited provider file a table-decode
+/// ceiling left undecoded. No disappearance is claimed and no manifest
+/// remedy is offered — a manifest cannot help a ceiling; the file was
+/// simply not decoded, and the counted remainder gap carries the total.
+/// Truncating: a refused file is bounded evidence, never verified
+/// absence (the no-table marker stays out of this string).
+fn undecoded_file_reason(budget: &CaptureWorkBudget) -> String {
+    format!("provider file was not decoded: {}", undecoded_cause(budget))
 }
 
 /// Scratch space for one maps read, reused across a sweep so a pass does
@@ -7713,6 +7729,10 @@ fn scan_view_examined_mode(
         if budget.scan_stopped() {
             if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
                 undecoded_ceiling_files += 1;
+                skipped.push(Skipped {
+                    subject: module.path.clone(),
+                    reason: undecoded_file_reason(budget),
+                });
             }
             modules.push(module);
             break;
@@ -7753,10 +7773,22 @@ fn scan_view_examined_mode(
         // which classified it by its exports and will report it in `discovery[]` and
         // `capture.modules[]` as a module the capture observed. Without this the
         // gap has nothing to show — no entry to skip, no attach to fail, no counter.
+        // A ceiling-refused file gets the plain ceiling row instead: no
+        // disappearance is proven, and the no-table manifest remedy cannot
+        // help a ceiling.
         if module.tables.is_empty() && !io_exhausted && !budget.scan_stopped() {
+            let reason = if module_refused_undecoded(
+                &module,
+                refusals_before_module,
+                budget.refusal_counts(),
+            ) {
+                undecoded_file_reason(budget)
+            } else {
+                no_table_found_reason(&module.path, hinted)
+            };
             skipped.push(Skipped {
                 subject: module.path.clone(),
-                reason: no_table_found_reason(&module.path, hinted),
+                reason,
             });
         }
         // The sole-table gate's "exactly one" needs a finished scan: no
@@ -7779,10 +7811,10 @@ fn scan_view_examined_mode(
     }
 
     // One named, counted gap for every visited provider file the table
-    // ceiling left undecoded. The per-file rows above stay (append-only
-    // evidence); this summary names the remainder the scan could not
-    // decode. Files never visited fall under the stop gap instead — the
-    // scan cannot know whether they are providers.
+    // ceiling left undecoded. Each such file already carries its plain
+    // per-file ceiling row above; this summary names the remainder the
+    // scan could not decode. Files never visited fall under the stop gap
+    // instead — the scan cannot know whether they are providers.
     if undecoded_ceiling_files > 0 {
         skipped.push(scan_skip(
             "capture discovery",
@@ -7804,8 +7836,9 @@ fn scan_view_examined_mode(
     // No pending module escapes until the second complete snapshot, dependency
     // comparisons and final generation check have all succeeded. A failed bracket
     // remains an explicit occurrence even when a later scan or manifest attaches.
-    // The one exception is a work-starved bracket over a live view (below):
-    // decoded modules publish with the failure named, never silently dropped.
+    // The one exception is a work- or deadline-starved bracket over a
+    // live view (below): decoded modules publish with the failure named,
+    // never silently dropped.
     let validation = (|| {
         let maps_b = acquire_scan_maps(view, budget, io).map_err(|error| error.reason)?;
         let index_b = index_maps_or_refuse(&maps_b, budget)?;
@@ -7853,15 +7886,19 @@ fn scan_view_examined_mode(
                     format!("{SCAN_GENERATION_CHANGED_REASON}: {reason}"),
                 ));
             }
-            // A work-starved bracket keeps what the scan decoded: the
-            // budget bought a full allowance of decode work and only the
-            // re-validation ran dry, so the decoded modules publish with
-            // the bracket failure named above — never an empty view. The
-            // live pin must still hold (a dead pin is a proven change);
+            // A work- or deadline-starved bracket keeps what the scan
+            // decoded: the budget bought a full allowance of decode work
+            // and only the re-validation ran dry, so the decoded modules
+            // publish with the bracket failure named above — never an
+            // empty view (owner data-always rule 2026-11-09). The live
+            // pin must still hold (a dead pin is a proven change);
             // every other bracket failure keeps the fail-closed clear.
             // Absence evidence always needs the full bracket.
-            let work_starved = matches!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
-            if !(work_starved && view.still_the_same()) {
+            let resource_starved = matches!(
+                budget.stopped_reason(),
+                Some(WORK_CEILING_REASON | SCAN_DEADLINE_REASON)
+            );
+            if !(resource_starved && view.still_the_same()) {
                 modules.clear();
             }
             examined.clear();
@@ -9059,7 +9096,18 @@ mod tests {
             work_ceiling: control.before_b.map_or(measured.work_units, |b| b.1) + 1,
             ..CaptureWorkBudget::default()
         };
-        f.assert_refused(&mut budget, "final mapping validation unavailable");
+        // Data-always: a work-starved bracket over a live view keeps the
+        // decoded module with the failure named, never an empty view.
+        let outcome = f.run(&mut budget).unwrap();
+        assert_eq!(outcome.modules().len(), 1);
+        assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable"))
+        );
+        assert!(!outcome.mapping_scan_completed());
     }
 
     extern "C" fn ceiling_anchor() {}
@@ -9175,6 +9223,25 @@ mod tests {
             "one named, counted gap for the refused files: {:?}",
             outcome.skipped()
         );
+        assert_eq!(
+            outcome
+                .skipped()
+                .iter()
+                .filter(|skip| skip.reason
+                    == "provider file was not decoded: table decode ceiling reached")
+                .count(),
+            2,
+            "one plain per-file ceiling row per refused file: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains(NO_TABLE_FOUND_MARKER)),
+            "no disappearance is claimed for refused files: {:?}",
+            outcome.skipped()
+        );
         assert!(
             outcome
                 .skipped()
@@ -9288,9 +9355,93 @@ mod tests {
             "singular counted gap for the refused file: {:?}",
             outcome.skipped()
         );
+        let refused = hints[1].display().to_string();
+        assert!(
+            outcome.skipped().iter().any(|skip| skip.subject == refused
+                && skip.reason == "provider file was not decoded: table decode ceiling reached"),
+            "plain per-file ceiling row for the refused file: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains(NO_TABLE_FOUND_MARKER)),
+            "no disappearance is claimed for a refused file: {:?}",
+            outcome.skipped()
+        );
         assert!(
             outcome.mapping_scan_completed(),
             "a passing bracket still completes: {outcome:?}"
+        );
+    }
+
+    /// The stop-break site carries the same plain row: with the table
+    /// ceiling fully saturated and the work budget sized to stop inside
+    /// the first provider's tables scan, the refused module breaks the
+    /// loop with its plain ceiling row (never the no-table remedy), the
+    /// second provider is never visited, and the counted gap says one.
+    /// Ceilings are probed, not computed: work accounting is
+    /// deterministic, and the first ceiling with the break shape wins.
+    #[test]
+    fn refused_file_stopped_mid_scan_keeps_its_plain_ceiling_row() {
+        fn break_shape(delta: u64) -> Option<ScanOutcome> {
+            let mut probe = BracketFixture::new(8, true);
+            probe.add_provider("provider2.so");
+            let mut budget = CaptureWorkBudget::default();
+            saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES);
+            budget.work_ceiling = budget.work_units_count() + delta;
+            let hints = probe.provider_paths();
+            let outcome = probe.run_with_hints(&hints, &mut budget).unwrap();
+            (outcome.modules().len() == 1
+                && outcome.skipped().iter().any(|skip| {
+                    skip.subject == "capture discovery"
+                        && skip.reason
+                            == "1 provider file was not decoded: table decode ceiling reached"
+                }))
+            .then_some(outcome)
+        }
+        let delta = [350u64, 450, 550, 650, 800, 1000]
+            .into_iter()
+            .find(|delta| break_shape(*delta).is_some())
+            .expect("a probe ceiling stops inside the first refused scan");
+
+        let mut f = BracketFixture::new(8, true);
+        f.add_provider("provider2.so");
+        let mut budget = CaptureWorkBudget::default();
+        saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES);
+        budget.work_ceiling = budget.work_units_count() + delta;
+        let hints = f.provider_paths();
+        let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
+        assert_eq!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
+        assert_eq!(
+            outcome.modules().len(),
+            1,
+            "the stop breaks the loop before the second provider: {outcome:?}"
+        );
+        assert_eq!(outcome.modules()[0].path, hints[0].display().to_string());
+        assert!(outcome.modules()[0].tables.is_empty());
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == hints[0].display().to_string()
+                    && skip.reason
+                        == "provider file was not decoded: table decode ceiling reached"),
+            "plain per-file ceiling row on the stop-break path: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains(NO_TABLE_FOUND_MARKER)),
+            "no disappearance is claimed for the refused file: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            !outcome.mapping_scan_completed(),
+            "a stopped scan never claims a completed mapping scan"
         );
     }
 
@@ -9355,7 +9506,23 @@ mod tests {
         f.expire_at_b = true;
         let mut budget = CaptureWorkBudget::default();
         budget.set_deadline(Some(u64::MAX));
-        f.assert_refused(&mut budget, "final mapping validation unavailable");
+        // Data-always: a deadline-starved bracket over a live view keeps
+        // the decoded module with the failure named, never an empty view.
+        let hints = [f.path.clone()];
+        let (outcome, examined) = f.run_examined_with_hints(&hints, &mut budget);
+        assert_eq!(outcome.modules().len(), 1);
+        assert_eq!(outcome.modules()[0].tables.len(), 1);
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("final mapping validation unavailable"))
+        );
+        assert!(
+            examined.is_empty(),
+            "absence evidence still needs the full bracket: {examined:?}"
+        );
+        assert!(!outcome.mapping_scan_completed());
     }
 
     #[test]
@@ -15347,6 +15514,7 @@ mod tests {
         let mut budget = CaptureWorkBudget::default();
         let table_reason = budget.table_exhaustion_reason().unwrap();
         let interface_reason = budget.interface_exhaustion_reason().unwrap();
+        let undecoded_reason = undecoded_file_reason(&budget);
         let truncating = [
             IO_CEILING_REASON,
             WORK_CEILING_REASON,
@@ -15358,6 +15526,7 @@ mod tests {
             MOUNTINFO_ENTRY_CEILING_REASON,
             table_reason.as_str(),
             interface_reason.as_str(),
+            undecoded_reason.as_str(),
             "too_large (123 bytes; per-object cap is 456)",
             MAPPING_CHANGED_REASON,
             "memory scan refused: final mapping validation unavailable: gone",

@@ -1490,8 +1490,9 @@ detail during a counter capture (`--select-endpoint`).
 Shipped in 0.7.0 and no longer planned: per-key tracking for
 programs started after a background caller.
 
-Shipped in 0.8.0 and no longer planned: one capture-owned
-open-handle table with a single acquire step.
+Shipped in 0.8.0 and no longer planned: bounded open-handle
+tables with a single acquire step (one table per lane; inventory
+pins each pass through a per-pass collector table).
 
 - Ordering-evidence pre-arm exactness producer for non-`run` scopes,
   inventory Detailed-subset activation, and same-granularity rewrite proof

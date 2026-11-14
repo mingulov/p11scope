@@ -1,8 +1,10 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-//! One capture-owned library-handle table: every retained library fd is
-//! filed here through the single `acquire()`, so `held <= len() <= cap`
-//! holds by construction instead of by per-site convention.
+//! One bounded library-handle table per lane: every retained library
+//! fd files through the single `acquire()`, so `held <= len() <= cap`
+//! holds per table by construction instead of by per-site convention.
+//! Inventory pins each pass through a per-pass collector table; the
+//! coordinator engine table and one-shot inspect tables are separate.
 
 use crate::discovery::identity::{EntryMeta, FileIdentity, MappedFile, Pin, pin_of};
 use p11scope_manifest::maps::ObjectKey;

@@ -19,7 +19,7 @@ pub(crate) const FD_RESERVE: u64 = 128;
 
 /// Concurrent library handles a capture may hold at once (view-collapse
 /// fix6 A2, owner 20:20): scan pins, manifest pins and pre-arm pins hold
-/// one fd per physical file (see the capture-owned handle table), and
+/// one fd per physical file (see the per-lane handle tables), and
 /// their distinct held files never exceed this. Past it, admissions wait
 /// for the next tick under the counted named gap below, never dropped.
 /// The lifetime number of distinct libraries stays unlimited: handles

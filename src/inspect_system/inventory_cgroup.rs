@@ -1163,7 +1163,7 @@ pub(crate) fn collect_with(
             }
         }
     }
-    progress!("p11scope: {}", handles.diagnostic_line());
+    progress!("p11scope: collector {}", handles.diagnostic_line());
     CgroupCollection {
         root: request.root,
         state: request.state,

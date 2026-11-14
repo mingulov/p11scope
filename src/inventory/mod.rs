@@ -9430,8 +9430,11 @@ fn progress_lines<Source: ProcessSource>(
             suppressed,
         ));
     }
+    // The coordinator's own table (owner-scan pins): the per-pass
+    // collector table prints its own labeled census beside this line,
+    // so this line names its table instead of reading as the whole.
     lines.push(format!(
-        "p11scope: pass {}: {}",
+        "p11scope: pass {}: {} (coordinator)",
         report.pass,
         coordinator.handle_table().diagnostic_line()
     ));
@@ -9446,6 +9449,7 @@ fn progress_lines<Source: ProcessSource>(
         }
         timings.push_str("; ");
         timings.push_str(&coordinator.handle_table().diagnostic_line());
+        timings.push_str(" (coordinator)");
         lines.push(timings);
     }
     // Admission failures aggregate past one per pass, like their gaps.
@@ -16322,6 +16326,37 @@ mod tests {
         ] {
             assert!(!is_handle_table_progress_line(line), "{line}");
         }
+    }
+
+    #[test]
+    fn progress_lines_names_the_coordinator_table() {
+        // The per-pass census names its table: the collector table
+        // prints its own labeled census beside this line, so an
+        // unlabeled coordinator line would read as the whole.
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        let coordinator = coordinator();
+        let report = PassReport {
+            pass: 6,
+            scanned: 128,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 128,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let lines = progress_lines(&coordinator, &report);
+        let census: Vec<_> = lines
+            .iter()
+            .filter(|line| line.starts_with("p11scope: pass 6: handle table: "))
+            .collect();
+        assert_eq!(census.len(), 1, "exactly one census line: {lines:?}");
+        assert!(
+            census[0].ends_with(" (coordinator)"),
+            "the census names its table: {}",
+            census[0]
+        );
     }
 
     #[test]

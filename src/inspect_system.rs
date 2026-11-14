@@ -1713,7 +1713,7 @@ fn collect_identity(
     );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
-    progress!("p11scope: {}", handles.diagnostic_line());
+    progress!("p11scope: collector {}", handles.diagnostic_line());
     Ok((catalog, custody))
 }
 
@@ -1844,7 +1844,7 @@ pub(crate) fn collect_pid_with_count_manifests(
         prior_bytes,
         &mut handles,
     );
-    progress!("p11scope: {}", handles.diagnostic_line());
+    progress!("p11scope: collector {}", handles.diagnostic_line());
     Ok(assemble(
         collection,
         bound,
@@ -5201,7 +5201,7 @@ pub(crate) fn collect_system_with_identity(
     );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
-    progress!("p11scope: {}", handles.diagnostic_line());
+    progress!("p11scope: collector {}", handles.diagnostic_line());
     Ok(catalog)
 }
 

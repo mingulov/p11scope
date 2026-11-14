@@ -437,22 +437,13 @@ fn provenance_objects(
                 let file = identity::open_object(&path).map_err(|error| {
                     format!("cannot open executable mapping {}: {error}", path.display())
                 })?;
-                let len = file
-                    .metadata()
-                    .map_err(|error| format!("metadata for {} failed: {error}", path.display()))?
-                    .len();
-                let next_bytes = total_bytes
-                    .checked_add(len)
-                    .ok_or_else(|| "executable provenance size overflowed u64".to_string())?;
-                if next_bytes > MAX_TOTAL_OBJECT_BYTES {
-                    return Err(format!(
-                        "executable provenance objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-                    ));
-                }
-                // Charge before hashing, including unsuccessful inspections
-                // and different pathname aliases, so best effort stays bounded.
-                total_bytes = next_bytes;
-                let object_identity = validated_file_identity(&path, &file, key)?;
+                // v0.8.0: the batch byte allowance debits what identify
+                // reads actually move (cumulative in `total_bytes`; a
+                // failed inspection keeps its partial debit), so best
+                // effort stays bounded without refusing any object for
+                // its own size.
+                let object_identity =
+                    validated_provenance_identity(&path, &file, key, &mut total_bytes)?;
                 if required
                     .get(&key)
                     .is_some_and(|expected| **expected != object_identity)
@@ -648,6 +639,24 @@ fn validated_file_identity_with_probe(
     probe: &impl SelfMappingProbe,
     budget: &mut dyn ProbeBudget,
 ) -> Result<ObjectIdentity, String> {
+    validated_file_identity_with_probe_and_reader(
+        path,
+        file,
+        expected,
+        probe,
+        budget,
+        |file, bytes, offset| file.read_at(bytes, offset),
+    )
+}
+
+fn validated_file_identity_with_probe_and_reader(
+    path: &Path,
+    file: &File,
+    expected: ObjectKey,
+    probe: &impl SelfMappingProbe,
+    budget: &mut dyn ProbeBudget,
+    reader: impl FnMut(&File, &mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<ObjectIdentity, String> {
     let actual = file_key(file)?;
     // On pre-6.8 kernels an overlayfs fd and its mappings legitimately
     // carry different keys (overlay vs backing device); the self-mapping
@@ -661,7 +670,7 @@ fn validated_file_identity_with_probe(
             actual
         ));
     }
-    let value = identity::inspect_file(file)
+    let value = identity::inspect_file_with_reader_exporting(file, reader, &[])
         .map_err(|e| format!("cannot identify {} for reuse: {e}", path.display()))?
         .identity;
     if !value.reusable {
@@ -672,6 +681,37 @@ fn validated_file_identity_with_probe(
         ));
     }
     Ok(value)
+}
+
+/// Provenance-loop identity with the batch byte allowance enforced
+/// incrementally as identify reads stream (v0.8.0: never an upfront
+/// size refusal). `spent` carries the loop's cumulative hashed bytes.
+fn validated_provenance_identity(
+    path: &Path,
+    file: &File,
+    expected: ObjectKey,
+    spent: &mut u64,
+) -> Result<ObjectIdentity, String> {
+    let mut budget = UnboundedProbeBudget;
+    validated_file_identity_with_probe_and_reader(
+        path,
+        file,
+        expected,
+        &KernelSelfMappingProbe,
+        &mut budget,
+        |file, bytes, offset| {
+            let left = MAX_TOTAL_OBJECT_BYTES.saturating_sub(*spent);
+            let allowed = left.min(bytes.len() as u64) as usize;
+            if allowed == 0 && !bytes.is_empty() {
+                return Err(std::io::Error::other(format!(
+                    "executable provenance objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+                )));
+            }
+            let read = file.read_at(&mut bytes[..allowed], offset)?;
+            *spent = spent.saturating_add(read as u64);
+            Ok(read)
+        },
+    )
 }
 
 struct ProcessMemory(File);
@@ -2435,8 +2475,8 @@ mod tests {
             );
             let len = std::fs::metadata(&path).unwrap().len();
             assert!(
-                len < identity::MAX_OBJECT_BYTES,
-                "the small owned fixture must stay pinnable: {len} bytes"
+                len < 64 * 1024 * 1024,
+                "the small owned fixture must stay small: {len} bytes"
             );
             path
         })
@@ -2444,12 +2484,12 @@ mod tests {
     }
 
     #[test]
-    fn small_owned_elf_stays_pinnable_under_the_object_limit() {
+    fn small_owned_elf_stays_pinnable() {
         let path = small_owned_elf();
         let len = std::fs::metadata(&path).unwrap().len();
         assert!(
-            len < identity::MAX_OBJECT_BYTES,
-            "the fixture must stay pinnable under any profile: {len} bytes"
+            len < 64 * 1024 * 1024,
+            "the fixture must stay small under any profile: {len} bytes"
         );
         assert_eq!(path, small_owned_elf());
         let file = identity::open_object(&path).unwrap();

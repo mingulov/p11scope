@@ -6297,6 +6297,55 @@ fn check_stopped_edge(
     Ok(())
 }
 
+/// One edge whose calls shed through a disclosed fault-era shed the cell
+/// already proved exact (the q2 equation balanced over counted shed): the
+/// edge is lossy with exactly the shed disclosure, `{SemanticLoss}` (plus
+/// `NoCalls` when no call attributed). That is a disclosure, not a lost
+/// call: every entered call sits in a counter. The edge is excused from
+/// the loss twins only while it carries exactly that disclosure and the
+/// attributed count the cell proved at the checkpoint; any other reason,
+/// a changed count, or a missing edge still fails.
+struct ShedEdge {
+    caller: crate::discovery::caller_registry::CallerId,
+    module: crate::discovery::caller_registry::ModuleId,
+    /// The edge's attributed returns read at the checkpoint that proved
+    /// the equation. Shed never attributes, so the count is pinned.
+    api_returns: Option<u64>,
+}
+
+/// The shed-edge verdict over one edge's published state (pure, so the
+/// unprivileged twins pin it).
+fn check_shed_edge(
+    shed: &ShedEdge,
+    lossy: bool,
+    reasons: &BTreeSet<crate::discovery::caller_registry::instance_input::InstanceReason>,
+    api_returns: Option<u64>,
+    historical_only: u64,
+    saturated: bool,
+) -> Result<()> {
+    use crate::discovery::caller_registry::instance_input::InstanceReason;
+    let mut disclosed = BTreeSet::from([InstanceReason::SemanticLoss]);
+    if shed.api_returns.is_none() {
+        disclosed.insert(InstanceReason::NoCalls);
+    }
+    ensure!(
+        lossy && *reasons == disclosed,
+        "shed edge {:?}/{:?} must carry exactly the shed disclosure {disclosed:?}: \
+         lossy={lossy} reasons={reasons:?}",
+        shed.caller,
+        shed.module
+    );
+    ensure!(
+        api_returns == shed.api_returns && historical_only == 0 && !saturated,
+        "shed edge {:?}/{:?} keeps its checkpoint count {:?}: api={api_returns:?} \
+         historical_only={historical_only} saturated={saturated}",
+        shed.caller,
+        shed.module,
+        shed.api_returns
+    );
+    Ok(())
+}
+
 /// The quiet-path loss twins with disclosed exemptions. Anything else
 /// loss-ish still fails.
 fn assert_quiet_twins_except(
@@ -6304,18 +6353,20 @@ fn assert_quiet_twins_except(
     tag: &str,
     exempt: &[QuietExemption<'_>],
 ) -> Result<()> {
-    assert_quiet_twins_except_stopped(coordinator, tag, exempt, &[])
+    assert_quiet_twins_except_stopped(coordinator, tag, exempt, &[], &[])
 }
 
 /// [`assert_quiet_twins_except`] plus edges whose lane the cell stopped on
-/// purpose ([`StoppedEdge`]): each must exist and pass the strict
-/// stopped-edge verdict instead of the loss twins; every other edge keeps
-/// the loss twins unchanged.
+/// purpose ([`StoppedEdge`]) and edges whose calls shed through a
+/// disclosed fault-era shed the cell proved exact ([`ShedEdge`]): each
+/// must exist and pass its strict verdict instead of the loss twins;
+/// every other edge keeps the loss twins unchanged.
 fn assert_quiet_twins_except_stopped(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     tag: &str,
     exempt: &[QuietExemption<'_>],
     stopped: &[StoppedEdge],
+    shed: &[ShedEdge],
 ) -> Result<()> {
     for exemption in exempt {
         let count = count_disclosed_gaps(
@@ -6382,6 +6433,17 @@ fn assert_quiet_twins_except_stopped(
             edge.module
         );
     }
+    for edge in shed {
+        ensure!(
+            coordinator
+                .registry()
+                .instance_semantic_edges()
+                .any(|record| record.caller == edge.caller && record.module == edge.module),
+            "{tag}: the shed edge {:?}/{:?} is missing",
+            edge.caller,
+            edge.module
+        );
+    }
     for record in coordinator.registry().instance_semantic_edges() {
         if let Some(edge) = stopped
             .iter()
@@ -6396,6 +6458,21 @@ fn assert_quiet_twins_except_stopped(
                 record.saturated,
             )
             .with_context(|| format!("{tag}: stopped edge"))?;
+            continue;
+        }
+        if let Some(edge) = shed
+            .iter()
+            .find(|edge| edge.caller == record.caller && edge.module == record.module)
+        {
+            check_shed_edge(
+                edge,
+                record.lossy,
+                &record.reasons,
+                record.api_returns,
+                record.historical_only_returns,
+                record.saturated,
+            )
+            .with_context(|| format!("{tag}: shed edge"))?;
             continue;
         }
         ensure!(
@@ -8678,7 +8755,7 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
         })
         .into_iter()
         .collect();
-    assert_quiet_twins_except_stopped(coordinator, "r16c-qb", &exemptions, &stopped_a)?;
+    assert_quiet_twins_except_stopped(coordinator, "r16c-qb", &exemptions, &stopped_a, &[])?;
     eprintln!(
         "JOINT_R16 r16c-qb polls={qb_polls} revision={revision} b_api={api_b} \
          promotion_refusal={promotion_reason:?}"
@@ -8708,9 +8785,9 @@ mod joint_ledger_parse_tests {
     //! population assertions rest on these, so their parsing is pinned
     //! here rather than trusted implicitly.
     use super::{
-        JOINT_SOFT_FUNCTIONS, QuietExemption, StoppedEdge, assert_quiet_twins_except,
-        assert_quiet_twins_except_stopped, check_stopped_edge, count_disclosed_gaps,
-        disclosed_scope_reason, exactness_diagnosis, joint_edges_fingerprint,
+        JOINT_SOFT_FUNCTIONS, QuietExemption, ShedEdge, StoppedEdge, assert_quiet_twins_except,
+        assert_quiet_twins_except_stopped, check_shed_edge, check_stopped_edge,
+        count_disclosed_gaps, disclosed_scope_reason, exactness_diagnosis, joint_edges_fingerprint,
         joint_gaps_fingerprint, ledger_calls, ledger_semantic_split, ledger_stamp,
         system_joint_coordinator,
     };
@@ -9061,13 +9138,74 @@ mod joint_ledger_parse_tests {
         use crate::discovery::caller_registry::{CallerId, ModuleId};
         let coordinator = system_joint_coordinator(&[])?;
         assert!(assert_quiet_twins_except(&coordinator, "t", &[]).is_ok());
-        assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[]).is_ok());
+        assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[], &[]).is_ok());
         let edge = StoppedEdge {
             caller: CallerId(7),
             module: ModuleId(0),
             api_returns: Some(12),
         };
-        assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[edge]).is_err());
+        assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[edge], &[]).is_err());
+        Ok(())
+    }
+
+    /// The shed-edge verdict accepts exactly the fault-era shed disclosure
+    /// over the checkpoint count, and nothing else: every failure twin
+    /// (not lossy, a non-shed loss, an extra reason, a changed count,
+    /// historical-only returns, saturation, a stray `NoCalls`) fails.
+    #[test]
+    fn shed_edge_accepts_only_the_shed_disclosure() {
+        use crate::discovery::caller_registry::instance_input::InstanceReason::{
+            CaptureStopped, NoCalls, OutOfOrderReturn, SemanticLoss,
+        };
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        use std::collections::BTreeSet;
+        let edge = ShedEdge {
+            caller: CallerId(7),
+            module: ModuleId(0),
+            api_returns: Some(12),
+        };
+        let shed = BTreeSet::from([SemanticLoss]);
+        assert!(check_shed_edge(&edge, true, &shed, Some(12), 0, false).is_ok());
+        assert!(check_shed_edge(&edge, false, &shed, Some(12), 0, false).is_err());
+        let stop = BTreeSet::from([SemanticLoss, CaptureStopped]);
+        assert!(check_shed_edge(&edge, true, &stop, Some(12), 0, false).is_err());
+        let extra = BTreeSet::from([SemanticLoss, OutOfOrderReturn]);
+        assert!(check_shed_edge(&edge, true, &extra, Some(12), 0, false).is_err());
+        let empty: BTreeSet<crate::discovery::caller_registry::instance_input::InstanceReason> =
+            BTreeSet::new();
+        assert!(check_shed_edge(&edge, true, &empty, Some(12), 0, false).is_err());
+        assert!(check_shed_edge(&edge, true, &shed, Some(11), 0, false).is_err());
+        assert!(check_shed_edge(&edge, true, &shed, Some(13), 0, false).is_err());
+        assert!(check_shed_edge(&edge, true, &shed, None, 0, false).is_err());
+        assert!(check_shed_edge(&edge, true, &shed, Some(12), 1, false).is_err());
+        assert!(check_shed_edge(&edge, true, &shed, Some(12), 0, true).is_err());
+        let stray = BTreeSet::from([NoCalls, SemanticLoss]);
+        assert!(check_shed_edge(&edge, true, &stray, Some(12), 0, false).is_err());
+        // An edge that attributed nothing keeps NoCalls.
+        let silent = ShedEdge {
+            api_returns: None,
+            ..edge
+        };
+        assert!(check_shed_edge(&silent, true, &stray, None, 0, false).is_ok());
+        assert!(check_shed_edge(&silent, true, &shed, None, 0, false).is_err());
+        assert!(check_shed_edge(&silent, true, &stray, Some(1), 0, false).is_err());
+    }
+
+    /// A named shed edge must exist: the shed variant fails on a
+    /// coordinator without it, while the plain check (no shed edges)
+    /// passes on the same coordinator.
+    #[test]
+    fn shed_edge_must_exist() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        let coordinator = system_joint_coordinator(&[])?;
+        assert!(assert_quiet_twins_except(&coordinator, "t", &[]).is_ok());
+        assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[], &[]).is_ok());
+        let edge = ShedEdge {
+            caller: CallerId(7),
+            module: ModuleId(0),
+            api_returns: Some(12),
+        };
+        assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[], &[edge]).is_err());
         Ok(())
     }
 
@@ -9090,7 +9228,7 @@ mod joint_ledger_parse_tests {
                 budget: None,
             });
             coordinator.registry_mut().publish();
-            assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[])
+            assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[], &[])
         };
         assert!(
             check(
@@ -10265,7 +10403,48 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
             max: None,
         });
     }
-    assert_quiet_twins_except(&coordinator, "r16b-q3", &exemptions)?;
+    // Fault-world shed edges: when a fault era moved and the q2 equation
+    // balanced over disclosed fault-era shed, a lossy owner edge carries
+    // exactly the shed disclosure (not a stop): excuse it under the
+    // strict shed verdict pinned to its q2 count. Non-lossy owners and
+    // every other edge keep the twins; without a moved era and a
+    // fault-era shed row the list stays empty and the check is exactly
+    // the quiet one.
+    let fault_shed = lane.semantic_era_counts().1 > 0
+        && coordinator.registry().gaps().iter().any(|gap| {
+            (gap.subject == "semantic calls unrouted"
+                || gap.subject == "semantic calls unrouted from other callers")
+                && gap.reason.contains("fault_era")
+        });
+    let shed_edges: Vec<ShedEdge> = if fault_shed {
+        let module_soft = module_of(&coordinator, "soft-copy.so")?;
+        let module_held = module_of(&coordinator, "live-joint-held.so")?;
+        [
+            (caller_e, module_soft, edge_e.api_returns),
+            (caller_c, module_soft, edge_c.api_returns),
+            (caller_h, module_held, edge_h.api_returns),
+        ]
+        .into_iter()
+        .filter(|(caller, module, _)| {
+            coordinator
+                .registry()
+                .instance_semantic_edges()
+                .any(|record| record.caller == *caller && record.module == *module && record.lossy)
+        })
+        .map(|(caller, module, api_returns)| ShedEdge {
+            caller,
+            module,
+            api_returns,
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+    eprintln!(
+        "JOINT_R16 r16b-q3 fault_shed={fault_shed} shed_edges={}",
+        shed_edges.len()
+    );
+    assert_quiet_twins_except_stopped(&coordinator, "r16b-q3", &exemptions, &[], &shed_edges)?;
     eprintln!(
         "JOINT_R16 r16b-q3 polls={q3_polls} revision={revision} feeds={} receipts={} \
          unknown_key={unknown_before}->{unknown_after} s_refusals={s_refusals} \

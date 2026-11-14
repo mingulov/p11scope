@@ -15,7 +15,9 @@ versioned separately and are opaque, exact dispatch keys.
   still-listed whole-group zombie (`Z` with no live threads) is the
   same ended generation, not a newcomer (was: re-marked on the next
   tick, then a prune gap at reap). A zombie leader with live workers
-  still arrives as a newcomer, so its calls are tracked.
+  still arrives as a newcomer: its calls are tracked when exactly one
+  worker is alive, and with more than one live worker the process is
+  counted as one named gap.
 - Exits of pre-existing kernel threads in `discover_plan` captures no
   longer file a `pid_descendant_gaps` gap when they land before the
   first live-tick walk: initial discovery already listed them, so

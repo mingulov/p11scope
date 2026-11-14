@@ -6093,6 +6093,19 @@ fn admitted_pid_counts_match_views_after_admit_close_churn() {
         "the last admission takes its pid out of the map"
     );
     assert_mirrored(&engine, "remove-last");
+    // Overwrite a recycled view ID with a different pid (profile/trace
+    // reuse path): the old pid's count drops and the new pid's rises.
+    engine.views.retain(|view| view.id() != ProcessViewId(7101));
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7101), pid_b).expect("track the sleeper"));
+    engine.record_cgroup_view_admissions([ProcessViewId(7101)]);
+    assert_eq!(
+        engine.admitted_cgroup_pid_counts,
+        BTreeMap::from([(pid_b, 1usize)]),
+        "recycled view id overwrite must drop the old pid count and raise the new one"
+    );
+    assert_mirrored(&engine, "recycle-id");
     first.kill().ok();
     second.kill().ok();
     first.wait().ok();

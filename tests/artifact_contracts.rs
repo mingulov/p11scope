@@ -10500,7 +10500,14 @@ fn script_dirs() -> Vec<String> {
     found.sort();
     assert_eq!(
         found,
-        ["ci", "demo", "fixtures", "matrix", "native"],
+        [
+            "ci",
+            "demo",
+            "fixtures",
+            "matrix",
+            "native",
+            "provider-matrix"
+        ],
         "a new directory under scripts/: teach the UNRUN and self-test derivations \
          about it, or a privileged lane there is invisible to both"
     );
@@ -10523,7 +10530,8 @@ fn every_admitted_script_directory_is_scanned() {
             "scripts/ci",
             "scripts/demo",
             "scripts/matrix",
-            "scripts/native"
+            "scripts/native",
+            "scripts/provider-matrix"
         ],
         "every admitted non-fixture directory must participate in the lane derivations"
     );
@@ -11494,6 +11502,10 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     let hosted_elsewhere = [
         "scripts/system-scope-measure.sh",
         "scripts/matrix/verify-container-image.sh",
+        // The privileged provider-matrix cells: privileged-tests.yml runs
+        // them as root through scripts/ci/run-cell-script.sh's name
+        // dispatch, so the lane body is hosted there, not UNRUN.
+        "scripts/ci/provider-matrix-cell.sh",
     ];
     let priv_yml = read(".github/workflows/privileged-tests.yml");
     for lane in &hosted_elsewhere {

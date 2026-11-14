@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! A program with the kryoptic PKCS#11 provider statically linked.
 //!
 //! The binary exports `C_GetFunctionList` / `C_GetInterface` /

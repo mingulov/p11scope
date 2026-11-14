@@ -82539,6 +82539,42 @@ fn handle_table_owned_loader_unavailable_on_budget_wait() {
     drop(live);
 }
 
+/// F1 twin: with the table full, a refresh rescan drops its candidate,
+/// keeps its retained pins, pends a refresh and files one gap — never a
+/// downgrade to unknown. A provider dlopen'd after setup is unrouted,
+/// so the rescan must wait rather than share.
+#[test]
+fn handle_table_refresh_rescan_defers_on_budget_wait() {
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let pid = view.pid();
+    let mut engine = lifecycle_discovered(vec![view]);
+    let provider = E07Provider::dlopen();
+    let views = BTreeSet::from([ProcessViewId(0)]);
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let entries_before = engine.pinned.pinned().count();
+    let gaps_before = engine.counters.object_skips.len();
+    let mut tick_now = crate::attach::monotonic_ns;
+    let (scans, _, _, _) = engine.scan_inventory_views(&views, "test refresh", &mut tick_now);
+    assert!(scans.is_empty(), "the waited rescan drops its candidate");
+    assert_eq!(
+        engine.pinned.pinned().count(),
+        entries_before,
+        "old pins stay"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&pid),
+        "the refresh pends for the next tick"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len() - gaps_before,
+        1,
+        "exactly one gap row"
+    );
+    drop(live);
+    drop(provider);
+}
+
 /// B2 site-4 twin (no resolving): a deferred memory scan with nothing
 /// parked restores its record and files one gap.
 #[test]

@@ -27658,11 +27658,16 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
                 None,
-                Filing::Adopt(&mut self.handle_table),
+                Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
             );
             // 6.14 Option B: learn the refreshed generation's executable.
             elf_needed::learn_view_exe(&mut self.extensive, &self.views[position]);
             self.deep_scans = self.deep_scans.saturating_add(1);
+            // A budget wait drops this view's rescan before it commits:
+            // its pins stay retained, the refresh pends with its counted
+            // gap, and the commit below never sees it — never a
+            // downgrade to unknown.
+            let waited_for_handles = pins_waited_for_handles_budget(&counters.object_skips);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
                 // Completeness is intentionally unused here: refreshed
@@ -27675,6 +27680,13 @@ impl Engine {
                 // re-reads the outcome — a refreshed view with modules is
                 // owned, an empty never-dirty one stays exploratory.
                 Ok((modules, pins, _complete)) => {
+                    if waited_for_handles {
+                        drop(pins);
+                        let pid = self.views[position].pid();
+                        self.request_refresh(pid, crate::attach::monotonic_ns());
+                        self.file_handles_wait_gap();
+                        continue;
+                    }
                     self.note_scan_observed(
                         *view_id,
                         self.views[position].view_admission(),

@@ -573,8 +573,10 @@ fn retired_cookie_reopens_and_clears_exit_timestamp() {
     // retired cookie with a timestamp after the exit reopens the task,
     // clears the exit timestamp, counts `exit_retire_reopened`, and is
     // never refused; an event timestamped at or before the exit counts
-    // `exit_retire_late` and is still admitted. Fails while admission
-    // ignores the exit timestamp: nothing reopens or counts late.
+    // `exit_retire_late` and is still admitted — and its rows are then
+    // reaped by the re-armed synthetic exit (admission is data-always,
+    // retention is not). Fails while admission ignores the exit
+    // timestamp: nothing reopens or counts late.
     let (mut s, mut t, _) = setup(64);
     let mut first = ev(100, 90, 0, 0);
     first.ts_ns = 100;
@@ -608,6 +610,9 @@ fn retired_cookie_reopens_and_clears_exit_timestamp() {
     assert_eq!(t.exit_counters_for_test(), (0, 0, 1, 0));
     // A second exit retires again; events at or before its hook count
     // late — twice proves the timestamp stays set — yet still admit.
+    // Each late feed's end-of-drain retire then reaps the just-reduced
+    // rows through the re-armed synthetic exit: no leak, and the late
+    // count still proves the timestamp stayed set for both.
     t.note_exit_taps(
         vec![crate::history::ExitTap {
             pid: 100,
@@ -625,7 +630,10 @@ fn retired_cookie_reopens_and_clears_exit_timestamp() {
         feed(&mut s, &mut t, [late]);
     }
     assert_eq!(s.semantic_evidence().semantic_history_drops, 0);
-    assert!(s.has_process_state(cookie), "late events still admit");
+    assert!(
+        !s.has_process_state(cookie),
+        "late rows are reaped by the synthetic exit"
+    );
     assert_eq!(t.exit_counters_for_test(), (0, 0, 1, 2));
 }
 
@@ -840,7 +848,10 @@ fn retired_sessions_count_as_closed_declared_diff() {
     // as closed, so `sessions.closed`, the session balance, and "N still
     // open" move — by exactly the retired sessions, and nothing else in
     // either the profile JSON or the text moves. Byte-diffs both renders
-    // of the same capture with and without the exit retire.
+    // of the same capture with and without the exit retire. The exec
+    // twin below declares the same for bumps: the old image's
+    // unresolved rows stay named in `pending_at_end` (the honest value;
+    // pre-B1 they vanished) while only the balance fields move.
     let (mut s, mut t, _) = setup(64);
     let mut first = ev(100, 90, 0, 0);
     first.ts_ns = 100;
@@ -974,6 +985,109 @@ fn retired_sessions_count_as_closed_declared_diff() {
     assert!(
         right.contains("1 still open"),
         "after names one open session: {right}"
+    );
+
+    // Exec twin: one process with two open sessions plus a pending and
+    // a detached row; the bump retires the old image through the same
+    // batch sweep. The end gap keeps naming both rows (2 before, 2
+    // after — pre-B1 the bump dropped them to 0), so `pending_at_end`
+    // never appears in the diff, and the new image restarts at #1. The
+    // bump event itself is one more observed call opening one more
+    // session, so those two counters move as well.
+    let (mut s2, mut t2, _) = setup(64);
+    let mut first = ev(100, 90, 0, 0);
+    first.ts_ns = 100;
+    let mut staying = ev(100, 90, 0, 2);
+    staying.ts_ns = 101;
+    staying.rv = pkcs11_types::CkRv::PENDING.0;
+    let mut second_session = ev(100, 90, 0, 0);
+    second_session.session = 8;
+    second_session.ts_ns = 102;
+    let mut detached_call = ev(100, 90, 0, 2);
+    detached_call.session = 8;
+    detached_call.ts_ns = 103;
+    detached_call.rv = pkcs11_types::CkRv::PENDING.0;
+    let mut get_id = ev(100, 90, 0, 4);
+    get_id.session = 8;
+    get_id.ts_ns = 104;
+    get_id.target_function = crate::kinds::function_id("C_Sign").unwrap();
+    get_id.async_value = 42;
+    feed(
+        &mut s2,
+        &mut t2,
+        [first, staying, second_session, detached_call, get_id],
+    );
+    assert_eq!(s2.pending_at_end(), 2);
+    let exec_json_before = render_json(&s2);
+    let exec_text_before = render_text(&s2);
+    let mut bumped = ev(100, 90, 1, 0);
+    bumped.session = 9;
+    bumped.ts_ns = 200;
+    feed(&mut s2, &mut t2, [bumped]);
+    assert_eq!(
+        s2.pending_at_end(),
+        2,
+        "bump-retired rows stay named in the end gap"
+    );
+    assert_eq!(
+        s2.session_pseudonym_process(key(90, 1), 0, 9),
+        Some(1),
+        "the new image restarts numbering at #1"
+    );
+    let exec_json_after = render_json(&s2);
+    let exec_text_after = render_text(&s2);
+    let mut exec_diffs = Vec::new();
+    json_diffs(
+        &exec_json_before,
+        &exec_json_after,
+        String::new(),
+        &mut exec_diffs,
+    );
+    exec_diffs.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        exec_diffs,
+        vec![
+            (
+                "cgroups[0].calls".to_string(),
+                serde_json::json!(5),
+                serde_json::json!(6),
+            ),
+            (
+                "sessions.balance".to_string(),
+                serde_json::json!(2),
+                serde_json::json!(1),
+            ),
+            (
+                "sessions.closed".to_string(),
+                serde_json::json!(0),
+                serde_json::json!(2),
+            ),
+            (
+                "sessions.opened".to_string(),
+                serde_json::json!(2),
+                serde_json::json!(3),
+            ),
+        ]
+    );
+    let exec_before_lines: Vec<&str> = exec_text_before.lines().collect();
+    let exec_after_lines: Vec<&str> = exec_text_after.lines().collect();
+    assert_eq!(exec_before_lines.len(), exec_after_lines.len());
+    let exec_line_diffs: Vec<(usize, &str, &str)> = exec_before_lines
+        .iter()
+        .zip(exec_after_lines.iter())
+        .enumerate()
+        .filter(|(_, (left, right))| left != right)
+        .map(|(index, (left, right))| (index, *left, *right))
+        .collect();
+    assert_eq!(exec_line_diffs.len(), 1, "only the sessions line moves");
+    let (_, exec_left, exec_right) = exec_line_diffs[0];
+    assert!(
+        exec_left.contains("2 still open"),
+        "before names two open sessions: {exec_left}"
+    );
+    assert!(
+        exec_right.contains("1 still open"),
+        "after names one open session: {exec_right}"
     );
 }
 
@@ -3097,4 +3211,273 @@ fn probe_exit_retire_keeps_pending_at_end() {
         before,
         "exit retire silently removes an unresolved async call from the rendered pending_at_end gap"
     );
+}
+
+fn rv2_trace(
+    s: &mut semantics::State,
+    t: &mut process::Tracker,
+    tracer: &mut trace::Tracer,
+    out: &mut Vec<u8>,
+    events: Vec<Event>,
+) {
+    let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
+    drain_trace_events_from(
+        &mut drain,
+        &mut None,
+        s,
+        t,
+        &scope(),
+        tracer,
+        out,
+        &mut true,
+        &mut None::<Vec<u8>>,
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn rv2_trace_path_keeps_pseudonym_continuity() {
+    // I-3 on the trace output path: the emitted line reduces through
+    // Tracer::on_event_process_with_executable, not reduce_profile_event.
+    let (mut s, mut t, _) = setup(64);
+    let mut tracer = trace::Tracer::new(&plan());
+    let mut out = Vec::new();
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    rv2_trace(&mut s, &mut t, &mut tracer, &mut out, vec![open7]);
+    let k = key(90, 0);
+    let p7 = s.session_pseudonym_process(k, 0, 7);
+    let sticky = t.sticky_pseudonym_counter(k);
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    let mut open8 = ev(100, 90, 0, 0);
+    open8.session = 8;
+    open8.ts_ns = 300;
+    rv2_trace(&mut s, &mut t, &mut tracer, &mut out, vec![open8]);
+    let p8 = s.session_pseudonym_process(k, 0, 8);
+    eprintln!(
+        "RV2-T1 p7={p7:?} p8={p8:?} sticky_after_open7={sticky:?} lines={:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_ne!(
+        p7, p8,
+        "trace path relabels the reopened process's next session as a retired one"
+    );
+}
+
+#[test]
+fn rv2_exec_bump_session_numbering_matches_pre_b1() {
+    // Pre-B1: an exec bump frees the old generation's counter, so the new
+    // image's first session is #1. Detects the fix2 reseed-on-bump change.
+    let (mut s, mut t, _) = setup(64);
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    feed(&mut s, &mut t, [open7]);
+    let mut open8 = ev(100, 90, 1, 0);
+    open8.session = 8;
+    open8.ts_ns = 300;
+    feed(&mut s, &mut t, [open8]);
+    let p8 = s.session_pseudonym_process(key(90, 1), 0, 8);
+    eprintln!("RV2-T2 post-exec first session pseudonym={p8:?}");
+    assert_eq!(
+        p8,
+        Some(1),
+        "exec bump now continues numbering instead of restarting at #1"
+    );
+}
+
+#[test]
+fn exit_retired_session_keeps_its_label_for_late_calls() {
+    // M2: the tombstone keeps the pseudonym, so a surviving thread's
+    // late call on a retired session still prints `sess#N`; the
+    // operation itself is orphaned (bindings retired with the exit),
+    // and a late close still matches silently, consuming the label.
+    let (mut s, mut t, _) = setup(64);
+    let mut tracer = trace::Tracer::new(&plan());
+    let mut out = Vec::new();
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    feed(&mut s, &mut t, [open7]);
+    let k = key(90, 0);
+    assert_eq!(s.session_pseudonym_process(k, 0, 7), Some(1));
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    assert_eq!(s.session_pseudonym_process(k, 0, 7), Some(1));
+    // A surviving thread's late operational call: still labeled, but
+    // orphaned — and the trace line prints the retired label.
+    let mut sign = ev(100, 90, 0, 2);
+    sign.ts_ns = 300;
+    rv2_trace(&mut s, &mut t, &mut tracer, &mut out, vec![sign]);
+    assert_eq!(s.session_pseudonym_process(k, 0, 7), Some(1));
+    assert_eq!(s.orphan_ops(), 1);
+    let lines = String::from_utf8(out).unwrap();
+    assert!(lines.contains("sess#1 C_Sign"), "{lines}");
+    // A late close matches the tombstone silently, consuming the label.
+    let mut close = ev(100, 90, 0, 8);
+    close.ts_ns = 310;
+    feed(&mut s, &mut t, [close]);
+    assert_eq!(s.unmatched_closes(), 0);
+    assert_eq!(s.sessions().closed, 1);
+    assert_eq!(s.session_pseudonym_process(k, 0, 7), None);
+}
+
+#[test]
+fn exec_bump_keeps_no_tombstones() {
+    // M3: bump-retired sessions leave no tombstones — the old key
+    // carries the superseded exec id and could never match — while
+    // exit-retired sessions do (their label survives for late calls).
+    let (mut s, mut t, _) = setup(64);
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    feed(&mut s, &mut t, [open7]);
+    let mut bumped = ev(100, 90, 1, 0);
+    bumped.session = 8;
+    bumped.ts_ns = 200;
+    feed(&mut s, &mut t, [bumped]);
+    assert_eq!(s.memory_lens().retired_sessions.len, 0);
+    assert_eq!(s.session_pseudonym_process(key(90, 0), 0, 7), None);
+    // The exit path still tombstones: the new generation's label
+    // survives its retire.
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 300,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    assert_eq!(s.memory_lens().retired_sessions.len, 1);
+    assert_eq!(s.session_pseudonym_process(key(90, 1), 0, 8), Some(1));
+}
+
+#[test]
+fn late_event_rows_are_reaped_by_a_synthetic_exit() {
+    // Gemini A, drain-driven: a late OPEN (ts at-or-before the exit
+    // hook) admitted after its exit retired re-creates State rows; the
+    // re-armed synthetic exit reaps them once the drain reads past its
+    // stamp — R10, sessions and the counter all return to zero and the
+    // session counts stay balanced. Fails while late rows leak: the
+    // reopened session stays open with its R10 entry and counter.
+    use crate::discovery::engine::Engine;
+    let (mut s, mut t, _) = setup(64);
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    let mut drain = EventDrain::over_test_domain(
+        crate::events::StagedEvents::with_caps(
+            ScriptedRecords::events([open7], usize::MAX),
+            1024,
+            1024 * 1024,
+        ),
+        1,
+    );
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert_eq!(vector(&s), (1, 0, 0, 1, 1, 0));
+    let old = key(90, 0);
+    // Exit at hook 200, retired past the tap position via a trigger.
+    let mut engine = Engine::empty_for_test();
+    engine.note_exit_tap(100, 200);
+    let stamp = crate::events::event_drain_positions(&drain).producer;
+    transfer_exit_taps(&mut engine, &mut t, stamp);
+    let mut trigger = ev(100, 90, 0, 7);
+    trigger.ts_ns = 150;
+    drain.source_mut().inner_mut().push_event(&trigger);
+    drain.source_mut().stage(1, None);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert!(!s.has_process_state(old));
+    assert_eq!(vector(&s), (1, 0, 1, 0, 1, 0));
+    // A late OPEN (ts 150, at-or-before the hook) admits and reduces —
+    // then its rows are reaped in the same drain's retire.
+    let mut late = ev(100, 90, 0, 0);
+    late.session = 8;
+    late.ts_ns = 150;
+    drain.source_mut().inner_mut().push_event(&late);
+    drain.source_mut().stage(1, None);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 0, 1));
+    assert_eq!(vector(&s), (2, 0, 2, 0, 1, 0));
+    assert!(!s.has_process_state(old));
+    let lens = s.memory_lens();
+    assert_eq!(lens.reduced.len, 0, "late R10 entry leaked");
+    assert_eq!(lens.open.len, 0, "late session leaked");
+    assert_eq!(lens.next_pseudonym.len, 0, "late counter leaked");
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+}
+
+#[test]
+fn synthetic_exit_waits_for_drain_past_its_stamp() {
+    // Gemini A, position-pinned: the synthetic exit is stamped with the
+    // producer position current at the first retire after the late
+    // admit, and reaps only once the drain reads past it. Direct
+    // drive: admission plus matching only, with positions chosen by
+    // hand. Fails while late admits arm nothing: the first retire
+    // leaves no pending work and the rows are never reaped.
+    let (mut s, mut t, _) = setup(64);
+    let mut open7 = ev(100, 90, 0, 0);
+    open7.ts_ns = 100;
+    feed(&mut s, &mut t, [open7]);
+    let k = key(90, 0);
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    s.retire_processes(&due);
+    assert!(!s.has_process_state(k));
+    // Late admit (ts 150): counted, reseeded from the stash, and the
+    // OPEN reduces — session 8 continues numbering at #2.
+    let image = ImageIdentity {
+        task_cookie: 90,
+        exec_id: 0,
+    };
+    let (admitted, retired, reseed) = t.admit_history(1, 100, image, 150);
+    assert_eq!(admitted, Some(k));
+    assert!(retired.is_empty());
+    assert!(reseed);
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 0, 1));
+    if reseed {
+        reseed_reopened_pseudonym(&t, &mut s, k);
+    }
+    let mut late = ev(100, 90, 0, 0);
+    late.session = 8;
+    late.ts_ns = 150;
+    assert!(s.observe_process(k, &late));
+    assert_eq!(s.session_pseudonym_process(k, 0, 8), Some(2));
+    assert!(s.has_process_state(k));
+    // The first retire stamps the synthetic with its then-current
+    // producer (1008); the drain has not read past it, so nothing is
+    // due and the rows stay.
+    let due = t.retire_exits_due(1000, 1008, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    assert!(due.is_empty(), "synthetic reaped before its stamp");
+    assert!(s.has_process_state(k));
+    assert_eq!(t.pending_exit_taps_for_test(), 1);
+    // Past the stamp the synthetic matches and reaps: R10, session and
+    // counter all freed, nothing pending.
+    let due = t.retire_exits_due(1008, 1008, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    assert_eq!(due, std::collections::BTreeSet::from([k]));
+    s.retire_processes(&due);
+    assert!(!s.has_process_state(k));
+    let lens = s.memory_lens();
+    assert_eq!(lens.reduced.len, 0);
+    assert_eq!(lens.open.len, 0);
+    assert_eq!(lens.next_pseudonym.len, 0);
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
 }

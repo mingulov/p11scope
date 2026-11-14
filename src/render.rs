@@ -2917,7 +2917,7 @@ fn concise_module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
 /// `-v`). A lone member names its file; members disagreeing on a
 /// family fall back to "provider files" instead of naming a wrong one.
 fn folded_closure_line(members: &[(&str, &SkippedOut)]) -> String {
-    const SHORT: &str = "forwarding layer; the calls it forwards are counted at the providers";
+    const SHORT: &str = "forwarding layer; calls it forwards count at attached providers";
     let first = members.first().map(|(_, row)| row);
     let status = match first {
         Some(row) if crate::plan::is_partial_coverage(&row.reason) => "partially covered",

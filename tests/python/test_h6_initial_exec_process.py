@@ -537,8 +537,21 @@ owner.close()
             pid, status = os.waitpid(child, 0)
             reaped = True
             self.assertEqual(pid, child)
-            self.assertTrue(os.WIFSIGNALED(status))
-            self.assertEqual(os.WTERMSIG(status), signal.SIGKILL)
+            if mode == "held":
+                self.assertTrue(os.WIFSIGNALED(status))
+                self.assertEqual(os.WTERMSIG(status), signal.SIGKILL)
+            else:
+                # The kernel closes the dead parent's files (the birth-pipe
+                # write end) before it delivers the parent-death SIGKILL, so
+                # the birth-blocked child either receives SIGKILL while still
+                # blocked or first wakes on the birth-pipe EOF and exits 125
+                # through its fail-closed birth-gate path. Both outcomes prove
+                # it never executed: the gate releases only on b"B".
+                if os.WIFSIGNALED(status):
+                    self.assertEqual(os.WTERMSIG(status), signal.SIGKILL)
+                else:
+                    self.assertTrue(os.WIFEXITED(status))
+                    self.assertEqual(os.WEXITSTATUS(status), 125)
             self.assertFalse(Path(f"/proc/{child}").exists())
             self.assertFalse(self.marker.exists())
         finally:

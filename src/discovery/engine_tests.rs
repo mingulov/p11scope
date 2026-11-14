@@ -5701,7 +5701,10 @@ fn tick_still_marks_running_newcomer_without_view() {
     let procdir = tempfile::tempdir().expect("fixture proc root");
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("live stat");
     let starttime = crate::process::process_start_time(pid).expect("live starttime");
-    assert!(!stat.contains(" Z "), "sleeper must be running, got: {stat}");
+    assert!(
+        !stat.contains(" Z "),
+        "sleeper must be running, got: {stat}"
+    );
     write_proc_stat_fixture(procdir.path(), pid, "S", starttime);
     engine.proc_root = procdir.path().to_path_buf();
     refresh_inventory_once(&mut engine);
@@ -5755,7 +5758,12 @@ fn tick_still_marks_reused_pid_with_pending_view() {
     // From the filter's viewpoint this is now a REUSED pid: the old view
     // pends removal, but a running generation with a new start_time answers.
     let procdir = tempfile::tempdir().expect("fixture proc root");
-    write_proc_stat_fixture(procdir.path(), pid, "R", old_start.unwrap_or(0).wrapping_add(100));
+    write_proc_stat_fixture(
+        procdir.path(),
+        pid,
+        "R",
+        old_start.unwrap_or(0).wrapping_add(100),
+    );
     engine.proc_root = procdir.path().to_path_buf();
     refresh_inventory_once(&mut engine);
     assert!(

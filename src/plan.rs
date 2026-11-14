@@ -18834,6 +18834,111 @@ pub(crate) mod tests {
         );
     }
 
+    /// F2 RED twin (slot reclaim): same-file short-lived churn in a shared
+    /// capture must not starve a later exact table. Thirty-two generations
+    /// of the same 68-entry provider file (same ObjectKey, new pin IDs)
+    /// retire quiescent (revivable), then the exact table reappears on a
+    /// new pin for the same file. It must attach (reusing retired
+    /// indices), not refuse for dead slots. Covers both 512 and 2112
+    /// ceilings (8 and 32 generations fill them).
+    #[test]
+    fn slot_reclaim_same_file_churn_then_exact_shared() {
+        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68, "gen1 admits");
+        for generation in 1u32..32u32 {
+            let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan.extend_exact(rebuilt).unwrap();
+            plan.revivable.clone_from(&plan.retired_keys);
+            let mut churn =
+                provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+            let pin = PinnedObjectId(100 + generation);
+            churn.object = pin;
+            churn.entry_objects = vec![vec![pin; 68]];
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&churn),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            plan.extend_exact(rebuilt).unwrap();
+        }
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        let mut exact = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        exact.object = PinnedObjectId(84);
+        exact.entry_objects = vec![vec![PinnedObjectId(84); 68]];
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&exact), &[], &PinnedObjects::empty());
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "exact attaches after same-file churn (F2): {:?}",
+            rebuilt.modules_skipped
+        );
+        assert_eq!(
+            rebuilt
+                .slots
+                .iter()
+                .filter(|slot| slot.object == PinnedObjectId(84))
+                .count(),
+            68,
+            "exact gets 68 slots"
+        );
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(
+            plan.active_slot_count(),
+            68,
+            "exact active, calls countable"
+        );
+    }
+
+    /// F2 companion RED (reserve): heuristic churn in a named capture must
+    /// leave the reserve for a later exact table. Thirty-two heuristic
+    /// generations (distinct files) retire, then the exact corroborated
+    /// table arrives. Covers both ceilings.
+    #[test]
+    fn slot_reclaim_heuristic_churn_named_leaves_reserve_for_exact() {
+        let gen1 = provider_with_tables(85, "/opt/churn1.so", 1, 68, false);
+        let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Named);
+        assert_eq!(plan.slots.len(), 68, "gen1 heuristic admits");
+        for generation in 1u32..32u32 {
+            let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan.extend_exact(rebuilt).unwrap();
+            let churn = provider_with_tables(
+                200 + generation,
+                &format!("/opt/churn{generation}.so"),
+                1,
+                68,
+                false,
+            );
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&churn),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            plan.extend_exact(rebuilt).unwrap();
+        }
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        let exact = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&exact), &[], &PinnedObjects::empty());
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "exact admits after heuristic churn (reserve): {:?}",
+            rebuilt.modules_skipped
+        );
+        assert_eq!(
+            rebuilt
+                .slots
+                .iter()
+                .filter(|slot| slot.object == PinnedObjectId(82))
+                .count(),
+            68,
+            "exact gets 68 slots"
+        );
+    }
+
     /// Same-target revival: a provider that leaves and returns while its
     /// retired slots are cleared reoccupies its old indices — the slot
     /// count does not grow, so churn stops burning the lifetime budget.

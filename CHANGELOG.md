@@ -6,6 +6,18 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
+## [Unreleased]
+
+### Known limitations
+
+- On a busy host, a long `inventory --system --key-operations`
+  capture can stop recording key operations partway through; the
+  report stays PARTIAL with exact counts and no lost calls. Since
+  0.8.0 the lane re-arms past a transient Audited-phase refusal (up
+  to 32 abandoned quanta per run, each named), and refusals at other
+  phases still stop the lane with the phase named. Rerun the capture
+  or narrow the scope (`--pid`).
+
 ## [0.7.0] - 2026-11-13
 
 ### Added

@@ -194,9 +194,10 @@ EOF
 }
 
 # rss_sampler OUT PID: poll /proc/PID/status every 2 s until PID dies,
-# appending "rss <VmRSS> hwm <VmHWM>" (KiB). The observer pid is resolved
-# with `pgrep -x p11scope` (exact comm): matching the full command line
-# catches the flock/sudo wrapper instead (mem-a0 round-1 lesson).
+# appending "rss <VmRSS> hwm <VmHWM>" (KiB). The caller resolves PID
+# through the sudo parentage: matching the full command line catches
+# the flock/sudo wrapper instead (mem-a0 round-1 lesson), and a global
+# first-match could catch another lane's capture.
 rss_sampler() {
     out=$1
     pid=$2
@@ -219,6 +220,12 @@ run_sample() {
     obs_dur=$(( SECS + OBS_SPARE ))
 
     wait_cool || refuse "host never cooled below $MAX_LOAD1/$MAX_LOAD5"
+    # Re-check exclusivity per sample: another lane may have started a
+    # capture since the campaign began, and its probes would charge
+    # this sample. Never measure beside a live capture.
+    if pgrep -x p11scope >/dev/null 2>&1; then
+        refuse "sample $arm: a p11scope process started before this sample"
+    fi
     record_load
     echo "sample arm=$arm bin=$bin sha=$(sha256sum "$bin" | cut -d' ' -f1)" >> "$LOG"
 
@@ -230,12 +237,13 @@ run_sample() {
     sudo -n "$bin" profile --system --duration "${obs_dur}s" -v \
         -o "$dir/report.json" >"$dir/stdout.txt" 2>"$dir/stderr.txt" &
     sudo_pid=$!
-    # The observer pid, resolved once it appears (exact comm only).
+    # The observer pid, resolved through the sudo parentage (never a
+    # global first-match: another lane's capture must not be sampled).
     obs_pid=
     deadline=$(( $(date +%s) + ATTACH_TIMEOUT ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         if grep -qF "$READY_MARK" "$dir/stderr.txt" 2>/dev/null; then
-            obs_pid=$(pgrep -x p11scope | head -n 1 || true)
+            obs_pid=$(pgrep -P "$sudo_pid" -x p11scope | head -n 1 || true)
             [ -n "$obs_pid" ] && break
         fi
         kill -0 "$sudo_pid" 2>/dev/null || break
@@ -363,8 +371,8 @@ main() {
     say "bench-profile-overhead ts=$ts base=$BASE_BIN cand=$CAND_BIN rate=$RATE fail_share=$FAIL_SHARE fork_every=$FORK_EVERY secs=$SECS rounds=$ROUNDS obs_spare=$OBS_SPARE"
     say "base_sha=$(sha256sum "$BASE_BIN" | cut -d' ' -f1)"
     say "cand_sha=$(sha256sum "$CAND_BIN" | cut -d' ' -f1)"
-    say "base_version=$("$BASE_BIN" --version 2>/dev/null || echo unknown)"
-    say "cand_version=$("$CAND_BIN" --version 2>/dev/null || echo unknown)"
+    say "base_version=$("$BASE_BIN" --version 2>/dev/null | head -n 1 || echo unknown)"
+    say "cand_version=$("$CAND_BIN" --version 2>/dev/null | head -n 1 || echo unknown)"
     round=1
     while [ "$round" -le "$ROUNDS" ]; do
         idx=1

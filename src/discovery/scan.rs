@@ -5528,6 +5528,38 @@ pub(crate) fn scan_skip_truncates(reason: &str) -> bool {
         || reason == "non-UTF-8 pathname")
 }
 
+/// A visited module left with no decoded table because a table-decode
+/// admission refused it: table refusals grew while it was scanned and
+/// no table survived. Partially decoded modules do not count — their
+/// decoded tables publish, and the ceiling gap covers the shortfall.
+fn module_refused_undecoded(
+    module: &ScannedModule,
+    refusals_before: (u64, u64),
+    refusals_after: (u64, u64),
+) -> bool {
+    module.tables.is_empty() && refusals_after.0 > refusals_before.0
+}
+
+/// The counted remainder gap for provider files a table-decode ceiling
+/// left with no decoded table. The cause names the ceiling that refused
+/// them: the discovery-window allowance under the Inventory policy, the
+/// retained table-key budget when admission passed but retention refused,
+/// else the capture-wide candidate ceiling.
+fn undecoded_files_reason(count: usize, budget: &CaptureWorkBudget) -> String {
+    let cause = if matches!(budget.stopped_reason(), Some(TABLE_WINDOW_CEILING_REASON)) {
+        "discovery window table decode allowance reached"
+    } else if budget.inventory_limits().is_some() {
+        "retained table-key budget reached"
+    } else {
+        "table decode ceiling reached"
+    };
+    if count == 1 {
+        format!("1 provider file was not decoded: {cause}")
+    } else {
+        format!("{count} provider files were not decoded: {cause}")
+    }
+}
+
 /// Scratch space for one maps read, reused across a sweep so a pass does
 /// not allocate (and zero) a 64 KiB chunk per pid. Holds no identity:
 /// every read truncates the bytes before filling them, and only freshly
@@ -7100,6 +7132,11 @@ fn scan_view_examined_mode(
     let mut examined: Vec<ExaminedObject> = Vec::new();
     let mut dependencies = BTreeMap::new();
     let mut skipped = Vec::new();
+    // Provider files visited but left with no decoded table because a
+    // table-decode admission refused them: the counted remainder gap
+    // below names them instead of leaving each file's no-table row to
+    // imply its table is missing.
+    let mut undecoded_ceiling_files = 0usize;
     let mut foreign_failures: Vec<ForeignOpenFailure> = Vec::new();
     // Group construction also consumes the capture's existing work allowance.
     if let Err(reason) = budget.spend(maps.len() as u64) {
@@ -7674,6 +7711,9 @@ fn scan_view_examined_mode(
             }
         }
         if budget.scan_stopped() {
+            if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
+                undecoded_ceiling_files += 1;
+            }
             modules.push(module);
             break;
         }
@@ -7732,7 +7772,22 @@ fn scan_view_examined_mode(
             && budget.refusal_counts() == refusals_before_module
             && stop_before_module.is_none()
             && budget.stopped_reason().is_none();
+        if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
+            undecoded_ceiling_files += 1;
+        }
         modules.push(module);
+    }
+
+    // One named, counted gap for every visited provider file the table
+    // ceiling left undecoded. The per-file rows above stay (append-only
+    // evidence); this summary names the remainder the scan could not
+    // decode. Files never visited fall under the stop gap instead — the
+    // scan cannot know whether they are providers.
+    if undecoded_ceiling_files > 0 {
+        skipped.push(scan_skip(
+            "capture discovery",
+            undecoded_files_reason(undecoded_ceiling_files, budget),
+        ));
     }
 
     skipped.extend(foreign_root_skips(foreign_failures));
@@ -7749,6 +7804,8 @@ fn scan_view_examined_mode(
     // No pending module escapes until the second complete snapshot, dependency
     // comparisons and final generation check have all succeeded. A failed bracket
     // remains an explicit occurrence even when a later scan or manifest attaches.
+    // The one exception is a work-starved bracket over a live view (below):
+    // decoded modules publish with the failure named, never silently dropped.
     let validation = (|| {
         let maps_b = acquire_scan_maps(view, budget, io).map_err(|error| error.reason)?;
         let index_b = index_maps_or_refuse(&maps_b, budget)?;
@@ -7796,7 +7853,17 @@ fn scan_view_examined_mode(
                     format!("{SCAN_GENERATION_CHANGED_REASON}: {reason}"),
                 ));
             }
-            modules.clear();
+            // A work-starved bracket keeps what the scan decoded: the
+            // budget bought a full allowance of decode work and only the
+            // re-validation ran dry, so the decoded modules publish with
+            // the bracket failure named above — never an empty view. The
+            // live pin must still hold (a dead pin is a proven change);
+            // every other bracket failure keeps the fail-closed clear.
+            // Absence evidence always needs the full bracket.
+            let work_starved = matches!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
+            if !(work_starved && view.still_the_same()) {
+                modules.clear();
+            }
             examined.clear();
         }
     }

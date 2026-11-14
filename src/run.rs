@@ -7414,8 +7414,12 @@ fn identify_tracked(
     }
     let (key, retired) =
         tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image, ev.ts_ns);
-    for old in retired {
-        state.retire_process(old);
+    // An exec bump retires its superseded generation through the batch
+    // path: the old key's R10 entry is freed with the refund landing only
+    // on actual removal, so a later exit of the final generation cannot
+    // strand it. Admit and birth already refuse old-key events and FORKs.
+    if !retired.is_empty() {
+        state.retire_processes(&retired.into_iter().collect::<BTreeSet<_>>());
     }
     if let Some(key) = key {
         tracker.history_call(key);
@@ -7640,8 +7644,10 @@ fn observe_fork(
     }
     let (parent, retired) =
         tracker.admit_history(domain, (ev.pid_tgid >> 32) as u32, ev.image, ev.ts_ns);
-    for old in retired {
-        state.retire_process(old);
+    // Batch retire, as in `identify_tracked`: a FORK can be the first
+    // post-exec event, and its superseded generation must free R10 too.
+    if !retired.is_empty() {
+        state.retire_processes(&retired.into_iter().collect::<BTreeSet<_>>());
     }
     if let Some(parent) = parent {
         tracker.history_root(parent, ev.root_affiliation);
@@ -7651,8 +7657,10 @@ fn observe_fork(
     }
     let (child, retired) =
         tracker.admit_history(domain, ev.session as u32, ev.child_image, ev.ts_ns);
-    for old in retired {
-        state.retire_process(old);
+    // Batch retire, as in `identify_tracked`: the child side of a FORK
+    // can equally carry an exec bump.
+    if !retired.is_empty() {
+        state.retire_processes(&retired.into_iter().collect::<BTreeSet<_>>());
     }
     if let (Some(parent), Some(child)) = (parent, child)
         && tracker.history_birth(parent, child)

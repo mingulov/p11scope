@@ -1008,6 +1008,103 @@ fn churned_processes_free_all_dead_owned_rows_on_exit() {
 }
 
 #[test]
+fn churned_fork_exec_processes_free_all_dead_owned_rows_on_exit() {
+    // Fork+exec churn twin: eight children are forked, exec (the bump
+    // retires the pre-exec generation through the batch path, freeing
+    // its R10 entry), open a session, start an op and leave a pending
+    // call, then all exit. After the exits drain, no dead-owned row
+    // remains in any map: the parent keeps its own live rows only, and
+    // the eight unfinished async calls stay named in `pending_at_end`.
+    // Fails while exec bumps retire through the single path: the
+    // superseded generations' R10 entries stay dead-owned.
+    let (mut s, mut t, _) = setup(64);
+    let mut popen = ev(50, 80, 0, 0);
+    popen.ts_ns = 10;
+    feed(&mut s, &mut t, [popen]);
+    let mut births = Vec::new();
+    for i in 0..8u32 {
+        let mut birth = ev(50, 80, 0, 0);
+        birth.event_type = event_type::FORK;
+        birth.session = u64::from(1000 + i);
+        birth.child_image = ImageIdentity {
+            task_cookie: u64::from(100 + i),
+            exec_id: 0,
+        };
+        births.push(birth);
+    }
+    feed(&mut s, &mut t, births);
+    let mut events = Vec::new();
+    for i in 0..8u32 {
+        let pid = 1000 + i;
+        let cookie = u64::from(100 + i);
+        let mut open = ev(pid, cookie, 1, 0);
+        open.ts_ns = 100;
+        let mut init = ev(pid, cookie, 1, 1);
+        init.ts_ns = 101;
+        init.capture = capture::MECHANISM_VALUE;
+        init.mechanism = 1;
+        let mut pending = ev(pid, cookie, 1, 2);
+        pending.ts_ns = 102;
+        pending.rv = pkcs11_types::CkRv::PENDING.0;
+        events.extend([open, init, pending]);
+    }
+    let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    // Eight inherited sessions (one per fork) plus eight own opens; the
+    // exec bumps already closed the eight inherited ones.
+    assert_eq!(s.sessions().closed, 8);
+    t.note_exit_taps(
+        (0..8u32).map(|i| crate::history::ExitTap {
+            pid: 1000 + i,
+            hook_ts_ns: 200,
+        }),
+        crate::events::event_drain_positions(&drain).producer,
+    );
+    let mut trigger = ev(50, 80, 0, 7);
+    trigger.ts_ns = 150;
+    drain.source_mut().push_event(&trigger);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    // Every child generation freed: the parent (pid 50) is the only live
+    // owner left, nothing reads dead-owned, and each child's own session
+    // counted closed on top of its bump-closed inherited one.
+    let parent_alive = |pid: u32| pid == 50;
+    let (live, dead, dead_rows, _) = s.memory_sample(&parent_alive);
+    assert_eq!((live, dead), (1, 0));
+    for (name, len) in [
+        ("R10", dead_rows.reduced_dead.len),
+        ("open", dead_rows.open_dead.len),
+        ("active_ops", dead_rows.active_ops_dead.len),
+        ("next_pseudonym", dead_rows.next_pseudonym_dead.len),
+        ("find_active", dead_rows.find_active_dead.len),
+        ("pending", dead_rows.pending_dead.len),
+        ("detached", dead_rows.detached_dead.len),
+        (
+            "inherited_ambiguous",
+            dead_rows.inherited_ambiguous_dead.len,
+        ),
+    ] {
+        assert_eq!(len, 0, "no dead-owned {name} rows remain");
+    }
+    let lens = s.memory_lens();
+    assert_eq!(lens.reduced.len, 1, "only the parent keeps R10");
+    assert_eq!(lens.open.len, 1, "only the parent keeps a session");
+    assert_eq!(lens.active_ops.len, 0);
+    assert_eq!(
+        lens.next_pseudonym.len, 1,
+        "only the parent keeps a counter"
+    );
+    assert_eq!(lens.pending.len, 0);
+    assert_eq!(s.sessions().closed, 16);
+    assert_eq!(
+        s.pending_at_end(),
+        8,
+        "the eight unfinished async calls stay named"
+    );
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 0, 0));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+}
+
+#[test]
 fn history_cookie_fd_and_pid_changes_never_order_independent_producer_histories() {
     let (mut s, mut t, a) = setup(16);
     feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);

@@ -11339,6 +11339,11 @@ fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
         "a running Audited refusal with its frame re-arms (no demand was bound)"
     );
     assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        None,
+        "a successful re-arm clears the recorded refusal"
+    );
+    assert_eq!(
         fixture.machine.disposition_reason(),
         None,
         "the latch clears"
@@ -11415,6 +11420,11 @@ fn joint_machine_healthy_quantum_needs_no_rearm() {
     fixture.published_labeled("healthy", None);
     assert_eq!(fixture.machine.disposition_reason(), None);
     assert_eq!(fixture.rearm("semantic_unavailable"), None);
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        None,
+        "a healthy run attempts no re-arm, so nothing is recorded"
+    );
     assert!(
         !fixture
             .all_gap_subjects()
@@ -11445,6 +11455,11 @@ fn joint_machine_preparation_refusal_keeps_the_latch() {
     }
     assert!(failed, "the attempted preparation latches");
     assert_eq!(fixture.rearm("semantic_unavailable"), None);
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::WrongPhase),
+        "the stop names the phase the abandon cannot dispose"
+    );
     assert_eq!(
         fixture.machine.disposition_reason(),
         Some(SemanticRefusal::Unavailable),
@@ -11479,6 +11494,11 @@ fn joint_machine_running_no_progress_trip_keeps_the_latch() {
     assert_eq!(fixture.service(1024), Err(SemanticRefusal::Unavailable));
     assert!(fixture.machine.audit_no_progress_trip_for_test().is_some());
     assert_eq!(fixture.rearm("semantic_unavailable"), None);
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::WatchdogTripped),
+        "the stop names the standing no-progress trip"
+    );
     assert_eq!(
         fixture.machine.disposition_reason(),
         Some(SemanticRefusal::Unavailable)
@@ -11526,6 +11546,11 @@ fn joint_machine_running_rearms_are_bounded() {
         limit,
         "the exhausted stop names its spent count"
     );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent),
+        "the exhausted stop names the spent bound"
+    );
 }
 
 /// Reason twin: only the transient `Unavailable` re-arms. A permanent
@@ -11540,6 +11565,11 @@ fn joint_machine_non_unavailable_refusal_keeps_the_latch() {
         fixture.rearm("semantic_attachment_refused"),
         None,
         "a non-transient refusal never re-arms"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::NotTransient),
+        "the stop names the permanent refusal"
     );
     assert_eq!(
         fixture.machine.disposition_reason(),
@@ -11575,6 +11605,15 @@ fn joint_machine_finish_state_refusal_keeps_the_latch() {
             fixture.rearm("semantic_unavailable"),
             None,
             "finish pose {pose} keeps the latch"
+        );
+        assert_eq!(
+            fixture.machine.rearm_refusal_for_test(),
+            Some(if pose == 2 {
+                crate::inventory_semantics::RunningRearmRefusal::WatchdogTripped
+            } else {
+                crate::inventory_semantics::RunningRearmRefusal::FinishActive
+            }),
+            "finish pose {pose} names its stop cause"
         );
         assert_eq!(
             fixture.machine.disposition_reason(),
@@ -12076,6 +12115,11 @@ fn joint_machine_stopped_adapter_refusal_stops_at_once() {
         "a stopped adapter never re-arms"
     );
     assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::CannotResync),
+        "the stop names the stream that cannot re-sync"
+    );
+    assert_eq!(
         fixture.machine.disposition_reason(),
         Some(SemanticRefusal::Unavailable),
         "the latch stands for the hold"
@@ -12095,6 +12139,64 @@ fn joint_machine_stopped_adapter_refusal_stops_at_once() {
             .iter()
             .any(|seen| seen == QUANTUM_ABANDONED),
         "no re-arm is named"
+    );
+}
+
+/// Frameless twin: an Audited latch whose frame a prior abandon
+/// consumed has nothing left to abandon, so the re-arm is refused
+/// and the stop names the missing frame.
+#[test]
+fn joint_machine_frameless_audited_refusal_names_the_missing_frame() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.refuse_at_audited(2);
+    assert!(
+        fixture.machine.take_abandoned_frame().is_some(),
+        "the Audited phase retains its frame before the take"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "an Audited latch without a frame never re-arms"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::FrameMissing),
+        "the stop names the missing frame"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "the latch stands for the hold"
+    );
+}
+
+/// Finished-lane twin: a lane that already finished cannot re-arm,
+/// so the re-arm is refused and the stop names the lane.
+#[test]
+fn joint_machine_finished_lane_refusal_names_the_lane() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.refuse_at_audited(2);
+    let _ = fixture.scene.real.lane.finish_semantic_stop();
+    assert!(
+        fixture.scene.real.lane.is_finished(),
+        "the finished pose lands on the scene lane"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "a finished lane never re-arms"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::LaneNotLive),
+        "the stop names the lane that is no longer live"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "the latch stands for the hold"
     );
 }
 

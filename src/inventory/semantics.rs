@@ -16,6 +16,7 @@ pub(crate) use joint::{
     EVENTS_STAGE_SATURATED_REASON, EVENTS_STAGE_SATURATED_SUBJECT,
     JOINT_FINISH_NO_PROGRESS_TIMEOUT, JOINT_FINISH_SETTLE_TIMEOUT, JointCommitRefusal,
     JointServiceMode, JointServiceProgress, JointWorkBudget, RUNNING_REARM_LIMIT,
+    RunningRearmRefusal,
 };
 pub(crate) use joint::{
     JointCommitIo, JointContinuationView, RetainedJointBirths, bind_semantic_callers_inner,
@@ -1062,6 +1063,10 @@ pub(crate) struct AttestedSemanticLane {
     /// runs without a live machine.
     #[cfg(test)]
     scripted_running_rearms: Option<u32>,
+    /// Tests-only posed re-arm refusal: the stop gap's refusal
+    /// naming runs without a live machine.
+    #[cfg(test)]
+    scripted_rearm_refusal: Option<Option<RunningRearmRefusal>>,
     /// Tests-only count of `begin_joint_commit` calls.
     #[cfg(test)]
     joint_commit_begin_calls: usize,
@@ -2142,6 +2147,8 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             scripted_running_rearms: None,
             #[cfg(test)]
+            scripted_rearm_refusal: None,
+            #[cfg(test)]
             joint_commit_begin_calls: 0,
             #[cfg(test)]
             joint_service_calls: 0,
@@ -2374,6 +2381,8 @@ impl AttestedSemanticLane {
             scripted_latched_phase: None,
             #[cfg(test)]
             scripted_running_rearms: None,
+            #[cfg(test)]
+            scripted_rearm_refusal: None,
             #[cfg(test)]
             joint_commit_begin_calls: 0,
             #[cfg(test)]
@@ -3099,6 +3108,15 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn set_scripted_joint_rearms_for_test(&mut self, rearms: u32) {
         self.scripted_running_rearms = Some(rearms);
+    }
+
+    /// Pose the re-arm refusal the stop gap names (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_scripted_joint_rearm_refusal_for_test(
+        &mut self,
+        refusal: Option<RunningRearmRefusal>,
+    ) {
+        self.scripted_rearm_refusal = Some(refusal);
     }
 
     /// How many `begin_joint_commit` calls this lane served.

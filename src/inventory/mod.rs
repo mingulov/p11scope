@@ -4874,23 +4874,56 @@ impl ClassicDriver<'_> {
     }
 
     /// The stop gap's suffix for a held Joint lane, shared by the
-    /// Poll path and the terminal not-begun step: the latched phase
-    /// and, past re-arms, how the lane got here. When the per-run
-    /// re-arm bound is spent, the suffix says plainly that the limit
-    /// stopped the lane.
-    fn joint_lane_stop_suffix(latched_at: Option<&str>, rearms: u32) -> String {
+    /// Poll path and the terminal not-begun step: the latched phase,
+    /// past re-arms, and why the last re-arm was refused. The limit
+    /// sentence prints only when the spent bound refused this very
+    /// re-arm: a stop at a phase that never re-arms names its own
+    /// cause instead, even past earlier re-arms.
+    fn joint_lane_stop_suffix(
+        latched_at: Option<&str>,
+        rearms: u32,
+        refusal: Option<crate::inventory_semantics::RunningRearmRefusal>,
+    ) -> String {
+        fn interruptions(count: u32) -> String {
+            if count == 1 {
+                "1 interruption".to_string()
+            } else {
+                format!("{count} interruptions")
+            }
+        }
         let mut suffix = String::new();
         if let Some(phase) = latched_at {
             suffix.push_str(&format!(" at {phase}"));
         }
-        if rearms >= crate::inventory_semantics::RUNNING_REARM_LIMIT {
-            suffix.push_str(&format!(
-                "; the lane stops: it already re-armed past {rearms} abandoned quanta (the per-run limit)"
-            ));
-        } else if rearms != 0 {
-            suffix.push_str(&format!(
-                "; after {rearms} abandoned quanta the lane continued past"
-            ));
+        match refusal {
+            Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent) => {
+                suffix.push_str(&format!(
+                    "; the lane stops: it already continued past {} (the per-run limit)",
+                    interruptions(crate::inventory_semantics::RUNNING_REARM_LIMIT)
+                ));
+            }
+            Some(reason) => {
+                if rearms != 0 {
+                    suffix.push_str(&format!(
+                        "; after continuing past {},",
+                        interruptions(rearms)
+                    ));
+                } else {
+                    suffix.push(';');
+                }
+                suffix.push_str(&format!(
+                    " the lane could not continue: {}",
+                    reason.describe()
+                ));
+            }
+            None => {
+                if rearms != 0 {
+                    suffix.push_str(&format!(
+                        "; the lane had already continued past {}",
+                        interruptions(rearms)
+                    ));
+                }
+            }
         }
         suffix
     }
@@ -4950,6 +4983,7 @@ impl ClassicDriver<'_> {
         let lane = self.semantic.take().expect("a joint lane is seated");
         let rearms = lane.joint_running_rearms();
         let latched_at = lane.joint_latched_phase();
+        let refusal = lane.joint_rearm_refusal();
         let (_, summary) = Self::hold_joint_lane_for_exit(
             lane,
             &mut *self.coordinator,
@@ -4963,9 +4997,10 @@ impl ClassicDriver<'_> {
             summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
         }
         self.joint_commit_pending = false;
-        // Name the earlier re-arms when the lane stops past them (the
-        // re-arm bound, or a later refusal no re-arm admits).
-        let rearmed = Self::joint_lane_stop_suffix(latched_at, rearms);
+        // Name the earlier re-arms and the refused re-arm's cause
+        // when the lane stops past them (the re-arm bound, or a
+        // later refusal no re-arm admits).
+        let rearmed = Self::joint_lane_stop_suffix(latched_at, rearms, refusal);
         self.coordinator.note_scope_gap(
             "semantic lane stopped".to_string(),
             format!(
@@ -5118,12 +5153,14 @@ impl ClassicDriver<'_> {
                     // The terminal cursor holds without re-arm: running
                     // recovery belongs to the Poll path, and this step
                     // only ever sees the final drain. It names the same
-                    // stop suffix, so the phase and any earlier re-arms
-                    // stay diagnosable here too.
+                    // stop suffix, so the phase, any earlier re-arms
+                    // and any recorded refusal stay diagnosable here
+                    // too.
                     let inner = lane.as_ref().expect("a failed lane holds");
                     let suffix = Self::joint_lane_stop_suffix(
                         inner.joint_latched_phase(),
                         inner.joint_running_rearms(),
+                        inner.joint_rearm_refusal(),
                     );
                     let live = lane.take().expect("a failed lane holds");
                     let (_, summary) = Self::hold_joint_lane_for_exit(
@@ -18355,7 +18392,7 @@ mod tests {
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
             stops[0].1,
-            "semantic_unavailable at BindingKeys; after 3 abandoned quanta the lane continued past; broad inventory continues; semantic probes stay attached until exit",
+            "semantic_unavailable at BindingKeys; the lane had already continued past 3 interruptions; broad inventory continues; semantic probes stay attached until exit",
             "the gap names the phase and the earlier re-arms"
         );
     }
@@ -20901,24 +20938,119 @@ mod tests {
 
     #[test]
     fn joint_lane_stop_suffix_names_phase_rearms_and_the_spent_limit() {
+        use crate::inventory_semantics::RunningRearmRefusal;
         // The stop gap's suffix, both hold sites: the latched phase,
         // the earlier re-arms, and — when the per-run bound is spent —
-        // a plain statement that the limit stopped the lane.
-        assert_eq!(ClassicDriver::joint_lane_stop_suffix(None, 0), "");
+        // a plain statement that the limit stopped the lane. The
+        // limit sentence prints only for a bound-spent refusal: a
+        // stop at a phase that never re-arms names its own cause
+        // instead, even past earlier re-arms.
+        assert_eq!(ClassicDriver::joint_lane_stop_suffix(None, 0, None), "");
         assert_eq!(
-            ClassicDriver::joint_lane_stop_suffix(Some("Audited"), 0),
+            ClassicDriver::joint_lane_stop_suffix(Some("Audited"), 0, None),
             " at Audited",
         );
         assert_eq!(
-            ClassicDriver::joint_lane_stop_suffix(Some("Collecting"), 3),
-            " at Collecting; after 3 abandoned quanta the lane continued past",
+            ClassicDriver::joint_lane_stop_suffix(Some("Collecting"), 3, None),
+            " at Collecting; the lane had already continued past 3 interruptions",
+        );
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(Some("Audited"), 1, None),
+            " at Audited; the lane had already continued past 1 interruption",
         );
         assert_eq!(
             ClassicDriver::joint_lane_stop_suffix(
                 Some("Audited"),
                 crate::inventory_semantics::RUNNING_REARM_LIMIT,
+                Some(RunningRearmRefusal::BoundSpent),
             ),
-            " at Audited; the lane stops: it already re-armed past 32 abandoned quanta (the per-run limit)",
+            " at Audited; the lane stops: it already continued past 32 interruptions (the per-run limit)",
+        );
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(
+                Some("BindingKeys"),
+                crate::inventory_semantics::RUNNING_REARM_LIMIT,
+                Some(RunningRearmRefusal::WrongPhase),
+            ),
+            " at BindingKeys; after continuing past 32 interruptions, the lane could not continue: only a refusal at the audited step can be continued past",
+        );
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(
+                Some("BindingKeys"),
+                crate::inventory_semantics::RUNNING_REARM_LIMIT,
+                None,
+            ),
+            " at BindingKeys; the lane had already continued past 32 interruptions",
+            "no recorded refusal means no limit claim, even at the bound",
+        );
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(
+                Some("Audited"),
+                0,
+                Some(RunningRearmRefusal::CannotResync),
+            ),
+            " at Audited; the lane could not continue: the journal stream could not re-sync",
+        );
+    }
+
+    #[test]
+    fn joint_lane_stop_suffix_names_every_rearm_refusal_cause() {
+        use crate::inventory_semantics::RunningRearmRefusal;
+        // Every recorded re-arm refusal renders its plain clause in
+        // the stop gap; the bound alone renders the count sentence.
+        for (refusal, clause) in [
+            (
+                RunningRearmRefusal::Consumed,
+                "this refusal already spent its re-arm",
+            ),
+            (
+                RunningRearmRefusal::NotTransient,
+                "the refusal was permanent, not transient",
+            ),
+            (
+                RunningRearmRefusal::FinishActive,
+                "the lane was already finishing",
+            ),
+            (
+                RunningRearmRefusal::WatchdogTripped,
+                "a no-progress trip was already standing",
+            ),
+            (
+                RunningRearmRefusal::FrameMissing,
+                "the audited pass had nothing left to abandon",
+            ),
+            (
+                RunningRearmRefusal::WrongPhase,
+                "only a refusal at the audited step can be continued past",
+            ),
+            (
+                RunningRearmRefusal::LaneNotLive,
+                "the lane was no longer live",
+            ),
+            (
+                RunningRearmRefusal::CannotResync,
+                "the journal stream could not re-sync",
+            ),
+            (
+                RunningRearmRefusal::PublicationPending,
+                "the unfinished pass was still standing after the abandon",
+            ),
+        ] {
+            assert_eq!(
+                ClassicDriver::joint_lane_stop_suffix(None, 0, Some(refusal)),
+                format!("; the lane could not continue: {clause}"),
+                "the gap names {refusal:?}",
+            );
+        }
+        assert_eq!(
+            ClassicDriver::joint_lane_stop_suffix(None, 0, Some(RunningRearmRefusal::BoundSpent),),
+            "; the lane stops: it already continued past 32 interruptions (the per-run limit)",
+            "the bound renders the count sentence",
+        );
+        assert_eq!(
+            RunningRearmRefusal::BoundSpent.describe(),
+            "the per-run re-arm limit was already spent",
+            "the bound keeps its standalone clause",
         );
     }
 
@@ -20933,6 +21065,9 @@ mod tests {
         lane.set_scripted_joint_begin_for_test(Some(Ok(())));
         lane.set_scripted_joint_latched_phase_for_test(Some("Audited"));
         lane.set_scripted_joint_rearms_for_test(crate::inventory_semantics::RUNNING_REARM_LIMIT);
+        lane.set_scripted_joint_rearm_refusal_for_test(Some(
+            crate::inventory_semantics::RunningRearmRefusal::BoundSpent,
+        ));
         driver.semantic = Some(lane);
         let first = driver.poll_commit(true);
         assert!(
@@ -20953,8 +21088,48 @@ mod tests {
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
             stops[0].1,
-            "semantic_unavailable at Audited; the lane stops: it already re-armed past 32 abandoned quanta (the per-run limit); broad inventory continues; semantic probes stay attached until exit",
+            "semantic_unavailable at Audited; the lane stops: it already continued past 32 interruptions (the per-run limit); broad inventory continues; semantic probes stay attached until exit",
             "the gap names the spent limit as the stop cause"
+        );
+    }
+
+    #[test]
+    fn joint_poll_commit_refused_rearm_names_its_cause_in_the_stop() {
+        // The stopped-adapter shape through the real driver hold: the
+        // poll refuses, the re-arm is refused (posed: substituted
+        // lanes seat no live machine), and the stop gap names the
+        // recorded cause instead of a bare phase label.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_joint_begin_for_test(Some(Ok(())));
+        lane.set_scripted_joint_latched_phase_for_test(Some("Audited"));
+        lane.set_scripted_joint_rearm_refusal_for_test(Some(
+            crate::inventory_semantics::RunningRearmRefusal::CannotResync,
+        ));
+        driver.semantic = Some(lane);
+        let first = driver.poll_commit(true);
+        assert!(
+            matches!(
+                first,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "a refused poll publishes the pass past the held lane"
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "the refused lane is held for exit"
+        );
+        let stops: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|gap| gap.0 == "semantic lane stopped")
+            .collect();
+        assert_eq!(stops.len(), 1, "the hold is disclosed once");
+        assert_eq!(
+            stops[0].1,
+            "semantic_unavailable at Audited; the lane could not continue: the journal stream could not re-sync; broad inventory continues; semantic probes stay attached until exit",
+            "the gap names the refused re-arm's cause"
         );
     }
 

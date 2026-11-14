@@ -66,6 +66,62 @@ pub(crate) const RUNNING_REARM_LIMIT: u32 = 32;
 /// Gap subject of one abandoned running quantum the lane continued past.
 pub(crate) const RUNNING_REARM_SUBJECT: &str = "semantic quantum abandoned; lane continues";
 
+/// Why one running re-arm was refused, recorded on the machine at
+/// the refusal: the stop gap names the cause instead of a bare
+/// phase label, so the next soak confirms or redirects the
+/// hypothesis. A re-arm never attempted (no latched disposition)
+/// records nothing; a success clears the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunningRearmRefusal {
+    /// Defensive: the latch-time shape failed (or a previous
+    /// attempt consumed the flag) yet the current shape passes.
+    /// Latched state never improves toward the shape, so this
+    /// names an already-spent latch.
+    Consumed,
+    /// The latched refusal is permanent, not the transient
+    /// `Unavailable` a re-arm admits.
+    NotTransient,
+    /// A Finish (or its original) is already underway.
+    FinishActive,
+    /// A no-progress trip (audit or finish) already stands.
+    WatchdogTripped,
+    /// The Audited phase kept no frame to abandon.
+    FrameMissing,
+    /// The latch sits at a phase the abandon cannot dispose in
+    /// full: only an Audited refusal re-arms.
+    WrongPhase,
+    /// The per-run re-arm bound is spent. The stop gap renders
+    /// this as the count sentence, not [`Self::describe`].
+    BoundSpent,
+    /// The lane is no longer live: not live, finished,
+    /// exit-retained, or its domain moved.
+    LaneNotLive,
+    /// The next collect cannot re-sync: a stopped adapter, or a
+    /// spent frontier on a linked lane.
+    CannotResync,
+    /// The abandon left the unfinished publication standing.
+    PublicationPending,
+}
+
+impl RunningRearmRefusal {
+    /// The plain user-facing clause the stop gap renders after
+    /// "the lane could not continue".
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Consumed => "this refusal already spent its re-arm",
+            Self::NotTransient => "the refusal was permanent, not transient",
+            Self::FinishActive => "the lane was already finishing",
+            Self::WatchdogTripped => "a no-progress trip was already standing",
+            Self::FrameMissing => "the audited pass had nothing left to abandon",
+            Self::WrongPhase => "only a refusal at the audited step can be continued past",
+            Self::BoundSpent => "the per-run re-arm limit was already spent",
+            Self::LaneNotLive => "the lane was no longer live",
+            Self::CannotResync => "the journal stream could not re-sync",
+            Self::PublicationPending => "the unfinished pass was still standing after the abandon",
+        }
+    }
+}
+
 /// Total wire rows one pre-grant quantum may attempt. This doubles as
 /// the collection's allocation limit (the quantum reserves exactly
 /// this many row slots and refuses allocator over-reservation), so a
@@ -1321,6 +1377,10 @@ pub(crate) struct LiveJointMachine {
     /// Running quanta abandoned and re-armed past, bounded by
     /// [`RUNNING_REARM_LIMIT`].
     running_rearms: u32,
+    /// Why the last attempted running re-arm was refused, for the
+    /// stop gap. A success clears it; a call with no latched
+    /// disposition attempts nothing and leaves it alone.
+    rearm_refusal: Option<RunningRearmRefusal>,
     #[cfg(test)]
     refuse_finish_q_merge_once: bool,
     #[cfg(test)]
@@ -1403,6 +1463,7 @@ impl LiveJointMachine {
             audit_no_progress_trip: None,
             rearm_eligible: false,
             running_rearms: 0,
+            rearm_refusal: None,
             #[cfg(test)]
             refuse_finish_q_merge_once: false,
             #[cfg(test)]
@@ -1469,6 +1530,13 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn running_rearms_for_test(&self) -> u32 {
         self.running_rearms
+    }
+
+    /// Why the last attempted running re-arm was refused (`None`
+    /// when none was attempted or the last one succeeded).
+    #[cfg(test)]
+    pub(crate) fn rearm_refusal_for_test(&self) -> Option<RunningRearmRefusal> {
+        self.rearm_refusal
     }
 
     /// Pose a begun finish on a latched machine: no production path
@@ -1558,12 +1626,27 @@ impl LiveJointMachine {
     /// `abandon_unfinished_joint_publication`); every other phase keeps
     /// Raw/H8/report custody no running path may drop or replay.
     fn running_rearm_shape(&self, reason: SemanticRefusal) -> bool {
-        reason == SemanticRefusal::Unavailable
-            && self.finish.is_none()
-            && self.finish_original.is_none()
-            && self.audit_no_progress_trip.is_none()
-            && self.finish_no_progress_trip.is_none()
-            && matches!(self.phase, Some(Phase::Audited { frame: Some(_), .. }))
+        self.running_rearm_shape_refusal(reason).is_none()
+    }
+
+    /// The first latched-shape check a running re-arm fails, in the
+    /// gate's order: `None` exactly when
+    /// [`Self::running_rearm_shape`] admits.
+    fn running_rearm_shape_refusal(&self, reason: SemanticRefusal) -> Option<RunningRearmRefusal> {
+        if reason != SemanticRefusal::Unavailable {
+            return Some(RunningRearmRefusal::NotTransient);
+        }
+        if self.finish.is_some() || self.finish_original.is_some() {
+            return Some(RunningRearmRefusal::FinishActive);
+        }
+        if self.audit_no_progress_trip.is_some() || self.finish_no_progress_trip.is_some() {
+            return Some(RunningRearmRefusal::WatchdogTripped);
+        }
+        match self.phase {
+            Some(Phase::Audited { frame: Some(_), .. }) => None,
+            Some(Phase::Audited { .. }) => Some(RunningRearmRefusal::FrameMissing),
+            _ => Some(RunningRearmRefusal::WrongPhase),
+        }
     }
 
     /// Re-arm a running machine past one transient refusal ("partial,
@@ -1590,14 +1673,33 @@ impl LiveJointMachine {
         let RunState::DispositionRequired(latched) = self.state else {
             return None;
         };
-        if !self.rearm_eligible
-            || !self.running_rearm_shape(latched)
-            || self.running_rearms >= RUNNING_REARM_LIMIT
-            || !lane.is_live()
+        // Every refusal below records its cause for the stop gap;
+        // the gate order is unchanged, only named.
+        if !self.rearm_eligible {
+            // The latch-time shape failed, or a previous attempt
+            // spent the flag: the current shape still fails, so it
+            // names the cause; a passing shape here is defensive
+            // only (latched state never improves toward it).
+            let refusal = self
+                .running_rearm_shape_refusal(latched)
+                .unwrap_or(RunningRearmRefusal::Consumed);
+            self.rearm_refusal = Some(refusal);
+            return None;
+        }
+        if let Some(refusal) = self.running_rearm_shape_refusal(latched) {
+            self.rearm_refusal = Some(refusal);
+            return None;
+        }
+        if self.running_rearms >= RUNNING_REARM_LIMIT {
+            self.rearm_refusal = Some(RunningRearmRefusal::BoundSpent);
+            return None;
+        }
+        if !lane.is_live()
             || lane.is_finished()
             || lane.exit_retained
             || lane.domain() != self.producers.native_domain()
         {
+            self.rearm_refusal = Some(RunningRearmRefusal::LaneNotLive);
             return None;
         }
         // A lane whose next collect cannot re-sync (a stopped adapter,
@@ -1609,12 +1711,14 @@ impl LiveJointMachine {
             .adapter()
             .lost_quantum_can_resync(self.producers.journal_linked())
         {
+            self.rearm_refusal = Some(RunningRearmRefusal::CannotResync);
             return None;
         }
         self.rearm_eligible = false;
         let frame = self.take_abandoned_frame();
         coordinator.abandon_unfinished_joint_publication(lane, frame, reason.to_string());
         if coordinator.publication_pending() {
+            self.rearm_refusal = Some(RunningRearmRefusal::PublicationPending);
             return None;
         }
         // An applied abandon strands staged-but-unreduced calls whose
@@ -1639,6 +1743,7 @@ impl LiveJointMachine {
         self.finish_no_progress_since = None;
         self.unpaid_void_yields = 0;
         self.running_rearms += 1;
+        self.rearm_refusal = None;
         coordinator.note_scope_gap(
             RUNNING_REARM_SUBJECT.to_string(),
             format!(
@@ -5048,6 +5153,20 @@ impl AttestedSemanticLane {
             .as_deref()
             .and_then(|live| live.joint_machine.as_ref())
             .map_or(0, |machine| machine.running_rearms)
+    }
+
+    /// Why this lane's machine refused its last attempted running
+    /// re-arm (`None` when none was attempted or the last one
+    /// succeeded). The stop gap names the cause.
+    pub(crate) fn joint_rearm_refusal(&self) -> Option<RunningRearmRefusal> {
+        #[cfg(test)]
+        if let Some(posed) = self.scripted_rearm_refusal {
+            return posed;
+        }
+        self.live
+            .as_deref()
+            .and_then(|live| live.joint_machine.as_ref())
+            .and_then(|machine| machine.rearm_refusal)
     }
 
     /// Re-arm this lane's latched running machine past one transient

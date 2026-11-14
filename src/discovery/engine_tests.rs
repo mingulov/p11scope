@@ -82633,6 +82633,159 @@ fn handle_table_learned_candidate_pushed_back_on_budget_wait() {
     drop(live);
 }
 
+/// Push-back bound twin: with the table full and `pending_learned`
+/// already at its bound, a deferred candidate refuses loudly through
+/// the per-capture cap row — the push-back path holds the same bound
+/// as fresh staging instead of growing the fd-holding queue past it.
+#[test]
+fn handle_table_learned_push_back_holds_the_pending_bound() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    // Prefill the pending queue to its bound: these entries are never
+    // staged here, so plain distinct files do — only their count and
+    // their held fds matter.
+    let fill = tempfile::tempdir().unwrap();
+    for n in 0..crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
+        let path = fill.path().join(format!("pending{n:02}.so"));
+        std::fs::write(&path, format!("pending-{n}")).unwrap();
+        let held = std::fs::File::open(&path).unwrap();
+        let (pending_dev, pending_ino) = crate::fanotify::file_identity(&held).unwrap();
+        engine
+            .pending_learned
+            .push(crate::fanotify::LearnedCandidate {
+                file: held,
+                dev: pending_dev,
+                ino: pending_ino,
+                display_path: path.to_string_lossy().into_owned(),
+                loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+                loader_unknown_reason: None,
+            });
+    }
+    let candidate = crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: library.to_string_lossy().into_owned(),
+        loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+        loader_unknown_reason: None,
+    };
+    engine.stage_learned_candidate(candidate);
+    assert_eq!(
+        engine.pending_learned.len(),
+        crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP,
+        "the push-back holds the pending bound instead of growing past it"
+    );
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "the excess settles so later loads drop"
+    );
+    assert_eq!(
+        engine.learned_cap_skipped_for_test(),
+        1,
+        "the excess counts"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_CAP_REASON
+        }),
+        "the excess names itself through the cap row: {public:?}"
+    );
+    drop(live);
+}
+
+/// Flush twin: the end-of-capture flush under a full table files its
+/// gaps and holds the pending bound over its two fixed passes — forty
+/// candidates over distinct files stage, defer, and settle into a
+/// bounded queue plus counted cap excess, never an unbounded queue and
+/// never a hang waiting for room.
+#[test]
+fn handle_table_learned_flush_under_full_table_holds_the_pending_bound() {
+    const CANDIDATES: usize = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP + 8;
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let bytes = std::fs::read(&library).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for n in 0..CANDIDATES {
+        // Copies of the seed bytes under distinct paths: distinct
+        // identities that stage exactly like the seed file, without a
+        // compiler in the test.
+        let path = dir.path().join(format!("flush{n:02}.so"));
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+        tx.send(crate::fanotify::LearnMsg::Candidate(
+            crate::fanotify::LearnedCandidate {
+                file,
+                dev,
+                ino,
+                display_path: path.to_string_lossy().into_owned(),
+                loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+                loader_unknown_reason: None,
+            },
+        ))
+        .unwrap();
+    }
+    // The drain stays alive for the whole flush: dropping `tx` here
+    // would model unexpected drain death instead.
+    let _drain_alive = &tx;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let fill = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, fill.path(), 1);
+    engine.set_learned_rx_for_test(rx);
+    engine.flush_learned_files_at_capture_end();
+    assert!(
+        engine.handle_table.stats().defers > 0,
+        "every candidate defers or the bound assertions are vacuous"
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP,
+        "the flush holds the pending bound"
+    );
+    assert_eq!(
+        engine.learned_cap_skipped_for_test(),
+        (CANDIDATES - crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP) as u64,
+        "the true excess counts"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED }),
+        "every deferral files its learned wait gap"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_CAP_REASON
+        }),
+        "the excess names itself through the cap row: {public:?}"
+    );
+    drop(live);
+}
+
 /// G1 pin-contract twin: the probe path builds no entries and files no
 /// rows, while the scan still reports its modules. The seed route's
 /// live process maps a provider, so a modules assertion is non-vacuous.

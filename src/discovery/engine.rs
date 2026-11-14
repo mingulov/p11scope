@@ -504,6 +504,10 @@ pub struct Engine {
     /// budget is inherently load-sensitive; the budget mechanism
     /// itself is pinned separately with a tight budget).
     owned_watch_run_budget_ns: u64,
+    /// Cheap-scan bound for the watch backoff
+    /// (`OWNED_WATCH_CHEAP_SCAN_BYTES`); tests that pin the backoff of
+    /// every member set `0`.
+    owned_watch_cheap_scan_bytes: u64,
     /// Views the owned-child priority deferred last tick: they arm
     /// normally this tick, so a repeatedly-rescheduled child cannot
     /// starve provider-free descendants. Recomputed every tick arm pass.
@@ -4848,6 +4852,10 @@ struct OwnedWatchEntry {
     /// Mono-ns this member is next eligible for a rescan (the backoff
     /// deadline from its last unproductive scan): `0` scans at once.
     next_eligible_ns: u64,
+    /// The member's executable identity (`/proc/<pid>/exe` stat) at its
+    /// last scan: an exec to a new image restarts the streak, so an
+    /// interpreter's re-exec is proven promptly, not after a backoff.
+    image: Option<(u64, u64)>,
 }
 
 struct LiveCandidate {
@@ -6510,6 +6518,19 @@ pub(crate) const OWNED_WATCH_RESCAN_HORIZON_NS: u64 = 5_000_000_000;
 /// test timing.
 pub(crate) const OWNED_WATCH_RUN_BUDGET_NS: u64 = 100_000_000;
 
+/// Attempted-I/O bytes below which one watch scan counts as cheap: an
+/// unproductive cheap member keeps the 10 ms watch cadence instead of
+/// backing off, so a small interpreted worker that loads its provider
+/// a few hundred milliseconds after birth is still proven in time.
+/// Only mapping-heavy members (their scans read more) back off.
+/// Measured (charged attempted I/O per scan, local 7.0 host): a `sleep`
+/// member 20 KB, a python worker with ssl/json/ctypes/hashlib/socket/
+/// sqlite3 loaded 21 KB (6 KB of maps); the scan reads mostly the maps
+/// text, so the 345 KB-maps shape the backoff exists for costs at
+/// least 345 KB. The bound sits well above small interpreters and
+/// below that shape.
+pub(crate) const OWNED_WATCH_CHEAP_SCAN_BYTES: u64 = 128 * 1024;
+
 /// Per-run attempted-I/O budget for the owned-tree watch, in bytes:
 /// the same stop condition in I/O terms, for cache-hot scans whose
 /// wall time understates their cost.
@@ -8061,6 +8082,15 @@ fn owned_watch_rescan_delay_ns(unproductive: u32) -> u64 {
         6 => 500_000_000,
         _ => 1_000_000_000,
     }
+}
+
+/// One watched member's executable identity: the `/proc/<pid>/exe`
+/// target's (`st_dev`, `st_ino`), or `None` when unreadable. Identity
+/// only, compared with itself across scans; never published.
+fn owned_watch_member_image(proc_root: &Path, pid: u32) -> Option<(u64, u64)> {
+    std::fs::metadata(proc_root.join(pid.to_string()).join("exe"))
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
 }
 
 /// True when `pid` is provably a kernel thread with no user address
@@ -12985,6 +13015,7 @@ impl Engine {
             owned_watch_last_ns: None,
             owned_watch_cursor: None,
             owned_watch_run_budget_ns: OWNED_WATCH_RUN_BUDGET_NS,
+            owned_watch_cheap_scan_bytes: OWNED_WATCH_CHEAP_SCAN_BYTES,
             child_priority_spared: BTreeSet::new(),
             learned_unapplied: false,
             member_stops: member_stop::MemberStopState::default(),
@@ -21317,6 +21348,7 @@ impl Engine {
                         scans: 0,
                         unproductive: 0,
                         next_eligible_ns: 0,
+                        image: None,
                     },
                 );
                 self.owned_watch_seen.entry(pid).or_insert(now_ns);
@@ -21349,6 +21381,19 @@ impl Engine {
                 }
                 if picks.contains(&pid) {
                     continue;
+                }
+                // A backed-off member that exec'd a new image is a new
+                // member to prove: one stat notices it without waiting
+                // out the old image's backoff.
+                if let Some(entry) = self.owned_watch_unproven.get_mut(&pid)
+                    && entry.next_eligible_ns > now_ns
+                    && entry.image.is_some()
+                {
+                    let image = owned_watch_member_image(&self.proc_root, pid);
+                    if image.is_some() && image != entry.image {
+                        entry.unproductive = 0;
+                        entry.next_eligible_ns = 0;
+                    }
                 }
                 let eligible = self
                     .owned_watch_unproven
@@ -21398,10 +21443,20 @@ impl Engine {
     /// transient views retain nothing, and the frames' own scans mark
     /// what they retain.
     fn scan_owned_watch_member(&mut self, pid: u32, now_ns: u64) {
+        let image = owned_watch_member_image(&self.proc_root, pid);
         let Some(entry) = self.owned_watch_unproven.get_mut(&pid) else {
             return;
         };
         entry.scans = entry.scans.saturating_add(1);
+        // A new image (exec) is a new member to prove: restart the
+        // streak so it scans at the prompt cadence again.
+        if image.is_some() && entry.image.is_some() && entry.image != image {
+            entry.unproductive = 0;
+            entry.next_eligible_ns = 0;
+        }
+        if image.is_some() {
+            entry.image = image;
+        }
         let Ok(id) = self.allocate_view_id() else {
             return;
         };
@@ -21412,13 +21467,17 @@ impl Engine {
             Err(_) => {
                 self.release_view_id(id);
                 if self.budget.stopped_now().is_some() {
-                    self.backoff_owned_watch_member(pid, now_ns);
-                } else {
+                    self.backoff_owned_watch_member(pid, now_ns, u64::MAX);
+                } else if crate::process::process_proven_exited(pid) {
                     self.owned_watch_unproven.remove(&pid);
                 }
+                // Otherwise the member is alive and the open lost a race
+                // (an exec or generation change during acquisition): it
+                // stays, unpenalized, for the next watch run.
                 return;
             }
         };
+        let io_before = self.budget.attempted_io_bytes();
         let broad_admit = self.broad_admit;
         let (scan_result, scan_counters) = Self::scan_retained_view(
             &view,
@@ -21435,13 +21494,26 @@ impl Engine {
         // frame scans.
         self.absorb_watch_scan_counters(scan_counters);
         self.deep_scans = self.deep_scans.saturating_add(1);
+        let scan_bytes = self.budget.attempted_io_bytes().saturating_sub(io_before);
+        // A scan cut short by the member itself proves nothing about
+        // it: an exit drops it, an exec (new image) or other generation
+        // change rescans promptly. Neither counts as unproductive.
+        let exited = view.original_exited().unwrap_or(false);
+        let image_changed =
+            image.is_some() && owned_watch_member_image(&self.proc_root, pid) != image;
         let (modules, pins, _complete) = match scan_result {
             Ok(scan) => scan,
             Err(_) => {
                 self.release_view_id(id);
-                // A failed scan proves nothing either way: back off
-                // and keep the member for the horizon.
-                self.backoff_owned_watch_member(pid, now_ns);
+                if exited {
+                    self.owned_watch_unproven.remove(&pid);
+                } else if image_changed {
+                    self.restart_owned_watch_member(pid);
+                } else {
+                    // A failed scan proves nothing either way: back off
+                    // and keep the member for the horizon.
+                    self.backoff_owned_watch_member(pid, now_ns, scan_bytes);
+                }
                 return;
             }
         };
@@ -21469,9 +21541,14 @@ impl Engine {
             .collect();
         self.release_view_id(id);
         if proofs.is_empty() {
+            if image_changed {
+                // The scan read the image the member just left.
+                self.restart_owned_watch_member(pid);
+                return;
+            }
             // No provider proved: back off and keep the member for
             // the horizon (a slow starter still gets rescanned).
-            self.backoff_owned_watch_member(pid, now_ns);
+            self.backoff_owned_watch_member(pid, now_ns, scan_bytes);
             return;
         }
         self.learn_owned_proofs(&pins, &proofs);
@@ -21482,13 +21559,29 @@ impl Engine {
     /// next rescan waits out the delay for its streak, so
     /// provider-free mapping-heavy members stop burning every frame
     /// while slow starters stay covered inside the rescan horizon.
-    fn backoff_owned_watch_member(&mut self, pid: u32, now_ns: u64) {
+    /// A member whose scan cost `scan_bytes` of attempted I/O below the
+    /// cheap bound keeps the watch cadence: backing it off saves little
+    /// and can miss a late provider load.
+    fn backoff_owned_watch_member(&mut self, pid: u32, now_ns: u64, scan_bytes: u64) {
+        let cheap = scan_bytes < self.owned_watch_cheap_scan_bytes;
         let Some(entry) = self.owned_watch_unproven.get_mut(&pid) else {
             return;
         };
         entry.unproductive = entry.unproductive.saturating_add(1);
-        entry.next_eligible_ns =
-            now_ns.saturating_add(owned_watch_rescan_delay_ns(entry.unproductive));
+        let mut delay = owned_watch_rescan_delay_ns(entry.unproductive);
+        if cheap {
+            delay = delay.min(OWNED_WATCH_SCAN_MIN_NS);
+        }
+        entry.next_eligible_ns = now_ns.saturating_add(delay);
+    }
+
+    /// Restarts one watched member's streak: its scan was cut short by
+    /// an exec or generation change, not by an absent provider.
+    fn restart_owned_watch_member(&mut self, pid: u32) {
+        if let Some(entry) = self.owned_watch_unproven.get_mut(&pid) {
+            entry.unproductive = 0;
+            entry.next_eligible_ns = 0;
+        }
     }
 
     /// Owned run-tree file learning (E1): stage scan-proven provider

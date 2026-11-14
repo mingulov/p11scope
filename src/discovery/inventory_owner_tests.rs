@@ -1060,36 +1060,38 @@ fn handle_table_owner_scan_holds_len_within_cap() {
     // paths, each keyed by the production maps-comparable resolution,
     // so the pin path's own identity guard passes and the twin
     // exercises only the table funnel.
-    let view = engine
-        .views
-        .iter()
-        .find(|view| view.id() == owner)
-        .expect("the opened owner retains its view");
-    let bytes = std::fs::read("/bin/true").unwrap();
-    let mut mounts = crate::process::MountTableCache::default();
-    // Fixture key resolution spends a throwaway budget, never the
-    // engine's: the scan under test must meet a fresh budget.
-    let mut fixture_budget = crate::discovery::scan::CaptureWorkBudget::default();
-    let mut modules = Vec::new();
-    for n in 0..MODULES {
-        let path = dir.path().join(format!("lib{n:02}.so"));
-        std::fs::write(&path, &bytes).unwrap();
-        let (_file, key) = crate::discovery::identity::open_view_object_cached(
-            view,
-            &path,
-            &mut mounts,
-            &mut fixture_budget,
-        )
-        .unwrap();
-        let mut module = crate::discovery::identity::test_fixture::module(key);
-        module.view = view.id();
-        module.mount_namespace = view.mount_namespace();
-        module.key = key;
-        module.path = path.to_str().unwrap().to_string();
-        module.tables = Vec::new();
-        modules.push(module);
-    }
-    drop(view);
+    let modules = {
+        let view = engine
+            .views
+            .iter()
+            .find(|view| view.id() == owner)
+            .expect("the opened owner retains its view");
+        let bytes = std::fs::read("/bin/true").unwrap();
+        let mut mounts = crate::process::MountTableCache::default();
+        // Fixture key resolution spends a throwaway budget, never the
+        // engine's: the scan under test must meet a fresh budget.
+        let mut fixture_budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let mut modules = Vec::new();
+        for n in 0..MODULES {
+            let path = dir.path().join(format!("lib{n:02}.so"));
+            std::fs::write(&path, &bytes).unwrap();
+            let (_file, key) = crate::discovery::identity::open_view_object_cached(
+                view,
+                &path,
+                &mut mounts,
+                &mut fixture_budget,
+            )
+            .unwrap();
+            let mut module = crate::discovery::identity::test_fixture::module(key);
+            module.view = view.id();
+            module.mount_namespace = view.mount_namespace();
+            module.key = key;
+            module.path = path.to_str().unwrap().to_string();
+            module.tables = Vec::new();
+            modules.push(module);
+        }
+        modules
+    };
     let mut guard = ScriptedImage(ImageCheck::Exact);
     let lease = engine.acquire_inventory_scan(owner).unwrap();
     let window = engine

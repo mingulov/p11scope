@@ -5240,6 +5240,34 @@ impl JournalAdapter {
         .then_some(entry)
     }
 
+    /// Whether a void wiped this admission's retained H8 original before
+    /// its claim. The caller has already proved the admission does not
+    /// match the current quantum and no retained original claims it, so
+    /// the remaining facts are: a void has happened on this stream, the
+    /// admission was collected (it has an H0 origin), and its exact H8
+    /// invocation is no longer retained. Such a call was observed before
+    /// the void and can no longer be certified; the claim step routes it
+    /// to plain S1 with a counted gap instead of refusing the whole
+    /// semantic lane. The H0 wire position stays in its own device
+    /// domain: it is never compared with the journal consumption ordinal
+    /// a fence records.
+    pub(crate) fn admission_voided(&self, admitted: &AdmittedInstanceCall) -> bool {
+        if self.voided_through == 0 {
+            return false;
+        }
+        let (Some(_origin), Some(resource)) = (
+            admitted.collected_origin(),
+            admitted.joint_resource_origin(),
+        ) else {
+            return false;
+        };
+        !self.open.contains_key(&resource.invocation())
+            && self
+                .resource_producers
+                .as_ref()
+                .is_some_and(|producers| resource.matches_producers(producers))
+    }
+
     /// Continued admission authority still requires an unclaimed original.
     /// Exact own-claim disposal below grants only a negative, never a claim.
     fn matches_retained_admission(&self, admitted: &AdmittedInstanceCall) -> bool {

@@ -2095,7 +2095,6 @@ impl MachineScene {
             .map(|record| record.feed.reduced())
             .collect()
     }
-
 }
 
 /// Same decoded DISCOVERY transport as the production reader, scoped to an
@@ -10745,6 +10744,31 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
             "the admitted call prepares; the failed call waits"
         );
     }
+    // Negative control for the voided-claim route: before any void,
+    // the retained original keeps the admission claimable, so the
+    // predicate stays false.
+    let pre_void_admission = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .admission_voided(&pre_void_admission),
+        "no void has wiped a retained original before the break"
+    );
     let grant = fixture
         .machine
         .retained_drain_grant_for_test()
@@ -10857,7 +10881,8 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
     // S1 with a counted gap instead of latching the whole lane.
     let disposed_before = fixture.disposed_total();
     let api_before = fixture.api_returns_total();
-    let mut reduced_before = fixture.reduced();
+    let direct_fallback_before = fixture.direct_fallback_total();
+    let reduced_before: u64 = fixture.reduced().iter().sum();
     fixture
         .scene
         .real
@@ -10876,7 +10901,9 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
             }
             Ok(_) => {}
             Err(reason) => panic!(
-                "the post-void quantum stopped the lane at {reason:?}; the voided pre-void claim must be retained as plain S1"
+                "the post-void quantum stopped the lane at {reason:?} ({:?}, staging {:?}); the voided pre-void claim must be retained as plain S1",
+                fixture.machine.latched_phase_label(),
+                fixture.machine.staging_detail_for_test(),
             ),
         }
     }
@@ -10891,6 +10918,20 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         fixture.machine.disposition_reason(),
         fixture.machine.latched_phase_label()
     );
+    // The idle void wiped the collected original and fenced its
+    // position, so the same admission is a voided pre-void claim (the
+    // positive side of the route the claim step took above).
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .admission_voided(&pre_void_admission),
+        "the idle void fenced the collected original"
+    );
     // Both calls were applied: the orphaned pre-void call as plain
     // S1 (its observed return is kept) and the fresh post-void call
     // on its feed.
@@ -10899,13 +10940,17 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         api_before + 2,
         "the orphaned call is kept as plain S1 and the post-void call is delivered"
     );
+    assert_eq!(
+        fixture.direct_fallback_total(),
+        direct_fallback_before + 1,
+        "the orphan is counted once as a call reduced S1-direct without Joint evidence"
+    );
     // The post-void call still stages on the Joint feed and replays
     // when the pending void closes its segment; the plain S1 orphan
-    // never enters Joint staging.
-    reduced_before[0] += 1;
+    // never enters Joint staging (it adds a new S1-only record).
     assert_eq!(
-        fixture.reduced(),
-        reduced_before,
+        fixture.reduced().iter().sum::<u64>(),
+        reduced_before + 1,
         "the post-void call replays once when the void rides"
     );
     // The idle drop still disposed the stranded staging as counted
@@ -10926,10 +10971,9 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
             )
         })
         .collect();
-    assert_eq!(stranded_after.len(), 1);
     assert!(
-        stranded_after[0].0 == 0,
-        "the idle drop disposed the stranded staging: {stranded_after:?}"
+        stranded_after.iter().all(|feed| feed.0 == 0),
+        "no feed keeps staged calls after the publish: {stranded_after:?}"
     );
     assert_eq!(
         fixture.disposed_total(),
@@ -10947,9 +10991,13 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
             .is_none(),
         "the void rode the post-void frame"
     );
-    assert!(
-        stranded_after[0].1 == FeedMode::S1Only && stranded_after[0].2.is_some(),
-        "the void closed the feed's segment at its fence: {stranded_after:?}"
+    assert_eq!(
+        stranded_after
+            .iter()
+            .filter(|feed| feed.1 == FeedMode::S1Only && feed.2.is_some())
+            .count(),
+        1,
+        "the void closed exactly the Joint feed's segment at its fence: {stranded_after:?}"
     );
     // The lost per-key detail is one counted named gap, not a
     // stopped view.
@@ -10975,8 +11023,7 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
     );
     let (gap, repeats) = retained[0];
     assert_eq!(
-        gap.subject,
-        "Joint key operations unavailable; retained S1",
+        gap.subject, "Joint key operations unavailable; retained S1",
         "the gap keeps the Joint-unavailable subject"
     );
     assert!(

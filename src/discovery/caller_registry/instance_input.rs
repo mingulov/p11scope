@@ -1056,6 +1056,7 @@ impl AdmittedInstanceCall {
             object: None,
             joint_resource: None,
             collected_origin: None,
+            plain_s1: false,
         }
     }
 }
@@ -1221,6 +1222,11 @@ pub(crate) struct AdmittedInstanceCall {
     /// consulted to decide admission, coverage or semantic attribution.
     joint_resource: Option<JointResourceOrigin>,
     collected_origin: Option<crate::semantics_objects::journal::joint_driver::CollectedCallOrigin>,
+    /// The retained journal original this admission named was wiped by a
+    /// void before its claim: the call is observed history that can no
+    /// longer be certified, so it reduces as plain S1 (its observed
+    /// return is kept) with a counted gap, never refuses the lane.
+    plain_s1: bool,
 }
 
 impl fmt::Debug for AdmittedInstanceCall {
@@ -1303,6 +1309,21 @@ impl AdmittedInstanceCall {
 
     pub(crate) fn joint_resource_origin(&self) -> Option<&JointResourceOrigin> {
         self.joint_resource.as_ref()
+    }
+
+    /// Whether this admission's retained H8 original was wiped by a
+    /// void before its claim: the call keeps its observed return as
+    /// plain S1, so claiming never consoles the whole semantic lane
+    /// for one orphaned pre-void admission.
+    pub(crate) fn plain_s1(&self) -> bool {
+        self.plain_s1
+    }
+
+    /// Route this voided pre-void admission to plain S1. Set only by
+    /// the claim step, after the adapter proved the exact original was
+    /// voided; no other path may clear a Joint evidence claim.
+    pub(crate) fn retain_as_plain_s1(&mut self) {
+        self.plain_s1 = true;
     }
 
     /// Journal per-call authority (H8): this admitted call's
@@ -3394,15 +3415,21 @@ impl CallerRegistry {
         input: &AdmittedInstanceCall,
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> Result<u64, crate::semantics_edge::resources::SemanticResourceRefusal> {
-        let mut joint = self
-            .instance_state
-            .semantics
-            .get(&id)
-            .expect("retained edge")
-            .feed
-            .mode()
-            == FeedMode::Joint;
+        // A voided pre-void admission is observed history that can no
+        // longer be certified: it reduces as plain S1 (keeping its
+        // return) beside the feed's normal calls, never as a Joint
+        // stage whose wiped H8 the next delivery would refuse.
+        let mut joint = !input.plain_s1()
+            && self
+                .instance_state
+                .semantics
+                .get(&id)
+                .expect("retained edge")
+                .feed
+                .mode()
+                == FeedMode::Joint;
         if !joint
+            && !input.plain_s1()
             && ledger.is_some()
             && crate::semantics_key_use::is_clean_point(&input.facts.function)
         {
@@ -3555,6 +3582,37 @@ impl CallerRegistry {
                     fallback_refused =
                         self.fallback_joint_for_order(id, input.caller, "no_owner", None);
                 }
+            }
+        }
+        if input.plain_s1() {
+            // Counted once as a call reduced S1-direct without Joint
+            // evidence. A later plain-S1 call must not overtake calls
+            // still awaiting their seals: fall back in order first
+            // (counted and named), then reduce this call direct below.
+            self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
+            let queued = self
+                .instance_state
+                .semantics
+                .get(&id)
+                .expect("retained edge")
+                .feed
+                .mode()
+                == FeedMode::Joint
+                && self
+                    .instance_state
+                    .semantics
+                    .get(&id)
+                    .expect("retained edge")
+                    .feed
+                    .staged_len()
+                    > 0;
+            if queued {
+                fallback_refused = self.fallback_joint_for_order(
+                    id,
+                    input.caller,
+                    "voided_admission",
+                    ledger.as_deref_mut(),
+                );
             }
         }
         // S1Only-direct reduction with effects into the shared
@@ -4330,6 +4388,7 @@ pub(crate) fn admit_call_from_evidence(
         joint_resource: evidence
             .joint_resource
             .filter(|origin| origin.matches_native(evidence.domain)),
+        plain_s1: false,
     })
 }
 
@@ -4614,6 +4673,7 @@ mod reference {
             object: None,
             joint_resource: None,
             collected_origin: None,
+            plain_s1: false,
         }
     }
     pub(crate) enum Scope {

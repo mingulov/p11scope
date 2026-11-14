@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::attach::SessionDrainProducers;
-use crate::discovery::caller_registry::CallerRegistry;
+use crate::discovery::caller_registry::{CallerRegistry, RegistryGap};
 use crate::inventory_semantics::{JointCommitIo, JointContinuationView, RetainedJointBirths};
 use crate::semantics_objects::journal::joint_audit::{
     DeliverDiagnosis, DisposedJointQuantum, IngestedJointQuantum, JointBirthEvidenceSource,
@@ -902,6 +902,14 @@ impl PreparedAdmission {
     }
 }
 
+/// One claim-scan step: the next claim, plus the batch's one-shot
+/// disclosure of admissions routed to plain S1 because a void wiped
+/// their retained original.
+pub(super) struct ClaimStep {
+    pub(super) claim: Option<PreparedClaim>,
+    pub(super) voided_s1: Option<u64>,
+}
+
 pub(super) struct PreparedH3 {
     pub(super) negatives: Vec<LaneNegative>,
     pub(super) staged_positions: Vec<Option<u64>>,
@@ -922,6 +930,11 @@ pub(crate) struct PreparedSemanticBatch {
     claim_cursor: usize,
     stage_cursor: usize,
     births_decided: bool,
+    /// Admissions whose retained H8 original a void wiped before the
+    /// claim; they reduce as plain S1 instead of refusing the lane.
+    voided_s1: u64,
+    /// The batch staged its one counted disclosure for `voided_s1`.
+    voided_s1_disclosed: bool,
     // Buffers and nested owned payloads drop before their retained charge.
     storage: Option<ResourceLease>,
     /// Test-only legacy switch: file fingerprint claims even without
@@ -958,6 +971,8 @@ impl PreparedSemanticBatch {
             claim_cursor: 0,
             stage_cursor: 0,
             births_decided: false,
+            voided_s1: 0,
+            voided_s1_disclosed: false,
             storage: None,
             #[cfg(test)]
             test_legacy_claims: false,
@@ -1057,17 +1072,30 @@ impl PreparedSemanticBatch {
         adapter: &mut JournalAdapter,
         ingested: &IngestedRaw,
         journal_feed: bool,
-    ) -> Result<Option<PreparedClaim>, RawQuantumRefusal> {
+    ) -> Result<ClaimStep, RawQuantumRefusal> {
         #[cfg(test)]
         let journal_feed = journal_feed || self.test_legacy_claims;
         let mut next = self.claim_cursor;
         while let Some(entry) = self.entries.get_mut(next) {
             // Conversion refusals need no journal claim. Their original
             // positions remain owned until the staging/refusal cursor moves.
-            if let Some(Ok(input)) = &entry.input {
+            if let Some(Ok(input)) = &mut entry.input {
                 if !ingested.matches_admission(input)
                     && !ingested.matches_retained_admission(input, adapter)
                 {
+                    // A void may have wiped this admission's retained
+                    // original after it was observed. Observed history
+                    // that can no longer be certified still counts:
+                    // retain the call as plain S1 with a counted gap
+                    // instead of refusing the whole semantic lane. Any
+                    // other mismatch (a replay, a duplicate or a
+                    // fenceless foreign original) stays a claim refusal.
+                    if ingested.admission_voided(input, adapter) {
+                        input.retain_as_plain_s1();
+                        self.voided_s1 = self.voided_s1.saturating_add(1);
+                        next += 1;
+                        continue;
+                    }
                     return Err(RawQuantumRefusal::Admission);
                 }
                 // Without a journal BEGIN feed no fingerprint claim can
@@ -1086,13 +1114,32 @@ impl PreparedSemanticBatch {
                     "each actual original claim is retained once"
                 );
                 entry.claim = Some(claim);
+                let token = entry.token;
                 self.claim_cursor = next + 1;
-                return Ok(Some((entry.token, claim)));
+                let step = self.claim_step(Some((token, claim)));
+                return Ok(step);
             }
             next += 1;
         }
         self.claim_cursor = next;
-        Ok(None)
+        Ok(self.claim_step(None))
+    }
+
+    /// The batch's one-shot disclosure, released exactly when the claim
+    /// scan reaches its end: how many admissions a void forced to plain
+    /// S1. A mid-scan claim keeps the count for the final step, so one
+    /// batch stages one counted gap however its claims interleave.
+    fn claim_step(&mut self, claim: Option<PreparedClaim>) -> ClaimStep {
+        let voided_s1 = if self.claim_cursor == self.entries.len()
+            && self.voided_s1 > 0
+            && !self.voided_s1_disclosed
+        {
+            self.voided_s1_disclosed = true;
+            Some(self.voided_s1)
+        } else {
+            None
+        };
+        ClaimStep { claim, voided_s1 }
     }
 
     pub(super) fn dispose_claims_s1(&mut self) {
@@ -1306,7 +1353,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(RawQuantumRefusal::Admission);
         }
         for entry in &batch.entries {
+            // A voided pre-void admission is claimed as plain S1, not
+            // Joint evidence: it stages no birth and names no original.
             if let Some(Ok(input)) = &entry.input
+                && !input.plain_s1()
                 && (entry.claim.is_none()
                     || entry.token != input.h0_ordinal()
                     || (!ingested.matches_admission(input)
@@ -1694,7 +1744,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if batch.domain != producers.native_domain() {
             return Err(RawQuantumRefusal::ForeignCapture);
         }
-        batch.claim_next(adapter, ingested, producers.journal_linked())
+        let step = batch.claim_next(adapter, ingested, producers.journal_linked())?;
+        if let Some(retained) = step.voided_s1 {
+            // The lost per-key detail is disclosed as one counted gap;
+            // the calls themselves stay as plain S1 evidence.
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "Joint key operations unavailable; retained S1".into(),
+                reason: format!(
+                    "joint_void_stashed_claim_history_loss ({retained} call(s) retained S1)"
+                ),
+                budget: None,
+            });
+        }
+        Ok(step.claim)
     }
 
     /// Test-only legacy switch for the pending batch: file fingerprint
@@ -1782,6 +1847,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // journal rows stage S1 directly. Associated originals still
         // take the strict disposition below.
         if let Some(Ok(input)) = batch.entries[batch.stage_cursor].input.as_ref()
+            && !input.plain_s1()
             && input.joint_resource_origin().is_some()
             && self.registry.admitted_feed_is_s1only(input)
             && crate::kinds::function_id(&input.s1_facts().function)

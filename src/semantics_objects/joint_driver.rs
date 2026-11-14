@@ -580,6 +580,20 @@ impl IngestedRaw {
             && adapter.matches_retained_admission(admitted)
     }
 
+    /// Whether a void wiped this admission's retained original before the
+    /// claim: a same-domain collected admission whose exact H8 invocation
+    /// is no longer retained after a void. The claim step retains such an
+    /// orphan as plain S1 with a counted gap, preserving the observed
+    /// call instead of stopping the lane.
+    pub(crate) fn admission_voided(
+        &self,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        adapter: &JournalAdapter,
+    ) -> bool {
+        admitted.journal_binding().0 == self.raw.producers.native_domain()
+            && adapter.admission_voided(admitted)
+    }
+
     pub(crate) fn disposition_s1only_original<'adapter, 'input>(
         &self,
         adapter: &'adapter mut JournalAdapter,

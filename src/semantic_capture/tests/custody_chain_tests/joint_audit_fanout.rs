@@ -11459,6 +11459,35 @@ impl MachineScene {
             .sum()
     }
 
+    /// Calls the registry reduced S1-direct without Joint evidence,
+    /// counted as not attributed (`joint_direct_fallback`).
+    fn direct_fallback_total(&self) -> u64 {
+        self.scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_direct_fallback()
+    }
+
+    /// Every per-call counter a re-arm's accounting moves, summed over
+    /// the retained feeds: S1 returns, reduced, disposed, fallback
+    /// replays, staged depth, the registry's not-attributed direct
+    /// fallbacks, and the unknown-key terminals.
+    fn call_accounting(&self) -> (u64, u64, u64, u64, usize, u64, [u64; 4]) {
+        let registry = self.scene.real.scene.coordinator.registry();
+        let edges = || registry.instance_semantic_edges();
+        (
+            self.api_returns_total(),
+            edges().map(|record| record.feed.reduced()).sum(),
+            self.disposed_total(),
+            edges().map(|record| record.feed.fallback_replayed()).sum(),
+            self.staged_total(),
+            self.direct_fallback_total(),
+            self.unknown_terminals(),
+        )
+    }
+
     /// Whether the coordinator still holds an untaken H3 disposition.
     fn h3_pending(&self) -> bool {
         self.scene
@@ -11527,6 +11556,7 @@ fn joint_machine_running_auditing_refusal_rearms_and_next_quantum_publishes() {
     let baseline_returns = fixture.api_returns_total();
     let reduced = fixture.reduced_for(0);
     let disposed_prime = fixture.disposed_total();
+    let direct_prime = fixture.direct_fallback_total();
     let unknown_before = fixture.unknown_terminals();
     let pid = std::process::id();
     fixture.scene.push(pid, 0, "C_SignInit", 2);
@@ -11591,10 +11621,19 @@ fn joint_machine_running_auditing_refusal_rearms_and_next_quantum_publishes() {
         baseline_returns + 4,
         "S1 joins every call including the abandoned three"
     );
+    // The cancelled publication kept its staged registry facts; they
+    // apply with the recovery after the void, so the abandoned calls
+    // count S1-direct as not attributed (never reduced as key rows).
     assert_eq!(
-        fixture.reduced_for(0) - reduced + (fixture.disposed_total() - disposed_prime),
+        fixture.reduced_for(0) - reduced
+            + (fixture.disposed_total() - disposed_prime)
+            + (fixture.direct_fallback_total() - direct_prime),
         fixture.api_returns_total() - baseline_returns,
-        "reduced and disposed calls cover every call across the re-arm"
+        "reduced, disposed and not-attributed calls cover every call across the re-arm"
+    );
+    assert!(
+        fixture.direct_fallback_total() > direct_prime,
+        "the abandoned calls count as not attributed"
     );
     let unknown_after = fixture.unknown_terminals();
     assert_eq!(
@@ -11636,6 +11675,7 @@ fn joint_machine_auditing_pool_refusal_rearms_bound_demand_as_published() {
     let baseline_returns = fixture.api_returns_total();
     let reduced = fixture.reduced_for(0);
     let disposed_prime = fixture.disposed_total();
+    let direct_prime = fixture.direct_fallback_total();
     fixture
         .scene
         .push(std::process::id(), 0, "C_CreateObject", 2);
@@ -11694,9 +11734,11 @@ fn joint_machine_auditing_pool_refusal_rearms_bound_demand_as_published() {
     assert!(!fixture.scene.real.scene.coordinator.publication_pending());
     fixture.assert_recovers("after auditing pool re-arm", 3);
     assert_eq!(
-        fixture.reduced_for(0) - reduced + (fixture.disposed_total() - disposed_prime),
+        fixture.reduced_for(0) - reduced
+            + (fixture.disposed_total() - disposed_prime)
+            + (fixture.direct_fallback_total() - direct_prime),
         fixture.api_returns_total() - baseline_returns,
-        "reduced and disposed calls cover every call across the re-arm"
+        "reduced, disposed and not-attributed calls cover every call across the re-arm"
     );
     assert_eq!(fixture.api_returns_total(), baseline_returns + 2);
 }
@@ -11788,6 +11830,50 @@ fn joint_machine_auditing_and_audited_rearms_share_the_bound() {
             .count(),
         limit as usize,
         "one named gap per re-arm inside the bound"
+    );
+}
+
+/// Equivalence twin: a re-arm at the audit step leaves every per-call
+/// count exactly where an Audited re-arm of the same unapplied quantum
+/// leaves it, after the latch, the re-arm and the recovery publish.
+/// Taking the untaken H3 slot and dropping the unaudited quantum adds
+/// no loss, drop or double count over the reviewed Audited path.
+#[test]
+fn joint_machine_auditing_rearm_accounts_like_an_audited_rearm() {
+    let run = |phase: &str| {
+        let mut fixture = MachineScene::new(1);
+        fixture.prime(1);
+        let pid = std::process::id();
+        fixture.scene.push(pid, 0, "C_SignInit", 2);
+        fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+        fixture.scene.push(pid, 0, "C_SignFinal", 4);
+        fixture.reach_phase(phase);
+        fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+        assert_eq!(fixture.service(1024), Err(SemanticRefusal::Unavailable));
+        assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, phase);
+        let latched = fixture.call_accounting();
+        assert_eq!(
+            fixture.rearm("semantic_unavailable"),
+            Some(false),
+            "{phase} re-arms"
+        );
+        assert!(!fixture.h3_pending(), "{phase} leaves no untaken H3 slot");
+        let rearmed = fixture.call_accounting();
+        fixture.assert_recovers(phase, 5);
+        (latched, rearmed, fixture.call_accounting())
+    };
+    let audited = run("Audited");
+    let auditing = run("Auditing");
+    assert_eq!(
+        auditing, audited,
+        "the audit-step re-arm accounts every call like the Audited re-arm"
+    );
+    let (_, _, (api, reduced, disposed, _, staged, direct, _)) = auditing;
+    assert_eq!(staged, 0, "nothing stays staged");
+    assert_eq!(
+        api,
+        reduced + disposed + direct,
+        "every S1 return is reduced, disposed or counted not attributed"
     );
 }
 

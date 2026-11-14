@@ -474,6 +474,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         )
     }
 
+    /// Take the H3 disposition an ingested quantum's refused audit left
+    /// untaken, exactly as that audit would have taken it (one take per
+    /// audit, `JournalAuditReceipt::collect`). The running re-arm at the
+    /// audit step then holds the same finalizer state an Audited re-arm
+    /// leaves when it drops its audited frame; without this take every
+    /// later preparation refuses (`h3_pending` gates it). The evidence
+    /// carries positions, not calls: every call of the quantum is
+    /// counted through its staged registry facts and the next collect's
+    /// unlocalized void. Only the retained Session's own producers take
+    /// it; returns whether a disposition was taken.
+    pub(crate) fn take_unaudited_joint_h3(&mut self, producers: &SessionDrainProducers) -> bool {
+        let Some(state) = self.semantic_finalizer.as_mut() else {
+            return false;
+        };
+        if state.domain != producers.native_domain()
+            || state.h3_pending.is_none()
+            || state
+                .producers
+                .as_ref()
+                .is_some_and(|held| !held.same_producers(producers))
+        {
+            return false;
+        }
+        let mut finalizer = SessionH3Finalizer { state, producers };
+        // The taken evidence is discarded, as an Audited re-arm discards
+        // its frame's audit receipt.
+        let _taken = crate::semantics_objects::journal::H3EvidenceSource::take_h3_disposition(
+            &mut finalizer,
+        );
+        true
+    }
+
     #[cfg_attr(not(test), allow(dead_code))] // The actual Session machine consumes this staged negative port later.
     #[allow(clippy::result_large_err)] // Preserve the same original negative buffers on refusal.
     pub(crate) fn audit_disposed_quantum(

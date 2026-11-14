@@ -77,8 +77,8 @@ pub(crate) enum RunningRearmRefusal {
     /// current latch has the admittable shape. The refusal came
     /// from outside the audited pass: the unlinked discovery reader
     /// stops the lane without an eligibility check, so it can latch
-    /// at Audited with the frame held. This names that outside
-    /// refusal.
+    /// at the audit step (Auditing, or Audited with the frame held).
+    /// This names that outside refusal.
     Consumed,
     /// The latched refusal is permanent, not the transient
     /// `Unavailable` a re-arm admits.
@@ -90,7 +90,8 @@ pub(crate) enum RunningRearmRefusal {
     /// The Audited phase kept no frame to abandon.
     FrameMissing,
     /// The latch sits at a phase the abandon cannot dispose in
-    /// full: only an Audited refusal re-arms.
+    /// full: only a refusal at the audit step (Auditing or Audited)
+    /// re-arms.
     WrongPhase,
     /// The per-run re-arm bound is spent. The stop gap renders
     /// this as the count sentence, not [`Self::describe`].
@@ -1621,12 +1622,16 @@ impl LiveJointMachine {
             .note_h0_merge(before, has_pending_scans, has_future_job, has_hold)
     }
 
-    /// The one latched shape a running re-arm admits: an `Unavailable`
-    /// refusal at Audited, outside any Finish and without a no-progress
-    /// trip, with the retained frame still held. The exit abandon
-    /// disposes exactly that custody in full (the frame through
-    /// `abandon_unfinished_joint_publication`); every other phase keeps
-    /// Raw/H8/report custody no running path may drop or replay.
+    /// The latched shapes a running re-arm admits: an `Unavailable`
+    /// refusal at the audit step, outside any Finish and without a
+    /// no-progress trip — at Audited with the retained frame still
+    /// held, or at Auditing (the audit refused before it ran, holding
+    /// the ingested quantum and its untaken H3 disposition). The
+    /// re-arm disposes exactly that custody in full (the frame through
+    /// `abandon_unfinished_joint_publication`; the unaudited quantum by
+    /// taking its H3 slot as the audit would and dropping it); every
+    /// other phase keeps Raw/H8/report custody no running path may drop
+    /// or replay.
     fn running_rearm_shape(&self, reason: SemanticRefusal) -> bool {
         self.running_rearm_shape_refusal(reason).is_none()
     }
@@ -1647,6 +1652,7 @@ impl LiveJointMachine {
         match self.phase {
             Some(Phase::Audited { frame: Some(_), .. }) => None,
             Some(Phase::Audited { .. }) => Some(RunningRearmRefusal::FrameMissing),
+            Some(Phase::Auditing { .. }) => None,
             _ => Some(RunningRearmRefusal::WrongPhase),
         }
     }
@@ -1685,7 +1691,7 @@ impl LiveJointMachine {
             // pass (the unlinked discovery reader stops the lane
             // without an eligibility check): the current shape still
             // fails, so it names the cause; a passing shape here is
-            // that outside refusal at Audited with the frame held.
+            // that outside refusal at the audit step.
             let refusal = self
                 .running_rearm_shape_refusal(latched)
                 .unwrap_or(RunningRearmRefusal::Consumed);
@@ -1733,6 +1739,18 @@ impl LiveJointMachine {
         // verifies against exactly its own history. An unapplied
         // abandon staged nothing, so this is a no-op there.
         coordinator.drop_abandoned_joint_staged();
+        // A refusal at Auditing came before the audit ran: the machine
+        // still holds the ingested quantum, and the coordinator its
+        // untaken H3 disposition. Take that slot exactly as the audit
+        // would have, so the finalizer matches an Audited re-arm's
+        // dropped frame; the ingested quantum drops with the phase
+        // below. Its calls stay counted (the cancelled publication kept
+        // their staged registry facts) and its journal custody is
+        // voided, named, by the next collect, like any abandoned
+        // quantum. An Audited frame already took its slot.
+        if matches!(self.phase, Some(Phase::Auditing { .. })) {
+            coordinator.take_unaudited_joint_h3(&self.producers);
+        }
         if self.producers.journal_linked() {
             coordinator
                 .joint_capture_mut()

@@ -2025,6 +2025,9 @@ fn run_with_terminal_budget(
     // emits its own copy (it returns before this tail).
     if crate::cli::text_is_verbose() {
         let voids = coordinator.joint_void_diagnosis();
+        let skip_eras = semantic_lane
+            .as_ref()
+            .map_or(0, |lane| lane.semantic_skip_eras());
         inventory_diagnostic(&crate::inventory_semantics::joint_voids_line(
             voids.break_dispose,
             voids.break_ingest,
@@ -2035,6 +2038,16 @@ fn run_with_terminal_budget(
             voids.keys_refused,
             voids.keys_tainted,
             voids.keys_pending,
+            voids.audit_fault_changed_chain,
+            voids.audit_fault_changed_reread,
+            voids.audit_h3_loss,
+            voids.audit_discarded,
+            voids.audit_malformed,
+            voids.audit_counter_unprovable,
+            voids.audit_fault_unreadable,
+            voids.audit_resource_unavailable,
+            skip_eras,
+            voids.voids_ended_joint_feed,
         ));
     }
     // Output attempts first; only then may an unsettled retirement's drop
@@ -9066,6 +9079,9 @@ fn run_dashboard(
     // before the classic tail, so it emits its own copy here.
     if crate::cli::text_is_verbose() {
         let voids = coordinator.joint_void_diagnosis();
+        let skip_eras = semantic_lane
+            .as_ref()
+            .map_or(0, |lane| lane.semantic_skip_eras());
         display.notice(&crate::inventory_semantics::joint_voids_line(
             voids.break_dispose,
             voids.break_ingest,
@@ -9076,6 +9092,16 @@ fn run_dashboard(
             voids.keys_refused,
             voids.keys_tainted,
             voids.keys_pending,
+            voids.audit_fault_changed_chain,
+            voids.audit_fault_changed_reread,
+            voids.audit_h3_loss,
+            voids.audit_discarded,
+            voids.audit_malformed,
+            voids.audit_counter_unprovable,
+            voids.audit_fault_unreadable,
+            voids.audit_resource_unavailable,
+            skip_eras,
+            voids.voids_ended_joint_feed,
         ));
     }
     // Output attempts first (R-C51-4), silent text: the live view showed it.

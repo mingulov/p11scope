@@ -966,6 +966,21 @@ pub(crate) struct JointVoidCounts {
     /// Seal endings refused at the void-fence check (receipt cut below
     /// the fence is the refusing cause).
     pub(crate) seal_below_fence: u64,
+    /// Audit voids by sub-cause (scope round): the `void_audit` total
+    /// split by the gap that voided. The two `fault_changed` buckets
+    /// split further by site (chain check vs seal-time re-read); the
+    /// eight buckets sum to `void_audit`.
+    pub(crate) audit_fault_changed_chain: u64,
+    pub(crate) audit_fault_changed_reread: u64,
+    pub(crate) audit_h3_loss: u64,
+    pub(crate) audit_discarded: u64,
+    pub(crate) audit_malformed: u64,
+    pub(crate) audit_counter_unprovable: u64,
+    pub(crate) audit_fault_unreadable: u64,
+    pub(crate) audit_resource_unavailable: u64,
+    /// Voids that ended at least one Joint feed (scope round): counted
+    /// once per void no matter how many feeds it ended.
+    pub(crate) voids_ended_joint_feed: u64,
 }
 
 /// Diagnostic-only Joint void telemetry (Task 0): where stream breaks
@@ -994,6 +1009,20 @@ pub(crate) struct JointVoidDiagnosis {
     /// Seal endings refused at the void-fence check (receipt cut below
     /// the fence is the refusing cause).
     pub(crate) seal_below_fence: u64,
+    /// Audit voids by sub-cause (scope round): the `void_audit` total
+    /// split by the gap that voided; the eight buckets sum to
+    /// `void_audit`.
+    pub(crate) audit_fault_changed_chain: u64,
+    pub(crate) audit_fault_changed_reread: u64,
+    pub(crate) audit_h3_loss: u64,
+    pub(crate) audit_discarded: u64,
+    pub(crate) audit_malformed: u64,
+    pub(crate) audit_counter_unprovable: u64,
+    pub(crate) audit_fault_unreadable: u64,
+    pub(crate) audit_resource_unavailable: u64,
+    /// Voids that ended at least one Joint feed (scope round): counted
+    /// once per void no matter how many feeds it ended.
+    pub(crate) voids_ended_joint_feed: u64,
     /// Keys currently retained.
     pub(crate) keys_total: u64,
     /// Keys with the refused flag set.
@@ -1320,6 +1349,22 @@ pub(crate) struct JournalAdapter {
     /// Diagnostic-only below-fence seal endings (Task 0): seals refused
     /// at the void-fence check. Saturating; instrumentation only.
     seal_below_fence: u64,
+    /// Diagnostic-only audit-void split (scope round): the `void_audit`
+    /// total by voiding gap, with `fault_changed` split further by site
+    /// (chain check vs seal-time re-read). Saturating; instrumentation
+    /// only, never authority.
+    audit_fault_changed_chain: u64,
+    audit_fault_changed_reread: u64,
+    audit_h3_loss: u64,
+    audit_discarded: u64,
+    audit_malformed: u64,
+    audit_counter_unprovable: u64,
+    audit_fault_unreadable: u64,
+    audit_resource_unavailable: u64,
+    /// Diagnostic-only voids that ended at least one Joint feed (scope
+    /// round): one per void however many feeds it ended. Saturating;
+    /// instrumentation only, never authority.
+    voids_ended_joint_feed: u64,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
@@ -1476,6 +1521,15 @@ impl JournalAdapter {
             void_audit: 0,
             void_resync: 0,
             seal_below_fence: 0,
+            audit_fault_changed_chain: 0,
+            audit_fault_changed_reread: 0,
+            audit_h3_loss: 0,
+            audit_discarded: 0,
+            audit_malformed: 0,
+            audit_counter_unprovable: 0,
+            audit_fault_unreadable: 0,
+            audit_resource_unavailable: 0,
+            voids_ended_joint_feed: 0,
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
@@ -2362,6 +2416,15 @@ impl JournalAdapter {
             void_audit: self.void_audit,
             void_resync: self.void_resync,
             seal_below_fence: self.seal_below_fence,
+            audit_fault_changed_chain: self.audit_fault_changed_chain,
+            audit_fault_changed_reread: self.audit_fault_changed_reread,
+            audit_h3_loss: self.audit_h3_loss,
+            audit_discarded: self.audit_discarded,
+            audit_malformed: self.audit_malformed,
+            audit_counter_unprovable: self.audit_counter_unprovable,
+            audit_fault_unreadable: self.audit_fault_unreadable,
+            audit_resource_unavailable: self.audit_resource_unavailable,
+            voids_ended_joint_feed: self.voids_ended_joint_feed,
         }
     }
 
@@ -2391,6 +2454,15 @@ impl JournalAdapter {
             void_audit: counts.void_audit,
             void_resync: counts.void_resync,
             seal_below_fence: counts.seal_below_fence,
+            audit_fault_changed_chain: counts.audit_fault_changed_chain,
+            audit_fault_changed_reread: counts.audit_fault_changed_reread,
+            audit_h3_loss: counts.audit_h3_loss,
+            audit_discarded: counts.audit_discarded,
+            audit_malformed: counts.audit_malformed,
+            audit_counter_unprovable: counts.audit_counter_unprovable,
+            audit_fault_unreadable: counts.audit_fault_unreadable,
+            audit_resource_unavailable: counts.audit_resource_unavailable,
+            voids_ended_joint_feed: counts.voids_ended_joint_feed,
             keys_total: self.keys.len() as u64,
             keys_refused: refused,
             keys_tainted: tainted,
@@ -13234,6 +13306,242 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_audit_void_split_counts_each_subcause() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // Scope-round instrumentation: each reject_audit void gap counts in
+        // its own split bucket. One fresh scene per gap; the H3Loss leg
+        // mirrors object_journal_audit_void_counts_audit_not_breaks (shed
+        // setup plus scripted_h0 loss), the rest use the minimal seal setup
+        // since the audit check voids before any domain check runs.
+        fn split(scene: &Scene) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+            let after = scene.adapter.joint_void_diagnosis();
+            (
+                after.audit_fault_changed_chain,
+                after.audit_fault_changed_reread,
+                after.audit_h3_loss,
+                after.audit_discarded,
+                after.audit_malformed,
+                after.audit_counter_unprovable,
+                after.audit_fault_unreadable,
+                after.audit_resource_unavailable,
+                after.void_audit,
+            )
+        }
+        // (gap, craft): craft mutates a clean scene audit into this gap's
+        // evidence. FaultChanged moves within one collection (chain).
+        let cases: [(JournalGap, fn(&mut JournalAuditReceipt)); 6] = [
+            (JournalGap::FaultChanged, |audit| audit.fault_after = 8),
+            (JournalGap::Malformed, |audit| audit.malformed_delta = 1),
+            (JournalGap::Discarded, |audit| audit.discarded_delta = 1),
+            (
+                JournalGap::CounterUnprovable,
+                |audit| audit.counter_error = true,
+            ),
+            (
+                JournalGap::FaultUnreadable,
+                |audit| audit.fault_error = Some(FaultReadError::Unreadable),
+            ),
+            (
+                JournalGap::ResourceUnavailable,
+                |audit| audit.resource_refused = true,
+            ),
+        ];
+        for (gap, craft) in cases {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let create = function_id("C_CreateObject");
+            let begin = begin_bytes(1, 1, create, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+            let bootstrap = scene.bootstrap(proof, 0);
+            let frontier = scene.adapter.consumed_frontier();
+            let mut audit = scene.audit();
+            craft(&mut audit);
+            let failure = scene
+                .seal_explicit(
+                    &audit,
+                    &bootstrap,
+                    frontier,
+                    SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                )
+                .expect_err("crafted audit evidence voids");
+            assert_eq!(failure.gap, gap, "the crafted evidence names its gap");
+            let expected = match gap {
+                JournalGap::FaultChanged => (1, 0, 0, 0, 0, 0, 0, 0, 1),
+                JournalGap::Malformed => (0, 0, 0, 0, 1, 0, 0, 0, 1),
+                JournalGap::Discarded => (0, 0, 0, 1, 0, 0, 0, 0, 1),
+                JournalGap::CounterUnprovable => (0, 0, 0, 0, 0, 1, 0, 0, 1),
+                JournalGap::FaultUnreadable => (0, 0, 0, 0, 0, 0, 1, 0, 1),
+                JournalGap::ResourceUnavailable => (0, 0, 0, 0, 0, 0, 0, 1, 1),
+                _ => unreachable!("table holds void gaps only"),
+            };
+            assert_eq!(
+                split(&scene),
+                expected,
+                "the {gap:?} void counts in its own bucket only"
+            );
+        }
+        // H3Loss needs the shed setup plus a scripted loss barrier.
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        assert_eq!(
+            split(&scene),
+            (0, 0, 1, 0, 0, 0, 0, 0, 1),
+            "the H3Loss void counts in its own bucket only"
+        );
+    }
+
+    #[test]
+    fn object_journal_audit_void_fault_changed_split_pins_chain_vs_reread() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // The FaultChanged site split: a move the collection audit sees
+        // (within one collection or between two) counts as chain, while a
+        // move only the seal-time re-read sees counts as reread. The
+        // seal-path re-read shape (baseline pinned, audit clean, cell moved)
+        // is pinned end-to-end by the fanout twin; here the audit-time
+        // re-read plus both chain shapes land through real seals.
+        fn split(scene: &Scene) -> (u64, u64, u64) {
+            let after = scene.adapter.joint_void_diagnosis();
+            (
+                after.audit_fault_changed_chain,
+                after.audit_fault_changed_reread,
+                after.void_audit,
+            )
+        }
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("clean seal pins the baseline");
+        assert_eq!(scene.adapter.last_fault, Some(7));
+        // Chain between collections: the audit opens where the last seal did
+        // not close.
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        let failure = scene
+            .seal_explicit(
+                &reaudit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("between-collection move voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert_eq!(
+            split(&scene),
+            (1, 0, 1),
+            "the between-collection move counts as chain"
+        );
+        // Audit-time re-read on the pinned baseline: the collection is clean
+        // but the seal-time cell already moved.
+        assert_eq!(scene.adapter.last_fault, Some(8));
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        let moved = ScriptedFaultCell::steady(9);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect_err("seal-time move voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            split(&scene),
+            (1, 1, 2),
+            "the seal-time move counts as reread beside the chain void"
+        );
+        assert_eq!(
+            after.audit_fault_changed_chain
+                + after.audit_fault_changed_reread
+                + after.audit_h3_loss
+                + after.audit_discarded
+                + after.audit_malformed
+                + after.audit_counter_unprovable
+                + after.audit_fault_unreadable
+                + after.audit_resource_unavailable,
+            after.void_audit,
+            "the split buckets sum to the audit-void total"
+        );
+        // Audit-time re-read on a fresh baseline: no pinned epoch, same
+        // bucket.
+        let mut fresh = Scene::new(image_default());
+        let proof = fresh.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        fresh.ingest(&begin);
+        fresh.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = fresh.bootstrap(proof, 0);
+        let frontier = fresh.adapter.consumed_frontier();
+        let audit = fresh.audit();
+        let moved = ScriptedFaultCell::steady(8);
+        let failure = fresh
+            .adapter
+            .seal(
+                &mut fresh.model,
+                &audit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect_err("seal-time move voids on a fresh baseline");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert_eq!(
+            split(&fresh),
+            (0, 1, 1),
+            "the fresh-baseline re-read counts as reread, not chain"
+        );
+    }
+
+    #[test]
     fn object_journal_clean_seal_counts_no_audit_void() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
@@ -13310,8 +13618,9 @@ pub(crate) mod tests {
 
     #[test]
     fn object_journal_void_carry_adopts_all_counters() {
-        // Retirement carry: adopting a counter snapshot moves all five
-        // event counters; the per-key gauges recompute from this
+        // Retirement carry: adopting a counter snapshot moves all event
+        // counters (Task 0 five plus the scope-round audit split and the
+        // feed-ended count); the per-key gauges recompute from this
         // owner's own (empty) retained state instead of being carried.
         let mut scene = Scene::new(image_default());
         let carried = JointVoidCounts {
@@ -13320,6 +13629,15 @@ pub(crate) mod tests {
             void_audit: 7,
             void_resync: 11,
             seal_below_fence: 13,
+            audit_fault_changed_chain: 17,
+            audit_fault_changed_reread: 19,
+            audit_h3_loss: 23,
+            audit_discarded: 29,
+            audit_malformed: 31,
+            audit_counter_unprovable: 37,
+            audit_fault_unreadable: 41,
+            audit_resource_unavailable: 43,
+            voids_ended_joint_feed: 47,
         };
         scene.adapter.carry_joint_void_counts(&carried);
         let after = scene.adapter.joint_void_diagnosis();
@@ -13332,7 +13650,22 @@ pub(crate) mod tests {
                 after.seal_below_fence
             ),
             (3, 5, 7, 11, 13),
-            "the carry adopts every event counter"
+            "the carry adopts every Task 0 event counter"
+        );
+        assert_eq!(
+            (
+                after.audit_fault_changed_chain,
+                after.audit_fault_changed_reread,
+                after.audit_h3_loss,
+                after.audit_discarded,
+                after.audit_malformed,
+                after.audit_counter_unprovable,
+                after.audit_fault_unreadable,
+                after.audit_resource_unavailable,
+                after.voids_ended_joint_feed,
+            ),
+            (17, 19, 23, 29, 31, 37, 41, 43, 47),
+            "the carry adopts every scope-round event counter"
         );
         assert_eq!(
             (

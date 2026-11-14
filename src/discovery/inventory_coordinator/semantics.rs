@@ -7294,6 +7294,15 @@ mod promotion_lifecycle_tests {
             void_audit: 7,
             void_resync: 11,
             seal_below_fence: 13,
+            audit_fault_changed_chain: 17,
+            audit_fault_changed_reread: 19,
+            audit_h3_loss: 23,
+            audit_discarded: 29,
+            audit_malformed: 31,
+            audit_counter_unprovable: 37,
+            audit_fault_unreadable: 41,
+            audit_resource_unavailable: 43,
+            voids_ended_joint_feed: 47,
         };
         coordinator
             .joint_capture_mut()
@@ -7312,7 +7321,22 @@ mod promotion_lifecycle_tests {
                 after.seal_below_fence
             ),
             (3, 5, 7, 11, 13),
-            "retirement carries the void counters to the new owner"
+            "retirement carries the Task 0 void counters to the new owner"
+        );
+        assert_eq!(
+            (
+                after.audit_fault_changed_chain,
+                after.audit_fault_changed_reread,
+                after.audit_h3_loss,
+                after.audit_discarded,
+                after.audit_malformed,
+                after.audit_counter_unprovable,
+                after.audit_fault_unreadable,
+                after.audit_resource_unavailable,
+                after.voids_ended_joint_feed,
+            ),
+            (17, 19, 23, 29, 31, 37, 41, 43, 47),
+            "retirement carries the scope-round void counters to the new owner"
         );
     }
 

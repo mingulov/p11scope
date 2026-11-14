@@ -710,6 +710,11 @@ pub(crate) struct RouterCounters {
     /// Era advances latched by a hook-program miss the capture loop had not
     /// yet covered with a fault raise (a subset of `eras`).
     pub(crate) miss_eras: u64,
+    /// Fault-era advances the capture loop raised for hook misses only
+    /// (scope round): the audit's skip-era take hit, so observations
+    /// carried into the new era. A subset of `eras`, disjoint from
+    /// `miss_eras`.
+    pub(crate) skip_eras: u64,
     /// Saturating registry evictions (F3): keys dropped from a full
     /// registry. Observed late calls degrade to Pending/Unobserved; a
     /// faulted eviction latches refusal; a retired eviction compacts its

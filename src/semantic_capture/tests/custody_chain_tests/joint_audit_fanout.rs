@@ -9428,6 +9428,86 @@ fn joint_machine_voided_feed_refuses_below_fence_resume() {
     );
 }
 
+/// Scope-round instrumentation twin: an audit void that ends Joint feeds
+/// counts once per void, however many feeds it ends; a later void that
+/// ends no Joint feed (every feed already degraded) counts no new ending.
+/// The first void lands through the seal-time re-read (baseline pinned,
+/// audit clean, cell moved); the second lands through the chain check.
+#[test]
+fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
+    let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+        1,
+        &["C_CreateObject", "C_SignInit"],
+        PublicationReceipts::All,
+    );
+    let mut frame = Some(original);
+    let fault = FrameFault::clean();
+    fault.epoch.set(1);
+    let old_revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.complete_publication(&mut frame, &fault, old_revision);
+    assert_eq!(
+        fixture.feeds().len(),
+        2,
+        "two feeds behind one provider once committed"
+    );
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(diagnosis.void_audit, 1, "the seal-time move voids once");
+    assert_eq!(
+        diagnosis.audit_fault_changed_reread, 1,
+        "the seal-path re-read counts as reread"
+    );
+    assert_eq!(
+        diagnosis.voids_ended_joint_feed, 1,
+        "one void ending two Joint feeds counts one ending"
+    );
+    assert!(
+        fixture.feeds().iter().all(|feed| feed.degraded),
+        "the void ended every Joint feed"
+    );
+    // Second round on the same fixture: the feeds are already S1Only, so
+    // the next void ends none. The finisher below is ingress-agnostic: it
+    // drives any failure-carrying frame (here an ingested collection void)
+    // through delivery to completion.
+    fixture.push_two("C_SignUpdate", 2);
+    fault.epoch.set(2);
+    let round = fixture.audited(2, 2, &fault);
+    finish_disposed_negative_frame(&mut fixture, round, &fault);
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(diagnosis.void_audit, 2, "the chain move voids again");
+    assert_eq!(
+        diagnosis.audit_fault_changed_chain, 1,
+        "the between-collection move counts as chain"
+    );
+    assert_eq!(
+        diagnosis.audit_fault_changed_reread, 1,
+        "the earlier reread void keeps its bucket"
+    );
+    assert_eq!(
+        diagnosis.voids_ended_joint_feed, 1,
+        "a void ending no Joint feed counts no new ending"
+    );
+}
+
 /// The ingest-break void fences every pre-break key's history: its live
 /// sessions end Uncertain(OutcomeLost), its objects retire, its bootstrap
 /// voids. Those effects are the void's own original failure; they ride

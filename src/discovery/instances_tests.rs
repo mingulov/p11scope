@@ -2494,6 +2494,34 @@ fn a_raise_covering_the_miss_advances_a_single_era() {
 }
 
 #[test]
+fn hook_miss_raise_advancing_the_era_counts_skip_only() {
+    // Scope-round instrumentation: a fault-era advance the capture loop
+    // raised for hook misses only (note_hook_miss_era consumed by the
+    // audit's take) counts as a skip-only era. A fault move with no miss
+    // note, and a note with no fault move, count none.
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    r.note_hook_miss_era();
+    assert!(r.audit(1, 0, 1).is_empty());
+    assert_eq!(r.counters().eras, 1);
+    assert_eq!(r.counters().skip_eras, 1);
+    assert_eq!(r.counters().miss_eras, 0);
+    // A fault move with no miss note advances the era but is not skip-only.
+    assert!(r.audit(2, 0, 1).is_empty());
+    assert_eq!(r.counters().eras, 2);
+    assert_eq!(r.counters().skip_eras, 1);
+    // A miss note with no fault move drops without counting, and never
+    // leaks into the next audit.
+    r.note_hook_miss_era();
+    assert!(r.audit(2, 0, 1).is_empty());
+    assert_eq!(r.counters().eras, 2);
+    assert_eq!(r.counters().skip_eras, 1);
+    assert!(r.audit(3, 0, 1).is_empty());
+    assert_eq!(r.counters().eras, 3);
+    assert_eq!(r.counters().skip_eras, 1);
+}
+
+#[test]
 fn sticky_refusal_disables_routing_for_the_capture() {
     let mut r = router();
     r.observe_legacy(observation(2, 0, 0, load(BASE_A)));

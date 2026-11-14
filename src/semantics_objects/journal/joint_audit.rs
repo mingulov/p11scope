@@ -49,6 +49,10 @@ pub(crate) struct IngestedJointQuantum {
     // or disposed, takes it whatever the other two slots hold.
     void_failure: Option<SealFailure>,
     failure: Option<SealFailure>,
+    // Diagnostic-only per-void dedup (scope round): the (fence, gap) of
+    // each void failure already counted as ending a Joint feed, so one
+    // void fanning out to many feeds counts once. Instrumentation only.
+    void_feed_ends_counted: Vec<(Option<u64>, JournalGap)>,
     consumers: Vec<FrameConsumer>,
     bound: bool,
     cursor: usize,
@@ -808,6 +812,7 @@ impl IngestedJointQuantum {
             raw_failure,
             void_failure,
             failure,
+            void_feed_ends_counted: Vec::new(),
             consumers: Vec::new(),
             bound: false,
             cursor: 0,
@@ -913,6 +918,7 @@ impl IngestedJointQuantum {
             raw_failure,
             void_failure,
             failure,
+            void_feed_ends_counted: Vec::new(),
             consumers: Vec::new(),
             bound: false,
             cursor: 0,

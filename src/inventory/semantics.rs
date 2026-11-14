@@ -1849,13 +1849,16 @@ pub(crate) fn joint_births_line(
     )
 }
 
-/// One stderr line for the diagnostic Joint-void summary (Task 0):
-/// stream breaks by recording side (dispose vs ingest), seals voided
-/// through a failed audit, the re-sync total they add up to, seal
-/// endings refused at the void-fence check, and per-key gauges (total,
-/// refused, tainted, pending). Counts only; no identities, paths or
-/// payloads. Diagnostic-only: printed beside the stop line only when
-/// verbose text is requested, never a contract and never in reports.
+/// One stderr line for the diagnostic Joint-void summary (Task 0 plus
+/// the scope-round split): stream breaks by recording side (dispose vs
+/// ingest), seals voided through a failed audit, the re-sync total they
+/// add up to, seal endings refused at the void-fence check, per-key
+/// gauges (total, refused, tainted, pending), the audit-void split by
+/// sub-cause (the eight buckets sum to `void_audit`), the router's
+/// skip-only fault eras, and the voids that ended at least one Joint
+/// feed. Counts only; no identities, paths or payloads.
+/// Diagnostic-only: printed beside the stop line only when verbose text
+/// is requested, never a contract and never in reports.
 #[allow(clippy::too_many_arguments)] // One line, two call sites, like joint_taints_line.
 pub(crate) fn joint_voids_line(
     break_dispose: u64,
@@ -1867,13 +1870,31 @@ pub(crate) fn joint_voids_line(
     keys_refused: u64,
     keys_tainted: u64,
     keys_pending: u64,
+    audit_fault_changed_chain: u64,
+    audit_fault_changed_reread: u64,
+    audit_h3_loss: u64,
+    audit_discarded: u64,
+    audit_malformed: u64,
+    audit_counter_unprovable: u64,
+    audit_fault_unreadable: u64,
+    audit_resource_unavailable: u64,
+    skip_eras: u64,
+    voids_ended_joint_feed: u64,
 ) -> String {
     format!(
         "p11scope: joint voids: break_dispose={break_dispose} \
          break_ingest={break_ingest} void_audit={void_audit} \
          void_resync={void_resync} seal_below_fence={seal_below_fence} \
          keys_total={keys_total} keys_refused={keys_refused} \
-         keys_tainted={keys_tainted} keys_pending={keys_pending}"
+         keys_tainted={keys_tainted} keys_pending={keys_pending} \
+         audit_fault_changed_chain={audit_fault_changed_chain} \
+         audit_fault_changed_reread={audit_fault_changed_reread} \
+         audit_h3_loss={audit_h3_loss} audit_discarded={audit_discarded} \
+         audit_malformed={audit_malformed} \
+         audit_counter_unprovable={audit_counter_unprovable} \
+         audit_fault_unreadable={audit_fault_unreadable} \
+         audit_resource_unavailable={audit_resource_unavailable} \
+         skip_eras={skip_eras} voids_ended_joint_feed={voids_ended_joint_feed}"
     )
 }
 
@@ -2637,6 +2658,14 @@ impl AttestedSemanticLane {
                 live.capture.router().counters().eras,
                 live.capture.router().instances_minted() as u64,
             )
+        })
+    }
+
+    /// Lifetime skip-only fault eras (zero without a live lane), for the
+    /// Joint-void line. Counts only.
+    pub(crate) fn semantic_skip_eras(&self) -> u64 {
+        self.live.as_ref().map_or(0, |live| {
+            live.capture.router().counters().skip_eras
         })
     }
 

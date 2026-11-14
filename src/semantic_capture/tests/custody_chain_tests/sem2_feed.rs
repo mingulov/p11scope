@@ -358,16 +358,22 @@ fn joint_births_line_format_is_exact() {
 #[test]
 fn joint_voids_line_format_is_exact() {
     assert_eq!(
-        joint_voids_line(0, 0, 0, 0, 0, 0, 0, 0, 0),
+        joint_voids_line(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         "p11scope: joint voids: break_dispose=0 break_ingest=0 void_audit=0 \
          void_resync=0 seal_below_fence=0 keys_total=0 keys_refused=0 \
-         keys_tainted=0 keys_pending=0"
+         keys_tainted=0 keys_pending=0 audit_fault_changed_chain=0 \
+         audit_fault_changed_reread=0 audit_h3_loss=0 audit_discarded=0 \
+         audit_malformed=0 audit_counter_unprovable=0 audit_fault_unreadable=0 \
+         audit_resource_unavailable=0 skip_eras=0 voids_ended_joint_feed=0"
     );
     assert_eq!(
-        joint_voids_line(3, 5, 7, 11, 13, 17, 2, 4, 6),
+        joint_voids_line(3, 5, 7, 11, 13, 17, 2, 4, 6, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59),
         "p11scope: joint voids: break_dispose=3 break_ingest=5 void_audit=7 \
          void_resync=11 seal_below_fence=13 keys_total=17 keys_refused=2 \
-         keys_tainted=4 keys_pending=6"
+         keys_tainted=4 keys_pending=6 audit_fault_changed_chain=19 \
+         audit_fault_changed_reread=23 audit_h3_loss=29 audit_discarded=31 \
+         audit_malformed=37 audit_counter_unprovable=41 audit_fault_unreadable=43 \
+         audit_resource_unavailable=47 skip_eras=53 voids_ended_joint_feed=59"
     );
 }
 

@@ -4788,14 +4788,30 @@ struct PrearmInput {
 }
 
 /// One file-identity proof for owned run-tree learning (E1): a
-/// provider module's owning view, loader pid, display path and
-/// resolved pin object. Both proof paths (the watch's synchronous
-/// scans and the live apply path) lower to this before staging.
+/// provider module's owning view, display path and resolved pin
+/// object, plus the loader program named under the proving view's
+/// pidfd at proof time (or the finite unknown when the loader was
+/// already gone). Both proof paths (the watch's synchronous scans
+/// and the live apply path) lower to this before staging; staging
+/// never re-resolves a bare pid, so a recycled pid is never named.
 struct OwnedLearnProof {
     view: ProcessViewId,
-    pid: u32,
     path: String,
     object: PinnedObjectId,
+    loader_exe: Option<String>,
+    loader_unknown_reason: Option<&'static str>,
+}
+
+/// Names the loader behind a run-tree proof through the proving
+/// view's pidfd: the exe link is read only while the pinned
+/// generation provably still lives, so an exited-and-recycled pid
+/// is never named. A pin without a pidfd (start-time fallback
+/// custody) or an exited loader resolves to the finite unknown.
+fn loader_name_for_proving_view(view: &ProcessView) -> (Option<String>, Option<&'static str>) {
+    match view.retained_pin().pidfd() {
+        Ok(pidfd) => crate::fanotify::loader_exe_for_pidfd(pidfd),
+        Err(_) => (None, Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON)),
+    }
 }
 
 /// Scan attempts per unproven owned-tree member under watch (E1),
@@ -17633,22 +17649,27 @@ impl Engine {
                 !module.scanned.tables.is_empty() || !module.scanned.interfaces.is_empty()
             })
             .filter_map(|module| {
-                let pid = self
+                let proving: &ProcessView = self
                     .views
                     .iter()
                     .find(|view| view.id() == module.scanned.view)
-                    .map(ProcessView::pid)
                     .or_else(|| {
                         extra_views
                             .iter()
                             .find(|view| view.id() == module.scanned.view)
-                            .map(|view| view.pid())
+                            .copied()
                     })?;
+                // The loader is named here, under the proving view's
+                // pidfd: learning later must never re-resolve the bare
+                // pid, which the mapper's exit may already have freed
+                // for reuse.
+                let (loader_exe, loader_unknown_reason) = loader_name_for_proving_view(proving);
                 Some(OwnedLearnProof {
                     view: module.scanned.view,
-                    pid,
                     path: module.scanned.path.clone(),
                     object: module.object,
+                    loader_exe,
+                    loader_unknown_reason,
                 })
             })
             .collect();
@@ -21248,11 +21269,20 @@ impl Engine {
             .filter(|module| !module.tables.is_empty() || !module.interfaces.is_empty())
             .filter_map(|module| {
                 pins.id_for_scanned(module, module.key, &module.path)
-                    .map(|object| OwnedLearnProof {
-                        view: view.id(),
-                        pid,
-                        path: module.path.clone(),
-                        object,
+                    .map(|object| {
+                        // The loader is named at scan time, under the
+                        // proving view's pidfd while it is still held:
+                        // learning later must never re-resolve the bare
+                        // pid.
+                        let (loader_exe, loader_unknown_reason) =
+                            loader_name_for_proving_view(&view);
+                        OwnedLearnProof {
+                            view: view.id(),
+                            path: module.path.clone(),
+                            object,
+                            loader_exe,
+                            loader_unknown_reason,
+                        }
                     })
             })
             .collect();
@@ -21311,15 +21341,16 @@ impl Engine {
             {
                 continue;
             }
-            let (loader_exe, loader_unknown_reason) =
-                crate::fanotify::resolve_loader_exe(proof.pid);
+            // The loader name travels with the proof, captured under
+            // the proving view's pidfd: staging never re-resolves the
+            // bare pid, so a recycled pid is never named.
             let learned = crate::fanotify::LearnedCandidate {
                 file: held,
                 dev: identity.0,
                 ino: identity.1,
                 display_path: proof.path.clone(),
-                loader_exe,
-                loader_unknown_reason,
+                loader_exe: proof.loader_exe.clone(),
+                loader_unknown_reason: proof.loader_unknown_reason,
                 run_learned: true,
             };
             if self.pending_learned.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {

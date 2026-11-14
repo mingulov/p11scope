@@ -20173,9 +20173,12 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
     let proofs = vec![OwnedLearnProof {
         view: ProcessViewId(7),
-        pid: sleeper.id(),
         path: backing.to_string_lossy().into_owned(),
         object,
+        // Naming travels with the proof (pinned by the twins
+        // below); staging itself is naming-agnostic.
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
     }];
     engine.learn_owned_proofs(&pins, &proofs);
     assert_eq!(
@@ -20216,9 +20219,10 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     engine.owned_run_pid = Some(me);
     let child_proofs = vec![OwnedLearnProof {
         view: ProcessViewId(0),
-        pid: me,
         path: backing.to_string_lossy().into_owned(),
         object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
     }];
     engine.learn_owned_proofs(&pins, &child_proofs);
     assert!(
@@ -20227,6 +20231,112 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     );
     sleeper.kill().expect("kill sleeper");
     sleeper.wait().expect("reap sleeper");
+}
+
+/// Staging stages the proof's stored loader naming and resolves
+/// nothing behind the proof: the name was captured under the
+/// proving view's pidfd at scan time, since the proving generation
+/// may have exited and its pid recycled by an unrelated process. A
+/// proof whose capture found the loader gone stages the finite
+/// unknown even while the loader reads live.
+#[test]
+fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let backing = dir.path().join("libprov.so");
+    std::fs::write(&backing, "p11scope-fixture:shared-provider-bytes").expect("write backing");
+    let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    let object = pins.pinned().next().expect("one pin").id;
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+    // The capture found the loader gone: the stored naming is the
+    // finite unknown, while the loader reads live (a recycled pid's
+    // exe link must never leak into the staged file).
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(7),
+        path: backing.to_string_lossy().into_owned(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the scan-proven file still stages"
+    );
+    assert_eq!(
+        engine.pending_learned[0].loader_exe, None,
+        "a gone loader is never named behind the proof"
+    );
+    assert_eq!(
+        engine.pending_learned[0].loader_unknown_reason,
+        Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        "the stored finite unknown travels with the proof"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// A still-live loader is named through the proving view's pidfd
+/// bracket: the live twin of the exited case below.
+#[test]
+fn owned_proof_loader_name_names_the_live_loader_through_its_pidfd() {
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let view = ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens");
+    let (exe, reason) = loader_name_for_proving_view(&view);
+    assert_eq!(reason, None, "a live loader names without a reason");
+    assert!(
+        exe.as_deref().is_some_and(|exe| exe.ends_with("sleep")),
+        "the live sleeper is named: {exe:?}"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Once the loader exits, the same proving view yields only the
+/// finite unknown — an exited (potentially recycled) pid is never
+/// named. The live twin above names the same view while it lives.
+#[test]
+fn owned_proof_loader_name_is_unknown_once_the_loader_exits() {
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let view = ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens");
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+    assert!(
+        !view.still_the_same(),
+        "the reaped view no longer names its generation"
+    );
+    let (exe, reason) = loader_name_for_proving_view(&view);
+    assert_eq!(exe, None, "an exited loader is never named");
+    assert_eq!(
+        reason,
+        Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        "the exited loader resolves to the finite unknown"
+    );
 }
 
 #[test]

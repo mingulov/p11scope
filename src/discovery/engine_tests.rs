@@ -42958,7 +42958,8 @@ fn over_cap_trigger_counts_user_processes_only() {
 }
 
 /// A fixture /proc stat line with explicit flags and start time (field
-/// 22), for the pid-class cache tests: reuse is a new start time.
+/// 22), for the pid-class cache tests: reuse is a new directory mtime,
+/// with the same start time when the realloc lands in one jiffy.
 fn pid_cache_stat_line(pid: u32, comm: &str, flags: u32, start_time: u64) -> String {
     format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 {start_time} 0")
 }
@@ -43043,6 +43044,72 @@ fn cached_pid_filter_reclassifies_on_pid_reuse() {
         engine.cached_user_process_pids(&pids),
         vec![101, 102],
         "the reused pid re-classifies as a user process; 103 stays out"
+    );
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// RED (§8.2 fix1): pid reuse within one jiffy re-classifies. Stat
+/// start time (field 22) has 10 ms resolution while the directory
+/// mtime is nanosecond, so an exit+realloc inside one jiffy presents
+/// as "new mtime, same start" — which must still re-read the class,
+/// never keep the cached one. Here a cached kernel thread is reused
+/// by a user process with the identical start time; it must rejoin
+/// the filtered set.
+#[test]
+fn cached_pid_filter_reclassifies_same_jiffy_reuse_kthread_to_user() {
+    let proc_root = std::env::temp_dir().join(format!("perf-pidrejiffy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    pid_cache_fixture(
+        &proc_root,
+        &[
+            (101, "kworker", crate::process::PF_KTHREAD, 3135074),
+            (102, "worker", 0, 200),
+        ],
+    );
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    let pids = vec![101u32, 102];
+    assert_eq!(engine.cached_user_process_pids(&pids), vec![102]);
+    // Same-jiffy reuse: procfs destroys and recreates the directory
+    // (new mtime) but the new generation starts in the same jiffy,
+    // so field 22 is unchanged while the flags flip to user.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    std::fs::remove_dir_all(proc_root.join("101")).unwrap();
+    pid_cache_fixture(&proc_root, &[(101, "reused", 0, 3135074)]);
+    assert_eq!(
+        engine.cached_user_process_pids(&pids),
+        vec![101, 102],
+        "same start time with a new mtime is reuse, not the same generation"
+    );
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// RED (§8.2 fix1): the reverse direction. A cached user process
+/// reused within one jiffy by a kernel thread (same start time, new
+/// mtime, flipped flags) must leave the filtered set.
+#[test]
+fn cached_pid_filter_reclassifies_same_jiffy_reuse_user_to_kthread() {
+    let proc_root =
+        std::env::temp_dir().join(format!("perf-pidrejiffy-rev-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    pid_cache_fixture(
+        &proc_root,
+        &[(101, "worker", 0, 3135074), (102, "worker", 0, 200)],
+    );
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    let pids = vec![101u32, 102];
+    assert_eq!(engine.cached_user_process_pids(&pids), vec![101, 102]);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    std::fs::remove_dir_all(proc_root.join("101")).unwrap();
+    pid_cache_fixture(
+        &proc_root,
+        &[(101, "kworker", crate::process::PF_KTHREAD, 3135074)],
+    );
+    assert_eq!(
+        engine.cached_user_process_pids(&pids),
+        vec![102],
+        "same start time with a new mtime is reuse, not the same generation"
     );
     let _ = std::fs::remove_dir_all(&proc_root);
 }

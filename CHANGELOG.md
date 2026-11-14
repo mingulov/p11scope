@@ -13,10 +13,13 @@ versioned separately and are opaque, exact dispatch keys.
 - On a busy host, a long `inventory --system --key-operations`
   capture can stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Since
-  0.8.0 the lane re-arms past a transient Audited-phase refusal (up
-  to 32 abandoned quanta per run, each named), and refusals at other
-  phases still stop the lane with the phase named. Rerun the capture
-  or narrow the scope (`--pid`).
+  0.8.0 the lane continues past a transient interruption at the
+  audited step (up to 32 interruptions per run, each named):
+  processes already running keep exact call counts but lose
+  per-key rows for the rest of the run, while processes started
+  later are tracked. Refusals at other steps still stop the lane,
+  with the step and the reason named. Rerun the capture or narrow
+  the scope (`--pid`).
 
 ## [0.7.0] - 2026-11-13
 

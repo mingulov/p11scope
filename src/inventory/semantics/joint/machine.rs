@@ -1662,8 +1662,10 @@ impl LiveJointMachine {
     /// A frame abandon that still leaves a publication standing also
     /// returns `None`; the hold's own abandon then finds it exactly as
     /// it would have. `Some(true)` when the abandoned publication was
-    /// the bound commit demand's (its physical work published in the
-    /// abandon), `Some(false)` otherwise (an unbound demand is kept).
+    /// the bound commit demand's (an applied abandon published its
+    /// work; an unapplied one cancelled its registry phase but kept
+    /// the staged facts, which publish one pass late), `Some(false)`
+    /// otherwise (an unbound demand is kept).
     pub(crate) fn rearm_after_running_refusal(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -1747,7 +1749,7 @@ impl LiveJointMachine {
         coordinator.note_scope_gap(
             RUNNING_REARM_SUBJECT.to_string(),
             format!(
-                "{reason}; key tracking open across the quantum ends, later key operations are tracked again"
+                "{reason}; processes already running keep exact call counts but lose per-key rows for the rest of the run; processes started later are tracked"
             ),
         );
         Some(published)
@@ -2710,7 +2712,7 @@ impl LiveJointMachine {
             Phase::Collecting(_) => "Collecting",
             Phase::Binding(_) => "Binding",
             Phase::AwaitH0(_) => "AwaitH0",
-            Phase::PendingQ { .. } => "PendingQReport",
+            Phase::PendingQ { .. } => "PendingReport",
             Phase::Preparing(_) => "Preparing",
             Phase::FinishStopReady(_) => "FinishStopReady",
             Phase::FinishStopReport { .. } => "FinishStopReport",

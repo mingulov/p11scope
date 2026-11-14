@@ -4951,8 +4951,10 @@ impl ClassicDriver<'_> {
         // Partial, never stop: a transient running refusal whose
         // quantum the abandon disposes in full re-arms the lane (that
         // quantum's loss is named), and the commit continues on it. A
-        // bound demand published its physical work in the abandon; an
-        // unbound or not yet begun demand polls the re-armed machine.
+        // bound demand counts the abandon as its publication (an
+        // applied abandon published its work; an unapplied one kept
+        // its staged facts for the next pass); an unbound or not yet
+        // begun demand polls the re-armed machine.
         // Bounded by the machine's per-run re-arm limit; every other
         // latch holds the lane below as before.
         let coordinator = &mut *self.coordinator;

@@ -19161,6 +19161,55 @@ pub(crate) mod tests {
         );
     }
 
+    /// Semantic pin migration RED (coverage): same-file pin churn with semantic
+    /// slots (non-zero descriptors, authorized names) must migrate without false
+    /// ambiguity. Gen1 active semantic (68, pin 82, same file, descriptors 1),
+    /// then Gen2 same file new pin (83, same ObjectKey/path/offsets/names/
+    /// descriptors) arrives with Gen1 still active (no revivable, links still
+    /// attached). It must migrate in place (lifetime 68, active 68, no retire/new,
+    /// object IDs 83, module_ambiguous 0 via same-file stable IDs), not retire+admit
+    /// fresh (136 lifetime, 68+68 delta) due to fresh ModuleIds causing Ambiguous
+    /// on semantic descriptors.
+    #[test]
+    fn slot_reclaim_pin_migration_semantic_no_ambiguity() {
+        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68, "gen1 admits");
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+        for slot in &mut plan.slots {
+            slot.descriptor_index = descriptor;
+            slot.semantics = semantics;
+            slot.semantic_authorized = true;
+        }
+        assert_eq!(plan.active_slot_count(), 68, "gen1 active semantic");
+        let mut gen2 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        gen2.object = PinnedObjectId(83);
+        gen2.entry_objects = vec![vec![PinnedObjectId(83); 68]];
+        let mut rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&gen2), &[], &PinnedObjects::empty());
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "gen2 same-file admits: {:?}",
+            rebuilt.modules_skipped
+        );
+        for slot in &mut rebuilt.slots {
+            slot.descriptor_index = descriptor;
+            slot.semantics = semantics;
+            slot.semantic_authorized = true;
+        }
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.retire.len(), 0, "no retire gap on semantic migration");
+        assert_eq!(delta.new.len(), 0, "no fresh slots on semantic migration");
+        assert_eq!(plan.slots.len(), 68, "lifetime stays 68 via migration");
+        assert_eq!(plan.active_slot_count(), 68, "stays active");
+        assert_eq!(plan.module_ambiguous, 0, "no false ambiguity via stable IDs");
+        assert!(
+            plan.slots.iter().all(|slot| slot.object == PinnedObjectId(83)),
+            "object IDs migrate to new pin"
+        );
+    }
+
     /// Same-target revival: a provider that leaves and returns while its
     /// retired slots are cleared reoccupies its old indices — the slot
     /// count does not grow, so churn stops burning the lifetime budget.

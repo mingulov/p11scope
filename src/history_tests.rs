@@ -277,7 +277,11 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     let (mut s, mut t, _) = setup(64);
     let mut first = ev(100, 90, 0, 0);
     first.ts_ns = 100;
-    feed(&mut s, &mut t, [first]);
+    let mut init = ev(100, 90, 0, 1);
+    init.ts_ns = 101;
+    init.capture = capture::MECHANISM_VALUE;
+    init.mechanism = 1;
+    feed(&mut s, &mut t, [first, init]);
     assert_eq!(vector(&s), (1, 0, 0, 1, 1, 0));
     let old = key(90, 0);
     assert!(s.has_process_state(old));
@@ -297,10 +301,15 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     // first CALL (ts 300, after the old exit) admits a new generation.
     let mut reborn = ev(100, 91, 0, 0);
     reborn.ts_ns = 300;
-    feed(&mut s, &mut t, [reborn]);
+    let mut reborn_init = ev(100, 91, 0, 1);
+    reborn_init.ts_ns = 301;
+    reborn_init.capture = capture::MECHANISM_VALUE;
+    reborn_init.mechanism = 1;
+    feed(&mut s, &mut t, [reborn, reborn_init]);
     let successor = semantics::ProcessKey::history(1, 91, 0, 100);
     assert!(s.has_process_state(successor));
     assert_eq!(vector(&s), (2, 0, 0, 2, 2, 0));
+    assert_eq!(s.memory_lens().active_ops.len, 2);
     // The drain reads past the tap position: the old generation's
     // maps are freed and its R10 entry is gone, while the successor's
     // rows are intact.
@@ -313,6 +322,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     let lens = s.memory_lens();
     assert_eq!(lens.reduced.len, 1, "only the successor keeps R10");
     assert_eq!(lens.open.len, 1, "only the successor keeps a session");
+    assert_eq!(lens.active_ops.len, 1, "only the successor keeps an op");
     assert_eq!(t.exit_counters_for_test(), (0, 0, 0, 0));
     assert_eq!(t.pending_exit_taps_for_test(), 0);
     // A first_ts_ns == hook_ts_ns tie retires neither generation and
@@ -332,6 +342,22 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     assert!(due.is_empty(), "ties never retire");
     assert!(s.has_process_state(tied_key));
     assert_eq!(t.exit_counters_for_test(), (1, 0, 0, 0));
+    // Repeating a retire is safe: a duplicate tap for the same exit
+    // re-collects the same key and the batch frees nothing twice.
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    assert_eq!(due, std::collections::BTreeSet::from([old]));
+    let closed = s.sessions().closed;
+    s.retire_processes(&due);
+    assert_eq!(s.sessions().closed, closed, "no double close");
+    assert!(s.has_process_state(successor));
+    assert_eq!(t.exit_counters_for_test(), (2, 0, 0, 0));
 }
 
 #[test]
@@ -393,6 +419,59 @@ fn retire_waits_for_drain_past_tap_position() {
     drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
     assert_eq!(t.pending_exit_taps_for_test(), 0);
     assert_eq!(t.exit_counters_for_test(), (0, 1, 0, 0));
+    // Strictly-past retire: the drain reads beyond the stamp while new
+    // records keep arriving — due without waiting for quiet.
+    let mut fresh = ev(200, 93, 0, 0);
+    fresh.ts_ns = 100;
+    drain.source_mut().inner_mut().push_event(&fresh);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    let fresh_key = semantics::ProcessKey::history(1, 93, 0, 200);
+    assert!(s.has_process_state(fresh_key));
+    engine.note_exit_tap(200, 200);
+    let stamp = crate::events::event_drain_positions(&drain).producer;
+    transfer_exit_taps(&mut engine, &mut t, stamp);
+    let mut next = ev(200, 93, 0, 7);
+    next.ts_ns = 150;
+    let mut later = ev(200, 93, 0, 7);
+    later.ts_ns = 151;
+    drain.source_mut().inner_mut().push_event(&next);
+    drain.source_mut().inner_mut().push_event(&later);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), Some(1)).unwrap();
+    assert!(!s.has_process_state(fresh_key));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+    assert_eq!(t.exit_counters_for_test(), (0, 1, 0, 0));
+}
+
+#[test]
+fn exec_bump_resets_exit_matching_generation() {
+    // Exit-matching generation twin: an exec-id bump resets the task's
+    // first_ts_ns, so an exit older than the exec never retires the new
+    // generation. Direct registry drive: admission plus matching only.
+    let domain = crate::events::EventsDomain::test_standin(1);
+    let mut registry = crate::history::Registry::new(domain, 16);
+    let image0 = ImageIdentity {
+        task_cookie: 90,
+        exec_id: 0,
+    };
+    assert!(registry.admit(1, 100, image0, 100).0.is_some());
+    let image1 = ImageIdentity {
+        task_cookie: 90,
+        exec_id: 1,
+    };
+    let (current, retired) = registry.admit(1, 100, image1, 250);
+    assert!(current.is_some());
+    assert_eq!(retired.len(), 1);
+    // An exit hooked between the original admit and the exec matches
+    // nothing: the live generation started after it.
+    registry.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 200,
+        }],
+        8,
+    );
+    let due = registry.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
+    assert!(due.is_empty(), "the post-exec generation is spared");
 }
 
 #[test]
@@ -766,6 +845,88 @@ fn retired_sessions_count_as_closed_declared_diff() {
         right.contains("1 still open"),
         "after names one open session: {right}"
     );
+}
+
+#[test]
+fn churned_processes_free_all_dead_owned_rows_on_exit() {
+    // B1 step-8 fixture: eight short-lived processes churn through one
+    // drain — each opening a session, starting an op, and leaving a
+    // pending call — then all exit. The A0 dead-owned lens proves the
+    // effect: before the exits drain, every R12 row reads dead-owned;
+    // after, no process owns rows and every dead count returns to zero.
+    let (mut s, mut t, _) = setup(64);
+    let mut events = Vec::new();
+    for i in 0..8u32 {
+        let pid = 1000 + i;
+        let cookie = u64::from(100 + i);
+        let mut open = ev(pid, cookie, 0, 0);
+        open.ts_ns = 100;
+        let mut init = ev(pid, cookie, 0, 1);
+        init.ts_ns = 101;
+        init.capture = capture::MECHANISM_VALUE;
+        init.mechanism = 1;
+        let mut pending = ev(pid, cookie, 0, 2);
+        pending.ts_ns = 102;
+        pending.rv = pkcs11_types::CkRv::PENDING.0;
+        events.extend([open, init, pending]);
+    }
+    let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert_eq!(vector(&s), (8, 0, 0, 8, 8, 8));
+    // Every test pid reads dead: all rows are dead-owned before retire.
+    let all_dead = |_: u32| false;
+    let (live, dead, dead_rows, _) = s.memory_sample(&all_dead);
+    assert_eq!((live, dead), (0, 8));
+    assert_eq!(dead_rows.reduced_dead.len, 8);
+    assert_eq!(dead_rows.open_dead.len, 8);
+    assert_eq!(dead_rows.active_ops_dead.len, 8);
+    assert_eq!(dead_rows.next_pseudonym_dead.len, 8);
+    assert_eq!(dead_rows.pending_dead.len, 8);
+    // All eight exit; the transfer stamps the producer, and one more
+    // drain past the stamp retires every generation.
+    t.note_exit_taps(
+        (0..8u32).map(|i| crate::history::ExitTap {
+            pid: 1000 + i,
+            hook_ts_ns: 200,
+        }),
+        crate::events::event_drain_positions(&drain).producer,
+    );
+    let mut trigger = ev(1000, 100, 0, 7);
+    trigger.ts_ns = 150;
+    drain.source_mut().push_event(&trigger);
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    // Everything freed: no owners remain, every dead count is zero,
+    // every session counted closed, no exit gap fired.
+    let (live, dead, dead_rows, _) = s.memory_sample(&all_dead);
+    assert_eq!((live, dead), (0, 0));
+    for (name, len) in [
+        ("R10", dead_rows.reduced_dead.len),
+        ("open", dead_rows.open_dead.len),
+        ("active_ops", dead_rows.active_ops_dead.len),
+        ("next_pseudonym", dead_rows.next_pseudonym_dead.len),
+        ("find_active", dead_rows.find_active_dead.len),
+        ("pending", dead_rows.pending_dead.len),
+        ("detached", dead_rows.detached_dead.len),
+        (
+            "inherited_ambiguous",
+            dead_rows.inherited_ambiguous_dead.len,
+        ),
+    ] {
+        assert_eq!(len, 0, "no dead-owned {name} rows remain");
+    }
+    let lens = s.memory_lens();
+    for (name, len) in [
+        ("R10", lens.reduced.len),
+        ("open", lens.open.len),
+        ("active_ops", lens.active_ops.len),
+        ("next_pseudonym", lens.next_pseudonym.len),
+        ("pending", lens.pending.len),
+    ] {
+        assert_eq!(len, 0, "no {name} rows remain at all");
+    }
+    assert_eq!(s.sessions().closed, 8);
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 0, 0));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
 }
 
 #[test]

@@ -2115,22 +2115,77 @@ mod corrective_tests {
     fn retire_processes_sweeps_each_process_like_retire_process() {
         // Batch twin for the exit path: one `retire_processes` call
         // frees every listed process's live maps exactly as
-        // `retire_process` would, each open session counts closed,
-        // and each `reduced_histories` entry is removed with its key
-        // refunded. Fails while the batch retire is unwired: nothing
-        // is swept and the count stays zero.
-        let p = plan(&["C_OpenSession", "C_SignInit", "C_FindObjectsInit"]);
+        // `retire_process` would — open, ops, finds, pending, detached
+        // ids, ambiguous inherits, pseudonym counters — each open
+        // session counts closed, and each `reduced_histories` entry is
+        // removed. Fails while the batch retire is unwired: nothing is
+        // swept and the count stays zero. The detached/ambiguous rows
+        // are planted directly (no cheap observed path creates them);
+        // exact key accounting stays pinned by the observed-only refund
+        // twin.
+        let p = plan(&["C_OpenSession", "C_SignInit", "C_Sign", "C_FindObjectsInit"]);
         let a = ProcessKey::from_pid(100);
         let b = ProcessKey::from_pid(101);
         let mut state = State::new(&p);
         state.observe(&open(&p, 7, 1));
         state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe(&event(&p, "C_FindObjectsInit", 7, 0));
+        state.observe(&event(&p, "C_Sign", 7, CkRv::PENDING.0));
+        // Orphan rows on never-opened handles: no open session covers
+        // them, so only the batch retains free them.
+        state.observe(&mechanism(&p, "C_SignInit", 99, 0x101, 0));
+        state.observe(&event(&p, "C_FindObjectsInit", 98, 0));
+        state.observe(&event(&p, "C_Sign", 97, CkRv::PENDING.0));
         let mut b_open = open(&p, 8, 1);
         b_open.pid_tgid = 101u64 << 32;
         state.observe(&b_open);
+        let detached_pending = Pending {
+            event: event(&p, "C_Sign", 7, 0),
+            meta: SlotMeta {
+                names: vec!["C_Sign".to_string()],
+                aliased: false,
+                semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                function_id: None,
+                fork_safe: false,
+                module: ModuleId(0),
+                module_ids: vec![ModuleId(0)],
+                standard_layout: false,
+            },
+            started_ns: 0,
+            sequence: 0,
+        };
+        state.detached.insert(
+            (ModuleId(0), 1, 2, 3, 4),
+            Detached {
+                pending: detached_pending.clone(),
+                owner: Some((a, sess(7))),
+                process: a,
+                collided: false,
+            },
+        );
+        // A floating id: ownerless and joinable, still the scope's own.
+        state.detached.insert(
+            (ModuleId(0), 5, 6, 7, 8),
+            Detached {
+                pending: detached_pending,
+                owner: None,
+                process: a,
+                collided: false,
+            },
+        );
+        state.inherited_ambiguous.insert((a, sess(7)));
+        state.inherited_ambiguous.insert((a, sess(96)));
         assert!(state.has_process_state(a));
         assert!(state.has_process_state(b));
         assert_eq!(state.sessions().closed, 0);
+        // Both the session-covered rows and the orphans exist before
+        // the sweep; the post-sweep zeros below pin both paths.
+        let before = state.memory_lens();
+        assert_eq!(before.active_ops.len, 2);
+        assert_eq!(before.find_active.len, 2);
+        assert_eq!(before.pending.len, 2);
+        assert_eq!(before.detached.len, 2);
+        assert_eq!(before.inherited_ambiguous.len, 2);
         let swept = state.retire_processes(&BTreeSet::from([a, b]));
         assert_eq!(swept, 2, "both processes held swept state");
         assert!(!state.has_process_state(a));
@@ -2140,19 +2195,19 @@ mod corrective_tests {
             2,
             "each open session counts closed"
         );
-        assert!(
-            !state.reduced_histories.contains(&a),
-            "the exit path frees the R10 entry"
-        );
-        assert!(
-            !state.reduced_histories.contains(&b),
-            "the exit path frees the R10 entry"
-        );
-        assert_eq!(
-            state.state_keys,
-            state.retained_dynamic_keys(),
-            "every retained key is counted exactly once"
-        );
+        let lens = state.memory_lens();
+        for (name, len) in [
+            ("R10", lens.reduced.len),
+            ("open", lens.open.len),
+            ("active_ops", lens.active_ops.len),
+            ("next_pseudonym", lens.next_pseudonym.len),
+            ("find_active", lens.find_active.len),
+            ("pending", lens.pending.len),
+            ("detached", lens.detached.len),
+            ("inherited_ambiguous", lens.inherited_ambiguous.len),
+        ] {
+            assert_eq!(len, 0, "the batch sweep frees every {name} row");
+        }
     }
 
     #[test]

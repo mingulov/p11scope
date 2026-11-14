@@ -733,28 +733,15 @@ impl<'a> ViewFilesystem<'a> {
         })
     }
 
+    /// v0.8.0: objects open at any size; the old shared object size cap
+    /// is retired (callers stream or map, bounded by time/progress
+    /// budgets instead). Kept as a named entry so mapped-object opens
+    /// stay distinguishable from plain rooted opens at call sites.
     pub(crate) fn open_rooted_object_detailed(
         &self,
         path: &Path,
     ) -> Result<std::fs::File, RootedOpenFailure> {
-        let file = self.open_rooted_detailed(path)?;
-        let size = file
-            .metadata()
-            .map_err(|error| RootedOpenFailure {
-                reason: error.to_string(),
-                resolution_errno: None,
-                errno: None,
-            })?
-            .len();
-        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
-        if size > limit {
-            return Err(RootedOpenFailure {
-                reason: format!("object is {size} bytes; limit is {limit}"),
-                resolution_errno: None,
-                errno: None,
-            });
-        }
-        Ok(file)
+        self.open_rooted_detailed(path)
     }
 
     /// Open a mapping-rendered path for a scan, pin or loader read: the
@@ -775,7 +762,8 @@ impl<'a> ViewFilesystem<'a> {
         }
     }
 
-    /// [`open_mapped`](Self::open_mapped) with the shared object size cap.
+    /// [`open_mapped`](Self::open_mapped) for mapped objects (v0.8.0: at
+    /// any size; the retired size cap's entry names stay put).
     pub(crate) fn open_mapped_object(&self, path: &Path) -> Result<std::fs::File, MappedOpenError> {
         match self.open_rooted_object_detailed(path) {
             Ok(file) => Ok(file),
@@ -787,7 +775,7 @@ impl<'a> ViewFilesystem<'a> {
         &self,
         path: &Path,
         failure: RootedOpenFailure,
-        with_size_cap: bool,
+        for_object: bool,
     ) -> Result<std::fs::File, MappedOpenError> {
         let target = self.target_root_identity();
         let observer = observer_root_identity();
@@ -806,7 +794,7 @@ impl<'a> ViewFilesystem<'a> {
                 errno: failure.errno,
             });
         }
-        let fallback = if with_size_cap {
+        let fallback = if for_object {
             Self::open_host_object(path)
         } else {
             Self::open_host_regular(path)
@@ -871,16 +859,11 @@ impl<'a> ViewFilesystem<'a> {
             .map_err(|error| format!("opening pinned regular file failed: {error}"))
     }
 
-    /// [`open_host_regular`](Self::open_host_regular) with the shared
-    /// object size cap.
+    /// [`open_host_regular`](Self::open_host_regular) for mapped
+    /// objects; v0.8.0 retired the shared object size cap, so this is
+    /// the same open under the mapped-object name.
     fn open_host_object(path: &Path) -> Result<std::fs::File, String> {
-        let file = Self::open_host_regular(path)?;
-        let size = file.metadata().map_err(|error| error.to_string())?.len();
-        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
-        if size > limit {
-            return Err(format!("object is {size} bytes; limit is {limit}"));
-        }
-        Ok(file)
+        Self::open_host_regular(path)
     }
 
     /// The target root's `(device, inode)` identity: the retained root for a
@@ -1140,8 +1123,8 @@ mod tests {
     }
 
     /// The stored gap reason: only a retained-root open failure gains
-    /// the target-root suffix; size-cap, precondition and same-root
-    /// failures keep their exact wording.
+    /// the target-root suffix; precondition and same-root failures keep
+    /// their exact wording.
     #[test]
     fn gap_reason_suffixes_only_retained_root_failures_under_a_foreign_root() {
         let retained = "opening object within retained target root: No such process (os error 3)";
@@ -1157,7 +1140,7 @@ mod tests {
         );
         for (reason, root) in [
             (
-                "object is 578755480 bytes; limit is 536870912",
+                "target-root object is not a regular file",
                 Some("/proc/99999/fdinfo"),
             ),
             (
@@ -1777,8 +1760,11 @@ mod tests {
         }
     }
 
+    /// v0.8.0: mapped objects open at any size. A sparse file past the
+    /// old 512 MiB object cap opens through both the plain and the
+    /// object entry, exactly like a small one.
     #[test]
-    fn rooted_object_retains_the_existing_size_policy() {
+    fn rooted_object_opens_past_the_old_size_cap() {
         let mut group = ColdLeaderSubject::spawn(1);
         group.leave_leader();
         let pin = PidPin::open(group.pid()).unwrap();
@@ -1786,34 +1772,14 @@ mod tests {
         let proof = ViewFilesystem::open(&pin, &mut work).unwrap();
         let large = group.program.with_file_name("large-sparse-object");
         let file = std::fs::File::create(&large).unwrap();
-        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
-        file.set_len(limit + 1).unwrap();
-        assert_eq!(
-            proof
-                .open_rooted_detailed(&large)
-                .unwrap()
-                .metadata()
-                .unwrap()
-                .len(),
-            limit + 1
-        );
-        assert!(
-            proof
-                .open_rooted_object_detailed(&large)
-                .unwrap_err()
-                .reason
-                .contains("limit is")
-        );
-        file.set_len(limit).unwrap();
-        assert_eq!(
-            proof
-                .open_rooted_object_detailed(&large)
-                .unwrap()
-                .metadata()
-                .unwrap()
-                .len(),
-            limit
-        );
+        let len = 600 * 1024 * 1024u64;
+        file.set_len(len).unwrap();
+        for opened in [
+            proof.open_rooted_detailed(&large).unwrap(),
+            proof.open_rooted_object_detailed(&large).unwrap(),
+        ] {
+            assert_eq!(opened.metadata().unwrap().len(), len);
+        }
         proof.validate(&mut work).unwrap();
         group.call_three();
     }
@@ -2089,16 +2055,18 @@ mod tests {
         }
         let exe = std::env::current_exe().unwrap();
         ViewFilesystem::open_host_regular(&exe).expect("an ordinary host file opens");
-        // The test binary itself exceeds the shared object cap, so the
-        // capped positive control uses a small system file instead.
+        // v0.8.0: no object cap remains, so the over-cap test binary
+        // itself is the positive control now.
+        ViewFilesystem::open_host_object(&exe).expect("a host object opens at any size");
         ViewFilesystem::open_host_object(Path::new("/bin/sh"))
-            .expect("a small host object opens under the cap");
+            .expect("a small host object still opens");
     }
 
-    /// A precondition refusal and a size refusal carry no resolution
-    /// errno, so the host fallback never runs after them.
+    /// A precondition refusal carries no resolution errno, so the host
+    /// fallback never runs after it; a large object is no refusal at
+    /// all in v0.8.0 and opens directly.
     #[test]
-    fn target_precondition_and_size_failures_carry_no_resolution_errno() {
+    fn target_precondition_failure_carries_no_resolution_errno() {
         let mut group = ColdLeaderSubject::spawn(1);
         group.leave_leader();
         let pin = PidPin::open(group.pid()).unwrap();
@@ -2114,11 +2082,17 @@ mod tests {
         assert_eq!(precondition.resolution_errno, None);
         let large = group.program.with_file_name("large-sparse-no-fallback");
         let file = std::fs::File::create(&large).unwrap();
-        let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
-        file.set_len(limit + 1).unwrap();
-        let oversized = proof.open_rooted_object_detailed(&large).unwrap_err();
-        assert!(oversized.reason.contains("limit is"), "{oversized:?}");
-        assert_eq!(oversized.resolution_errno, None);
+        let len = 600 * 1024 * 1024u64;
+        file.set_len(len).unwrap();
+        assert_eq!(
+            proof
+                .open_rooted_object_detailed(&large)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            len
+        );
         proof.validate(&mut work).unwrap();
         group.call_three();
     }

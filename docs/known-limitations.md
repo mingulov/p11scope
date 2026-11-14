@@ -519,14 +519,14 @@ This is rare — it requires a tracking interruption at the same moment
 a call is set aside — and is planned to be fixed in 0.8.0.
 
 Where automatic continuation does apply (up to 32 interruptions per
-run), once all 32 continuations are spent the next interruption stops
-detailed tracking (mechanisms and key operations) for the rest of the
-run: coverage is marked `PARTIAL`, stderr prints the stop counts, and
-the `semantic lane stopped` gap reports that tracking stopped because
-it already continued past 32 interruptions (the per-run limit). In
-both stop cases, the broad inventory keeps running to the end of the
-window with exact call counts and detailed-tracking probes stay
-attached until exit.
+rolling 2 minutes), once all 32 continuations are spent the next
+interruption stops detailed tracking (mechanisms and key operations)
+for the rest of the run: coverage is marked `PARTIAL`, stderr prints the
+stop counts, and the `semantic lane stopped` gap reports that tracking
+stopped because it already continued past 32 interruptions in the last
+2 minutes. In both stop cases, the broad inventory keeps running to the
+end of the window with exact call counts and detailed-tracking probes
+stay attached until exit.
 
 ### Calls through the p11-kit proxy can publish no mechanism names
 

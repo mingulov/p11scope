@@ -3472,9 +3472,13 @@ impl AttachPlan {
             .map_or(0, |id| id + 1);
         // Ids already spoken for in this remap: live modules keep
         // theirs, and the retired-memory fallback below must never
-        // hand one historical id to two returning objects.
+        // hand one historical id to two returning objects. Same-file pin
+        // churn transfers live ids separately (old pin IDs absent from the
+        // rebuild, same key+path), so a new pin for the same file keeps the
+        // provider's id with no false ambiguity.
         let mut stable_in_use: BTreeSet<ModuleId> =
             self.modules.iter().map(|module| module.id).collect();
+        let mut same_file_donated: BTreeSet<ModuleId> = BTreeSet::new();
         for module in &mut rebuilt.modules {
             if !objects.insert(module.object) {
                 return Err(format!("duplicate module object {:?}", module.object));
@@ -3486,6 +3490,19 @@ impl AttachPlan {
                 .find(|old| old.object == module.object)
                 .map(|old| old.id)
                 .or_else(|| self.retired_module_id(module.object, &stable_in_use))
+                .or_else(|| {
+                    self.modules
+                        .iter()
+                        .find(|old| {
+                            old.key == module.key
+                                && old.path == module.path
+                                && !same_file_donated.contains(&old.id)
+                        })
+                        .map(|old| {
+                            same_file_donated.insert(old.id);
+                            old.id
+                        })
+                })
                 .unwrap_or_else(|| {
                     let id = ModuleId(next);
                     next += 1;

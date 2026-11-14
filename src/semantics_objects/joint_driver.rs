@@ -4044,4 +4044,90 @@ mod tests {
         let quantum = collect_probe_quantum(overflow);
         assert!(quantum.begin_table_full_or_refused());
     }
+
+    /// Marks-report twin: a released-tainted disposition consumes
+    /// its exact input without retaining an S1 subject, so it must
+    /// report that it marked nothing — only the strict retained
+    /// path commits a mark, so a marks counter fed by this report
+    /// stays unchanged for released-tainted entries.
+    #[test]
+    fn released_tainted_disposition_reports_no_mark() {
+        use crate::discovery::caller_registry::instance_input::{
+            AdmittedInstanceCall, InstanceKey,
+        };
+        use crate::discovery::caller_registry::{CallerId, ModuleKey};
+        use crate::discovery::instances::InstanceId;
+        use crate::semantics_edge::SemanticCall;
+        use p11scope_ebpf_common::ImageIdentity;
+
+        fn scripted_input(caller: CallerId) -> AdmittedInstanceCall {
+            AdmittedInstanceCall::scripted(
+                InstanceKey::scripted(
+                    NativeDomainId::mint(),
+                    ImageIdentity {
+                        task_cookie: 101,
+                        exec_id: 1,
+                    },
+                    InstanceId::from_raw(1),
+                    ModuleKey::Physical {
+                        dev_major: 1,
+                        dev_minor: 2,
+                        ino: 3,
+                        sha256: None,
+                    },
+                ),
+                caller,
+                1,
+                SemanticCall {
+                    function: "C_Initialize".into(),
+                    ..SemanticCall::default()
+                },
+            )
+        }
+
+        /// What `consume_for` reported: `None` when it reported
+        /// nothing (a `()` result), `Some(marked)` when it reports
+        /// whether it marked.
+        trait ConsumedReport {
+            fn marked_report(&self) -> Option<bool>;
+        }
+        impl ConsumedReport for () {
+            fn marked_report(&self) -> Option<bool> {
+                None
+            }
+        }
+        impl ConsumedReport for bool {
+            fn marked_report(&self) -> Option<bool> {
+                Some(*self)
+            }
+        }
+
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let input = scripted_input(CallerId(7));
+        let outcome = S1OriginalDisposition {
+            original: &input,
+            adapter: &mut adapter,
+            kind: S1OriginalKind::ReleasedTainted,
+        }
+        .consume_for(&input)
+        .expect("the exact input consumes");
+        assert_eq!(
+            outcome.marked_report(),
+            Some(false),
+            "a released-tainted disposition reports that it marked nothing"
+        );
+        let other = scripted_input(CallerId(8));
+        let refused = S1OriginalDisposition {
+            original: &input,
+            adapter: &mut adapter,
+            kind: S1OriginalKind::ReleasedTainted,
+        }
+        .consume_for(&other);
+        assert_eq!(
+            refused,
+            Err(RawQuantumRefusal::Admission),
+            "the exact-input check still refuses a different admission"
+        );
+    }
 }

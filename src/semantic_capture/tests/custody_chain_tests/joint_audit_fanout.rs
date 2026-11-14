@@ -14590,6 +14590,47 @@ fn joint_machine_unposed_rearm_clock_reads_boottime() {
     );
 }
 
+/// Clock twin: a failed boot-clock read stops the lane with its own
+/// named refusal, never the spent-rate bound: no re-arm ran, so the
+/// 32-interruptions sentence cannot be true, and the stop names the
+/// clock in plain words instead.
+#[test]
+fn joint_machine_unreadable_rearm_clock_stops_with_its_own_refusal() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.machine.fail_rearm_clock_for_test();
+    fixture.refuse_at_audited(2);
+    assert_eq!(
+        fixture.machine.rearm_now(),
+        None,
+        "the posed clock read fails"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "an unreadable clock fails closed"
+    );
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        0,
+        "no re-arm ran, so no spent-rate sentence can be true"
+    );
+    let refusal = fixture
+        .machine
+        .rearm_refusal_for_test()
+        .expect("the stop records why the re-arm was refused");
+    assert_ne!(
+        refusal,
+        crate::inventory_semantics::RunningRearmRefusal::BoundSpent,
+        "a clock-read failure is not the spent rate bound"
+    );
+    assert_eq!(
+        refusal.describe(),
+        "the clock could not be read",
+        "the stop names the unreadable clock in plain words"
+    );
+}
+
 /// Count twin: N continuations publish one re-arm row whose repeats
 /// is N. The staged gaps merge at publish time; the text names the
 /// row once with its count, and JSON carries `repeats`.

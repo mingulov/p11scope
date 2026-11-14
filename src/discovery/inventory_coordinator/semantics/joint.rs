@@ -2113,4 +2113,35 @@ mod tests {
             "the lowest loss is the barrier"
         );
     }
+
+    /// Marks-counter pin: the staging disposition's diagnostic
+    /// counter counts only dispositions whose `consume_for` reports
+    /// a committed mark. A released-tainted disposition consumes
+    /// without marking, so its report must leave the counter
+    /// unchanged — the increment stays gated on the report.
+    #[test]
+    fn staging_marks_counter_counts_only_reported_marks() {
+        let source = include_str!("joint.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn stage_next_prepared_admission_with_disposition(")
+            .expect("the staging disposition step is present");
+        let end = production[start..]
+            .find("pub(crate) fn finish_prepared_semantic_batch(")
+            .expect("the next step follows the staging disposition step");
+        let body = &production[start..start + end];
+        let report = body
+            .find("let marked = ingested")
+            .expect("the disposition's mark report is bound");
+        let gate = body[report..]
+            .find("if marked {")
+            .expect("the report gates the counter");
+        let counted = body[gate..]
+            .find("self.joint_subject_marks = self.joint_subject_marks.saturating_add(1);")
+            .expect("the counter increment follows its gate");
+        assert!(
+            report < gate && gate < counted,
+            "the marks counter counts only dispositions that reported a mark"
+        );
+    }
 }

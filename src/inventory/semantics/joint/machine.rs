@@ -1407,9 +1407,10 @@ pub(crate) struct LiveJointMachine {
     /// free or expired.
     rearm_window: [Option<u64>; RUNNING_REARM_LIMIT as usize],
     /// Posed boot clock for the running re-arm window (tests only):
-    /// production always reads the boot clock.
+    /// `Some(Some(t))` poses instant `t`, `Some(None)` poses a failed
+    /// read; unposed, production reads the boot clock.
     #[cfg(test)]
-    posed_rearm_now: Option<u64>,
+    posed_rearm_now: Option<Option<u64>>,
     /// Why the last attempted running re-arm was refused, for the
     /// stop gap. A success clears it; a call with no latched
     /// disposition attempts nothing and leaves it alone.
@@ -1573,7 +1574,15 @@ impl LiveJointMachine {
     /// waiting it out. Production never sets this.
     #[cfg(test)]
     pub(crate) fn set_rearm_clock_for_test(&mut self, now: Option<u64>) {
-        self.posed_rearm_now = now;
+        self.posed_rearm_now = now.map(Some);
+    }
+
+    /// Pose a failed boot-clock read for the running re-arm window
+    /// (twins only): `rearm_now` then reports the failure exactly as
+    /// a failed production read would.
+    #[cfg(test)]
+    pub(crate) fn fail_rearm_clock_for_test(&mut self) {
+        self.posed_rearm_now = Some(None);
     }
 
     /// Boot clock for the running re-arm window, in nanoseconds: the
@@ -1582,8 +1591,8 @@ impl LiveJointMachine {
     /// fails; the gate then fails closed.
     pub(crate) fn rearm_now(&self) -> Option<u64> {
         #[cfg(test)]
-        if let Some(now) = self.posed_rearm_now {
-            return Some(now);
+        if let Some(posed) = self.posed_rearm_now {
+            return posed;
         }
         crate::discovery::pause::boot_ns()
     }

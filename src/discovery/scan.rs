@@ -5541,15 +5541,23 @@ fn module_refused_undecoded(
 }
 
 /// The ceiling that refused table decodes: the discovery-window
-/// allowance under the Inventory policy, the retained table-key budget
-/// when admission passed but retention refused, else the capture-wide
+/// allowance under the Inventory policy, else the exhausted retained
+/// budget (file keys, runtime keys, or both — a runtime-keys refusal
+/// is never named a table-key refusal), else the capture-wide
 /// candidate ceiling. Shared by the counted remainder gap and the
 /// per-file rows so the two name one cause.
 fn undecoded_cause(budget: &CaptureWorkBudget) -> &'static str {
     if matches!(budget.stopped_reason(), Some(TABLE_WINDOW_CEILING_REASON)) {
         "discovery window table decode allowance reached"
-    } else if budget.inventory_limits().is_some() {
-        "retained table-key budget reached"
+    } else if let Some(limits) = budget.inventory_limits() {
+        let files_saturated = budget.admitted_tables.len() >= limits.retained.table_keys;
+        let runtime_saturated =
+            budget.admitted_runtime_tables.len() >= limits.retained.runtime_keys;
+        match (files_saturated, runtime_saturated) {
+            (false, true) => "retained runtime-key budget reached",
+            (true, true) => "retained table and runtime-key budgets reached",
+            _ => "retained table-key budget reached",
+        }
     } else {
         "table decode ceiling reached"
     }
@@ -7775,21 +7783,21 @@ fn scan_view_examined_mode(
         // gap has nothing to show — no entry to skip, no attach to fail, no counter.
         // A ceiling-refused file gets the plain ceiling row instead: no
         // disappearance is proven, and the no-table manifest remedy cannot
-        // help a ceiling.
-        if module.tables.is_empty() && !io_exhausted && !budget.scan_stopped() {
-            let reason = if module_refused_undecoded(
-                &module,
-                refusals_before_module,
-                budget.refusal_counts(),
-            ) {
-                undecoded_file_reason(budget)
-            } else {
-                no_table_found_reason(&module.path, hinted)
-            };
-            skipped.push(Skipped {
-                subject: module.path.clone(),
-                reason,
-            });
+        // help a ceiling. The row stays even when mapping reads exhausted
+        // — the counted gap below names the file (data-always) — matching
+        // the stop-break site above.
+        if module.tables.is_empty() && !budget.scan_stopped() {
+            if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
+                skipped.push(Skipped {
+                    subject: module.path.clone(),
+                    reason: undecoded_file_reason(budget),
+                });
+            } else if !io_exhausted {
+                skipped.push(Skipped {
+                    subject: module.path.clone(),
+                    reason: no_table_found_reason(&module.path, hinted),
+                });
+            }
         }
         // The sole-table gate's "exactly one" needs a finished scan: no
         // truncating skip, I/O exhaustion, stop or refusal on this module.

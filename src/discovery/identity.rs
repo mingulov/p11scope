@@ -7796,11 +7796,28 @@ pub(crate) fn pin_count_manifest_objects_in_views_with_prior(
     )
 }
 
+/// v0.8.0: the manifest/pre-arm batch byte allowance as an
+/// incremental progress budget. `spent` seeds with already-retained
+/// bytes; each read debits what it actually moves and refuses past the
+/// cap with the batch's named gap — never an upfront size refusal.
+/// Returns the bytes this read may take.
+fn batch_byte_allowance(spent: u64, wanted: usize) -> Result<usize, String> {
+    let allowed = MAX_TOTAL_OBJECT_BYTES.saturating_sub(spent);
+    let allowed = allowed.min(wanted as u64);
+    if allowed == 0 && wanted != 0 {
+        return Err(format!(
+            "manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+        ));
+    }
+    Ok(allowed as usize)
+}
+
 fn inspect_count_manifest_file(
     file: &std::fs::File,
     before: Pin,
     mapping: MappingFileKey,
     budget: &mut CaptureWorkBudget,
+    batch_spent: &mut u64,
 ) -> Result<InspectedObject, String> {
     budget.spend(1).map_err(str::to_owned)?;
     let key = object_key(mapping);
@@ -7814,9 +7831,9 @@ fn inspect_count_manifest_file(
         }
         return Err("file changed while its cached identity was checked".into());
     }
-    if before.size > budget.limits().per_object_bytes {
-        return Err("manifest object exceeds the collection per-object read allowance".into());
-    }
+    // v0.8.0: no per-object size gate here; the chunked reads below
+    // enforce the capture allowances and the batch allowance
+    // incrementally.
     let mut operation_bytes = 0u64;
     let inspected = inspect_file_with_reader_exporting(
         file,
@@ -7824,13 +7841,23 @@ fn inspect_count_manifest_file(
             if let Some(reason) = budget.check_deadline_now() {
                 return Err(std::io::Error::other(reason));
             }
-            let allowed = budget.allowed_io(operation_bytes, bytes.len());
+            let batch_allowed = batch_byte_allowance(*batch_spent, bytes.len());
+            let capture_allowed = budget.allowed_io(operation_bytes, bytes.len());
+            let allowed = match batch_allowed {
+                Ok(batch) => capture_allowed.min(batch),
+                // Batch exhausted; the branch below reports its gap.
+                Err(_) => 0,
+            };
             if allowed == 0 {
+                if let Err(reason) = batch_allowed {
+                    return Err(std::io::Error::other(reason));
+                }
                 return Err(std::io::Error::other(IO_CEILING_REASON));
             }
             let read = file.read_at(&mut bytes[..allowed], offset)?;
             budget.record_io(read);
             operation_bytes = operation_bytes.saturating_add(read as u64);
+            *batch_spent = batch_spent.saturating_add(read as u64);
             Ok(read)
         },
         &standard_function_names(),
@@ -7871,7 +7898,9 @@ fn pin_manifest_objects_with_read_policy(
     let mut skipped: Vec<Skipped> = Vec::new();
     let mut stale = Vec::new();
     let mut pinned = Vec::new();
-    let mut total_object_bytes = prior_bytes;
+    // v0.8.0: the batch byte allowance is enforced incrementally as
+    // identify reads stream (see `batch_byte_allowance`), never as an
+    // upfront size refusal; `prior_bytes` seeds that spend below.
     for object in &m.objects {
         let path = Path::new(&object.path);
         let retained = match retained_view_for_manifest_locator(&object.path, views) {
@@ -7961,28 +7990,11 @@ fn pin_manifest_objects_with_read_policy(
                 continue;
             }
         };
-        let len = pin.size;
-        let Some(total) = total_object_bytes.checked_add(len) else {
-            skipped.push(Skipped {
-                subject: object.path.clone(),
-                reason: "manifest object unavailable: total object size overflowed u64".into(),
-            });
-            continue;
-        };
-        if total > MAX_TOTAL_OBJECT_BYTES {
-            skipped.push(Skipped {
-                subject: object.path.clone(),
-                reason: format!(
-                    "manifest object unavailable: manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-                ),
-            });
-            continue;
-        }
-        total_object_bytes = total;
         pinned.push((object, file, pin, mountinfo));
     }
 
     let mut opened = BTreeMap::new();
+    let mut batch_spent = prior_bytes;
     for (object, file, pin, mountinfo) in pinned {
         let count_mapping = if meter_identity {
             match identity_of_manifest(&file, mountinfo.as_deref()) {
@@ -7999,11 +8011,17 @@ fn pin_manifest_objects_with_read_policy(
             None
         };
         let inspected = match if let Some(mapping) = count_mapping {
-            inspect_count_manifest_file(&file, pin, mapping, budget)
+            inspect_count_manifest_file(&file, pin, mapping, budget, &mut batch_spent)
         } else {
             inspect_file_with_reader_exporting(
                 &file,
-                |file, bytes, offset| file.read_at(bytes, offset),
+                |file, bytes, offset| {
+                    let allowed = batch_byte_allowance(batch_spent, bytes.len())
+                        .map_err(std::io::Error::other)?;
+                    let read = file.read_at(&mut bytes[..allowed], offset)?;
+                    batch_spent = batch_spent.saturating_add(read as u64);
+                    Ok(read)
+                },
                 &standard_function_names(),
             )
         } {
@@ -8319,9 +8337,11 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
         )]));
     }
     // Phase 1: resolve and open every path; one bad path becomes a gap
-    // while good paths continue (never-stop).
+    // while good paths continue (never-stop). v0.8.0: the batch byte
+    // allowance is enforced incrementally as identify reads stream
+    // (see `batch_byte_allowance`), never as an upfront size refusal;
+    // `prior_bytes` seeds that spend in phase 2.
     let mut opened = Vec::new();
-    let mut total_object_bytes = prior_bytes;
     for request in requests {
         let spelling = request.open.to_string_lossy().into_owned();
         let display = request.display.clone();
@@ -8440,33 +8460,23 @@ pub(crate) fn pin_prearm_requests_in_views_with_budget(
                 continue;
             }
         };
-        let Some(total) = total_object_bytes.checked_add(pin.size) else {
-            skipped.push(Skipped {
-                subject: display.clone(),
-                reason: "prearm object unavailable: total object size overflowed u64".into(),
-            });
-            continue;
-        };
-        if total > MAX_TOTAL_OBJECT_BYTES {
-            skipped.push(Skipped {
-                subject: display.clone(),
-                reason: format!(
-                    "prearm object unavailable: manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-                ),
-            });
-            continue;
-        }
-        total_object_bytes = total;
         opened.push((display, file, pin, mountinfo));
     }
 
     // Phase 2: identify, hash, bracket and file every opened object.
     let mut pins = PinnedObjects::empty();
     let mut inputs = Vec::new();
+    let mut batch_spent = prior_bytes;
     for (spelling, file, pin, mountinfo) in opened {
         let inspected = match inspect_file_with_reader_exporting(
             &file,
-            |file, bytes, offset| file.read_at(bytes, offset),
+            |file, bytes, offset| {
+                let allowed = batch_byte_allowance(batch_spent, bytes.len())
+                    .map_err(std::io::Error::other)?;
+                let read = file.read_at(&mut bytes[..allowed], offset)?;
+                batch_spent = batch_spent.saturating_add(read as u64);
+                Ok(read)
+            },
             &standard_function_names(),
         ) {
             Ok(inspected) => inspected,
@@ -9620,13 +9630,8 @@ fn pin_map_files_fallback(
             "map_files range {start:x}-{end:x} is not a regular file; refused"
         )));
     }
-    // The shared object size cap applies to the served file exactly as
-    // to a root-opened one: same limit, same wording, never lowered.
-    let size = metadata.len();
-    let limit = p11scope_manifest::identity::MAX_OBJECT_BYTES;
-    if size > limit {
-        return Err(Refused(format!("object is {size} bytes; limit is {limit}")));
-    }
+    // v0.8.0: the served file joins at any size, like a root-opened
+    // one; downstream reads stream or map under time/progress budgets.
     // The like-for-like proof, read fresh on both sides: the served
     // fd's self-mapped `vm_file` against this range's `map_files`
     // stat. Only a proven same file joins.
@@ -9868,15 +9873,9 @@ fn pin_scanned_object(
         return Err("the pre-copy-up pin has no proof-time identity; it was refused".into());
     }
     let mapped = mapped.ok();
-    // The per-file rule can be decided from metadata. Aggregate admission happens
-    // incrementally at the reader below, and a partial digest is never trusted.
-    if before.size > budget.limits().per_object_bytes {
-        let limits = budget.limits();
-        return Err(PinFailure::Refused(format!(
-            "too_large ({} bytes; per-object cap is {})",
-            before.size, limits.per_object_bytes,
-        )));
-    }
+    // v0.8.0: no per-file size gate here. Admission happens incrementally
+    // at the reader below (capture allowances plus deadline), and a
+    // partial digest is never trusted.
     #[cfg(test)]
     tests::run_before_hash_test_hook(budget);
     // A repeat pin of the unchanged file reuses the cached inspection with zero
@@ -10103,12 +10102,12 @@ pub(crate) mod test_fixture {
 
     /// A small owned ELF for tests that need a real pinnable object. The
     /// test binary itself doubles as one while thin, but once instrumented
-    /// (coverage) it exceeds the scanner's object limit and every pin of it
-    /// is refused — so pinnable-object fixtures use this instead. Built once
-    /// per process and shared: pins from different calls merge exactly like
-    /// pins of one file. The file is gcc-built, never instrumented, and
-    /// asserted far below the limit, so it stays pinnable under any test
-    /// profile.
+    /// (coverage) it grows to hundreds of megabytes and every pin of it
+    /// pays a whole-file hash — so fast pinnable-object fixtures use this
+    /// instead. Built once per process and shared: pins from different
+    /// calls merge exactly like pins of one file. The file is gcc-built,
+    /// never instrumented, and asserted small, so it stays fast under any
+    /// test profile.
     pub(crate) fn small_owned_object() -> &'static Path {
         static OBJECT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         OBJECT
@@ -10134,8 +10133,8 @@ pub(crate) mod test_fixture {
                 );
                 let len = std::fs::metadata(&path).unwrap().len();
                 assert!(
-                    len < p11scope_manifest::identity::MAX_OBJECT_BYTES,
-                    "the small owned fixture must stay pinnable: {len} bytes"
+                    len < 64 * 1024 * 1024,
+                    "the small owned fixture must stay small: {len} bytes"
                 );
                 dir.keep().join("small-owned-object.so")
             })
@@ -10614,12 +10613,12 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
-    fn small_owned_object_stays_pinnable_under_the_object_limit() {
+    fn small_owned_object_stays_pinnable() {
         let path = test_fixture::small_owned_object();
         let len = std::fs::metadata(path).unwrap().len();
         assert!(
-            len < p11scope_manifest::identity::MAX_OBJECT_BYTES,
-            "the fixture must stay pinnable under any profile: {len} bytes"
+            len < 64 * 1024 * 1024,
+            "the fixture must stay small under any profile: {len} bytes"
         );
         // Same path twice: the process shares one file, so pins merge.
         assert_eq!(path, test_fixture::small_owned_object());
@@ -10641,6 +10640,81 @@ mod tests {
             pins.id_for_scanned(&module, module.key, &module.path)
                 .is_some(),
             "the fixture pin resolves"
+        );
+    }
+
+    /// v0.8.0: a chrome-sized sparse object pins under a sufficient
+    /// allowance (no per-object size gate), streaming its identity
+    /// hash; a starved allowance degrades through the I/O ceiling's
+    /// named gap instead of a size refusal.
+    #[test]
+    fn chrome_sized_object_pins_without_a_size_gate() {
+        use crate::discovery::scan::ScanLimits;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chrome-sized.so");
+        std::fs::copy(test_fixture::small_owned_object(), &path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let file = open_object(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let key = ObjectKey {
+            device: Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        let module = ScannedModule {
+            key_is_identity: false,
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: None,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            path: path.display().to_string(),
+            tables_scan_finished: false,
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        };
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let (pins, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(
+            pins.id_for_scanned(&module, module.key, &module.path)
+                .is_some(),
+            "the large pin resolves"
+        );
+
+        let mut starved = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 1024 * 1024,
+            total_bytes: 1024 * 1024,
+        });
+        let (_, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut starved).unwrap();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0].reason.contains("attempted-I/O ceiling"),
+            "a starved allowance keeps the named gap, got {:?}",
+            skipped[0].reason
+        );
+        assert!(
+            !skipped[0].reason.contains("too_large") && !skipped[0].reason.contains("limit is"),
+            "no size wording may remain, got {:?}",
+            skipped[0].reason
         );
     }
 

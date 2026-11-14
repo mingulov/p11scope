@@ -196,8 +196,9 @@ fn timing_key(index: usize) -> PinnedTimingKey {
         let view = ProcessView::open(ProcessViewId(99), std::process::id()).unwrap();
         let mut keys = Vec::new();
         // First key: the small owned fixture. The test binary itself would
-        // be the natural first executable object, but instrumented builds
-        // exceed the object limit and refuse every pin.
+        // be the natural first executable object, but hashing hundreds of
+        // megabytes per key would stall the fixture (production pins at
+        // any size since v0.8.0).
         let module = crate::discovery::identity::test_fixture::small_owned_module(&view);
         let pins = pin_test_module(&view, &module);
         let object = pins
@@ -225,11 +226,11 @@ fn timing_key(index: usize) -> PinnedTimingKey {
             else {
                 continue;
             };
-            // Objects past the scanner's object limit cannot pin (notably
-            // this test binary once instrumented); they contribute no key.
-            if std::fs::metadata(&path)
-                .is_ok_and(|facts| facts.len() > p11scope_manifest::identity::MAX_OBJECT_BYTES)
-            {
+            // Fixture-only bound: objects past 64 MiB (notably this test
+            // binary once instrumented) would stall key collection with a
+            // whole-file hash, so they contribute no key. Production pins
+            // at any size since v0.8.0.
+            if std::fs::metadata(&path).is_ok_and(|facts| facts.len() > 64 * 1024 * 1024) {
                 continue;
             }
             let module = mapped_object(&view, mapping, &path);
@@ -11661,7 +11662,7 @@ fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
 fn a_cleanly_retired_loader_context_publishes_no_skip() {
     // Retire a context over a small owned child, not this test binary: the
     // retirement batch scans the subject's mappings and pins its modules,
-    // and instrumented builds exceed the object limit.
+    // and hashing an instrumented test binary per pin would stall it.
     let subject = OwnedMapper::ready();
     let (mut engine, owner) = Engine::retiring_loader_context(subject.pid());
     // This test's subject is loader-retirement skip semantics, not tick
@@ -72570,10 +72571,12 @@ int main(int argc, char **argv) {
 }
 
 /// The tables-scan finished flag from a real scan: a default-budget scan
-/// of a loader child finishes the provider module, while a per-object
-/// cap that skips the module leaves it unfinished. A work ceiling cannot
-/// twin the failure leg here: any mid-scan stop fails the maps-B bracket
-/// and drops every module, so no stopped module is observable.
+/// of a loader child finishes the provider module, while a starved
+/// per-operation allowance leaves it unfinished behind the I/O ceiling's
+/// named gap (v0.8.0: no whole-size gate; reads degrade incrementally).
+/// A work ceiling cannot twin the failure leg here: any mid-scan stop
+/// fails the maps-B bracket and drops every module, so no stopped module
+/// is observable.
 #[test]
 fn raw_scan_tables_scan_finished_and_skipped_unfinished() {
     use std::process::{Command, Stdio};
@@ -72684,22 +72687,27 @@ int main(int argc, char **argv) {
         .modules()
         .iter()
         .find(|module| module.path.ends_with("provider.so"))
-        .expect("a skipped module is still reported");
+        .expect("a degraded module is still reported");
     assert!(
         outcome
             .skipped()
             .iter()
-            .any(|skip| skip.subject.ends_with("provider.so") && skip.reason.contains("too_large")),
-        "the cap skipped the provider module: {:?}",
+            .any(|skip| skip.subject.ends_with("provider.so")
+                && skip.reason.contains("attempted-I/O ceiling")),
+        "the starved allowance keeps the named gap: {:?}",
         outcome.skipped()
     );
     assert!(
-        provider.tables.is_empty(),
-        "a skipped module carries no tables"
+        outcome
+            .skipped()
+            .iter()
+            .all(|skip| !skip.reason.contains("too_large")),
+        "no size wording may remain: {:?}",
+        outcome.skipped()
     );
     assert!(
         !provider.tables_scan_finished,
-        "a skipped tables scan reports unfinished"
+        "a degraded tables scan reports unfinished"
     );
 }
 

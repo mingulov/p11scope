@@ -2080,7 +2080,7 @@ fn byte_identical_aliases_require_an_unambiguous_provenance_relation() {
 }
 
 #[test]
-fn aggregate_object_bytes_are_refused_before_parsing() {
+fn aggregate_object_bytes_degrade_through_the_batch_gap() {
     let d = tmpdir("manifest_pinning_aggregate_object_bytes");
     let so = cc_so(&d, "small", "int f(void){return 1;}\n");
     let _guard = CC_LOCK.lock().unwrap();
@@ -2088,8 +2088,11 @@ fn aggregate_object_bytes_are_refused_before_parsing() {
     for id in 1..=2 {
         let path = d.join(format!("large-{id}.so"));
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(p11scope_manifest::identity::MAX_OBJECT_BYTES)
-            .unwrap();
+        // v0.8.0: the batch allowance is enforced incrementally as
+        // identify reads stream, so this aggregate twin streams one
+        // allowance worth of bytes before the named gap (no upfront
+        // size refusal).
+        file.set_len(512 * 1024 * 1024).unwrap();
         m.objects.push(ObjectRecord {
             id,
             path: path.display().to_string(),
@@ -2475,15 +2478,19 @@ fn an_unlisted_retained_memfd_never_uses_inode_only_identity() {
 }
 
 #[test]
-fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
-    // The per-object cap also bounds every mount-table read (read_mountinfo_with
-    // caps a table at min(per_object_bytes, MAX_MOUNTINFO_BYTES)), and pinning
-    // reads the child's mountinfo before it can judge the object. A ~16 KB
-    // `hold` made the cap below smaller than a busy host's mount table, so the
-    // case failed on the table, not the object (DR-PINNING-MOUNTINFO-HOST-SIZE).
+fn an_object_over_the_byte_budget_is_skipped_with_the_named_gap() {
+    // The per-operation allowance also bounds every mount-table read
+    // (read_mountinfo_with caps a table at min(per_object_bytes,
+    // MAX_MOUNTINFO_BYTES)), and pinning reads the child's mountinfo
+    // before it can hash the object. A ~16 KB `hold` made the allowance
+    // below smaller than a busy host's mount table, so the case failed on
+    // the table, not the object (DR-PINNING-MOUNTINFO-HOST-SIZE).
     // Extend `hold` with a sparse tail past the absolute 64 MiB mount-table
-    // ceiling: the cap then never binds the table before the product's own
-    // ceiling does, on any host. Bytes past the ELF's segments are never loaded.
+    // ceiling: the allowance then never binds the table before the product's
+    // own ceiling does, on any host. Bytes past the ELF's segments are never
+    // loaded. v0.8.0: the hash streams to the allowance, then degrades
+    // through the I/O ceiling's named gap (never a size refusal, and the
+    // partial digest is never trusted).
     const MOUNT_TABLE_CEILING: u64 = 64 * 1024 * 1024;
     assert!(
         include_str!("../src/discovery/scan.rs")
@@ -2512,15 +2519,17 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
     assert_eq!(
         pinned.pinned().count(),
         0,
-        "an object over budget is never hashed"
+        "a partial digest is never trusted"
     );
     assert_eq!(skipped.len(), 1, "{skipped:?}");
     let reason = &skipped[0].reason;
     assert!(
-        reason.starts_with("too_large")
-            && reason.contains(&format!("{len} bytes"))
-            && reason.contains(&(len - 1).to_string()),
-        "the reason must name the object's size and the cap it broke: {reason}"
+        reason.contains("attempted-I/O ceiling"),
+        "the exhausted allowance keeps its named gap: {reason}"
+    );
+    assert!(
+        !reason.contains("too_large") && !reason.contains("limit is"),
+        "no size wording may remain: {reason}"
     );
 }
 

@@ -42,6 +42,11 @@
 # step-6 expectation). The < 1% target / 3% ceiling gate runs in A1 and
 # B4 on longer campaigns with this script.
 #
+# REQUIRE_QUIET (default 1) keeps the M2 quiet-host wait (load bounds
+# plus no cargo/rustc) before every sample. Set 0 only to validate the
+# harness itself on a shared host: per-sample loads are still recorded
+# and the delta is provisional noise, never a gate verdict.
+#
 # Usage: flock "$LOCK" scripts/bench-profile-overhead.sh [--self-test]
 # The script refuses unless an ancestor holds LOCK (default
 # /var/tmp/p11scope-ws-tmp/privileged.lock), the tree is clean, and no
@@ -75,6 +80,7 @@ ATTACH_TIMEOUT=${ATTACH_TIMEOUT:-180}
 MAX_LOAD1=${MAX_LOAD1:-4}
 MAX_LOAD5=${MAX_LOAD5:-4}
 COOLDOWN=${COOLDOWN:-300}
+REQUIRE_QUIET=${REQUIRE_QUIET:-1}
 LOCK=${LOCK:-/var/tmp/p11scope-ws-tmp/privileged.lock}
 CHURN=${CHURN:-$REPO/scripts/mem-churn.py}
 TMPDIR=${TMPDIR:-}
@@ -148,6 +154,10 @@ guards() {
     is_positive_int "$ROUNDS" || die "ROUNDS must be a positive integer"
     is_positive_int "$OBS_SPARE" || die "OBS_SPARE must be a positive integer"
     is_positive_int "$ATTACH_TIMEOUT" || die "ATTACH_TIMEOUT must be a positive integer"
+    case "$REQUIRE_QUIET" in
+        0|1) : ;;
+        *) die "REQUIRE_QUIET must be 0 or 1" ;;
+    esac
     [ -n "$TMPDIR" ] || die "TMPDIR must be set to a disk filesystem"
     [ -d "$TMPDIR" ] || die "TMPDIR is not a directory: $TMPDIR"
     [ "$(stat -f -c %T "$TMPDIR" 2>/dev/null)" != "tmpfs" ] \
@@ -221,7 +231,9 @@ run_sample() {
     mkdir -p "$dir"
     obs_dur=$(( SECS + OBS_SPARE ))
 
-    wait_cool || refuse "host never cooled below $MAX_LOAD1/$MAX_LOAD5"
+    if [ "$REQUIRE_QUIET" = 1 ]; then
+        wait_cool || refuse "host never cooled below $MAX_LOAD1/$MAX_LOAD5"
+    fi
     # Re-check exclusivity per sample: another lane may have started a
     # capture since the campaign began, and its probes would charge
     # this sample. Never measure beside a live capture.
@@ -382,7 +394,7 @@ main() {
     fi
     LOG=$OUTDIR/campaign.log
     : > "$LOG"
-    say "bench-profile-overhead ts=$ts base=$BASE_BIN cand=$CAND_BIN rate=$RATE fail_share=$FAIL_SHARE fork_every=$FORK_EVERY secs=$SECS rounds=$ROUNDS obs_spare=$OBS_SPARE"
+    say "bench-profile-overhead ts=$ts base=$BASE_BIN cand=$CAND_BIN rate=$RATE fail_share=$FAIL_SHARE fork_every=$FORK_EVERY secs=$SECS rounds=$ROUNDS obs_spare=$OBS_SPARE quiet=$REQUIRE_QUIET max_load=$MAX_LOAD1/$MAX_LOAD5"
     say "base_sha=$(sha256sum "$BASE_BIN" | cut -d' ' -f1)"
     say "cand_sha=$(sha256sum "$CAND_BIN" | cut -d' ' -f1)"
     say "base_version=$("$BASE_BIN" --version 2>/dev/null | head -n 1 || echo unknown)"

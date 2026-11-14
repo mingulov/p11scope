@@ -467,6 +467,13 @@ pub struct Engine {
     /// Bounded: past the cap new identities are simply not retained
     /// (a re-staged candidate dedupes by pinned identity instead).
     learned_settled: BTreeSet<(u64, u64)>,
+    /// Learned identities the table deferred at least once and not
+    /// yet staged-or-refused: their retries requeue without
+    /// re-proving while the table stays full. Bounded: an identity
+    /// enters only beside its requeue into the bounded
+    /// `pending_learned` (or settles straight out past the bound)
+    /// and leaves at settle.
+    learned_waited: BTreeSet<(u64, u64)>,
     /// Candidates past the per-tick pin bound: staged first next tick.
     /// Queue entries, not library handles: fanotify event fds stay
     /// outside the table by design (D2) and only file a row once
@@ -12880,6 +12887,7 @@ impl Engine {
             learned_notes: BTreeMap::new(),
             learned_load_tally: BTreeMap::new(),
             learned_settled: BTreeSet::new(),
+            learned_waited: BTreeSet::new(),
             pending_learned: Vec::new(),
             learned_staged_files: 0,
             learned_event_loss: 0,
@@ -21446,6 +21454,9 @@ impl Engine {
         {
             self.learned_settled.insert(identity);
         }
+        // A settled wait is over: the retry pre-check below must not
+        // treat a later staging of this identity as a deferral retry.
+        self.learned_waited.remove(&identity);
     }
 
     /// Re-queues one candidate into `pending_learned` under the staging
@@ -21552,27 +21563,24 @@ impl Engine {
         if let Some(path) = self.learned_unlink_before_pin_for_test.take() {
             let _ = std::fs::remove_file(path);
         }
-        // Cheap pre-check before paying for proof: a full table cannot
-        // admit, so prune-then-recheck (like `acquire`) and requeue
-        // without proving — no re-hash, no mountinfo re-read, no new
-        // row. The one wait row files here, deduped, under the same
-        // subject the prove path would file (the normalized display
-        // spelling), so retries add nothing and the capture-wide I/O
-        // ceiling stands still.
-        self.handle_table.prune(usize::MAX);
-        if crate::fd_budget::library_handle_budget_exhausted(
-            self.handle_table.len(),
-            self.handle_table.scan_cap(),
-        ) {
-            let subject =
-                crate::discovery::identity::normalize_target_path(&candidate.display_path)
-                    .unwrap_or_else(|| candidate.display_path.clone());
-            self.mark_partial(
-                &subject,
-                crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED,
-            );
-            self.requeue_learned_candidate(candidate);
-            return;
+        // Retry pre-check before paying to re-prove: a candidate the
+        // table already deferred waits again without proving while
+        // the table stays full — prune-then-recheck (like `acquire`),
+        // then requeue with no re-hash, no mountinfo re-read and no
+        // new row (the first deferral filed the one wait row), so the
+        // capture-wide I/O ceiling stands still across retries. With
+        // room the wait lifts and the candidate proves below. First
+        // stagings always prove: the wait row comes from the prove
+        // path, and a shareable file stages at once.
+        if self.learned_waited.contains(&identity) {
+            self.handle_table.prune(usize::MAX);
+            if crate::fd_budget::library_handle_budget_exhausted(
+                self.handle_table.len(),
+                self.handle_table.scan_cap(),
+            ) {
+                self.requeue_learned_candidate(candidate);
+                return;
+            }
         }
         // The candidate owns its fd for this whole call, so the pin
         // worker's `/proc/self/fd/N` open cannot dangle.
@@ -21655,6 +21663,11 @@ impl Engine {
             // Past the pending bound the requeue refuses loudly instead
             // (never an unbounded queue, never a silent close).
             if learned_wait {
+                // The first deferral files the wait row above; mark
+                // the identity waited so retries requeue without
+                // re-proving while the table stays full. Settle (or
+                // the pending bound's loud refusal) clears the mark.
+                self.learned_waited.insert(identity);
                 self.requeue_learned_candidate(candidate);
                 return;
             }

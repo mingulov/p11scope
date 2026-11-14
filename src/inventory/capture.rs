@@ -1067,8 +1067,11 @@ impl<L> NativeLane<L> {
     /// Extends the backlog prefix within one tick window against `targets`,
     /// buffering attached/failed/custody/refusal for the next pass to
     /// forward. Skips when the backlog is empty or an extend already
-    /// refused (no progress possible). The backlog keeps drain order: the
-    /// receipt's deferred (the prefix tail) plus the untouched suffix.
+    /// refused (no progress possible). The backlog is the receipt's
+    /// deferred (the prefix tail) plus the untouched suffix; a cutoff
+    /// inside the tick returns the tail in facade order (admission tail,
+    /// then group-key order on Multi), so the backlog can drift from
+    /// drain order within one prefix until the next pass re-sorts it.
     /// `targets` must not borrow this lane (host targets); cached ticks
     /// use [`Self::tick_extend_cached`].
     fn tick_extend_backlog<Pin>(&mut self, targets: &dyn CaptureTargets)
@@ -1263,9 +1266,10 @@ impl<L> NativeLane<L> {
     /// nothing more (the batch bound covers empty quanta, which charge
     /// zero records but still cost a shell); the backlog extend still
     /// runs when asked (it is bounded by its own tick window, not the
-    /// held bounds). Ordering stays `sort_drain_order`: the backlog
-    /// keeps the last pass's sorted order, ticks take its prefix, no
-    /// re-sort.
+    /// held bounds). Ticks take the backlog's prefix without re-sorting;
+    /// a cutoff inside a tick returns the prefix tail in facade order,
+    /// so the order can drift within one prefix until the next pass
+    /// re-sorts (`sort_drain_order` still decides every pass window).
     pub(crate) fn collecting_tick<Pin>(&mut self, extend: bool)
     where
         L: CaptureLane<Pin>,

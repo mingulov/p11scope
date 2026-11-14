@@ -2487,24 +2487,20 @@ fn retiring_line_counts_tick_attaches_buffered_since_the_last_pass() {
     let started = NativeLane::start(lane, &mut scene, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
-    // The stop fires once the first pass published and 50 ms passed: the
-    // 1 ms inter-pass ticks in between drain the one deferred endpoint, and
-    // the loop breaks before a second pass could flush them first.
-    let published_at: Rc<RefCell<Option<Instant>>> = Rc::default();
+    // The stop fires once the first pass published and an inter-pass tick
+    // extended: three extends logged (startup, pass 1, the draining tick).
+    // No wall clock: the stop cannot fire before the tick drains, however
+    // slow or fast the host runs, and the loop breaks before a second pass
+    // could flush the buffered attach first.
     let stop_log = Rc::clone(&log);
-    let stop_seen = Rc::clone(&published_at);
     let stop = move || {
-        if stop_seen.borrow().is_none()
-            && stop_log
-                .borrow()
+        let entries = stop_log.borrow();
+        entries.iter().any(|entry| entry == "publish:pass")
+            && entries
                 .iter()
-                .any(|entry| entry == "publish:pass")
-        {
-            *stop_seen.borrow_mut() = Some(Instant::now());
-        }
-        stop_seen
-            .borrow()
-            .is_some_and(|at| at.elapsed() >= Duration::from_millis(50))
+                .filter(|entry| entry.starts_with("extend["))
+                .count()
+                >= 3
     };
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
@@ -2541,7 +2537,19 @@ fn retiring_line_counts_tick_attaches_buffered_since_the_last_pass() {
         "the pass attach plus the tick attach: {:?}",
         entries(&log)
     );
-    let retiring = entries(&log)
+    let captured = entries(&log);
+    let published = captured
+        .iter()
+        .position(|entry| entry == "publish:pass")
+        .expect("the pass publishes");
+    assert!(
+        captured[published + 1] == "service"
+            && captured[published + 2] == "stage:lifecycle"
+            && captured[published + 3].starts_with("extend["),
+        "the inter-pass tick services the ring before it extends: {:?}",
+        &captured[published + 1..published + 4]
+    );
+    let retiring = captured
         .iter()
         .find(|entry| entry.starts_with("publish:retiring "))
         .cloned()

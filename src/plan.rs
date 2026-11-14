@@ -2681,38 +2681,41 @@ impl AttachPlan {
             // gap. Every mismatch fails closed to retire+admit as before.
             // Count-only tolerates the new pin's fresh module IDs (Ambiguous);
             // new ambiguity on a semantic descriptor refuses migration.
-            let migrated = rebuilt.slot_by_key.iter().find_map(|(new_key, new_position)| {
-                if new_key.file_offset != key.file_offset {
-                    return None;
-                }
-                let new_slot = rebuilt.slots.get(*new_position)?;
-                let old_slot = slots.get(*position)?;
-                if new_slot.object_path != old_slot.object_path {
-                    return None;
-                }
-                if new_slot.descriptor_index != old_slot.descriptor_index
-                    || new_slot.names != old_slot.names
-                {
-                    return None;
-                }
-                if let (Some(old_identity), Some(new_identity)) = (
-                    self.object_identities.get(&old_slot.object),
-                    rebuilt.object_identities.get(&new_slot.object),
-                ) && old_identity != new_identity
-                {
-                    return None;
-                }
-                let previous = aggregate_owners.get(*position).copied()?;
-                let candidate = if rebuilt.slot_is_module_ambiguous(new_slot.index) {
-                    AggregateOwner::Ambiguous
-                } else {
-                    AggregateOwner::from_module_ids(&new_slot.module_ids)
-                };
-                if previous.merge(candidate) != previous && new_slot.descriptor_index != 0 {
-                    return None;
-                }
-                Some((*new_key, new_slot.clone(), previous.merge(candidate)))
-            });
+            let migrated = rebuilt
+                .slot_by_key
+                .iter()
+                .find_map(|(new_key, new_position)| {
+                    if new_key.file_offset != key.file_offset {
+                        return None;
+                    }
+                    let new_slot = rebuilt.slots.get(*new_position)?;
+                    let old_slot = slots.get(*position)?;
+                    if new_slot.object_path != old_slot.object_path {
+                        return None;
+                    }
+                    if new_slot.descriptor_index != old_slot.descriptor_index
+                        || new_slot.names != old_slot.names
+                    {
+                        return None;
+                    }
+                    if let (Some(old_identity), Some(new_identity)) = (
+                        self.object_identities.get(&old_slot.object),
+                        rebuilt.object_identities.get(&new_slot.object),
+                    ) && old_identity != new_identity
+                    {
+                        return None;
+                    }
+                    let previous = aggregate_owners.get(*position).copied()?;
+                    let candidate = if rebuilt.slot_is_module_ambiguous(new_slot.index) {
+                        AggregateOwner::Ambiguous
+                    } else {
+                        AggregateOwner::from_module_ids(&new_slot.module_ids)
+                    };
+                    if previous.merge(candidate) != previous && new_slot.descriptor_index != 0 {
+                        return None;
+                    }
+                    Some((*new_key, new_slot.clone(), previous.merge(candidate)))
+                });
             if let Some((new_key, new_slot, merged_owner)) = migrated {
                 let mut updated = new_slot;
                 updated.index = *position as u32;
@@ -19145,9 +19148,15 @@ pub(crate) mod tests {
         assert_eq!(delta.retire.len(), 0, "no retire gap on pin migration");
         assert_eq!(delta.new.len(), 0, "no fresh slots on pin migration");
         assert_eq!(plan.slots.len(), 68, "lifetime stays 68 via migration");
-        assert_eq!(plan.active_slot_count(), 68, "stays active, calls countable");
+        assert_eq!(
+            plan.active_slot_count(),
+            68,
+            "stays active, calls countable"
+        );
         assert!(
-            plan.slots.iter().all(|slot| slot.object == PinnedObjectId(83)),
+            plan.slots
+                .iter()
+                .all(|slot| slot.object == PinnedObjectId(83)),
             "object IDs migrate to new pin"
         );
     }

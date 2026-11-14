@@ -32,7 +32,8 @@ use crate::discovery::identity::{
     pin_manifest_objects_deferred_in_views_with_budget_and_filing,
     pin_manifest_objects_deferred_in_views_with_prior_and_filing, pin_of,
     pin_prearm_objects_in_views_with_budget_and_filing, pin_scanned_view_objects_with_filing,
-    preexec_object_key, retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
+    pin_scanned_view_objects_with_table, preexec_object_key, retained_object_key_cached,
+    self_mapped_fallback_key, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
@@ -5772,6 +5773,10 @@ enum DiscoveryRecordOutcome {
         view: ProcessViewId,
         owner: LoaderContextId,
     },
+    /// A live publication that waited for library handles: nothing was
+    /// applied, and the record pass restores the untouched record plus
+    /// the unprocessed rest at the head of the pending FIFO.
+    HandlesDeferred,
 }
 
 impl DiscoveryRecordOutcome {
@@ -5785,7 +5790,9 @@ impl DiscoveryRecordOutcome {
     fn changed(self) -> bool {
         match self {
             Self::Applied { changed, .. } => changed,
-            Self::Rejected(_) | Self::TerminalSelectionHandoff { .. } => false,
+            Self::Rejected(_) | Self::TerminalSelectionHandoff { .. } | Self::HandlesDeferred => {
+                false
+            }
         }
     }
 
@@ -6059,6 +6066,7 @@ fn seed_object_is_unadmitted_closure(plan: &plan::AttachPlan, seed: &CountOnlySe
 /// by-value read never creates a second dispatchable owner: only this
 /// envelope (or the terminal batch/error prefix it moves into) carries the
 /// record to dispatch or retention.
+#[derive(Clone)]
 struct QueuedDiscoveryRecord {
     record: DiscoveryRecord,
     terminal_owner: Option<LoaderContextId>,
@@ -7652,6 +7660,21 @@ fn scan_pins_waited_only_for_reserve(skips: &[Skipped]) -> bool {
         waited = true;
     }
     waited
+}
+
+/// True when a pin result waited for the library-handle budget: at
+/// least one pin stopped before the cap. Presence, not exclusivity —
+/// a budget wait means the pin set is incomplete however else it
+/// skipped, so the caller defers whole rather than applying partial.
+/// Live tails and refresh paths restore on this; admission loops keep
+/// the tail-selecting `only` variants below.
+fn pins_waited_for_handles_budget(skips: &[Skipped]) -> bool {
+    skips.iter().any(|skip| {
+        skip.subject == crate::discovery::identity::PIN_WAIT_SUBJECT
+            && skip
+                .reason
+                .contains(crate::discovery::identity::PIN_BUDGET_STOP_DETAIL)
+    })
 }
 
 /// True when a scan's pins waited ONLY for the pre-emptive
@@ -19675,14 +19698,20 @@ impl Engine {
     ) -> Result<DiscoveryRecordOutcome> {
         self.note_publication_availability(subject, record, table.version, header_available);
         self.note_unowned_publication(subject, &table);
+        if self.collected_finish_actions.is_some() {
+            self.mark_partial(
+                "live export discovery",
+                "a publication lowered after the terminal stop was not admitted; its objects were not pinned",
+            );
+            return Ok(DiscoveryRecordOutcome::applied(false, false));
+        }
         let mut targets = BTreeMap::<ObjectKey, String>::new();
         for entry in &table.entries {
             targets
                 .entry(entry.object)
                 .or_insert_with(|| entry.object_path.clone());
         }
-        let mut changed = false;
-        let mut complete = true;
+        let mut lowered = Vec::new();
         for (key, path) in targets {
             let mut observed = table.clone();
             observed.entries.retain(|entry| entry.object == key);
@@ -19695,7 +19724,7 @@ impl Engine {
             observed.manifest_supported = false;
             observed.walk = "known_prefix";
             let view = &self.views[position];
-            let module = ScannedModule {
+            lowered.push(ScannedModule {
                 key_is_identity: false,
                 module_hint: None,
                 mapped_identity: None,
@@ -19711,9 +19740,27 @@ impl Engine {
                 exports: Vec::new(),
                 tables: vec![observed],
                 interfaces: Vec::new(),
-            };
-            let outcome = self.apply_lowered_module(
+            });
+        }
+        // Acquire-all-then-apply: every target's handle before any
+        // application. On a budget wait the collected pins drop, nothing
+        // applies, and the record restores for the next pass — never a
+        // partial apply, never a double apply.
+        let mut pinned = Vec::new();
+        for module in &lowered {
+            let (pins, pin_skips) = self.pin_lowered_module(module, position, record.hook_ts_ns)?;
+            if pins_waited_for_handles_budget(&pin_skips) {
+                return Ok(DiscoveryRecordOutcome::HandlesDeferred);
+            }
+            pinned.push((pins, pin_skips));
+        }
+        let mut changed = false;
+        let mut complete = true;
+        for (module, (pins, pin_skips)) in lowered.into_iter().zip(pinned) {
+            let outcome = self.apply_pinned_lowered_module(
                 module,
+                pins,
+                pin_skips,
                 position,
                 record.hook_ts_ns,
                 session,
@@ -19860,10 +19907,42 @@ impl Engine {
         )
     }
 
+    /// Pins one lowered publication module through the single
+    /// `acquire()`: the shared pin half of every lowered-module apply.
+    // `hook_ts_ns` feeds the test-only validation probe below.
+    #[allow(unused_variables)]
+    fn pin_lowered_module(
+        &mut self,
+        lowered: &ScannedModule,
+        position: usize,
+        hook_ts_ns: u64,
+    ) -> Result<(PinnedObjects, Vec<Skipped>)> {
+        #[cfg(test)]
+        crate::first_use_probe::publication_validated(&self.views[position], lowered, hook_ts_ns);
+        let view = &self.views[position];
+        let pin_start = crate::attach::monotonic_ns();
+        let pinned = pin_scanned_view_objects_with_table(
+            view,
+            std::slice::from_ref(lowered),
+            &mut self.budget,
+            None,
+            &mut self.handle_table,
+            DeferredReason::Live,
+        );
+        self.stage_timings.span(
+            crate::timing::StageKind::Pin,
+            "pin_lowered_module",
+            pin_start,
+            crate::attach::monotonic_ns(),
+        );
+        pinned.map_err(anyhow::Error::msg)
+    }
+
     /// Pins, merges and applies one lowered publication module — the
     /// shared tail of export-record and selection-result lowering, so
     /// equivalent factory forms admit through one ownership-validation
-    /// path and one causal-timing observation.
+    /// path and one causal-timing observation. A budget wait defers the
+    /// record whole instead of applying partial pins.
     fn apply_lowered_module(
         &mut self,
         lowered: ScannedModule,
@@ -19880,26 +19959,39 @@ impl Engine {
             );
             return Ok(DiscoveryRecordOutcome::applied(false, false));
         }
-        #[cfg(test)]
-        crate::first_use_probe::publication_validated(&self.views[position], &lowered, hook_ts_ns);
-        let (pins, pin_skips) = {
-            let view = &self.views[position];
-            let pin_start = crate::attach::monotonic_ns();
-            let pinned = pin_scanned_view_objects_with_filing(
-                view,
-                std::slice::from_ref(&lowered),
-                &mut self.budget,
-                None,
-                Filing::Adopt(&mut self.handle_table),
-            );
-            self.stage_timings.span(
-                crate::timing::StageKind::Pin,
-                "pin_lowered_module",
-                pin_start,
-                crate::attach::monotonic_ns(),
-            );
-            pinned.map_err(anyhow::Error::msg)?
-        };
+        let (pins, pin_skips) = self.pin_lowered_module(&lowered, position, hook_ts_ns)?;
+        if pins_waited_for_handles_budget(&pin_skips) {
+            return Ok(DiscoveryRecordOutcome::HandlesDeferred);
+        }
+        self.apply_pinned_lowered_module(
+            lowered,
+            pins,
+            pin_skips,
+            position,
+            hook_ts_ns,
+            session,
+            additions_allowed,
+            pending_views,
+        )
+    }
+
+    /// Merges and applies one lowered publication module whose pins are
+    /// already held: the apply half of [`Engine::apply_lowered_module`],
+    /// shared by the single-pin callers (after their wait check) and by
+    /// the unowned-publication loop (after its acquire-all phase, which
+    /// owns the terminal-stop check for its targets).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_pinned_lowered_module(
+        &mut self,
+        lowered: ScannedModule,
+        pins: PinnedObjects,
+        pin_skips: Vec<Skipped>,
+        position: usize,
+        hook_ts_ns: u64,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
         let mut candidate_pins = self.pinned.clone();
         let mut skipped = pin_skips;
         skipped.extend(candidate_pins.absorb(pins));
@@ -26684,6 +26776,10 @@ impl Engine {
     /// explicit head refusal, so a refused head keeps the honest accounting
     /// ordinary dispatch would have recorded for it.
     #[allow(clippy::too_many_arguments)]
+    /// Dispatch one queued record. Returns the untouched record when a
+    /// live publication waited for library handles: the caller restores
+    /// it plus the unprocessed rest at the head of the pending FIFO and
+    /// ends the pass.
     fn dispatch_one_queued_record(
         &mut self,
         queued: QueuedDiscoveryRecord,
@@ -26695,10 +26791,14 @@ impl Engine {
         terminal_selection_handoffs: &mut TerminalSelectionHandoffs,
         closure: &mut PauseClosure,
         changed: &mut bool,
-    ) {
+    ) -> Option<QueuedDiscoveryRecord> {
         self.note_record_protection(&queued.record);
         let record = queued.record;
         let origin = (queued.record.pid_tgid >> 32) as u32;
+        // The restore header for a handles deferral: the record is
+        // untouched, so it rides back verbatim. Cloned per dispatch;
+        // the exports vec is empty on the live path, so no heap moves.
+        let restore = queued.clone();
         match self.dispatch_discovery_record(
             queued,
             session,
@@ -26713,12 +26813,15 @@ impl Engine {
                     .or_default()
                     .push(record);
                 self.queue_retirement(view, RetirementCause::GenerationLost, pending_views);
+                None
             }
+            Ok(DiscoveryRecordOutcome::HandlesDeferred) => Some(restore),
             Ok(outcome) => {
                 *changed |= outcome.changed();
                 if !outcome.required_complete() {
                     closure.fail();
                 }
+                None
             }
             Err(_) => {
                 closure.fail();
@@ -26732,8 +26835,37 @@ impl Engine {
                         "a structurally valid private record failed exact live resolution",
                     );
                 }
+                None
             }
         }
+    }
+
+    /// The live-tail library-handle wait gap: one counted row per
+    /// deferral point (never per record). Live tails share the live
+    /// budget reason: the operative clause — budget exhausted,
+    /// deferred to the next tick — is what the retry honors.
+    fn file_handles_wait_gap(&mut self) {
+        let skipped = Skipped {
+            subject: crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT.into(),
+            reason: crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE.into(),
+        };
+        attribution::note(&skipped);
+        self.counters.object_skips.push(skipped);
+    }
+
+    /// Restore a handles-deferred record plus the unprocessed rest at
+    /// the head of the pending FIFO in their original order, with its
+    /// one counted wait gap. The restore moves, never duplicates: the
+    /// next record pass dispatches the record first.
+    fn restore_handles_deferred(
+        &mut self,
+        queued: QueuedDiscoveryRecord,
+        rest: Vec<QueuedDiscoveryRecord>,
+    ) {
+        let mut front = vec![queued];
+        front.extend(rest);
+        self.prepend_pending_records(front);
+        self.file_handles_wait_gap();
     }
 
     /// Runs one selected-request service transaction with the parked
@@ -26971,7 +27103,7 @@ impl Engine {
                         // additions closed, and the suffix keeps ring order.
                         pressure_quiet = true;
                         *additions_allowed = false;
-                        self.dispatch_one_queued_record(
+                        if let Some(deferred) = self.dispatch_one_queued_record(
                             queued,
                             session,
                             additions_allowed,
@@ -26981,7 +27113,14 @@ impl Engine {
                             &mut terminal_selection_handoffs,
                             closure,
                             &mut changed,
-                        );
+                        ) {
+                            // Unreachable today (publication paths check
+                            // the terminal stop before pinning), but a
+                            // deferral here must restore like any other.
+                            let rest: Vec<QueuedDiscoveryRecord> = batch.by_ref().collect();
+                            self.restore_handles_deferred(deferred, rest);
+                            break;
+                        }
                         self.pressure_episode_clear();
                         continue;
                     }
@@ -27081,7 +27220,7 @@ impl Engine {
                         .next()
                         .expect("a parked prefix always holds its head");
                     batch = parked;
-                    self.dispatch_one_queued_record(
+                    if let Some(deferred) = self.dispatch_one_queued_record(
                         head,
                         session,
                         additions_allowed,
@@ -27091,11 +27230,15 @@ impl Engine {
                         &mut terminal_selection_handoffs,
                         closure,
                         &mut changed,
-                    );
+                    ) {
+                        let rest: Vec<QueuedDiscoveryRecord> = batch.by_ref().collect();
+                        self.restore_handles_deferred(deferred, rest);
+                        break;
+                    }
                     self.pressure_episode_clear();
                     continue;
                 }
-                self.dispatch_one_queued_record(
+                if let Some(deferred) = self.dispatch_one_queued_record(
                     queued,
                     session,
                     additions_allowed,
@@ -27105,7 +27248,15 @@ impl Engine {
                     &mut terminal_selection_handoffs,
                     closure,
                     &mut changed,
-                );
+                ) {
+                    // A live publication waited for library handles: the
+                    // untouched record plus the unprocessed rest restore
+                    // at the head of the pending FIFO with one wait gap,
+                    // and the pass ends for the next record pass.
+                    let rest: Vec<QueuedDiscoveryRecord> = batch.by_ref().collect();
+                    self.restore_handles_deferred(deferred, rest);
+                    break;
+                }
             }
             // Diverted fresh records join the pending queue behind anything
             // the frame deferred: they are newer than every parked record.

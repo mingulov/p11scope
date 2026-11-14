@@ -29,9 +29,9 @@ use p11scope_manifest::identity::{
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 
-#[cfg(test)]
-use super::handle_table::DeferredReason;
-use super::handle_table::{AcquireOutcome, Filing, HandleTable, Held, RowId, TableHandle};
+use super::handle_table::{
+    AcquireOutcome, DeferredReason, Filing, HandleTable, Held, RowId, TableHandle,
+};
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
     read_maps_or_refuse, read_mountinfo, standard_function_names,
@@ -8998,14 +8998,12 @@ pub(crate) fn pin_scanned_view_objects_with_filing(
     pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file, reserve, filing)
 }
 
-/// [`pin_scanned_view_objects_with_filing`] for admission scans: every
-/// proven pin goes through the single `acquire()` with the caller's
-/// refusal reason. A refusal stops the scan with this and every
-/// remaining object waiting under the named budget gap — never
-/// attempted past the cap, never rejected. Twin-facing: production
-/// admission scans reach the same core arm through the funnel's
-/// `Filing::Acquire`.
-#[cfg(test)]
+/// [`pin_scanned_view_objects_with_filing`] for single-module pins
+/// through the single `acquire()`: every proven pin acquires with the
+/// caller's refusal reason, and a refusal stops the scan with this and
+/// every remaining object waiting under the named budget gap — never
+/// attempted past the cap, never rejected. The funnel reaches the same
+/// core arm through `Filing::Acquire`.
 pub(crate) fn pin_scanned_view_objects_with_table(
     view: &ProcessView,
     modules: &[ScannedModule],

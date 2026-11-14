@@ -82037,3 +82037,168 @@ fn review_cgroup_unknown_lower_bound_counts() {
         "an exit predating a failed start sample must count"
     );
 }
+
+// Handle-table Task 2 twins: live tails + refresh-rescan through acquire().
+
+/// Fill `engine`'s table with `count` live rows over fresh tempfiles.
+/// Dropping the returned shares frees the rows.
+fn fill_handle_table_for_test(
+    engine: &mut Engine,
+    dir: &std::path::Path,
+    count: usize,
+) -> Vec<crate::discovery::handle_table::Held> {
+    let mut live = Vec::new();
+    for n in 0..count {
+        let path = dir.join(format!("fill{n:04}.so"));
+        std::fs::write(&path, format!("fill-{n}")).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let maps = ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        };
+        let proved = crate::discovery::identity::ProvedEntry::for_test(
+            std::fs::File::open(&path).unwrap(),
+            maps,
+            &format!("fill-{n:04}"),
+            None,
+        );
+        let crate::discovery::identity::ProvedEntry { file, meta } = proved;
+        match engine.handle_table.acquire(
+            file,
+            &meta,
+            crate::discovery::handle_table::DeferredReason::Live,
+        ) {
+            crate::discovery::handle_table::AcquireOutcome::Held(held) => {
+                assert!(held.inserted);
+                live.push(held);
+            }
+            crate::discovery::handle_table::AcquireOutcome::Deferred(reason) => {
+                panic!("prefill admits: deferred with {reason:?}")
+            }
+        }
+    }
+    live
+}
+
+/// B1 stop-pass twin: with the table full, a live publication acquires
+/// nothing, applies nothing, drops its phase-1 pins and returns the
+/// record for restore; after release the retry admits.
+#[test]
+fn handle_table_live_publication_defers_whole_on_budget_wait() {
+    use crate::discovery::identity::open_view_object_cached;
+    use crate::process::MountTableCache;
+    let mut engine = Engine::empty();
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    engine.views.push(view);
+    // Cap 2, one live row: the first target fits, the second trips.
+    engine.set_table_cap_for_test(2);
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_for_test(&mut engine, dir.path(), 1);
+    // Two pinnable targets with production-resolved keys.
+    let bytes = std::fs::read("/bin/true").unwrap();
+    let mut budget = CaptureWorkBudget::default();
+    let mut mounts = MountTableCache::default();
+    let mut entries = Vec::new();
+    for n in 0..2 {
+        let path = dir.path().join(format!("target{n}.so"));
+        std::fs::write(&path, &bytes).unwrap();
+        let (_file, key) =
+            open_view_object_cached(&engine.views[0], &path, &mut mounts, &mut budget).unwrap();
+        entries.push(ScannedEntry {
+            name: "C_Initialize",
+            object: key,
+            object_path: path.to_str().unwrap().to_string(),
+            file_offset: 0x1000,
+        });
+    }
+    let table = ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries,
+        null_entries: Vec::new(),
+        unpinned: Vec::new(),
+        address: 0,
+        file_offset: None,
+        live_return: true,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+    record.pid_tgid = u64::from(std::process::id()) << 32;
+    record.hook_ts_ns = 1_000_000;
+    let mut session = ScriptedSession::default();
+    let modules_before = engine.modules.len();
+    let outcome = engine
+        .apply_unowned_publication(
+            table.clone(),
+            true,
+            0,
+            &record,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+            "live export discovery",
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::HandlesDeferred),
+        "a full table defers the publication whole: {outcome:?}"
+    );
+    assert_eq!(engine.modules.len(), modules_before, "no target applied");
+    // The first target's phase-1 pins were dropped: their row is dead.
+    let stats = engine.handle_table.prune(usize::MAX);
+    assert_eq!((stats.reaped, stats.pending), (1, 0));
+    assert_eq!(engine.handle_table.len(), 1);
+    // Retry after release admits.
+    engine.set_table_cap_for_test(1000);
+    let outcome = engine
+        .apply_unowned_publication(
+            table,
+            true,
+            0,
+            &record,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+            "live export discovery",
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::Applied { .. }),
+        "the retry admits after release: {outcome:?}"
+    );
+    assert!(engine.handle_table.len() > 1, "the retry files the targets");
+    drop(live);
+}
+
+/// B1 restore twin: a deferred record plus the unprocessed rest restore
+/// at the head of the pending FIFO in order, with exactly one wait gap.
+#[test]
+fn handle_table_deferred_record_restores_at_head_with_one_gap() {
+    let mut engine = Engine::empty();
+    engine.pending_discovery_records =
+        vec![queued_record_with_case(10), queued_record_with_case(11)];
+    let gaps_before = engine.counters.object_skips.len();
+    engine.restore_handles_deferred(
+        queued_record_with_case(1),
+        vec![queued_record_with_case(2), queued_record_with_case(3)],
+    );
+    let order: Vec<u8> = engine
+        .pending_discovery_records
+        .iter()
+        .map(|queued| queued.record.case_id)
+        .collect();
+    assert_eq!(order, vec![1, 2, 3, 10, 11]);
+    let gaps = &engine.counters.object_skips[gaps_before..];
+    assert_eq!(gaps.len(), 1, "exactly one gap row");
+    assert_eq!(gaps[0].subject, "library handles");
+    assert!(
+        gaps[0].reason.contains("deferred to the next tick"),
+        "the gap names the wait: {:?}",
+        gaps[0].reason
+    );
+}

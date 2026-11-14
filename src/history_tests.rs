@@ -341,6 +341,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
     assert!(due.is_empty(), "ties never retire");
     assert!(s.has_process_state(tied_key));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
     assert_eq!(t.exit_counters_for_test(), (1, 0, 0, 0));
     // Repeating a retire is safe: a duplicate tap for the same exit
     // re-collects the same key and the batch frees nothing twice.
@@ -357,7 +358,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     s.retire_processes(&due);
     assert_eq!(s.sessions().closed, closed, "no double close");
     assert!(s.has_process_state(successor));
-    assert_eq!(t.exit_counters_for_test(), (2, 0, 0, 0));
+    assert_eq!(t.exit_counters_for_test(), (1, 0, 0, 0));
 }
 
 #[test]

@@ -28,6 +28,18 @@ Module paths are probed from each env file's `PROVIDER_CANDIDATES`, never
 assumed; a pinned task-dir copy wins over system paths, and the winner
 plus its sha256 lands in the cell's `cell.env`. Fresh token per cell.
 
+Env contract: `PROVIDER_NAME`, `PROVIDER_VERSION`, `PROVIDER_CANDIDATES`
+(space-separated, `$TASK_DIR` allowed), `PROVIDER_SETUP` (shell function
+taking `$TASK_DIR`; creates the token/config), `PROVIDER_ENV_VARS`
+(space-separated `NAME=value`, `$TASK_DIR` allowed, never `P11TEST_*`),
+optional `PROVIDER_TEARDOWN`, optional `PROVIDER_PREFLIGHT` (a refusal
+records the provider UNRUN instead of failed), `PROVIDER_SUITE`
+(`yes`, or `no` for reader-less providers without suite legs). A setup
+with dynamic outputs (the p11-kit server address) writes `KEY=VALUE`
+lines to `$TASK_DIR/.provider-extra-env`; the cell exports them after a
+successful setup (the file is removed before setup, so nothing leaks
+across cells).
+
 ## Entry command
 
 ```sh

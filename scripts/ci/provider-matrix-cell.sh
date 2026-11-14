@@ -152,7 +152,9 @@ echo "provider-matrix-cell: provider=$PROVIDER_NAME version=$PROVIDER_VERSION mo
 } >"$OUT/cell.env" 2>&1
 # Provider setup (token in the task folder) as the suite user: direct in
 # user mode, or re-sourced under setpriv in root mode (setup functions
-# cannot cross setpriv as shell functions).
+# cannot cross setpriv as shell functions). A stale extra-env file from an
+# earlier cell in this task dir must not leak into this one.
+rm -f "$TASK_DIR/.provider-extra-env"
 if [ "$ROOTMODE" = yes ]; then
   set +e
   (export TASK_DIR PKCS11_MODULE PKCS11_TOOL PROVIDER_MATRIX_DIR
@@ -192,6 +194,21 @@ if [ "$(cat "$OUT/setup.exit")" != 0 ]; then
   fi
   echo "provider-matrix-cell: provider setup failed (see setup.log)" >&2
   exit 2
+fi
+# Dynamic setup outputs (e.g. the p11-kit server address): KEY=VALUE lines
+# this cell's own setup wrote to $TASK_DIR/.provider-extra-env (stale
+# files went before setup ran, so nothing leaks across cells).
+EXTRA_ENV=$TASK_DIR/.provider-extra-env
+if [ -f "$EXTRA_ENV" ]; then
+  while IFS='=' read -r name value; do
+    case $name in ''|\#*) continue ;; esac
+    case $name in *[!A-Za-z0-9_]*)
+      echo "provider-matrix-cell: bad extra-env name: '$name'" >&2; exit 2 ;;
+    esac
+    export "$name=$value"
+    RUN_ENV+=("$name=$value")
+  done <"$EXTRA_ENV"
+  echo "provider-matrix-cell: extra-env: $(cut -d= -f1 "$EXTRA_ENV" | tr '\n' ' ')"
 fi
 # Discover the module now (unprivileged helper, runs provider code in its
 # own process). rc is judged by the compare, never aborts here.

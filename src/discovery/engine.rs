@@ -7170,9 +7170,9 @@ fn scan_and_pin_with_proof(
     let pin_start = crate::attach::monotonic_ns();
     // Fix7 F1: the tick's reserve budgets the pin loop itself, so a scan
     // that wants more pins than the headroom covers stops with the rest
-    // pending instead of opening into `EMFILE`. Converted sites file
+    // pending instead of opening into `EMFILE`. Every site files
     // through the single `acquire()`, so one scan can no longer retain
-    // past the cap; the rest adopt count-only until their task.
+    // past the cap.
     let pinned = pin_scanned_view_objects_with_filing(view, &modules, budget, reserve, filing);
     stage.span(
         crate::timing::StageKind::Pin,

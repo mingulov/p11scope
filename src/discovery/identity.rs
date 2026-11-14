@@ -7866,17 +7866,13 @@ fn identity_of_manifest(
 /// opened object's remaining checks are fatal except an exact recorded-identity
 /// mismatch; the caller may ignore either stale class only after a scan-opened
 /// replacement is proven.
-/// File one worker-proven pin from a manifest/prearm chain: adopt
-/// into the table or acquire with the caller's reason. A refusal
-/// returns the reason for the caller's per-object gap; good pins
-/// continue. `Scratch` is scan-path-only and never reaches here.
+/// File one worker-proven pin from a manifest/prearm chain: acquire
+/// with the caller's reason. A refusal returns the reason for the
+/// caller's per-object gap; good pins continue. `Scratch` is
+/// scan-path-only and never reaches here.
 fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Result<Entry, DeferredReason> {
     let ProvedEntry { file, meta } = proved;
     match filing {
-        Filing::Adopt(table) => {
-            let held = table.adopt(file, &meta);
-            Ok(Entry::from_held(meta, held))
-        }
         Filing::Acquire(table, reason) => match table.acquire(file, &meta, *reason) {
             AcquireOutcome::Held(held) => Ok(Entry::from_held(meta, held)),
             AcquireOutcome::Deferred(reason) => Err(reason),
@@ -7970,9 +7966,9 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
 }
 
 /// [`pin_manifest_objects_deferred_in_views_with_probe`] with the filing
-/// destination for each proven pin (Phase 0): trusted-input sites file
-/// `Adopt` into their lane's table; `Scratch` is scan-path-only and
-/// files `Untracked` here.
+/// destination for each proven pin: trusted-input sites file `Acquire`
+/// into their lane's table; `Scratch` is scan-path-only and files
+/// `Untracked` here.
 pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe_and_filing(
     m: &Manifest,
     views: &[ProcessView],
@@ -9122,8 +9118,8 @@ pub(crate) fn pin_scanned_view_objects_with_reserve(
 }
 
 /// [`pin_scanned_view_objects`] with the filing destination for each
-/// proven pin: converted sites file `Acquire` (refusing) into their
-/// lane's table, the rest file `Adopt` (count-only) until their task.
+/// proven pin: every site files `Acquire` (refusing) into its lane's
+/// table.
 pub(crate) fn pin_scanned_view_objects_with_filing(
     view: &ProcessView,
     modules: &[ScannedModule],
@@ -9165,9 +9161,8 @@ type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<MappedFile, S
 /// read through `pinned_identity` (a seam: following `map_files` needs
 /// privilege, so tests script it). `reserve` is the tick's fd-reserve
 /// snapshot (fix7 F1, see the bridge above); `None` pins unbounded on
-/// that axis. `filing` is where each proven pin files: a table row
-/// (refusing for converted sites, count-only for the rest), no row,
-/// or a probe-local scratch dropped at return.
+/// that axis. `filing` is where each proven pin files: a refusing
+/// table row, no row, or a probe-local scratch dropped at return.
 fn pin_scanned_view_objects_with(
     view: &ProcessView,
     modules: &[ScannedModule],
@@ -9261,7 +9256,7 @@ fn pin_scanned_view_objects_with(
             );
             break;
         }
-        // Pre-open fast path (converted sites only): when the table
+        // Pre-open fast path (acquire filings only): when the table
         // is full with no row under this maps key, the pin cannot
         // share, so it stops the scan before paying for the open. A
         // routed key may still share; only the acquire below decides.
@@ -9289,9 +9284,9 @@ fn pin_scanned_view_objects_with(
             &mut mounts,
             budget,
         );
-        // Filing: converted sites acquire (a refusal stops the scan
+        // Filing: every site acquires (a refusal stops the scan
         // with this and every remaining object pending under the named
-        // budget gap); the rest adopt count-only until their task.
+        // budget gap).
         let candidate = match candidate {
             Ok(proved) => {
                 scan_opens = scan_opens.saturating_add(1);
@@ -9312,11 +9307,6 @@ fn pin_scanned_view_objects_with(
                                 break;
                             }
                         }
-                    }
-                    Filing::Adopt(table) => {
-                        let ProvedEntry { file, meta } = proved;
-                        let held = table.adopt(file, &meta);
-                        Ok(Entry::from_held(meta, held))
                     }
                     #[cfg(test)]
                     Filing::Untracked => {

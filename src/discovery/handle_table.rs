@@ -181,19 +181,15 @@ pub(crate) struct TableStats {
 }
 
 /// Where the pin path files one worker-proven pin: a table row
-/// (count-only or refusing), no row, or a probe-local scratch dropped
-/// at return.
+/// through the single acquire step, no row, or a probe-local scratch
+/// dropped at return.
 pub(crate) enum Filing<'a> {
-    /// Count-only filing (Phase 0 migration): shares like `acquire()`
-    /// but never refuses. Converted row groups use `Acquire` instead;
-    /// deleted once every site acquires.
-    Adopt(&'a mut HandleTable),
     /// The single acquire step with the caller's refusal reason. The
     /// pin loops record the refusal as waits; no site drops a pin.
     Acquire(&'a mut HandleTable, DeferredReason),
     /// Test-only filing: no row, for fixture scans that predate the
     /// table. Gated so production cannot file outside a row: every
-    /// production pin path passes `Adopt`, `Acquire` or `Scratch`.
+    /// production pin path passes `Acquire` or `Scratch`.
     #[cfg(test)]
     Untracked,
     /// The probationary probe files no rows at all: proven pins stay
@@ -252,34 +248,15 @@ impl HandleTable {
         meta: &EntryMeta,
         reason: DeferredReason,
     ) -> AcquireOutcome {
-        self.file_or_refuse(Arc::new(file), meta, true, reason)
+        self.file_or_defer(Arc::new(file), meta, reason)
     }
 
-    /// Count-only filing of a worker-proven pin (Phase 0 migration):
-    /// shares like [`HandleTable::acquire`] but never refuses — inserts
-    /// even past the cap, so `held <= len() <= cap` holds only from
-    /// Task 6, once every site acquires.
-    pub(crate) fn adopt(&mut self, file: std::fs::File, meta: &EntryMeta) -> Held {
-        self.adopt_shared(Arc::new(file), meta)
-    }
-
-    /// Count-only filing of an already-shared handle (C4 re-file): same
-    /// proven-key routing as [`HandleTable::adopt`], over an `Arc` the
-    /// caller already holds instead of a fresh open.
-    pub(crate) fn adopt_shared(&mut self, file: Arc<std::fs::File>, meta: &EntryMeta) -> Held {
-        match self.file_or_refuse(file, meta, false, DeferredReason::Live) {
-            AcquireOutcome::Held(held) => held,
-            AcquireOutcome::Deferred(_) => unreachable!("count-only adopt never refuses"),
-        }
-    }
-
-    /// Shared filing core: proven-key lookup, then insert — or, when
-    /// `refuse`, prune-then-retry once and defer with `reason`.
-    fn file_or_refuse(
+    /// Shared filing core: proven-key lookup, then insert — or
+    /// prune-then-retry once and defer with `reason`.
+    fn file_or_defer(
         &mut self,
         file: Arc<std::fs::File>,
         meta: &EntryMeta,
-        refuse: bool,
         reason: DeferredReason,
     ) -> AcquireOutcome {
         let (key, dedupable) = self.derive_key(meta, &file);
@@ -297,7 +274,7 @@ impl HandleTable {
             DeferredReason::Trusted => self.cap,
             _ => self.scan_cap(),
         };
-        if refuse && crate::fd_budget::library_handle_budget_exhausted(self.len(), limit) {
+        if crate::fd_budget::library_handle_budget_exhausted(self.len(), limit) {
             self.prune(usize::MAX);
             if crate::fd_budget::library_handle_budget_exhausted(self.len(), limit) {
                 self.defers = self.defers.saturating_add(1);
@@ -638,11 +615,6 @@ mod tests {
         table.acquire(file, &meta, reason)
     }
 
-    fn adopt(table: &mut HandleTable, proved: ProvedEntry) -> Held {
-        let ProvedEntry { file, meta } = proved;
-        table.adopt(file, &meta)
-    }
-
     #[test]
     fn table_admits_two_distinct_files_then_defers_third() {
         let (_d1, first) = fixture_bytes("first.so", b"first-bytes");
@@ -894,21 +866,6 @@ mod tests {
             second.inserted,
             "a resident without a mapped proof never lends"
         );
-        assert_eq!(table.len(), 2);
-    }
-
-    #[test]
-    fn adopt_never_refuses_past_the_cap() {
-        let (_d1, first) = fixture_bytes("first.so", b"first-bytes");
-        let (_d2, second) = fixture_bytes("second.so", b"second-bytes");
-        let mut table = HandleTable::new(1);
-        let first = adopt(&mut table, proved(&first, maps_key_for(&first), "aa", None));
-        assert!(first.inserted);
-        let second = adopt(
-            &mut table,
-            proved(&second, maps_key_for(&second), "bb", None),
-        );
-        assert!(second.inserted, "count-only adopt files past the cap");
         assert_eq!(table.len(), 2);
     }
 

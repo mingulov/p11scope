@@ -9,8 +9,16 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The observer under test: the `P11SCOPE_E2E_OBSERVER` override when the
+/// runner stages a prebuilt binary elsewhere, else the binary Cargo built
+/// beside this test target.
+fn bin() -> String {
+    std::env::var("P11SCOPE_E2E_OBSERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_p11scope").to_string())
+}
+
 fn p11scope() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_p11scope"));
+    let mut command = Command::new(bin());
     command.stdin(std::process::Stdio::null());
     command
 }
@@ -170,6 +178,7 @@ fn foreign_owned_directory_refuses_without_the_flag_and_names_it() {
         eprintln!("skipped: needs root");
         return;
     }
+    eprintln!("P11SCOPE_TEST_BRANCH=positive");
     let (_dir, out, foreign) = foreign_mount();
     let seed = seed();
     let report = out.join("report.json");
@@ -201,6 +210,7 @@ fn flag_trusts_the_named_owner_and_hands_the_files_over() {
         eprintln!("skipped: needs root");
         return;
     }
+    eprintln!("P11SCOPE_TEST_BRANCH=positive");
     let (_dir, out, foreign) = foreign_mount();
     let third = [1u32, 2, 3]
         .into_iter()
@@ -248,6 +258,7 @@ fn symlink_and_mode_protections_hold_with_the_flag() {
         eprintln!("skipped: needs root");
         return;
     }
+    eprintln!("P11SCOPE_TEST_BRANCH=positive");
     let (_dir, out, foreign) = foreign_mount();
     let seed = seed();
     let owner = foreign.to_string();
@@ -315,6 +326,7 @@ fn trace_stream_is_handed_over_and_reused_by_a_second_run() {
         eprintln!("skipped: needs root");
         return;
     }
+    eprintln!("P11SCOPE_TEST_BRANCH=positive");
     let (_dir, out, foreign) = foreign_mount();
     let log = out.join("trace.log");
     let owner = foreign.to_string();
@@ -347,6 +359,7 @@ fn inventory_scan_hands_the_report_over() {
         eprintln!("skipped: needs root");
         return;
     }
+    eprintln!("P11SCOPE_TEST_BRANCH=positive");
     let (_dir, out, foreign) = foreign_mount();
     let report = out.join("inventory.json");
     let output = p11scope()
@@ -363,4 +376,22 @@ fn inventory_scan_hands_the_report_over() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_handed(&report, foreign, foreign);
+}
+
+/// `P11SCOPE_E2E_OBSERVER` variable. A stray matrix export must not silently
+/// switch the binary in an ordinary `cargo test`, so `bin()` must not read
+/// that variable. (The needle is spelled in two halves so this guard does
+/// not match its own source.)
+#[test]
+fn observer_override_uses_the_dedicated_variable() {
+    let path = format!("{}/tests/output_owner.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains(r#"std::env::var("P11SCOPE_E2E_OBSERVER")"#),
+        "bin() must read P11SCOPE_E2E_OBSERVER in {path}"
+    );
+    assert!(
+        !source.contains(&["P11SCOPE", "BIN"].join("_")),
+        "bin() must not read the matrix override variable in {path}"
+    );
 }

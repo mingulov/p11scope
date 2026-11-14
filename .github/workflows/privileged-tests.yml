@@ -1454,10 +1454,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
   # Dual-outcome integration tests as root with the positive branch
-  # required: run_lifecycle, pause, t2_cold_start and ux_journeys cells
-  # plus the second-SIGINT report cell (14 rows, all qualified; the
-  # script judges the branch of each cell, not just its exit code).
-  # Root-required, consistent with the cell template.
+  # required: run_lifecycle, pause, t2_cold_start, ux_journeys and
+  # output_owner cells plus the second-SIGINT report cell (19 rows,
+  # all qualified; the script judges the branch of each cell, not just
+  # its exit code). Root-required, consistent with the cell template.
   root-integration:
     needs: release-build
     runs-on: ubuntu-26.04
@@ -1504,7 +1504,7 @@ jobs:
         with:
           name: release-inputs
           path: ${{ runner.temp }}/release-inputs
-      - name: Build the five integration test targets
+      - name: Build the six integration test targets
         shell: bash
         run: |
           set -euo pipefail
@@ -1512,10 +1512,11 @@ jobs:
           cargo +"$toolchain" test --locked --offline --no-run \
             --test run_lifecycle --test pause --test t2_cold_start \
             --test ux_journeys --test run_abandon_report \
+            --test output_owner \
             --message-format=json >"$RUNNER_TEMP/root-build.jsonl"
           bindir="$GITHUB_WORKSPACE/root-test-bins"
           mkdir -p "$bindir"
-          for target in run_lifecycle pause t2_cold_start ux_journeys run_abandon_report; do
+          for target in run_lifecycle pause t2_cold_start ux_journeys run_abandon_report output_owner; do
             exe=$(jq -r --arg t "$target" 'select(.reason == "compiler-artifact" and .target.name == $t and (.target.kind | any(. == "test"))) | .executable' "$RUNNER_TEMP/root-build.jsonl" | grep -v '^null$' | tail -1)
             test -x "$exe"
             cp -p "$exe" "$bindir/$target"
@@ -1533,7 +1534,7 @@ jobs:
           sudo -n scripts/ci/run-root-integration.sh "$in/p11scope" "$out" "$GITHUB_WORKSPACE/root-test-bins"
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           # Inline exact-set check (the WP-1 checker takes this over
-          # with --require when that lane ports; same 14 cells).
+          # with --require when that lane ports; same 19 cells).
           python3 -I - "$out/results.jsonl" <<'PY'
           import json
           import sys
@@ -1554,7 +1555,12 @@ jobs:
                   "ux_journeys::b7_run_refuses_without_capture_lane",
                   "ux_journeys::t3_f3_doctor_verdict_ends_with_newline",
                   "ux_journeys::j3_script_target_runs_like_any_program",
-                  "run_abandon_report::second_sigint_during_teardown_publishes_truthful_report_and_exits_130"}
+                  "run_abandon_report::second_sigint_during_teardown_publishes_truthful_report_and_exits_130",
+                  "output_owner::foreign_owned_directory_refuses_without_the_flag_and_names_it",
+                  "output_owner::flag_trusts_the_named_owner_and_hands_the_files_over",
+                  "output_owner::symlink_and_mode_protections_hold_with_the_flag",
+                  "output_owner::trace_stream_is_handed_over_and_reused_by_a_second_run",
+                  "output_owner::inventory_scan_hands_the_report_over"}
           problems = sorted("missing cell " + name for name in need - set(cells))
           problems += sorted("extra cell " + name for name in set(cells) - need)
           for row in rows:

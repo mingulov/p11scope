@@ -26,6 +26,11 @@
 #   ux_journeys::t3_f3_doctor_verdict_ends_with_newline
 #   ux_journeys::j3_script_target_runs_like_any_program
 #   run_abandon_report::second_sigint_during_teardown_publishes_truthful_report_and_exits_130
+#   output_owner::foreign_owned_directory_refuses_without_the_flag_and_names_it
+#   output_owner::flag_trusts_the_named_owner_and_hands_the_files_over
+#   output_owner::symlink_and_mode_protections_hold_with_the_flag
+#   output_owner::trace_stream_is_handed_over_and_reused_by_a_second_run
+#   output_owner::inventory_scan_hands_the_report_over
 #
 # Each results.jsonl row carries exactly cell/pass/qualification/detail (the
 # shared cell-result contract); the detail embeds the observed branch (the
@@ -43,7 +48,7 @@
 #                 <target>.<test>.log per cell.
 #   TEST_BIN_DIR  directory of prebuilt integration-test executables
 #                 (CI build job output). When absent, the script builds
-#                 the five targets itself; that build path is for
+#                 the six targets itself; that build path is for
 #                 development hosts only.
 #
 # --self-test runs the cell judgment and the summary gate against fixture
@@ -352,7 +357,7 @@ command -v timeout >/dev/null 2>&1 || {
     exit 77
 }
 
-TARGETS=(run_lifecycle pause t2_cold_start ux_journeys run_abandon_report)
+TARGETS=(run_lifecycle pause t2_cold_start ux_journeys run_abandon_report output_owner)
 # target:test[:ignored]
 CELLS=(
     run_lifecycle:an_owned_run_reports_the_exact_child_status_and_reaps_it
@@ -369,6 +374,11 @@ CELLS=(
     ux_journeys:t3_f3_doctor_verdict_ends_with_newline
     ux_journeys:j3_script_target_runs_like_any_program
     run_abandon_report:second_sigint_during_teardown_publishes_truthful_report_and_exits_130:ignored
+    output_owner:foreign_owned_directory_refuses_without_the_flag_and_names_it
+    output_owner:flag_trusts_the_named_owner_and_hands_the_files_over
+    output_owner:symlink_and_mode_protections_hold_with_the_flag
+    output_owner:trace_stream_is_handed_over_and_reused_by_a_second_run
+    output_owner:inventory_scan_hands_the_report_over
 )
 
 PRIVTMP=$(mktemp -d) || exit 2
@@ -417,7 +427,7 @@ for line in open(sys.argv[1]):
     d=json.loads(line)
     if d.get('reason')=='compiler-artifact' and d.get('executable') and 'test' in d['target']['kind']:
         bins[d['target']['name']]=d['executable']
-want=['run_lifecycle','pause','t2_cold_start','ux_journeys','run_abandon_report']
+want=['run_lifecycle','pause','t2_cold_start','ux_journeys','run_abandon_report','output_owner']
 missing=[t for t in want if t not in bins]
 if missing:
     sys.stderr.write('missing test executables: %s\n' % ' '.join(missing))

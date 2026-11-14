@@ -4493,26 +4493,26 @@ impl State {
     }
 
     /// Retires whole processes in one pass per map: the exit path's
-    /// batch form of [`Self::retire_process`]. Each process's live
-    /// maps are swept exactly as `retire_process` sweeps them (open
-    /// sessions count closed), and its `reduced_histories` entry is
-    /// removed with the key refunded only on actual removal — so an
-    /// exit retire plus a history retire of the same key refunds once.
-    /// Returns how many input processes lost any swept entry.
+    /// batch form of [`Self::retire_process`]. The session loop removes
+    /// open sessions (each counts closed and leaves a retired tombstone);
+    /// one retain pass per remaining map then sweeps every listed
+    /// process's rows — the per-session clears would only revisit rows
+    /// these passes already remove, so the loop skips them. Each
+    /// process's `reduced_histories` entry is removed with the key
+    /// refunded only on actual removal — so an exit retire plus a
+    /// history retire of the same key refunds once. Returns how many
+    /// input processes lost any swept entry.
     pub fn retire_processes(&mut self, processes: &BTreeSet<ProcessKey>) -> u64 {
         if processes.is_empty() {
             return 0;
         }
-        // Gap baselines ahead of every sweep: the session loop below also
-        // clears per-session pending rows, so a later snapshot would miss
-        // them and the retired gap count would under-report.
+        // Gap baselines ahead of every sweep, so the retired gap count
+        // below cannot miss rows any pass removes.
         let pending_before = self.pending.len();
         let detached_before = self.detached.len();
         let mut touched = BTreeSet::new();
-        // Open sessions first, exactly as `clear_scope` sweeps them:
-        // each removed session returns its key, clears its session
-        // state, and counts closed. Collected first: the sweep below
-        // mutates the map while `clear_session_state` needs `&mut self`.
+        // Open sessions first: each removed session returns its key and
+        // counts closed. Collected first because the loop mutates the map.
         let sessions: Vec<(ProcessKey, SessionRef)> = self
             .open
             .keys()
@@ -4534,7 +4534,10 @@ impl State {
                         self.retired_session_evictions.saturating_add(1);
                 }
             }
-            self.clear_session_state(*process, *session);
+            // No per-session clear: the retain passes below sweep the
+            // same rows by owner in one pass each (a detached record's
+            // owner names its own process, so owner-clears are subsumed
+            // by the process-keyed removal too).
             if existed {
                 self.sessions.closed = self.sessions.closed.saturating_add(1);
             }

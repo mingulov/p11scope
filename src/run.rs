@@ -13477,6 +13477,19 @@ fn reduce_profile_event(
     Ok(())
 }
 
+/// Per-drain cap on exit taps examined for retirement; the rest
+/// carry over to the next drain, keeping retire work inside the
+/// drain tick wall.
+const EXIT_RETIRE_PER_DRAIN_BUDGET: usize = 1024;
+
+/// Moves engine-tapped exits into the tracker, stamped with the
+/// EVENTS producer position read at transfer time. Only what fits
+/// moves; the rest stays queued on the engine for the next tick.
+fn transfer_exit_taps(engine: &mut Engine, tracker: &mut process::Tracker, events_producer: usize) {
+    let taps = engine.take_exit_taps(tracker.exit_tap_space());
+    tracker.note_exit_taps(taps, events_producer);
+}
+
 fn drain_profile_events<S: crate::events::RecordSource>(
     drain: &mut crate::events::EventDrain<S>,
     state: &mut semantics::State,

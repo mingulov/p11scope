@@ -303,7 +303,7 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
     // The drain reads past the tap position: the old generation's
     // maps are freed and its R10 entry is gone, while the successor's
     // rows are intact.
-    let due = t.retire_exits_due(8, 8, 1024);
+    let due = t.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
     assert_eq!(due, std::collections::BTreeSet::from([old]));
     s.retire_processes(&due);
     assert!(!s.has_process_state(old));
@@ -327,10 +327,71 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
         }],
         8,
     );
-    let due = t.retire_exits_due(8, 8, 1024);
+    let due = t.retire_exits_due(8, 8, EXIT_RETIRE_PER_DRAIN_BUDGET);
     assert!(due.is_empty(), "ties never retire");
     assert!(s.has_process_state(tied_key));
     assert_eq!(t.exit_counters_for_test(), (1, 0, 0, 0));
+}
+
+#[test]
+fn retire_waits_for_drain_past_tap_position() {
+    // B1 step-3 twin: an exit tapped while a late CALL is still in
+    // staging retires only after the drain reads past the tap-time
+    // producer position — the CALL is admitted first, never
+    // `reject_unadmitted` — and an unmatched exit retries two
+    // position-passing drains, then drops with a counted gap. Fails
+    // while the drains consume no exits: nothing ever retires.
+    use crate::discovery::engine::Engine;
+    let (mut s, mut t, _) = setup(64);
+    let mut first = ev(100, 90, 0, 0);
+    first.ts_ns = 100;
+    let mut drain = EventDrain::over_test_domain(
+        crate::events::StagedEvents::with_caps(
+            ScriptedRecords::events([first], usize::MAX),
+            1024,
+            1024 * 1024,
+        ),
+        1,
+    );
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert_eq!(vector(&s), (1, 0, 0, 1, 1, 0));
+    let old = key(90, 0);
+    // A late CALL from the same process is staged but not yet
+    // reduced when the exit is captured and transferred.
+    let mut late = ev(100, 90, 0, 2);
+    late.ts_ns = 150;
+    drain.source_mut().inner_mut().push_event(&late);
+    drain.source_mut().stage(1, None);
+    let mut engine = Engine::empty_for_test();
+    engine.note_exit_tap(100, 200);
+    let stamp = crate::events::event_drain_positions(&drain).producer;
+    transfer_exit_taps(&mut engine, &mut t, stamp);
+    assert_eq!(t.pending_exit_taps_for_test(), 1);
+    // A drain that reads nothing does not pass the tap position:
+    // nothing retires.
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), Some(0)).unwrap();
+    assert!(s.has_process_state(old));
+    assert_eq!(t.pending_exit_taps_for_test(), 1);
+    // The full drain reduces the staged CALL first — admitted, never
+    // refused — and only then, past the tap position, retires.
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert_eq!(s.semantic_evidence().semantic_history_drops, 0);
+    assert!(!s.has_process_state(old));
+    assert_eq!(vector(&s), (1, 0, 1, 0, 1, 0));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+    // An exit with no matching task retries two position-passing
+    // drains, then drops with the counted gap.
+    engine.note_exit_tap(999, 300);
+    let stamp = crate::events::event_drain_positions(&drain).producer;
+    transfer_exit_taps(&mut engine, &mut t, stamp);
+    for _ in 0..2 {
+        drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+        assert_eq!(t.pending_exit_taps_for_test(), 1);
+        assert_eq!(t.exit_counters_for_test(), (0, 0, 0, 0));
+    }
+    drain_profile_events(&mut drain, &mut s, &mut t, &scope(), None).unwrap();
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+    assert_eq!(t.exit_counters_for_test(), (0, 1, 0, 0));
 }
 
 #[test]

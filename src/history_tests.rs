@@ -361,6 +361,46 @@ fn exit_tap_retires_by_kernel_time_and_spares_reuse_successor() {
 }
 
 #[test]
+fn tie_exit_drops_immediately_with_single_count() {
+    // F2 twin: a `first_ts_ns == hook_ts_ns` tie can never match on
+    // retry, so the exit drops on the first position-passing drain
+    // with its own named outcome (one tie count, no requeue, never
+    // unmatched). Fails while ties retry: pending stays 1 and the tie
+    // recounts, then miscounts as unmatched.
+    let (mut s, mut t, _) = setup(64);
+    let mut tied = ev(101, 92, 0, 0);
+    tied.ts_ns = 200;
+    feed(&mut s, &mut t, [tied]);
+    let tied_key = semantics::ProcessKey::history(1, 92, 0, 101);
+    t.note_exit_taps(
+        vec![crate::history::ExitTap {
+            pid: 101,
+            hook_ts_ns: 200,
+        }],
+        1000,
+    );
+    assert_eq!(t.pending_exit_taps_for_test(), 1);
+    for drain in 1..=3 {
+        let due = t.retire_exits_due(1000, 1000, EXIT_RETIRE_PER_DRAIN_BUDGET);
+        assert!(due.is_empty(), "ties never retire (drain {drain})");
+        assert_eq!(
+            t.pending_exit_taps_for_test(),
+            0,
+            "tie drops on the first drain (drain {drain})"
+        );
+        assert_eq!(
+            t.exit_counters_for_test(),
+            (1, 0, 0, 0),
+            "one tie, never unmatched (drain {drain})"
+        );
+    }
+    assert!(
+        s.has_process_state(tied_key),
+        "tied rows are retained, never freed"
+    );
+}
+
+#[test]
 fn retire_waits_for_drain_past_tap_position() {
     // B1 step-3 twin: an exit tapped while a late CALL is still in
     // staging retires only after the drain reads past the tap-time

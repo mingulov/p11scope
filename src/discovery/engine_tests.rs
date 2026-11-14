@@ -5536,6 +5536,74 @@ fn exit_tap_queue_bounds_at_16384_with_counted_overflow() {
 }
 
 #[test]
+fn exit_tap_overflow_keeps_newest_same_pid_generation() {
+    // F1 twin: queue full, pid exits twice with reuse — the incoming
+    // (newest) tap for an already-queued pid replaces that pid's oldest
+    // tap (counted), so the later exit still retires both generations
+    // (self-healing). Fails while overflow drops incoming: the later tap
+    // is lost and the successor leaks.
+    let mut engine = Engine::empty();
+    let limit = crate::history::EXIT_TAP_QUEUE_LIMIT;
+    for i in 0..(limit - 1) as u32 {
+        engine.note_exit_tap(2000 + i, u64::from(i));
+    }
+    engine.note_exit_tap(100, 20);
+    assert_eq!(engine.exit_taps_for_test(), (16384, 0));
+    engine.note_exit_tap(100, 40);
+    assert_eq!(
+        engine.exit_taps_for_test(),
+        (16384, 1),
+        "overflow evicts oldest same-pid tap, counted"
+    );
+    let taps = engine.take_exit_taps(usize::MAX);
+    assert_eq!(taps.len(), 16384);
+    assert_eq!(
+        taps[0],
+        crate::history::ExitTap {
+            pid: 2000,
+            hook_ts_ns: 0
+        },
+        "unrelated oldest filler is spared, not evicted"
+    );
+    assert!(
+        taps.contains(&crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 40
+        }),
+        "newest same-pid tap must be kept"
+    );
+    assert!(
+        !taps.contains(&crate::history::ExitTap {
+            pid: 100,
+            hook_ts_ns: 20
+        }),
+        "oldest same-pid tap is the one evicted"
+    );
+    let domain = crate::events::EventsDomain::test_standin(1);
+    let mut registry = crate::history::Registry::new(domain, 16);
+    let old_image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 90,
+        exec_id: 0,
+    };
+    let new_image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 91,
+        exec_id: 0,
+    };
+    let (old, _) = registry.admit(1, 100, old_image, 10);
+    let (successor, _) = registry.admit(1, 100, new_image, 30);
+    let old = old.unwrap();
+    let successor = successor.unwrap();
+    let kept: Vec<_> = taps.into_iter().filter(|tap| tap.pid == 100).collect();
+    registry.note_exit_taps(kept, 8);
+    let due = registry.retire_exits_due(8, 8, 10);
+    assert_eq!(
+        due,
+        std::collections::BTreeSet::from([old, successor]),
+        "kept later tap retires both generations"
+    );
+}
+
+#[test]
 fn cgroup_ingress_admission_and_delayed_exit_are_generation_bounded() {
     let first = ProcessView::open(ProcessViewId(31), std::process::id()).unwrap();
     let pid = first.pid();

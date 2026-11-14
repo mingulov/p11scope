@@ -1163,6 +1163,9 @@ pub(crate) fn collect_with(
             }
         }
     }
+    if crate::cli::text_is_verbose() {
+        eprintln!("p11scope: {}", handles.diagnostic_line());
+    }
     CgroupCollection {
         root: request.root,
         state: request.state,

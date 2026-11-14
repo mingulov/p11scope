@@ -1490,6 +1490,9 @@ detail during a counter capture (`--select-endpoint`).
 Shipped in 0.7.0 and no longer planned: per-key tracking for
 programs started after a background caller.
 
+Shipped in 0.8.0 and no longer planned: one capture-owned
+open-handle table with a single acquire step.
+
 - Ordering-evidence pre-arm exactness producer for non-`run` scopes,
   inventory Detailed-subset activation, and same-granularity rewrite proof
   (packet 6.13 follow-ups).
@@ -1538,8 +1541,6 @@ programs started after a background caller.
 - Inferred key family and size class from operation mechanisms and
   output lengths (0.8.0).
 - Creation-template curves and parameter sets (0.8.0).
-- One capture-owned open-handle table with a single acquire step
-  (0.8.0).
 - Narrower count-only windows at high key-operation rates (a later release).
 - A kernel-side witness for library loads after the main thread
   exits (a later release).

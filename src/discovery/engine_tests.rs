@@ -51524,6 +51524,10 @@ fn tick_handle_release_owes_an_immediate_round() {
             },
         );
     }
+    // The release the note observes is a tabled release: file the
+    // fixtures first (two distinct /dev/null opens, two rows), then
+    // free one.
+    engine.file_fixture_pins_for_test();
     engine.scan_inputs.remove(&ProcessViewId(1001));
     engine.note_tick_handle_release(2, 0);
     assert!(
@@ -51564,6 +51568,7 @@ fn tick_handle_release_owes_an_immediate_round() {
             },
         );
     }
+    engine.file_fixture_pins_for_test();
     engine.scan_inputs.remove(&ProcessViewId(1001));
     engine.note_tick_handle_release(2, 0);
     assert!(
@@ -51587,6 +51592,7 @@ fn tick_handle_release_owes_an_immediate_round() {
             counters: DiscoveryCounters::default(),
         },
     );
+    engine.file_fixture_pins_for_test();
     engine.note_tick_handle_release(1, 0);
     assert!(
         !engine.handles_freed_frame_owed,
@@ -82693,4 +82699,163 @@ fn handle_table_loader_record_restores_without_resolving_on_budget_wait() {
         "exactly one gap row"
     );
     drop(live);
+}
+
+/// Task-6 mixed-capture invariant: scans, manifest, pre-arm, learned
+/// and refresh hold `len <= cap` after every tick, and every deferral
+/// files a counted gap. One phase per tick-equivalent, all filing into
+/// the engine's own table; a production capture interleaves the same
+/// phases per tick. The first `len <= cap` assertion in the plan.
+#[test]
+fn handle_table_mixed_capture_holds_len_within_cap() {
+    const CAP: usize = 4;
+    let first = E07Provider::dlopen();
+    let second = E07Provider::dlopen();
+    let live_pid = std::process::id();
+    let mut engine = Engine::empty();
+    engine.module_hints = vec![first.path.clone(), second.path.clone()];
+    engine.set_table_cap_for_test(CAP);
+    let tick_start = 1_000_000u64;
+    engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(3_600_000_000_000);
+    engine.scheduler.begin_deep_scan_tick(Some(tick_start));
+    let mut tick_now = || Some(tick_start);
+    let max_scan_pids = engine.max_scan_pids;
+
+    // Tick 1: admission scans the live providers. Admission stages;
+    // production commits staged views through the candidate build, so
+    // the test commits them the same way the F1 twin stages its view.
+    // The staged pins stay held: their rows are tick 1's filing.
+    let (new_views, _, _) = engine.admit_inventory_new_views(
+        vec![live_pid],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut tick_now,
+    );
+    assert!(
+        engine.handle_table.len() <= CAP,
+        "tick 1: admission holds the cap"
+    );
+    assert!(
+        !new_views.is_empty(),
+        "admission must discover the live view or the refresh below is vacuous"
+    );
+    let mut views = BTreeSet::new();
+    let mut staged_pins = Vec::new();
+    for (view, _modules, pins) in new_views {
+        views.insert(view.id());
+        engine.retain_view_id(view.id()).unwrap();
+        engine.views.push(view);
+        staged_pins.push(pins);
+    }
+
+    // Tick 2: trusted manifest + pre-arm through the same funnels as
+    // the C1/C2/C4 paths, against a fresh view of the live process.
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = std::fs::read("/bin/true").unwrap();
+    let mut trusted = Vec::new();
+    for name in ["m1.so", "m2.so", "p1.so", "l1.so"] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        trusted.push(path);
+    }
+    let mut budget = CaptureWorkBudget::default();
+    let view = ProcessView::open(ProcessViewId(900), live_pid).unwrap();
+    let mut trusted_gaps = 0usize;
+    for manifest in [
+        valid_manifest_for(&trusted[..1], &[0; 67]),
+        valid_manifest_for(&trusted[1..2], &[0; 67]),
+    ] {
+        let pinning =
+            crate::discovery::identity::pin_manifest_objects_deferred_in_views_with_budget_and_filing(
+                &manifest,
+                std::slice::from_ref(&view),
+                &mut budget,
+                crate::discovery::handle_table::Filing::Acquire(
+                    engine.handle_table_mut(),
+                    crate::discovery::handle_table::DeferredReason::Trusted,
+                ),
+            )
+            .expect("trusted manifests pin or gap per object");
+        trusted_gaps += pinning.skipped.len();
+    }
+    let proved = crate::discovery::identity::pin_prearm_proved_in_views_with_budget(
+        &trusted[2..3],
+        std::slice::from_ref(&view),
+        None,
+        0,
+        0,
+        &mut budget,
+    )
+    .expect("pre-arm proves or gaps per object");
+    let prearm = crate::discovery::identity::file_prearm_proved(proved, engine.handle_table_mut());
+    trusted_gaps += prearm.skipped.len();
+    assert!(
+        engine.handle_table.len() <= CAP,
+        "tick 2: trusted inputs hold the cap"
+    );
+
+    // Tick 3: learned staging + drain.
+    let file = std::fs::File::open(&trusted[3]).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: trusted[3].to_string_lossy().into_owned(),
+        loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+        loader_unknown_reason: None,
+    });
+    engine.service_learned_files();
+    assert!(
+        engine.handle_table.len() <= CAP,
+        "tick 3: learned holds the cap"
+    );
+
+    // Tick 4: a late provider plus refresh rescan. Top up first so the
+    // refresh faces a full table deterministically, and re-arm the
+    // tick: tick 1's quantum is long expired on the real clock, and
+    // an expired quantum would skip the rescan instead of testing it.
+    let topup_dir = tempfile::tempdir().unwrap();
+    let topup = fill_handle_table_to_cap_for_test(&mut engine, topup_dir.path(), CAP);
+    let third = E07Provider::dlopen();
+    engine.module_hints.push(third.path.clone());
+    // The F1 shape: the view stays retained but its scan state is
+    // dropped, so the rescan below faces a full candidate (including
+    // the late provider) instead of revalidating retained modules.
+    engine.scan_inputs.clear();
+    engine
+        .scheduler
+        .begin_deep_scan_tick(crate::attach::monotonic_ns());
+    let mut refresh_now = crate::attach::monotonic_ns;
+    let (_scans, _, _, _) = engine.scan_inventory_views(&views, "test refresh", &mut refresh_now);
+    assert!(
+        engine.handle_table.len() <= CAP,
+        "tick 4: refresh holds the cap"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&live_pid),
+        "the waited rescan pends for the next tick (a skipped rescan would not)"
+    );
+
+    // Pressure was real: over-cap demand deferred, and every deferral
+    // surfaced as a counted gap.
+    assert!(
+        engine.handle_table.stats().defers > 0,
+        "over-cap demand must defer or the cap assertions are vacuous"
+    );
+    let engine_gaps = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.reason.contains("library-handle budget exhausted"))
+        .count();
+    assert!(
+        engine_gaps + trusted_gaps > 0,
+        "every deferral files a counted gap"
+    );
+    drop(topup);
 }

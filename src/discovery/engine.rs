@@ -8885,7 +8885,6 @@ fn discover_plan(
                 if let Some(tick) = reserve_tick.as_mut() {
                     tick.note_opened_n(discovered.handle_table.stats().admits - admits_before);
                 }
-                discovered.debug_assert_table_coherent();
                 discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
                     view.id(),
@@ -17576,9 +17575,6 @@ impl Engine {
         // clearance the next merge reads is always fresh — including
         // after a failed application, whose links may still have moved.
         self.refresh_revivable(session);
-        // Phase-0 shadow assert after every commit (covers every
-        // refresh, loader and live-tail commit path at once).
-        self.debug_assert_table_coherent();
         outcome
     }
 
@@ -29008,7 +29004,12 @@ impl Engine {
         if self.handles_deferred.is_empty() {
             return;
         }
-        if self.count_held_library_handles() < held_before || self.views.len() < views_before {
+        // `len()` counts rows pruned lazily; the release comparison
+        // needs the exact live count the old recount computed, so
+        // reap first — like the baseline below, only while a retry
+        // pends.
+        self.handle_table.prune(usize::MAX);
+        if self.handle_table.len() < held_before || self.views.len() < views_before {
             self.handles_freed_frame_owed = true;
         }
     }
@@ -29022,32 +29023,17 @@ impl Engine {
         std::mem::take(&mut self.handles_freed_frame_owed)
     }
 
-    /// Distinct library files this capture currently holds (fix6 A2):
-    /// the union over per-view scan pins, manifest pins, pre-arm pins
-    /// and the engine aggregate (whose entries alias the same `Arc`s, so
-    /// the union counts them once). Each admission pass counts once up
-    /// front, then tracks its own additions exactly through the share
-    /// step's new-fd count instead of recounting per pid.
-    fn count_held_library_handles(&self) -> usize {
-        let mut fds = BTreeSet::new();
-        for input in self.scan_inputs.values() {
-            input.pins.held_library_fds(&mut fds);
-        }
-        for input in &self.manifest_inputs {
-            input.pins.held_library_fds(&mut fds);
-        }
-        if let Some(prearm) = &self.prearm_input {
-            prearm.pins.held_library_fds(&mut fds);
-        }
-        self.pinned.held_library_fds(&mut fds);
-        fds.len()
-    }
-
     /// The capture-owned handle table, mutably: the coordinator lane
     /// files its trusted pins through here. Same-module callers use
     /// the field directly so their borrows can split.
     pub(crate) fn handle_table_mut(&mut self) -> &mut HandleTable {
         &mut self.handle_table
+    }
+
+    /// The capture-owned handle table, shared: diagnostics render
+    /// [`HandleTable::diagnostic_line`] through here.
+    pub(crate) fn handle_table(&self) -> &HandleTable {
+        &self.handle_table
     }
 
     /// Pin one manifest for the semantic retained inputs (C3), filing
@@ -29068,42 +29054,6 @@ impl Engine {
             prior_bytes,
             Filing::Acquire(&mut self.handle_table, DeferredReason::Trusted),
         )
-    }
-
-    /// Phase-0 shadow assert (debug-only): after pruning to
-    /// quiescence, the tabled recount over the four retained sets
-    /// stays within the table, and the distinct rows reachable from
-    /// the tabled handles equal the tabled recount. Untableable
-    /// handles (fixtures, untracked pins) stay out of both sides. The
-    /// old recount stays the enforcement until Task 6.
-    fn debug_assert_table_coherent(&mut self) {
-        #[cfg(debug_assertions)]
-        {
-            while self.handle_table.prune(1024).pending > 0 {}
-            let mut fds = BTreeSet::new();
-            let mut rows = BTreeSet::new();
-            for input in self.scan_inputs.values() {
-                input.pins.tabled_held_library_fds(&mut fds, &mut rows);
-            }
-            for input in &self.manifest_inputs {
-                input.pins.tabled_held_library_fds(&mut fds, &mut rows);
-            }
-            if let Some(prearm) = &self.prearm_input {
-                prearm.pins.tabled_held_library_fds(&mut fds, &mut rows);
-            }
-            self.pinned.tabled_held_library_fds(&mut fds, &mut rows);
-            debug_assert!(
-                fds.len() <= self.handle_table.len(),
-                "tabled recount {} exceeds table len {}",
-                fds.len(),
-                self.handle_table.len()
-            );
-            debug_assert_eq!(
-                rows.len(),
-                fds.len(),
-                "distinct tabled rows must equal the tabled recount"
-            );
-        }
     }
 
     fn admit_inventory_new_views(
@@ -29445,7 +29395,6 @@ impl Engine {
                     if let Some(tick) = reserve_tick.as_mut() {
                         tick.note_opened_n(self.handle_table.stats().admits - admits_before);
                     }
-                    self.debug_assert_table_coherent();
                     // Provider-proven slot priority: a complete scan that
                     // proves provider-freedom yields the last free slot
                     // when a pending waiter follows in this window — the
@@ -29561,7 +29510,8 @@ impl Engine {
         let handle_baseline = if self.handles_deferred.is_empty() {
             None
         } else {
-            Some((self.count_held_library_handles(), self.views.len()))
+            self.handle_table.prune(usize::MAX);
+            Some((self.handle_table.len(), self.views.len()))
         };
         self.in_refresh_tick = true;
         let result = self.refresh_inventory_inner(

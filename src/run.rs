@@ -10112,6 +10112,14 @@ fn capture_profile(
             let _ = crate::sink::try_stderr_line(&line);
         }
     }
+    // The table's end-of-capture census: diagnostics only, never on
+    // the findings path above.
+    if capture_diagnostics_on() {
+        let _ = crate::sink::try_stderr_line(&format!(
+            "p11scope: capture end: {}",
+            engine.handle_table().diagnostic_line()
+        ));
+    }
     // K0: snapshot the exec witness while the tap is still live.
     // Quiescence invalidates the PID lifecycle tap (and the later
     // terminal drain would too), so a snapshot past this point always
@@ -11846,6 +11854,14 @@ fn capture_trace(
         if let Some(line) = crate::ring_accounting::loop_end_line(&ring_accounts) {
             let _ = crate::sink::try_stderr_line(&line);
         }
+    }
+    // The table's end-of-capture census: diagnostics only, never on
+    // the findings path above.
+    if capture_diagnostics_on() {
+        let _ = crate::sink::try_stderr_line(&format!(
+            "p11scope: capture end: {}",
+            engine.handle_table().diagnostic_line()
+        ));
     }
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and

@@ -1719,6 +1719,9 @@ fn collect_identity(
     );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
+    if crate::cli::text_is_verbose() {
+        eprintln!("p11scope: {}", handles.diagnostic_line());
+    }
     Ok((catalog, custody))
 }
 
@@ -1849,6 +1852,9 @@ pub(crate) fn collect_pid_with_count_manifests(
         prior_bytes,
         &mut handles,
     );
+    if crate::cli::text_is_verbose() {
+        eprintln!("p11scope: {}", handles.diagnostic_line());
+    }
     Ok(assemble(
         collection,
         bound,
@@ -5205,6 +5211,9 @@ pub(crate) fn collect_system_with_identity(
     );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
+    if crate::cli::text_is_verbose() {
+        eprintln!("p11scope: {}", handles.diagnostic_line());
+    }
     Ok(catalog)
 }
 

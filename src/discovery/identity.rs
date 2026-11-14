@@ -29,9 +29,7 @@ use p11scope_manifest::identity::{
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 
-use super::handle_table::{
-    AcquireOutcome, DeferredReason, Filing, HandleTable, Held, RowId, TableHandle,
-};
+use super::handle_table::{AcquireOutcome, DeferredReason, Filing, HandleTable, Held, TableHandle};
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
     read_maps_or_refuse, read_mountinfo, standard_function_names,
@@ -367,8 +365,9 @@ impl EntryMeta {
 }
 
 /// The pin worker's output: an owned proven file plus its proof meta,
-/// never an [`Entry`]. Filing turns it into a [`Held`] (table row or
-/// untracked) and [`Entry::from_held`] builds the entry.
+/// never an [`Entry`]. Filing turns it into a [`Held`] (a table row,
+/// or a test-only row-less hold) and [`Entry::from_held`] builds the
+/// entry.
 pub(crate) struct ProvedEntry {
     pub(crate) file: std::fs::File,
     pub(crate) meta: EntryMeta,
@@ -2409,18 +2408,6 @@ impl PinnedObjects {
         self.by_id.len()
     }
 
-    /// Inserts every distinct held library fd of this set into `fds`
-    /// (fix6 A2): entries sharing one `Arc` insert once, so the union
-    /// over all retained sets is exactly the capture's concurrent
-    /// library handles. Raw fd numbers: unique per process at an
-    /// instant, never reopened or compared across time.
-    pub(crate) fn held_library_fds(&self, fds: &mut BTreeSet<std::os::unix::io::RawFd>) {
-        use std::os::unix::io::AsRawFd as _;
-        for entry in self.by_id.values() {
-            fds.insert(entry.file.as_raw_fd());
-        }
-    }
-
     /// File every entry's handle into `table` by open file (engine
     /// test helper): one row per distinct `Arc`, whatever the entries'
     /// scripted meta claims. Fixture pins that alias one fd converge
@@ -2432,23 +2419,16 @@ impl PinnedObjects {
         }
     }
 
-    /// The tabled subset of [`PinnedObjects::held_library_fds`] for the
-    /// Phase-0 shadow assert: distinct live fds plus their distinct
-    /// rows, skipping untabled handles (fixtures and untracked pins
-    /// file no rows). Debug-only callers.
-    pub(crate) fn tabled_held_library_fds(
-        &self,
-        fds: &mut BTreeSet<std::os::unix::io::RawFd>,
-        rows: &mut BTreeSet<RowId>,
-    ) {
+    /// Every distinct held fd number in this set (test-only): entries
+    /// sharing one `Arc` report once. For twins asserting a filed
+    /// handle is the proved fd, never a reopen.
+    #[cfg(test)]
+    pub(crate) fn filed_fds_for_test(&self) -> BTreeSet<std::os::unix::io::RawFd> {
         use std::os::unix::io::AsRawFd as _;
-        for entry in self.by_id.values() {
-            if entry.file.id() == RowId::MAX {
-                continue;
-            }
-            fds.insert(entry.file.as_raw_fd());
-            rows.insert(entry.file.id());
-        }
+        self.by_id
+            .values()
+            .map(|entry| entry.file.as_raw_fd())
+            .collect()
     }
 
     /// The held object's `vm_file` identity ([`self_mapped_file`]):
@@ -7887,10 +7867,9 @@ fn identity_of_manifest(
 /// mismatch; the caller may ignore either stale class only after a scan-opened
 /// replacement is proven.
 /// File one worker-proven pin from a manifest/prearm chain: adopt
-/// into the table, acquire with the caller's reason, or hold
-/// untracked. A refusal returns the reason for the caller's
-/// per-object gap; good pins continue. `Scratch` is scan-path-only
-/// and files `Untracked` here (a programming error, caught in debug).
+/// into the table or acquire with the caller's reason. A refusal
+/// returns the reason for the caller's per-object gap; good pins
+/// continue. `Scratch` is scan-path-only and never reaches here.
 fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Result<Entry, DeferredReason> {
     let ProvedEntry { file, meta } = proved;
     match filing {
@@ -7902,14 +7881,13 @@ fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Result<Entry, De
             AcquireOutcome::Held(held) => Ok(Entry::from_held(meta, held)),
             AcquireOutcome::Deferred(reason) => Err(reason),
         },
+        #[cfg(test)]
         Filing::Untracked => {
-            let held = Held::untracked(Arc::new(file), meta.mapped);
+            let held = Held::for_test(Arc::new(file), meta.mapped);
             Ok(Entry::from_held(meta, held))
         }
         Filing::Scratch => {
-            debug_assert!(false, "Filing::Scratch is scan-path-only");
-            let held = Held::untracked(Arc::new(file), meta.mapped);
-            Ok(Entry::from_held(meta, held))
+            unreachable!("Filing::Scratch is scan-path-only");
         }
     }
 }
@@ -7973,6 +7951,12 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
     prior_objects: usize,
     prior_bytes: u64,
 ) -> Result<ManifestPinning, ManifestPinError> {
+    // No lane table here (integration-test and probe callers): an
+    // unbounded per-call table, so every object acquires exactly like
+    // the old row-less path but through a row — one module can file
+    // several pins, so no finite cap is exact. Trusted: the manifest
+    // chain only refuses trusted/learned inputs.
+    let mut table = HandleTable::new(usize::MAX);
     pin_manifest_objects_with_read_policy(
         m,
         views,
@@ -7981,7 +7965,7 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
         false,
         prior_objects,
         prior_bytes,
-        Filing::Untracked,
+        Filing::Acquire(&mut table, DeferredReason::Trusted),
     )
 }
 
@@ -9097,13 +9081,18 @@ pub fn pin_scanned_view_objects(
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
+    // No lane table here (integration-test callers): an unbounded
+    // per-call table, so every module acquires exactly like the old
+    // row-less path but through a row — one module can file several
+    // pins, so no finite cap is exact.
+    let mut table = HandleTable::new(usize::MAX);
     pin_scanned_view_objects_with(
         view,
         modules,
         budget,
         &self_mapped_file,
         None,
-        Filing::Untracked,
+        Filing::Acquire(&mut table, DeferredReason::Live),
     )
 }
 
@@ -9329,9 +9318,10 @@ fn pin_scanned_view_objects_with(
                         let held = table.adopt(file, &meta);
                         Ok(Entry::from_held(meta, held))
                     }
+                    #[cfg(test)]
                     Filing::Untracked => {
                         let ProvedEntry { file, meta } = proved;
-                        let held = Held::untracked(Arc::new(file), meta.mapped);
+                        let held = Held::for_test(Arc::new(file), meta.mapped);
                         Ok(Entry::from_held(meta, held))
                     }
                     Filing::Scratch => {
@@ -20927,12 +20917,11 @@ mod tests {
         assert_eq!(table.len(), 2);
     }
 
-    /// View-collapse fix6 A2: the concurrent library-handle
-    /// budget counts distinct held files, so views sharing one pin count
-    /// once. The sharing here is a manual `Arc` clone (no dependence on
-    /// the A1 share path): the counter must see through any aliasing.
+    /// Task-6 shared-count twin (supersedes the fix6 A2 shared-count
+    /// original): two views over one file file one row; dropping the
+    /// second file's view and pruning leaves one row.
     #[test]
-    fn held_library_fds_counts_shared_files_once() {
+    fn handle_table_shared_files_count_once() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.so");
         let second = dir.path().join("second.so");
@@ -20943,20 +20932,20 @@ mod tests {
         let incoming = test_fixture::real_scan_pin(&second, None, 1, sha);
         let mut shared = test_fixture::real_scan_pin(&first, None, 1, sha);
         let shared_id = *shared.by_id.keys().next().unwrap();
-        let retained_arc = retained.by_id.values().next().unwrap().file.clone();
-        shared.by_id.get_mut(&shared_id).unwrap().file = retained_arc;
-        let mut fds = std::collections::BTreeSet::new();
-        retained.held_library_fds(&mut fds);
-        assert_eq!(fds.len(), 1);
-        incoming.held_library_fds(&mut fds);
-        assert_eq!(fds.len(), 2);
-        shared.held_library_fds(&mut fds);
-        assert_eq!(fds.len(), 2, "the shared pin adds no new handle");
+        let retained_handle = retained.by_id.values().next().unwrap().file.clone();
+        shared.by_id.get_mut(&shared_id).unwrap().file = retained_handle;
+        let mut table = HandleTable::new(1000);
+        let mut held = Vec::new();
+        for pins in [&retained, &incoming, &shared] {
+            for entry in pins.by_id.values() {
+                held.push(table.adopt_existing(&entry.file));
+            }
+        }
+        assert_eq!(table.len(), 2, "the shared pin adds no new row");
         drop(incoming);
-        let mut fds = std::collections::BTreeSet::new();
-        retained.held_library_fds(&mut fds);
-        shared.held_library_fds(&mut fds);
-        assert_eq!(fds.len(), 1, "two views over one file hold one handle");
+        held.remove(1);
+        table.prune(usize::MAX);
+        assert_eq!(table.len(), 1, "two views over one file file one row");
     }
 
     /// Copies of `/bin/true` as pinnable scan modules for the pin-wait

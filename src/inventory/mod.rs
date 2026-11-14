@@ -9409,6 +9409,11 @@ fn progress_lines<Source: ProcessSource>(
             suppressed,
         ));
     }
+    lines.push(format!(
+        "p11scope: pass {}: {}",
+        report.pass,
+        coordinator.handle_table().diagnostic_line()
+    ));
     if crate::inspect_system::stage_timings_requested() {
         let mut timings = format!(
             "p11scope: pass {}: stage timings: {}",
@@ -9418,6 +9423,8 @@ fn progress_lines<Source: ProcessSource>(
         if let Some(high_water) = coordinator.lifecycle_high_water_bytes() {
             timings.push_str(&lifecycle_high_water_suffix(high_water));
         }
+        timings.push_str("; ");
+        timings.push_str(&coordinator.handle_table().diagnostic_line());
         lines.push(timings);
     }
     // Admission failures aggregate past one per pass, like their gaps.

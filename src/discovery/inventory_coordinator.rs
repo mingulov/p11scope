@@ -1294,6 +1294,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.lifecycle_high_water_bytes
     }
 
+    /// The capture-owned handle table, shared: per-pass diagnostics
+    /// render [`HandleTable::diagnostic_line`] through here.
+    pub(crate) fn handle_table(&self) -> &crate::discovery::handle_table::HandleTable {
+        self.engine.handle_table()
+    }
+
     pub(crate) fn set_manifests(&mut self, manifests: Vec<PathBuf>) {
         self.count_manifests = manifests.clone();
         // A replaced input set returns its unfiled share first, so
@@ -12974,8 +12980,7 @@ pub(crate) mod tests {
         let prearm = coordinator.prearm.as_ref().expect("pre-arm retained");
         assert_eq!(prearm.pins.pinned().count(), 2);
         assert_eq!(prearm.inputs.len(), 2);
-        let mut held = std::collections::BTreeSet::new();
-        prearm.pins.held_library_fds(&mut held);
+        let held = prearm.pins.filed_fds_for_test();
         assert_eq!(held.len(), 2);
         for fd in &proved_fds {
             assert!(

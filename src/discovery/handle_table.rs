@@ -62,19 +62,14 @@ impl Row {
 /// the resident fd. Cloning shares; the fd closes with the last share.
 #[derive(Debug, Clone)]
 pub(crate) struct TableHandle {
+    // The row tag is written on every filing but read only by tests:
+    // production routes by proven key and shares by open file.
+    #[allow(dead_code)]
     id: HandleId,
     file: Arc<std::fs::File>,
 }
 
 impl TableHandle {
-    /// A handle filed under no row (migration only; deleted in Task 6).
-    pub(crate) fn untracked(file: Arc<std::fs::File>) -> Self {
-        Self {
-            id: RowId::MAX,
-            file,
-        }
-    }
-
     /// A fixture handle filed under no row.
     #[cfg(test)]
     pub(crate) fn for_test(file: Arc<std::fs::File>) -> Self {
@@ -84,6 +79,7 @@ impl TableHandle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn id(&self) -> HandleId {
         self.id
     }
@@ -124,10 +120,13 @@ pub(crate) struct Held {
 }
 
 impl Held {
-    /// A pin filed under no row (migration only; deleted in Task 6).
-    pub(crate) fn untracked(file: Arc<std::fs::File>, mapped: Option<MappedFile>) -> Self {
+    /// A fixture pin filed under no row (test-only): what the
+    /// test-gated [`Filing::Untracked`] arm builds. Production files
+    /// every pin through a table row.
+    #[cfg(test)]
+    pub(crate) fn for_test(file: Arc<std::fs::File>, mapped: Option<MappedFile>) -> Self {
         Self {
-            handle: TableHandle::untracked(file),
+            handle: TableHandle::for_test(file),
             mapped,
             inserted: false,
         }
@@ -192,6 +191,10 @@ pub(crate) enum Filing<'a> {
     /// The single acquire step with the caller's refusal reason. The
     /// pin loops record the refusal as waits; no site drops a pin.
     Acquire(&'a mut HandleTable, DeferredReason),
+    /// Test-only filing: no row, for fixture scans that predate the
+    /// table. Gated so production cannot file outside a row: every
+    /// production pin path passes `Adopt`, `Acquire` or `Scratch`.
+    #[cfg(test)]
     Untracked,
     /// The probationary probe files no rows at all: proven pins stay
     /// as `ProvedEntry`s in a dropped-at-return scratch.
@@ -413,6 +416,17 @@ impl HandleTable {
     /// the trusted reservation. Trusted inputs admit into the cap.
     pub(crate) fn scan_cap(&self) -> usize {
         self.cap.saturating_sub(self.reserved)
+    }
+
+    /// One-line stderr diagnostic (`-v`/timing only, never stdout or
+    /// JSON): live rows against the cap plus cumulative filing
+    /// counters. The caller supplies the `p11scope: ...` prefix.
+    pub(crate) fn diagnostic_line(&self) -> String {
+        let stats = self.stats();
+        format!(
+            "handle table: {}/{} rows (admits {}, shares {}, defers {}, prunes {})",
+            stats.len, self.cap, stats.admits, stats.shares, stats.defers, stats.prunes
+        )
     }
 
     /// Test-only cap override (the `library_handle_cap_for_test` seam,
@@ -914,5 +928,14 @@ mod tests {
         let three = table.adopt_existing(&TableHandle::for_test(other));
         assert!(three.inserted);
         assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn diagnostic_line_reports_rows_against_the_cap() {
+        let table = HandleTable::new(1000);
+        assert_eq!(
+            table.diagnostic_line(),
+            "handle table: 0/1000 rows (admits 0, shares 0, defers 0, prunes 0)"
+        );
     }
 }

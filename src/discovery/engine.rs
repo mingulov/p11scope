@@ -468,6 +468,9 @@ pub struct Engine {
     /// (a re-staged candidate dedupes by pinned identity instead).
     learned_settled: BTreeSet<(u64, u64)>,
     /// Candidates past the per-tick pin bound: staged first next tick.
+    /// Queue entries, not library handles: fanotify event fds stay
+    /// outside the table by design (D2) and only file a row once
+    /// their staging pin acquires through `DeferredReason::Learned`.
     pending_learned: Vec<crate::fanotify::LearnedCandidate>,
     /// Provider files the fanotify drain staged for attachment.
     learned_staged_files: u64,
@@ -21584,7 +21587,7 @@ impl Engine {
             prior_objects,
             prior_bytes,
             &mut self.budget,
-            Filing::Adopt(&mut self.handle_table),
+            Filing::Acquire(&mut self.handle_table, DeferredReason::Learned),
         ) {
             Ok(pinning) => pinning,
             Err(error) => {
@@ -21618,6 +21621,17 @@ impl Engine {
             self.counters.object_skips.push(skip.clone());
         }
         if pinning.inputs.is_empty() {
+            // A budget wait is not a refusal: the candidate stays
+            // learnable and rides the next drain instead of settling.
+            // The learned gap above already filed through the merge.
+            if pinning
+                .skipped
+                .iter()
+                .any(|skip| skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED)
+            {
+                self.pending_learned.push(candidate);
+                return;
+            }
             self.note_learned_settled(identity);
             self.learned_load_tally.remove(&identity);
             return;
@@ -28828,7 +28842,10 @@ impl Engine {
             return (false, Vec::new());
         }
         let broad_admit = self.broad_admit;
-        // The probationary probe discards its pins: no rows until Task 4.
+        // The probationary probe files nothing: proven pins stay as
+        // `ProvedEntry`s in a dropped-at-return scratch that builds no
+        // entries and inserts no rows. Modules and completeness still
+        // flow for the provider-freedom verdict below.
         let (scan_result, counters) = Self::scan_retained_view(
             &view,
             &self.module_hints,
@@ -28837,7 +28854,7 @@ impl Engine {
             broad_admit,
             &mut self.stage_timings,
             None,
-            Filing::Untracked,
+            Filing::Scratch,
         );
         // 6.14 Option B: learn the probationary generation's executable.
         elf_needed::learn_view_exe(&mut self.extensive, &view);

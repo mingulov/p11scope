@@ -62,6 +62,9 @@ pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_LIVE: &str = "capture library-hand
 /// no retry — the reservation covers the full trusted total up to the
 /// cap, so anything past it can never file.
 pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_TRUSTED: &str = "capture library-handle budget exhausted (1000 concurrent handles); trusted input object skipped permanently";
+/// Learned candidates that find the table full wait for the next drain
+/// instead of settling: the candidate stays learnable.
+pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_LEARNED: &str = "capture library-handle budget exhausted (1000 concurrent handles); learned input deferred to the next tick";
 
 /// True for the open(2)-family errnos that mean "out of handles, wait":
 /// `EMFILE` (this process's fd table is full) and `ENFILE` (the

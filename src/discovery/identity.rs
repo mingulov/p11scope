@@ -7914,16 +7914,17 @@ fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Result<Entry, De
     }
 }
 
-/// The permanent per-object gap for a trusted/learned refusal: no wait,
-/// no retry. Trusted inputs take it from Task 3; learned candidates
-/// take their own reason from Task 4.
+/// The permanent per-object gap for a trusted refusal, or the
+/// next-tick wait gap for a learned one. Manifest/prearm chains never
+/// acquire as an admission site.
 fn trusted_refusal_gap(reason: DeferredReason) -> &'static str {
     match reason {
         DeferredReason::Trusted => crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_TRUSTED,
+        DeferredReason::Learned => crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED,
         _ => {
             debug_assert!(
                 false,
-                "manifest/prearm chains only refuse trusted inputs in Task 3"
+                "manifest/prearm chains only refuse trusted/learned inputs"
             );
             crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_TRUSTED
         }

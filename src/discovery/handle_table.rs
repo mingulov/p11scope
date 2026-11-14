@@ -137,9 +137,6 @@ impl Held {
 /// Why a refusal waits where it does: the site class whose gap vocabulary
 /// the caller files. Admission scans map to the initial/live budget tails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Initial/Live/Trusted are constructed by their acquire paths; Learned
-// follows in Task 4, when this allow goes away.
-#[allow(dead_code)]
 pub(crate) enum DeferredReason {
     Initial,
     Live,
@@ -196,8 +193,8 @@ pub(crate) enum Filing<'a> {
     /// pin loops record the refusal as waits; no site drops a pin.
     Acquire(&'a mut HandleTable, DeferredReason),
     Untracked,
-    /// Wired in Task 4 (the probationary probe files no rows at all).
-    #[allow(dead_code)]
+    /// The probationary probe files no rows at all: proven pins stay
+    /// as `ProvedEntry`s in a dropped-at-return scratch.
     Scratch,
 }
 

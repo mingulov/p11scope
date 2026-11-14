@@ -82575,6 +82575,102 @@ fn handle_table_refresh_rescan_defers_on_budget_wait() {
     drop(provider);
 }
 
+/// D1 twin: with the table full, a learned candidate is pushed back
+/// to `pending_learned` unsettled with its learned gap filed — never
+/// lost; after release the retry stages.
+#[test]
+fn handle_table_learned_candidate_pushed_back_on_budget_wait() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let candidate = crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: library.to_string_lossy().into_owned(),
+        loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+        loader_unknown_reason: None,
+    };
+    let gaps_before = engine.counters.object_skips.len();
+    engine.stage_learned_candidate(candidate);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the candidate is pushed back, not settled"
+    );
+    assert!(
+        !engine.learned_settled.contains(&(dev, ino)),
+        "a wait never settles"
+    );
+    assert!(
+        engine.counters.object_skips[gaps_before..]
+            .iter()
+            .any(|skip| { skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED }),
+        "the learned gap is filed"
+    );
+    engine.set_table_cap_for_test(1000);
+    engine.service_learned_files();
+    assert!(
+        engine.pending_learned.is_empty(),
+        "the retry drains the queue"
+    );
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "the retry settles"
+    );
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    drop(live);
+}
+
+/// G1 pin-contract twin: the probe path builds no entries and files no
+/// rows, while the scan still reports its modules. The seed route's
+/// live process maps a provider, so a modules assertion is non-vacuous.
+#[test]
+fn handle_table_probe_pins_file_nothing() {
+    let (_fixture, engine, _context, record, _session) = armed_seed_route(1);
+    let pid = (record.pid_tgid >> 32) as u32;
+    let view = ProcessView::open(ProcessViewId(9), pid).unwrap();
+    // The seed engine holds its own rows; the probe must add none.
+    let rows_before = engine.handle_table.len();
+    let mut budget = CaptureWorkBudget::default();
+    let mut timings = crate::timing::StageTimings::default();
+    let (scan, _) = Engine::scan_retained_view(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut budget,
+        false,
+        &mut timings,
+        None,
+        crate::discovery::handle_table::Filing::Scratch,
+    );
+    let (modules, pins, _) = scan.unwrap();
+    assert!(!modules.is_empty(), "the scan reports its modules");
+    assert_eq!(pins.pinned().count(), 0, "scratch builds no entries");
+    assert_eq!(
+        engine.handle_table.len(),
+        rows_before,
+        "scratch files no rows"
+    );
+}
+
+/// G1 verdict twin: the probationary probe keeps its provider-freedom
+/// verdict while filing no rows.
+#[test]
+fn handle_table_probationary_probe_keeps_verdict_without_rows() {
+    let children = e06_spawn_sleeps(1);
+    let pid = children[0].pid();
+    let mut engine = Engine::empty();
+    let (proven_free, _skipped) = engine.probe_newcomer_provider_free(pid);
+    assert!(proven_free, "a sleep scan proves absence");
+    assert_eq!(engine.handle_table.len(), 0, "the probe files no rows");
+}
+
 /// B2 site-4 twin (no resolving): a deferred memory scan with nothing
 /// parked restores its record and files one gap.
 #[test]

@@ -4,9 +4,10 @@
 """Contract for the provider-matrix CI cell (scripts/ci/provider-matrix-cell.sh).
 
 The cell runs the pinned pkcs11-check suite (or a pkcs11-tool probe for
-reader-less providers) against one provider in two legs ((a) alone,
-(b) under `p11scope run`), plus a `p11scope-discover` manifest assertion
-and a paced workload under `p11scope inventory --pid`. The judge is
+reader-less providers) against one provider in three legs ((a) alone,
+(b) under `p11scope run`, (c) under `p11scope run --manifest`), plus a
+`p11scope-discover` manifest assertion and a paced workload under
+`p11scope inventory --pid`. The judge is
 scripts/ci/provider_matrix_cell_compare.py. These tests pin the judge:
 
 - run-observed counts only calls whose functions[].module joins to the
@@ -292,12 +293,13 @@ class InventoryPidTests(unittest.TestCase):
             self.assertIn("absent", detail)
 
     def test_unpinned_identity_dev_ino_fallback_joins(self):
-        # sha256 null (unpinned object) still joins on the recorded
-        # device/inode identity, like the observed-functions join.
+        # sha256 null (unpinned object) and no exact path still joins on
+        # the recorded device/inode identity, like the observed join.
         with tempfile.TemporaryDirectory() as tmp:
             module = make_module(tmp)
             doc = inventory_doc(module, 4242, 656)
             doc["modules"][0]["identity"]["sha256"] = None
+            doc["modules"][0]["paths"] = ["/elsewhere/libprovider.so"]
             ok, detail = _COMPARE.judge_inventory_pid(doc, str(module), 4242)
             self.assertTrue(ok, detail)
             self.assertIn("dev-ino", detail)
@@ -767,6 +769,7 @@ class PreflightDropTests(unittest.TestCase):
         setpriv.write_text(
             "#!/bin/bash\n"
             "echo \"setpriv-shim $*\"\n"
+            "while [ \"${1:0:1}\" = \"-\" ]; do shift; done\n"
             "exec \"$@\"\n", encoding="utf-8")
         setpriv.chmod(0o755)
         env_file = base / "probe.env"

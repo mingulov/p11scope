@@ -19,9 +19,9 @@
 # Provider comes from PROVIDER (scripts/provider-matrix/providers/*.env)
 # with TASK_DIR holding fetched artifacts and cell state; module paths
 # are probed from PROVIDER_CANDIDATES, never assumed.
-# Two modes: as root (CI) the suite/setup/workload/discover drop to
-# RUNUID/RUNGID via setpriv and the observer runs direct; as a user (test
-# hosts) everything runs direct and the observer goes through
+# Two modes: as root (CI) the suite/setup/preflight/workload/discover
+# drop to RUNUID/RUNGID via setpriv and the observer runs direct; as a
+# user (test hosts) everything runs direct and the observer goes through
 # $OBS_SUDO (default `sudo -n`) with the provider env. Exit 0 means every
 # qualified row passed, 1 means a cell failed, 2 means a harness error,
 # 77 means the provider is absent (system-only candidates, host UNRUN).
@@ -32,7 +32,7 @@ MATRIX_DIR=$REPO/scripts/provider-matrix
 if [ $# -ne 2 ]; then echo "usage: provider-matrix-cell.sh P11SCOPE OUTDIR" >&2; exit 2; fi
 P=$1; OUT=$2
 [ -x "$P" ] || { echo "provider-matrix-cell: no executable observer: $P" >&2; exit 2; }
-case ${PROVIDER:-} in ''|*/*|*..*|" "* ) echo "provider-matrix-cell: PROVIDER must be a bare provider name, got '${PROVIDER:-}'" >&2; exit 2 ;; esac
+case ${PROVIDER:-} in ''|*/*|*..*|*[[:space:]]* ) echo "provider-matrix-cell: PROVIDER must be a bare provider name, got '${PROVIDER:-}'" >&2; exit 2 ;; esac
 case ${TASK_DIR:-} in '' ) echo "provider-matrix-cell: TASK_DIR must be set" >&2; exit 2 ;; esac
 [ -d "$TASK_DIR" ] || { echo "provider-matrix-cell: TASK_DIR not a directory: $TASK_DIR" >&2; exit 2; }
 MODE=${P11CHECK_MODE:-smoke}
@@ -186,14 +186,28 @@ echo "setup exit=$(cat "$OUT/setup.exit")"
 if [ "$(cat "$OUT/setup.exit")" != 0 ]; then
   # A failing optional preflight means the provider is unusable here
   # (e.g. OpenSC with no reader-less mode): host UNRUN, not a failure.
+  # The probe dlopens provider code, so in root mode it runs under the
+  # same setpriv drop as the suite (re-source pattern; a shell function
+  # cannot cross setpriv), never as root.
   if [ -n "$PROVIDER_PREFLIGHT" ]; then
-    set +e
-    (
-      set -euo pipefail
-      "$PROVIDER_PREFLIGHT" "$TASK_DIR"
-    ) >"$OUT/preflight.log" 2>&1
-    rc=$?
-    set -e
+    if [ "$ROOTMODE" = yes ]; then
+      set +e
+      (export TASK_DIR PKCS11_MODULE PKCS11_TOOL PROVIDER_MATRIX_DIR
+       # shellcheck disable=SC1090
+       setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups \
+         bash -c '. "$0"; "$1" "$2"' "$ENV_FILE" "$PROVIDER_PREFLIGHT" "$TASK_DIR" \
+      ) >"$OUT/preflight.log" 2>&1
+      rc=$?
+      set -e
+    else
+      set +e
+      (
+        set -euo pipefail
+        "$PROVIDER_PREFLIGHT" "$TASK_DIR"
+      ) >"$OUT/preflight.log" 2>&1
+      rc=$?
+      set -e
+    fi
     if [ "$rc" != 0 ]; then
       echo "provider-matrix-cell: preflight refused; provider UNRUN (see preflight.log)" >&2
       exit 77

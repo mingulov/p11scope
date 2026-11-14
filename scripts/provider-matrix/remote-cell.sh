@@ -14,7 +14,7 @@
 set -u
 [ $# -eq 1 ] || { echo "usage: remote-cell.sh PROVIDER" >&2; exit 2; }
 PROVIDER=$1
-case $PROVIDER in ''|*/*|*..*|" "* ) echo "remote-cell: bad provider name" >&2; exit 2 ;; esac
+case $PROVIDER in ''|*/*|*..*|*[[:space:]]* ) echo "remote-cell: bad provider name" >&2; exit 2 ;; esac
 : "${TASK_DIR:?}" "${REPO:?}" "${OUT:?}" "${P11SCOPE:?}" "${DISCOVER:?}" "${P11CHECK:?}" "${PINS:?}"
 MODE=${MODE:-smoke}
 OBS_SUDO=${OBS_SUDO:-sudo -n}

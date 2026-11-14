@@ -27,7 +27,7 @@ reader-less providers) against one provider in three legs ((a) alone,
 Result-set and oracle helpers are reused from
 scripts/ci/pkcs11_check_cell_compare.py, not duplicated.
 
-It writes results.jsonl (five rows) and summary.txt, prints details, and
+It writes results.jsonl (six rows) and summary.txt, prints details, and
 exits 0 when every qualified row passes, 1 when a qualified check fails,
 2 on harness errors. PINs never appear in outputs.
 """
@@ -218,20 +218,36 @@ def judge_run_observed(observed, module_path, oracle=None, capture=None):
 def inventory_module_ids(inventory, module_path):
     """(ids, how): module ids joining to the provider file.
 
-    sha256 join first; basename-in-paths fallback only when no identity
-    joins (reported as such). Empty ids means the module is absent.
+    sha256 join first. When no digest joins, a row carrying no sha256
+    (unpinned object) still joins on an exact path or a recorded
+    device/inode identity (same-file proofs, never a basename
+    substring): a same-basename module with different bytes does not
+    join, and a recorded different digest refuses. Empty ids means the
+    module is absent.
     """
-    sha256, _, _ = file_identity(module_path)
-    base = os.path.basename(module_path)
+    sha256, dev, ino = file_identity(module_path)
     by_sha = {m.get("id") for m in inventory.get("modules", [])
               if isinstance(m.get("identity"), dict)
               and m["identity"].get("sha256") == sha256}
     if by_sha:
         return by_sha, "sha256"
-    by_path = {m.get("id") for m in inventory.get("modules", [])
-               if any(base in p for p in m.get("paths", []))}
-    if by_path:
-        return by_path, "basename-fallback"
+    for module in inventory.get("modules", []):
+        if not isinstance(module, dict):
+            continue
+        identity = module.get("identity")
+        digest = (identity.get("sha256")
+                  if isinstance(identity, dict) else None)
+        if digest is not None:
+            continue
+        paths = [str(p) for p in module.get("paths", [])]
+        if str(module_path) in paths:
+            return {module.get("id")}, "path"
+        device = identity.get("device") if isinstance(identity, dict) else None
+        if (isinstance(device, dict)
+                and device.get("major") == dev[0]
+                and device.get("minor") == dev[1]
+                and identity.get("inode") == ino):
+            return {module.get("id")}, "dev-ino"
     return set(), "absent"
 
 

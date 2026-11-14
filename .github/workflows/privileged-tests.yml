@@ -2086,10 +2086,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
   # Provider-matrix SMOKE under p11scope: kryoptic (pinned koji rpm, sha
-  # in scripts/provider-matrix/pins.sh) and Haskoki (pinned release
-  # tarball, sha likewise) each run the smoke selection alone, under
-  # `p11scope run` and under `p11scope run --manifest`, plus a discover
-  # manifest assertion and a paced workload under inventory --pid
+  # in scripts/provider-matrix/pins.sh), Haskoki (pinned release
+  # tarball, sha likewise) and NSS softokn (system libnss3, suite=no
+  # tool probe with identical-results nonqualifying) each run the smoke
+  # selection alone, under `p11scope run` and under
+  # `p11scope run --manifest`, plus a discover manifest assertion and a
+  # paced workload under inventory --pid
   # (scripts/ci/provider-matrix-cell.sh). A provider that is not observed
   # on the manifest leg or the inventory leg fails its cell; kryoptic's
   # discover row is kryoptic-multi-table. Runs on every push (host

@@ -91,7 +91,9 @@ onto `modules[]`/`edges[]`, using instances only where the
 semantic lane proves one. I1 — per-backend link deltas (Multi
 and Singles), a per-group return program, and
 `entry_link_bound`/`fd_preflight` extended with the info return
-links and the `INFO` ring, pinned in the routing twins. I2 —
+links [info-return counting superseded by N4 — EMFILE deferral,
+excluded from the hard preflight] and the `INFO` ring, pinned in
+the routing twins. I2 —
 full stash-map lifecycles (§8.2, §17.4). I3 — function kind via
 a frozen endpoint→kind map [superseded by fix9 R1 —
 admission-published, never frozen] (cookie tag rejected,
@@ -122,7 +124,9 @@ return always deletes `INFO_START` and reads only on `CKR_OK`.
 R6 — identity hashes each base program's fully linked instruction
 stream incl. subprograms (`aya_obj` precedent), with the verifier
 cells as backstop. R7 — a static fd-preflight bound for info
-returns; the 4096-endpoint Singles cell stays passing. R8 —
+returns [superseded by N4 — info returns are excluded from the
+hard preflight and defer on EMFILE]; the 4096-endpoint Singles
+cell stays passing. R8 —
 `generation` dropped (unnamed source); the fix7 R2 sentence marked
 superseded; plan Task 7 Step 4 lists inventory cells only.
 
@@ -1442,6 +1446,17 @@ the `eba746421` allowlist hunk) plus a new `## Key metadata:
 inferred family and size class (v0.8.0 keymeta)` section, appended
 after the last section, plus the field-inventory edit below. Header
 status line gains both sections (PROPOSED). v1/v2 bytes unchanged.
+The R2 block also amends approved passages in place, with the same
+PROPOSED status and outside OD11 until reviewed: the DeriveKey
+scalar-result set (four to seven), the `CKA_TOKEN`, `CKA_VALUE_LEN`
+and `CKA_EC_PARAMS` rows, the finite vocabulary (key type 0x42,
+value sizes 12/48, the Montgomery/Edwards encodings, and removal
+of the rule that Edwards/Montgomery key types do not authorize
+curve decoding), the requested-values promotion rule and the
+establishment rule. The keymeta section adds the three
+operation-length rows. Until both reviews pass, the implemented
+boundary stays EC parameter lengths 7/10, value lengths 16/24/32,
+the four-member derive set and no promotion.
 There is no descriptor-table edit and no authority-condition edit:
 evidence reads add no descriptors and change no entry gating
 (§8.1, §8.4) — the amendment adds fields, not entries.
@@ -1473,6 +1488,8 @@ is no other R2-amendment owner.
 
 New section body (normative):
 
+> § references are to `docs/superpowers/specs/2026-11-14-v080-keymeta-design.md`.
+>
 > **Status: PROPOSED (v0.8.0 keymeta design 2026-11-14); owner/Opus
 > privacy review and Codex re-review required before activation.**
 > This section scopes section version 7 of
@@ -1511,7 +1528,8 @@ New section body (normative):
 > malicious caller can place any number in one, so classification is
 > full-width (§5.2 finite triples) and only the numeric value publishes.
 > Payload, key-material, PIN and environment bytes are never read;
-> the length value is the only new word. Standard RSA octet lengths
+> the length cell is the only new read: entry capacity for the checks,
+> never transported; return value in the trailer. Standard RSA octet lengths
 > (128/256/384/512) name the standard size with the `length` source;
 > other admitted octets show a masked class with the byte count;
 > ECDSA raw lengths name P-256/P-384/P-521 with the `length` source;
@@ -1535,10 +1553,11 @@ New section body (normative):
 > identity contract (byte-identical records, same linked set,
 > base-program linked-instruction identity), canary lanes with length-cell sentinel
 > positions on every §5.1 shape (LP64+ia32) proving no payload byte
-> reaches output/maps/logs, verifier headroom + `bpf loads` for
-> base journal AND length programs (§8.5), full `artifact_contracts`,
-> and the Task 5 live matrix (Firefox/Chromium/pkcs11-tool/OpenSSL
-> provider, ≥5 runs each, 6.6+).
+> reaches output/maps/logs and that unclassified lengths (the
+> AES-GCM canary) publish nowhere, verifier headroom + `bpf loads`
+> for base journal AND length programs (§8.5), full
+> `artifact_contracts`, and the Task 5 live matrix
+> (Firefox/Chromium/pkcs11-tool/OpenSSL provider, ≥5 runs each, 6.6+).
 
 ## 12. Tests and live proof
 
@@ -1963,7 +1982,9 @@ record header [superseded by fix9 R2/R8 — 48-B header, 176-B
 record, no `generation`] carry joinable identity, the default
 join keys onto `modules[]`/`edges[]` (§17.4/§17.5); I1 —
 per-backend link deltas, per-group returns, extended
-link-bound/fd-preflight (§8.3/§8.6/§17.4, routing twins); I2 —
+link-bound/fd-preflight [info-return counting superseded by N4
+— EMFILE deferral, excluded from the hard preflight]
+(§8.3/§8.6/§17.4, routing twins); I2 —
 stash-map lifecycles (§8.2/§17.4); I3 — frozen endpoint→kind
 map [superseded by fix9 R1 — admission-published, never frozen],
 function-identity plumbing, single-info-function rule (§17.4,
@@ -1981,7 +2002,9 @@ is scope-gated with an out-of-scope negative twin; R4 —
 `EVIDENCE_START` binds on the START row `ts_ns`; R5 — the info
 return always deletes `INFO_START`; R6 — linked-instruction-stream
 hashes with the verifier cells as backstop; R7 — a static
-fd-preflight bound for info returns; R8 — `generation` dropped
+fd-preflight bound for info returns [superseded by N4 — info
+returns are excluded from the hard preflight and defer on
+EMFILE]; R8 — `generation` dropped
 (§8.2/§8.5/§8.6/§11/§12.1/§17.1/§17.4/§17.5/§17.6/§17.7); DAG
 edges unchanged (§13).
 Round 11 (Opus r5 nits N1–N5, controller direction): N1 — the
@@ -2323,9 +2346,14 @@ capacity N, `BPF_F_RDONLY_PROG` so the BPF side stays
 read-only). Publication follows the `ENDPOINT_OBJECT` precedent
 exactly (`publish_caller_endpoint_with`,
 `src/attach/inventory/callers.rs:163-181`; invariant (a),
-`capture.rs:11-19`): each endpoint's kind is written once at
-admission in `admit_entry`/extend and read back, re-publication
-is refused, and the map is never frozen — `ENDPOINT_OBJECT`
+`capture.rs:11-19`): each endpoint's kind is written once and
+read back, re-publication is refused, and the map is never
+frozen — but only after that endpoint's (Singles) or group's
+(Multi) return link exists. A return-deferred endpoint keeps
+kind 0, so the existing scope gate (fix9 R3) stops it stashing
+while the usage witness still records; a successful retry
+publishes once, so the write-once/read-back rule is unchanged.
+`ENDPOINT_OBJECT`
 appears in no freeze list
 (`src/attach/inventory.rs:726-769`) because endpoints are
 admitted during capture extends, after preparation has already
@@ -2333,9 +2361,10 @@ loaded the programs; freezing `INFO_KIND` in the prepare
 sequence would freeze it empty and no info would ever be
 captured. The entry reads
 `INFO_KIND[endpoint]` to select argument positions and read
-ranges; kind zero (usage-only endpoint) takes the usage body
-with no stash. The cookie-tag alternative is REJECTED: the
-cookie's high word is fully consumed by `INVENTORY_COOKIE_TAG`
+ranges; kind zero (usage-only or return-deferred endpoint)
+takes the usage body with no stash. The cookie-tag alternative
+is REJECTED: the cookie's high word is fully consumed by
+`INVENTORY_COOKIE_TAG`
 and the low word by the endpoint id
 (`crates/ebpf-common/src/lib.rs:443-450`), so stealing kind bits
 would fork `inventory_cookie_endpoint` and every cookie site
@@ -2400,9 +2429,16 @@ is left unlinked and reports the named counted gap
 7 section — the usage entry still records, the capture never
 stops: owner partial-never-stop, following the entry-deferral
 precedent `fd_exhausted` + `deferred`,
-`capture.rs:722-724/2299-2301`). A later extend with free fds
-retries the return attach; until then that endpoint's info is
-unavailable with the named gap, never silent. The
+`capture.rs:722-724/2299-2301`). The retry cannot ride the
+`deferred` backlog — an attached endpoint counts as already
+handled (`book.knows`, `capture.rs:1757-1759/1851-1853`) and is
+never resubmitted (`:2295-2301`) — so the capture keeps its own
+private `info_return_pending` list (endpoint on Singles, group
+on Multi). Each extend retries that list first, within the same
+window; the endpoint stays `known` and the receipt gains an
+`info_return_deferred` count. Until a retry links the return,
+that endpoint's info is unavailable with the named gap, never
+silent. The
 `INFO` ring (64 KiB `RingBuf`, cold traffic)
 drains in the inventory session alongside `DISCOVERY`; loss
 accounting rides a new `PRODUCED_INFO = 2` cell with
@@ -2489,7 +2525,13 @@ linked into the Callers inventory build,
 identity field; in the Global flavor (proof only, no caller
 witnesses) the return emits a zero identity without calling the
 helper (cookie 0 = unavailable, `lib.rs:1594`; the helper is not
-linked into the Global inventory-only build). `mechanism` is 0 for
+linked into the Global inventory-only build). If the helper does
+not return 1, or the cookie is 0, at return, the record carries
+zero identity. `provider_info` still publishes, but its
+`tokens[]`/`mechanisms[]` rows are refused with the named counted
+gap `info_caller_unavailable`. They are never keyed under a
+shared zero caller (a shared zero caller would mix per-process
+slot numbers — the fix8 C2 hazard). `mechanism` is 0 for
 `C_GetInfo`/`C_GetTokenInfo` and `slot` is 0 for `C_GetInfo`.
 The join reads header words
 per the kind (the provider kind ignores slot) and keys by
@@ -2625,7 +2667,11 @@ formula (entry links + 4 + 64 — info returns excluded from the
 hard preflight); a deferral twin pins EMFILE leaving the info
 return unlinked with the named counted `info_return_deferred`
 gap while the usage entry still records and the capture
-continues; single-info-function twins
+continues: N info calls leave zero `INFO_START` rows (kind
+stays 0, so the scope gate stops the stash) and the usage
+count is still right; a retry twin pins a later extend with
+free fds linking the return, publishing `INFO_KIND` once, and
+info records flowing; single-info-function twins
 (fix8 I3): an endpoint whose slot set is exactly one info
 function links the info pair with the right kind in
 `INFO_KIND`, while an info/non-info alias and an info/info

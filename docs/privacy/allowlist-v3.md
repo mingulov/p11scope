@@ -81,8 +81,19 @@ The [New-site key metadata (R2, 2026-11-13)](#new-site-key-metadata-r2-2026-11-1
 (re-proposed with the per-field `source` refinement) and
 [Key metadata: inferred family and size class (v0.8.0 keymeta)](#key-metadata-inferred-family-and-size-class-v080-keymeta)
 sections below are PROPOSED and carry no capture authority until reviewed.
-Apart from those sections, this document does not enable capture, describe
-implemented fields, or qualify a release. The implemented contracts remain
+The R2 section also amends in place, with the same PROPOSED status and
+outside OD11 until reviewed: the DeriveKey scalar-result set (four to
+seven), the `CKA_TOKEN`, `CKA_VALUE_LEN` and `CKA_EC_PARAMS` rows, the
+finite vocabulary (key type 0x42, value sizes 12/48, the
+Montgomery/Edwards encodings, and removal of the rule that
+Edwards/Montgomery key types do not authorize curve decoding), the
+requested-values promotion rule and the establishment rule. The keymeta
+section adds the three operation-length rows. Until both reviews pass,
+the implemented boundary stays EC parameter lengths 7/10, value lengths
+16/24/32, the four-member derive set and no promotion.
+Apart from the sections the status line lists, this document does not
+enable capture, describe implemented fields, or qualify a release. The
+implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
 exclusions are unchanged.
 Implementation, schema changes, decoder review and the evidence below must
@@ -249,9 +260,10 @@ The initial scalar-result set is exactly:
 | `CKM_HKDF_DATA` | 0x0000402b | One handle through arg 5 |
 
 These scalar-result mechanisms are specified in PKCS #11 Current Mechanisms
-3.0 sections 2.4.10, 2.22.5, 2.3.17 and 2.3.18. In contrast, its sections
-2.39.6, 2.40.6–2.40.7 and 2.41.6–2.41.8 describe SSL3/TLS12/WTLS
-key-material or PRF results outside `phKey`; that cell can be ignored.
+3.0 sections 2.4.10, 2.22.5, 2.3.17, 2.3.18, 2.43.3, 2.62.3 and 2.62.4.
+In contrast, its sections 2.39.6, 2.40.6–2.40.7 and 2.41.6–2.41.8
+describe SSL3/TLS12/WTLS key-material or PRF results outside `phKey`;
+that cell can be ignored.
 [Primary mechanism specification](https://docs.oasis-open.org/pkcs11/pkcs11-curr/v3.0/os/pkcs11-curr-v3.0-os.html).
 Numeric IDs are pinned by the
 [pkcs11-types mechanism catalog](https://github.com/mingulov/pkcs11-components/blob/v0.2.3/crates/types/src/mechanism_official.rs).
@@ -398,7 +410,10 @@ through the unchanged path. Queries stay `not_queried`: promotion
 records the creation result, never a read-back. The `CKA_TOKEN`
 exclusion is deliberate: token/session persistence drives
 cross-session lifetime reasoning and keeps its stronger
-query-established bar.
+query-established bar. Promotion is per field: an unlisted key
+type (e.g. 0x33/0x34) stays unknown and promotes nothing, while
+the same template's finite value length promotes with
+`creation_success` and never labels.
 
 For `C_GetAttributeValue`, accept per-attribute result processing only on
 `CKR_OK`, `CKR_ATTRIBUTE_SENSITIVE`, `CKR_ATTRIBUTE_TYPE_INVALID`, or
@@ -2248,16 +2263,21 @@ of silence, whatever traffic already-marked filesystems produce.
 
 ## New-site key metadata (R2, 2026-11-13)
 
+§ references are to `docs/superpowers/specs/2026-11-14-v080-keymeta-design.md`.
+
 **Status: PROPOSED (v0.8.0 keymeta Task 0 2026-11-14; R2 re-proposed
 with the per-field `source` refinement, keymeta §6/K5); owner/Opus
 privacy review and Codex re-review required before activation.**
 This section scopes section version 6 of
-[docs/schema/inventory-v1-object-observations-v6.schema.json](../schema/inventory-v1-object-observations-v6.schema.json)
+`inventory-v1-object-observations-v6.schema.json`
 (to be created in Task 1): the finite rows below plus the
 sixteen-label publication. It partially supersedes the "requested
 metadata never labels" clause: complete finite creation templates
 establish on success (see the promotion rule above); `CKA_TOKEN`,
 unknown/conflict shapes and incomplete triples still never label.
+It also partially supersedes the finite-vocabulary rule that
+Edwards and Montgomery key-type labels do not authorize curve
+decoding for those types, which the R2 rows remove.
 Promoted fields carry per-field `source: creation_success`;
 queried fields carry `source: query`. KEM T0, the terminal states
 and every other exclusion stay in force. Allowlist-v1 bytes are
@@ -2294,6 +2314,8 @@ Version 6 is emitted exactly when new-site content is present;
 versions 1–5 stay frozen and byte-stable.
 
 ## Key metadata: inferred family and size class (v0.8.0 keymeta)
+
+§ references are to `docs/superpowers/specs/2026-11-14-v080-keymeta-design.md`.
 
 **Status: PROPOSED (v0.8.0 keymeta design 2026-11-14); owner/Opus
 privacy review and Codex re-review required before activation.**
@@ -2333,7 +2355,8 @@ Length words are scalars under the v1 hostile-caller boundary: a
 malicious caller can place any number in one, so classification is
 full-width (§5.2 finite triples) and only the numeric value publishes.
 Payload, key-material, PIN and environment bytes are never read;
-the length value is the only new word. Standard RSA octet lengths
+the length cell is the only new read: entry capacity for the checks,
+never transported; return value in the trailer. Standard RSA octet lengths
 (128/256/384/512) name the standard size with the `length` source;
 other admitted octets show a masked class with the byte count;
 ECDSA raw lengths name P-256/P-384/P-521 with the `length` source;
@@ -2357,7 +2380,8 @@ RED/GREEN at the journal seam, hostile-width, overlap/alias,
 identity contract (byte-identical records, same linked set,
 base-program linked-instruction identity), canary lanes with length-cell sentinel
 positions on every §5.1 shape (LP64+ia32) proving no payload byte
-reaches output/maps/logs, verifier headroom + `bpf loads` for
-base journal AND length programs (§8.5), full `artifact_contracts`,
-and the Task 5 live matrix (Firefox/Chromium/pkcs11-tool/OpenSSL
-provider, ≥5 runs each, 6.6+).
+reaches output/maps/logs and that unclassified lengths (the
+AES-GCM canary) publish nowhere, verifier headroom + `bpf loads`
+for base journal AND length programs (§8.5), full
+`artifact_contracts`, and the Task 5 live matrix
+(Firefox/Chromium/pkcs11-tool/OpenSSL provider, ≥5 runs each, 6.6+).

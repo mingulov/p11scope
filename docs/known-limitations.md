@@ -501,22 +501,20 @@ inventory keeps running to the end of the window with exact counts
 and no lost calls. Workaround: rerun the capture, or narrow the
 scope (`--pid`).
 
-### A call caught mid-flight by a tracking interruption can still stop detailed tracking
+### A call caught mid-flight by a tracking interruption can lose its per-key detail
 
 When tracking hits a transient interruption, a call that was waiting
 for a seal (for example behind a still-running call from the same
 process) is preserved as counted history: a completed staged call
 keeps a completed row without key identity, an unfinished one stays
 an unfinished operation in the unknown-key bucket, and detailed
-tracking continues for new work. However, if a call whose caller took
-an extra pass to resolve was set aside just before the interruption
-and had not yet been matched to its key, recovery cannot match that
-call to its proof. Automatic continuation does not cover that
-recovery stage, so detailed tracking (mechanisms and key operations)
-stops for the rest of the run while call counts continue; coverage is
-marked `PARTIAL` and a `semantic lane stopped` gap records the stop.
-This is rare — it requires a tracking interruption at the same moment
-a call is set aside — and is planned to be fixed in 0.8.0.
+tracking continues for new work. A call whose caller took an extra
+pass to resolve and was set aside just before the interruption is
+also kept: its observed call is still counted and its return is
+preserved as a plain row without key identity, a counted gap names
+the lost per-key detail, and detailed tracking continues for every
+other key and call. This is rare — it requires a tracking
+interruption at the same moment a call is set aside.
 
 Where automatic continuation does apply (up to 32 interruptions per
 rolling 2 minutes), once all 32 continuations are spent the next

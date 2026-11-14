@@ -2,7 +2,7 @@
 <!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # v0.8.0 Key Metadata: Inferred Family, Size Class, Creation Sources
 
-Status: design (spark lane, round 8). Base: task/v080-design-keymeta 763b29998.
+Status: design (spark lane, round 9). Base: task/v080-design-keymeta e3d6fb8b3.
 Branch: task/v080-design-keymeta. Plan: `docs/superpowers/plans/2026-11-14-v080-keymeta.md`.
 
 Owner direction (2026-11-14 07:05): v0.8.0 carries much more key
@@ -65,6 +65,39 @@ under `--key-operations` the 3 endpoints use journal-program
 info variants keeping the journal entry's info-call handling
 (the `begin_decision` Call arm for proved-irrelevant calls).
 
+Controller rulings (fix8, binding, dispose the Opus r3 review
+C1–C3, I1–I3 and minors): C3 takes the recommended fix — the
+journal info programs, the 760/600 END+info forms, the
+`EVIDENCE_START` info use and Task 7's co-ownership of the two
+journal files are dropped; the inventory info pair links in
+every native inventory mode including under `--key-operations`,
+and a refused journal start leaves Task 7 running on the
+ordinary retry's broad inventory (§17.4, §17.7). C1 — the info
+entries run the unchanged `usage_entry` body in both flavors,
+then stash, with a Callers-flavor twin pinning `CALLER_USE`
+rows and counts at the 3 endpoints equal to baseline. C2 —
+`INFO_START` rows carry {info pointer, slot, mechanism,
+function kind, layout, generation}, the 160-B record header
+carries {endpoint id, host tgid + caller incarnation cookie,
+slot, mechanism, kind}, and the default-mode join keys by
+(module via endpoint, caller incarnation, slot[, mechanism])
+onto `modules[]`/`edges[]`, using instances only where the
+semantic lane proves one. I1 — per-backend link deltas (Multi
+and Singles), a per-group return program, and
+`entry_link_bound`/`fd_preflight` extended with the info return
+links and the `INFO` ring, pinned in the routing twins. I2 —
+full stash-map lifecycles (§8.2, §17.4). I3 — function kind via
+a frozen endpoint→kind map (cookie tag rejected, §17.4),
+function identity plumbed through `InventoryEndpoint`/
+`AttachEndpoint` routing, the info pair linked only where the
+endpoint's slot set is exactly one info function (named gap
+otherwise), with the map validators, the freeze sequence and
+Multi load mode covered. Minors — `JOURNAL_MAPS`/program
+inventory growth, a `check-bpf-load-journal.sh --key-sizes`
+run, the compact 488 form dropped (no producer), byte-for-byte
+ELF section identity for the base programs, and the P0
+inventory flavor list stated.
+
 ## 1. Goal, non-goals, constraints
 
 Goal: per-key rows carry, beside established token-reported facts,
@@ -93,11 +126,13 @@ and metrics never carry object facts; observed-profile v2/v3 schemas
 untouched; bounded steps for I/O/close/join/scan; Linux x86-64 LP64
 first, ia32 claims require actual ABI cells; with `--key-sizes`
 off, hot-path records, ring/journal load, the linked program set
-at hot endpoints, pinned verifier counts and classification are
+at hot endpoints, base-program bytes and classification are
 exactly today's (§8.6 — extra programs in the same journal
 object, loaded and linked only with the flag, never a runtime
 branch inside the hot programs; the only linked-set additions
-are the cold-only Task 7 info programs, §17.4).
+are the cold-only Task 7 inventory info programs, which link in
+every native inventory mode including under `--key-operations`,
+§17.4).
 
 ## 2. Prior work and dispositions
 
@@ -663,10 +698,11 @@ creation calls are cold (not hot per-call paths), the R2 reads
 ride the existing creation adapters, and no `--key-sizes` is
 needed to see them. The R2 BPF delta is finite-set const data on
 those cold paths; the §12.1 off-mode identity twin pins the
-journal programs' verifier counts equal to today's pins, and if
+journal programs' ELF sections byte-identical to the recorded
+hashes, and if
 the Task 1 lane cannot hold that pin it restructures its delta
 (dedicated tables, no shared-helper growth — §8.6 rule) instead
-of moving the journal pins.
+of moving the hashes.
 
 ## 7. Other cheap facts, ranked by value/cost
 
@@ -750,9 +786,9 @@ names positions only; record forms live in §8.3 (length) and
 | `C_UnwrapKey` | length, V-scalar arg 4 (input 2, result 7, template (5, 6); Unwrap kept) | journal END + 16-B length trailer (§8.3) |
 | `C_EncapsulateKey` | length, S-cell arg 6 (input 2, result 7; Encapsulate kept) | journal END + 16-B length trailer (§8.3) |
 | `C_DecapsulateKey` | length, V-scalar arg 6 (input 2, result 7; Decapsulate kept) | journal END + 16-B length trailer (§8.3) |
-| `C_GetInfo` | info, pointer arg 0 (§17) | inventory info record; journal END + 128-B info trailer under `--key-operations` (§17.4) |
-| `C_GetTokenInfo` | info, slot scalar 0 + pointer arg 1 (§17) | inventory info record; journal END + 128-B info trailer under `--key-operations` (§17.4) |
-| `C_GetMechanismInfo` | info, slot scalar 0 + mechanism scalar 1 + pointer arg 2 (§17) | inventory info record; journal END + 128-B info trailer under `--key-operations` (§17.4) |
+| `C_GetInfo` | info, pointer arg 0 (§17) | 160-B inventory info record in every native inventory mode (§17.4) |
+| `C_GetTokenInfo` | info, slot scalar 0 + pointer arg 1 (§17) | 160-B inventory info record in every native inventory mode (§17.4) |
+| `C_GetMechanismInfo` | info, slot scalar 0 + mechanism scalar 1 + pointer arg 2 (§17) | 160-B inventory info record in every native inventory mode (§17.4) |
 
 The `C_UnwrapKey` creation template (5, 6) stays acquired by the
 existing Unwrap adapter and stays authorized exactly as today
@@ -763,8 +799,10 @@ carry no template pairs (T0-style: never authorized).
 Variant mapping (mechanism in §8.6, §17.4): the 11 length
 rows link the journal length programs iff `--key-sizes` is on,
 else the base journal pair exactly as today; the 3 info rows
-link the inventory info pair in default inventory and the journal
-info programs under `--key-operations` (default-on, §17.4). The
+link the inventory info pair in every native inventory mode,
+including under `--key-operations` (default-on, §17.4 — fix8
+C3: there is no journal info carrier, so there is nothing to
+deduplicate and no `--key-operations`-only info path). The
 table above names positions, never programs: which program runs
 at a position is an attach-time routing decision.
 
@@ -823,18 +861,40 @@ is absent unless the length programs load, §8.6.)
 
 Retention (no shared row grows — still no new map KIND): the
 journal object gains one dedicated stash map, `EVIDENCE_START`
-(`HashMap<StartKey, EvidenceStart>`, 16384 entries, existing
-kinds only), used solely by the length programs (Task 2) and the
-journal info programs (Task 7, §17.4 — length and info endpoint
-sets are disjoint, so one map with an `ev_kind` tag serves both
-with no collision). Row: `ev_cell: u64` (retained S-cell pointer,
-V-scalar snapshot, or info pointer) plus `ev_kind: u8` and 7 pad
-bytes — 16 B, +256 KiB worst case at 16384 entries, reservation
-cost only with the flag off (no shared `START`/`OBJECT_START` row
-changes shape, so the base journal programs' verifier counts are
-untouched by construction). Every terminal/loss/cancellation/
-exec/teardown path clears the stash, exactly like the
-result-handle pointer row. Emission is reserve-and-fill (never
+(`HashMap<StartKey, EvidenceStart>`, existing kinds only), used
+solely by the length programs (Task 2; fix8 C3 drops the info
+use, so the `ev_kind` tag is gone — length rows only). Key is
+the call's `StartKey` (`lib.rs:1206-1212`: `pid_tgid` + slot).
+Row (32 B): `ev_cell: u64` (retained S-cell pointer or V-scalar
+snapshot), `ev_thread: u64` + `ev_sequence: u64` (the journal
+BEGIN's pairing key), `ev_kind: u8` (S-cell vs V-scalar) +
+layout/flags bytes and reserved zero. Lifecycle (fix8 I2): the
+entry always overwrites its key on retention and always deletes
+it on the unavailable path (a stale row is never trusted); the
+return matches the row's (thread, sequence) against the END's
+pairing key and on mismatch deletes the row and emits the base
+END with the trailer status unavailable (counted, never a
+guessed length); every terminal/loss/cancellation/exec path
+clears the stash, exactly like the result-handle pointer row;
+the stop scrub (`src/attach/object_stop.rs`, today
+OBJECT_START-only) is extended to zero-verify-remove
+`EVIDENCE_START` after quiescence; full-map insert failures and
+mismatch deletes each land in their own evidence counter (new
+cells beside `EVIDENCE_START_INSERT_FAILURES`-style accounting,
+never silent). The map is cfg-gated to the journal build
+(`p11scope_journal_roots`, following the `main.rs:50` journal
+gate): it exists only where the length programs can load.
+With the flag on, `max_entries` is 16384 (the `START_ENTRIES`
+precedent, `lib.rs`: small-state-maps shrinks to 1); with the
+flag off the loader overrides it to 1, so the off-state
+reservation is exactly one row. Memory (corrected — the old
+"+256 KiB" counted payload only): the on-state preallocated
+reservation is key + value + per-element hash overhead over
+16384 entries, order of 1 MiB, measured at load and recorded by
+the Task 2 lane; the off-state reservation is one row. No
+shared `START`/`OBJECT_START` row changes shape, so the base
+journal programs' bytes are untouched by construction (§8.5
+ELF identity). Emission is reserve-and-fill (never
 stack-built): one END per completed call, base END + trailer
 (§8.3). The inventory info pair keeps its own stash map and ring
 (§17.4), never this one.
@@ -844,44 +904,44 @@ stack-built): one END per completed call, base END + trailer
 `--key-sizes` only works with `--key-operations`, and that mode
 loads the journal object (`src/attach.rs` journal selection,
 `src/attach/journal.rs:9-19`), where each call produces journal
-BEGIN (224 B) and END (632 / 472 B) records
-(`object_journal.rs:33-38`) — never 368/608 CALL records. Length
-trailers therefore ride the journal END forms. Six exact END
-lengths; dispatch is by exact length only (BEGIN 224 B is never
-trailered):
+BEGIN (224 B) and END records (`object_journal.rs:33-38`) —
+never 368/608 CALL records. Length trailers therefore ride the
+journal END form. Three exact END lengths; dispatch is by exact
+length only (BEGIN 224 B is never trailered):
 
 | Form | Bytes | Layout |
 | --- | --- | --- |
 | END full | 632 | `JournalEndFull`: 24-B header + 608-B payload (UNCHANGED — `JOURNAL_VERSION` stays 1, `validate_end` accepts it exactly as today) |
-| END compact | 472 | 24-B header + 448-B compact payload (UNCHANGED) |
+| END compact | 472 | 24-B header + 448-B compact payload (UNCHANGED decoder form; no BPF root emits it — the roots reserve only `JournalEndFull` (`journal_roots.rs:342`, `main.rs:5028`) and the compact packer "does not activate compact production emission" (`object_journal.rs:659)) |
 | END+length full | 648 | 632 + 16-byte length trailer (`version: u16`, `kind: u8`, `status: u8`, `value: u64`, 4 reserved bytes) |
-| END+length compact | 488 | 472 + the same 16-byte length trailer |
-| END+info full | 760 | 632 + 128-byte info trailer (§17.4) |
-| END+info compact | 600 | 472 + the same 128-byte info trailer (§17.4) |
 
-No END ever carries both trailers: length and info endpoint sets
-are disjoint, so each END carries at most one. The 608-B payload
+Fix8 drops two carriers: the 760/600 END+info forms are gone
+with the journal info programs (C3 — the inventory pair is the
+only info carrier, §17.4), and the compact 488 form is dropped
+because no producer is named (minor — the compact base itself
+has no producer, so a compact trailer would be dead wire).
+Every length END carries exactly one trailer. The 608-B payload
 slice of a trailered END validates under the unchanged v1
-validator (full) or the unchanged compact reconstruction
-(compact); the header `length` field carries the total record
-bytes (the existing pattern: 632/472 today, 648/488/760/600 with
-trailers). The 368/608 ordinary/object CALL forms are untouched —
+validator; the header `length` field carries the total record
+bytes (the existing pattern: 632/472 today, plus 648 with the
+flag). The 368/608 ordinary/object CALL forms are untouched —
 keymeta adds no trailer to any non-journal record.
 
-The journal length programs emit the trailer form at their
-endpoints on every completed call (the status field marks
-unavailable shapes); the base journal pair always emits the
-base END there, so with the flag off every length endpoint yields
-only 632/472-byte ENDs exactly as today (§8.6 identity
-contract). The P0 journal flavor omits the length programs and
-P0 refuses the flag (§10.5). Length-based dispatch
-(`decode_journal_record` / `validate_end`,
-`object_journal.rs`, plus its userspace mirror in the
-`src/events.rs` poll dispatch) gains the exact lengths
-648/488/760/600; every other length stays malformed. The trailer
-validates against `EVIDENCE_POSITIONS` (exact version + kind,
-function-matched row, zero reserved). Old readers refuse the new
-lengths loudly (no silent misparse). The
+The journal length programs emit the 648 form at their endpoints
+on every completed call (the status field marks unavailable
+shapes); the base journal pair always emits the base END there,
+so with the flag off every length endpoint yields only base
+ENDs exactly as today (§8.6 identity contract). The P0 journal
+flavor omits the length programs and P0 refuses the flag
+(§10.5). Length-based dispatch (`decode_journal_record` /
+`validate_end`, `object_journal.rs`, plus its userspace mirror
+in the `src/events.rs` poll dispatch) gains the exact length
+648; 488/760/600 and every other length stay malformed (the
+§12.1 dispatch twin pins 648 accept + 488/760/600 malformed +
+224/632/472/368/608 unchanged). The trailer validates against
+`EVIDENCE_POSITIONS` (exact version + kind, function-matched
+row, zero reserved). Old readers refuse the new length loudly
+(no silent misparse). The
 `object_producer_compiled_frames_are_bounded` 512-byte frame test
 must pass unmodified in limit (frames are adapter code, and
 records are reserve-filled, never stack-built; if frames do not
@@ -889,14 +949,24 @@ fit, the lane stops and reports — no silent bound raise).
 
 No new map kinds (`EVIDENCE_START` is a `HashMap`), no new arg-7
 exception (all indices ≤ 6, §5.1). Attach/plan: +0 newly
-probed functions, +0 endpoints, +0 links — the length programs
-substitute the journal pair at already-linked endpoints (§8.6).
+probed functions, +0 endpoints. Links (fix8 I1 — the old "+0
+links" line was false on Multi): groups key per (attach path,
+entry program) with one return link plus one entry link per
+group (`attach.rs:3119-3129, 4289-4326`), so on Multi the
+length endpoints split out of their base groups into new
+groups: +G entry links and +G return links with the flag on,
+where G is the number of distinct attach paths among the 11
+length endpoints (one provider path in the fixture, pinned by
+the routing twin). On Singles the length pair substitutes the
+base pair at already-linked sites: +0 entry, +0 return. The
+return program becomes per-group (§8.6): length groups link
+`p11_return_journal_length`, every other group the base return.
 The length cost is per-call bytes on already-hot endpoints
-(END 632→648 / 472→488, BEGIN unchanged at 224 — +16 B each:
-+2.5% / +3.4%, ≈ +160 kB/s ring per hot endpoint at 10k
-calls/s) plus the `EVIDENCE_START` reservation (§8.2) — paid
-ONLY with `--key-sizes`, and sized by the ring-loss gate (§12.3,
-now the opt-in's acceptance), not by endpoint count. The 8192
+(END 632→648, BEGIN unchanged at 224 — +16 B, +2.5%, ≈ +160
+kB/s ring per hot endpoint at 10k calls/s) plus the
+`EVIDENCE_START` reservation (§8.2) — paid ONLY with
+`--key-sizes`, and sized by the ring-loss gate (§12.3, now the
+opt-in's acceptance), not by endpoint count. The 8192
 slot budget is unchanged. Info cost (default-on) is sized in
 §17.4 and never touches a hot program (§8.6).
 
@@ -915,9 +985,10 @@ nothing to gate, because no entry is added. A provider with NULL
 `C_SignRecover` keeps working exactly as today (no evidence at a
 NULL entry — the entry does not exist). Variant selection (§8.6,
 §17.4) changes no entry gating either: the same admitted
-endpoints link a different program (length: substitution; info:
-entry substitution plus the §17.4 return links at already-
-admitted endpoints), under the same admission rules.
+endpoints link a different program (length: journal-side
+substitution per group; info: inventory-side entry substitution
+plus the §17.4 return links at already-admitted endpoints),
+under the same admission rules.
 
 ### 8.5 Verifier and size budget
 
@@ -927,26 +998,33 @@ precedent), `object_producer_compiled_frames_are_bounded` green,
 The 6.1 E2BIG-style refusal precedent applies: if a floor kernel
 refuses, the lane reports the named refusal instead of
 simplifying the program. The dedicated maps (`EVIDENCE_START`,
-the §17.4 info stash + ring) and the 3 cold info return hook
-sites (§17.4) go through the `bpf-noninterference` allowed-change
-record (`scripts/bpf-noninterference-allowed.json`, reviewed) —
-never a silent baseline move, and no hot-path contact.
+the §17.4 `INFO_START` + `INFO` ring + `INFO_KIND` +
+`INFO_EVIDENCE`) and the cold info return hook sites (§17.4) go
+through the `bpf-noninterference` allowed-change record
+(`scripts/bpf-noninterference-allowed.json`, reviewed) — never a
+silent baseline move, and no hot-path contact.
 
-Base programs (flag off): their verifier counts are pinned EQUAL
-to today's cells in `tests/bpf-verifier-budgets.json` — the Task
-2/7 lanes must not re-pin them. Today's journal pins (processed
-insns, 115%-margined; limit 1,000,000):
-`journal-gate1/p11_entry_journal` max 390,605 (39.1%; 6.6 floor
-145,313), `journal-gate1/p11_return_journal` max 186,862 (18.7%;
-6.6 floor 95,914). Today's inventory pins:
-`inventory/p11_usage_entry_lp64` and
-`inventory/p11_usage_entry_ia32`, max 1,025 each. The §12.1
-identity contract enforces the equality; keymeta adds no program
-to the Detailed object, so the `detailed/*` cells are out of
-scope (untouched, never re-pinned by a keymeta lane). If a lane's
-delta perturbs a pinned count, that lane restructures its delta
-(dedicated tables/maps, no shared-helper or shared-row growth —
-§8.6 rule) instead of re-pinning.
+Base programs (flag off): their compiled bytes are pinned by
+byte-for-byte ELF section identity, not by "counts equal" (fix8
+minor — the gates check count ≤ budget, so equal counts never
+proved the base programs unchanged). The Task 2/7 lanes record
+hashes of the base programs' ELF sections at the fix8 base and
+the §12.1 identity contract compares the candidate's sections
+byte for byte: `p11_entry_journal` / `p11_return_journal` in the
+journal object, `p11_usage_entry_lp64` /
+`p11_usage_entry_ia32` in the inventory object. Any drift fails
+the contract and the lane restructures its delta (dedicated
+tables/maps, no shared-helper or shared-row growth — the §8.6
+rule) instead of re-hashing. Today's journal cells stay as
+reference numbers (processed insns, 115%-margined; limit
+1,000,000): `journal-gate1/p11_entry_journal` max 390,605
+(39.1%; 6.6 floor 145,313), `journal-gate1/p11_return_journal`
+max 186,862 (18.7%; 6.6 floor 95,914); inventory
+`p11_usage_entry_*`, max 1,025 each — still checked, never
+re-pinned by a keymeta lane, but the proof is the bytes.
+Keymeta adds no program to the Detailed object, so the
+`detailed/*` cells are out of scope (untouched, never re-pinned
+by a keymeta lane).
 
 New programs (flag on / info): each linked new program gets its
 own budget cell per measured kernel in
@@ -955,21 +1033,34 @@ own budget cell per measured kernel in
 `journal-gate1/p11_entry_journal_length`,
 `journal-gate1/p11_return_journal_length` (mixed-ABI like the base
 journal pair — no separate ia32 program, following the
-journal-roots precedent), `journal-gate1/p11_entry_journal_info`,
-`journal-gate1/p11_return_journal_info` (§17.4), plus
-`inventory/p11_info_entry_lp64`,
+journal-roots precedent), plus `inventory/p11_info_entry_lp64`,
 `inventory/p11_info_entry_ia32`, `inventory/p11_info_return`
-(§17.4, per-ABI entries following the usage-entry precedent).
-Every linked new program on every measured kernel gets a cell.
-BUD-1 applies to every new cell: any pin past 750,000 (75% of
-the 1M limit) is refused — growth past 75% needs restructuring,
-never a mechanical pin — and the 95% budgets-cap contract still
-enforces the file. The new programs share helpers with the base
-programs plus the §8.2 adapters, so their pins will sit above
-today's pins; the acceptance is recorded cells, every cell under
-750,000, and ≥5% headroom on the 6.6 floor. The
-`frames_are_bounded` 512-byte frame check must pass with the
-limit unmodified.
+(§17.4, per-ABI entries following the usage-entry precedent;
+the journal info pair is gone with C3). Every linked new program
+on every measured kernel gets a cell. Exact-inventory growth
+(fix8 minor): `JOURNAL_MAPS` (`src/attach/journal.rs:36-56`)
+gains the `EVIDENCE_START` row (flag-dependent `max_entries`
+16384/1, §8.2) and `journal_expected_programs`/
+`validate_journal_inventory` (`:190-215`) gain the length pair
+(flag-dependent — the flag-off object must validate without
+them); `INVENTORY_PROGRAMS`
+(`src/attach/inventory.rs:602-617`) grows from 12 to 15 entries
+with review in the FULL inventory flavors, while the P0
+inventory flavor keeps the exact 12-program list (info omitted,
+explicit unavailability — the per-flavor lists are stated, not
+assumed). BUD-1 applies to every new cell: any pin past 750,000
+(75% of the 1M limit) is refused — growth past 75% needs
+restructuring, never a mechanical pin — and the 95%
+budgets-cap contract still enforces the file. The new programs
+share helpers with the base programs plus the §8.2 adapters, so
+their pins will sit above today's pins; the acceptance is
+recorded cells, every cell under 750,000, and ≥5% headroom on
+the 6.6 floor. The `frames_are_bounded` 512-byte frame check
+must pass with the limit unmodified. `check-bpf-load-journal.sh`
+(which today runs only the `--key-operations` load, header
+lines 32-36) gains a `--key-sizes` run scoring the
+`journal-gate1/*_length` cells — without that probe row the new
+cells would fail the check.
 
 ### 8.6 Opt-in: extra programs in the same journal object
 
@@ -997,10 +1088,8 @@ the integrator renames), all in the one journal object:
   `RV_COUNTS`, `CONFIG`, filters, gates and loss counters —
   nothing is split) and additionally run the §8.2 length
   adapters, stashing into `EVIDENCE_START` and emitting the
-  END+length forms (§8.3).
-- Info pair (§17.4, default-on): `p11_entry_journal_info` /
-  `p11_return_journal_info`, same sharing rule, linked ONLY at
-  the 3 cold info endpoints.
+  648 END+length form (§8.3). (Fix8 C3: no info pair lives in
+  this object — Task 7 is inventory-side only, §17.4.)
 
 The P0 journal flavor omits the length programs (the SMALL
 flavor omits the whole journal object — the same flavor
@@ -1012,22 +1101,23 @@ Attach-time routing (Task 2, `src/attach.rs` group routing +
 classification stays untouched): a multi-attach unit already
 pairs "one return link plus one entry link" per (attach path,
 entry program) (`attach.rs` static-group rule), so routing is
-per group, in both backends (multi and singles):
+per group, in both backends (multi and singles). The
+`return_program` single constant per mode
+(`attach.rs:4282-4288`) becomes per-group: each group names its
+own return program alongside its entry program.
 
 - Flag on (FULL): the 11 length-endpoint groups link the
   length pair (entry and return always as a pair — a mixed pair
   would strand the stash and is a planner bug, pinned by the
-  routing twin); every other non-info group links the base pair
-  as today.
-- Flag off: every group EXCEPT the 3 cold info groups links
-  the base pair — the linked set at every hot endpoint is
-  exactly today's, the length programs never load (no
-  verification, no floor-kernel refusal risk from length code),
-  and every length endpoint yields only base ENDs.
-- Both modes: the 3 info-endpoint groups link the info pair
-  (cold, default-on); with the flag off no endpoint links a
-  length program, and with the flag on no non-length endpoint
-  does (pinned by the routing twin, §12.1).
+  routing twin); every other group links the base pair as
+  today.
+- Flag off: every group links the base pair — the linked set
+  at every endpoint is exactly today's, the length programs
+  never load (no verification, no floor-kernel refusal risk
+  from length code), and every length endpoint yields only base
+  ENDs. With the flag off no endpoint links a length program,
+  and with the flag on no non-length endpoint does (pinned by
+  the routing twin, §12.1).
 
 Length evidence rides the END record of the call it measures,
 so the evidence itself needs no cross-record pairing — but
@@ -1038,15 +1128,16 @@ rather than splitting it).
 
 Off-mode identity (the §12.1 contract proves each, none is
 assumed): per-endpoint record bytes identical to the no-length
-baseline (224/632/472 forms only, byte-identical BEGIN/ENDs);
-linked program set at hot endpoints exactly today's; journal
-verifier counts equal today's budget cells (§8.5 — the lanes
-must not re-pin them); journal classification, census,
-sole-complete set and alias agreement byte-identical (the four
-existing pins); ring bytes/s at the gate workload equal to the
-baseline. If a lane cannot hold a pinned count it restructures
-its delta (dedicated tables/maps, no shared-helper or
-shared-row growth) instead of re-pinning — the pins never move.
+baseline (base forms only, byte-identical BEGIN/ENDs, never
+648); linked program set at every endpoint exactly today's;
+base-program ELF sections byte-for-byte identical to the
+recorded hashes (§8.5 — the lanes must not re-hash); journal
+classification, census, sole-complete set and alias agreement
+byte-identical (the four existing pins); ring bytes/s at the
+gate workload equal to the baseline. If a lane cannot hold the
+byte identity it restructures its delta (dedicated tables/maps,
+no shared-helper or shared-row growth) instead of re-hashing —
+the hashes never move.
 
 ## 9. Userspace join (N5 decided)
 
@@ -1061,8 +1152,8 @@ stale or replayed trailer can never classify), while family
 evidence joins in both modes. The binding path, end to end:
 
 1. The journal END (base + length trailer, one record)
-   dispatches in `src/events.rs` (gains 648/488/760/600) and
-   validates in `decode_journal_record` / `validate_end`
+   dispatches in `src/events.rs` (gains 648) and validates in
+   `decode_journal_record` / `validate_end`
    (`object_journal.rs`, co-owned with keyrows, §13); the
    BEGIN/END pairing (`ingest_end`, keyed by (thread,
    sequence)) is unchanged, and the trailer's evidence rides
@@ -1388,7 +1479,7 @@ New section body (normative):
 > RED/GREEN at the journal seam, hostile-width, overlap/alias,
 > 2041-bit and DER/padding negative controls), the §12.1 off-mode
 > identity contract (byte-identical records, same linked set,
-> pinned journal counts), canary lanes with length-cell sentinel
+> base-program ELF section identity), canary lanes with length-cell sentinel
 > positions on every §5.1 shape (LP64+ia32) proving no payload byte
 > reaches output/maps/logs, verifier headroom + `bpf loads` for
 > base journal AND length programs (§8.5), full `artifact_contracts`,
@@ -1451,23 +1542,25 @@ Non-interference twins (B7): journal census `[0,19,79,6]`
 re-run green, sole-complete test re-run green, alias-agreement
 twin (`C_Verify`/`C_VerifyFinal` still agree), journal-class
 snapshot (info still irrelevant, length still neutral),
-dispatch twins (648/488/760/600 accept, neighbors malformed, old
-lengths — 224/632/472/368/608 — unchanged; 152-B info records
-dispatch on the INFO drain).
+dispatch twins (648 accepts; 488/760/600 and neighbors
+malformed; old lengths — 224/632/472/368/608 — unchanged;
+160-B info records dispatch on the INFO drain, §17.6).
 Off-mode identity contract (§8.6, one `artifact_contracts` case
 plus host twins): with `--key-sizes` off on the scripted gate
 workload — every length-endpoint record is the base form
-(632/472 ENDs, never 648/488) with byte-identical BEGIN/ENDs vs
+(632-byte ENDs, never 648) with byte-identical BEGIN/ENDs vs
 the no-length baseline; the attach plan links the base journal
-pair at every group except the 3 cold info groups (pinned name
-list = today's set there; the length programs never load —
-asserted, not assumed); journal verifier counts equal today's
-`journal-gate1/*` cells (no re-pin); ring bytes/s equal the
-baseline. Routing twins: flag on → the 11
-length-endpoint groups link the length pair (entry+return
+pair at every group (pinned name list = today's set; the length
+programs never load — asserted, not assumed); base-program ELF
+sections byte-for-byte identical to the recorded hashes (§8.5 —
+no re-hash) with the `journal-gate1/*` cells still checked;
+ring bytes/s equal the baseline. Routing twins: flag on → the
+11 length-endpoint groups link the length pair (entry+return
 always paired — a mixed-pair plan is refused), all other
-non-info groups link the base pair; with the flag off no
-endpoint links a length program (both backends).
+groups link the base pair; with the flag off no endpoint links
+a length program (both backends); per-backend link deltas
+pinned (Singles +0/+0 substitution; Multi +G/+G with G = the
+distinct length-endpoint paths, one in the fixture).
 Mode twins (Task 3): flag off → `inferred_size` always
 `unknown`/`size_inference_off`, family/creation/token-reported
 output identical to flag-on output minus sizes, `-v` hint line
@@ -1495,7 +1588,7 @@ AES-GCM canary: a GCM encrypt of sentinel plaintext publishes no
 length anywhere (the captured word is dropped unclassified, §5.3).
 The positive control proves the scanner sees planted length values.
 The lane runs both modes: flag on (positions active, above) and
-flag off (no 648/488 record emitted, no length value published
+flag off (no 648 record emitted, no length value published
 anywhere — the off-mode canary is a negative control).
 
 ### 12.3 Gates and live proof (Task 5)
@@ -1507,8 +1600,8 @@ loads, public-CLI cells. Per-call overhead + ring-loss gate — now the OPT-IN's
 (Task 2 measures, Task 5 re-runs on the candidate): scripted
 `C_Encrypt` AES-GCM and `C_Sign` at 5k and 10k calls/s each, in
 three configurations: no-lane baseline, flag off, flag on.
-Record per-call ns delta, ring bytes/s (224/632/472-byte journal
-forms vs 648/488-byte trailer forms), and ring-loss counts. Flag
+Record per-call ns delta, ring bytes/s (224/632-byte journal
+forms vs the 648-byte trailer form), and ring-loss counts. Flag
 off must EQUAL the baseline
 on all three (the identity contract, §12.1 — any delta stops the
 lane). Flag on passes if loss at 5k calls/s stays zero and loss
@@ -1547,7 +1640,7 @@ One DAG (keyrows plan `4cca0dd88`; keymeta tasks are this plan):
 keyrows T0 ──► keyrows T1 ──► keymeta T1 ──► keyrows T3 ──► keyrows T4 ──► keymeta T3 ──► keymeta T7 ──► keymeta T6
                   │                │                                                     ▲
                   │                └────► keymeta T2 ────────────────────────────────────┘
-                  │                   (journal length programs + flag + routing; wire base for T3/T7)
+                  │                   (journal length programs + flag + routing; evidence-table base for T3/T7)
                   ▼
              keymeta T0 ──► Task 7 Step 0 (§17.3 allowlist block)
              (docs; independent of code order)
@@ -1559,12 +1652,15 @@ keymeta T5 (live proof) after keymeta T4 + keymeta T7 + keyrows T4 (yield needs
   rows AND facts; on+off matrix per app + Task 7 info positives, §17.6).
 ```
 
-Keyrows co-owns the two journal files keymeta T2/T7 touch
+Keyrows co-owns the two journal files keymeta T2 touches
 (`object_journal.rs`, `journal_roots.rs` — keyrows' void/fence/
 birth/seal ride BEGIN/END): keymeta T2 rebases onto the keyrows
-T1 merge for those files, re-runs the keyrows journal twins on
-its merge, and keymeta T7 follows keymeta T2 on the same files
-(serialized, never parallel with keyrows journal work).
+T1 merge for those files and re-runs the keyrows journal twins
+on its merge (serialized, never parallel with keyrows journal
+work). Fix8 C3 removes Task 7 from both files: Task 7 touches
+no journal wire, program or map, so the T2→T7 serialization on
+them is gone — T7 consumes only the T2 evidence-table base
+through the T3 chain.
 
 The order is unchanged by the 08:50 opt-in (round 7): Task 2
 produces the length programs, the flag and the attach-time
@@ -1573,7 +1669,10 @@ rendering, which is already the T2→T3 direction above. No new
 edge, no new task — only wider node contents (plan Tasks
 2/3/4/5/7). Round 8 keeps the same edges: R1/R2 change node
 contents (same-object programs, END trailers, inventory info
-pair) and the file table below, not the order.
+pair) and the file table below, not the order. Round 9 (fix8)
+likewise: C3/I1/I2/I3 change node contents (no journal info
+carrier, per-group returns, stash lifecycles, endpoint→kind
+map) and the file table below, not the order.
 
 Why this order: keymeta Task 1 edits `state.rs`,
 `semantics_key_use.rs` and `semantics_objects/journal.rs` — the
@@ -1597,8 +1696,10 @@ at a time, never parallel with T1). Keymeta T3 (join + v7 +
 projection + flag consumption: join gating, family-only default,
 `-v` hint) consumes sealed rows, so it merges after keyrows T4,
 developing against recorded fixtures until then. Keymeta T7
-consumes the T2 wire base through the T3 chain and shares
-projection/schema/test files with T3 — merges after T3. Task 4
+consumes the T2 evidence-table base through the T3 chain and
+shares projection/schema/test files with T3 — merges after T3;
+its BPF half (inventory object, attach routing, INFO drain) is
+journal-free. Task 4
 owns the canary files alone (Task 7 never writes them). Task 5
 runs after Tasks 1–4 AND Task 7 (it checks Task 7 results).
 
@@ -1607,21 +1708,22 @@ twins on the merged SHA):
 
 | File | Ordered writers |
 | --- | --- |
-| `src/semantics_objects/journal.rs` | keyrows T0 → T1 → keymeta T1 → keyrows T3 → keymeta T3 (length carry) → keymeta T7 (info carry) |
+| `src/semantics_objects/journal.rs` | keyrows T0 → T1 → keymeta T1 → keyrows T3 → keymeta T3 (length carry) |
 | `src/semantics_key_use.rs` | keyrows T0 → T1 → keymeta T1 → keyrows T3 → keymeta T3 |
 | `src/semantics_objects/state.rs` | keymeta T1 → keymeta T6 (EC arm, optional) |
 | `src/key_operation_projection.rs` | keymeta T1 → keyrows T4 → keymeta T3 |
 | `src/inventory/present.rs` | keyrows T0 → T1 → T3 → T4 → keymeta T3 → keymeta T7 |
 | `src/inventory/present_key_ops_tests.rs` | keyrows T0 → T3 → T4 → keymeta T3 → keymeta T7 |
-| `src/semantics_edge.rs`, `src/events.rs` | keymeta T2 (journal dispatch) → keymeta T3 (effects/compat) → keymeta T7 (info decode, journal + INFO drains) |
+| `src/semantics_edge.rs`, `src/events.rs` | keymeta T2 (journal dispatch) → keymeta T3 (effects/compat); keymeta T7 touches neither (INFO drain lives in the inventory session, §17.4) |
 | `crates/ebpf-common/src/object_{policy,flow,wire}.rs` | keymeta T1 (R2 finite sets) → T2 (length adapters) → T7 (info adapters) |
 | `crates/ebpf-common/src/evidence_table.rs` (new) | keymeta T2 → keymeta T7 |
-| `crates/ebpf-common/src/object_journal.rs` | keymeta T2 (length END trailers) → keymeta T7 (info END trailers); keyrows co-owner (journal-wire consumer — twins re-run, serialized) |
-| `crates/ebpf/src/journal_roots.rs` | keymeta T2 (length programs) → keymeta T7 (info programs); keyrows co-owner (same) |
-| `crates/ebpf/src/main.rs` (`EVIDENCE_START`; `INFO_START` + `INFO` ring) | keymeta T2 (length stash) → keymeta T7 (info stash + ring) |
+| `crates/ebpf-common/src/object_journal.rs` | keymeta T2 (length END trailers); keyrows co-owner (journal-wire consumer — twins re-run, serialized) |
+| `crates/ebpf/src/journal_roots.rs` | keymeta T2 (length programs); keyrows co-owner (same) |
+| `crates/ebpf/src/main.rs` (`EVIDENCE_START`, journal-gated; `INFO_START` + `INFO` ring + `INFO_KIND` + `INFO_EVIDENCE`, inventory-gated) | keymeta T2 (length stash) → keymeta T7 (info stash + ring + kind + evidence) |
 | `crates/ebpf/src/inventory_info.rs` (new, info pair) | keymeta T7 alone |
-| `src/attach/inventory.rs`, `src/attach/inventory/capture.rs` (program list, +3 return links, INFO drain) | keymeta T7 alone |
-| `build.rs` (journal/inventory flavor program sets) | keymeta T2 (P0 journal omits length) → keymeta T7 (info programs) |
+| `src/attach/inventory.rs`, `src/attach/inventory/capture.rs` (program list 12→15 FULL / 12 P0, per-group info returns, link-bound/fd-preflight growth, INFO drain, PRODUCED cross-check) | keymeta T7 alone |
+| `src/attach/inventory/activation.rs`, `src/discovery/inventory_attach_set.rs` (function identity plumbing, single-info-function rule, INFO_KIND publication) | keymeta T7 alone |
+| `build.rs` (journal/inventory flavor program sets) | keymeta T2 (P0 journal omits length) → keymeta T7 (info programs in FULL inventory flavors; P0 list stated) |
 | `src/cli.rs` (`--key-sizes`) | keymeta T2 (flag) — integrator checks keyrows writers at merge |
 | `src/attach.rs` (group routing), `src/attach/journal.rs` (program selection), planner mode input | keymeta T2 (routing) — integrator checks keyrows writers at merge |
 | `docs/privacy/allowlist-v3.md` | keymeta T0 (§11 + R2 block) → Task 7 Step 0 (§17.3) |
@@ -1650,8 +1752,9 @@ task depends on the postponed Task 8 (§18).
   reason (no yield loss vs today, which is 0 typed).
 - Section-version collision with keyrows gap subjects: mitigated by
   integrator allocation (§10.1).
-- Ring pressure from longer records (END 632→648, 472→488 on hot
-  endpoints): +0 endpoints and +0 links, so slot budgets are
+- Ring pressure from longer records (END 632→648 on hot
+  endpoints): +0 endpoints, and links only per §8.3 (+0/+0 on
+  Singles, +G/+G on Multi), so slot budgets are
   untouched — the cost is bytes/s, and only with `--key-sizes`
   (default runs are unaffected by construction, §8.6). Sized by
   the §12.3 ring-loss gate as the opt-in's acceptance; a
@@ -1786,6 +1889,24 @@ R2 — Task 7 moves to the inventory-object info pair (stash map,
 per provider) with journal info programs under
 `--key-operations` keeping the `begin_decision` Call arm
 (§17.4/§17.6/§17.7); DAG edges unchanged (§13).
+Round 9 (fix8: Opus r3 C1–C3/I1–I3/minors, controller rulings):
+C3 — the journal info programs, the 760/600 forms, the
+`EVIDENCE_START` info use and Task 7's journal co-ownership are
+dropped; the inventory info pair links in every native inventory
+mode including under `--key-operations`, with the refused-start
+fallback stated (§17.4/§17.7); C1 — info entries run the
+unchanged `usage_entry` body in both flavors, then stash, plus a
+Callers twin (§17.4/§17.6); C2 — `INFO_START` rows and the 160-B
+record header carry joinable identity, the default join keys
+onto `modules[]`/`edges[]` (§17.4/§17.5); I1 — per-backend link
+deltas, per-group returns, extended link-bound/fd-preflight
+(§8.3/§8.6/§17.4, routing twins); I2 — stash-map lifecycles
+(§8.2/§17.4); I3 — frozen endpoint→kind map, function-identity
+plumbing, single-info-function rule (§17.4, §13 +
+activation/attach-set files); minors — `JOURNAL_MAPS`/program
+inventory growth, a `--key-sizes` load-check run, 488 dropped,
+ELF section identity, P0 flavor lists (§8.5/§12); DAG edges
+unchanged (§13).
 
 ## 17. Required: provider, token and mechanism info (Task 7)
 
@@ -1907,11 +2028,16 @@ that ABI's span size.
 
 Protocol: entry retains the `pInfo` pointer with full-span
 validation of the per-ABI fixed struct size (LP64/ia32: 88/76,
-208/160, 24/12) and snapshots the slot/mechanism
-scalars; return reads the fixed bytes on `CKR_OK` only. NULL
+208/160, 24/12) and snapshots the slot/mechanism scalars into
+the `INFO_START` row (§17.4); the return — a uretprobe, which
+cannot read entry arguments — emits the record header's
+slot/mechanism words FROM that stash row (fix8 C2: the old
+"ride the header, never the stash" line contradicted this
+paragraph and was wrong — without the stash the return has no
+scalars). Return reads the fixed bytes on `CKR_OK` only. NULL
 pointer → unavailable; any other return → never (no
 BUFFER_TOO_SMALL/query-shape rule: these are not length cells).
-Every terminal/loss path clears the retained pointer, exactly like
+Every terminal/loss path clears the retained row, exactly like
 the S-protocol cell. FULL builds only: the P0 flavors omit the
 info programs (explicit unavailability, §17.4), so P0 acquires no
 info bytes.
@@ -1972,10 +2098,11 @@ public parsed fields only: cryptoki/library versions, manufacturer,
 description, flags); `Token info ranges (C_GetTokenInfo)` (the
 four §17.1 ranges — manufacturer, model, flags incl. the PIN-state
 bits, PIN min/max lens, hardware/firmware versions — plus the slot
-scalar from the base record; §17.2 bytes never fetched, not
-read-and-scrubbed); `Mechanism info struct (C_GetMechanismInfo)`
-(whole `CK_MECHANISM_INFO` + slot/mechanism scalars from the base
-record; min/max key size as raw mechanism-dependent numbers,
+scalar from the INFO record header, snapshotted at entry;
+§17.2 bytes never fetched, not read-and-scrubbed); `Mechanism
+info struct (C_GetMechanismInfo)` (whole `CK_MECHANISM_INFO` +
+slot/mechanism scalars from the INFO record header, snapshotted
+at entry; min/max key size as raw mechanism-dependent numbers,
 flags incl. `CKF_HW`). Evidence reads ride already-admitted
 entries only (the §8.4 rule, never provider-gating).
 
@@ -2015,54 +2142,165 @@ New section body (normative):
 No new `ObjectAction` (`OBJECT_ACTION_MAX` stays 14): the 3 info
 functions are rows 12–14 of `EVIDENCE_POSITIONS` (§8.1) with the
 §17.1 info kind + read ranges; no inputs, no templates (never
-authorized). Default inventory loads the inventory object, which
-carries only the usage entry probes and compiles out
-`START`/`CallStart`, `EVENTS`, `STATS` and `DESCRIPTORS`
+authorized). Every native inventory mode loads the inventory
+object, which carries only the usage entry probes and compiles
+out `START`/`CallStart`, `EVENTS`, `STATS` and `DESCRIPTORS`
 (`main.rs` `cfg(not(feature = "inventory-only"))`) — so Task 7
-brings its own entry+return pair, stash map and ring there, and
-journal info programs under `--key-operations`:
+brings its own entry+return pair, stash map, kind map and ring
+there. Fix8 C3: there is no journal info carrier — no journal
+info programs, no 760/600 forms, no `EVIDENCE_START` info use —
+so the inventory pair is the only carrier and no dedup rule is
+needed (the old design's mechanism loss — `C_GetMechanismInfo`
+records only `slot_arg 0` with no `mechanism_arg`,
+`src/kinds.rs:188-191` — and its double-carrier duplication are
+both gone with the journal carrier).
 
-- Default inventory: `p11_info_entry_lp64` /
-  `p11_info_entry_ia32` / `p11_info_return` (new programs in the
-  inventory object; per-ABI entries follow the usage-entry
-  precedent). The entry programs mark usage for their endpoint
-  (same `USAGE` bitmap semantics as the usage entries they
-  substitute at the 3 endpoints — +0 entry links) and stash the
-  info pointer into the dedicated `INFO_START` map; the return
-  program reads the §17.1 ranges on `CKR_OK` and emits the 152-B
-  info record on the dedicated `INFO` ring. Slot and mechanism
-  scalars ride the record header, never the stash. +0 newly
-  probed functions (all three already carry usage probes); +3
-  return links per provider (the return side is new — the
-  inventory object has no return probe at these endpoints
-  today). `p11_usage_entry_*` code is untouched and its budget
-  cells stay pinned (§8.5).
-- Under `--key-operations`: `p11_entry_journal_info` /
-  `p11_return_journal_info` (mixed-ABI, same sharing rule as the
-  §8.6 length pair — same maps, ring and journal state, stash in
-  `EVIDENCE_START`). The entry program keeps the journal entry's
-  info-call handling: proved-irrelevant calls still take the
-  `begin_decision` Call arm (`journal_roots.rs`), so info calls
-  still produce BEGIN/END — the END carries the 128-B info
-  trailer (760/600 forms, §8.3). Substitution at already-linked
-  endpoints: +0 links.
+Programs, in every native inventory mode including under
+`--key-operations`: `p11_info_entry_lp64` /
+`p11_info_entry_ia32` / `p11_info_return` (new programs in the
+inventory object; per-ABI entries follow the usage-entry
+precedent). The entry programs run the UNCHANGED `usage_entry`
+body first — in the Global flavor `mark_usage`, in the Callers
+flavor `inventory_callers::record` (fix8 C1: live inventory
+always loads the Callers flavor — `FacadeLane::prepare` →
+`default_caller_budget`, `src/inventory/capture.rs:4386-4400` →
+`prepare_callers_pinned`,
+`src/attach/inventory/capture.rs:2108-2181` — and in that
+flavor the usage entry records the `CALLER_USE` witness plus
+entry count, `crates/ebpf/src/inventory.rs:66-79`; a
+mark-usage-only info entry would drop the caller's "which
+program called my token?" rows by default) — and then stash.
+`p11_usage_entry_*` code is untouched and its bytes stay pinned
+(§8.5 ELF identity). The return program reads the §17.1 ranges
+on `CKR_OK` and emits the 160-B info record on the dedicated
+`INFO` ring. +0 newly probed functions (all three already carry
+usage probes).
+
+`INFO_START` stash map (fix8 C2/I2): `HashMap`, key 16 B
+(`pid_tgid: u64`, `endpoint: u32`, pad — the endpoint leg is
+required because the p11-kit proxy nests info calls on the same
+thread across endpoints, so `pid_tgid` alone aliases), value
+32 B (`info_ptr: u64`, `slot: u64`, `mechanism: u64`, `kind:
+u8`, `layout: u8`, `generation: u16`, reserved `u32`), capacity
+1024 (cold in-flight calls only; order of 64 KiB reservation
+with hash overhead, measured at load). Lifecycle: the entry
+always overwrites its key on retention and always deletes it on
+the unavailable path (a stale row is never trusted — NULL-cell
+and refused-guard shapes delete, never leave); the return
+consumes (reads and deletes) on `CKR_OK`, and on a missing row
+emits nothing with the named `info_unmatched_return` count
+(the same-thread same-endpoint nesting case: the inner entry
+overwrites, the inner return consumes the inner row, the outer
+return finds no row and yields unavailable — exactly one good
+record plus one named unavailable, never a crossed pointer);
+`generation` is a per-insert monotonic stamp from a control cell
+and rides the record for post-hoc ordering and diagnosis. Stop
+scrub: after callback quiescence the inventory teardown
+zero-verify-removes every `INFO_START` row (the
+`object_stop.rs` pattern) and asserts the map empty — plus
+fresh maps per preparation, so no row survives the session.
+Full-map insert failures, unmatched returns and nested
+overwrites each land in their own `INFO_EVIDENCE` PerCpuArray
+cell (new map, 4 cells: insert failures, unmatched returns,
+nested overwrites, stash mismatches — never silent, never
+folded into `EVIDENCE`).
+
+Function kind (fix8 I3): the BPF side learns the function from
+a frozen endpoint→kind map, `INFO_KIND` (`Array`, key 4 B,
+value 8 B with the kind in the low byte, capacity N, frozen
+`BPF_F_RDONLY_PROG`), published alongside `ENDPOINT_OBJECT` in
+`admit_entry` and frozen in the same sequence. The entry reads
+`INFO_KIND[endpoint]` to select argument positions and read
+ranges; kind zero (usage-only endpoint) takes the usage body
+with no stash. The cookie-tag alternative is REJECTED: the
+cookie's high word is fully consumed by `INVENTORY_COOKIE_TAG`
+and the low word by the endpoint id
+(`crates/ebpf-common/src/lib.rs:443-450`), so stealing kind bits
+would fork `inventory_cookie_endpoint` and every cookie site
+(activation, capture, tests) and weaken the exact-tag refusal —
+the map follows the `ENDPOINT_OBJECT` precedent, keeps the
+cookie ABI byte-identical, and costs one array lookup.
+Plumbing: `AttachEndpoint`
+(`src/discovery/inventory_attach_set.rs:152-157`) and
+`InventoryEndpoint` (`src/attach/inventory/activation.rs:43-48`)
+each gain the endpoint's info kind (`None` = usage-only). The
+attach set computes it from the plan slots' names at that
+physical (object, offset) (`Slot.names`/`aliased`,
+`src/plan.rs:182-210`): the set is exactly one of the 3 info
+functions → that kind; anything else (alias of two info
+functions, info aliased with a non-info function, no info
+function) → `None`. Link rule: the info pair links ONLY where
+the kind is `Some`; otherwise the usage entry stays and the
+endpoint reports the named gap `info_aliased_endpoint`
+(counted per endpoint, surfaced in the Task 7 section — never
+a silent skip, never a guessed kind). Validators, freeze and
+load mode: `validate_inventory_maps` and
+`validate_caller_maps` (`src/attach/inventory.rs:437-560`,
+`src/attach/inventory/callers.rs:38-90`) gain the exact
+`INFO_START`/`INFO`/`INFO_KIND`/`INFO_EVIDENCE` rows and the
+`PRODUCED` size 3; the freeze sequence
+(`prepare_inventory_with_kind`, `src/attach/inventory.rs:726-771`)
+gains `Freeze("INFO_KIND")` after publication and before any
+program load; Multi load mode (`inventory_program_load`,
+`:662-678` — today `UProbeMulti` for the usage entries only)
+extends to the info entries, and info returns attach per group
+(a new return-group attach mirroring `attach_entry_group`,
+`activation.rs:291-301`).
+
+Links (fix8 I1 — the old "+3 return links per provider" line
+assumed Singles): on Singles the info entries substitute usage
+entries (+0 entry links) and each info endpoint takes one
+return link (+1 per info endpoint). On Multi the info endpoints
+split out of their usage groups into their own groups per
+(object, info entry program) (`capture.rs:1822-1890` grouping):
++G entry-group links and +G return-group links, where G is the
+number of distinct (object, ABI) pairs among the info endpoints
+(one provider object × one ABI in the fixture, pinned by the
+routing twin). `entry_link_bound`
+(`src/attach/inventory/capture.rs:225-229`) gains the
+info-return bound (Singles: info endpoint count; Multi: info
+group count ≤ info endpoint count) and `fd_preflight`
+(`:231-262`) grows from links + 3 + 64 to entry links + info
+return links + 4 (2 roots + `DISCOVERY` + `INFO`) + 64 — the
+§17.6 routing twins pin the exact link plan and the fd formula
+per backend. The `INFO` ring (64 KiB `RingBuf`, cold traffic)
+drains in the inventory session alongside `DISCOVERY`; loss
+accounting rides a new `PRODUCED_INFO = 2` cell with
+`PRODUCED_CELLS` 2→3 (`lib.rs:609-611`) — the drain
+cross-checks produced vs consumed per quantum and counts the
+difference, never a silent drop.
 
 Feasibility inside the inventory-only build: the info pair needs
-none of the compiled-out items. It brings its own stash map and
-ring (existing `HashMap`/`RingBuf` kinds, without the
+none of the compiled-out items. It brings its own stash/kind
+maps, evidence cells and ring (existing `HashMap`/`Array`/
+`PerCpuArray`/`RingBuf` kinds, without the
 `cfg(not(feature = "inventory-only"))` gate); entry/return probe
 support already exists in the inventory object (the
 `INVENTORY_PROGRAMS` table carries both `Entry` and `Return`
-kinds); `arg_u64`, `target_layout_from_cs`,
-`validate_target_span` and `read_word` are available outside the
-gate; the byte-range reader is a 2-line body the lane adds for
-the inventory flavor (the existing `read_bytes_user` is gated,
-its body is not special). `INVENTORY_PROGRAMS`
-(`src/attach/inventory.rs`) grows from 12 to 15 entries with
-review, and the inventory session drains the `INFO` ring
-alongside `DISCOVERY` (`src/attach/inventory/capture.rs` drain
-quantum). No fallback to key-operations-only is needed; Task 7
-ships in default inventory and CBOM as §17.7 requires.
+kinds, `src/attach/inventory.rs:602-617`); `scope_auth`
+(`main.rs:630`), `probe_layout`/`ret_probe_layout`
+(`:540-548`), `read_word`/`BpfReader` (`:550-575`),
+`cookie_of` (`:2378`), `arg_u64` (`:2821`),
+`p11_read_ia32_arg` (`:2848`) and the no-op inventory stop gate
+(`:443-454`) plus `validate_target_span` (ebpf-common
+`object_capture.rs:340`) are all available outside the gate;
+the byte-range reader is a 2-line body the lane adds for the
+inventory flavor (the existing `read_bytes_user` is gated,
+`:576-581`, its body is not special). `INVENTORY_PROGRAMS`
+grows from 12 to 15 entries with review in the FULL inventory
+flavors (Global and Callers); the P0 inventory flavor keeps the
+exact 12-program list (info omitted, explicit unavailability).
+No fallback to key-operations-only is needed; Task 7 ships in
+default inventory and CBOM as §17.7 requires.
+
+Refused journal start (fix8 C3 fallback): a refused journal
+start retries the ordinary lane and keeps broad inventory
+running with an honest "key operations unavailable" gap
+(`src/inventory/mod.rs:5910-5928`). The inventory info pair
+rides that broad lane — it never rode the journal — so Task 7
+output continues unchanged across the refusal; that
+independence IS the fallback, pinned by a §17.6 twin asserting
+info positives on a journal-refused run.
 
 Entry-guard spans are the full struct sizes (88/76, 208/160,
 24/12 LP64/ia32); bytes read are the field ranges only (76/72,
@@ -2070,77 +2308,97 @@ Entry-guard spans are the full struct sizes (88/76, 208/160,
 unmodified in limit. Verifier: the info programs get their own
 budget cells (§8.5: recorded, <750,000, ≥5% headroom on the 6.6
 floor), `bpf loads` on vng 6.6/6.12 + host 7.x, LP64 + ia32.
-The P0 inventory and P0 journal flavors omit the info programs;
-Task 7 in P0 reports explicit unavailability (no info bytes
-acquired).
+The P0 inventory flavor omits the info programs (exact
+12-program list above); Task 7 in P0 reports explicit
+unavailability (no info bytes acquired).
 
-Cold cost (default-on, negligible by construction): one 152-B
-record per info call (default inventory) or +128 END bytes per
-info call (760/600 under `--key-operations`) at application poll
-rates (Hz, not the kHz of hot paths — the Task 7 lane records
-the observed info-call rates on the Task 5 matrix apps as
-coldness evidence); one pointer stash per in-flight info call in
-the dedicated stash map (reservation cost); zero per-call
-record, ring or count delta at any non-info endpoint (covered
-by the §12.1 identity contract). No shared row grows, so no
-fallback is needed — the pins never move.
+Cold cost (default-on, negligible by construction): one 160-B
+record per info call in every mode at application poll rates
+(Hz, not the kHz of hot paths — the Task 7 lane records the
+observed info-call rates on the Task 5 matrix apps as coldness
+evidence); one stashed row per in-flight info call (bounded by
+the 1024-entry map); zero per-call record, ring or count delta
+at any non-info endpoint (covered by the §12.1 identity
+contract). No shared row grows, so the base-program hashes
+never move.
 
 Wire: the 128-byte info trailer (`version: u16`, `kind: u8`,
 `status: u8`, `layout: u8`, `payload_len: u8`, 3 reserved bytes,
 `payload: [u8; 120]` — payload_len is exact per (kind, layout):
 76/72 for `CK_INFO`, 76/64 for token ranges, 24/12 for mechanism
-info) rides two carriers: the 152-B inventory info record (24-B
-header — `slot: u64`, `mechanism: u64`, `reserved: u64` — with
-`mechanism` 0 for `C_GetInfo`/`C_GetTokenInfo` and `slot` 0 for
-`C_GetInfo`, followed by the trailer) on the `INFO` ring, and
-the journal END+info forms (760/600, §8.3) where slot and
-mechanism ride the END payload's base record. The join reads
-header words per the trailer kind (the provider kind ignores
-slot). The trailer validator is exact length + version + kind +
-layout + payload_len + zero reserved. This keeps the
-v2-tail-union alternative beaten on validator surface: the union
-would fork `validate_object_tail` with a union tag plus
-per-action offsets, while the trailer adds standalone
+info) rides one carrier: the 160-B inventory info record (32-B
+header + trailer) on the `INFO` ring. Header (fix8 C2):
+`endpoint_id: u32`, `kind: u8`, `layout: u8`, `generation: u16`
+(8 B); `host_tgid: u32`, `task_cookie: u32` — the caller
+incarnation cookie the Callers flavor already obtains (8 B);
+`slot: u64`, `mechanism: u64` (16 B, snapshotted at entry into
+`INFO_START` — §17.1 — because a uretprobe cannot read entry
+arguments). `mechanism` is 0 for `C_GetInfo`/`C_GetTokenInfo`
+and `slot` is 0 for `C_GetInfo`. The join reads header words
+per the kind (the provider kind ignores slot) and keys by
+(module via endpoint, caller incarnation, slot[, mechanism])
+(§17.5). The record validator is exact length + header (known
+endpoint, known kind, layout, zero reserved) + trailer
+(version + kind + layout + payload_len + zero reserved). This
+keeps the v2-tail-union alternative beaten on validator surface:
+the union would fork `validate_object_tail` with a union tag
+plus per-action offsets, while the record adds standalone
 exact-length checks and leaves every existing validator,
-classification and pin byte-identical. Old readers refuse
-152/760/600 loudly. Task 7 merges after Task 3's merge commit
-and consumes the Task 2 wire base through that chain (shared
+classification and pin byte-identical. Old readers refuse 160
+loudly. Task 7 merges after Task 3's merge commit and consumes
+the Task 2 evidence-table base through that chain (shared
 files, one writer at a time — the §13 rule).
 
 ### 17.5 Schema, output and CBOM
 
 New schema section, next free number after v7 (suggest v8;
 integrator allocates per §10.1), emitted exactly when Task 7
-content is present; v1–v7 stay frozen and byte-stable:
+content is present; v1–v7 stay frozen and byte-stable (fix8 C2:
+keys hang off `modules[]`/`edges[]`, never bare instances):
 
-- per instance `provider_info`: cryptoki/library major+minor,
-  manufacturer, library description, flags;
-- per (instance, slot) `tokens[]`: manufacturer, model,
-  hardware/firmware version, flags (whole word, incl. PIN-state
-  bits), `pin_min_len`, `pin_max_len`, `completions`, `changes`;
-- per (instance, slot, mechanism) `mechanisms[]`: type, min/max
-  key size as RAW numbers (no unit claim — PKCS#11 v2.40 §3.5:
-  "bits or bytes, mechanism-dependent"), flags, `completions`,
-  `changes` — capped at 128 mechanisms per (instance, slot);
-  extras refuse with a named `mechanism_info_refused: too_many`
+- per module `provider_info`: cryptoki/library major+minor,
+  manufacturer, library description, flags (references the
+  `modules[]` record — library facts do not vary by caller);
+- per (module, caller incarnation, slot) `tokens[]`:
+  manufacturer, model, hardware/firmware version, flags (whole
+  word, incl. PIN-state bits), `pin_min_len`, `pin_max_len`,
+  `completions`, `changes`;
+- per (module, caller incarnation, slot, mechanism)
+  `mechanisms[]`: type, min/max key size as RAW numbers (no unit
+  claim — PKCS#11 v2.40 §3.5: "bits or bytes,
+  mechanism-dependent"), flags, `completions`, `changes` —
+  capped at 128 mechanisms per (module, caller, slot); extras
+  refuse with a named `mechanism_info_refused: too_many`
   counter, never silently.
 
 Repeat rule (apps poll; flags change; tokens swap): last-wins per
-(instance, slot) and per (instance, slot, mechanism).
+(module, caller, slot) and per (module, caller, slot, mechanism).
 `completions` counts polls; `changes` counts value transitions
 (first observation sets the value with `changes: 0`). A different
 token inserted into the same slot is last-wins plus one `changes`
 bump — never a second entry, never a merge. Per-slot caps: tokens
-are 1 per slot by construction; mechanisms 128 per slot (above).
+are 1 per (module, caller, slot) by construction; mechanisms 128
+per (module, caller, slot) (above).
 
-Join: info record → owning instance (slot/mechanism from the
-152-B record header in default inventory, from the END payload's
-base record under `--key-operations`; payload from the trailer);
-no `AggKey` contact (these are not key rows) and no
+Join (fix8 C2): info record → (module via endpoint id, caller
+incarnation via the header's host tgid + task cookie, slot[,
+mechanism]) onto `modules[]`/`edges[]` (the header carries all
+four — §17.4 — because slot ids are per-process and joining by
+(provider, slot) across processes on a busy `--system` host
+would mix different processes' tokens under last-wins). The
+default no-manifest run has no semantic lane at all
+(`src/inventory/mod.rs:1696-1712`: "No manifests means no
+Session") and instances exist only there
+(`docs/schema/inventory-v1.md:1001-1013`), so the default join
+never mentions instances: rows carry module + caller references
+resolving in `modules[]`/`edges[]`. Where the semantic lane
+proves an instance (manifest runs), the same rows additionally
+carry the instance id — attached, never synthesized, and never
+required. No `AggKey` contact (these are not key rows) and no
 `metadata_at_use` contact.
 A provider with no completed Task 7 calls has no `provider_info`
 block: "provider never watched" is derivable from the JSON
-already (no rows for its instance beside coverage notes), so no
+already (no rows for its module beside coverage notes), so no
 new field marks it.
 
 Text: concise gains one provider line only where Task 7 content
@@ -2168,12 +2426,12 @@ with hardware/firmware versions, flags and PIN lens in
 Per-slot mechanism limits map onto the global-per-id
 `type: cryptographic-asset` algorithm components
 (`src/inventory/cbom/input.rs:94-104`, no slot key) by reporter
-count: exactly one (instance, slot) reporter → plain properties
+count: exactly one (module, caller, slot) reporter → plain properties
 (`p11scope:min-key-size`, `p11scope:max-key-size`,
 `p11scope:mechanism-flags`, `p11scope:mechanism-hw`); more than
 one → per-reporter properties suffixed
 `p11scope:slot-<slot>:<base>` (slot ids are provider-small;
-different instances sharing a slot id each report — suffix
+different reporters sharing a slot id each report — suffix
 collisions append `p11scope:slot-limits-truncated: true` instead
 of merging), capped at 16 reporters per mechanism with the same
 truncation flag. When limit properties are present the algorithm
@@ -2187,14 +2445,37 @@ Serials never appear (no such key exists anywhere).
 
 Host twins per call (LP64 + ia32 layouts): CKR_OK positive
 (exact parsed fields), NULL-pointer negative, failure-RV
-negative, owner-mismatch negative; selection twins: in default
-inventory the 3 info groups link the inventory info pair (+3
-return links present, usage entries substituted there, the USAGE
-bitmap still marks them used) while every other group links
-usage entries; under `--key-operations` the 3 info groups link
-the journal info pair in both flag modes while every hot
-endpoint links the base journal pair with the flag off
-(cold-only proof); sentinel twin: a provider
+negative, owner-mismatch negative; usage-preservation twins
+(fix8 C1): in the Global flavor the USAGE bitmap still marks
+the 3 endpoints used, and in the Callers flavor the
+`CALLER_USE` rows and entry counts at the 3 endpoints equal the
+usage-entry baseline exactly (same rows, same counts — the info
+entries run the unchanged `usage_entry` body first); selection
+twins: in every native inventory mode including under
+`--key-operations` the info endpoints link the inventory info
+pair while every other endpoint links usage entries
+(cold-only proof — no journal program links at an info
+endpoint in any mode); routing twins per backend (fix8 I1):
+Singles pins +0 entry links and +1 return link per info
+endpoint, Multi pins +G/+G with G = the distinct (object, ABI)
+info pairs, and both pin the extended fd formula (entry links
++ info return links + 4 + 64); single-info-function twins
+(fix8 I3): an endpoint whose slot set is exactly one info
+function links the info pair with the right kind in
+`INFO_KIND`, while an info/non-info alias and an info/info
+alias keep the usage entry and report the named
+`info_aliased_endpoint` gap; lifecycle twins (fix8 I2):
+same-thread cross-endpoint nesting yields two good records
+(p11-kit case), same-thread same-endpoint nesting yields one
+good record plus one named unavailable, a full `INFO_START`
+lands in its evidence cell, the teardown scrub leaves the map
+empty, and the drain's `PRODUCED_INFO` cross-check counts a
+forced loss; fallback twin (fix8 C3): info positives on a
+journal-refused run equal the unrefused run's; join twins
+(fix8 C2): two processes' same-slot tokens stay separate rows
+under one (module, caller) each, and a manifest run attaches
+the proved instance id while a no-manifest run carries none;
+sentinel twin: a provider
 returning sentinel serial/label/session/memory/utcTime bytes and
 sentinel `CK_INFO` pad bytes publishes none of those bytes
 anywhere (JSON/logs/maps scanned — the B6 padding-sentinel twin);
@@ -2202,8 +2483,9 @@ PIN-policy positive twin: PIN-state flag bits and
 min/max PIN lens publish with exact values; repeat twin:
 re-polled token (same value → `completions` bump only; changed
 flags → `changes` bump; swapped token → last-wins + `changes`
-bump, single entry); cap twin: the 129th mechanism on a slot
-refuses with the named reason while the first 128 stand; units
+bump, single entry); cap twin: the 129th mechanism on a
+(module, caller, slot) refuses with the named reason while the
+first 128 stand; units
 twin: mechanism limits render as raw numbers with no "bits"
 wording anywhere; escape twin: ESC/C1 bytes in provider strings
 are escaped in text, raw in JSON; CBOM twins: no serial key in
@@ -2218,26 +2500,30 @@ provider's own reports.
 
 ### 17.7 Mode scope: default inventory and CBOM
 
-Task 7 rides its own info lane in each mode: in default
-inventory the inventory info pair stashes one pointer per
-in-flight info call (`INFO_START`) and emits the 152-B record on
-the `INFO` ring (§17.4), drained in the inventory session; under
-`--key-operations` the journal info programs stash in
-`EVIDENCE_START` and the END carries the trailer (§8.3). The
-join keys off the record header's (default) or the END payload
-base's (key-operations) slot/mechanism. The object lane's
+Task 7 rides one info lane in every native inventory mode: the
+inventory info pair stashes one row per in-flight info call
+(`INFO_START`: pointer + slot/mechanism/kind/layout/generation)
+and emits the 160-B record on the `INFO` ring (§17.4), drained
+in the inventory session — under `--key-operations` too, where
+the broad inventory lane runs beside the journal lane. The join
+keys off the record header's (module via endpoint, caller
+incarnation, slot[, mechanism]) (§17.5). The object lane's
 `--key-operations` gate (`src/cli.rs:828`,
 `allowlist-v3.md:108-125`) therefore does not apply:
 provider/token/mechanism info appears in DEFAULT inventory
 (JSON + concise/`-v` text) and in CBOM whenever the Task 7
 amendment rows (§17.3) are approved and the calls are observed.
-Cost in default runs: +0 newly probed functions (all three
-already carry usage probes), +3 return links per provider, one
-152-B record per info call (rare — apps poll tokens, not hot
-paths), one pointer stash per in-flight info call. No
-`--key-operations` requirement, no object-lane dependency, no
-`--key-sizes` interaction: Task 7 output is identical with the
-flag on or off (§10.5; pinned by a both-modes twin in Task 7).
+A refused journal start changes nothing for Task 7: the
+ordinary retry keeps the broad lane (and the info pair on it)
+running with an honest gap (§17.4 fallback). Cost per run: +0
+newly probed functions (all three already carry usage probes);
+links per backend (§17.4: Singles +1 return per info endpoint,
+Multi +G/+G); one 160-B record per info call (rare — apps poll
+tokens, not hot paths); one stashed row per in-flight info
+call. No `--key-operations` requirement, no object-lane
+dependency, no `--key-sizes` interaction: Task 7 output is
+identical with the flag on or off (§10.5; pinned by a
+both-modes twin in Task 7).
 (Keymeta Tasks 1–3 DO need `--key-operations`: inferred facts
 ride per-key rows, which exist only there; §5 sizes additionally
 need `--key-sizes`.)

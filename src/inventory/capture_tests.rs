@@ -10035,7 +10035,7 @@ fn startup_drain_holds_records_and_stages_them_first_in_drain_order() {
         .map_err(|(_, reason)| reason)
         .unwrap();
     let loaded =
-        crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), None, || {
+        crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), None, None, || {
             // Long enough for several drainer ticks (10 ms each).
             std::thread::sleep(Duration::from_millis(80));
             "loaded"
@@ -10084,7 +10084,7 @@ fn startup_drain_releases_its_drainer_when_the_load_panics() {
         .map_err(|(_, reason)| reason)
         .unwrap();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::inventory::draining_lifecycle::<Pin, _, (), _>(Some(&mut started), None, || {
+        crate::inventory::draining_lifecycle::<Pin, _, (), _>(Some(&mut started), None, None, || {
             std::thread::sleep(Duration::from_millis(20));
             panic!("scripted load panic")
         })
@@ -10109,7 +10109,7 @@ fn startup_drain_releases_its_drainer_when_the_load_panics() {
 fn startup_drain_without_a_lane_runs_the_load_once() {
     let mut runs = 0;
     let caller = std::thread::current().id();
-    let ran_on = crate::inventory::draining_lifecycle::<Pin, DrainLane, _, _>(None, None, || {
+    let ran_on = crate::inventory::draining_lifecycle::<Pin, DrainLane, _, _>(None, None, None, || {
         runs += 1;
         std::thread::current().id()
     });
@@ -10145,7 +10145,7 @@ fn startup_drain_extends_nothing_after_a_stop_during_the_load() {
         600,
         "the activation defers the whole pre-arm delta"
     );
-    crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), Some(&*stop), || {
+    crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), Some(&*stop), None, || {
         // The operator stop lands as the semantic load starts, like a
         // Ctrl-C during the BPF load; the load then outlasts several
         // 10 ms drainer ticks plus the final quantum.
@@ -10186,7 +10186,7 @@ fn startup_drain_extends_the_backlog_while_no_stop_pends() {
         600,
         "the activation defers the whole pre-arm delta"
     );
-    crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), Some(&*stop), || {
+    crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), Some(&*stop), None, || {
         std::thread::sleep(Duration::from_millis(80));
     });
     assert!(
@@ -10196,5 +10196,63 @@ fn startup_drain_extends_the_backlog_while_no_stop_pends() {
     assert!(
         started.backlog.endpoints.len() < 600,
         "drain extends shrink the backlog before the first pass"
+    );
+}
+
+/// A passed --duration deadline turns every startup tick drain-only:
+/// the 600-endpoint pre-arm backlog stays queued and zero drain
+/// extends start after the deadline — while the ring drain continues.
+/// The stop stays clear, so only the deadline gate is under test;
+/// the extend count is read before the load because the activation
+/// itself extends once.
+#[test]
+fn startup_drain_extends_nothing_after_the_duration_deadline_passes() {
+    use std::sync::atomic::Ordering;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut lane = DrainLane::new(1);
+    lane.defer_next = 600;
+    lane.stop = Some(std::sync::Arc::clone(&stop));
+    let extends = std::sync::Arc::clone(&lane.extends);
+    let drained = std::sync::Arc::clone(&lane.drained);
+    let mut host = ReverseOrderHost {
+        set: InventoryAttachSet::new(InventoryBudget::new(4096, 4096 * 8).unwrap()),
+        delta: fabricated_delta(600),
+        start_pending: true,
+    };
+    let mut started = NativeLane::start(lane, &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    assert_eq!(
+        started.backlog.endpoints.len(),
+        600,
+        "the activation defers the whole pre-arm delta"
+    );
+    let extends_before_load = extends.load(Ordering::SeqCst);
+    // Already passed: any tick's `now` reads past it, so the gate is
+    // established by the fixture, never raced on the wall clock.
+    let passed = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+    crate::inventory::draining_lifecycle::<Pin, _, _, _>(
+        Some(&mut started),
+        Some(&*stop),
+        Some(passed),
+        || {
+            std::thread::sleep(Duration::from_millis(80));
+        },
+    );
+    assert!(
+        !drained.lock().unwrap().is_empty(),
+        "the drainer ticked while the deadline pended"
+    );
+    assert_eq!(
+        extends.load(Ordering::SeqCst),
+        extends_before_load,
+        "zero drain extends start after the deadline"
+    );
+    assert_eq!(
+        started.backlog.endpoints.len(),
+        600,
+        "the backlog stays queued past the deadline"
     );
 }

@@ -1706,6 +1706,7 @@ fn run_with_terminal_budget(
         draining_lifecycle::<crate::process::PidPin, _, _, _>(
             lane.as_mut(),
             drain_stop_source.as_deref(),
+            None,
             || {
                 start_semantic_lane(
                     &mut coordinator,
@@ -5807,6 +5808,7 @@ fn note_semantic_lane_sealed() {
 pub(crate) fn draining_lifecycle<Pin, L, T, F>(
     lane: Option<&mut NativeLane<L>>,
     stop: Option<&std::sync::atomic::AtomicUsize>,
+    _deadline: Option<std::time::Instant>,
     start: F,
 ) -> T
 where

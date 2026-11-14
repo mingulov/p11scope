@@ -516,6 +516,9 @@ struct ScriptedLane {
     /// receipt carries the refusal and defers the whole delta, like the
     /// production facade's sticky refusal arm.
     refuse_extends: bool,
+    /// The worst single-attach wall time this lane reports per extend
+    /// (the flush-fold twin varies it across ticks).
+    attach_ns_max: u64,
 }
 
 impl Drop for ScriptedLane {
@@ -569,6 +572,7 @@ impl ScriptedLane {
             backend: LaneBackend::singles(),
             check_targets: false,
             refuse_extends: false,
+            attach_ns_max: 0,
         }
     }
 
@@ -640,6 +644,7 @@ impl CaptureLane<Pin> for ScriptedLane {
             custody: Some(self.custody()),
             ..ExtendReceipt::default()
         };
+        receipt.attach_ns_max = self.attach_ns_max;
         if self.check_targets {
             for endpoint in &delta.endpoints {
                 assert!(
@@ -1674,6 +1679,8 @@ struct ReceiptHost {
     set: InventoryAttachSet,
     delta: TargetDelta,
     receipts: Vec<(usize, usize)>,
+    /// Every receipt's worst single-attach wall time, in receipt order.
+    receipt_max: Vec<u64>,
     gaps: Vec<(String, String)>,
 }
 
@@ -1684,6 +1691,7 @@ impl ReceiptHost {
             set: InventoryAttachSet::new(InventoryBudget::new(32768, 32768 * 8).unwrap()),
             delta,
             receipts: Vec::new(),
+            receipt_max: Vec::new(),
             gaps: Vec::new(),
         }
     }
@@ -1712,6 +1720,7 @@ impl ReceiptHost {
             set,
             delta: absorbed.delta,
             receipts: Vec::new(),
+            receipt_max: Vec::new(),
             gaps: Vec::new(),
         }
     }
@@ -1723,6 +1732,7 @@ impl LaneHost<Pin> for ReceiptHost {
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
         self.receipts
             .push((receipt.attached.len(), receipt.deferred.endpoints.len()));
+        self.receipt_max.push(receipt.attach_ns_max);
     }
     fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
     fn take_target_delta(&mut self) -> TargetDelta {
@@ -2268,6 +2278,46 @@ fn multi_lane_tick_refusal_skips_later_ticks_and_reports_one_gap() {
         host.gaps
     );
     assert_eq!(host.gaps[0].0, "native capture refused an extend");
+}
+
+/// The flush folds the buffered ticks' worst single-attach wall time into
+/// the forwarded receipt (a max over ticks, not last-wins): three tick
+/// pairs report 1000, 3000, 2000 and the flush carries 3000, while the
+/// pass receipts keep their own per-extend values.
+#[test]
+fn flush_carries_the_buffered_ticks_worst_attach_wall_time() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_absorbed_provider(40000);
+    let mut lane = NativeLane::start(
+        checking_lane(&log, AttachBackend::Multi),
+        &mut host,
+        windows(),
+        None,
+    )
+    .map_err(|(_, reason)| reason)
+    .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts[1], (32768, 7232));
+    for max in [1000, 3000, 2000] {
+        lane.capture.attach_ns_max = max;
+        lane.tick(&mut host);
+        lane.collecting_tick(true);
+    }
+    lane.capture.attach_ns_max = 0;
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts,
+        vec![(0, 0), (32768, 7232), (6144, 0), (1088, 0)],
+        "three tick pairs drain 6144 before the second pass: {:?}",
+        host.receipts
+    );
+    assert_eq!(
+        host.receipt_max,
+        vec![0, 0, 3000, 0],
+        "the flush folds the ticks' worst wall time; pass receipts keep \
+         their own: {:?}",
+        host.receipt_max
+    );
 }
 
 /// The retiring line counts tick progress buffered since the last pass: one

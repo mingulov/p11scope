@@ -87,11 +87,16 @@ pub(crate) struct LaneWindows {
     /// Attach attempts per inter-pass/collection tick, and the tick's
     /// attach budget, on Singles: ticks drain the deferred backlog in
     /// small bounded quanta without regressing loop tick time (10 ms,
-    /// one SERVICE_TICK; entry bound is a safety cap, the wall binds).
+    /// one SERVICE_TICK, plus one single-entry attach; the entry bound
+    /// is a safety cap, the wall binds).
     pub tick_extend_entries: usize,
     pub tick_extend_budget: Duration,
-    /// The same tick quantum on Multi (1024 entries / 10 ms: wall binds
-    /// at 19-227 us/site across 1-33 mappers; ~90-1050 sites per tick).
+    /// The same tick quantum on Multi: up to 1024 entries of admission
+    /// within 10 ms, then whole links with the deadline checked only
+    /// between them — the first link always starts once admission
+    /// finishes in time, so a tick costs admission plus one link (8-96
+    /// sites sized near the 200 ms link target: about 22 ms at
+    /// 227 us/site, about 190 ms in the harsh ~2 ms/site regime).
     pub multi_tick_extend_entries: usize,
     pub multi_tick_extend_budget: Duration,
     /// CALLER_USE rows per witness read, and its budget.
@@ -225,9 +230,10 @@ impl LaneWindows {
 
     /// One tick's attach window on `backend` (v0.8.0 cadence): a small
     /// bounded quantum (Singles 64 / 10 ms, Multi 1024 / 10 ms) so
-    /// inter-pass and collection ticks drain the deferred backlog
-    /// without regressing loop tick time. The wall binds at measured
-    /// 19-227 us/site; the entry bound is a safety cap.
+    /// inter-pass and collection ticks drain the deferred backlog. The
+    /// window bounds admission; the first attach past it (one Singles
+    /// entry, one Multi link) always starts, so a Multi tick costs
+    /// admission plus one link, not 10 ms flat.
     fn extend_for_tick(&self, backend: AttachBackend) -> ExtendWindow {
         let (entries, budget) = match backend {
             AttachBackend::Multi => (
@@ -790,6 +796,9 @@ pub(crate) struct NativeLane<L> {
     pending_tick_failed: Vec<EndpointFailure>,
     pending_tick_custody: Option<ScopeCustody>,
     pending_tick_refused: Option<String>,
+    /// The worst single-attach wall time across the buffered ticks,
+    /// forwarded with their receipt.
+    pending_tick_attach_ns_max: u64,
 }
 
 impl<L> NativeLane<L> {
@@ -862,6 +871,7 @@ impl<L> NativeLane<L> {
             pending_tick_failed: Vec::new(),
             pending_tick_custody: None,
             pending_tick_refused: None,
+            pending_tick_attach_ns_max: 0,
         };
         lane.cache_backlog_targets(host);
         Ok(lane)
@@ -997,15 +1007,22 @@ impl<L> NativeLane<L> {
     }
 
     /// Forwards tick attach progress buffered since the last pass as one
-    /// ordered receipt (attached/failed in tick order). Deferred stays in
-    /// `backlog` and is reported by the pass receipt if still deferred, so
-    /// ticks never flood gaps. Custody-only ticks (no attaches, fails or
-    /// refusal) forward nothing; the pass receipt carries custody anyway.
+    /// ordered receipt (attached/failed in tick order, worst single-attach
+    /// wall time folded across the ticks). Deferred stays in `backlog` and
+    /// is reported by the pass receipt if still deferred, so ticks never
+    /// flood gaps. Custody-only ticks (no attaches, fails or refusal)
+    /// forward nothing; the pass receipt carries custody anyway. The rest
+    /// of the tick receipts stays behind deliberately: totals and group
+    /// handles are per-extend diagnostics nothing downstream reads,
+    /// `fd_exhausted` re-probes on the next pass, `known` is idempotent,
+    /// and activation never happens in a tick so no `exec_coverage` or
+    /// `activated_roots` is lost.
     fn flush_tick_progress<Pin, H>(&mut self, host: &mut H)
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
+        let attach_ns_max = std::mem::take(&mut self.pending_tick_attach_ns_max);
         if self.pending_tick_attached.is_empty()
             && self.pending_tick_failed.is_empty()
             && self.pending_tick_refused.is_none()
@@ -1018,6 +1035,7 @@ impl<L> NativeLane<L> {
             failed: std::mem::take(&mut self.pending_tick_failed),
             refused: self.pending_tick_refused.take(),
             custody: self.pending_tick_custody.take(),
+            attach_ns_max,
             ..ExtendReceipt::default()
         };
         host.note_extend_receipt(&receipt);
@@ -1055,6 +1073,7 @@ impl<L> NativeLane<L> {
             &mut self.pending_tick_failed,
             &mut self.pending_tick_custody,
             &mut self.pending_tick_refused,
+            &mut self.pending_tick_attach_ns_max,
             &self.windows,
             self.refusal_reported,
             targets,
@@ -1079,6 +1098,7 @@ impl<L> NativeLane<L> {
             pending_failed,
             pending_custody,
             pending_refused,
+            pending_attach_ns_max,
             windows,
             refusal_reported,
         ) = (
@@ -1088,6 +1108,7 @@ impl<L> NativeLane<L> {
             &mut self.pending_tick_failed,
             &mut self.pending_tick_custody,
             &mut self.pending_tick_refused,
+            &mut self.pending_tick_attach_ns_max,
             &self.windows,
             self.refusal_reported,
         );
@@ -1098,6 +1119,7 @@ impl<L> NativeLane<L> {
             pending_failed,
             pending_custody,
             pending_refused,
+            pending_attach_ns_max,
             windows,
             refusal_reported,
             &cached,
@@ -1113,6 +1135,7 @@ impl<L> NativeLane<L> {
         pending_failed: &mut Vec<EndpointFailure>,
         pending_custody: &mut Option<ScopeCustody>,
         pending_refused: &mut Option<String>,
+        pending_attach_ns_max: &mut u64,
         windows: &LaneWindows,
         refusal_reported: bool,
         targets: &dyn CaptureTargets,
@@ -1143,6 +1166,7 @@ impl<L> NativeLane<L> {
         }
         let prefix = TargetDelta { endpoints, objects };
         let receipt = capture.extend(prefix, targets, window);
+        *pending_attach_ns_max = (*pending_attach_ns_max).max(receipt.attach_ns_max);
         if let Some(custody) = receipt.custody.clone() {
             *pending_custody = Some(custody);
         }
@@ -1188,18 +1212,21 @@ impl<L> NativeLane<L> {
         events
     }
 
-    /// One service tick between passes (invariant 3): first one bounded
-    /// backlog extend (buffered for the next pass to forward, so ticks
-    /// never flood gaps), then one discovery quantum staged at once.
-    /// Skips the extend when the backlog is empty or refused.
+    /// One service tick between passes (invariant 3): first one
+    /// discovery quantum staged at once, then one bounded backlog
+    /// extend (buffered for the next pass to forward, so ticks never
+    /// flood gaps). Service runs first so a long attach — a Multi link
+    /// past the tick's 10 ms admission — never delays the ring: the
+    /// ring keeps its cadence and the attach only shifts this tick's
+    /// own end. Skips the extend when the backlog is empty or refused.
     pub(crate) fn tick<Pin, H>(&mut self, host: &mut H)
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
-        self.tick_extend_backlog(host.capture_targets());
         let events = self.service(host, 1);
         self.pending_events.extend(events);
+        self.tick_extend_backlog(host.capture_targets());
     }
 
     /// One service tick while the pass's collection runs on its worker

@@ -794,6 +794,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     cgroup_fence: CgroupFence,
     pending_cgroup: Option<(CgroupCollection, u64)>,
     completed_cgroup: Option<CgroupCompletion>,
+    /// File-derived scan facts carried between cgroup passes. Each entry
+    /// keeps the opened file's identity and pin, so an unchanged file is
+    /// not re-read on the next pass and a changed file is. Only the
+    /// cgroup serial collector installs and takes this bundle; the other
+    /// scopes keep their own budget lifetimes.
+    cgroup_file_facts: crate::discovery::scan::RetainedFileFacts,
     scanned_owners: BTreeSet<ProcessViewId>,
     churned_owners: BTreeSet<ProcessViewId>,
     next_window: u64,
@@ -1274,6 +1280,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
             completed_cgroup: None,
+            cgroup_file_facts: crate::discovery::scan::RetainedFileFacts::default(),
             scanned_owners: BTreeSet::new(),
             churned_owners: BTreeSet::new(),
             next_window: 0,
@@ -4789,7 +4796,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// engine. A legacy System/PID job can never stand in for this request.
     #[cfg_attr(not(test), allow(dead_code))] // Cg4 supplies the runtime owner.
     pub(crate) fn cgroup_collector(
-        &self,
+        &mut self,
         state: CgroupWalkState,
         limits: CgroupWalkLimits,
         control: CollectionControl,
@@ -4799,7 +4806,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     pub(crate) fn cgroup_collector_observed(
-        &self,
+        &mut self,
         state: CgroupWalkState,
         limits: CgroupWalkLimits,
         control: CollectionControl,
@@ -4813,6 +4820,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         else {
             bail!("cgroup inventory collection requires the immutable Inventory work policy");
         };
+        // Hand the previous pass's file-derived facts to this pass's fresh
+        // budget. The take happens only after the request is known valid:
+        // a refused collector keeps the facts for the next attempt.
+        let carried = std::mem::take(&mut self.cgroup_file_facts);
         let request = CgroupCollectRequest {
             root: Arc::clone(dir),
             fence: self.cgroup_fence.issue(),
@@ -4821,7 +4832,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             control,
             max_scan_pids,
             scan_budget: self.collector_budget(
-                crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+                crate::discovery::scan::CaptureWorkBudget::for_inventory(work)
+                    .with_retained_file_facts(carried),
                 false,
             ),
             observer,
@@ -4845,7 +4857,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn apply_cgroup_collection(
         &mut self,
-        collection: CgroupCollection,
+        mut collection: CgroupCollection,
         now_ns: u64,
     ) -> Result<PassReport> {
         if self.publication_pending() {
@@ -4871,6 +4883,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 "previous cgroup transaction must be committed and its continuation consumed first"
             );
         }
+        // Keep this pass's file-derived facts for the next pass. They are
+        // keyed and pin-validated per opened file, so reuse never outlives
+        // a file change, and a refused or discarded collection (rejected
+        // above) never replaces the facts a future pass can use.
+        self.cgroup_file_facts = collection.take_retained_file_facts();
         let work = collection.work();
         let events = self
             .adapter
@@ -18267,10 +18284,7 @@ pub(crate) mod tests {
             let gaps = collection.member_gaps_for_test();
             let paths = collection.module_paths_for_test();
             self.coordinator
-                .apply_cgroup_collection(
-                    collection,
-                    crate::discovery::caller_registry::now_ns(),
-                )
+                .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
                 .unwrap();
             self.coordinator.commit_batch(false).unwrap();
             let _completion = self.coordinator.take_cgroup_completion().unwrap();
@@ -18285,7 +18299,9 @@ pub(crate) mod tests {
             .map(|path| std::fs::metadata(path).unwrap())
             .collect();
         assert!(
-            metadata.windows(2).all(|pair| pair[0].dev() == pair[1].dev()),
+            metadata
+                .windows(2)
+                .all(|pair| pair[0].dev() == pair[1].dev()),
             "the fixture files must share one device for object-key order"
         );
         assert!(
@@ -18322,13 +18338,15 @@ pub(crate) mod tests {
         let (first_gaps, first_modules) = scene.pass();
         assert!(
             first_gaps.iter().any(|(_, subject, reason)| {
-                subject.contains("ghci-like") && reason.contains(crate::discovery::scan::IO_CEILING_REASON)
+                subject.contains("ghci-like")
+                    && reason.contains(crate::discovery::scan::IO_CEILING_REASON)
             }),
             "the first pass must exhaust its window on the large tables: {first_gaps:?}"
         );
         assert!(
             first_gaps.iter().any(|(_, subject, reason)| {
-                subject.contains("scoped-provider") && reason.contains(crate::discovery::scan::IO_CEILING_REASON)
+                subject.contains("scoped-provider")
+                    && reason.contains(crate::discovery::scan::IO_CEILING_REASON)
             }),
             "a provider after the large tables is refused in the first pass: {first_gaps:?}"
         );
@@ -18380,15 +18398,13 @@ pub(crate) mod tests {
             &[],
         );
         same_device_and_inode_order(&[&changed, &pandoc, &ghci]);
-        let mut scene = CgroupTableScene::new(
-            dir,
-            &[changed.clone(), pandoc, ghci],
-            None,
-        );
+        let mut scene = CgroupTableScene::new(dir, &[changed.clone(), pandoc, ghci], None);
 
         let (_, first_modules) = scene.pass();
         assert!(
-            !first_modules.iter().any(|path| path.contains("changed-table")),
+            !first_modules
+                .iter()
+                .any(|path| path.contains("changed-table")),
             "the initial changed-table file exports no hook: {first_modules:?}"
         );
 
@@ -20289,7 +20305,7 @@ exit 0
     fn cgroup_wrong_root_and_legacy_catalog_jobs_cannot_supply_authority() {
         let (_fixture, _child, mut coordinator) = cgroup_os_scene();
         assert!(coordinator.collector(InventoryScope::System, None)().is_err());
-        let (_other_fixture, _, other) = cgroup_os_scene();
+        let (_other_fixture, _, mut other) = cgroup_os_scene();
         let collection = other
             .cgroup_collector(
                 CgroupWalkState::default(),
@@ -29975,7 +29991,7 @@ exit 0
             );
             let budget = native.scene.coordinator.attach_set.budget();
             let edges = native.scene.coordinator.registry.edges().count();
-            let (other, _) = boxed_cgroup_retained_history_scene();
+            let (mut other, _) = boxed_cgroup_retained_history_scene();
             std::fs::write(other.scene._dir.path().join("cgroup.procs"), b"7\n").unwrap();
             let collect = other
                 .scene

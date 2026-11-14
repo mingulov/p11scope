@@ -214,7 +214,12 @@ fn read_elf_snapshot_with(
             return Err(std::io::Error::other(reason));
         }
         let read = reader(file, &mut bytes[..allowed], offset)?;
-        budget.record_io(read);
+        // One charging rule for file-content reads: bytes debit the
+        // inventory window (the per-operation leg is enforced above),
+        // while parsed entries charge work through `spend`. Converting
+        // the bytes to collection work here too would double-charge a
+        // large snapshot against the small cgroup work allowance.
+        budget.record_window_io(read);
         operation_bytes += read as u64;
         Ok(read)
     })
@@ -1074,6 +1079,24 @@ fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// File-derived facts one inventory pass retains for its successor: the
+/// inspection, export facts, table-cap refusal and loader facts read from
+/// opened files. Every map is keyed by the opened file's identity and its
+/// `(ino, size, ctime)` pin (the loader map by its own descriptor pin), so
+/// an unchanged file costs no reads on the next pass while a changed file
+/// misses and is read again. Nothing here comes from a target process or
+/// from a generation-scoped view, so the facts stay valid across passes
+/// the way the main inventory budget's caches do. Byte accounting shares
+/// the one retained-cache ceiling the budget already enforces.
+#[derive(Debug, Default)]
+pub(crate) struct RetainedFileFacts {
+    inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
+    elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
+    table_cap_refusals: BTreeMap<InspectedFileKey, String>,
+    loader_elf_facts: BTreeMap<LoaderFactsKey, LoaderElfFacts>,
+    retained_cache_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 struct ActiveInventoryWindow {
     token: WindowToken,
@@ -1617,14 +1640,15 @@ impl CaptureWorkBudget {
         }
     }
 
-    /// Window-only I/O debit for the demand-paged table walk: the bytes
-    /// charge the window (and the capture total) without the 1 unit per
-    /// 32 bytes collection-work conversion. Table entries are already
-    /// charged separately through `spend`, so converting the bytes too
-    /// would debit one pandoc-sized walk (55 MB = 1.7M units) against
-    /// the 1 MiB cgroup collection allowance and stop the whole pass.
-    /// Still polls the collection stop (0 units) so an operator stop
-    /// or deadline reaches the walk without charging it.
+    /// Window-only I/O debit for file-content reads: the demand-paged
+    /// table walk and the bounded ELF snapshot reader. The bytes charge
+    /// the window (and the capture total) without the 1 unit per 32
+    /// bytes collection-work conversion. Parsed entries are charged
+    /// separately through `spend`, so converting the bytes too would
+    /// debit one pandoc-sized walk (55 MB = 1.7M units) against the
+    /// 1 MiB cgroup collection allowance and stop the whole pass. Still
+    /// polls the collection stop (0 units) so an operator stop or
+    /// deadline reaches the read without charging it.
     pub(crate) fn record_window_io(&mut self, bytes: usize) {
         self.collection_checkpoint(0);
         self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
@@ -2064,6 +2088,34 @@ impl CaptureWorkBudget {
             .saturating_sub(old)
             .saturating_add(bytes);
         true
+    }
+
+    /// Take every retained file-derived cache, leaving this budget with
+    /// none and its byte counter zeroed. The cgroup collector carries
+    /// the bundle into the next pass's fresh budget: each entry keeps its
+    /// file identity and pin, so unchanged files are reused with no
+    /// reads and changed files miss and are read again.
+    pub(crate) fn take_retained_file_facts(&mut self) -> RetainedFileFacts {
+        RetainedFileFacts {
+            inspected_files: std::mem::take(&mut self.inspected_files),
+            elf_export_facts: std::mem::take(&mut self.elf_export_facts),
+            table_cap_refusals: std::mem::take(&mut self.table_cap_refusals),
+            loader_elf_facts: std::mem::take(&mut self.loader_elf_facts),
+            retained_cache_bytes: std::mem::replace(&mut self.retained_cache_bytes, 0),
+        }
+    }
+
+    /// Install file facts carried from an earlier pass, before this
+    /// budget begins its window and scan. Installed entries keep the
+    /// entry and byte ceilings the budget already enforces for new
+    /// insertions; a later changed pin simply misses.
+    pub(crate) fn with_retained_file_facts(mut self, facts: RetainedFileFacts) -> Self {
+        self.inspected_files = facts.inspected_files;
+        self.elf_export_facts = facts.elf_export_facts;
+        self.table_cap_refusals = facts.table_cap_refusals;
+        self.loader_elf_facts = facts.loader_elf_facts;
+        self.retained_cache_bytes = facts.retained_cache_bytes;
+        self
     }
 
     #[cfg(test)]
@@ -18133,6 +18185,152 @@ mod tests {
             budget.finish_scan(scan).unwrap();
             budget.finish_window(window).unwrap();
         }
+    }
+
+    /// The cgroup pass carry: export facts and gate refusals taken from
+    /// one budget are reused by the next pass's budget with zero reads,
+    /// while a changed pin (same inode, new size) misses and is read
+    /// again. Facts, not bytes: the second pass starts with a plain
+    /// empty budget plus the carried bundle.
+    #[test]
+    fn inventory_retained_file_facts_carry_reuse_and_re_read_a_changed_file() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let facts_path = dir.path().join("library.so");
+        std::fs::copy("/bin/sh", &facts_path).unwrap();
+        let refusal_path = dir.path().join("many-phdr.so");
+        write_many_phdr_elf(&refusal_path, 2048);
+        let facts_file = File::open(&facts_path).unwrap();
+        let refusal_file = File::open(&refusal_path).unwrap();
+        assert!(
+            crate::discovery::identity::file_inodes_are_unique(&facts_file)
+                && crate::discovery::identity::file_inodes_are_unique(&refusal_file),
+            "the lane TMPDIR must name one file per (device, inode)"
+        );
+        let facts_key = object_key_of(&facts_file);
+        let refusal_key = object_key_of(&refusal_file);
+        let limits = || inventory_limits(8 << 20, 1 << 20, 4096, 32768, 4096, 512);
+
+        let mut first = CaptureWorkBudget::for_inventory(limits());
+        let window = first.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = first.checkpoint(window.clone()).unwrap();
+        let facts = provider_facts_for(&facts_file, facts_key, &[], &mut first).unwrap();
+        assert!(first.attempted_io_bytes() > 0);
+        let refusal = provider_facts_for(&refusal_file, refusal_key, &[], &mut first).unwrap_err();
+        first.finish_scan(scan).unwrap();
+        first.finish_window(window).unwrap();
+        let carried = first.take_retained_file_facts();
+
+        let mut second =
+            CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
+        let window = second.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = second.checkpoint(window.clone()).unwrap();
+        assert_eq!(
+            provider_facts_for(&facts_file, facts_key, &[], &mut second).unwrap(),
+            facts
+        );
+        assert_eq!(
+            provider_facts_for(&refusal_file, refusal_key, &[], &mut second).unwrap_err(),
+            refusal
+        );
+        assert_eq!(
+            second.attempted_io_bytes(),
+            0,
+            "carried facts and refusals reread nothing"
+        );
+        second.finish_scan(scan).unwrap();
+        second.finish_window(window).unwrap();
+
+        // Same inode, larger size: the pin moved, so the entry misses.
+        let original_key = InspectedFileKey::for_open_file(
+            &facts_file,
+            facts_key.device,
+            facts_key.inode,
+            pin_of(&facts_file).unwrap(),
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&facts_path)
+            .unwrap()
+            .write_all(&[0u8; 1024])
+            .unwrap();
+        let changed_key = InspectedFileKey::for_open_file(
+            &facts_file,
+            facts_key.device,
+            facts_key.inode,
+            pin_of(&facts_file).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(changed_key, original_key);
+        assert!(
+            second.elf_export_facts_for(&original_key).is_some(),
+            "the unchanged entry is still carried"
+        );
+        assert!(
+            second.elf_export_facts_for(&changed_key).is_none(),
+            "a changed pin names no carried entry (an identity-only cache would serve stale facts)"
+        );
+        let window = second.begin_window(WindowId::new(2), u64::MAX).unwrap();
+        let scan = second.checkpoint(window.clone()).unwrap();
+        let reread = provider_facts_for(&facts_file, facts_key, &[], &mut second).unwrap();
+        assert!(
+            second.attempted_io_bytes() > 0,
+            "a changed pin is read again"
+        );
+        assert_eq!(reread.abi, facts.abi);
+        assert_eq!(reread.exports, facts.exports);
+        assert!(
+            second.elf_export_facts_for(&changed_key).is_some(),
+            "the re-read facts cache under the changed pin"
+        );
+        second.finish_scan(scan).unwrap();
+        second.finish_window(window).unwrap();
+    }
+
+    /// One charging rule: a snapshot read debits the inventory window
+    /// for every byte and charges no collection work; the parsed table
+    /// entries alone charge work through `spend`.
+    #[test]
+    fn inventory_snapshot_read_charges_the_window_not_collection_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = File::open(&path).unwrap();
+        let size = file.metadata().unwrap().len();
+        assert!(size > 0);
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(
+            8 << 20,
+            1 << 20,
+            4096,
+            32768,
+            4096,
+            512,
+        ));
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        let snapshot = read_elf_snapshot(&file, &mut budget).unwrap();
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            size,
+            "the whole snapshot was read"
+        );
+        assert_eq!(
+            budget.work_units_count(),
+            0,
+            "snapshot bytes charge the window only"
+        );
+        let entries = snapshot.table_bounds().table_entries();
+        assert!(entries > 0, "the fixture has table entries to charge");
+        budget.spend(entries).unwrap();
+        assert_eq!(
+            budget.work_units_count(),
+            entries,
+            "parsed entries charge collection work"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
     }
 
     /// C2: a sparse 2 GiB `.dynsym` refuses as a per-object named gap

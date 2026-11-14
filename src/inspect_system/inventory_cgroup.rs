@@ -748,6 +748,17 @@ impl CgroupCollection {
         let outcome = self.outcome();
         (self.state, outcome)
     }
+    /// Take the file-derived facts this pass read, leaving its budget
+    /// without them. The coordinator keeps the bundle for the next cgroup
+    /// pass; every entry carries the opened file's identity and pin, so
+    /// an unchanged file is reused with no reads and a changed file is
+    /// read again. Empty when the collection never scanned.
+    pub(crate) fn take_retained_file_facts(&mut self) -> crate::discovery::scan::RetainedFileFacts {
+        self.collection
+            .as_mut()
+            .map(|collection| collection.budget.take_retained_file_facts())
+            .unwrap_or_default()
+    }
     #[cfg(test)]
     pub(crate) fn used_work(&self) -> usize {
         self.work.budget.lock().unwrap().used.units

@@ -688,11 +688,8 @@ mod tests {
         let domain = NativeDomainId::mint();
         let own = take_producers(domain, 91);
         coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
-        coordinator
-            .semantic_finalizer
-            .as_mut()
-            .unwrap()
-            .h3_pending = Some(H3DispositionEvidence::genesis());
+        coordinator.semantic_finalizer.as_mut().unwrap().h3_pending =
+            Some(H3DispositionEvidence::genesis());
         assert_eq!(
             coordinator.take_unaudited_joint_h3(&own),
             UnauditedH3Take::Taken,
@@ -729,11 +726,8 @@ mod tests {
         let mut coordinator = take_coordinator();
         let own = take_producers(NativeDomainId::mint(), 91);
         coordinator.semantic_finalizer = Some(SessionFinalizerState::new(NativeDomainId::mint()));
-        coordinator
-            .semantic_finalizer
-            .as_mut()
-            .unwrap()
-            .h3_pending = Some(H3DispositionEvidence::genesis());
+        coordinator.semantic_finalizer.as_mut().unwrap().h3_pending =
+            Some(H3DispositionEvidence::genesis());
         assert_eq!(
             coordinator.take_unaudited_joint_h3(&own),
             UnauditedH3Take::ForeignHeld,

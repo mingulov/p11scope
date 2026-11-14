@@ -4954,7 +4954,7 @@ impl ClassicDriver<'_> {
         match refusal {
             Some(crate::inventory_semantics::RunningRearmRefusal::BoundSpent) => {
                 suffix.push_str(&format!(
-                    "; the lane stops: it already continued past {} (the per-run limit)",
+                    "; the lane stops: it already continued past {} in the last 10 minutes (the re-arm rate limit)",
                     interruptions(crate::inventory_semantics::RUNNING_REARM_LIMIT)
                 ));
             }
@@ -5011,7 +5011,7 @@ impl ClassicDriver<'_> {
         // applied abandon published its work; an unapplied one kept
         // its staged facts for the next pass); an unbound or not yet
         // begun demand polls the re-armed machine.
-        // Bounded by the machine's per-run re-arm limit; every other
+        // Bounded by the machine's re-arm rate window; every other
         // latch holds the lane below as before.
         let coordinator = &mut *self.coordinator;
         // The verbose-only audit code, read before the re-arm attempt:
@@ -21073,7 +21073,7 @@ mod tests {
     fn joint_lane_stop_suffix_names_phase_rearms_and_the_spent_limit() {
         use crate::inventory_semantics::RunningRearmRefusal;
         // The stop gap's suffix, both hold sites: the latched phase,
-        // the earlier re-arms, and — when the per-run bound is spent —
+        // the earlier re-arms, and — when the rate bound is spent —
         // a plain statement that the limit stopped the lane. The
         // limit sentence prints only for a bound-spent refusal: a
         // stop at a phase that never re-arms names its own cause
@@ -21097,7 +21097,7 @@ mod tests {
                 crate::inventory_semantics::RUNNING_REARM_LIMIT,
                 Some(RunningRearmRefusal::BoundSpent),
             ),
-            " at Audited; the lane stops: it already continued past 32 interruptions (the per-run limit)",
+            " at Audited; the lane stops: it already continued past 32 interruptions in the last 10 minutes (the re-arm rate limit)",
         );
         assert_eq!(
             ClassicDriver::joint_lane_stop_suffix(
@@ -21185,7 +21185,7 @@ mod tests {
             ),
             (
                 RunningRearmRefusal::H3SlotHeld,
-                "the untaken H3 slot was still held for another producer",
+                "the refused audit's evidence was still held for another producer",
             ),
         ] {
             assert_eq!(
@@ -21196,12 +21196,12 @@ mod tests {
         }
         assert_eq!(
             ClassicDriver::joint_lane_stop_suffix(None, 0, Some(RunningRearmRefusal::BoundSpent),),
-            "; the lane stops: it already continued past 32 interruptions (the per-run limit)",
+            "; the lane stops: it already continued past 32 interruptions in the last 10 minutes (the re-arm rate limit)",
             "the bound renders the count sentence",
         );
         assert_eq!(
             RunningRearmRefusal::BoundSpent.describe(),
-            "the per-run re-arm limit was already spent",
+            "the re-arm rate limit was already spent",
             "the bound keeps its standalone clause",
         );
     }
@@ -21240,7 +21240,7 @@ mod tests {
         assert_eq!(stops.len(), 1, "the hold is disclosed once");
         assert_eq!(
             stops[0].1,
-            "semantic_unavailable at Audited; the lane stops: it already continued past 32 interruptions (the per-run limit); broad inventory continues; semantic probes stay attached until exit",
+            "semantic_unavailable at Audited; the lane stops: it already continued past 32 interruptions in the last 10 minutes (the re-arm rate limit); broad inventory continues; semantic probes stay attached until exit",
             "the gap names the spent limit as the stop cause"
         );
     }

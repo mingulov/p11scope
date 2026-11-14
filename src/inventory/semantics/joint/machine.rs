@@ -60,10 +60,19 @@ fn reborrow_acquisition<'a, 'b: 'a>(
 /// before it takes the named disposition path.
 pub(crate) const MAX_UNPAID_VOID_YIELDS: u32 = 64;
 
-/// Running quanta one lane may abandon and re-arm past per run. Each
-/// re-arm disposes one refused quantum through the named exit abandon;
-/// past the bound the latch stands and the lane is held, named.
+/// Running quanta one lane may abandon and re-arm past per rolling
+/// [`RUNNING_REARM_WINDOW`]. Each re-arm disposes one refused quantum
+/// through the named exit abandon; past the bound the latch stands
+/// and the lane is held, named. A rate, not a run total: a long run
+/// with sparse interruptions never stops for its age, while a dense
+/// storm (back-to-back re-arms) still stops. Sized from the heavy
+/// soaks: runs that stopped hit 32 re-arms within nine minutes, runs
+/// that finished stayed at 27 per sixteen minutes or fewer, and a
+/// truly stuck lane re-arms every pass (tens per minute).
 pub(crate) const RUNNING_REARM_LIMIT: u32 = 32;
+/// Rolling window of the running re-arm bound: at most
+/// [`RUNNING_REARM_LIMIT`] re-arms per window.
+pub(crate) const RUNNING_REARM_WINDOW: Duration = Duration::from_secs(600);
 /// Gap subject of one abandoned running quantum the lane continued past.
 pub(crate) const RUNNING_REARM_SUBJECT: &str = "semantic quantum abandoned; lane continues";
 
@@ -94,7 +103,7 @@ pub(crate) enum RunningRearmRefusal {
     /// full: only a refusal at the audit step (Auditing or Audited)
     /// re-arms.
     WrongPhase,
-    /// The per-run re-arm bound is spent. The stop gap renders
+    /// The re-arm rate bound is spent. The stop gap renders
     /// this as the count sentence, not [`Self::describe`].
     BoundSpent,
     /// The lane is no longer live: not live, finished,
@@ -122,11 +131,11 @@ impl RunningRearmRefusal {
             Self::WatchdogTripped => "a no-progress trip was already standing",
             Self::FrameMissing => "the audited pass had nothing left to abandon",
             Self::WrongPhase => "only a refusal at the audit step can be continued past",
-            Self::BoundSpent => "the per-run re-arm limit was already spent",
+            Self::BoundSpent => "the re-arm rate limit was already spent",
             Self::LaneNotLive => "the lane was no longer live",
             Self::CannotResync => "the journal stream could not re-sync",
             Self::PublicationPending => "the unfinished pass was still standing after the abandon",
-            Self::H3SlotHeld => "the untaken H3 slot was still held for another producer",
+            Self::H3SlotHeld => "the refused audit's evidence was still held for another producer",
         }
     }
 }
@@ -1384,9 +1393,13 @@ pub(crate) struct LiveJointMachine {
     /// abandon can dispose in full; cleared by the re-arm. Every other
     /// latch leaves it false.
     rearm_eligible: bool,
-    /// Running quanta abandoned and re-armed past, bounded by
-    /// [`RUNNING_REARM_LIMIT`].
+    /// Running quanta abandoned and re-armed past in this run: the
+    /// stop gap's count. The rate window bounds, not this total.
     running_rearms: u32,
+    /// Stamps of the re-arms inside the current [`RUNNING_REARM_WINDOW`]:
+    /// a fixed ring, so the window costs no heap past the machine's own
+    /// pool reservation. `None` slots are free or expired.
+    rearm_window: [Option<Instant>; RUNNING_REARM_LIMIT as usize],
     /// Posed wall clock for the running re-arm window (tests only):
     /// production always reads `Instant::now()`.
     #[cfg(test)]
@@ -1486,6 +1499,7 @@ impl LiveJointMachine {
             audit_no_progress_trip: None,
             rearm_eligible: false,
             running_rearms: 0,
+            rearm_window: [None; RUNNING_REARM_LIMIT as usize],
             #[cfg(test)]
             posed_rearm_now: None,
             rearm_refusal: None,
@@ -1550,13 +1564,22 @@ impl LiveJointMachine {
 
     /// Wall clock for the running re-arm window: the posed test
     /// clock when set, else `Instant::now()`.
-    #[cfg_attr(not(test), allow(dead_code))] // The rate gate reads it; until then only the twins do.
     pub(crate) fn rearm_now(&self) -> Instant {
         #[cfg(test)]
         if let Some(now) = self.posed_rearm_now {
             return now;
         }
         Instant::now()
+    }
+
+    /// Drop the re-arm stamps older than [`RUNNING_REARM_WINDOW`], so
+    /// only the current rate counts against the bound.
+    fn prune_rearm_window(&mut self, now: Instant) {
+        for slot in &mut self.rearm_window {
+            if slot.is_some_and(|stamp| now.duration_since(stamp) >= RUNNING_REARM_WINDOW) {
+                *slot = None;
+            }
+        }
     }
 
     /// The recorded Audited no-progress trip, if the wall-time bound fired.
@@ -1707,7 +1730,7 @@ impl LiveJointMachine {
     /// at Idle. The refused phase is never re-run and its frame never
     /// resumes. `None` admits no re-arm and changes nothing: the latch
     /// stands for the driver's hold (any other latched shape, a Finish,
-    /// a no-progress trip, the per-run bound, a lane no longer live, or
+    /// a no-progress trip, the rate bound, a lane no longer live, or
     /// a lane whose next collect cannot re-sync).
     /// A frame abandon that still leaves a publication standing also
     /// returns `None`; the hold's own abandon then finds it exactly as
@@ -1744,7 +1767,9 @@ impl LiveJointMachine {
             self.rearm_refusal = Some(refusal);
             return None;
         }
-        if self.running_rearms >= RUNNING_REARM_LIMIT {
+        let now = self.rearm_now();
+        self.prune_rearm_window(now);
+        if self.rearm_window.iter().all(Option::is_some) {
             self.rearm_refusal = Some(RunningRearmRefusal::BoundSpent);
             return None;
         }
@@ -1818,6 +1843,12 @@ impl LiveJointMachine {
         self.finish_no_progress_since = None;
         self.unpaid_void_yields = 0;
         self.running_rearms += 1;
+        let slot = self
+            .rearm_window
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("the rate gate left a free window slot");
+        *slot = Some(now);
         self.rearm_refusal = None;
         // The re-arm consumed the latch; a later stop must not show its code.
         self.audit_refusal = None;

@@ -14078,7 +14078,7 @@ fn joint_machine_auditing_back_to_back_rearms_recover_and_drain_the_void() {
 }
 
 /// Bound twin across both steps: Audited and Auditing re-arms spend
-/// one shared per-run limit; past it an Auditing refusal keeps the
+/// one shared rate window; past it an Auditing refusal keeps the
 /// latch with its raw quantum and H3 slot held.
 #[test]
 fn joint_machine_auditing_and_audited_rearms_share_the_bound() {
@@ -14265,7 +14265,7 @@ fn joint_machine_running_no_progress_trip_keeps_the_latch() {
     );
 }
 
-/// Bound twin: re-arms are finite per run; past the bound the latch
+/// Bound twin: re-arms are rate-bounded; past the bound the latch
 /// stands and the hold names the stop.
 #[test]
 fn joint_machine_running_rearms_are_bounded() {

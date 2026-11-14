@@ -31,7 +31,7 @@ versioned separately and are opaque, exact dispatch keys.
   report stays PARTIAL with exact counts and no lost calls. Since
   0.8.0 the lane continues past a transient interruption at the
   audit step, while a batch of calls is being checked or right after
-  (up to 32 interruptions per run, each named):
+  (up to 32 interruptions per rolling 10 minutes, each named):
   processes already running keep exact call counts but lose
   per-key rows for the rest of the run, while processes started
   later are tracked. Refusals at other steps still stop the lane,

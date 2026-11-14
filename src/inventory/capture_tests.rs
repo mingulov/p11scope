@@ -10039,12 +10039,16 @@ fn startup_drain_holds_records_and_stages_them_first_in_drain_order() {
     let mut started = NativeLane::start(lane, &mut scene, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
-    let loaded =
-        crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), None, None, || {
+    let loaded = crate::inventory::draining_lifecycle::<Pin, _, _, _>(
+        Some(&mut started),
+        None,
+        None,
+        || {
             // Long enough for several drainer ticks (10 ms each).
             std::thread::sleep(Duration::from_millis(80));
             "loaded"
-        });
+        },
+    );
     assert_eq!(loaded, "loaded");
     let held: Vec<u64> = drained.lock().unwrap().clone();
     assert!(
@@ -10089,10 +10093,15 @@ fn startup_drain_releases_its_drainer_when_the_load_panics() {
         .map_err(|(_, reason)| reason)
         .unwrap();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::inventory::draining_lifecycle::<Pin, _, (), _>(Some(&mut started), None, None, || {
-            std::thread::sleep(Duration::from_millis(20));
-            panic!("scripted load panic")
-        })
+        crate::inventory::draining_lifecycle::<Pin, _, (), _>(
+            Some(&mut started),
+            None,
+            None,
+            || {
+                std::thread::sleep(Duration::from_millis(20));
+                panic!("scripted load panic")
+            },
+        )
     }));
     let payload = outcome.expect_err("the load's panic is re-raised");
     assert_eq!(
@@ -10114,10 +10123,11 @@ fn startup_drain_releases_its_drainer_when_the_load_panics() {
 fn startup_drain_without_a_lane_runs_the_load_once() {
     let mut runs = 0;
     let caller = std::thread::current().id();
-    let ran_on = crate::inventory::draining_lifecycle::<Pin, DrainLane, _, _>(None, None, None, || {
-        runs += 1;
-        std::thread::current().id()
-    });
+    let ran_on =
+        crate::inventory::draining_lifecycle::<Pin, DrainLane, _, _>(None, None, None, || {
+            runs += 1;
+            std::thread::current().id()
+        });
     assert_eq!(runs, 1);
     assert_eq!(ran_on, caller);
 }
@@ -10151,13 +10161,18 @@ fn startup_drain_extends_nothing_after_a_stop_during_the_load() {
         600,
         "the activation defers the whole pre-arm delta"
     );
-    crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), Some(&*stop), None, || {
-        // The operator stop lands as the semantic load starts, like a
-        // Ctrl-C during the BPF load; the load then outlasts several
-        // 10 ms drainer ticks plus the final quantum.
-        stop.store(1, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(80));
-    });
+    crate::inventory::draining_lifecycle::<Pin, _, _, _>(
+        Some(&mut started),
+        Some(&*stop),
+        None,
+        || {
+            // The operator stop lands as the semantic load starts, like a
+            // Ctrl-C during the BPF load; the load then outlasts several
+            // 10 ms drainer ticks plus the final quantum.
+            stop.store(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(80));
+        },
+    );
     assert!(
         stopped_services.load(Ordering::SeqCst) >= 1,
         "the drainer ticked while the stop pended"
@@ -10192,9 +10207,14 @@ fn startup_drain_extends_the_backlog_while_no_stop_pends() {
         600,
         "the activation defers the whole pre-arm delta"
     );
-    crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), Some(&*stop), None, || {
-        std::thread::sleep(Duration::from_millis(80));
-    });
+    crate::inventory::draining_lifecycle::<Pin, _, _, _>(
+        Some(&mut started),
+        Some(&*stop),
+        None,
+        || {
+            std::thread::sleep(Duration::from_millis(80));
+        },
+    );
     assert!(
         extends.load(Ordering::SeqCst) >= 2,
         "the drainer extended during the load"

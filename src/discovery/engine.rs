@@ -7740,15 +7740,19 @@ pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
 }
 
 /// One cached pid classification (§8.2): the `/proc/<pid>` directory
-/// mtime the class was read under (procfs destroys and recreates the
-/// directory on reuse, so a reused pid never keeps its mtime), and
-/// whether the pid is a user process. No start time: stat field 22
-/// has 10 ms (jiffy) resolution, so a same-jiffy reuse carries the
-/// same start time and it cannot confirm the generation — the mtime
-/// guard plus always-fresh classification on a miss is the whole
-/// guard.
+/// identity the class was read under, and whether the pid is a user
+/// process. The identity is the (inode, mtime) pair from a single
+/// `metadata()` call: procfs destroys and recreates the directory on
+/// reuse, so a reused pid always gets a fresh inode, while the mtime
+/// alone cannot confirm the generation — it is coarse (tick
+/// granularity) and set when the inode is created on lookup, not at
+/// fork, so two generations can share one. No start time either:
+/// stat field 22 has 10 ms (jiffy) resolution, so a same-jiffy reuse
+/// carries the same start time — the pair plus always-fresh
+/// classification on a miss is the whole guard.
 #[derive(Debug, Clone)]
 struct PidClassCacheEntry {
+    dir_ino: u64,
     dir_mtime: std::time::SystemTime,
     is_user: bool,
 }
@@ -7756,15 +7760,18 @@ struct PidClassCacheEntry {
 impl Engine {
     /// The user processes among `pids`, with classifications cached
     /// across refreshes (§8.2): a pid whose `/proc/<pid>` directory
-    /// mtime is unchanged since its classification reuses it without
-    /// re-reading its stat file; a changed or missing mtime re-reads
-    /// and re-classifies from the fresh stat exactly like
-    /// [`user_process_pids`], never keeping the cached class. The
-    /// fresh read is correct either way: `PF_KTHREAD` is immutable
-    /// per task generation, and stat start time (10 ms jiffies)
-    /// cannot tell same-jiffy reuse from the same generation, so on
-    /// any doubt the fresh class wins. Same fail-closed semantics as
-    /// the uncached predicate: unreadable or unparsable stats stay
+    /// (inode, mtime) pair is unchanged since its classification
+    /// reuses it without re-reading its stat file; a changed or
+    /// unreadable pair re-reads and re-classifies from the fresh
+    /// stat exactly like [`user_process_pids`], never keeping the
+    /// cached class. Both halves come from the same `metadata()`
+    /// call, so the pair is one atomic identity. The fresh read is
+    /// correct either way: `PF_KTHREAD` is immutable per task
+    /// generation, and neither the coarse directory mtime nor the
+    /// stat start time (10 ms jiffies) can tell same-tick or
+    /// same-jiffy reuse from the same generation, so on any doubt
+    /// the fresh class wins. Same fail-closed semantics as the
+    /// uncached predicate: unreadable or unparsable stats stay
     /// eligible and are never cached. Prunes departed pids so the
     /// cache never outgrows the live scope.
     pub(crate) fn cached_user_process_pids(&mut self, pids: &[u32]) -> Vec<u32> {
@@ -7772,9 +7779,18 @@ impl Engine {
         let mut dir = self.proc_root.clone();
         for pid in pids {
             dir.push(pid.to_string());
-            let mtime = std::fs::metadata(&dir).and_then(|metadata| metadata.modified());
-            let cached_class = match (&mtime, self.pid_class_cache.get(pid)) {
-                (Ok(mtime), Some(entry)) if entry.dir_mtime == *mtime => Some(entry.is_user),
+            let guard = std::fs::metadata(&dir).ok().and_then(|metadata| {
+                metadata
+                    .modified()
+                    .ok()
+                    .map(|mtime| (metadata.ino(), mtime))
+            });
+            let cached_class = match (&guard, self.pid_class_cache.get(pid)) {
+                (Some((ino, mtime)), Some(entry))
+                    if entry.dir_ino == *ino && entry.dir_mtime == *mtime =>
+                {
+                    Some(entry.is_user)
+                }
                 _ => None,
             };
             if let Some(is_user) = cached_class {
@@ -7788,20 +7804,27 @@ impl Engine {
             self.pid_cache_misses = self.pid_cache_misses.saturating_add(1);
             // Miss or unreadable guard: one stat read classifies and
             // refreshes the cache, exactly like `user_process_pids`.
-            // Always the fresh class: a changed mtime is reuse until
-            // proven otherwise, and the start time cannot prove
-            // otherwise (same-jiffy reuse shares it), so keeping the
-            // cached class would pin a stale verdict for the new
+            // Always the fresh class: a changed guard pair is reuse
+            // until proven otherwise, and neither the mtime nor the
+            // start time can prove otherwise (same-tick reuse shares
+            // the mtime, same-jiffy reuse the start time), so keeping
+            // the cached class would pin a stale verdict for the new
             // generation's lifetime.
             dir.push("stat");
             match std::fs::read_to_string(&dir) {
                 Ok(text) => {
-                    let is_user = !process::stat_flags_from_stat_text(&text)
-                        .is_some_and(|flags| flags & process::PF_KTHREAD != 0);
-                    if let Ok(mtime) = mtime {
+                    let flags = process::stat_flags_from_stat_text(&text);
+                    let is_user = !flags.is_some_and(|flags| flags & process::PF_KTHREAD != 0);
+                    // Cache only parsed classes: an unparsable stat
+                    // stays eligible but uncached, like an unreadable
+                    // one, and is re-read on the next refresh.
+                    if let Some((ino, mtime)) = guard
+                        && flags.is_some()
+                    {
                         self.pid_class_cache.insert(
                             *pid,
                             PidClassCacheEntry {
+                                dir_ino: ino,
                                 dir_mtime: mtime,
                                 is_user,
                             },

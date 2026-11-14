@@ -4584,7 +4584,10 @@ impl State {
     }
     /// A0 sample: distinct processes owning R12 rows, for the 60 s
     /// live/dead split. O(entries): called only on the emit path,
-    /// never on the hot path.
+    /// never on the hot path. Covers `detached` too: its map key is
+    /// module-scoped, so only the record's own `process` names the
+    /// owning process (a process whose only rows are detached would
+    /// otherwise be counted in neither live nor dead).
     pub(crate) fn memory_process_keys(&self) -> Vec<ProcessKey> {
         let mut keys = BTreeSet::new();
         keys.extend(self.reduced_histories.iter().copied());
@@ -4593,6 +4596,7 @@ impl State {
         keys.extend(self.next_pseudonym.keys().copied());
         keys.extend(self.find_active.iter().map(|(process, _)| *process));
         keys.extend(self.pending.keys().map(|(process, _, _)| *process));
+        keys.extend(self.detached.values().map(|detached| detached.process));
         keys.extend(self.inherited_ambiguous.iter().map(|(process, _)| *process));
         keys.into_iter().collect()
     }
@@ -5181,6 +5185,39 @@ mod tests {
         assert_eq!(lens.pending.len, 1);
         assert_eq!(lens.detached.len, 1);
         assert_eq!(lens.inherited_ambiguous.len, 1);
+        assert_eq!(s.memory_process_keys(), vec![process]);
+    }
+
+    #[test]
+    fn memory_process_keys_includes_detached_only_process() {
+        let mut s = State::with_policy(&test_plan(), crate::attach::CapturePolicy::Allowlisted);
+        assert!(s.memory_process_keys().is_empty());
+        // The process owns no R12 row anywhere else: only a floating
+        // (ownerless, joinable) detached record names it.
+        let process = ProcessKey::from_pid(4242);
+        s.detached.insert(
+            (ModuleId(0), 1, 2, 3, 4),
+            Detached {
+                pending: Pending {
+                    event: ev(4242, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 5),
+                    meta: SlotMeta {
+                        names: vec!["C_Sign".to_string()],
+                        aliased: false,
+                        semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                        function_id: None,
+                        fork_safe: false,
+                        module: ModuleId(0),
+                        module_ids: vec![ModuleId(0)],
+                        standard_layout: false,
+                    },
+                    started_ns: 0,
+                    sequence: 0,
+                },
+                owner: None,
+                process,
+                collided: false,
+            },
+        );
         assert_eq!(s.memory_process_keys(), vec![process]);
     }
 

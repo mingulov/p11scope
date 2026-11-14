@@ -4722,6 +4722,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     prior_objects,
                     prior_bytes,
                     &priors,
+                    false,
                 ),
             }
         }

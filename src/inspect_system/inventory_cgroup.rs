@@ -1040,6 +1040,7 @@ pub(crate) fn collect_with(
                 started,
                 before,
                 &mut handles,
+                false,
             )
         });
         #[cfg(test)]
@@ -1103,6 +1104,7 @@ pub(crate) fn collect_with(
         request.prearm_prior.0,
         request.prearm_prior.1,
         &mut handles,
+        false,
     );
     if collection.budget.stopped_reason().is_some() && outcome == ScopedCollectionOutcome::Complete
     {

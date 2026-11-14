@@ -7920,8 +7920,9 @@ fn file_proved_pin(proved: ProvedEntry, filing: &mut Filing) -> Result<Entry, De
     }
 }
 
-/// The permanent per-object gap for a trusted refusal, or the
-/// next-tick wait gap for a learned one. Manifest/prearm chains never
+/// The permanent per-object gap for a trusted refusal, the
+/// next-tick wait gap for a learned one, or the one-shot terminal
+/// gap for a one-shot count manifest. Manifest/prearm chains never
 /// acquire as an admission site.
 fn trusted_refusal_gap(reason: DeferredReason) -> &'static str {
     match reason {
@@ -7929,6 +7930,9 @@ fn trusted_refusal_gap(reason: DeferredReason) -> &'static str {
         DeferredReason::Learned => crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED,
         DeferredReason::CountManifest => {
             crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST
+        }
+        DeferredReason::CountManifestOneShot => {
+            crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST_ONESHOT
         }
         _ => {
             debug_assert!(
@@ -8141,11 +8145,11 @@ fn batch_byte_allowance(spent: u64, wanted: usize) -> Result<usize, String> {
 
 /// Inspect-lane variant of `pin_count_manifest_objects_in_views_with_prior`:
 /// manifest objects file rows into the run's own table. The collector
-/// passes [`DeferredReason::CountManifest`] for its operator-supplied
-/// manifest (the manifest chain only refuses trusted/learned/count
-/// inputs); the caller's strict `skipped.is_empty()` refusal turns any
-/// deferral into a scope gap (the `count manifest refused` row), never
-/// the run's hard error.
+/// passes [`DeferredReason::CountManifest`] (or its one-shot sibling
+/// for one-shot runs) for its operator-supplied manifest (the manifest
+/// chain only refuses trusted/learned/count inputs); the caller's
+/// strict `skipped.is_empty()` refusal turns any deferral into a scope
+/// gap (the `count manifest refused` row), never the run's hard error.
 pub(crate) fn pin_count_manifest_objects_in_views_with_prior_and_table(
     m: &Manifest,
     views: &[ProcessView],
@@ -9280,7 +9284,13 @@ fn pin_scanned_view_objects_with(
     let mut scratch = Vec::new();
     // One-shot lanes never retry: their wait rows name the terminal
     // wait instead of a next tick that never comes.
-    let retries = !matches!(&filing, Filing::Acquire(_, DeferredReason::Inspect));
+    let retries = !matches!(
+        &filing,
+        Filing::Acquire(
+            _,
+            DeferredReason::Inspect | DeferredReason::CountManifestOneShot
+        )
+    );
     let mut wanted = wanted.into_iter();
     for raw in wanted.by_ref() {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).

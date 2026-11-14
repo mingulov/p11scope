@@ -69,6 +69,10 @@ pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_LEARNED: &str = "capture library-h
 /// the next pass instead of skipping permanently: the collector
 /// retries every pass under its reservation.
 pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST: &str = "capture library-handle budget exhausted (1000 concurrent handles); count manifest object deferred to the next pass";
+/// Count-manifest objects that find a one-shot run's table full:
+/// trusted-class admission like the pass retry above, but the run
+/// never retries, so the stop names the terminal wait.
+pub(crate) const LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST_ONESHOT: &str = "capture library-handle budget exhausted (1000 concurrent handles); count manifest object skipped: the run does not retry";
 
 /// True for the open(2)-family errnos that mean "out of handles, wait":
 /// `EMFILE` (this process's fd table is full) and `ENFILE` (the

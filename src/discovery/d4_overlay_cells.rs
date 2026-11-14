@@ -3715,8 +3715,9 @@ fn k1_no_route_collect_row(
     // no-route witness budget.
     let (single_before, _) = witness_stats_for_test();
     let single_scanned: BTreeSet<u32> = scanned_for_fresh();
-    let single = crate::inspect_system::collect(&[], &[], &hooks, Some(1), policy, &single_scanned)
-        .map_err(|error| format!("k1 no-route single-shot collect: {error:#}"))?;
+    let single =
+        crate::inspect_system::collect(&[], &[], &hooks, Some(1), policy, &single_scanned, false)
+            .map_err(|error| format!("k1 no-route single-shot collect: {error:#}"))?;
     let (single_after, _) = witness_stats_for_test();
     let (fresh_objects, fresh_status) =
         catalog_of(fresh_pid, &single).ok_or("k1 no-route single-shot: fresh pid missing")?;

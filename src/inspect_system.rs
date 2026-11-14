@@ -123,6 +123,9 @@ fn run_with_writer(
         AdmissionPolicy::detailed(),
         // Single pass: no earlier scans, pure rarity selection.
         &BTreeSet::new(),
+        // One-shot: the run never retries, so budget stops name the
+        // terminal wait instead of a next tick or pass.
+        true,
     )?;
     // The header's wall total: measured around the collection, so
     // `deep scans` never reads as the command's own time.
@@ -573,6 +576,7 @@ fn collect_members(
     scanned: &BTreeSet<u32>,
     priors: &ScanPriors,
     table: &mut HandleTable,
+    one_shot: bool,
 ) -> Collection {
     collect_members_identity(
         hints,
@@ -585,6 +589,7 @@ fn collect_members(
         scanned,
         priors,
         table,
+        one_shot,
     )
     .0
 }
@@ -633,6 +638,7 @@ fn collect_members_identity(
     scanned: &BTreeSet<u32>,
     priors: &ScanPriors,
     table: &mut HandleTable,
+    one_shot: bool,
 ) -> (Collection, Option<ExaminedCustody>) {
     debug_assert!(!take_anchors || identity);
     progress!("p11scope: enumerating processes...");
@@ -784,6 +790,7 @@ fn collect_members_identity(
             &mut noise,
             custody.as_mut(),
             &mut *table,
+            one_shot,
         ));
     }
     if let Some(summary) = deep_scan_progress_summary(selected.len()) {
@@ -838,6 +845,7 @@ fn collect_members_identity(
 
 /// Deep-scan one member and pin what it named, fail-open: an unreadable
 /// member records its status and its gap, never fails the machine.
+#[allow(clippy::too_many_arguments)]
 fn scan_member(
     pid: u32,
     view: ProcessViewId,
@@ -846,8 +854,11 @@ fn scan_member(
     budget: &mut CaptureWorkBudget,
     noise: &mut DiscoveryNoiseAggregator,
     table: &mut HandleTable,
+    one_shot: bool,
 ) -> MemberResult {
-    scan_member_identity(pid, view, hints, hooks, budget, noise, None, table)
+    scan_member_identity(
+        pid, view, hints, hooks, budget, noise, None, table, one_shot,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -860,6 +871,7 @@ fn scan_member_identity(
     noise: &mut DiscoveryNoiseAggregator,
     custody: Option<&mut ExaminedCustody>,
     table: &mut HandleTable,
+    one_shot: bool,
 ) -> MemberResult {
     let started_ns = monotonic_ns();
     let budget_before = (budget.stopped_reason(), budget.refusal_counts());
@@ -888,6 +900,7 @@ fn scan_member_identity(
             budget_before,
             custody,
             &mut *table,
+            one_shot,
         )
     })
 }
@@ -903,6 +916,7 @@ fn scan_pinned_member(
     started_ns: Option<u64>,
     budget_before: (Option<&'static str>, (u64, u64)),
     table: &mut HandleTable,
+    one_shot: bool,
 ) -> MemberResult {
     scan_pinned_member_identity(
         view_handle,
@@ -914,6 +928,7 @@ fn scan_pinned_member(
         budget_before,
         None,
         table,
+        one_shot,
     )
 }
 
@@ -928,6 +943,7 @@ fn scan_pinned_member_identity(
     budget_before: (Option<&'static str>, (u64, u64)),
     mut custody: Option<&mut ExaminedCustody>,
     table: &mut HandleTable,
+    one_shot: bool,
 ) -> MemberResult {
     let scan = custody.as_mut().map(|held| held.begin_scan());
     let result = scan_pinned_member_inner(
@@ -940,6 +956,7 @@ fn scan_pinned_member_identity(
         budget_before,
         custody.as_deref_mut().zip(scan),
         table,
+        one_shot,
     );
     if (!result.mapping_scan_completed
         || !result.status.inventoried()
@@ -949,6 +966,26 @@ fn scan_pinned_member_identity(
         custody.discard_scan(scan);
     }
     result
+}
+
+/// The member-pin filing reason for this lane: one-shot runs never
+/// retry, so their stops name the terminal wait instead of a next tick.
+fn member_pin_reason(one_shot: bool) -> DeferredReason {
+    if one_shot {
+        DeferredReason::Inspect
+    } else {
+        DeferredReason::Live
+    }
+}
+
+/// The count-manifest filing reason for this lane: one-shot runs never
+/// retry, so their stops name the terminal wait instead of a next pass.
+fn count_manifest_reason(one_shot: bool) -> DeferredReason {
+    if one_shot {
+        DeferredReason::CountManifestOneShot
+    } else {
+        DeferredReason::CountManifest
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -962,6 +999,7 @@ fn scan_pinned_member_inner(
     budget_before: (Option<&'static str>, (u64, u64)),
     custody: Option<(&mut ExaminedCustody, u64)>,
     table: &mut HandleTable,
+    one_shot: bool,
 ) -> MemberResult {
     let pid = view_handle.pid();
     let view = view_handle.id();
@@ -1020,13 +1058,15 @@ fn scan_pinned_member_inner(
     // The run's table bounds this member's pins like every other
     // member's: a full table stops the pin with the shared
     // budget-stop gap, which files below as this member's named gap.
+    // One-shot runs file the one-shot reason: they never retry, so
+    // the stop names the terminal wait instead of a next tick.
     let (pins, pin_skips) = match pin_scanned_view_objects_with_table(
         view_handle,
         outcome.modules(),
         budget,
         None,
         table,
-        DeferredReason::Live,
+        member_pin_reason(one_shot),
     ) {
         Ok(pinned) => pinned,
         Err(error) => {
@@ -1469,6 +1509,8 @@ pub(crate) struct CatalogLowering {
 /// the catalog. `inspect --system` lowers Detailed; the inventory command
 /// lowers Inventory. The only `Err` is a failed `/proc` listing
 /// (stdout stays empty); unreadable members render as gaps.
+/// `one_shot` is true only for one-shot runs (no retry): budget stops
+/// then name the terminal wait instead of a next tick or pass.
 pub(crate) fn collect(
     hints: &[PathBuf],
     excludes: &[PathBuf],
@@ -1476,10 +1518,19 @@ pub(crate) fn collect(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     scanned: &BTreeSet<u32>,
+    one_shot: bool,
 ) -> Result<Catalog> {
     let mut budget = CaptureWorkBudget::default();
     budget.set_excludes(excludes.to_vec());
-    collect_with_budget(hints, hooks, max_scan_pids, policy, budget, scanned)
+    collect_with_budget(
+        hints,
+        hooks,
+        max_scan_pids,
+        policy,
+        budget,
+        scanned,
+        one_shot,
+    )
 }
 
 pub(crate) fn collect_with_budget(
@@ -1489,6 +1540,7 @@ pub(crate) fn collect_with_budget(
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
     scanned: &BTreeSet<u32>,
+    one_shot: bool,
 ) -> Result<Catalog> {
     collect_with_count_manifests(
         hints,
@@ -1501,6 +1553,7 @@ pub(crate) fn collect_with_budget(
         0,
         0,
         &ScanPriors::empty(),
+        one_shot,
     )
 }
 
@@ -1523,6 +1576,7 @@ pub(crate) fn collect_with_count_manifests(
     prior_objects: usize,
     prior_bytes: u64,
     priors: &ScanPriors,
+    one_shot: bool,
 ) -> Result<Catalog> {
     collect_identity(
         hints,
@@ -1536,6 +1590,7 @@ pub(crate) fn collect_with_count_manifests(
         prior_objects,
         prior_bytes,
         priors,
+        one_shot,
     )
     .map(|(catalog, _)| catalog)
 }
@@ -1566,6 +1621,7 @@ pub(crate) fn collect_inventory_identity(
         0,
         0,
         &ScanPriors::empty(),
+        false,
     )?;
     Ok((catalog, custody.expect("opt-in collection owns custody")))
 }
@@ -1583,6 +1639,7 @@ fn collect_identity(
     prior_objects: usize,
     prior_bytes: u64,
     priors: &ScanPriors,
+    one_shot: bool,
 ) -> Result<(Catalog, Option<ExaminedCustody>)> {
     let mut timings = StageTimings::new();
     // One table for the run: member pins and manifest objects share
@@ -1604,6 +1661,7 @@ fn collect_identity(
             scanned,
             priors,
             &mut handles,
+            one_shot,
         )
     } else {
         (
@@ -1616,6 +1674,7 @@ fn collect_identity(
                 scanned,
                 priors,
                 &mut handles,
+                one_shot,
             ),
             None,
         )
@@ -1706,6 +1765,7 @@ fn collect_identity(
         prior_objects,
         prior_bytes,
         &mut handles,
+        one_shot,
     );
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(
@@ -1813,6 +1873,7 @@ pub(crate) fn collect_pid_with_count_manifests(
         &mut budget,
         &mut noise,
         &mut handles,
+        false,
     );
     noise.report();
     if !member.status.inventoried() {
@@ -1851,6 +1912,7 @@ pub(crate) fn collect_pid_with_count_manifests(
         prior_objects,
         prior_bytes,
         &mut handles,
+        false,
     );
     progress!("p11scope: collector {}", handles.diagnostic_line());
     Ok(assemble(
@@ -2053,6 +2115,7 @@ fn prepare_count_manifests(
     prior_objects: usize,
     prior_bytes: u64,
     table: &mut HandleTable,
+    one_shot: bool,
 ) {
     for path in paths {
         let accepted = (|| -> Result<Manifest> {
@@ -2126,7 +2189,9 @@ fn prepare_count_manifests(
             // Manifest objects file into the run's table; the strict
             // refusal below turns any deferral into a scope gap (the
             // `count manifest refused` row), never the run's hard
-            // error, unchanged.
+            // error, unchanged. One-shot runs file the one-shot
+            // reason: they never retry, so the stop names the
+            // terminal wait instead of a next pass.
             let pinning = pin_count_manifest_objects_in_views_with_prior_and_table(
                 &manifest,
                 &views,
@@ -2134,7 +2199,7 @@ fn prepare_count_manifests(
                 prior_objects,
                 prior_bytes,
                 &mut *table,
-                DeferredReason::CountManifest,
+                count_manifest_reason(one_shot),
             )
             .map_err(|error| anyhow::anyhow!("manifest pinning refused: {:?}", error.problems()))?;
             ensure!(
@@ -5114,6 +5179,7 @@ pub(crate) fn collect_system_with_identity(
         scanned,
         priors,
         &mut handles,
+        false,
     );
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
@@ -5260,6 +5326,7 @@ pub(crate) fn collect_system_with_identity(
         prior_objects,
         prior_bytes,
         &mut handles,
+        false,
     );
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(
@@ -6011,6 +6078,7 @@ mod tests {
             0,
             0,
             &mut table,
+            false,
         );
         assert_eq!(collection.scope_gaps.len(), 1);
         assert!(
@@ -6019,6 +6087,68 @@ mod tests {
                 .contains(crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST),
             "the deferral waits for the next pass: {:?}",
             collection.scope_gaps[0].reason
+        );
+    }
+
+    #[test]
+    fn staged_count_manifest_oneshot_names_no_retry() {
+        // One-shot twin of the next-pass deferral above: a count
+        // manifest deferred by a full table in a one-shot run names
+        // the terminal wait — the run never retries, so no "next
+        // pass". The zero-cap table defers every trusted-class filing,
+        // so no prefill can mask the row text.
+        let (_dir, doc) = count_manifest_doc();
+        let mut collection = empty_collection();
+        let mut bound = super::bind_collection(&mut collection);
+        let mut table = crate::discovery::handle_table::HandleTable::new(0);
+        super::prepare_count_manifests(
+            &mut collection,
+            &mut bound,
+            std::slice::from_ref(&doc),
+            0,
+            0,
+            &mut table,
+            true,
+        );
+        assert_eq!(collection.scope_gaps.len(), 1);
+        assert!(
+            collection.scope_gaps[0]
+                .reason
+                .contains(crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_COUNT_MANIFEST_ONESHOT),
+            "the one-shot deferral names the terminal wait: {:?}",
+            collection.scope_gaps[0].reason
+        );
+        assert!(
+            !collection.scope_gaps[0].reason.contains("next pass"),
+            "no next pass in a one-shot run: {:?}",
+            collection.scope_gaps[0].reason
+        );
+    }
+
+    #[test]
+    fn oneshot_reasons_name_the_terminal_wait() {
+        // The one-shot reason table: one-shot runs never retry, so
+        // member pins file the inspect reason (terminal tail) and
+        // count manifests file the one-shot count reason (terminal
+        // gap); multi-pass runs keep the retry reasons. The count
+        // twin above proves the flag reaches its sink end to end; the
+        // member sink shares the same threaded chain, and the inspect
+        // tail itself is pinned in the identity tests.
+        assert_eq!(
+            super::member_pin_reason(true),
+            crate::discovery::handle_table::DeferredReason::Inspect,
+        );
+        assert_eq!(
+            super::member_pin_reason(false),
+            crate::discovery::handle_table::DeferredReason::Live,
+        );
+        assert_eq!(
+            super::count_manifest_reason(true),
+            crate::discovery::handle_table::DeferredReason::CountManifestOneShot,
+        );
+        assert_eq!(
+            super::count_manifest_reason(false),
+            crate::discovery::handle_table::DeferredReason::CountManifest,
         );
     }
 
@@ -6161,6 +6291,7 @@ mod tests {
             512,
             0,
             &mut table,
+            false,
         );
         assert!(bound.count_manifests.is_empty());
         assert_eq!(collection.scope_gaps.len(), 1);
@@ -6181,6 +6312,7 @@ mod tests {
             0,
             0,
             &mut table,
+            false,
         );
         assert!(bound.count_manifests.is_empty());
         assert_eq!(collection.scope_gaps.len(), 1);
@@ -7472,6 +7604,7 @@ mod tests {
                 &mut CaptureWorkBudget::default(),
                 &mut DiscoveryNoiseAggregator::default(),
                 &mut table,
+                false,
             );
             assert!(result.status.inventoried());
             let json = application_json(&result.application);
@@ -7584,6 +7717,7 @@ int main(int argc, char **argv) {
                 &mut CaptureWorkBudget::default(),
                 &mut DiscoveryNoiseAggregator::default(),
                 &mut table,
+                false,
             );
             assert!(result.status.inventoried());
             assert_eq!(
@@ -10862,6 +10996,7 @@ pub(crate) mod demotion_retirement_producer_tests {
                 &mut budget,
                 &mut noise,
                 &mut table,
+                false,
             );
             // SAFETY: the exact owned mapping is no longer used by the scanner.
             assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
@@ -10918,6 +11053,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             &mut budget,
             &mut noise,
             &mut table,
+            false,
         );
         // SAFETY: scanning completed; this is the exact owned 4096-byte mapping.
         assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
@@ -10942,6 +11078,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             &mut positive_budget,
             &mut noise,
             &mut table,
+            false,
         );
         drop(child);
         assert!(
@@ -11881,6 +12018,7 @@ mod maps_skip_tests {
                 &scanned,
                 priors,
                 &mut table,
+                false,
             )
             .0
         };
@@ -11958,6 +12096,7 @@ mod take_anchors_wiring_tests {
                 &std::collections::BTreeSet::new(),
                 &super::ScanPriors::empty(),
                 &mut table,
+                false,
             );
             assert!(
                 collection.selected.is_empty(),

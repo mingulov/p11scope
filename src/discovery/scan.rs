@@ -5497,14 +5497,15 @@ fn capture_scan_reason(reason: &str) -> bool {
     )
 }
 
-/// Budget-exhaustion stops that keep decoded modules past a failed final
-/// bracket (owner data-always rule 2026-11-09, controller R1): the budget
-/// bought a full allowance of decode work and only the re-validation ran
-/// dry, so the decoded modules publish with the failure named — never an
-/// empty view. Every other bracket failure (a proven mapping change, an
-/// unreadable maps snapshot, a lost generation) keeps the fail-closed
-/// clear. Maps byte/entry ceilings are truncated snapshots, not an
-/// exhausted allowance, so they stay out of this set.
+/// Budget-exhaustion reasons for the failed-bracket keep (owner
+/// data-always rule 2026-11-09, controller R1): the bracket keeps its
+/// decoded modules only when EVERY failing half names one of these —
+/// the budget bought a full allowance of decode work and only the
+/// re-validation ran dry, so the decoded modules publish with the
+/// failure named, never an empty view. Any other failing half (a proven
+/// mapping change, an unreadable maps snapshot, a lost generation)
+/// keeps the fail-closed clear. Maps byte/entry ceilings are truncated
+/// snapshots, not an exhausted allowance, so they stay out of this set.
 fn bracket_budget_exhaustion(reason: &str) -> bool {
     matches!(
         reason,
@@ -5589,8 +5590,9 @@ fn undecoded_cause(budget: &CaptureWorkBudget) -> &'static str {
 /// Subject of the counted undecoded gap: the decode stage that refused
 /// the files — deliberately not `capture discovery`, which the empty-plan
 /// classifier reads as "discovery stopped early" even when the bracket
-/// passed and nothing stopped.
-const UNDECODED_GAP_SUBJECT: &str = "table decode";
+/// passed and nothing stopped. The classifier skips this subject: each
+/// counted file already carries its own per-file ceiling row.
+pub(crate) const UNDECODED_GAP_SUBJECT: &str = "table decode";
 
 /// The counted remainder gap for provider files a table-decode ceiling
 /// left with no decoded table.
@@ -7935,16 +7937,26 @@ fn scan_view_examined_mode(
             // re-validation ran dry, so the decoded modules publish with
             // the bracket failure named above — never an empty view (owner
             // data-always rule 2026-11-09). The live pin must still hold
-            // (a dead pin is a proven change); every other bracket failure
-            // keeps the fail-closed clear. The check's own failure reasons
-            // count as well as the sticky stop: DetailedLegacy IO
-            // exhaustion names its ceiling without setting a stop.
+            // (a dead pin is a proven change). The keep needs EVERY
+            // failing half to name a budget reason: a passed half beside
+            // a starved half keeps, but one starved half never overrides
+            // a genuine failure in the other (a proven mapping change, an
+            // unreadable maps snapshot, a lost generation, a truncated
+            // maps ceiling). This arm always has at least one Err, so no
+            // separate sticky-stop check is needed: a stop both halves
+            // agree on keeps, anything else clears. The check's own
+            // failure reasons are read, not the sticky stop:
+            // DetailedLegacy IO exhaustion names its ceiling without
+            // setting one.
             // Absence evidence always needs the full bracket.
-            let resource_starved = budget
-                .stopped_reason()
-                .is_some_and(bracket_budget_exhaustion)
-                || matches!(&validation, Err(reason) if bracket_budget_exhaustion(reason))
-                || matches!(&generation, Err(reason) if bracket_budget_exhaustion(reason));
+            let resource_starved = validation
+                .as_ref()
+                .err()
+                .is_none_or(|reason| bracket_budget_exhaustion(reason))
+                && generation
+                    .as_ref()
+                    .err()
+                    .is_none_or(|reason| bracket_budget_exhaustion(reason));
             if resource_starved && view.still_the_same() {
                 // A module the check PROVED changed is dropped with its
                 // mapping-changed row, like the healthy arm; only passed
@@ -9220,20 +9232,41 @@ mod tests {
     extern "C" fn ceiling_anchor() {}
 
     /// Fill `count` table-candidate slots with distinct crafted tables
-    /// decoded from this binary's own data mapping, so the scan under
-    /// test meets a nearly saturated 512-candidate ceiling. The direct
-    /// decodes charge walk work like any decode, so callers sizing a
-    /// tight work ceiling must saturate first and add the control run's
-    /// `before_b` figure on top of the spent saturation work.
+    /// decoded against a synthetic map index, so the scan under test
+    /// meets a nearly saturated 512-candidate ceiling. The index is
+    /// synthetic — never the live `/proc/self/maps`, whose snapshot
+    /// tears under parallel-test mmap churn — with a writable data
+    /// range for the nominal table addresses and an executable file
+    /// range covering the slot targets. The direct decodes charge walk
+    /// work like any decode, so callers sizing a tight work ceiling
+    /// must saturate first and add the control run's `before_b` figure
+    /// on top of the spent saturation work.
     fn saturate_table_candidates(budget: &mut CaptureWorkBudget, count: usize) {
-        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
-        let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
-        let data = maps
-            .iter()
-            .find(|mapping| {
-                mapping.permissions.starts_with(b"rw-") && mapping.end - mapping.start >= 4096
-            })
-            .expect("the test process has a writable data mapping");
+        let anchor = ceiling_anchor as *const () as usize as u64;
+        let exec_start = anchor & !0xfff;
+        let data_start = exec_start + 0x10_0000;
+        let maps = [
+            MapEntry {
+                start: exec_start,
+                end: exec_start + 0x1000,
+                file_offset: 0,
+                permissions: *b"r-xp",
+                device: Device { major: 8, minor: 1 },
+                inode: 999,
+                raw_path: Some(b"/synthetic/saturate-test".to_vec()),
+            },
+            MapEntry {
+                start: data_start,
+                end: data_start + 0x2000,
+                file_offset: 0,
+                permissions: *b"rw-p",
+                device: Device { major: 0, minor: 0 },
+                inode: 0,
+                raw_path: None,
+            },
+        ];
+        let map_index = MapIndex::new(&maps).expect("synthetic entries are sorted and disjoint");
+        let data = &maps[1];
         let mut snapshot = vec![0u8; 2048];
         snapshot[..8].copy_from_slice(&0x2802u64.to_le_bytes());
         for slot in 0..255 {
@@ -9406,8 +9439,10 @@ mod tests {
     }
 
     /// Refusal twin: a proven generation loss on a healthy budget still
-    /// drops every module — the work-starved keep never rescues a
-    /// genuinely unprovable scan — and refuses nothing spuriously.
+    /// drops every module and refuses nothing spuriously. The two
+    /// mixed-leg twins below prove the same when the other half
+    /// starves: a lost generation is never a budget reason, so the
+    /// every-failing-half keep never rescues it.
     #[test]
     fn proven_generation_loss_still_drops_modules_without_an_undecoded_gap() {
         let mut f = BracketFixture::new(8, true);
@@ -9535,9 +9570,10 @@ mod tests {
             "a truncated maps snapshot clears even under a sticky budget stop: {outcome:?}"
         );
         assert!(
-            outcome.skipped().iter().any(|skip| skip
-                .reason
-                .contains(MAPS_ENTRY_CEILING_REASON)),
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains(MAPS_ENTRY_CEILING_REASON)),
             "the truncated snapshot stays named: {:?}",
             outcome.skipped()
         );

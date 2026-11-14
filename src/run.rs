@@ -6957,10 +6957,12 @@ impl EmptyPlanClasses<'_> {
 /// `--module`. Every other non-benign skip is a mapped file the scan
 /// could not examine, whose provider-ness is exactly what cannot be
 /// determined — except `capture discovery` stops, which read as
-/// discovery events, never file counts. Verified absence (an examined
-/// file with no table, a hint verified absent), a function entry in a
-/// decoded table, and a proxy closure still awaiting publication keep
-/// the nothing-found hint.
+/// discovery events, never file counts. The counted `table decode`
+/// summary is an aggregate over per-file rows the scan already
+/// emitted, never a file. Verified absence (an examined file with no
+/// table, a hint verified absent), a function entry in a decoded
+/// table, and a proxy closure still awaiting publication keep the
+/// nothing-found hint.
 fn classify_empty_plan(plan: &crate::plan::AttachPlan) -> EmptyPlanClasses<'_> {
     use crate::discovery::scan::Skipped;
     let mut confirmed: Vec<&Skipped> = plan
@@ -6986,6 +6988,11 @@ fn classify_empty_plan(plan: &crate::plan::AttachPlan) -> EmptyPlanClasses<'_> {
             // A scan ceiling, stop or unavailable map is a discovery
             // event, not a mapped file: it never joins the file count.
             discovery_stops.push(skip);
+        } else if skip.subject == crate::discovery::scan::UNDECODED_GAP_SUBJECT {
+            // The counted undecoded remainder is an aggregate, not a
+            // mapped file: every file it counts already carries its own
+            // per-file ceiling row, so the summary never joins the file
+            // count.
         } else {
             unexamined.push(skip);
         }

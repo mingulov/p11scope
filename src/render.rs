@@ -5163,7 +5163,7 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
     // residual F-12): the metrics lane embeds `Evidence` directly (the
     // four profile-only fields are absent) with a selection-blind verdict.
     let envelope = evidence_envelope(metrics_evidence_base_value(ev), None, None);
-    let streamer = StreamedMetricsReport::new(reports, ev, &envelope, capture, None, true);
+    let streamer = StreamedMetricsReport::new(reports, ev, &envelope, capture, None, false);
     serde_json::to_value(&streamer).expect("the metrics streamer serializes to a value")
 }
 
@@ -5859,7 +5859,7 @@ pub fn profile_json(
     // four versioned-only evidence fields with a selection-aware verdict.
     let ev = versioned.evidence();
     let envelope = evidence_envelope(versioned.into_value(), None, None);
-    let streamer = StreamedProfileReport::new(reports, ev, &envelope, state, capture, None, true);
+    let streamer = StreamedProfileReport::new(reports, ev, &envelope, state, capture, None, false);
     serde_json::to_value(&streamer).expect("the profile streamer serializes to a value")
 }
 
@@ -6265,10 +6265,11 @@ fn metrics_section_value(
 /// struct for both sinks: the healthy file pass leaves `delivery` as
 /// `None`, while the stdout rescue carries `Some` mark, emitted in its
 /// sorted position (third, between `cgroups` and `evidence`). R5 is
-/// measured here, not rebuilt: each built section updates
-/// `largest_section` via `json_value_bytes` as it serializes (a
-/// `Cell`, not a lock; the seal is single-threaded), so diagnostics
-/// never pay a second section build or a second cgroup walk.
+/// measured here, not rebuilt, and only when `measure` is set: each
+/// built section updates `largest_section` via `json_value_bytes` as
+/// it serializes (a `Cell`, not a lock; the seal is single-threaded),
+/// so diagnostics never pay a second section build or a second cgroup
+/// walk, and the default path pays no walk at all.
 pub(crate) struct StreamedProfileReport<'a> {
     reports: &'a [crate::metrics::SlotReport],
     ev: &'a Evidence,
@@ -6303,7 +6304,8 @@ impl<'a> StreamedProfileReport<'a> {
     }
 
     /// The largest non-evidence section seen while serializing, in
-    /// `json_value_bytes` units for R5. Zero until serialized.
+    /// `json_value_bytes` units for R5. Zero until serialized with
+    /// measuring on; stays zero when `measure` is false.
     pub(crate) fn largest_section_bytes(&self) -> u64 {
         self.largest_section.get()
     }
@@ -6337,9 +6339,11 @@ impl serde::Serialize for StreamedProfileReport<'_> {
                         self.capture,
                         &forwarding,
                     );
-                    let bytes = crate::memory_counters::json_value_bytes(&value);
-                    self.largest_section
-                        .set(self.largest_section.get().max(bytes));
+                    if self.measure {
+                        let bytes = crate::memory_counters::json_value_bytes(&value);
+                        self.largest_section
+                            .set(self.largest_section.get().max(bytes));
+                    }
                     map.serialize_entry(section.as_str(), &value)?;
                 }
             }
@@ -6353,7 +6357,8 @@ impl serde::Serialize for StreamedProfileReport<'_> {
 
 /// B2: a metrics report that serializes section by section, like the
 /// profile streamer above. `delivery` sorts second here, between
-/// `capture` and `evidence`.
+/// `capture` and `evidence`. The section walk for R5 runs only when
+/// `measure` is set, like the profile streamer.
 pub(crate) struct StreamedMetricsReport<'a> {
     reports: &'a [crate::metrics::SlotReport],
     ev: &'a Evidence,
@@ -6385,7 +6390,7 @@ impl<'a> StreamedMetricsReport<'a> {
     }
 
     /// The largest non-evidence section seen while serializing, like the
-    /// profile getter above.
+    /// profile getter above: zero unless serialized with measuring on.
     pub(crate) fn largest_section_bytes(&self) -> u64 {
         self.largest_section.get()
     }
@@ -6418,9 +6423,11 @@ impl serde::Serialize for StreamedMetricsReport<'_> {
                         self.capture,
                         &forwarding,
                     );
-                    let bytes = crate::memory_counters::json_value_bytes(&value);
-                    self.largest_section
-                        .set(self.largest_section.get().max(bytes));
+                    if self.measure {
+                        let bytes = crate::memory_counters::json_value_bytes(&value);
+                        self.largest_section
+                            .set(self.largest_section.get().max(bytes));
+                    }
                     map.serialize_entry(section.as_str(), &value)?;
                 }
             }
@@ -19684,7 +19691,7 @@ pub(crate) mod tests {
                 let base = VersionedEvidence::wrap(ev).into_value();
                 let envelope = super::evidence_envelope(base, snapshot_opt, ledger_opt);
                 let streamed = super::StreamedProfileReport::new(
-                    reports, ev, &envelope, state, &capture, None, true,
+                    reports, ev, &envelope, state, &capture, None, false,
                 );
                 let materialized =
                     serde_json::to_value(&streamed).expect("the profile streamer materializes");
@@ -19739,8 +19746,9 @@ pub(crate) mod tests {
                     snapshot_opt,
                     ledger_opt,
                 );
-                let streamed =
-                    super::StreamedMetricsReport::new(reports, ev, &envelope, &capture, None, true);
+                let streamed = super::StreamedMetricsReport::new(
+                    reports, ev, &envelope, &capture, None, false,
+                );
                 let materialized =
                     serde_json::to_value(&streamed).expect("the metrics streamer materializes");
                 if arm == "legacy-gaps" {
@@ -19781,7 +19789,7 @@ pub(crate) mod tests {
                 &large_state,
                 &capture,
                 Some(delivery.clone()),
-                true,
+                false,
             );
             let materialized =
                 serde_json::to_value(&streamed).expect("the profile rescue materializes");
@@ -19831,7 +19839,7 @@ pub(crate) mod tests {
                 &envelope,
                 &capture,
                 Some(delivery.clone()),
-                true,
+                false,
             );
             let materialized =
                 serde_json::to_value(&streamed).expect("the metrics rescue materializes");
@@ -20128,7 +20136,7 @@ pub(crate) mod tests {
                     Some(&ledger),
                 );
                 let streamed = super::StreamedProfileReport::new(
-                    &reports, &ev, &envelope, &state, &capture, None, true,
+                    &reports, &ev, &envelope, &state, &capture, None, false,
                 );
                 let mut writer = CountingWriter { bytes: 0 };
                 serde_json::to_writer_pretty(&mut writer, &streamed).unwrap();
@@ -20261,7 +20269,7 @@ pub(crate) mod tests {
                     Some(&ledger),
                 );
                 let streamed = super::StreamedMetricsReport::new(
-                    &reports, &ev, &envelope, &capture, None, true,
+                    &reports, &ev, &envelope, &capture, None, false,
                 );
                 let mut writer = CountingWriter { bytes: 0 };
                 serde_json::to_writer_pretty(&mut writer, &streamed).unwrap();

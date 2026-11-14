@@ -5499,7 +5499,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                 None,
             );
             let streamed = render::StreamedProfileReport::new(
-                &reports, &ev, &envelope, &state, &capture, None, true,
+                &reports, &ev, &envelope, &state, &capture, None, false,
             );
             write_json_report(out_file.file(), &streamed)?;
         } else {
@@ -5509,7 +5509,7 @@ fn seal_owned_handoff_profile(context: &mut HandoffReportContext) -> Result<()> 
                 None,
             );
             let streamed =
-                render::StreamedMetricsReport::new(&reports, &ev, &envelope, &capture, None, true);
+                render::StreamedMetricsReport::new(&reports, &ev, &envelope, &capture, None, false);
             write_json_report(out_file.file(), &streamed)?;
         }
         out_file.commit().map_err(anyhow::Error::msg)?;
@@ -10784,6 +10784,7 @@ fn capture_profile(
                 );
                 poll_terminal_cancellation();
                 let out_path = out_file.path().to_path_buf();
+                let diagnostics_on = capture_diagnostics_on();
                 let streamed = render::StreamedProfileReport::new(
                     reports,
                     &ev,
@@ -10791,13 +10792,13 @@ fn capture_profile(
                     consumers.state,
                     &capture,
                     None,
-                    true,
+                    diagnostics_on,
                 );
                 // The rescue streamer is built inside the closure below;
                 // its largest section rides out through this cell so R5
                 // can take the larger of the two passes.
                 let rescue_largest = std::cell::Cell::new(0u64);
-                publish_streamed_report_with_drop_accounting(
+                let published = publish_streamed_report_with_drop_accounting(
                     context.3,
                     context.4,
                     consumers.scheduling,
@@ -10818,7 +10819,7 @@ fn capture_profile(
                             consumers.state,
                             &capture,
                             Some(delivery),
-                            true,
+                            diagnostics_on,
                         );
                         let result = serde_json::to_writer(&mut *bytes, &rescued);
                         rescue_largest
@@ -10826,19 +10827,19 @@ fn capture_profile(
                         result
                     },
                     frame_error,
-                )
-                .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
+                );
                 // B2 (R5): the streamed peak — envelope plus the largest
                 // section as recorded by the streamer during
-                // serialization — only when diagnostics are on. Set after
-                // publication (the A0 line emits after the seal), from the
-                // larger of the file and rescue passes.
-                *seal_value_bytes =
-                    seal_value_bytes_if_diagnostics(capture_diagnostics_on(), || {
-                        crate::memory_counters::json_value_bytes(&envelope).saturating_add(
-                            streamed.largest_section_bytes().max(rescue_largest.get()),
-                        )
-                    });
+                // serialization — only when diagnostics are on. Assigned
+                // before the publication error propagates (a rescue always
+                // returns the `-o` error), from the larger of the file and
+                // rescue passes; the A0 line emits after the seal.
+                *seal_value_bytes = seal_value_bytes_if_diagnostics(diagnostics_on, || {
+                    crate::memory_counters::json_value_bytes(&envelope)
+                        .saturating_add(streamed.largest_section_bytes().max(rescue_largest.get()))
+                });
+                published
+                    .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
             } else {
                 let envelope = render::evidence_envelope(
                     render::metrics_evidence_base_value(&ev),
@@ -10847,11 +10848,17 @@ fn capture_profile(
                 );
                 poll_terminal_cancellation();
                 let out_path = out_file.path().to_path_buf();
+                let diagnostics_on = capture_diagnostics_on();
                 let streamed = render::StreamedMetricsReport::new(
-                    reports, &ev, &envelope, &capture, None, true,
+                    reports,
+                    &ev,
+                    &envelope,
+                    &capture,
+                    None,
+                    diagnostics_on,
                 );
                 let rescue_largest = std::cell::Cell::new(0u64);
-                publish_streamed_report_with_drop_accounting(
+                let published = publish_streamed_report_with_drop_accounting(
                     context.3,
                     context.4,
                     consumers.scheduling,
@@ -10871,7 +10878,7 @@ fn capture_profile(
                             &envelope,
                             &capture,
                             Some(delivery),
-                            true,
+                            diagnostics_on,
                         );
                         let result = serde_json::to_writer(&mut *bytes, &rescued);
                         rescue_largest
@@ -10879,14 +10886,13 @@ fn capture_profile(
                         result
                     },
                     frame_error,
-                )
-                .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
-                *seal_value_bytes =
-                    seal_value_bytes_if_diagnostics(capture_diagnostics_on(), || {
-                        crate::memory_counters::json_value_bytes(&envelope).saturating_add(
-                            streamed.largest_section_bytes().max(rescue_largest.get()),
-                        )
-                    });
+                );
+                *seal_value_bytes = seal_value_bytes_if_diagnostics(diagnostics_on, || {
+                    crate::memory_counters::json_value_bytes(&envelope)
+                        .saturating_add(streamed.largest_section_bytes().max(rescue_largest.get()))
+                });
+                published
+                    .map_err(|error| terminal_publication_error(terminal_error.take(), error))?;
             }
         } else if let Some(error) = frame_error {
             return Err(terminal_publication_error(terminal_error.take(), error));
@@ -10930,7 +10936,7 @@ fn write_json_report(file: &mut std::fs::File, report: &impl serde::Serialize) -
     {
         let mut writer = std::io::BufWriter::new(&mut *file);
         serde_json::to_writer_pretty(&mut writer, report).context("writing profile output")?;
-        writer.flush().context("flushing profile output")?;
+        writer.flush().context("writing profile output")?;
     }
     file.flush().context("flushing profile output")?;
     file.sync_all().context("syncing profile output")

@@ -8510,6 +8510,20 @@ fn maybe_emit_memory_line(
     crate::memory_counters::emit_line(&snapshot(cadence.elapsed_secs(now)));
 }
 
+/// A0 (R5): measure the sealed report tree only when diagnostics are
+/// on; the off path never runs the closure, so the default path pays
+/// nothing for the R5 counter.
+fn seal_value_bytes_if_diagnostics(
+    diagnostics_on: bool,
+    measure: impl FnOnce() -> u64,
+) -> Option<u64> {
+    if diagnostics_on {
+        Some(measure())
+    } else {
+        None
+    }
+}
+
 /// The one startup line, printed on stderr as the first action of
 /// every live capture, before the slow discovery/attach work: the
 /// flagship command spends tens of seconds between launch and the
@@ -10754,8 +10768,11 @@ fn capture_profile(
                 Some(ledger) => metrics::selected_detail_driver::with_selected_detail(j, ledger),
                 None => j,
             };
-            // A0 (R5): measure the sealed tree before it streams to disk.
-            *seal_value_bytes = Some(crate::memory_counters::json_value_bytes(&j));
+            // A0 (R5): measure the sealed tree before it streams to disk,
+            // only when diagnostics are on (the default path skips the walk).
+            *seal_value_bytes = seal_value_bytes_if_diagnostics(capture_diagnostics_on(), || {
+                crate::memory_counters::json_value_bytes(&j)
+            });
             poll_terminal_cancellation();
             let out_path = out_file.path().to_path_buf();
             publish_profile_report_with_drop_accounting(
@@ -27551,6 +27568,19 @@ int main(int argc, char **argv) {
             None
         );
         assert_eq!(loader_readiness_hooks(true, || 7), Some(7));
+    }
+
+    /// A0 (R5): the seal-tree measurement runs only when diagnostics
+    /// are on; the default path never walks the sealed tree.
+    #[test]
+    fn seal_value_bytes_gated_on_capture_diagnostics() {
+        assert_eq!(
+            seal_value_bytes_if_diagnostics(false, || panic!(
+                "the default path must not walk the sealed tree"
+            )),
+            None
+        );
+        assert_eq!(seal_value_bytes_if_diagnostics(true, || 7), Some(7));
     }
 
     /// Startup T2: both capture loops emit the ready line before the

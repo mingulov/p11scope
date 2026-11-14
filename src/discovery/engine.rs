@@ -6490,9 +6490,13 @@ pub(crate) const OWNED_WATCH_RESCAN_HORIZON_NS: u64 = 5_000_000_000;
 /// a run stops scanning further members once it has spent this long,
 /// so mapping-heavy members cannot starve the frame's own discovery
 /// behind megabytes of rescans. At least one eligible member scans
-/// per run (progress); the rest wait for the next run.
-/// Provisional — ratify by measurement.
-pub(crate) const OWNED_WATCH_RUN_BUDGET_NS: u64 = 20_000_000;
+/// per run (progress); the rest wait for the next run. The per-member
+/// backoff carries the steady-state bound (a 345 KB-maps shape drops
+/// from 9.3 s to ~3 s of scan stage on backoff alone); this cap is the
+/// backstop for pathological single scans, so it sits a hundredfold
+/// above typical small-member scans (~1 ms) rather than inside loaded
+/// test timing.
+pub(crate) const OWNED_WATCH_RUN_BUDGET_NS: u64 = 100_000_000;
 
 /// Per-run attempted-I/O budget for the owned-tree watch, in bytes:
 /// the same stop condition in I/O terms, for cache-hot scans whose

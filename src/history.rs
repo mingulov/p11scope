@@ -72,9 +72,20 @@ struct PendingExit {
 /// in exactly one place (`exit_tap_overflow` on the engine).
 pub(crate) const EXIT_TAP_QUEUE_LIMIT: usize = 16_384;
 
-/// Drains past its tap position an unmatched exit survives before it
+/// Position-passing drains an unmatched exit survives before it
 /// drops with the counted `exit_retire_unmatched` gap.
 const EXIT_UNMATCHED_RETRIES: u8 = 2;
+
+/// Whether an exit stamped with tap-time producer `tap_producer` is
+/// due at these EVENTS ring positions: the drain read strictly past
+/// the stamp, or stands exactly on it with nothing committed past it
+/// (a quiet ring — no uncommitted record hides before the drain).
+/// The consumer only advances over consumed records in ring order, so
+/// either case proves every pre-exit CALL was already reduced.
+fn exit_due(consumer_now: usize, producer_now: usize, tap_producer: usize) -> bool {
+    consumer_now > tap_producer || (consumer_now == tap_producer && producer_now == tap_producer)
+}
+
 pub(crate) struct Registry {
     limit: usize,
     tasks: BTreeMap<u64, Task>,
@@ -320,8 +331,69 @@ impl Registry {
         producer_now: usize,
         budget: usize,
     ) -> BTreeSet<ProcessKey> {
-        let _ = (consumer_now, producer_now, budget);
-        BTreeSet::new()
+        let mut due = BTreeSet::new();
+        let mut keep = Vec::new();
+        let mut examined = 0usize;
+        while examined < budget {
+            let Some(pending) = self.pending_exits.pop_front() else {
+                break;
+            };
+            if !exit_due(consumer_now, producer_now, pending.tap_producer) {
+                // Tap stamps are non-decreasing down the queue: nothing
+                // behind this exit can be due either.
+                self.pending_exits.push_front(pending);
+                break;
+            }
+            examined += 1;
+            let matched = self.match_exit_tap(&pending.tap);
+            if matched.is_empty() {
+                let mut pending = pending;
+                pending.passes += 1;
+                if pending.passes > EXIT_UNMATCHED_RETRIES {
+                    self.exit_retire_unmatched = self.exit_retire_unmatched.saturating_add(1);
+                } else {
+                    keep.push(pending);
+                }
+            } else {
+                due.extend(matched);
+            }
+        }
+        for pending in keep.into_iter().rev() {
+            self.pending_exits.push_front(pending);
+        }
+        due
+    }
+
+    /// Matches one due exit against this pid's open tasks by kernel
+    /// time: tasks admitted strictly before the hook retire, ties
+    /// skip with a counted gap, successors (admitted after the exit)
+    /// are spared. Matched tasks record the exit hook time — the
+    /// earliest observed, so any post-exit event reopens — never the
+    /// `closed` flag, so the next event is never refused.
+    fn match_exit_tap(&mut self, tap: &ExitTap) -> Vec<ProcessKey> {
+        let mut matched = Vec::new();
+        let Some(cookies) = self.pid_index.get(&tap.pid) else {
+            return matched;
+        };
+        // The cookie set is copied: matching mutates tasks below.
+        for cookie in cookies.iter().copied().collect::<Vec<_>>() {
+            let Some(task) = self.tasks.get_mut(&cookie) else {
+                continue;
+            };
+            if task.closed {
+                continue;
+            }
+            if task.first_ts_ns < tap.hook_ts_ns {
+                task.exit_ts_ns = Some(
+                    task.exit_ts_ns
+                        .map_or(tap.hook_ts_ns, |exit| exit.min(tap.hook_ts_ns)),
+                );
+                matched.push(task.key);
+            } else if task.first_ts_ns == tap.hook_ts_ns {
+                self.exit_tie_skipped = self.exit_tie_skipped.saturating_add(1);
+            }
+        }
+        matched
     }
 
     /// `(tie_skipped, unmatched, reopened, late)` exit gap counters.

@@ -4319,10 +4319,93 @@ impl State {
     /// sessions count closed), and its `reduced_histories` entry is
     /// removed with the key refunded only on actual removal — so an
     /// exit retire plus a history retire of the same key refunds once.
-    /// Returns how many input processes held swept state.
+    /// Returns how many input processes lost any swept entry.
     pub fn retire_processes(&mut self, processes: &BTreeSet<ProcessKey>) -> u64 {
-        let _ = processes;
-        0
+        if processes.is_empty() {
+            return 0;
+        }
+        let mut touched = BTreeSet::new();
+        // Open sessions first, exactly as `clear_scope` sweeps them:
+        // each removed session returns its key, clears its session
+        // state, and counts closed. Collected first: the sweep below
+        // mutates the map while `clear_session_state` needs `&mut self`.
+        let sessions: Vec<(ProcessKey, SessionRef)> = self
+            .open
+            .keys()
+            .filter(|(owner, _)| processes.contains(owner))
+            .map(|(owner, session)| (*owner, *session))
+            .collect();
+        for (process, session) in &sessions {
+            let existed = self.open.remove(&(*process, *session)).is_some();
+            if existed {
+                self.release_keys(1);
+                touched.insert(*process);
+            }
+            self.clear_session_state(*process, *session);
+            if existed {
+                self.sessions.closed = self.sessions.closed.saturating_add(1);
+            }
+        }
+        // One retain pass per remaining map, in `clear_scope` order:
+        // the session loop above already cleared per-session state,
+        // so each delta refunds only what its own pass removed.
+        let ops_before = self.active_ops.len();
+        self.active_ops.retain(|(owner, _, _), _| {
+            let drop = processes.contains(owner);
+            if drop {
+                touched.insert(*owner);
+            }
+            !drop
+        });
+        self.release_keys(ops_before - self.active_ops.len());
+        let find_before = self.find_active.len();
+        self.find_active.retain(|(owner, _)| {
+            let drop = processes.contains(owner);
+            if drop {
+                touched.insert(*owner);
+            }
+            !drop
+        });
+        self.release_keys(find_before - self.find_active.len());
+        let ambiguous_before = self.inherited_ambiguous.len();
+        self.inherited_ambiguous.retain(|(owner, _)| {
+            let drop = processes.contains(owner);
+            if drop {
+                touched.insert(*owner);
+            }
+            !drop
+        });
+        self.release_keys(ambiguous_before - self.inherited_ambiguous.len());
+        // `pending` and `detached` never drew from the budget, so their
+        // sweep below returns nothing — same as `clear_scope`.
+        self.pending.retain(|(owner, _, _), _| {
+            let drop = processes.contains(owner);
+            if drop {
+                touched.insert(*owner);
+            }
+            !drop
+        });
+        self.detached.retain(|_, detached| {
+            let drop = processes.contains(&detached.process);
+            if drop {
+                touched.insert(detached.process);
+            }
+            !drop
+        });
+        for process in processes {
+            if self.next_pseudonym.remove(process).is_some() {
+                self.release_keys(1);
+                touched.insert(*process);
+            }
+            // R10: the exit path frees the process entry; the refund
+            // lands only on actual removal, so an exit retire plus a
+            // history retire of the same key refunds exactly once.
+            if self.reduced_histories.remove(process) {
+                self.release_keys(1);
+                touched.insert(*process);
+            }
+        }
+        touched.len() as u64
     }
 
     /// Drops session-scoped state for `process`. `None` retires the whole

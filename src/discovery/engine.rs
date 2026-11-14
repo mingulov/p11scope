@@ -25996,16 +25996,27 @@ impl Engine {
     /// position. Past [`crate::history::EXIT_TAP_QUEUE_LIMIT`] the
     /// incoming tap drops and `exit_tap_overflow` counts it — the
     /// process keeps its rows, never silently.
+    /// Taps one `LEADER_EXIT`/`_MAPPINGS` record for the process-exit
+    /// retire path: the tracker frees the exiting process's semantic
+    /// rows once the EVENTS drain reads past the tap-time producer
+    /// position. Past [`crate::history::EXIT_TAP_QUEUE_LIMIT`] the
+    /// incoming tap drops and `exit_tap_overflow` counts it — the
+    /// process keeps its rows, never silently.
     pub(crate) fn note_exit_tap(&mut self, pid: u32, hook_ts_ns: u64) {
-        let _ = (pid, hook_ts_ns);
+        if self.exit_taps.len() >= crate::history::EXIT_TAP_QUEUE_LIMIT {
+            self.exit_tap_overflow = self.exit_tap_overflow.saturating_add(1);
+            return;
+        }
+        self.exit_taps
+            .push_back(crate::history::ExitTap { pid, hook_ts_ns });
     }
 
     /// Takes up to `max` tapped exits, oldest first, for transfer to
     /// the process tracker. The caller passes the tracker's free
     /// space, so the tracker queue never overflows.
     pub(crate) fn take_exit_taps(&mut self, max: usize) -> Vec<crate::history::ExitTap> {
-        let _ = max;
-        Vec::new()
+        let take = max.min(self.exit_taps.len());
+        self.exit_taps.drain(..take).collect()
     }
 
     /// `(queued taps, overflow drops)` for tests.
@@ -26021,6 +26032,16 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) -> Option<ProcessViewId> {
         let pid = (record.pid_tgid >> 32) as u32;
+        // Exit tap ahead of view/ledger routing: every leader exit is
+        // observed even for viewless pids (--pid captures included),
+        // so the tracker can free the process's semantic rows once
+        // the EVENTS drain reads past the tap-time producer position.
+        if matches!(
+            record.kind,
+            DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+        ) {
+            self.note_exit_tap(pid, record.hook_ts_ns);
+        }
         // 6.14 Option B: seed the exe-identity stash from every EXEC,
         // matched or not; a gap exit may consume it later. Disabled
         // captures ignore the record's exe words entirely.

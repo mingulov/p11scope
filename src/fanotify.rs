@@ -1125,6 +1125,7 @@ impl FileLearner {
             };
             if exited {
                 if worker.handle.join().is_err() {
+                    self.state.loss_other.fetch_add(1, Ordering::Relaxed);
                     lost = true;
                 }
             } else {
@@ -1135,6 +1136,13 @@ impl FileLearner {
             }
         }
         lost || self.state.lost_tail.load(Ordering::Acquire)
+    }
+
+    /// Attributes one residual loss to the `other` telemetry counter:
+    /// the engine's unexpected-disconnect path funnels through here so
+    /// the next `learned_event_loss` can be traced to its source.
+    pub(crate) fn note_other_loss(&self) {
+        self.state.loss_other.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1586,7 +1594,10 @@ fn tally_pid(event: &ParsedFanotifyEvent, pidfd: Option<&OwnedFd>) -> Option<u32
 /// whenever the drain notices it — and always fits inside the join
 /// bound. The `loss_*` counters attribute every learning loss to its
 /// source for the `-v` telemetry line: counts only, never paths, pids
-/// or file bytes.
+/// or file bytes. `other` covers the residual sources — parse errors,
+/// `FIONREAD` failures, drain exits after failed sends or poll errors,
+/// drain panics, and engine disconnects — so the next
+/// `learned_event_loss` can be traced.
 #[derive(Debug, Default)]
 struct LearnShutdownState {
     shutdown: AtomicBool,
@@ -1594,9 +1605,10 @@ struct LearnShutdownState {
     stop: std::sync::Mutex<Option<std::time::Instant>>,
     loss_shed: std::sync::atomic::AtomicU64,
     loss_tail_deadline: std::sync::atomic::AtomicU64,
-    loss_tail_read_error: std::sync::atomic::AtomicU64,
+    loss_read_error: std::sync::atomic::AtomicU64,
     loss_send_deadline: std::sync::atomic::AtomicU64,
     loss_join_timeout: std::sync::atomic::AtomicU64,
+    loss_other: std::sync::atomic::AtomicU64,
 }
 
 /// Sends one message, waiting past a full channel in 1 ms steps so a
@@ -1883,6 +1895,7 @@ impl DrainCtx<'_> {
                     // its length fields still describe, then stop.
                     close_unread_tail(buf, offset, len);
                     self.state.lost_tail.store(true, Ordering::Release);
+                    self.state.loss_other.fetch_add(1, Ordering::Relaxed);
                     return (true, parsed);
                 }
             };
@@ -1898,6 +1911,19 @@ impl DrainCtx<'_> {
 
     fn send(&self, msg: LearnMsg, window: SendWindow) -> bool {
         send_learn_in(self.tx, self.state, msg, window)
+    }
+
+    /// Files one group read error with the shared live/tail meaning:
+    /// the failed read's head event is unproven, so it is counted in
+    /// telemetry (`unreadable` plus the read-error loss counter) and in
+    /// the report (`lost_tail`), then the drain continues — a lone
+    /// error never abandons the queue. The 1 ms pacing keeps a
+    /// persistently failing fd from hot-spinning the drain.
+    fn note_read_error(&mut self) {
+        self.stats.unreadable = self.stats.unreadable.saturating_add(1);
+        self.state.loss_read_error.fetch_add(1, Ordering::Relaxed);
+        self.state.lost_tail.store(true, Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
     fn process_event(&mut self, event: ParsedFanotifyEvent, window: SendWindow) -> bool {
@@ -2137,6 +2163,34 @@ fn fionread_unit_from_probe(snapshot: Option<usize>, got: libc::ssize_t, buf: &[
     snapshot
 }
 
+/// One meaning for group reads in the live loop and the tail: data to
+/// decide, an empty queue (`EAGAIN`, or a zero read, which a fanotify
+/// group never returns), an interrupted call to retry at once, or a
+/// failed read whose head event is unproven — counted and filed (see
+/// `note_read_error`), then the drain continues with the rest of the
+/// queue instead of abandoning it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupReadOutcome {
+    Data(usize),
+    Empty,
+    Interrupted,
+    Failed,
+}
+
+fn classify_group_read(got: libc::ssize_t) -> GroupReadOutcome {
+    if got > 0 {
+        return GroupReadOutcome::Data(got as usize);
+    }
+    if got == 0 {
+        return GroupReadOutcome::Empty;
+    }
+    match std::io::Error::last_os_error().kind() {
+        std::io::ErrorKind::Interrupted => GroupReadOutcome::Interrupted,
+        std::io::ErrorKind::WouldBlock => GroupReadOutcome::Empty,
+        _ => GroupReadOutcome::Failed,
+    }
+}
+
 /// User-space bound on the unlimited kernel queue: queued events past
 /// `cap_bytes` of records (about 262,000 events at 32 `FIONREAD` bytes
 /// per event, about 349,000 at 24 — the unit differs by kernel, see
@@ -2212,9 +2266,9 @@ fn drain_final_tail(raw: std::os::unix::io::RawFd, ctx: &mut DrainCtx<'_>, buf: 
 
 /// The tail drain with an injectable read: production passes the
 /// blocking-safe `read(2)` above, tests simulate read errors without
-/// a group. A read error drops only the head event: it is counted as
-/// unreadable and the tail continues with the rest of the snapshot
-/// instead of abandoning the whole tail as lost.
+/// a group. A read error is counted and filed (`note_read_error`)
+/// and the tail continues with the rest of the snapshot instead of
+/// abandoning the whole tail as lost.
 fn drain_final_tail_with(
     raw: std::os::unix::io::RawFd,
     ctx: &mut DrainCtx<'_>,
@@ -2224,6 +2278,7 @@ fn drain_final_tail_with(
     let deadline = tail_deadline_from(ctx.state);
     let window = SendWindow::Final(deadline);
     let Some(snapshot) = queued_event_bytes(raw) else {
+        ctx.state.loss_other.fetch_add(1, Ordering::Relaxed);
         return false;
     };
     // Events, not bytes: on a 24-byte-unit kernel a byte count stops
@@ -2239,30 +2294,21 @@ fn drain_final_tail_with(
             return false;
         }
         let got = read(raw, buf);
-        if got < 0 {
-            let error = std::io::Error::last_os_error();
-            match error.kind() {
-                std::io::ErrorKind::Interrupted => continue,
-                // Nothing left to read: the snapshot is consumed.
-                std::io::ErrorKind::WouldBlock => return true,
-                _ => {
-                    ctx.stats.unreadable = ctx.stats.unreadable.saturating_add(1);
-                    ctx.state
-                        .loss_tail_read_error
-                        .fetch_add(1, Ordering::Relaxed);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
+        match classify_group_read(got) {
+            GroupReadOutcome::Data(got) => {
+                let (cont, decided) = ctx.process_read(&buf[..got], window);
+                owed = owed.saturating_sub(decided);
+                if !cont {
+                    return false;
                 }
             }
-        }
-        if got == 0 {
-            return true;
-        }
-        let got = got as usize;
-        let (cont, decided) = ctx.process_read(&buf[..got], window);
-        owed = owed.saturating_sub(decided);
-        if !cont {
-            return false;
+            // Nothing left to read: the snapshot is consumed.
+            GroupReadOutcome::Empty => return true,
+            GroupReadOutcome::Interrupted => continue,
+            GroupReadOutcome::Failed => {
+                ctx.note_read_error();
+                continue;
+            }
         }
     }
     true
@@ -2340,7 +2386,7 @@ fn adopt_remark_result(
 fn print_drain_telemetry(ctx: &DrainCtx<'_>, state: &LearnShutdownState) {
     let stats = &ctx.stats;
     eprintln!(
-        "p11scope: file learning: {} events, {} checked, {} providers, {} staged, {} loads, {} overflows, {} unreadable, shed {}, tail_deadline {}, tail_read_error {}, send_deadline {}, join_timeout {}",
+        "p11scope: file learning: {} events, {} checked, {} providers, {} staged, {} loads, {} overflows, {} unreadable, shed {}, tail_deadline {}, read_error {}, send_deadline {}, join_timeout {}, other {}",
         stats.events,
         stats.checked,
         stats.proved,
@@ -2350,9 +2396,10 @@ fn print_drain_telemetry(ctx: &DrainCtx<'_>, state: &LearnShutdownState) {
         stats.unreadable,
         state.loss_shed.load(Ordering::Relaxed),
         state.loss_tail_deadline.load(Ordering::Relaxed),
-        state.loss_tail_read_error.load(Ordering::Relaxed),
+        state.loss_read_error.load(Ordering::Relaxed),
         state.loss_send_deadline.load(Ordering::Relaxed),
         state.loss_join_timeout.load(Ordering::Relaxed),
+        state.loss_other.load(Ordering::Relaxed),
     );
 }
 
@@ -2494,13 +2541,19 @@ fn drain_loop(
         }
         // SAFETY: libc read into a live buffer; NONBLOCK so no stall.
         let read = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if read <= 0 {
-            continue;
-        }
-        if !ctx.process_read(&buf[..read as usize], SendWindow::Live).0 {
-            // The engine is gone or a send hit the tail bound (the
-            // loss is marked): nothing more can be delivered.
-            break 'drain;
+        match classify_group_read(read) {
+            GroupReadOutcome::Data(got) => {
+                if !ctx.process_read(&buf[..got], SendWindow::Live).0 {
+                    // The engine is gone or a send hit the tail bound (the
+                    // loss is marked): nothing more can be delivered.
+                    break 'drain;
+                }
+            }
+            GroupReadOutcome::Empty | GroupReadOutcome::Interrupted => continue,
+            GroupReadOutcome::Failed => {
+                ctx.note_read_error();
+                continue;
+            }
         }
     }
     if stopped {
@@ -2519,6 +2572,7 @@ fn drain_loop(
         let ready = unsafe { libc::poll(&mut final_poll, 1, 0) };
         if ready > 0 {
             state.lost_tail.store(true, Ordering::Release);
+            state.loss_other.fetch_add(1, Ordering::Relaxed);
         }
     }
     // The group dies here even when a re-mark helper is still stuck in
@@ -3957,12 +4011,14 @@ mod tests {
         assert_eq!(ctx.stats.events, 0, "nothing is decided past the deadline");
     }
 
-    /// A tail read error drops only the head event: the error is
-    /// counted as unreadable and the tail continues instead of
-    /// abandoning the snapshot as lost. (Unprivileged: the read is
-    /// injected; the pipe only provides the queued-bytes snapshot.)
+    /// A tail read error is counted and filed, like a live-loop one:
+    /// the failed read's head event is unproven, so it counts as
+    /// unreadable plus the shared read-error loss counter and files
+    /// the lost tail — and the tail still continues with the rest of
+    /// the snapshot instead of abandoning it. (Unprivileged: the read
+    /// is injected; the pipe only provides the snapshot.)
     #[test]
-    fn learn_tail_read_error_counts_unreadable_and_continues() {
+    fn learn_tail_read_error_is_counted_and_filed() {
         use std::os::unix::io::FromRawFd;
         use std::sync::atomic::Ordering;
         let mut fds = [0; 2];
@@ -4006,9 +4062,147 @@ mod tests {
         });
         assert!(done, "the tail continues past a read error");
         assert_eq!(ctx.stats.unreadable, 1, "the error is counted once");
+        assert_eq!(
+            state.loss_read_error.load(Ordering::Acquire),
+            1,
+            "the error attributes to the read-error counter"
+        );
         assert!(
-            !state.lost_tail.load(Ordering::Acquire),
-            "a continued error is not a lost tail"
+            state.lost_tail.load(Ordering::Acquire),
+            "an unproven head event files the lost tail"
+        );
+    }
+
+    /// Group reads mean one thing in the live loop and the tail —
+    /// both loops classify through the same function: data to decide,
+    /// an empty queue (`EAGAIN` or zero), an interrupted call to retry,
+    /// or a filed error. (Unprivileged: pure over injected errno.)
+    #[test]
+    fn learn_group_read_errors_classify_once_for_both_loops() {
+        use super::GroupReadOutcome;
+        assert_eq!(super::classify_group_read(32), GroupReadOutcome::Data(32));
+        assert_eq!(super::classify_group_read(0), GroupReadOutcome::Empty);
+        for (errno, want, why) in [
+            (
+                libc::EINTR,
+                GroupReadOutcome::Interrupted,
+                "interrupted retries",
+            ),
+            (
+                libc::EAGAIN,
+                GroupReadOutcome::Empty,
+                "EAGAIN is an empty queue",
+            ),
+            (libc::EIO, GroupReadOutcome::Failed, "I/O errors are filed"),
+            (libc::EBADF, GroupReadOutcome::Failed, "bad fds are filed"),
+        ] {
+            // SAFETY: test-only errno for the injected failure.
+            unsafe {
+                *libc::__errno_location() = errno;
+            }
+            assert_eq!(super::classify_group_read(-1), want, "{why}");
+        }
+    }
+
+    /// An unparseable record in a read buffer counts as `other` and
+    /// files the lost tail, while the parsed prefix still stands: the
+    /// drain continues with the rest. (Unprivileged: synthetic bytes,
+    /// no group.)
+    #[test]
+    fn learn_parse_error_is_counted_as_other_and_filed() {
+        use std::sync::atomic::Ordering;
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: -1,
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
+        };
+        let mut buf = Vec::from(synthetic_open_record());
+        buf.extend_from_slice(b"garbage!");
+        let (cont, parsed) = ctx.process_read(&buf, super::SendWindow::Live);
+        assert!(cont, "a parse error never abandons the drain");
+        assert_eq!(parsed, 1, "the parsed prefix still stands");
+        assert_eq!(
+            state.loss_other.load(Ordering::Acquire),
+            1,
+            "the parse error attributes to other"
+        );
+        assert!(
+            state.lost_tail.load(Ordering::Acquire),
+            "an unparseable record files the lost tail"
+        );
+    }
+
+    /// A tail whose snapshot cannot be read is given up and counted as
+    /// `other`: without the snapshot nothing can be accounted.
+    /// (Unprivileged: fd -1 fails `FIONREAD`; the read must not run.)
+    #[test]
+    fn learn_tail_fionread_failure_is_counted_as_other() {
+        use std::sync::atomic::Ordering;
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::LearnMsg>(16);
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let mut ctx = super::DrainCtx {
+            group: -1,
+            tx: &tx,
+            state: &state,
+            self_pid: std::process::id(),
+            fionread_unit: super::FANOTIFY_META_LEN,
+            cache: super::LearnCache::new(),
+            stats: super::DrainStats::default(),
+            ignore_marks: 0,
+            marked_this_period: std::collections::HashSet::new(),
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        let done = super::drain_final_tail_with(-1, &mut ctx, &mut buf, |_, _| {
+            panic!("no snapshot means no read");
+        });
+        assert!(!done, "an unreadable snapshot gives up the tail");
+        assert_eq!(
+            state.loss_other.load(Ordering::Acquire),
+            1,
+            "the snapshot failure attributes to other"
+        );
+    }
+
+    /// A drain thread that panicked counts as `other` at the join: the
+    /// report files the lost tail and the telemetry names the panic.
+    /// (Unprivileged: a learner assembled around a panicking thread,
+    /// never started. The child panic prints, as panics do.)
+    #[test]
+    fn learn_panicked_drain_join_is_counted_as_other() {
+        use std::sync::atomic::Ordering;
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("p11scope-learn-panic-twin".to_string())
+            .spawn(move || {
+                drop(done_tx);
+                panic!("twin drain panic");
+            })
+            .unwrap();
+        let mut learner = super::FileLearner {
+            state: std::sync::Arc::clone(&state),
+            thread: Some(super::LearnerThread {
+                handle,
+                done: done_rx,
+            }),
+            pending: None,
+        };
+        assert!(
+            learner.shutdown_and_join_pumping(|| {}),
+            "a panicked drain files the lost tail"
+        );
+        assert_eq!(
+            state.loss_other.load(Ordering::Acquire),
+            1,
+            "the panic attributes to other"
         );
     }
 

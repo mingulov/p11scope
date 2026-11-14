@@ -20546,7 +20546,11 @@ impl Engine {
                     // The drain died unexpectedly: learning stops here.
                     // The channel is dropped so this fires once, and
                     // the loss funnels into the overflow aggregate
-                    // (row dedupes).
+                    // (row dedupes). The drain's `other` counter names
+                    // the source for the next `learned_event_loss`.
+                    if let Some(learner) = self.file_learner.as_ref() {
+                        learner.note_other_loss();
+                    }
                     self.learned_event_loss = self.learned_event_loss.saturating_add(1);
                     self.mark_partial(
                         crate::render::LEARNED_SKIP_SUBJECT,

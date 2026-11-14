@@ -2173,15 +2173,18 @@ fn fionread_unit_from_probe(snapshot: Option<usize>, got: libc::ssize_t, buf: &[
 
 /// One meaning for group reads in the live loop and the tail: data to
 /// decide, an empty queue (`EAGAIN`, or a zero read, which a fanotify
-/// group never returns), an interrupted call to retry at once, or a
-/// failed read whose head event is unproven — counted and filed (see
-/// `note_read_error`), then the drain continues with the rest of the
-/// queue instead of abandoning it.
+/// group never returns), an interrupted call to retry at once, a
+/// device-node read that found no openable file (`EBUSY`/`ENXIO`/`ENODEV`
+/// from a single-open or vanished device — counted as unreadable, never
+/// filed), or a failed read whose head event is unproven — counted and
+/// filed (see `note_read_error`), then the drain continues with the rest
+/// of the queue instead of abandoning it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupReadOutcome {
     Data(usize),
     Empty,
     Interrupted,
+    Unreadable,
     Failed,
 }
 
@@ -2313,6 +2316,9 @@ fn drain_final_tail_with(
             // Nothing left to read: the snapshot is consumed.
             GroupReadOutcome::Empty => return true,
             GroupReadOutcome::Interrupted => continue,
+            GroupReadOutcome::Unreadable => {
+                unreachable!("classifier does not return Unreadable yet");
+            }
             GroupReadOutcome::Failed => {
                 ctx.note_read_error();
                 continue;
@@ -2558,6 +2564,9 @@ fn drain_loop(
                 }
             }
             GroupReadOutcome::Empty | GroupReadOutcome::Interrupted => continue,
+            GroupReadOutcome::Unreadable => {
+                unreachable!("classifier does not return Unreadable yet");
+            }
             GroupReadOutcome::Failed => {
                 ctx.note_read_error();
                 continue;
@@ -2915,6 +2924,22 @@ mod tests {
             .collect();
         marks.sort();
         assert_eq!(marks, vec!["/", "/dev", "/mnt/ovl", "/mnt/with space"]);
+    }
+
+    /// Device nodes are never marked: `devtmpfs` is a pseudo filesystem
+    /// for the mark pass, so the observer never queues opens of `/dev`
+    /// entries and never attempts its own open of single-open devices
+    /// (ALSA PCMs, TPMs, watchdogs) inside the group read.
+    #[test]
+    fn learn_mount_marks_skip_devtmpfs() {
+        let table = "1 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n\
+             42 1 0:6 / /dev rw,nosuid,relatime - devtmpfs udev rw\n";
+        let mut marks: Vec<String> = super::mounts_for_marks(table)
+            .iter()
+            .map(|mount| mount.point.to_string_lossy().into_owned())
+            .collect();
+        marks.sort();
+        assert_eq!(marks, vec!["/"], "a devtmpfs /dev is skipped, never marked");
     }
 
     /// An autofs trigger is never marked (opening it would mount and
@@ -4084,7 +4109,9 @@ mod tests {
     /// Group reads mean one thing in the live loop and the tail —
     /// both loops classify through the same function: data to decide,
     /// an empty queue (`EAGAIN` or zero), an interrupted call to retry,
-    /// or a filed error. (Unprivileged: pure over injected errno.)
+    /// a device-node miss counted as unreadable without filing
+    /// (`EBUSY`/`ENXIO`/`ENODEV`), or a filed error. (Unprivileged: pure
+    /// over injected errno.)
     #[test]
     fn learn_group_read_errors_classify_once_for_both_loops() {
         use super::GroupReadOutcome;
@@ -4100,6 +4127,36 @@ mod tests {
                 libc::EAGAIN,
                 GroupReadOutcome::Empty,
                 "EAGAIN is an empty queue",
+            ),
+            (
+                libc::EBUSY,
+                GroupReadOutcome::Unreadable,
+                "a busy single-open device is unreadable, not loss",
+            ),
+            (
+                libc::ENXIO,
+                GroupReadOutcome::Unreadable,
+                "a vanished device address is unreadable, not loss",
+            ),
+            (
+                libc::ENODEV,
+                GroupReadOutcome::Unreadable,
+                "a vanished device is unreadable, not loss",
+            ),
+            (
+                libc::EACCES,
+                GroupReadOutcome::Failed,
+                "permission errors are filed",
+            ),
+            (
+                libc::EMFILE,
+                GroupReadOutcome::Failed,
+                "fd exhaustion is filed",
+            ),
+            (
+                libc::ENFILE,
+                GroupReadOutcome::Failed,
+                "system fd exhaustion is filed",
             ),
             (libc::EIO, GroupReadOutcome::Failed, "I/O errors are filed"),
             (libc::EBADF, GroupReadOutcome::Failed, "bad fds are filed"),
@@ -4214,6 +4271,42 @@ mod tests {
         );
     }
 
+    /// A panicked drain counts once even when both the join and the
+    /// engine's disconnect path observe it: the first attributes to
+    /// `other`, the second finds it already filed. (Unprivileged: a
+    /// panicking join followed by the engine funnel on the same state.)
+    #[test]
+    fn learn_panicked_drain_counts_once_across_join_and_disconnect() {
+        use std::sync::atomic::Ordering;
+        let state = std::sync::Arc::new(super::LearnShutdownState::default());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("p11scope-learn-panic-once-twin".to_string())
+            .spawn(move || {
+                drop(done_tx);
+                panic!("twin drain panic for the once count");
+            })
+            .unwrap();
+        let mut learner = super::FileLearner {
+            state: std::sync::Arc::clone(&state),
+            thread: Some(super::LearnerThread {
+                handle,
+                done: done_rx,
+            }),
+            pending: None,
+        };
+        assert!(
+            learner.shutdown_and_join_pumping(|| {}),
+            "a panicked drain files the lost tail"
+        );
+        learner.note_other_loss();
+        assert_eq!(
+            state.loss_other.load(Ordering::Acquire),
+            1,
+            "the join panic plus the disconnect funnel count once"
+        );
+    }
+
     /// The probe decision accepts the snapshot only for exactly one
     /// record it fits inside: 24-in-32 (a pre-`68615158c12d` kernel)
     /// and 32-in-32 (a newer one). Anything else — no snapshot, a
@@ -4241,6 +4334,18 @@ mod tests {
             (Some(24), -1, one.as_slice(), "a failed read"),
             (Some(24), 0, one.as_slice(), "an empty read"),
             (Some(0), 32, one.as_slice(), "an empty snapshot"),
+            (
+                Some(25),
+                32,
+                one.as_slice(),
+                "a snapshot inside the record but neither 24 nor the read size",
+            ),
+            (
+                Some(31),
+                32,
+                one.as_slice(),
+                "a near-miss snapshot is not a unit",
+            ),
             (
                 Some(64),
                 32,
@@ -4469,6 +4574,102 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// A re-mark pass still pending at the next 30 s period leaves
+    /// coverage unproven: the tick files the unavailable-learning gap
+    /// instead of silently skipping. (Unprivileged: the pass sleeps past
+    /// any bound, the second spawn is the next period tick.)
+    #[test]
+    fn learn_remark_pending_at_next_period_files_gap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(group)));
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut pending = None;
+        let prev = std::collections::BTreeSet::new();
+        let first = std::sync::Arc::clone(&calls);
+        assert!(
+            super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
+                first.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                (std::collections::BTreeSet::new(), 0)
+            }),
+            "the first pass starts"
+        );
+        let started = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) != 1 && std::time::Instant::now() < started {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the pass is running");
+        let at = std::time::Instant::now();
+        let second = std::sync::Arc::clone(&calls);
+        assert!(
+            !super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
+                second.fetch_add(1, Ordering::SeqCst);
+                (std::collections::BTreeSet::new(), 0)
+            }),
+            "a pass still pending at the next period files the gap"
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(1),
+            "the tick never waits for the stuck pass"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no second thread starts while one runs"
+        );
+    }
+
+    /// A re-mark pass that finished before the next 30 s period starts
+    /// the next pass with no gap: only a still-pending pass is unproven.
+    /// (Unprivileged: the pass returns at once, the adopt collects it,
+    /// the second spawn is the next period tick.)
+    #[test]
+    fn learn_remark_finished_pass_starts_next_without_gap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(group)));
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut pending = None;
+        let prev = std::collections::BTreeSet::new();
+        let first = std::sync::Arc::clone(&calls);
+        assert!(
+            super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
+                first.fetch_add(1, Ordering::SeqCst);
+                (std::collections::BTreeSet::new(), 0)
+            }),
+            "the first pass starts"
+        );
+        let landed = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some((_, uncovered)) = super::adopt_remark_result(&prev, &mut pending) {
+                assert_eq!(uncovered, 0, "the finished pass covered all");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < landed,
+                "the quick pass lands before the next period"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(pending.is_none(), "no pass in flight after the adopt");
+        let second = std::sync::Arc::clone(&calls);
+        assert!(
+            super::spawn_remark_pass(&shared, &prev, &mut pending, move |_, _| {
+                second.fetch_add(1, Ordering::SeqCst);
+                (std::collections::BTreeSet::new(), 0)
+            }),
+            "a finished pass starts the next one with no gap"
+        );
+        let restarted = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) != 2 && std::time::Instant::now() < restarted {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
     /// A re-mark helper whose group drain exit already took marks
     /// nothing and panics nowhere: the slot is empty, so every mark
     /// step is refused — the pass resolves what it can and credits
@@ -4481,6 +4682,65 @@ mod tests {
             super::mark_visible_filesystems_shared(&shared, &std::collections::BTreeSet::new());
         assert!(covered.is_empty(), "no group means no marks: {covered:?}");
         assert!(uncovered > 0, "unmarked mounts count as uncovered");
+    }
+
+    /// Drain exit closes the group while a re-mark helper is still stuck
+    /// in its mount open: the take drops the last reference at once,
+    /// never waiting for the helper. (Unprivileged: a pipe stands in for
+    /// the group — the reader in the slot, a stuck helper holding only
+    /// the `Arc`, the take closing the reader so the writer gets `EPIPE`.)
+    #[test]
+    fn learn_taken_slot_closes_group_while_helper_stuck() {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let mut fds = [0; 2];
+        // SAFETY: libc pipe into a live array; checked before use.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: fresh owned fds from the pipe above.
+        let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        let shared: std::sync::Arc<std::sync::Mutex<Option<std::os::fd::OwnedFd>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(reader)));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        let helper_shared = std::sync::Arc::clone(&shared);
+        let helper = std::thread::Builder::new()
+            .name("p11scope-learn-stuck-twin".to_string())
+            .spawn(move || {
+                let _ = started_tx.send(());
+                // A hung mount open: holds the Arc, never the lock.
+                let _ = unblock_rx.recv();
+                // After the hang clears, the group is gone.
+                let guard = helper_shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(guard.is_none(), "the taken slot stays empty");
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let at = std::time::Instant::now();
+        drop(
+            shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(1),
+            "the take never waits for the stuck helper"
+        );
+        // SAFETY: libc write to our own pipe whose reader just closed.
+        let rc =
+            unsafe { libc::write(writer.as_raw_fd(), [7u8].as_ptr() as *const libc::c_void, 1) };
+        assert_eq!(rc, -1, "a closed reader breaks the writer");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPIPE),
+            "the writer gets EPIPE once the slot is taken"
+        );
+        drop(unblock_tx);
+        helper.join().unwrap();
     }
 
     /// The arming-timeout dup is read down to `EAGAIN`: the events

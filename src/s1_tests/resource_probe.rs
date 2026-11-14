@@ -844,6 +844,10 @@ fn native_semantic_resource_final_types_pinned() {
     // +24 (joint partial): the `unattributed` counter Vec in
     // ObjectObservations, measured 1240 below.
     pin!(crate::inventory_present::PresentationRenderIndex, 8);
+    pin!(
+        Option<crate::discovery::engine::inventory_coordinator::JointAuditSubjectDiagnosis>,
+        40
+    );
     pin!(crate::inventory_semantics::SemanticCaptureSummary, 48);
     // +24 (c9e1dd977): one inline Vec of pre-arm interval rows, one row
     // per `--prearm-module` input; the pin was never re-measured for it.

@@ -10648,11 +10648,8 @@ mod tests {
     /// v0.8.0: a chrome-sized sparse object pins under a sufficient
     /// allowance (no per-object size gate), streaming its identity
     /// hash; a starved allowance degrades through the I/O ceiling's
-    /// named gap instead of a size refusal. Heavy 300 MiB hash for the
-    /// default lib suite — the 2/1 MiB export twins prove the point —
-    /// so it runs only when explicitly requested for scale.
+    /// named gap instead of a size refusal.
     #[test]
-    #[ignore = "heavy 300 MiB hash; 2/1 MiB twins prove the point, run explicitly for scale"]
     fn chrome_sized_object_pins_without_a_size_gate() {
         use crate::discovery::scan::ScanLimits;
         let dir = tempfile::tempdir().unwrap();

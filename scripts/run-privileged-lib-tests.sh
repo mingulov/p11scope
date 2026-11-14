@@ -787,8 +787,6 @@ metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses
 # are hard gates, the stop time is measured and disclosed (R-40).
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
 inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
-# Unprivileged 300 MiB sparse-file hash scale check; 2/1 MiB twins run in default tests.
-discovery::identity::tests::chrome_sized_object_pins_without_a_size_gate
 )
 SKIP_REASONS=(
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
@@ -828,7 +826,6 @@ SKIP_REASONS=(
 "6.1 E2BIG lane: proves the verifier-budget refusal maps before lifecycle without activating; run exact --ignored as root on the 6.1 verifier-budget host"
 "unprivileged system-population graph sizing (4096 pin files plus 16384 native links; memory, drain and release asserts gate, the stop time is measured, not gated); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture on a host whose hard RLIMIT_NOFILE fits the population"
 "needs root, gcc/softhsm tooling and a built observer with p11scope-discover beside it; run by hand via scripts/ci/stop-races.sh (results.jsonl entry), unscheduled in CI"
-"unprivileged 300 MiB sparse-file hash scale check (2/1 MiB twins prove the point in default tests); not a privileged campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture"
 )
 
 # Btrfs campaign cells: run only with --include-btrfs. Each needs

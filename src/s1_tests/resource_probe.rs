@@ -858,10 +858,14 @@ fn native_semantic_resource_final_types_pinned() {
     // unidentified-caller publication — image counters, identity-refusal
     // counters, and the host-pid Vec plus its dropped count. Round 7 adds
     // no inline byte here (its executable data sits behind the pid Vec).
+    // +24 (dda9f25d9): one more inline Vec (`unmatched_modules`,
+    // unmatched `--module` inputs); operator-bounded like the other
+    // unmatched lists. The pin predates the field, so it measured 1392
+    // against a 1416 struct until this repin.
     pin!(
         crate::inventory_present::Presentation,
         1288 + size_of::<crate::inventory_present::PresentationRenderIndex>()
-            + 4 * size_of::<Vec<u8>>()
+            + 5 * size_of::<Vec<u8>>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.
     pin!(p11scope_ebpf_common::EventRecord, 368);

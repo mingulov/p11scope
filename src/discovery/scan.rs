@@ -9445,6 +9445,240 @@ mod tests {
         );
     }
 
+    /// The IO-exhausted twin of the counted gap: with the table ceiling
+    /// fully saturated and the capture I/O total sized to exhaust inside
+    /// the refused module's tables scan, the refused file is still counted
+    /// AND keeps its plain per-file ceiling row (data-always), alongside
+    /// its IO-ceiling row. Totals are probed, not computed: IO accounting
+    /// is deterministic, and the first total with the exhaust-inside shape
+    /// wins. No scan stop is set (DetailedLegacy IO exhaustion never
+    /// stops), so the row comes from the normal path, not the break path.
+    #[test]
+    fn io_exhausted_refused_file_keeps_its_plain_ceiling_row() {
+        fn exhaust_shape(total: u64) -> Option<ScanOutcome> {
+            let mut probe = BracketFixture::new(8, true);
+            let mut budget = CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: total,
+            });
+            saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES);
+            let hints = probe.provider_paths();
+            let Ok(outcome) = probe.run_with_hints(&hints, &mut budget) else {
+                return None;
+            };
+            let gap = outcome.skipped().iter().any(|skip| {
+                skip.subject == "capture discovery"
+                    && skip.reason
+                        == "1 provider file was not decoded: table decode ceiling reached"
+            });
+            let io = outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason == IO_CEILING_REASON);
+            (gap && io).then_some(outcome)
+        }
+        let total = (512u64..16384)
+            .step_by(64)
+            .find(|total| exhaust_shape(*total).is_some())
+            .expect("a probe total exhausts inside the refused scan");
+
+        let mut f = BracketFixture::new(8, true);
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: total,
+        });
+        saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES);
+        let hints = f.provider_paths();
+        let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
+        let provider = hints[0].display().to_string();
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == "capture discovery"
+                    && skip.reason
+                        == "1 provider file was not decoded: table decode ceiling reached"),
+            "the refused file is counted: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == provider && skip.reason == IO_CEILING_REASON),
+            "mapping reads exhausted inside this module: {:?}",
+            outcome.skipped()
+        );
+        assert_eq!(
+            budget.stopped_reason(),
+            None,
+            "no stop: the row below comes from the normal path: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| skip.subject == provider
+                && skip.reason == "provider file was not decoded: table decode ceiling reached"),
+            "the counted file keeps its plain row past IO exhaustion: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| !skip.reason.contains(NO_TABLE_FOUND_MARKER)),
+            "no disappearance is claimed for the refused file: {:?}",
+            outcome.skipped()
+        );
+    }
+
+    /// The discovery-window cause noun: an Inventory budget whose window
+    /// table allowance refuses a decode stops with the window reason, and
+    /// both the per-file row and the counted gap name the window — never
+    /// the retained budget. The pre-stop assertion pins the transition:
+    /// the same budget names the retained budget before the window stops.
+    #[test]
+    fn undecoded_cause_names_the_window_allowance_after_a_window_stop() {
+        let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(4096, 64, 1, 68, 4, 4));
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        assert!(budget.admit_decoded_table(68));
+        assert_eq!(
+            undecoded_cause(&budget),
+            "retained table-key budget reached",
+            "before the window stops, the retained budget is named"
+        );
+        assert!(!budget.admit_decoded_table(68));
+        assert_eq!(budget.stopped_reason(), Some(TABLE_WINDOW_CEILING_REASON));
+        assert_eq!(
+            undecoded_file_reason(&budget),
+            "provider file was not decoded: discovery window table decode allowance reached"
+        );
+        assert_eq!(
+            undecoded_files_reason(2, &budget),
+            "2 provider files were not decoded: discovery window table decode allowance reached"
+        );
+        assert!(
+            scan_skip_truncates(&undecoded_file_reason(&budget)),
+            "a window-refused file is bounded evidence, never verified absence"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    /// The retained file-key cause noun: an Inventory budget with only its
+    /// file-key budget exhausted names the table-key budget, with no scan
+    /// stop set. The runtime budget stays generous, so a runtime noun
+    /// here would be a misattribution.
+    #[test]
+    fn undecoded_cause_names_retained_file_keys_when_only_they_are_exhausted() {
+        let window = InventoryWindowLimits::new(1 << 20, 1 << 20, 64, 4096, 64).unwrap();
+        let retained = InventoryRetainedLimits::new(1, 8, 8, 4, 4, 64 * 1024).unwrap();
+        let limits = InventoryDiscoveryLimits::new(1 << 20, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        assert!(budget.note_table_admitted(table_identity(1)));
+        assert!(
+            !budget.note_table_admitted(table_identity(2)),
+            "the second file key is refused"
+        );
+        assert_eq!(budget.stopped_reason(), None);
+        assert_eq!(
+            undecoded_file_reason(&budget),
+            "provider file was not decoded: retained table-key budget reached"
+        );
+        assert_eq!(
+            undecoded_files_reason(3, &budget),
+            "3 provider files were not decoded: retained table-key budget reached"
+        );
+        assert!(
+            scan_skip_truncates(&undecoded_file_reason(&budget)),
+            "a retained-refused file is bounded evidence, never verified absence"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    /// The retained runtime-key cause noun: an Inventory budget with only
+    /// its runtime-key budget exhausted must name the runtime keys — never
+    /// the table keys. The file-key budget stays generous, so a table-key
+    /// noun here would be a misattribution.
+    #[test]
+    fn undecoded_cause_names_retained_runtime_keys_not_table_keys() {
+        let window = InventoryWindowLimits::new(1 << 20, 1 << 20, 64, 4096, 64).unwrap();
+        let retained = InventoryRetainedLimits::new(8, 1, 8, 4, 4, 64 * 1024).unwrap();
+        let limits = InventoryDiscoveryLimits::new(1 << 20, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        let runtime = |view| RuntimeTableIdentity {
+            view: ProcessViewId(view),
+            address: 0x1000,
+            version_word: 0x2802,
+            usable: 68,
+            content: u64::from(view),
+        };
+        assert!(budget.note_runtime_table_admitted(runtime(1)));
+        assert!(
+            !budget.note_runtime_table_admitted(runtime(2)),
+            "the second runtime key is refused"
+        );
+        assert_eq!(budget.stopped_reason(), None);
+        assert_eq!(
+            undecoded_file_reason(&budget),
+            "provider file was not decoded: retained runtime-key budget reached"
+        );
+        assert_eq!(
+            undecoded_files_reason(3, &budget),
+            "3 provider files were not decoded: retained runtime-key budget reached"
+        );
+        assert!(
+            scan_skip_truncates(&undecoded_file_reason(&budget)),
+            "a retained-refused file is bounded evidence, never verified absence"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    /// Both retained budgets exhausted: the cause names both families, so
+    /// neither a file-key nor a runtime-key refusal is misnamed.
+    #[test]
+    fn undecoded_cause_names_both_retained_budgets_when_both_are_exhausted() {
+        let window = InventoryWindowLimits::new(1 << 20, 1 << 20, 64, 4096, 64).unwrap();
+        let retained = InventoryRetainedLimits::new(1, 1, 8, 4, 4, 64 * 1024).unwrap();
+        let limits = InventoryDiscoveryLimits::new(1 << 20, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        assert!(budget.note_table_admitted(table_identity(1)));
+        assert!(budget.note_runtime_table_admitted(RuntimeTableIdentity {
+            view: ProcessViewId(1),
+            address: 0x1000,
+            version_word: 0x2802,
+            usable: 68,
+            content: 1,
+        }));
+        assert!(
+            !budget.note_table_admitted(table_identity(2)),
+            "the second file key is refused"
+        );
+        assert_eq!(budget.stopped_reason(), None);
+        assert_eq!(
+            undecoded_file_reason(&budget),
+            "provider file was not decoded: retained table and runtime-key budgets reached"
+        );
+        assert_eq!(
+            undecoded_files_reason(3, &budget),
+            "3 provider files were not decoded: retained table and runtime-key budgets reached"
+        );
+        assert!(
+            scan_skip_truncates(&undecoded_file_reason(&budget)),
+            "a retained-refused file is bounded evidence, never verified absence"
+        );
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
     #[test]
     fn p2_bracket_independent_module_survives_refused_neighbor() {
         let mut f = BracketFixture::new(8, true);

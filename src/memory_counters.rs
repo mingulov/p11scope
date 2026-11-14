@@ -7,6 +7,8 @@
 //! plus one at end of capture. Production behavior, caps, and reports
 //! are unchanged; rows a command does not own read `null` (N/A).
 
+use std::collections::BTreeMap;
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
@@ -103,8 +105,11 @@ pub(crate) struct EdgeLens {
 }
 
 /// R2 lens: registry caller/module/edge tables plus R3, the key/gap
-/// sibling indexes, and the semantic pool charge (spec §3.1: the R3
-/// mechanism-cell bytes against the 160 MiB pool).
+/// sibling indexes, and the shared semantic-pool charge against the
+/// 160 MiB pool. Minor 2: this is the WHOLE pool (custody pins, joint
+/// grants, instance input, and mechanism cells all charge it), not
+/// mechanism cells alone — the name stays for wire stability, the
+/// meaning is documented here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistryLens {
     pub callers: CounterRow,
@@ -191,6 +196,23 @@ pub(crate) struct StateLens {
     pub inherited_ambiguous: CounterRow,
 }
 
+/// Dead-owned ROW counts per R10/R12 map (Blocker 2): rows whose
+/// owning process is gone but whose state is retained — the number
+/// B1 exit routing would free. Bytes reuse the same entry + heap
+/// factors as the totals above. Built from one live-pid set per
+/// 60 s pass (see `semantics::State::memory_sample`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StateDeadLens {
+    pub reduced_dead: CounterRow,
+    pub open_dead: CounterRow,
+    pub active_ops_dead: CounterRow,
+    pub next_pseudonym_dead: CounterRow,
+    pub find_active_dead: CounterRow,
+    pub pending_dead: CounterRow,
+    pub detached_dead: CounterRow,
+    pub inherited_ambiguous_dead: CounterRow,
+}
+
 /// R11 lens: the trace `CallerReasons` sizes, read only through the
 /// size accessors B0 adds (`trace.rs`: `caller_entries`, `row_entries`,
 /// `overflowed`, `folded_lines`, `folded_rows`). Entry shapes mirror
@@ -214,13 +236,21 @@ impl TracerLens {
         folded_lines: u64,
         folded_rows: usize,
     ) -> Self {
+        // Minor 5: entry sizes include the map VALUES, not just the
+        // keys — the outer value is the inner row-map shell (BTreeMap,
+        // 24 B) and each row value is its u64 count (8 B).
         Self {
             outer: counter_row(
                 outer,
-                std::mem::size_of::<(u32, Option<String>)>(),
+                std::mem::size_of::<(u32, Option<String>)>()
+                    .saturating_add(std::mem::size_of::<BTreeMap<(String, u64), u64>>()),
                 HEAP_R11_CALLER,
             ),
-            rows: counter_row(rows, std::mem::size_of::<(String, u64)>(), HEAP_R11_ROW),
+            rows: counter_row(
+                rows,
+                std::mem::size_of::<((String, u64), u64)>(),
+                HEAP_R11_ROW,
+            ),
             overflowed,
             folded_lines,
             folded_rows: folded_rows as u64,
@@ -228,14 +258,23 @@ impl TracerLens {
     }
 }
 
-/// Profile/trace capture lens: engine history, semantic state,
-/// distinct R12 pids for the live/dead sample, history tasks, and the
-/// capture-start RSS baseline for the floor row.
+/// Profile/trace capture lens: engine history, semantic state
+/// totals, the dead-owned ROW split from one live-pid set, the
+/// live/dead process counts over R10+R12 owners, the sample cost,
+/// the pre-sample RSS/HWM, history tasks, and the capture-start RSS
+/// baseline for the floor row. The RSS is read BEFORE the sample is
+/// built (Important 3), so the sample's own allocations never skew
+/// the line it reports on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProfileLens {
     pub history: HistoryLens,
     pub state: StateLens,
-    pub process_pids: Vec<u32>,
+    pub dead: StateDeadLens,
+    pub live_processes: u64,
+    pub dead_processes: u64,
+    pub sample_us: u64,
+    pub self_rss_kb: Option<u64>,
+    pub self_hwm_kb: Option<u64>,
     pub tasks: CounterRow,
     pub baseline_rss_kb: Option<u64>,
 }
@@ -273,7 +312,7 @@ pub(crate) struct MemorySnapshot {
     r3_edge_mechs: Option<CounterRow>,
     r3_edge_pending: Option<CounterRow>,
     r3_edge_detached: Option<CounterRow>,
-    r3_mech_pool_bytes: u64,
+    r3_mech_pool_bytes: Option<u64>,
     r3_mech_pool_used_bytes: Option<u64>,
     r4_model_sessions: Option<CounterRow>,
     r4_model_objects: Option<CounterRow>,
@@ -313,8 +352,17 @@ pub(crate) struct MemorySnapshot {
     r12_pending: Option<CounterRow>,
     r12_detached: Option<CounterRow>,
     r12_inherited_ambiguous: Option<CounterRow>,
-    r12_live_processes: Option<u64>,
-    r12_dead_processes: Option<u64>,
+    r10_r12_live_processes: Option<u64>,
+    r10_r12_dead_processes: Option<u64>,
+    r10_reduced_dead: Option<CounterRow>,
+    r12_open_dead: Option<CounterRow>,
+    r12_active_ops_dead: Option<CounterRow>,
+    r12_next_pseudonym_dead: Option<CounterRow>,
+    r12_find_active_dead: Option<CounterRow>,
+    r12_pending_dead: Option<CounterRow>,
+    r12_detached_dead: Option<CounterRow>,
+    r12_inherited_ambiguous_dead: Option<CounterRow>,
+    sample_us: Option<u64>,
     caller_metadata_rows: Option<CounterRow>,
     floor_discovery_baseline_kb: Option<u64>,
     floor_staging_bytes: u64,
@@ -345,40 +393,19 @@ impl MemorySnapshot {
         serde_json::from_str(json).ok()
     }
 
-    fn floor(ring_bytes: u32) -> (u64, u64, Option<u64>, Option<u64>) {
-        let (rss, hwm) = self_rss_hwm_kb().unzip();
-        (
-            crate::events::EVENTS_STAGE_BYTES as u64,
-            ring_bytes as u64,
-            rss,
-            hwm,
-        )
+    fn floor_staging_ring(ring_bytes: u32) -> (u64, u64) {
+        (crate::events::EVENTS_STAGE_BYTES as u64, ring_bytes as u64)
     }
 
     /// Profile snapshot: R5 (seal only), R6-R10, R12, floor.
-    /// R1-R4, R11 and metadata are N/A on this path.
+    /// R1-R4, R11 and metadata are N/A on this path. The lens carries
+    /// the pre-sample RSS and the one-pass live/dead + dead-row split
+    /// (see `capture_memory_lens`); the snapshot copies, never probes.
     pub(crate) fn for_profile(
         elapsed_secs: u64,
         lens: ProfileLens,
         ring_bytes: u32,
         seal_value_bytes: Option<u64>,
-    ) -> Self {
-        Self::for_profile_with_probe(
-            elapsed_secs,
-            lens,
-            ring_bytes,
-            seal_value_bytes,
-            &proc_pid_live,
-        )
-    }
-
-    /// [`for_profile`] with an injectable liveness probe (tests).
-    pub(crate) fn for_profile_with_probe(
-        elapsed_secs: u64,
-        lens: ProfileLens,
-        ring_bytes: u32,
-        seal_value_bytes: Option<u64>,
-        probe: &dyn Fn(u32) -> bool,
     ) -> Self {
         Self::for_event_capture(
             "profile",
@@ -387,7 +414,6 @@ impl MemorySnapshot {
             ring_bytes,
             seal_value_bytes,
             None,
-            probe,
         )
     }
 
@@ -408,31 +434,9 @@ impl MemorySnapshot {
             ring_bytes,
             seal_value_bytes,
             Some(tracer),
-            &proc_pid_live,
         )
     }
 
-    /// [`for_trace`] with an injectable liveness probe (tests).
-    #[cfg(test)]
-    fn for_trace_with_probe(
-        elapsed_secs: u64,
-        lens: ProfileLens,
-        ring_bytes: u32,
-        probe: &dyn Fn(u32) -> bool,
-        tracer: &TracerLens,
-    ) -> Self {
-        Self::for_event_capture(
-            "trace",
-            elapsed_secs,
-            lens,
-            ring_bytes,
-            None,
-            Some(tracer),
-            probe,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn for_event_capture(
         command: &str,
         elapsed_secs: u64,
@@ -440,11 +444,10 @@ impl MemorySnapshot {
         ring_bytes: u32,
         seal_value_bytes: Option<u64>,
         r11: Option<&TracerLens>,
-        probe: &dyn Fn(u32) -> bool,
     ) -> Self {
-        let (live, dead) = split_live_dead(&lens.process_pids, probe);
-        let (staging, ring, rss, hwm) = Self::floor(ring_bytes);
+        let (staging, ring) = Self::floor_staging_ring(ring_bytes);
         let state = lens.state;
+        let dead = lens.dead;
         Self {
             command: command.to_string(),
             elapsed_secs,
@@ -462,7 +465,7 @@ impl MemorySnapshot {
             r3_edge_mechs: None,
             r3_edge_pending: None,
             r3_edge_detached: None,
-            r3_mech_pool_bytes: crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT as u64,
+            r3_mech_pool_bytes: None,
             r3_mech_pool_used_bytes: None,
             r4_model_sessions: None,
             r4_model_objects: None,
@@ -502,21 +505,31 @@ impl MemorySnapshot {
             r12_pending: Some(state.pending),
             r12_detached: Some(state.detached),
             r12_inherited_ambiguous: Some(state.inherited_ambiguous),
-            r12_live_processes: Some(live),
-            r12_dead_processes: Some(dead),
+            r10_r12_live_processes: Some(lens.live_processes),
+            r10_r12_dead_processes: Some(lens.dead_processes),
+            r10_reduced_dead: Some(dead.reduced_dead),
+            r12_open_dead: Some(dead.open_dead),
+            r12_active_ops_dead: Some(dead.active_ops_dead),
+            r12_next_pseudonym_dead: Some(dead.next_pseudonym_dead),
+            r12_find_active_dead: Some(dead.find_active_dead),
+            r12_pending_dead: Some(dead.pending_dead),
+            r12_detached_dead: Some(dead.detached_dead),
+            r12_inherited_ambiguous_dead: Some(dead.inherited_ambiguous_dead),
+            sample_us: Some(lens.sample_us),
             caller_metadata_rows: None,
             floor_discovery_baseline_kb: lens.baseline_rss_kb,
             floor_staging_bytes: staging,
             floor_ring_bytes: ring,
-            self_rss_kb: rss,
-            self_hwm_kb: hwm,
+            self_rss_kb: lens.self_rss_kb,
+            self_hwm_kb: lens.self_hwm_kb,
         }
     }
 
     /// Inventory snapshot: R1-R4, R6, metadata, floor.
     /// R5, R7-R12 are N/A on this path.
     pub(crate) fn for_inventory(elapsed_secs: u64, lens: InventoryLens, ring_bytes: u32) -> Self {
-        let (staging, ring, rss, hwm) = Self::floor(ring_bytes);
+        let (staging, ring) = Self::floor_staging_ring(ring_bytes);
+        let (rss, hwm) = self_rss_hwm_kb().unzip();
         Self {
             command: "inventory".to_string(),
             elapsed_secs,
@@ -534,7 +547,9 @@ impl MemorySnapshot {
             r3_edge_mechs: Some(lens.registry.edge.mechs),
             r3_edge_pending: Some(lens.registry.edge.pending),
             r3_edge_detached: Some(lens.registry.edge.detached),
-            r3_mech_pool_bytes: crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT as u64,
+            r3_mech_pool_bytes: Some(
+                crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT as u64,
+            ),
             r3_mech_pool_used_bytes: Some(lens.registry.mech_pool_used_bytes),
             r4_model_sessions: Some(lens.model.sessions),
             r4_model_objects: Some(lens.model.objects),
@@ -574,8 +589,17 @@ impl MemorySnapshot {
             r12_pending: None,
             r12_detached: None,
             r12_inherited_ambiguous: None,
-            r12_live_processes: None,
-            r12_dead_processes: None,
+            r10_r12_live_processes: None,
+            r10_r12_dead_processes: None,
+            r10_reduced_dead: None,
+            r12_open_dead: None,
+            r12_active_ops_dead: None,
+            r12_next_pseudonym_dead: None,
+            r12_find_active_dead: None,
+            r12_pending_dead: None,
+            r12_detached_dead: None,
+            r12_inherited_ambiguous_dead: None,
+            sample_us: None,
             caller_metadata_rows: lens.metadata_rows,
             floor_discovery_baseline_kb: lens.baseline_rss_kb,
             floor_staging_bytes: staging,
@@ -630,15 +654,19 @@ impl MemoryCadence {
     }
 }
 
-/// Split distinct pids into live vs dead by the probe. Pids are
-/// deduplicated: several R12 rows (or generations) may name one pid.
-/// PID reuse undercounts dead processes (a recycled pid reads live);
-/// the B1 exit routing replaces this sample with an incremental
-/// split and keeps it as the cross-check.
-pub(crate) fn split_live_dead(pids: &[u32], probe: &dyn Fn(u32) -> bool) -> (u64, u64) {
+/// Split distinct pids into live vs dead by the probe. The caller
+/// collects pids straight into a `BTreeSet<u32>` (no intermediate
+/// `Vec<ProcessKey>`); several R10/R12 rows (or generations) may name
+/// one pid. PID reuse undercounts dead processes (a recycled pid
+/// reads live); the B1 exit routing replaces this sample with an
+/// incremental split and keeps it as the cross-check. Test-only: the
+/// production sample (`semantics::State::memory_sample`) builds its
+/// live set inline to reuse it for the dead-row counts.
+#[cfg(test)]
+pub(crate) fn split_live_dead(pids: &BTreeSet<u32>, probe: &dyn Fn(u32) -> bool) -> (u64, u64) {
     let mut live = 0u64;
     let mut dead = 0u64;
-    for pid in pids.iter().collect::<BTreeSet<_>>() {
+    for pid in pids {
         if probe(*pid) {
             live += 1;
         } else {
@@ -651,6 +679,18 @@ pub(crate) fn split_live_dead(pids: &[u32], probe: &dyn Fn(u32) -> bool) -> (u64
 /// Best-effort /proc presence probe for the R12 sample.
 pub(crate) fn proc_pid_live(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The capture-start RSS baseline for the floor row, read only when
+/// diagnostics are on (Minor 1): the off path pays no
+/// `/proc/self/status` read. Bool-gated (like
+/// `seal_value_bytes_if_diagnostics`), never env-toggled in tests.
+pub(crate) fn baseline_rss_if_diagnostics(on: bool) -> Option<u64> {
+    if on {
+        self_rss_hwm_kb().map(|(rss, _)| rss)
+    } else {
+        None
+    }
 }
 
 /// The observer's own VmRSS/VmHWM in KiB, for the attribution table's
@@ -767,11 +807,29 @@ mod tests {
         }
     }
 
+    fn full_dead() -> StateDeadLens {
+        StateDeadLens {
+            reduced_dead: row(19),
+            open_dead: row(20),
+            active_ops_dead: row(21),
+            next_pseudonym_dead: row(22),
+            find_active_dead: row(23),
+            pending_dead: row(24),
+            detached_dead: row(25),
+            inherited_ambiguous_dead: row(26),
+        }
+    }
+
     fn full_profile_lens() -> ProfileLens {
         ProfileLens {
             history: full_history(),
             state: full_state(),
-            process_pids: vec![1, 2],
+            dead: full_dead(),
+            live_processes: 1,
+            dead_processes: 1,
+            sample_us: 123,
+            self_rss_kb: Some(1111),
+            self_hwm_kb: Some(2222),
             tasks: row(3),
             baseline_rss_kb: Some(4321),
         }
@@ -824,13 +882,8 @@ mod tests {
     /// owned grower row, and rows the command does not own read N/A.
     #[test]
     fn memory_counters_cover_every_grower() {
-        let profile = MemorySnapshot::for_profile_with_probe(
-            60,
-            full_profile_lens(),
-            32 * 1024 * 1024,
-            Some(100),
-            &|pid| pid == 1,
-        );
+        let profile =
+            MemorySnapshot::for_profile(60, full_profile_lens(), 32 * 1024 * 1024, Some(100));
         assert_eq!(profile.command, "profile");
         // Owned: R5-R10 + R12 + floor.
         assert_eq!(profile.r5_seal_value_bytes, Some(100));
@@ -843,8 +896,17 @@ mod tests {
         assert_eq!(profile.r10_reduced.expect("R10").len, 8);
         assert_eq!(profile.r12_open.expect("R12").len, 9);
         assert_eq!(profile.r12_inherited_ambiguous.expect("R12").len, 15);
-        assert_eq!(profile.r12_live_processes, Some(1));
-        assert_eq!(profile.r12_dead_processes, Some(1));
+        assert_eq!(profile.r10_r12_live_processes, Some(1));
+        assert_eq!(profile.r10_r12_dead_processes, Some(1));
+        assert_eq!(profile.r10_reduced_dead.expect("R10 dead").len, 19);
+        assert_eq!(profile.r12_open_dead.expect("R12 dead").len, 20);
+        assert_eq!(
+            profile.r12_inherited_ambiguous_dead.expect("R12 dead").len,
+            26
+        );
+        assert_eq!(profile.sample_us, Some(123));
+        assert_eq!(profile.self_rss_kb, Some(1111));
+        assert_eq!(profile.self_hwm_kb, Some(2222));
         assert_eq!(profile.floor_staging_bytes, 48 * 1024 * 1024);
         assert_eq!(profile.floor_ring_bytes, 32 * 1024 * 1024);
         // Not owned: R1-R4, R11, metadata.
@@ -873,6 +935,7 @@ mod tests {
         assert!(profile.r2_modules_by_key.is_none());
         assert!(profile.r2_gap_index.is_none());
         assert!(profile.r3_edge_detached.is_none());
+        assert_eq!(profile.r3_mech_pool_bytes, None);
         assert_eq!(profile.r3_mech_pool_used_bytes, None);
         assert!(profile.r4_domains.is_none());
         assert!(profile.r4_instances.is_none());
@@ -891,17 +954,18 @@ mod tests {
         assert_eq!(profile.r7_cgroup_retained_paths.expect("R7").len, 18);
         assert_eq!(profile.floor_discovery_baseline_kb, Some(4321));
 
-        let trace = MemorySnapshot::for_trace_with_probe(
+        let trace = MemorySnapshot::for_trace(
             60,
             full_profile_lens(),
             32 * 1024 * 1024,
-            &|_| true,
+            None,
             &TracerLens::from_sizes(2, 5, true, 7, 3),
         );
         assert_eq!(trace.command, "trace");
         assert_eq!(trace.r9_tasks.expect("trace owns R9").len, 3);
-        assert_eq!(trace.r12_live_processes, Some(2));
-        assert_eq!(trace.r12_dead_processes, Some(0));
+        assert_eq!(trace.r10_r12_live_processes, Some(1));
+        assert_eq!(trace.r10_r12_dead_processes, Some(1));
+        assert_eq!(trace.r3_mech_pool_bytes, None);
         // R11 rides B0's accessors (round 2): no pending hook remains.
         assert_eq!(trace.r11_caller_reasons_outer.expect("R11").len, 2);
         assert_eq!(trace.r11_caller_reasons_rows.expect("R11").len, 5);
@@ -916,7 +980,7 @@ mod tests {
         assert_eq!(inventory.r1_adapter_incarnations.expect("R1").len, 2);
         assert_eq!(inventory.r2_registry_edges.expect("R2").len, 6);
         assert_eq!(inventory.r3_edge_pending.expect("R3").len, 10);
-        assert_eq!(inventory.r3_mech_pool_bytes, 160 * 1024 * 1024);
+        assert_eq!(inventory.r3_mech_pool_bytes, Some(160 * 1024 * 1024));
         assert_eq!(inventory.r4_model_pending.expect("R4").len, 13);
         assert_eq!(inventory.r4_pruned_sessions, Some(14));
         assert_eq!(inventory.r4_pruned_objects, Some(15));
@@ -965,8 +1029,12 @@ mod tests {
         assert!(inventory.r12_pending.is_none());
         assert!(inventory.r12_detached.is_none());
         assert!(inventory.r12_inherited_ambiguous.is_none());
-        assert!(inventory.r12_live_processes.is_none());
-        assert!(inventory.r12_dead_processes.is_none());
+        assert!(inventory.r10_r12_live_processes.is_none());
+        assert!(inventory.r10_r12_dead_processes.is_none());
+        assert!(inventory.r10_reduced_dead.is_none());
+        assert!(inventory.r12_open_dead.is_none());
+        assert!(inventory.r12_next_pseudonym_dead.is_none());
+        assert!(inventory.sample_us.is_none());
     }
 
     /// A0 step 4 (corrected): the stderr line parses back to the same
@@ -1038,10 +1106,55 @@ mod tests {
 
     #[test]
     fn memory_live_dead_split_counts_probe_results() {
-        let (live, dead) = split_live_dead(&[1, 2, 3], &|pid| pid != 2);
+        let pids = BTreeSet::from([1, 2, 3]);
+        let (live, dead) = split_live_dead(&pids, &|pid| pid != 2);
         assert_eq!((live, dead), (2, 1));
-        let (live, dead) = split_live_dead(&[], &|_| true);
+        let empty = BTreeSet::new();
+        let (live, dead) = split_live_dead(&empty, &|_| true);
         assert_eq!((live, dead), (0, 0));
+    }
+
+    /// Minor 7: the stderr line stays well below the 4096-byte atomic
+    /// pipe-write limit, even at large counter values. Future keys
+    /// must keep this margin (split or trim before growing past it).
+    #[test]
+    fn memory_line_stays_well_below_pipe_atomic_limit() {
+        fn big(len: u64) -> CounterRow {
+            CounterRow {
+                len,
+                bytes: len.saturating_mul(4096),
+            }
+        }
+        // Large but realistic soak values (tens of thousands of rows,
+        // multi-GB byte totals), not u64::MAX extremes.
+        let mut lens = full_profile_lens();
+        lens.state.reduced = big(25_000);
+        lens.state.open = big(25_000);
+        lens.state.next_pseudonym = big(25_000);
+        lens.dead.reduced_dead = big(20_000);
+        lens.dead.open_dead = big(20_000);
+        lens.dead.next_pseudonym_dead = big(20_000);
+        lens.live_processes = 100;
+        lens.dead_processes = 25_000;
+        lens.sample_us = 999_999;
+        for snapshot in [
+            MemorySnapshot::for_profile(3600, lens.clone(), 64 * 1024 * 1024, Some(u64::MAX)),
+            MemorySnapshot::for_trace(
+                3600,
+                lens.clone(),
+                64 * 1024 * 1024,
+                None,
+                &TracerLens::from_sizes(4096, 10_000, true, 1_000_000, 500),
+            ),
+            MemorySnapshot::for_inventory(3600, full_inventory_lens(), 64 * 1024 * 1024),
+        ] {
+            let line = snapshot.format_line();
+            assert!(
+                line.len() < 4096,
+                "memory line {} bytes, must stay well below 4096: {line:.200}",
+                line.len()
+            );
+        }
     }
 
     #[test]
@@ -1064,5 +1177,15 @@ mod tests {
     fn self_rss_reads_current_process() {
         let (rss, hwm) = self_rss_hwm_kb().expect("test host has /proc/self/status");
         assert!(rss > 0 && hwm >= rss, "rss={rss} hwm={hwm}");
+    }
+
+    /// Minor 1 twin: the baseline reads only when diagnostics are on;
+    /// the off path pays no `/proc` read (returns None without touching
+    /// the filesystem).
+    #[test]
+    fn baseline_rss_gated_on_capture_diagnostics() {
+        assert_eq!(baseline_rss_if_diagnostics(false), None);
+        let on = baseline_rss_if_diagnostics(true).expect("test host has /proc/self/status");
+        assert!(on > 0);
     }
 }

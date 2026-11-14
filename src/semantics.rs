@@ -4587,7 +4587,10 @@ impl State {
     /// never on the hot path. Covers `detached` too: its map key is
     /// module-scoped, so only the record's own `process` names the
     /// owning process (a process whose only rows are detached would
-    /// otherwise be counted in neither live nor dead).
+    /// otherwise be counted in neither live nor dead). Test-only since
+    /// round 4: production uses `memory_process_pids` (u32 directly)
+    /// via `memory_sample`.
+    #[cfg(test)]
     pub(crate) fn memory_process_keys(&self) -> Vec<ProcessKey> {
         let mut keys = BTreeSet::new();
         keys.extend(self.reduced_histories.iter().copied());
@@ -4599,6 +4602,125 @@ impl State {
         keys.extend(self.detached.values().map(|detached| detached.process));
         keys.extend(self.inherited_ambiguous.iter().map(|(process, _)| *process));
         keys.into_iter().collect()
+    }
+    /// A0 sample pids: distinct owner pids across R10 + R12, collected
+    /// straight into a `BTreeSet<u32>` with no intermediate
+    /// `Vec<ProcessKey>` (Important 3). O(entries), emit path only.
+    pub(crate) fn memory_process_pids(&self) -> BTreeSet<u32> {
+        let mut pids = BTreeSet::new();
+        pids.extend(self.reduced_histories.iter().map(|key| key.pid));
+        pids.extend(self.open.keys().map(|(process, _)| process.pid));
+        pids.extend(self.active_ops.keys().map(|(process, _, _)| process.pid));
+        pids.extend(self.next_pseudonym.keys().map(|key| key.pid));
+        pids.extend(self.find_active.iter().map(|(process, _)| process.pid));
+        pids.extend(self.pending.keys().map(|(process, _, _)| process.pid));
+        pids.extend(self.detached.values().map(|detached| detached.process.pid));
+        pids.extend(
+            self.inherited_ambiguous
+                .iter()
+                .map(|(process, _)| process.pid),
+        );
+        pids
+    }
+    /// A0 one-pass sample (Blocker 2 + Important 3): one live-pid set
+    /// per 60 s pass, then dead-owned ROW counts + bytes per R10/R12
+    /// map from that same set, plus the live/dead process counts over
+    /// R10+R12 owners. Returns `(live, dead, dead_rows, sample_us)`.
+    /// O(entries) + O(distinct pids) probes, emit path only. PID reuse
+    /// undercounts dead (a recycled pid reads live); B1 replaces this
+    /// with an incremental split and keeps it as the cross-check.
+    pub(crate) fn memory_sample(
+        &self,
+        probe: &dyn Fn(u32) -> bool,
+    ) -> (u64, u64, crate::memory_counters::StateDeadLens, u64) {
+        use crate::memory_counters::{HEAP_MAP_ENTRY, StateDeadLens, counter_row};
+        use std::mem::size_of;
+        let start = std::time::Instant::now();
+        let pids = self.memory_process_pids();
+        let live_pids: BTreeSet<u32> = pids.iter().copied().filter(|pid| probe(*pid)).collect();
+        let live = live_pids.len() as u64;
+        let dead_processes = (pids.len() as u64).saturating_sub(live);
+        let is_dead = |pid: u32| !live_pids.contains(&pid);
+        let reduced_dead = self
+            .reduced_histories
+            .iter()
+            .filter(|key| is_dead(key.pid))
+            .count();
+        let open_dead = self
+            .open
+            .keys()
+            .filter(|(process, _)| is_dead(process.pid))
+            .count();
+        let active_ops_dead = self
+            .active_ops
+            .keys()
+            .filter(|(process, _, _)| is_dead(process.pid))
+            .count();
+        let next_pseudonym_dead = self
+            .next_pseudonym
+            .keys()
+            .filter(|key| is_dead(key.pid))
+            .count();
+        let find_active_dead = self
+            .find_active
+            .iter()
+            .filter(|(process, _)| is_dead(process.pid))
+            .count();
+        let pending_dead = self
+            .pending
+            .keys()
+            .filter(|(process, _, _)| is_dead(process.pid))
+            .count();
+        let detached_dead = self
+            .detached
+            .values()
+            .filter(|detached| is_dead(detached.process.pid))
+            .count();
+        let inherited_ambiguous_dead = self
+            .inherited_ambiguous
+            .iter()
+            .filter(|(process, _)| is_dead(process.pid))
+            .count();
+        let sample_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let dead = StateDeadLens {
+            reduced_dead: counter_row(reduced_dead, size_of::<ProcessKey>(), HEAP_MAP_ENTRY),
+            open_dead: counter_row(
+                open_dead,
+                size_of::<((ProcessKey, SessionRef), SessionInfo)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            active_ops_dead: counter_row(
+                active_ops_dead,
+                size_of::<((ProcessKey, SessionRef, u16), Binding)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            next_pseudonym_dead: counter_row(
+                next_pseudonym_dead,
+                size_of::<(ProcessKey, u64)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            find_active_dead: counter_row(
+                find_active_dead,
+                size_of::<(ProcessKey, SessionRef)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            pending_dead: counter_row(
+                pending_dead,
+                size_of::<((ProcessKey, SessionRef, u32), Pending)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            detached_dead: counter_row(
+                detached_dead,
+                size_of::<((ModuleId, u64, u32, u64, u64), Detached)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            inherited_ambiguous_dead: counter_row(
+                inherited_ambiguous_dead,
+                size_of::<(ProcessKey, SessionRef)>(),
+                HEAP_MAP_ENTRY,
+            ),
+        };
+        (live, dead_processes, dead, sample_us)
     }
     pub fn pending_at_end(&self) -> u64 {
         (self.pending.len() + self.detached.len()) as u64
@@ -5219,6 +5341,42 @@ mod tests {
             },
         );
         assert_eq!(s.memory_process_keys(), vec![process]);
+    }
+
+    /// Blocker 2 twin: one dead-owned `next_pseudonym` row plus one
+    /// live-owned `open` row. The sample builds one live-pid set and
+    /// reports dead-owned ROW counts (not just processes) with bytes.
+    #[test]
+    fn memory_sample_counts_dead_owned_rows_per_map() {
+        let mut s = State::with_policy(&test_plan(), crate::attach::CapturePolicy::Allowlisted);
+        let dead = ProcessKey::from_pid(4242);
+        let live = ProcessKey::from_pid(4343);
+        s.next_pseudonym.insert(dead, 2);
+        s.open.insert(
+            (
+                live,
+                SessionRef {
+                    module: ModuleId(0),
+                    handle: 10,
+                },
+            ),
+            SessionInfo {
+                pseudonym: 1,
+                slot: 0,
+                fork_safe: false,
+            },
+        );
+        // One live pid set per pass: 4343 live, 4242 dead.
+        let (live_count, dead_count, dead_lens, _sample_us) = s.memory_sample(&|pid| pid == 4343);
+        assert_eq!((live_count, dead_count), (1, 1));
+        assert_eq!(dead_lens.next_pseudonym_dead.len, 1);
+        assert!(dead_lens.next_pseudonym_dead.bytes > 0);
+        assert_eq!(dead_lens.open_dead.len, 0);
+        assert_eq!(dead_lens.open_dead.bytes, 0);
+        assert_eq!(dead_lens.reduced_dead.len, 0);
+        // Pids collected directly as u32, no intermediate ProcessKey vec.
+        let pids = s.memory_process_pids();
+        assert_eq!(pids, BTreeSet::from([4242, 4343]));
     }
 
     #[test]

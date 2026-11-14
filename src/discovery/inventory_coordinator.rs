@@ -1130,7 +1130,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             promotion_finish: false,
             promotion_records_discarded: 0,
             memory_cadence: crate::memory_counters::MemoryCadence::new(),
-            memory_baseline_rss_kb: crate::memory_counters::self_rss_hwm_kb().map(|(rss, _)| rss),
+            // Gated on diagnostics (Minor 1): the default path pays no
+            // `/proc/self/status` read at construction.
+            memory_baseline_rss_kb: crate::memory_counters::baseline_rss_if_diagnostics(
+                crate::run::capture_diagnostics_on(),
+            ),
             seal_diagnosis: semantics::SealDiagnosis::default(),
             #[cfg(test)]
             engine_collected_finish_calls: 0,
@@ -12179,6 +12183,14 @@ pub(crate) mod tests {
     #[test]
     fn coordinator_memory_snapshot_carries_owned_rows() {
         let mut coordinator = coordinator();
+        // The baseline is gated on diagnostics (Minor 1): the test
+        // process runs without `-v`, so construction leaves it None.
+        // Set it explicitly to pin the wire shape with a baseline
+        // present (the gating itself is pinned by the helper twin in
+        // `memory_counters`).
+        coordinator.memory_baseline_rss_kb =
+            crate::memory_counters::baseline_rss_if_diagnostics(true);
+        assert!(coordinator.memory_baseline_rss_kb.is_some());
         // One adapter admission with the live test process moves R1.
         let pid = std::process::id();
         coordinator

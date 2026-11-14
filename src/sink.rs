@@ -254,13 +254,16 @@ pub(crate) fn bounded_stderr_writer() -> Box<dyn Write> {
 /// line says nothing the exit status does not — while every other
 /// byte passes: progress lines, slow completions, partial or
 /// uncertain receipts, other diagnostics, and unterminated tails
-/// (never a complete receipt). Lines are judged whole, however the
-/// writes split them; a tail past [`QUIET_CLEANUP_HOLD_CAP`] flushes
-/// through verbatim, so a newline-less writer can never wedge bytes
-/// here. Fail-open by construction: only the exact receipt drops.
+/// (never a complete receipt). A receipt following cleanup narrative
+/// stays: it completes a visible story. Lines are judged whole,
+/// however the writes split them; a tail past [`QUIET_CLEANUP_HOLD_CAP`]
+/// flushes through verbatim, so a newline-less writer can never wedge
+/// bytes here. Fail-open by construction: only the exact quiet
+/// receipt drops, and a drop delivers the held tail best-effort.
 struct QuietCleanupWriter {
     inner: Box<dyn Write>,
     pending: Vec<u8>,
+    cleanup_narrative_seen: bool,
 }
 
 /// Longest held tail: the receipt is under a hundred bytes, so
@@ -273,15 +276,22 @@ impl QuietCleanupWriter {
         Self {
             inner,
             pending: Vec::new(),
+            cleanup_narrative_seen: false,
         }
     }
 
     /// Emit every complete held line except the quiet receipt, then
-    /// flush a past-cap tail through verbatim.
+    /// flush a past-cap tail through verbatim. A receipt following
+    /// cleanup narrative stays: it completes the visible story.
     fn drain_complete_lines(&mut self) -> io::Result<()> {
         while let Some(end) = self.pending.iter().position(|&byte| byte == b'\n') {
             let line: Vec<u8> = self.pending.drain(..=end).collect();
             if !is_instant_completed_cleanup(&line) {
+                if is_cleanup_narrative(&line) {
+                    self.cleanup_narrative_seen = true;
+                }
+                self.inner.write_all(&line)?;
+            } else if self.cleanup_narrative_seen {
                 self.inner.write_all(&line)?;
             }
         }
@@ -290,6 +300,21 @@ impl QuietCleanupWriter {
             self.inner.write_all(&tail)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for QuietCleanupWriter {
+    /// Best-effort delivery of the held tail, mirroring `flush`:
+    /// every current caller writes whole lines, but a dropped writer
+    /// must not silently eat an unterminated tail. Errors ignored: a
+    /// drop must never panic.
+    fn drop(&mut self) {
+        let _ = self.drain_complete_lines();
+        if !self.pending.is_empty() {
+            let tail: Vec<u8> = std::mem::take(&mut self.pending);
+            let _ = self.inner.write_all(&tail);
+        }
+        let _ = self.inner.flush();
     }
 }
 
@@ -308,6 +333,15 @@ impl Write for QuietCleanupWriter {
         }
         self.inner.flush()
     }
+}
+
+/// True for a cleanup-narrative line an instant receipt completes:
+/// progress (`cleanup N/M ...`), slow, partial or uncertain
+/// completions, and the stop estimate (`closing ... progress
+/// follows`). Only the cleanup worker emits these prefixes.
+fn is_cleanup_narrative(line: &[u8]) -> bool {
+    line.starts_with(b"p11scope: closing ")
+        || (line.starts_with(b"p11scope: cleanup ") && !is_instant_completed_cleanup(line))
 }
 
 /// True for the exact instant-completed cleanup receipt:
@@ -2088,7 +2122,8 @@ mod tests {
     fn quiet_cleanup_writer_flushes_its_tail_on_drop() {
         let (writer, mut reader) = pair();
         let mut out = QuietCleanupWriter::new(bounded_writer_on_fd(writer.as_raw_fd()));
-        out.write_all(b"p11scope: capturing: 1466 probes attached").unwrap();
+        out.write_all(b"p11scope: capturing: 1466 probes attached")
+            .unwrap();
         drop(out);
         drop(writer);
         let mut got = Vec::new();

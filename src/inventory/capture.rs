@@ -4628,12 +4628,15 @@ fn detach_duration_text(seconds: u64) -> String {
     }
     let minutes = seconds.saturating_add(30) / 60;
     if minutes < 90 {
-        let plural = if minutes == 1 { "" } else { "s" };
-        return format!("about {minutes} minute{plural}");
+        // No singular: minutes == 1 needs seconds in 30..=89, which
+        // always takes the seconds branch above, so the smallest
+        // minute render is "about 2 minutes" (90 s).
+        return format!("about {minutes} minutes");
     }
     let hours = minutes.saturating_add(30) / 60;
-    let plural = if hours == 1 { "" } else { "s" };
-    format!("about {hours} hour{plural}")
+    // No singular, likewise: hours == 1 needs minutes in 30..=89,
+    // which always takes the minutes branch.
+    format!("about {hours} hours")
 }
 
 /// The run's end after the stop (R-C51-4): `write` attempts final outputs

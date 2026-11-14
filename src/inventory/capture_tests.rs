@@ -3833,7 +3833,9 @@ fn unsettled_singles_detach_line_estimates_remaining_minutes() {
 }
 
 /// The estimate renders seconds below a minute and a half, minutes
-/// below an hour and a half, and hours past that, with singulars.
+/// below an hour and a half, and hours past that, with a singular
+/// for one second only: the round-half-up 90 thresholds leave
+/// minutes == 1 and hours == 1 unreachable.
 #[test]
 fn unsettled_singles_detach_estimate_renders_plain_durations() {
     for (attached, duration) in [

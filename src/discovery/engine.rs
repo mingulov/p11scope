@@ -1422,7 +1422,61 @@ struct CaptureFacts {
     staged: Option<CaptureHistory>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Equality of two names (§8.3): length first, then a same-address
+/// shortcut (one pointer comparison instead of a memcmp), then content.
+/// Same address plus same length means the same live bytes. Exactly
+/// `str` equality.
+fn decoded_name_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_ptr() == right.as_ptr() || left == right
+}
+
+/// Order of two names (§8.3): same-address names compare equal by
+/// pointer instead of memcmp; everything else compares by content.
+/// Exactly `str` order.
+fn decoded_name_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    if left.as_ptr() == right.as_ptr() && left.len() == right.len() {
+        return std::cmp::Ordering::Equal;
+    }
+    left.cmp(right)
+}
+
+/// Order of two shared opened identities (§8.3): the same allocation
+/// compares equal without walking its content. Exactly the content
+/// order otherwise.
+fn shared_key_cmp(left: &Arc<PinnedTimingKey>, right: &Arc<PinnedTimingKey>) -> std::cmp::Ordering {
+    if Arc::ptr_eq(left, right) {
+        std::cmp::Ordering::Equal
+    } else {
+        left.cmp(right)
+    }
+}
+
+/// Order of two static function names (§8.3): the same static compares
+/// equal by pointer instead of memcmp. Exactly `str` order otherwise.
+fn static_name_cmp(left: &'static str, right: &'static str) -> std::cmp::Ordering {
+    if left.as_ptr() == right.as_ptr() && left.len() == right.len() {
+        std::cmp::Ordering::Equal
+    } else {
+        left.cmp(right)
+    }
+}
+
+/// Order of one decoded-target key (§8.3): static-name order, then
+/// shared-key order, then offset. Exactly the tuple order; shared by
+/// the occurrence sort and its run detection so grouping matches.
+fn decoded_target_key_cmp(
+    left: &(&'static str, Arc<PinnedTimingKey>, u64),
+    right: &(&'static str, Arc<PinnedTimingKey>, u64),
+) -> std::cmp::Ordering {
+    static_name_cmp(left.0, right.0)
+        .then_with(|| shared_key_cmp(&left.1, &right.1))
+        .then_with(|| left.2.cmp(&right.2))
+}
+
+#[derive(Debug, Clone)]
 enum DecodedOccurrence {
     /// One exact decoded target occurrence, in the one keyspace every source
     /// shares: a manifest corroborating a scanned entry names the same
@@ -1460,6 +1514,217 @@ enum DecodedOccurrence {
         name: &'static str,
         object: Option<(PinnedTimingKey, u64)>,
     },
+}
+
+impl PartialEq for DecodedOccurrence {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Target {
+                    module: left_module,
+                    name: left_name,
+                    object: left_object,
+                    file_offset: left_offset,
+                    occurrence: left_occurrence,
+                },
+                Self::Target {
+                    module: right_module,
+                    name: right_name,
+                    object: right_object,
+                    file_offset: right_offset,
+                    occurrence: right_occurrence,
+                },
+            ) => {
+                left_module == right_module
+                    && decoded_name_eq(left_name, right_name)
+                    && (Arc::ptr_eq(left_object, right_object) || left_object == right_object)
+                    && left_offset == right_offset
+                    && left_occurrence == right_occurrence
+            }
+            (
+                Self::ScanSkip {
+                    module: left_module,
+                    subject: left_subject,
+                    reason: left_reason,
+                    occurrence: left_occurrence,
+                },
+                Self::ScanSkip {
+                    module: right_module,
+                    subject: right_subject,
+                    reason: right_reason,
+                    occurrence: right_occurrence,
+                },
+            ) => {
+                left_module == right_module
+                    && left_subject == right_subject
+                    && left_reason == right_reason
+                    && left_occurrence == right_occurrence
+            }
+            (
+                Self::ManifestFunction {
+                    module: left_module,
+                    manifest: left_manifest,
+                    surface: left_surface,
+                    function: left_function,
+                },
+                Self::ManifestFunction {
+                    module: right_module,
+                    manifest: right_manifest,
+                    surface: right_surface,
+                    function: right_function,
+                },
+            ) => {
+                left_module == right_module
+                    && left_manifest == right_manifest
+                    && left_surface == right_surface
+                    && left_function == right_function
+            }
+            (
+                Self::Selection {
+                    module: left_module,
+                    provider: left_provider,
+                    table_file_offset: left_offset,
+                    version: left_version,
+                    ordinal: left_ordinal,
+                    name: left_name,
+                    object: left_object,
+                },
+                Self::Selection {
+                    module: right_module,
+                    provider: right_provider,
+                    table_file_offset: right_offset,
+                    version: right_version,
+                    ordinal: right_ordinal,
+                    name: right_name,
+                    object: right_object,
+                },
+            ) => {
+                left_module == right_module
+                    && left_provider == right_provider
+                    && left_offset == right_offset
+                    && left_version == right_version
+                    && left_ordinal == right_ordinal
+                    && left_name.len() == right_name.len()
+                    && (left_name.as_ptr() == right_name.as_ptr() || left_name == right_name)
+                    && left_object == right_object
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DecodedOccurrence {}
+
+impl PartialOrd for DecodedOccurrence {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DecodedOccurrence {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (
+                Self::Target {
+                    module: left_module,
+                    name: left_name,
+                    object: left_object,
+                    file_offset: left_offset,
+                    occurrence: left_occurrence,
+                },
+                Self::Target {
+                    module: right_module,
+                    name: right_name,
+                    object: right_object,
+                    file_offset: right_offset,
+                    occurrence: right_occurrence,
+                },
+            ) => left_module
+                .cmp(right_module)
+                .then_with(|| decoded_name_cmp(left_name, right_name))
+                .then_with(|| shared_key_cmp(left_object, right_object))
+                .then_with(|| left_offset.cmp(right_offset))
+                .then_with(|| left_occurrence.cmp(right_occurrence)),
+            (
+                Self::ScanSkip {
+                    module: left_module,
+                    subject: left_subject,
+                    reason: left_reason,
+                    occurrence: left_occurrence,
+                },
+                Self::ScanSkip {
+                    module: right_module,
+                    subject: right_subject,
+                    reason: right_reason,
+                    occurrence: right_occurrence,
+                },
+            ) => (left_module, left_subject, left_reason, left_occurrence).cmp(&(
+                right_module,
+                right_subject,
+                right_reason,
+                right_occurrence,
+            )),
+            (
+                Self::ManifestFunction {
+                    module: left_module,
+                    manifest: left_manifest,
+                    surface: left_surface,
+                    function: left_function,
+                },
+                Self::ManifestFunction {
+                    module: right_module,
+                    manifest: right_manifest,
+                    surface: right_surface,
+                    function: right_function,
+                },
+            ) => (left_module, left_manifest, left_surface, left_function).cmp(&(
+                right_module,
+                right_manifest,
+                right_surface,
+                right_function,
+            )),
+            (
+                Self::Selection {
+                    module: left_module,
+                    provider: left_provider,
+                    table_file_offset: left_offset,
+                    version: left_version,
+                    ordinal: left_ordinal,
+                    name: left_name,
+                    object: left_object,
+                },
+                Self::Selection {
+                    module: right_module,
+                    provider: right_provider,
+                    table_file_offset: right_offset,
+                    version: right_version,
+                    ordinal: right_ordinal,
+                    name: right_name,
+                    object: right_object,
+                },
+            ) => left_module
+                .cmp(right_module)
+                .then_with(|| left_provider.cmp(right_provider))
+                .then_with(|| left_offset.cmp(right_offset))
+                .then_with(|| left_version.cmp(right_version))
+                .then_with(|| left_ordinal.cmp(right_ordinal))
+                .then_with(|| decoded_name_cmp(left_name, right_name))
+                .then_with(|| left_object.cmp(right_object)),
+            (left, right) => Self::variant_rank(left).cmp(&Self::variant_rank(right)),
+        }
+    }
+}
+
+impl DecodedOccurrence {
+    /// Variant order is declaration order, exactly as derived.
+    fn variant_rank(occurrence: &DecodedOccurrence) -> u8 {
+        match occurrence {
+            DecodedOccurrence::Target { .. } => 0,
+            DecodedOccurrence::ScanSkip { .. } => 1,
+            DecodedOccurrence::ManifestFunction { .. } => 2,
+            DecodedOccurrence::Selection { .. } => 3,
+        }
+    }
 }
 
 /// `DecodedOccurrence::Target` keeps the owned key's equality and order:
@@ -1525,6 +1790,85 @@ mod decoded_occurrence_key_tests {
                     file_offset,
                     ..
                 } => (module.0, name.to_string(), (**object).clone(), *file_offset),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(ordered, owned);
+    }
+
+    /// The comparison fast paths (§8.3) preserve owned-tuple order
+    /// exactly: same-static borrows, borrowed-vs-owned twins,
+    /// prefix-sharing names, and occurrence ties all order like the
+    /// owned `(module, name, object, offset, occurrence)` tuple.
+    #[test]
+    fn target_order_matches_owned_tuples_across_borrowed_and_owned_names() {
+        let pins = pin_set(&[(overlay(1), SHA, 1), (overlay(2), SHA, 1)], true);
+        let keys: Vec<PinnedTimingKey> = pins
+            .pinned()
+            .map(|pin| pins.owned_timing_key(pin.id).unwrap())
+            .collect();
+        assert_eq!(keys.len(), 2);
+        let target =
+            |module: u32, name: Cow<'static, str>, key: usize, offset: u64, occurrence: usize| {
+                DecodedOccurrence::Target {
+                    module: plan::ModuleId(module),
+                    name,
+                    object: Arc::new(keys[key].clone()),
+                    file_offset: offset,
+                    occurrence,
+                }
+            };
+        // (module, name, borrowed?, key, offset, occurrence).
+        let shapes: [(u32, &'static str, bool, usize, u64, usize); 9] = [
+            (0, "C_Sign", true, 0, 8, 0),
+            (0, "C_Sign", true, 0, 8, 0),
+            (0, "C_Sign", false, 0, 8, 1),
+            (0, "C_SignInit", true, 0, 0, 0),
+            (0, "C_Final", false, 1, 2, 0),
+            (1, "C_Init", true, 0, 1, 0),
+            (0, "C_Sign", false, 1, 8, 0),
+            (0, "C_GetInfo", true, 1, 8, 0),
+            (0, "C_GetInfo", false, 0, 8, 0),
+        ];
+        let mut set = BTreeSet::new();
+        for (module, name, borrowed, key, offset, occurrence) in shapes {
+            let name = if borrowed {
+                Cow::Borrowed(name)
+            } else {
+                Cow::Owned(name.to_string())
+            };
+            set.insert(target(module, name, key, offset, occurrence));
+        }
+        let mut owned: Vec<_> = shapes
+            .iter()
+            .map(|(module, name, _, key, offset, occurrence)| {
+                (
+                    *module,
+                    name.to_string(),
+                    keys[*key].clone(),
+                    *offset,
+                    *occurrence,
+                )
+            })
+            .collect();
+        owned.sort();
+        owned.dedup();
+        let ordered: Vec<_> = set
+            .iter()
+            .map(|occurrence| match occurrence {
+                DecodedOccurrence::Target {
+                    module,
+                    name,
+                    object,
+                    file_offset,
+                    occurrence,
+                } => (
+                    module.0,
+                    name.to_string(),
+                    (**object).clone(),
+                    *file_offset,
+                    *occurrence,
+                ),
                 _ => unreachable!(),
             })
             .collect();
@@ -2804,8 +3148,19 @@ impl CaptureFacts {
                     StandardExportFact::Absent
                 },
             );
-            let mut targets: BTreeMap<(&'static str, Arc<PinnedTimingKey>, u64), usize> =
-                BTreeMap::new();
+            // Decoded-target keys for the occurrence pass below: one
+            // vector instead of a per-entry B-tree (no node allocation
+            // per entry). Occurrence indices count sorted-key runs,
+            // which assigns the same per-key multiset the map did.
+            let mut target_entries: Vec<(&'static str, Arc<PinnedTimingKey>, u64)> =
+                Vec::with_capacity(
+                    module
+                        .scanned
+                        .tables
+                        .iter()
+                        .map(|table| table.entries.len())
+                        .sum(),
+                );
             // One exact opened identity per target object, built once per
             // module instead of once per decoded entry.
             let mut timing_keys: BTreeMap<PinnedObjectId, Arc<PinnedTimingKey>> = BTreeMap::new();
@@ -2977,17 +3332,7 @@ impl CaptureFacts {
                             key
                         }
                     };
-                    let occurrence = targets
-                        .entry((entry.name, object.clone(), entry.file_offset))
-                        .or_insert(0usize);
-                    history.decoded.insert(DecodedOccurrence::Target {
-                        module: owner,
-                        name: std::borrow::Cow::Borrowed(entry.name),
-                        object,
-                        file_offset: entry.file_offset,
-                        occurrence: *occurrence,
-                    });
-                    *occurrence += 1;
+                    target_entries.push((entry.name, object.clone(), entry.file_offset));
                 }
                 for skipped in table
                     .null_entries
@@ -3010,6 +3355,25 @@ impl CaptureFacts {
                     history.skips.entry(key).or_insert(skipped);
                     *occurrence += 1;
                 }
+            }
+            target_entries.sort_unstable_by(decoded_target_key_cmp);
+            let mut occurrence = 0usize;
+            for (index, (name, object, file_offset)) in target_entries.iter().enumerate() {
+                if index > 0
+                    && decoded_target_key_cmp(&target_entries[index - 1], &target_entries[index])
+                        == std::cmp::Ordering::Equal
+                {
+                    occurrence += 1;
+                } else {
+                    occurrence = 0;
+                }
+                history.decoded.insert(DecodedOccurrence::Target {
+                    module: owner,
+                    name: std::borrow::Cow::Borrowed(name),
+                    object: object.clone(),
+                    file_offset: *file_offset,
+                    occurrence,
+                });
             }
         }
 

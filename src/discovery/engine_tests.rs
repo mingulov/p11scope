@@ -4550,6 +4550,57 @@ fn batch_steady_refusals_defer_to_one_tail_merge() {
     assert_publish_deferral_evidence_equal(&batched, &full);
 }
 
+/// Characterization (§8.3): the merge assigns occurrence indices per
+/// exact target key in input order and iterates them in sorted-key
+/// order. Unsorted input with one aliased offset pins the exact
+/// assignment the allocation fixes must reproduce.
+#[test]
+fn merge_assigns_occurrence_indices_in_sorted_key_order() {
+    let mut raw = overlay_module(overlay_key(210));
+    let entry = |file_offset| ScannedEntry {
+        name: "C_Sign",
+        object: raw.key,
+        object_path: raw.path.clone(),
+        file_offset,
+    };
+    raw.tables[0].entries = vec![entry(8), entry(0), entry(8)];
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut engine = Engine::empty();
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    let targets: Vec<(String, u64, usize)> = engine
+        .capture_facts
+        .history
+        .decoded
+        .iter()
+        .filter_map(|occurrence| match occurrence {
+            DecodedOccurrence::Target {
+                name,
+                file_offset,
+                occurrence,
+                ..
+            } => Some((name.to_string(), *file_offset, *occurrence)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        targets,
+        vec![
+            ("C_Sign".to_string(), 0, 0),
+            ("C_Sign".to_string(), 8, 0),
+            ("C_Sign".to_string(), 8, 1),
+        ]
+    );
+}
+
 /// A loader transaction flushes (§8.1 batching): proof-carrying
 /// candidates always publish per candidate, so the loader path stays
 /// bit-identical (including its planning-cache reseeds) with batch

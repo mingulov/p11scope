@@ -2257,7 +2257,9 @@ _DETAILED_BASE_MAPS = {
         # counters. Tracks the constant; change both together.
         "PRODUCED": (6, 4, 8, 2),
         "MECH_SHAPE": (1, 8, 4, 1_024, 128),
-        "PAUSE_PIDS": (1, 16, 8, 1),
+        # The owned chain plus the member pause rows
+        # (ebpf-common MAX_PAUSE_PIDS); change both together.
+        "PAUSE_PIDS": (1, 16, 8, 65),
         "PID_FILTER": (1, 4, 8, 1_024, 128),
         "RV_COUNTS": (5, 16, 8, 4_096),
         "DESCRIPTORS": (2, 4, 18, 105, 128),
@@ -2579,7 +2581,7 @@ def self_test():
     assert SAFE_MAPS["DISCOVERY"] == map_def(27, 0, 0, 2 * 1024 * 1024)
     assert SAFE_MAPS["DISCOVERY_STATE"] == map_def(1, 24, 24, 64)
     assert SAFE_MAPS["COUNTERS"] == map_def(6, 4, 8, 5)
-    assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
+    assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 65)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
     assert SAFE_MAPS["PRODUCED"] == map_def(6, 4, 8, 2)

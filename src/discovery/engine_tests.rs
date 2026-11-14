@@ -83343,3 +83343,115 @@ int main(int argc, char **argv) {
     drop(seed);
     drop(child);
 }
+
+/// A loader arm that fails with the `ENOENT` an exiting group's
+/// executable or mappings return, on a group in its final exit: the group
+/// can never load anything again, so the arm is not armable — no
+/// unbound loader context and no arming gap.
+#[test]
+fn loader_arm_failure_on_a_group_in_final_exit_files_no_loader_gap() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    engine.set_final_exit_for_test(view);
+    engine.fail_next_loader_locate_for_test = true;
+    let mut additions_allowed = true;
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut ScriptedSession::default(),
+        &mut additions_allowed,
+        &mut PendingViewRetirements::new(),
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    armed.expect("an ending group's arm returns");
+    let aggregate = engine.loader_discovery();
+    assert_eq!(
+        aggregate.strategies.unavailable, 0,
+        "an ending group files no unbound context: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(aggregate.dlopen_timing.none, 0);
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live loader arming"),
+        "an ending group files no arming gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Healthy twin: the same failure on a live group stays a disclosed
+/// arming gap with its unbound context.
+#[test]
+fn loader_arm_failure_on_a_live_group_still_files_the_loader_gap() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    engine.fail_next_loader_locate_for_test = true;
+    let mut additions_allowed = true;
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut ScriptedSession::default(),
+        &mut additions_allowed,
+        &mut PendingViewRetirements::new(),
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    armed.expect("a failed arm still returns");
+    let aggregate = engine.loader_discovery();
+    assert_eq!(aggregate.strategies.unavailable, 1);
+    assert_eq!(aggregate.dlopen_timing.none, 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader arming"
+                && skip.reason == "No such file or directory (os error 2)"
+        }),
+        "a live group's failed arm keeps its gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// An exported provider of a group in its final exit has no loader
+/// context to hook through, and needs none: the export attach is complete
+/// with nothing to attach, and no gap is filed.
+#[test]
+fn export_attach_without_context_on_a_group_in_final_exit_files_no_gap() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
+    engine.set_final_exit_for_test(view);
+    let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(outcome, (false, true, false, false));
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live export hook"),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Healthy twin: a live group's exported provider without a unique
+/// attached context stays a disclosed export-hook gap.
+#[test]
+fn export_attach_without_context_on_a_live_group_still_files_the_gap() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
+    let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(outcome, (false, false, false, false));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live export hook"
+                && skip.reason == "a refreshed provider had no unique attached loader context"
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}

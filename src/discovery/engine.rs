@@ -1124,6 +1124,14 @@ pub struct Engine {
     /// cannot be produced deterministically with live pins.
     #[cfg(test)]
     pin_probe_script: RefCell<VecDeque<PinProbeAnswer>>,
+    /// Views a test declares to be in their final exit; the live answer
+    /// needs a real dying thread group.
+    #[cfg(test)]
+    final_exit_views_for_test: BTreeSet<ProcessViewId>,
+    /// Fails the next loader locate with the `ENOENT` an exiting group's
+    /// executable or mappings return.
+    #[cfg(test)]
+    fail_next_loader_locate_for_test: bool,
     /// Graphs created by the barrier (test count, G12/G20/G22/G23).
     #[cfg(test)]
     collected_graphs_created: u32,
@@ -13097,6 +13105,10 @@ impl Engine {
             #[cfg(test)]
             pin_probe_script: RefCell::new(VecDeque::new()),
             #[cfg(test)]
+            final_exit_views_for_test: BTreeSet::new(),
+            #[cfg(test)]
+            fail_next_loader_locate_for_test: false,
+            #[cfg(test)]
             collected_graphs_created: 0,
             #[cfg(test)]
             collected_intake_intents: 0,
@@ -23569,6 +23581,12 @@ impl Engine {
         {
             return Err(LoaderArmFailure::NotArmable);
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_loader_locate_for_test) {
+            return Err(LoaderArmFailure::ordinary(anyhow!(
+                "No such file or directory (os error 2)"
+            )));
+        }
         let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
             return Err(LoaderArmFailure::NotArmable);
         };
@@ -25473,6 +25491,11 @@ impl Engine {
     /// Whether this view's retained original pin *proves* its process exited.
     /// A poll failure or a dropped view is not exit evidence and stays false,
     /// so an unprovable loss is never downgraded.
+    #[cfg(test)]
+    pub(crate) fn set_final_exit_for_test(&mut self, view: ProcessViewId) {
+        self.final_exit_views_for_test.insert(view);
+    }
+
     fn original_exited(&self, view: ProcessViewId) -> bool {
         #[cfg(test)]
         if let Some(answer) = self.pop_pin_probe_exited() {

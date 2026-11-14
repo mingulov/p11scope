@@ -3247,7 +3247,12 @@ where
                     }
                 }
                 RetainedTerminalPhase::Retiring => {
-                    if let Some(RetainedNative::Live(lane)) = run.native.as_ref() {
+                    if let Some(RetainedNative::Live(lane)) = run.native.as_mut() {
+                        // Tick progress buffered since the last pass joins the
+                        // counts the line reports; the stop's own flush then
+                        // no-ops. Without this the line can undercount
+                        // `attached` against kernel-truth `links`.
+                        lane.flush_tick_progress(driver.host());
                         let load = lane.retirement_load();
                         let point = Publish::Retiring {
                             attached: lane.attached,
@@ -4163,7 +4168,7 @@ where
             .host()
             .note_scope_gap(ZERO_PASS_GAP_SUBJECT.into(), zero.gap_reason());
     }
-    let Some(lane) = lane else {
+    let Some(mut lane) = lane else {
         // The stop above may have begun a Joint finish beside the
         // (absent) native lane: drive it exactly like the native-lane
         // path below, while its receipts are fresh. A settle was owed
@@ -4201,6 +4206,10 @@ where
             retained: None,
         };
     };
+    // Tick progress buffered since the last pass joins the counts the
+    // retiring line reports (and the retirement budget covers); the stop's
+    // own flush then no-ops.
+    lane.flush_tick_progress(driver.host());
     if let Err(next) = publish(
         driver,
         Publish::Retiring {

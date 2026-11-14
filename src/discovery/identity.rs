@@ -8081,6 +8081,9 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_prior_and_filing(
 /// already-retained capture-level pins (packet 6.13 round-3, finding 3):
 /// per-pass count-manifest pins coexist with the run-retained pre-arm
 /// pins, so they charge the same shared object/byte budget.
+/// Test-only since Task 5: production inspect files through
+/// [`pin_count_manifest_objects_in_views_with_prior_and_table`].
+#[cfg(test)]
 pub(crate) fn pin_count_manifest_objects_in_views_with_prior(
     m: &Manifest,
     views: &[ProcessView],
@@ -8114,6 +8117,33 @@ fn batch_byte_allowance(spent: u64, wanted: usize) -> Result<usize, String> {
         ));
     }
     Ok(allowed as usize)
+}
+
+/// Inspect-lane variant of `pin_count_manifest_objects_in_views_with_prior`:
+/// manifest objects file rows into the run's own table. Inspect passes
+/// [`DeferredReason::Trusted`] for its operator-supplied manifest (the
+/// manifest chain only refuses trusted/learned inputs); the caller's
+/// strict `skipped.is_empty()` refusal turns any deferral into the
+/// run's hard error, unchanged.
+pub(crate) fn pin_count_manifest_objects_in_views_with_prior_and_table(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    prior_objects: usize,
+    prior_bytes: u64,
+    table: &mut HandleTable,
+    reason: DeferredReason,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_with_read_policy(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        true,
+        prior_objects,
+        prior_bytes,
+        Filing::Acquire(table, reason),
+    )
 }
 
 fn inspect_count_manifest_file(

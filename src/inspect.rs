@@ -8,8 +8,9 @@
 //! does this process actually use". Interface names are shown here on purpose:
 //! `inspect` is a discovery tool, not capture output (spec §4.3).
 
+use crate::discovery::handle_table::{DeferredReason, HandleTable};
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::{PinnedObjects, pin_scanned_view_objects};
+use crate::discovery::identity::{PinnedObjects, pin_scanned_view_objects_with_table};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
 };
@@ -729,6 +730,10 @@ fn run_with_view(
     let mut budget = CaptureWorkBudget::default();
     budget.set_excludes(excludes.to_vec());
     let mut context = (ProcessViewImageReader::new(&view), budget);
+    // The inspect lane owns its table for the run: same cap as a
+    // capture, no shared state with one. A full table stops the pin
+    // with the shared budget-stop gap; the run never retries.
+    let mut handles = HandleTable::new(1000);
     let result = scan_and_pin_application_with(
         &mut context,
         |context| context.0.view().still_the_same(),
@@ -740,7 +745,14 @@ fn run_with_view(
             )
         },
         |context, outcome| {
-            pin_scanned_view_objects(context.0.view(), outcome.modules(), &mut context.1)
+            pin_scanned_view_objects_with_table(
+                context.0.view(),
+                outcome.modules(),
+                &mut context.1,
+                None,
+                &mut handles,
+                DeferredReason::Live,
+            )
         },
     );
     let (excluded, unmatched) =
@@ -887,6 +899,7 @@ fn failure_json(pid: u32, reason: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::identity::pin_scanned_view_objects;
     use crate::discovery::scan::{
         ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped,
     };

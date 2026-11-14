@@ -33,11 +33,12 @@ use crate::discovery::engine::{
     MAX_SCAN_PIDS, capture_manifest_object_key, parse_manifest_text, retarget_to_pins, scope_pids,
     select_excluding_kernel_threads, sweep_process_maps, unreadable_member_skip,
 };
+use crate::discovery::handle_table::{DeferredReason, HandleTable};
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
     ExaminedObject, PinnedObjectId, PinnedObjects, ReconciledModule, bind_scanned_modules,
-    canonicalize_scanned_overlays, pin_count_manifest_objects_in_views_with_prior,
-    pin_scanned_view_objects,
+    canonicalize_scanned_overlays, pin_count_manifest_objects_in_views_with_prior_and_table,
+    pin_scanned_view_objects_with_table,
 };
 use crate::discovery::kernel_identity::{EXAMINED_ANCHOR_CAP, ExaminedCustody};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
@@ -577,6 +578,7 @@ fn collect_members(
     budget: CaptureWorkBudget,
     scanned: &BTreeSet<u32>,
     priors: &ScanPriors,
+    table: &mut HandleTable,
 ) -> Collection {
     collect_members_identity(
         hints,
@@ -588,6 +590,7 @@ fn collect_members(
         false,
         scanned,
         priors,
+        table,
     )
     .0
 }
@@ -635,6 +638,7 @@ fn collect_members_identity(
     take_anchors: bool,
     scanned: &BTreeSet<u32>,
     priors: &ScanPriors,
+    table: &mut HandleTable,
 ) -> (Collection, Option<ExaminedCustody>) {
     debug_assert!(!take_anchors || identity);
     progress!("p11scope: enumerating processes...");
@@ -785,6 +789,7 @@ fn collect_members_identity(
             &mut budget,
             &mut noise,
             custody.as_mut(),
+            &mut *table,
         ));
     }
     if let Some(summary) = deep_scan_progress_summary(selected.len()) {
@@ -846,10 +851,12 @@ fn scan_member(
     hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     noise: &mut DiscoveryNoiseAggregator,
+    table: &mut HandleTable,
 ) -> MemberResult {
-    scan_member_identity(pid, view, hints, hooks, budget, noise, None)
+    scan_member_identity(pid, view, hints, hooks, budget, noise, None, table)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_member_identity(
     pid: u32,
     view: ProcessViewId,
@@ -858,6 +865,7 @@ fn scan_member_identity(
     budget: &mut CaptureWorkBudget,
     noise: &mut DiscoveryNoiseAggregator,
     custody: Option<&mut ExaminedCustody>,
+    table: &mut HandleTable,
 ) -> MemberResult {
     let started_ns = monotonic_ns();
     let budget_before = (budget.stopped_reason(), budget.refusal_counts());
@@ -885,11 +893,13 @@ fn scan_member_identity(
             started_ns,
             budget_before,
             custody,
+            &mut *table,
         )
     })
 }
 
 /// The existing physical scan/absence authority remains independent of naming.
+#[allow(clippy::too_many_arguments)]
 fn scan_pinned_member(
     view_handle: &ProcessView,
     hints: &[PathBuf],
@@ -898,6 +908,7 @@ fn scan_pinned_member(
     noise: &mut DiscoveryNoiseAggregator,
     started_ns: Option<u64>,
     budget_before: (Option<&'static str>, (u64, u64)),
+    table: &mut HandleTable,
 ) -> MemberResult {
     scan_pinned_member_identity(
         view_handle,
@@ -908,6 +919,7 @@ fn scan_pinned_member(
         started_ns,
         budget_before,
         None,
+        table,
     )
 }
 
@@ -921,6 +933,7 @@ fn scan_pinned_member_identity(
     started_ns: Option<u64>,
     budget_before: (Option<&'static str>, (u64, u64)),
     mut custody: Option<&mut ExaminedCustody>,
+    table: &mut HandleTable,
 ) -> MemberResult {
     let scan = custody.as_mut().map(|held| held.begin_scan());
     let result = scan_pinned_member_inner(
@@ -932,6 +945,7 @@ fn scan_pinned_member_identity(
         started_ns,
         budget_before,
         custody.as_deref_mut().zip(scan),
+        table,
     );
     if (!result.mapping_scan_completed
         || !result.status.inventoried()
@@ -953,6 +967,7 @@ fn scan_pinned_member_inner(
     started_ns: Option<u64>,
     budget_before: (Option<&'static str>, (u64, u64)),
     custody: Option<(&mut ExaminedCustody, u64)>,
+    table: &mut HandleTable,
 ) -> MemberResult {
     let pid = view_handle.pid();
     let view = view_handle.id();
@@ -1008,7 +1023,17 @@ fn scan_pinned_member_inner(
             gaps,
         );
     }
-    let (pins, pin_skips) = match pin_scanned_view_objects(view_handle, outcome.modules(), budget) {
+    // The run's table bounds this member's pins like every other
+    // member's: a full table stops the pin with the shared
+    // budget-stop gap, which files below as this member's named gap.
+    let (pins, pin_skips) = match pin_scanned_view_objects_with_table(
+        view_handle,
+        outcome.modules(),
+        budget,
+        None,
+        table,
+        DeferredReason::Live,
+    ) {
         Ok(pinned) => pinned,
         Err(error) => {
             return member_not_scanned(
@@ -1566,6 +1591,9 @@ fn collect_identity(
     priors: &ScanPriors,
 ) -> Result<(Catalog, Option<ExaminedCustody>)> {
     let mut timings = StageTimings::new();
+    // One table for the run: member pins and manifest objects share
+    // the same cap, since member pins stay held across members.
+    let mut handles = HandleTable::new(1000);
     let (mut collection, mut custody) = if identity {
         collect_members_identity(
             hints,
@@ -1577,6 +1605,7 @@ fn collect_identity(
             true,
             scanned,
             priors,
+            &mut handles,
         )
     } else {
         (
@@ -1588,6 +1617,7 @@ fn collect_identity(
                 budget,
                 scanned,
                 priors,
+                &mut handles,
             ),
             None,
         )
@@ -1677,6 +1707,7 @@ fn collect_identity(
         manifests,
         prior_objects,
         prior_bytes,
+        &mut handles,
     );
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(
@@ -1768,7 +1799,18 @@ pub(crate) fn collect_pid_with_count_manifests(
 ) -> Result<Catalog> {
     progress!("p11scope: deep-scanning pid {pid}...");
     let mut noise = DiscoveryNoiseAggregator::default();
-    let member = scan_member(pid, ProcessViewId(0), hints, hooks, &mut budget, &mut noise);
+    // One table for the run: the member pin and manifest objects
+    // share the same cap.
+    let mut handles = HandleTable::new(1000);
+    let member = scan_member(
+        pid,
+        ProcessViewId(0),
+        hints,
+        hooks,
+        &mut budget,
+        &mut noise,
+        &mut handles,
+    );
     noise.report();
     if !member.status.inventoried() {
         let detail = member
@@ -1805,6 +1847,7 @@ pub(crate) fn collect_pid_with_count_manifests(
         manifests,
         prior_objects,
         prior_bytes,
+        &mut handles,
     );
     Ok(assemble(
         collection,
@@ -1948,6 +1991,7 @@ fn prepare_count_manifests(
     paths: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
+    table: &mut HandleTable,
 ) {
     for path in paths {
         let accepted = (|| -> Result<Manifest> {
@@ -2018,12 +2062,17 @@ fn prepare_count_manifests(
                 );
                 views.push(view);
             }
-            let pinning = pin_count_manifest_objects_in_views_with_prior(
+            // Manifest objects file into the run's table; the strict
+            // refusal below turns any deferral into the run's hard
+            // error, unchanged.
+            let pinning = pin_count_manifest_objects_in_views_with_prior_and_table(
                 &manifest,
                 &views,
                 &mut collection.budget,
                 prior_objects,
                 prior_bytes,
+                &mut *table,
+                DeferredReason::Trusted,
             )
             .map_err(|error| anyhow::anyhow!("manifest pinning refused: {:?}", error.problems()))?;
             ensure!(
@@ -4985,6 +5034,9 @@ pub(crate) fn collect_system_with_identity(
         budget.set_explicit_userspace();
     }
     let mut timings = StageTimings::new();
+    // One table for the run: member pins and manifest objects share
+    // the same cap, since member pins stay held across members.
+    let mut handles = HandleTable::new(1000);
     let (mut collection, mut custody) = collect_members_identity(
         hints,
         hooks,
@@ -4995,6 +5047,7 @@ pub(crate) fn collect_system_with_identity(
         identity_takes_anchors(selection),
         scanned,
         priors,
+        &mut handles,
     );
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
@@ -5140,6 +5193,7 @@ pub(crate) fn collect_system_with_identity(
         manifests,
         prior_objects,
         prior_bytes,
+        &mut handles,
     );
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(
@@ -5834,12 +5888,14 @@ mod tests {
         let (_dir, doc) = count_manifest_doc();
         let mut collection = empty_collection();
         let mut bound = super::bind_collection(&mut collection);
+        let mut table = crate::discovery::handle_table::HandleTable::new(1000);
         super::prepare_count_manifests(
             &mut collection,
             &mut bound,
             std::slice::from_ref(&doc),
             512,
             0,
+            &mut table,
         );
         assert!(bound.count_manifests.is_empty());
         assert_eq!(collection.scope_gaps.len(), 1);
@@ -5852,12 +5908,14 @@ mod tests {
         // refused later for scope reasons (nothing collected), not budget.
         let mut collection = empty_collection();
         let mut bound = super::bind_collection(&mut collection);
+        let mut table = crate::discovery::handle_table::HandleTable::new(1000);
         super::prepare_count_manifests(
             &mut collection,
             &mut bound,
             std::slice::from_ref(&doc),
             0,
             0,
+            &mut table,
         );
         assert!(bound.count_manifests.is_empty());
         assert_eq!(collection.scope_gaps.len(), 1);
@@ -6944,6 +7002,7 @@ mod tests {
 
     mod application {
         use super::*;
+        use crate::discovery::identity::pin_scanned_view_objects;
         use crate::fixture_guard::DieWithParent as _;
         use crate::inspect_identity::{
             InspectApplicationResult, InspectIdentityUnknown, InspectImageReader,
@@ -7139,6 +7198,7 @@ mod tests {
         #[test]
         fn system_inspect_os_scan_adapter_retains_the_owned_executable() {
             let pid = std::process::id();
+            let mut table = crate::discovery::handle_table::HandleTable::new(1000);
             let result = scan_member(
                 pid,
                 ProcessViewId(0),
@@ -7146,6 +7206,7 @@ mod tests {
                 &HookRegistry::builtin(),
                 &mut CaptureWorkBudget::default(),
                 &mut DiscoveryNoiseAggregator::default(),
+                &mut table,
             );
             assert!(result.status.inventoried());
             let json = application_json(&result.application);
@@ -7153,6 +7214,138 @@ mod tests {
             assert_eq!(
                 json["application"]["path"],
                 read_exe_identity(pid).unwrap().path.unwrap()
+            );
+        }
+
+        /// Task-5 inspect twin: a member mapping three distinct providers
+        /// pins two into a cap-2 table; the third files one named member
+        /// gap while the member still inventories.
+        #[test]
+        fn handle_table_inspect_member_pins_two_of_three_with_named_gap() {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("provider.c");
+            std::fs::write(
+                &source,
+                r#"
+#include <stddef.h>
+__attribute__((visibility("default"), noinline))
+int C_GetFunctionList(void **out) {
+    if (out != NULL) *out = NULL;
+    return 0;
+}
+"#,
+            )
+            .unwrap();
+            let mut libraries = Vec::new();
+            for name in ["provider-a.so", "provider-b.so", "provider-c.so"] {
+                let library = dir.path().join(name);
+                // Separate links, so each copy carries its own build id:
+                // three distinct providers, never three aliases of one.
+                assert!(
+                    std::process::Command::new("gcc")
+                        .args(["-shared", "-fPIC", "-o"])
+                        .arg(&library)
+                        .arg(&source)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                libraries.push(library);
+            }
+            let runner_source = dir.path().join("runner.c");
+            std::fs::write(
+                &runner_source,
+                r#"
+#include <dlfcn.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    for (int i = 1; i < argc; i++) {
+        if (dlopen(argv[i], RTLD_NOW | RTLD_LOCAL) == NULL) return 3;
+    }
+    for (;;) pause();
+    return 0;
+}
+"#,
+            )
+            .unwrap();
+            let runner = dir.path().join("runner");
+            assert!(
+                std::process::Command::new("gcc")
+                    .arg("-o")
+                    .arg(&runner)
+                    .arg(&runner_source)
+                    .arg("-ldl")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut spawn = std::process::Command::new(&runner);
+            for library in &libraries {
+                spawn.arg(library);
+            }
+            struct Guard(std::process::Child);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let child = Guard(spawn.die_with_parent().spawn().unwrap());
+            let pid = child.0.id();
+            let names: Vec<String> = libraries
+                .iter()
+                .map(|library| library.to_string_lossy().into_owned())
+                .collect();
+            for _ in 0..200 {
+                let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+                if names.iter().all(|name| {
+                    maps.lines().any(|line| {
+                        line.split_whitespace()
+                            .last()
+                            .is_some_and(|path| path == name)
+                    })
+                }) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let mut table = crate::discovery::handle_table::HandleTable::new(2);
+            let result = scan_member(
+                pid,
+                ProcessViewId(0),
+                &[],
+                &HookRegistry::builtin(),
+                &mut CaptureWorkBudget::default(),
+                &mut DiscoveryNoiseAggregator::default(),
+                &mut table,
+            );
+            assert!(result.status.inventoried());
+            assert_eq!(
+                result.modules.len(),
+                3,
+                "all three providers scan or the twin is vacuous"
+            );
+            assert_eq!(
+                result.pins.pinned().count(),
+                2,
+                "the cap-2 table holds two providers"
+            );
+            let budget_gaps: Vec<_> = result
+                .gaps
+                .iter()
+                .filter(|gap| gap.reason.contains("library-handle budget exhausted"))
+                .collect();
+            assert_eq!(
+                budget_gaps.len(),
+                1,
+                "the third provider files exactly one budget gap"
+            );
+            let gap = budget_gaps[0];
+            assert_eq!(gap.pid, Some(pid), "the gap is a member gap");
+            assert!(
+                names.iter().any(|name| gap.reason.contains(name.as_str())),
+                "the gap names the refused provider"
             );
         }
         #[test]
@@ -10395,6 +10588,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             };
             let mut budget = CaptureWorkBudget::default();
             let mut noise = DiscoveryNoiseAggregator::default();
+            let mut table = crate::discovery::handle_table::HandleTable::new(1000);
             let member = scan_member(
                 std::process::id(),
                 ProcessViewId(0),
@@ -10402,6 +10596,7 @@ pub(crate) mod demotion_retirement_producer_tests {
                 &HookRegistry::builtin(),
                 &mut budget,
                 &mut noise,
+                &mut table,
             );
             // SAFETY: the exact owned mapping is no longer used by the scanner.
             assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
@@ -10449,6 +10644,7 @@ pub(crate) mod demotion_retirement_producer_tests {
         std::fs::write(&path, b"replacement physical file").unwrap();
         let mut budget = CaptureWorkBudget::default();
         let mut noise = DiscoveryNoiseAggregator::default();
+        let mut table = crate::discovery::handle_table::HandleTable::new(1000);
         let member = scan_member(
             std::process::id(),
             ProcessViewId(0),
@@ -10456,6 +10652,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             &HookRegistry::builtin(),
             &mut budget,
             &mut noise,
+            &mut table,
         );
         // SAFETY: scanning completed; this is the exact owned 4096-byte mapping.
         assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
@@ -10471,6 +10668,7 @@ pub(crate) mod demotion_retirement_producer_tests {
         );
         let child = OwnedStoppedChild::new();
         let mut positive_budget = CaptureWorkBudget::default();
+        let mut table = crate::discovery::handle_table::HandleTable::new(1000);
         let member = scan_member(
             child.id(),
             ProcessViewId(0),
@@ -10478,6 +10676,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             &HookRegistry::builtin(),
             &mut positive_budget,
             &mut noise,
+            &mut table,
         );
         drop(child);
         assert!(
@@ -11405,6 +11604,7 @@ mod maps_skip_tests {
         // sweep snapshots) and keeps the test to one deep scan per run.
         let run = |priors: &ScanPriors| {
             let mut timings = StageTimings::new();
+            let mut table = crate::discovery::handle_table::HandleTable::new(1000);
             collect_members_identity(
                 &[],
                 &HookRegistry::builtin(),
@@ -11415,6 +11615,7 @@ mod maps_skip_tests {
                 false,
                 &scanned,
                 priors,
+                &mut table,
             )
             .0
         };
@@ -11479,6 +11680,7 @@ mod take_anchors_wiring_tests {
     fn collect_members_identity_forwards_take_anchors_to_custody_capacity() {
         for take_anchors in [false, true] {
             let mut timings = StageTimings::new();
+            let mut table = crate::discovery::handle_table::HandleTable::new(1000);
             let (collection, custody) = collect_members_identity(
                 &[],
                 &HookRegistry::builtin(),
@@ -11490,6 +11692,7 @@ mod take_anchors_wiring_tests {
                 // Cap 0 selects nothing; freshness is moot.
                 &std::collections::BTreeSet::new(),
                 &super::ScanPriors::empty(),
+                &mut table,
             );
             assert!(
                 collection.selected.is_empty(),

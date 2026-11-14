@@ -1013,6 +1013,9 @@ pub(crate) fn collect_with(
         );
     }
     let mut noise = DiscoveryNoiseAggregator::default();
+    // The cgroup run owns its table across members, like the
+    // system/pid runs own theirs.
+    let mut handles = HandleTable::new(1000);
     let mut members = Vec::new();
     for pid in &selected {
         checkpoint(CollectionStage::DeepScan);
@@ -1032,6 +1035,7 @@ pub(crate) fn collect_with(
                 &mut noise,
                 started,
                 before,
+                &mut handles,
             )
         });
         #[cfg(test)]
@@ -1094,6 +1098,7 @@ pub(crate) fn collect_with(
         &request.count_manifests,
         request.prearm_prior.0,
         request.prearm_prior.1,
+        &mut handles,
     );
     if collection.budget.stopped_reason().is_some() && outcome == ScopedCollectionOutcome::Complete
     {

@@ -19882,13 +19882,21 @@ fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
 fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
+    // Small members only: the test runner itself has huge maps, and a
+    // per-run time budget must never decide these exact counts, even
+    // loaded. Ownership still names the test process (it need not be
+    // a tree member for the watch to run).
+    let mut first_sleeper = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
-        .expect("spawn sleeper");
+        .expect("spawn first sleeper");
+    let mut second_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn second sleeper");
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n", sleeper.id()),
+        format!("{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -19905,15 +19913,15 @@ fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
         "unseen members join the rescan rotation"
     );
     assert!(
-        engine.owned_watch_seen.contains_key(&me)
-            && engine.owned_watch_seen.contains_key(&sleeper.id()),
+        engine.owned_watch_seen.contains_key(&first_sleeper.id())
+            && engine.owned_watch_seen.contains_key(&second_sleeper.id()),
         "noticed members take first-seen times"
     );
     assert!(
         engine.refresh_requested.is_empty() && engine.newcomer_first_seen.is_empty(),
         "the watch never queues frame work nor marks (exits gap exactly)"
     );
-    // Newest plus oldest scan per run (neither maps a provider, so
+    // Both members scan per run (neither maps a provider, so
     // both stay unproven for the rotation).
     let scanned: u32 = engine
         .owned_watch_unproven
@@ -19961,8 +19969,10 @@ fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
         engine.owned_watch_unproven.is_empty(),
         "a degraded exact-PID run has no tree to watch"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    first_sleeper.kill().expect("kill first sleeper");
+    first_sleeper.wait().expect("reap first sleeper");
+    second_sleeper.kill().expect("kill second sleeper");
+    second_sleeper.wait().expect("reap second sleeper");
 }
 
 #[test]
@@ -20108,13 +20118,20 @@ fn owned_tree_watch_renotice_keeps_first_seen_time() {
 fn owned_tree_watch_backs_off_unproductive_members() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
+    // Small members only, so the per-run time budget never decides
+    // these exact counts, even loaded (the test runner itself has
+    // huge maps).
+    let mut first_sleeper = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
-        .expect("spawn sleeper");
+        .expect("spawn first sleeper");
+    let mut second_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn second sleeper");
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n", sleeper.id()),
+        format!("{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -20147,8 +20164,10 @@ fn owned_tree_watch_backs_off_unproductive_members() {
     // Past the backoff the rotation resumes.
     engine.owned_tree_watch(Some(second + 25_000_000));
     assert_eq!(scans(&engine), 6, "a slow starter still gets rescanned");
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    first_sleeper.kill().expect("kill first sleeper");
+    first_sleeper.wait().expect("reap first sleeper");
+    second_sleeper.kill().expect("kill second sleeper");
+    second_sleeper.wait().expect("reap second sleeper");
 }
 
 /// Rotation reaches every member, not just the extremes: with three
@@ -20158,6 +20177,9 @@ fn owned_tree_watch_backs_off_unproductive_members() {
 fn owned_tree_watch_rotation_reaches_the_middle_member() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
+    // Small members only, so the per-run time budget never decides
+    // these exact counts, even loaded (the test runner itself has
+    // huge maps).
     let mut first_sleeper = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
@@ -20166,9 +20188,18 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
         .arg("30")
         .spawn()
         .expect("spawn second sleeper");
+    let mut third_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn third sleeper");
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+        format!(
+            "{}\n{}\n{}\n",
+            first_sleeper.id(),
+            second_sleeper.id(),
+            third_sleeper.id()
+        ),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -20182,7 +20213,7 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
     engine.owned_tree_watch(Some(first));
     engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
     engine.owned_tree_watch(Some(first + 2 * OWNED_WATCH_SCAN_MIN_NS));
-    let mut pids = vec![me, first_sleeper.id(), second_sleeper.id()];
+    let mut pids = vec![first_sleeper.id(), second_sleeper.id(), third_sleeper.id()];
     pids.sort_unstable();
     for pid in &pids {
         assert_eq!(
@@ -20198,6 +20229,8 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
     first_sleeper.wait().expect("reap first sleeper");
     second_sleeper.kill().expect("kill second sleeper");
     second_sleeper.wait().expect("reap second sleeper");
+    third_sleeper.kill().expect("kill third sleeper");
+    third_sleeper.wait().expect("reap third sleeper");
 }
 
 /// A rotation member that gains a retained view leaves the rotation:

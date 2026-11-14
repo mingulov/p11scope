@@ -20621,6 +20621,85 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// Learning records whether the proving view was still retained: a
+/// retained prover's scan-owned slots persist, so its staging owes no
+/// first-use gap when the key is scan-covered; a transient prover's
+/// slots retire with it, so its staging still owes the row.
+#[test]
+fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let retained_backing = dir.path().join("libretained.so");
+    let transient_backing = dir.path().join("libtransient.so");
+    std::fs::write(
+        &retained_backing,
+        "p11scope-fixture:retained-provider-bytes",
+    )
+    .expect("write retained backing");
+    std::fs::write(
+        &transient_backing,
+        "p11scope-fixture:transient-provider-bytes",
+    )
+    .expect("write transient backing");
+    let retained_pins = real_scan_pin(&retained_backing, None, 400, &"ab".repeat(32));
+    let transient_pins = real_scan_pin(&transient_backing, None, 400, &"cd".repeat(32));
+    let retained_object = retained_pins.pinned().next().expect("one pin").id;
+    let transient_object = transient_pins.pinned().next().expect("one pin").id;
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+    // A proof from the retained sleeper view and one from a released
+    // transient view id (never retained): distinct files, so neither
+    // proof dedupes the other.
+    let retained_proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(7),
+        path: retained_backing.to_string_lossy().into_owned(),
+        object: retained_object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+    }];
+    let transient_proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: transient_backing.to_string_lossy().into_owned(),
+        object: transient_object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+    }];
+    engine.learn_owned_proofs(&retained_pins, &retained_proofs);
+    engine.learn_owned_proofs(&transient_pins, &transient_proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        2,
+        "both proofs stage (distinct files)"
+    );
+    assert!(
+        engine.pending_learned[0].proving_retained,
+        "a retained prover stages as retained"
+    );
+    assert!(
+        !engine.pending_learned[1].proving_retained,
+        "a transient prover stages as transient"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// Staging stages the proof's stored loader naming and resolves
 /// nothing behind the proof: the name was captured under the
 /// proving view's pidfd at scan time, since the proving generation
@@ -80430,6 +80509,7 @@ fn learned_candidate_stages_through_prearm_and_marks_first_run_gap() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80561,6 +80641,7 @@ fn learned_scan_covered_file_stays_unstaged_and_silent() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80607,6 +80688,7 @@ fn learned_run_learned_scan_covered_file_still_stages() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: true,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80640,6 +80722,63 @@ fn learned_run_learned_scan_covered_file_still_stages() {
                          its earlier calls were not observed"
         }),
         "staging files the named first-run gap: {public:?}"
+    );
+}
+
+/// A run-learned proof from a still-retained view over a scan-covered
+/// key stages silently: ordinary discovery already observes this
+/// long-lived mapper's calls, so a first-use gap row would mislead.
+/// The persistent piece still stages (later mappers stay covered).
+#[test]
+fn learned_run_learned_retained_covered_file_stages_silently() {
+    let (fixture, _view, _module, pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: true,
+            proving_retained: true,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned.absorb(pins);
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the covered file still stages its persistent piece"
+    );
+    assert_eq!(
+        engine.learned_notes.len(),
+        1,
+        "one loader note per staged file"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was learned after its first use; \
+                         its earlier calls were not observed"
+        }),
+        "no first-use gap for observed calls: {public:?}"
     );
 }
 
@@ -80702,6 +80841,7 @@ fn learned_run_learned_prearmed_file_dedupes_by_identity_not_spelling() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: true,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80749,6 +80889,7 @@ fn learned_cap_names_the_excess_once() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80830,6 +80971,7 @@ fn learned_service_bounds_pins_per_tick() {
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
                 run_learned: false,
+                proving_retained: false,
             },
         ))
         .unwrap();
@@ -80892,6 +81034,7 @@ fn learned_capture_end_flushes_pending_candidates() {
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
                 run_learned: false,
+                proving_retained: false,
             },
         ))
         .unwrap();
@@ -80950,6 +81093,7 @@ fn learned_shutdown_stages_unserviced_channel() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81004,6 +81148,7 @@ fn learned_clean_shutdown_after_drain_join_files_no_loss() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81060,6 +81205,7 @@ fn learned_terminal_record_publishes_unserviced_file() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81131,6 +81277,7 @@ fn learned_pin_refusal_after_proof_settles_without_staging() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81183,6 +81330,7 @@ fn learned_staging_invalidates_a_stable_plan() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81272,6 +81420,7 @@ fn learned_replaced_file_at_same_path_stages_fresh() {
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
                 run_learned: false,
+                proving_retained: false,
             },
         ))
         .unwrap();
@@ -81333,6 +81482,7 @@ fn learned_deleted_held_file_is_refused_not_staged() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81409,6 +81559,7 @@ fn learned_file_deleted_between_check_and_pin_is_refused_not_staged() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81499,6 +81650,7 @@ fn learned_file_replaced_over_opened_path_with_hard_link_is_refused() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81724,6 +81876,7 @@ fn loader_exhaustion_names_once_and_watch_still_stages() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: true,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81972,6 +82125,7 @@ fn learned_staging_applies_without_a_discovery_batch() {
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
             run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();

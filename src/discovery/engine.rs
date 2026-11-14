@@ -21513,7 +21513,11 @@ impl Engine {
             }
             // The loader name travels with the proof, captured under
             // the proving view's pidfd: staging never re-resolves the
-            // bare pid, so a recycled pid is never named.
+            // bare pid, so a recycled pid is never named. The proving
+            // view's retention travels too: a retained prover's
+            // scan-owned slots persist, so its staging owes no
+            // first-use gap when the key is scan-covered.
+            let proving_retained = self.views.iter().any(|view| view.id() == proof.view);
             let learned = crate::fanotify::LearnedCandidate {
                 file: held,
                 dev: identity.0,
@@ -21522,6 +21526,7 @@ impl Engine {
                 loader_exe: proof.loader_exe.clone(),
                 loader_unknown_reason: proof.loader_unknown_reason,
                 run_learned: true,
+                proving_retained,
             };
             if self.pending_learned.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
                 self.refuse_learned_candidate(learned);
@@ -21901,6 +21906,7 @@ impl Engine {
         // new key) always stages as new.
         let scan_covered = self.pinned.sweep_match_keys();
         let mut fresh = 0usize;
+        let mut row_owed = false;
         {
             let staged = self.prearm_input.get_or_insert_with(|| PrearmInput {
                 pins: PinnedObjects::empty(),
@@ -21962,6 +21968,18 @@ impl Engine {
                 staged.inputs.push(input.clone());
                 self.learned_notes.insert(input.key, note.clone());
                 fresh += 1;
+                // A run-learned proof from a still-retained prover over a
+                // scan-covered key stages silently: ordinary discovery
+                // already observes this long-lived mapper's calls, so a
+                // first-use gap row would mislead. Transient provers
+                // (whose slots retire with them) and uncovered keys
+                // still owe the row.
+                if !(candidate.run_learned
+                    && candidate.proving_retained
+                    && scan_covered.contains_key(&input.key))
+                {
+                    row_owed = true;
+                }
             }
         }
         self.note_learned_settled(identity);
@@ -21974,10 +21992,14 @@ impl Engine {
         // count rides in `learned_staged_files`, the per-file loads in
         // the module's `first_loaded_by`. No path, pid, or executable:
         // the render boundary passes only the finite row through.
-        self.mark_partial(
-            crate::render::LEARNED_SKIP_SUBJECT,
-            crate::render::LEARNED_FIRST_RUN_REASON,
-        );
+        // Silently staged inputs (a retained prover's covered key) owe
+        // no row: their calls were already observed.
+        if row_owed {
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_FIRST_RUN_REASON,
+            );
+        }
         self.learned_staged_files = self.learned_staged_files.saturating_add(fresh as u64);
         self.plan_rebuild_stable = false;
         self.learned_unapplied = true;

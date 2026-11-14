@@ -115,6 +115,12 @@ pub(crate) struct LearnedCandidate {
     /// so transient scan coverage does not exempt the file from
     /// staging (the drain's exemption assumes a stable mapper).
     pub(crate) run_learned: bool,
+    /// The proving view was still retained when the proof was taken:
+    /// a run-learned file from a retained prover over a scan-covered
+    /// key stages silently (ordinary discovery already observes its
+    /// calls), while a transient prover's staging still owes the
+    /// first-use row. Always false for drain candidates.
+    pub(crate) proving_retained: bool,
 }
 
 /// Drain-to-engine messages. `Load` tallies post-send opens so the staged
@@ -2106,6 +2112,7 @@ impl DrainCtx<'_> {
             loader_exe,
             loader_unknown_reason,
             run_learned: false,
+            proving_retained: false,
         };
         if !self.send(LearnMsg::Candidate(candidate), window) {
             return false;
@@ -4198,6 +4205,7 @@ mod tests {
                 loader_exe: None,
                 loader_unknown_reason: Some(super::LOADER_EXE_UNREADABLE_REASON),
                 run_learned: false,
+                proving_retained: false,
             }),
         );
         assert!(!ok);

@@ -34,8 +34,12 @@ const MEMORY_EMIT_INTERVAL: Duration = Duration::from_secs(MEMORY_EMIT_INTERVAL_
 pub(crate) const HEAP_MAP_ENTRY: usize = 64;
 /// Admitted caller record: exe identity, launcher chain, app hint.
 pub(crate) const HEAP_CALLER_RECORD: usize = 1536;
-/// Registry edge record: mapping evidence, entry strings, gaps.
-pub(crate) const HEAP_EDGE_RECORD: usize = 2304;
+/// Registry edge record through the production mapping + semantic
+/// feed, with a materialized reducer and one observed session:
+/// 3561 heap bytes/edge measured over 256 edges (round 4, exceeding
+/// the round-1 2304 estimate from a test-only edge without a reducer).
+/// Pinned at 3584; the A1 smaps cross-check recalibrates.
+pub(crate) const HEAP_EDGE_RECORD: usize = 3584;
 /// Registry module record: paths, digests, linkage summaries.
 pub(crate) const HEAP_MODULE_RECORD: usize = 1024;
 /// Mechanism row shells: op-name set plus combo-map nodes (combos

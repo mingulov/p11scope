@@ -3959,6 +3959,9 @@ impl CallerRegistry {
                 pending: row(pending),
                 detached: row(detached),
             },
+            // Minor 2: the whole shared semantic pool (custody pins at
+            // `SharedCallerPin::new`, joint grants, instance input, and
+            // mechanism cells), not mechanism cells alone.
             mech_pool_used_bytes: self.semantic_resource_snapshot().charged_bytes as u64,
         }
     }
@@ -7992,19 +7995,49 @@ pub(crate) mod tests {
             "one incarnation admit cost {admit_bytes} heap bytes, ceiling 4096"
         );
 
+        // Production edge cost: N distinct edges through the real
+        // mapping + semantic feed (note_mapping/publish +
+        // observe_semantic/publish), each with a materialized reducer
+        // and one observed session. The module is shared, so its cost
+        // amortizes over N; the pin is the steady-state marginal edge.
+        // Harness inputs (ModuleInfo/SemanticCall values) are built
+        // outside the probe, so only registry work counts.
+        const N_EDGES: usize = 256;
         let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
-        let key = ModuleKey::physical(8, 1, 12, Some("sha0012".into()), "/lib/b.so");
-        // Unmeasured: the module, its key index, and the first edge.
-        // The ceiling below pins the marginal second edge on the same
-        // module (steady-state insert cost at scale, not first-insert
-        // root allocation).
-        registry.scripted_module_edge(key.clone(), CallerId(1));
-        let (_, _, edge_bytes) = crate::test_alloc::count_allocs_during(|| {
-            registry.scripted_module_edge(key, CallerId(2))
+        let template = module_info("/lib/b.so", 12, AdmissionState::Admitted);
+        let key = template.key.clone();
+        let infos: Vec<ModuleInfo> = (0..N_EDGES)
+            .map(|_| module_info("/lib/b.so", 12, AdmissionState::Admitted))
+            .collect();
+        let calls: Vec<SemanticCall> = (0..N_EDGES)
+            .map(|i| SemanticCall {
+                function: "C_OpenSession".to_string(),
+                session: 7 + i as u64,
+                ts_ns: 100 + i as u64,
+                ..SemanticCall::default()
+            })
+            .collect();
+        let (_, _, total_bytes) = crate::test_alloc::count_allocs_during(|| {
+            for (i, info) in infos.into_iter().enumerate() {
+                registry.note_mapping(CallerId(i as u32), 50 + i as u32, info, 100);
+            }
+            registry.publish();
+            for (i, call) in calls.into_iter().enumerate() {
+                registry.observe_semantic(CallerId(i as u32), &key, call);
+            }
+            registry.publish();
         });
+        let per_edge = total_bytes / N_EDGES;
         assert!(
-            edge_bytes <= 3072,
-            "one edge insert cost {edge_bytes} heap bytes, ceiling 3072"
+            per_edge > 0,
+            "production edge insert measured 0 heap bytes/edge (vacuous pin)"
+        );
+        // Round 4 correction (Opus blocker 1): the production path
+        // costs 3561/edge, exceeding the round-1 3072 ceiling from a
+        // test-only edge. Pinned at 4096 (measured + 535 headroom).
+        assert!(
+            per_edge <= 4096,
+            "one production edge insert cost {per_edge} heap bytes/edge (total {total_bytes} for {N_EDGES}), ceiling 4096"
         );
     }
 

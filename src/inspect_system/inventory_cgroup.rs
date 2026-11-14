@@ -1016,6 +1016,11 @@ pub(crate) fn collect_with(
     // The cgroup run owns its table across members, like the
     // system/pid runs own theirs.
     let mut handles = HandleTable::new(1000);
+    // Hold the count manifests' rows before the member scans below
+    // can take them: without the reservation a full table would
+    // starve the Trusted manifest pins.
+    let staged_manifests =
+        parse_and_reserve_count_manifests(&mut handles, &request.count_manifests, &mut budget);
     let mut members = Vec::new();
     for pid in &selected {
         checkpoint(CollectionStage::DeepScan);
@@ -1095,7 +1100,7 @@ pub(crate) fn collect_with(
     prepare_count_manifests(
         &mut collection,
         &mut bound,
-        &request.count_manifests,
+        staged_manifests,
         request.prearm_prior.0,
         request.prearm_prior.1,
         &mut handles,

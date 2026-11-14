@@ -853,6 +853,15 @@ pub struct Engine {
     /// Proc root the kernel-thread classifier reads (`/proc` in
     /// production; tests point it at a fixture dir).
     proc_root: PathBuf,
+    /// Cached per-pid kernel-thread classifications (§8.2): refreshes
+    /// re-stat one directory mtime per pid instead of re-reading and
+    /// re-parsing every stat file. Guarded by the directory mtime with
+    /// a start-time confirmation, pruned to the live scope each pass.
+    pid_class_cache: BTreeMap<u32, PidClassCacheEntry>,
+    /// Cache guard hits (reused without a stat read) and misses (one
+    /// stat read each). Read by the env-gated diagnostics line only.
+    pid_cache_hits: u64,
+    pid_cache_misses: u64,
     /// Cumulative newcomer queue-age evidence (admissions and drops sample
     /// here; pending counts fill in at snapshot time).
     newcomer_ages: crate::timing::NewcomerStats,
@@ -7421,6 +7430,117 @@ pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
         .collect()
 }
 
+/// One cached pid classification (§8.2): the `/proc/<pid>` directory
+/// mtime the class was read under (procfs destroys and recreates the
+/// directory on reuse, so a reused pid never keeps its mtime), the stat
+/// start time confirming the generation, and whether the pid is a user
+/// process.
+#[derive(Debug, Clone)]
+struct PidClassCacheEntry {
+    dir_mtime: std::time::SystemTime,
+    start_time: Option<u64>,
+    is_user: bool,
+}
+
+impl Engine {
+    /// The user processes among `pids`, with classifications cached
+    /// across refreshes (§8.2): a pid whose `/proc/<pid>` directory
+    /// mtime is unchanged since its classification reuses it without
+    /// re-reading its stat file; a changed or missing mtime re-reads
+    /// and re-parses exactly like [`user_process_pids`], with the stat
+    /// start time confirming the generation. Same fail-closed semantics
+    /// as the uncached predicate: unreadable or unparsable stats stay
+    /// eligible and are never cached. Prunes departed pids so the cache
+    /// never outgrows the live scope.
+    pub(crate) fn cached_user_process_pids(&mut self, pids: &[u32]) -> Vec<u32> {
+        let mut out = Vec::with_capacity(pids.len());
+        let mut dir = self.proc_root.clone();
+        for pid in pids {
+            dir.push(pid.to_string());
+            let mtime = std::fs::metadata(&dir).and_then(|metadata| metadata.modified());
+            let cached_class = match (&mtime, self.pid_class_cache.get(pid)) {
+                (Ok(mtime), Some(entry)) if entry.dir_mtime == *mtime => Some(entry.is_user),
+                _ => None,
+            };
+            if let Some(is_user) = cached_class {
+                self.pid_cache_hits = self.pid_cache_hits.saturating_add(1);
+                if is_user {
+                    out.push(*pid);
+                }
+                dir.pop();
+                continue;
+            }
+            self.pid_cache_misses = self.pid_cache_misses.saturating_add(1);
+            // Miss or unreadable guard: one stat read classifies and
+            // refreshes the cache, exactly like `user_process_pids`.
+            dir.push("stat");
+            let cached = self.pid_class_cache.get(pid).cloned();
+            match std::fs::read_to_string(&dir) {
+                Ok(text) => {
+                    let fresh_is_user = !process::stat_flags_from_stat_text(&text)
+                        .is_some_and(|flags| flags & process::PF_KTHREAD != 0);
+                    let (start_time, _) = process::stat_pair_from_stat(&text);
+                    // Same start time despite a changed mtime means the
+                    // same generation (a clock flake, not reuse): the
+                    // class cannot have changed, so keep it.
+                    let is_user = match (&cached, start_time) {
+                        (Some(entry), Some(fresh)) if entry.start_time == Some(fresh) => {
+                            entry.is_user
+                        }
+                        _ => fresh_is_user,
+                    };
+                    if let Ok(mtime) = mtime {
+                        self.pid_class_cache.insert(
+                            *pid,
+                            PidClassCacheEntry {
+                                dir_mtime: mtime,
+                                start_time,
+                                is_user,
+                            },
+                        );
+                    }
+                    if is_user {
+                        out.push(*pid);
+                    }
+                }
+                Err(_) => {
+                    // Fail-closed and uncached: an unreadable stat stays
+                    // eligible and is re-read on the next refresh.
+                    out.push(*pid);
+                }
+            }
+            dir.pop();
+            dir.pop();
+        }
+        let live: BTreeSet<u32> = pids.iter().copied().collect();
+        self.pid_class_cache.retain(|pid, _| live.contains(pid));
+        out
+    }
+
+    /// Cached classification count, for the prune tests.
+    #[cfg(test)]
+    pub(crate) fn pid_class_cache_len_for_test(&self) -> usize {
+        self.pid_class_cache.len()
+    }
+
+    /// Guard hits and misses, for tests.
+    #[cfg(test)]
+    pub(crate) fn pid_cache_stats_for_test(&self) -> (u64, u64) {
+        (self.pid_cache_hits, self.pid_cache_misses)
+    }
+
+    /// `p11scope: timing: pidcache: ...` stderr line. Emitted only when
+    /// `P11SCOPE_DEFER_STATS=1`; default output is unchanged.
+    pub(crate) fn pid_cache_stats_line(&self) -> String {
+        format!(
+            "p11scope: timing: pidcache: {} hits, {} misses, {} cached",
+            self.pid_cache_hits,
+            self.pid_cache_misses,
+            self.pid_class_cache.len(),
+        )
+    }
+}
+
 /// True when `pid` is provably a kernel thread with no user address
 /// space: the `PF_KTHREAD` flag in `{proc_root}/<pid>/stat` plus an
 /// empty `{proc_root}/<pid>/maps` (one byte decides; a mapping-heavy
@@ -12446,6 +12566,9 @@ impl Engine {
             known_kernel_threads: BTreeMap::new(),
             departed_kernel_threads: BTreeSet::new(),
             proc_root: PathBuf::from("/proc"),
+            pid_class_cache: BTreeMap::new(),
+            pid_cache_hits: 0,
+            pid_cache_misses: 0,
             newcomer_ages: crate::timing::NewcomerStats::new(),
             // A fresh engine owes its first tail publication: the revision
             // starts dirty so the first batch tail publishes unconditionally,
@@ -28817,7 +28940,10 @@ impl Engine {
         let desired_pids = if named {
             pids.clone()
         } else {
-            user_process_pids(&pids, &self.proc_root)
+            // Cached across refreshes (§8.2): one directory mtime per
+            // pid instead of a stat re-read each, with a start-time
+            // reuse guard and identical fail-closed semantics.
+            self.cached_user_process_pids(&pids)
         };
         let membership_complete = skipped.is_empty() && desired_pids.len() <= max_scan_pids;
         let enumerated = desired_pids.len();

@@ -42906,6 +42906,148 @@ fn over_cap_trigger_counts_user_processes_only() {
     let _ = std::fs::remove_dir_all(&proc_root);
 }
 
+/// A fixture /proc stat line with explicit flags and start time (field
+/// 22), for the pid-class cache tests: reuse is a new start time.
+fn pid_cache_stat_line(pid: u32, comm: &str, flags: u32, start_time: u64) -> String {
+    format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 {start_time} 0")
+}
+
+fn pid_cache_fixture(proc_root: &std::path::Path, entries: &[(u32, &str, u32, u64)]) {
+    for (pid, comm, flags, start_time) in entries {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stat"),
+            pid_cache_stat_line(*pid, comm, *flags, *start_time),
+        )
+        .unwrap();
+    }
+}
+
+/// RED (§8.2): the per-refresh pid filter caches classifications across
+/// refreshes. A second refresh over unchanged pids re-reads nothing:
+/// revoking read permission on the fixture stats between refreshes proves
+/// no re-read (chmod touches ctime, not the directory mtime the guard
+/// compares), yet filtering stays identical.
+#[test]
+fn cached_pid_filter_reuses_classification_across_refreshes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let proc_root = std::env::temp_dir().join(format!("perf-pidcache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    pid_cache_fixture(
+        &proc_root,
+        &[
+            (101, "kworker", crate::process::PF_KTHREAD, 100),
+            (102, "worker", 0, 200),
+        ],
+    );
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    let pids = vec![101u32, 102];
+    assert_eq!(engine.cached_user_process_pids(&pids), vec![102]);
+    for pid in &pids {
+        std::fs::set_permissions(
+            proc_root.join(pid.to_string()).join("stat"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        engine.cached_user_process_pids(&pids),
+        vec![102],
+        "the cached classes filter without re-reading"
+    );
+    assert_eq!(engine.pid_cache_stats_for_test(), (2, 2));
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// RED (§8.2): pid reuse with a different start time re-classifies. A
+/// cached kernel thread rewritten as a user process (new mtime, new
+/// start time) rejoins the filtered set, while an untouched kernel
+/// thread stays excluded.
+#[test]
+fn cached_pid_filter_reclassifies_on_pid_reuse() {
+    let proc_root = std::env::temp_dir().join(format!("perf-pidreuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    pid_cache_fixture(
+        &proc_root,
+        &[
+            (101, "kworker", crate::process::PF_KTHREAD, 100),
+            (102, "worker", 0, 200),
+            (103, "kworker", crate::process::PF_KTHREAD, 300),
+        ],
+    );
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    let pids = vec![101u32, 102, 103];
+    assert_eq!(engine.cached_user_process_pids(&pids), vec![102]);
+    // Reuse destroys and recreates the pid directory (as procfs does),
+    // so the guard mtime changes. The sleep keeps the mtimes distinct
+    // deterministically: fixture writes land microseconds apart and
+    // guard mtimes are nanosecond-granular.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    std::fs::remove_dir_all(proc_root.join("101")).unwrap();
+    pid_cache_fixture(&proc_root, &[(101, "reused", 0, 400)]);
+    assert_eq!(
+        engine.cached_user_process_pids(&pids),
+        vec![101, 102],
+        "the reused pid re-classifies as a user process; 103 stays out"
+    );
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// RED (§8.2): departed pids leave the cache, so it never outgrows the
+/// live scope.
+#[test]
+fn cached_pid_filter_prunes_departed_pids() {
+    let proc_root = std::env::temp_dir().join(format!("perf-pidprune-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    pid_cache_fixture(
+        &proc_root,
+        &[
+            (101, "kworker", crate::process::PF_KTHREAD, 100),
+            (102, "worker", 0, 200),
+        ],
+    );
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    assert_eq!(engine.cached_user_process_pids(&[101u32, 102]), vec![102]);
+    assert_eq!(engine.pid_class_cache_len_for_test(), 2);
+    assert_eq!(
+        engine.cached_user_process_pids(&[101u32]),
+        Vec::<u32>::new()
+    );
+    assert_eq!(engine.pid_class_cache_len_for_test(), 1);
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// RED (§8.2): unreadable pids stay eligible (fail-closed) and uncached:
+/// a pid missing on one refresh is re-read on the next, so a later
+/// kernel thread still excludes.
+#[test]
+fn cached_pid_filter_leaves_unreadable_pids_eligible_and_uncached() {
+    let proc_root = std::env::temp_dir().join(format!("perf-pidfail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    let mut engine = Engine::empty();
+    engine.proc_root = proc_root.clone();
+    assert_eq!(
+        engine.cached_user_process_pids(&[999999u32]),
+        vec![999999],
+        "an unreadable pid stays eligible"
+    );
+    assert_eq!(engine.pid_class_cache_len_for_test(), 0);
+    pid_cache_fixture(
+        &proc_root,
+        &[(999999, "kworker", crate::process::PF_KTHREAD, 100)],
+    );
+    assert_eq!(
+        engine.cached_user_process_pids(&[999999u32]),
+        Vec::<u32>::new(),
+        "the next refresh re-reads and excludes the kernel thread"
+    );
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
 /// The deep-scan default is 1024 user processes, pinned by the 2026-11-12
 /// guard round: the raised cap stays (owner 14:35) once the fd wall is
 /// fixed at the cause (rlimit raise + reserve), the 512 choice is

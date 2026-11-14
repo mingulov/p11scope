@@ -13150,6 +13150,7 @@ fn resource_evidence_of(
 fn emit_defer_stats(engine: &crate::discovery::engine::Engine) {
     if std::env::var("P11SCOPE_DEFER_STATS").as_deref() == Ok("1") {
         let _ = crate::sink::try_stderr_line(&engine.defer_stats_line());
+        let _ = crate::sink::try_stderr_line(&engine.pid_cache_stats_line());
     }
 }
 

@@ -20100,6 +20100,361 @@ fn owned_tree_watch_renotice_keeps_first_seen_time() {
     );
 }
 
+/// An unproven member that scans clean backs off: after two prompt
+/// scans it is not rescanned until its backoff expires, so
+/// provider-free mapping-heavy members stop burning every frame,
+/// while a slow starter still gets a rescan once the delay passes.
+#[test]
+fn owned_tree_watch_backs_off_unproductive_members() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    let scans = |engine: &Engine| {
+        engine
+            .owned_watch_unproven
+            .values()
+            .map(|entry| entry.scans)
+            .sum::<u32>()
+    };
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    assert_eq!(scans(&engine), 2, "fresh members scan promptly");
+    let second = first + OWNED_WATCH_SCAN_MIN_NS;
+    engine.owned_tree_watch(Some(second));
+    assert_eq!(scans(&engine), 4, "the first rescan stays prompt");
+    // Inside the second backoff nothing rescans.
+    engine.owned_tree_watch(Some(second + OWNED_WATCH_SCAN_MIN_NS));
+    assert_eq!(
+        scans(&engine),
+        4,
+        "unproductive members back off instead of rescanning"
+    );
+    // Past the backoff the rotation resumes.
+    engine.owned_tree_watch(Some(second + 25_000_000));
+    assert_eq!(scans(&engine), 6, "a slow starter still gets rescanned");
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Rotation reaches every member, not just the extremes: with three
+/// unproven members the middle pid scans within three runs instead
+/// of starving behind the newest and oldest.
+#[test]
+fn owned_tree_watch_rotation_reaches_the_middle_member() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut first_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn first sleeper");
+    let mut second_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn second sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
+    engine.owned_tree_watch(Some(first + 2 * OWNED_WATCH_SCAN_MIN_NS));
+    let mut pids = vec![me, first_sleeper.id(), second_sleeper.id()];
+    pids.sort_unstable();
+    for pid in &pids {
+        assert_eq!(
+            engine
+                .owned_watch_unproven
+                .get(pid)
+                .map(|entry| entry.scans),
+            Some(2),
+            "fair rotation scans every member, extremes and middle: {pids:?}"
+        );
+    }
+    first_sleeper.kill().expect("kill first sleeper");
+    first_sleeper.wait().expect("reap first sleeper");
+    second_sleeper.kill().expect("kill second sleeper");
+    second_sleeper.wait().expect("reap second sleeper");
+}
+
+/// A rotation member that gains a retained view leaves the rotation:
+/// the frames own it now, so the watch must not scan it twice.
+#[test]
+fn owned_tree_watch_prunes_members_that_gain_retained_views() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 1;
+    engine.owned_tree_watch(Some(1_000));
+    assert!(
+        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        "the unretained member joins the rotation"
+    );
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), sleeper.id()).expect("sleeper view opens"));
+    engine.owned_tree_watch(Some(1_000 + OWNED_WATCH_SCAN_MIN_NS));
+    assert!(
+        !engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        "a newly retained member leaves the rotation for the frames"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Telemetry-only watch scans merge quietly: a scan that finds
+/// nothing new must not invalidate the loader-plan cache nor dirty
+/// the publication revision, or every 10 ms watch run forces a tail
+/// republish and a plan rebuild.
+#[test]
+fn owned_tree_watch_telemetry_scans_keep_the_loader_plan_cache() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.loader_plan_cache = Some(LoaderPlanCache {
+        revision: engine.published_facts_revision,
+        broad_admit: engine.broad_admit,
+        counter_hint: engine.counter_hint,
+        plan: plan_with(0, 0),
+    });
+    let revision = engine.facts_revision;
+    engine.owned_tree_watch(Some(1_000));
+    assert_eq!(
+        engine.facts_revision, revision,
+        "a telemetry-only watch run dirties no publication input"
+    );
+    assert!(
+        engine.loader_plan_cache.is_some(),
+        "a telemetry-only watch run keeps the cached loader plan"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Transient watch view opens charge the capture budget: even a
+/// failed open attempted real work, and a ghost member (no view, no
+/// scan) proves no scan ran to charge anything else.
+#[test]
+fn owned_tree_watch_charges_transient_view_opens() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let ghost: u32 = 424242;
+    assert!(
+        ProcessView::open(ProcessViewId(99), ghost).is_err(),
+        "the ghost pid must not open"
+    );
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{ghost}\n"))
+        .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    let before = engine.budget.work_units_count();
+    engine.owned_tree_watch(Some(1_000));
+    assert!(
+        engine.budget.work_units_count() > before,
+        "the attempted transient open charges the capture budget"
+    );
+    assert!(
+        !engine.owned_watch_unproven.contains_key(&ghost),
+        "an unopenable member still drops at once"
+    );
+}
+
+/// A budget refusal is not an exit: when the capture budget is
+/// stopped, an unopenable member stays in rotation for a later run
+/// instead of dropping as departed.
+#[test]
+fn owned_tree_watch_keeps_members_refused_by_a_stopped_budget() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let ghost: u32 = 424242;
+    assert!(
+        ProcessView::open(ProcessViewId(99), ghost).is_err(),
+        "the ghost pid must not open"
+    );
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{ghost}\n"))
+        .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.budget.note_io_refusal();
+    engine.owned_tree_watch(Some(1_000));
+    assert!(
+        engine.owned_watch_unproven.contains_key(&ghost),
+        "a budget-refused member stays in rotation"
+    );
+}
+
+/// The exploration predicate's positive half: a view with a provider
+/// module owns; a view with neither module nor claim does not.
+#[test]
+fn view_owns_provider_pins_the_exploration_predicate() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.next_view_id = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+    assert!(!engine.view_owns_provider(ProcessViewId(0)));
+    assert!(!engine.view_owns_provider(ProcessViewId(1)));
+    let (_fixture, _view, scanned, _pins) = loaded_seed_provider();
+    let mut owned = scanned;
+    owned.view = ProcessViewId(1);
+    engine.modules.push(ReconciledModule {
+        scanned: owned,
+        object: PinnedObjectId(7),
+        entry_objects: Vec::new(),
+        forward_verified: Vec::new(),
+        exports: std::sync::Arc::from([]),
+        getter_present: false,
+        witness_fault: false,
+    });
+    assert!(
+        engine.view_owns_provider(ProcessViewId(1)),
+        "a provider module owns its view"
+    );
+    assert!(
+        !engine.view_owns_provider(ProcessViewId(0)),
+        "a module elsewhere owns nothing here"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// The owned child's scheduled arm moves first: newcomer order that
+/// buries the child behind descendants rotates it to the front, and
+/// outside owned runs (or when the child is not scheduled) the order
+/// stands.
+#[test]
+fn owned_child_arm_priority_moves_the_scheduled_child_first() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.next_view_id = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+    engine.owned_run_pid = Some(std::process::id());
+    let ids = vec![ProcessViewId(0), ProcessViewId(1)];
+    let mut order = vec![1usize, 0];
+    assert_eq!(
+        engine.owned_child_arm_priority(&ids, &mut order),
+        Some(ProcessViewId(0))
+    );
+    assert_eq!(order, vec![0, 1], "the scheduled child arms first");
+    // The child unscheduled: no priority, order stands.
+    let mut backlog = vec![1usize];
+    assert_eq!(engine.owned_child_arm_priority(&ids, &mut backlog), None);
+    assert_eq!(backlog, vec![1]);
+    // Outside owned runs: no priority either.
+    engine.owned_run_pid = None;
+    let mut unordered = vec![1usize, 0];
+    assert_eq!(engine.owned_child_arm_priority(&ids, &mut unordered), None);
+    assert_eq!(unordered, vec![1, 0]);
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// The watch run budget binds time and I/O: either ceiling stops the
+/// run's further scans, while a failed clock read alone stops nothing.
+#[test]
+fn watch_run_over_budget_bounds_time_and_io() {
+    assert!(!watch_run_over_budget(100, 100, 1_000, Some(1_000)));
+    assert!(watch_run_over_budget(
+        100,
+        100,
+        1_000,
+        Some(1_000 + OWNED_WATCH_RUN_BUDGET_NS)
+    ));
+    assert!(watch_run_over_budget(
+        100,
+        100 + OWNED_WATCH_RUN_IO_CAP_BYTES,
+        1_000,
+        Some(1_000)
+    ));
+    assert!(!watch_run_over_budget(100, 100, 1_000, None));
+}
+
 /// The lazy user-pid selector stops once its room fills: two user pids
 /// taken from five costs two predicate calls, not five — and a full
 /// rotation (room zero) costs zero stat reads.

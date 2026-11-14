@@ -491,6 +491,14 @@ pub struct Engine {
     /// two scans per `OWNED_WATCH_SCAN_MIN_NS`. `None` before the
     /// first run.
     owned_watch_last_ns: Option<u64>,
+    /// Last pid the owned-tree watch scanned: the fair-rotation
+    /// cursor; each run continues after it (wrapping). `None` before
+    /// the first scan.
+    owned_watch_cursor: Option<u32>,
+    /// Views the owned-child priority deferred last tick: they arm
+    /// normally this tick, so a repeatedly-rescheduled child cannot
+    /// starve provider-free descendants. Recomputed every tick arm pass.
+    child_priority_spared: BTreeSet<ProcessViewId>,
     /// A learned staging mutated the pre-arm inputs since the last
     /// inventory refresh consumed them: shallow-idle frames must not
     /// skip the apply that attaches the new file.
@@ -4821,6 +4829,13 @@ fn loader_name_for_proving_view(view: &ProcessView) -> (Option<String>, Option<&
 /// exec between scans must not read as an exit).
 struct OwnedWatchEntry {
     scans: u32,
+    /// Consecutive scans that proved no provider (and were not cut
+    /// short by a member exit): drives the rescan backoff, so
+    /// provider-free mapping-heavy members stop burning every frame.
+    unproductive: u32,
+    /// Mono-ns this member is next eligible for a rescan (the backoff
+    /// deadline from its last unproductive scan): `0` scans at once.
+    next_eligible_ns: u64,
 }
 
 struct LiveCandidate {
@@ -6471,6 +6486,20 @@ pub(crate) const OWNED_WATCH_UNPROVEN_CAP: usize = 64;
 /// Provisional — ratify by measurement.
 pub(crate) const OWNED_WATCH_RESCAN_HORIZON_NS: u64 = 5_000_000_000;
 
+/// Per-run wall-time budget for the owned-tree watch, in nanoseconds:
+/// a run stops scanning further members once it has spent this long,
+/// so mapping-heavy members cannot starve the frame's own discovery
+/// behind megabytes of rescans. At least one eligible member scans
+/// per run (progress); the rest wait for the next run.
+/// Provisional — ratify by measurement.
+pub(crate) const OWNED_WATCH_RUN_BUDGET_NS: u64 = 20_000_000;
+
+/// Per-run attempted-I/O budget for the owned-tree watch, in bytes:
+/// the same stop condition in I/O terms, for cache-hot scans whose
+/// wall time understates their cost.
+/// Provisional — ratify by measurement.
+pub(crate) const OWNED_WATCH_RUN_IO_CAP_BYTES: u64 = 2_097_152;
+
 /// How a marked newcomer generation's descendant gap was counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NewcomerGapCount {
@@ -7980,6 +8009,35 @@ fn select_user_pids_lazily(
         }
     }
     out
+}
+
+/// Whether an owned-tree watch run has spent its per-run budget and
+/// must stop scanning further members: either the wall-time or the
+/// attempted-I/O ceiling stops the run. A failed clock read never
+/// stops the run alone (the I/O ceiling still binds it).
+fn watch_run_over_budget(io_start: u64, io_now: u64, ns_start: u64, ns_now: Option<u64>) -> bool {
+    io_now.saturating_sub(io_start) >= OWNED_WATCH_RUN_IO_CAP_BYTES
+        || ns_now.is_some_and(|now| now.saturating_sub(ns_start) >= OWNED_WATCH_RUN_BUDGET_NS)
+}
+
+/// Rescan delay after `unproductive` consecutive unproductive scans
+/// of one watched member, in nanoseconds: the first rescan stays
+/// prompt (tens-of-ms workers still get caught), then the member
+/// backs off to sparse rescans so provider-free mapping-heavy
+/// members stop burning every frame. Slow starters stay covered:
+/// the delay caps at one second, far inside the rescan horizon.
+/// Provisional — ratify by measurement.
+fn owned_watch_rescan_delay_ns(unproductive: u32) -> u64 {
+    match unproductive {
+        0 => 0,
+        1 => 10_000_000,
+        2 => 25_000_000,
+        3 => 50_000_000,
+        4 => 100_000_000,
+        5 => 250_000_000,
+        6 => 500_000_000,
+        _ => 1_000_000_000,
+    }
 }
 
 /// True when `pid` is provably a kernel thread with no user address
@@ -12902,6 +12960,8 @@ impl Engine {
             owned_watch_unproven: BTreeMap::new(),
             owned_watch_seen: BTreeMap::new(),
             owned_watch_last_ns: None,
+            owned_watch_cursor: None,
+            child_priority_spared: BTreeSet::new(),
             learned_unapplied: false,
             handles_deferred: BTreeMap::new(),
             handles_last_retry_delay_ns: None,
@@ -16633,6 +16693,32 @@ impl Engine {
             }
         }
         counters.object_skips
+    }
+
+    /// Merges a watch scan's counters without dirtying publication: a
+    /// transient watch scan changes no plan input, so its telemetry
+    /// (time, noise) must not invalidate the loader-plan cache nor
+    /// force a tail republish every 10 ms. Loud loss still publishes:
+    /// a newly unavailable scan dirties the revision, and
+    /// memory-refused skips file through the loud path exactly like
+    /// frame scans.
+    fn absorb_watch_scan_counters(&mut self, counters: DiscoveryCounters) {
+        let unavailable_new =
+            counters.scan_unavailable.is_some() && self.counters.scan_unavailable.is_none();
+        self.counters.scan_unavailable =
+            self.counters.scan_unavailable.or(counters.scan_unavailable);
+        self.counters.scan_ms = self.counters.scan_ms.saturating_add(counters.scan_ms);
+        self.counters.noise.merge(&counters.noise);
+        let mut marked = false;
+        for skipped in &counters.object_skips {
+            if skipped.reason.starts_with("memory scan refused: ") {
+                self.mark_partial(&skipped.subject, &skipped.reason);
+                marked = true;
+            }
+        }
+        if unavailable_new && !marked {
+            self.note_facts_mutated();
+        }
     }
 
     /// Records the capture's object skips into the committed plan, reporting
@@ -21122,10 +21208,14 @@ impl Engine {
     /// armed pause holds back) or loader arming (which a millisecond
     /// dlopen beats). The loops call this every tick; it runs at most
     /// every `OWNED_WATCH_SCAN_MIN_NS`, notices unseen user members,
-    /// and scans two unproven members per run — the newest (promptness
-    /// for newborns) and the oldest (fair rotation) — until a scan
-    /// proves a provider (then the file stages), the member leaves, or
-    /// the rescan horizon passes.
+    /// and scans up to two unproven members per run — just-noticed
+    /// members first (promptness for newborns, whose dlopen may be
+    /// milliseconds away), then fair rotation after the cursor — until
+    /// a scan proves a provider (then the file stages), the member
+    /// leaves, or the rescan horizon passes. Unproductive members back
+    /// off per member, and each run stops at its time/I-O budget, so
+    /// provider-free mapping-heavy members cannot starve the frame's
+    /// own discovery.
     /// Scans open a fresh transient view per attempt (released right
     /// after, never retained) and charge the capture budget like frame
     /// scans. No-op outside owned `run` captures on their cgroup scope
@@ -21149,6 +21239,11 @@ impl Engine {
         self.owned_watch_last_ns = Some(now_ns);
         let (pids, _) = scope_pids(&self.scope);
         let live: BTreeSet<u32> = pids.into_iter().filter(|pid| *pid != 0).collect();
+        // Retained pid set, built once: members the frames own (their
+        // admission scans and loader hooks prove them) never join the
+        // rotation, and members that gain a retained view below leave
+        // it, so the watch never scans them twice.
+        let retained: BTreeSet<u32> = self.views.iter().map(ProcessView::pid).collect();
         // Forget departed members, so a later pid reuse notices fresh.
         // (An exit and reuse inside one watch interval inherits the old
         // first-seen time; the frames still own that generation and its
@@ -21158,12 +21253,15 @@ impl Engine {
             seen.get(&pid)
                 .is_some_and(|first| now_ns.saturating_sub(*first) >= OWNED_WATCH_RESCAN_HORIZON_NS)
         };
-        // Drop members that left or aged past the rescan horizon, so
-        // a stable tree costs no steady-state scans. An exec is not an
-        // exit: views open fresh per scan below, so a replaced image
-        // is simply rescanned.
-        self.owned_watch_unproven
-            .retain(|pid, _| live.contains(pid) && !horizon_aged(&self.owned_watch_seen, *pid));
+        // Drop members that left, gained a retained view, or aged past
+        // the rescan horizon, so a stable tree costs no steady-state
+        // scans. An exec is not an exit: views open fresh per scan
+        // below, so a replaced image is simply rescanned.
+        self.owned_watch_unproven.retain(|pid, _| {
+            live.contains(pid)
+                && !retained.contains(pid)
+                && !horizon_aged(&self.owned_watch_seen, *pid)
+        });
         // Notice unseen user members that never aged out. Retained
         // views are owned by the frames (admission scans and loader
         // hooks prove them); kernel threads never join.
@@ -21171,11 +21269,14 @@ impl Engine {
             .iter()
             .copied()
             .filter(|pid| {
-                !self.views.iter().any(|view| view.pid() == *pid)
+                !retained.contains(pid)
                     && !self.owned_watch_unproven.contains_key(pid)
                     && !horizon_aged(&self.owned_watch_seen, *pid)
             })
             .collect();
+        // Members noticed this run, in pid order: they scan first
+        // below (promptness for newborns).
+        let mut just_inserted = Vec::new();
         if !unseen.is_empty() {
             let room = OWNED_WATCH_UNPROVEN_CAP.saturating_sub(self.owned_watch_unproven.len());
             // Lazily classify in pid order (`unseen` inherits the live
@@ -21190,29 +21291,75 @@ impl Engine {
                 room,
             );
             for pid in selected {
-                self.owned_watch_unproven
-                    .insert(pid, OwnedWatchEntry { scans: 0 });
+                self.owned_watch_unproven.insert(
+                    pid,
+                    OwnedWatchEntry {
+                        scans: 0,
+                        unproductive: 0,
+                        next_eligible_ns: 0,
+                    },
+                );
                 self.owned_watch_seen.entry(pid).or_insert(now_ns);
+                just_inserted.push(pid);
             }
         }
-        // Scan two members per run: the newest unproven member
+        // Scan up to two members per run: just-noticed members first
         // (promptness for newborns, whose dlopen may be milliseconds
-        // away) and the oldest one (fair rotation, so continuous
-        // newborns cannot starve a rescan forever). One member scans
-        // once when newest and oldest coincide. Deterministic pid
-        // order breaks first-seen ties.
-        let newest = self
-            .owned_watch_unproven
-            .iter()
-            .max_by_key(|(pid, _)| self.owned_watch_seen.get(pid).copied())
-            .map(|(pid, _)| *pid);
-        let oldest = self
-            .owned_watch_unproven
-            .iter()
-            .min_by_key(|(pid, _)| self.owned_watch_seen.get(pid).copied())
-            .map(|(pid, _)| *pid);
-        for pid in newest.into_iter().chain(oldest).collect::<BTreeSet<_>>() {
-            self.scan_owned_watch_member(pid);
+        // away), then fair rotation after the cursor over
+        // backoff-eligible members, so continuous newborns cannot
+        // starve a rescan forever and no middle member starves behind
+        // the extremes.
+        let mut picks: Vec<u32> = Vec::new();
+        for pid in &just_inserted {
+            if picks.len() >= 2 {
+                break;
+            }
+            picks.push(*pid);
+        }
+        if picks.len() < 2 {
+            // Pids ascend from after the cursor, wrapping once.
+            let mut ordered: Vec<u32> = self.owned_watch_unproven.keys().copied().collect();
+            if let Some(cursor) = self.owned_watch_cursor {
+                let at = ordered.iter().position(|pid| *pid > cursor).unwrap_or(0);
+                ordered.rotate_left(at);
+            }
+            for pid in ordered {
+                if picks.len() >= 2 {
+                    break;
+                }
+                if picks.contains(&pid) {
+                    continue;
+                }
+                let eligible = self
+                    .owned_watch_unproven
+                    .get(&pid)
+                    .is_some_and(|entry| entry.next_eligible_ns <= now_ns);
+                if eligible {
+                    picks.push(pid);
+                }
+            }
+        }
+        // At least one eligible member scans per run (progress); the
+        // rest stop at the run's time/I-O budget, keeping their slots
+        // for the next run. The time budget measures its own wall
+        // interval, never the run's logical clock (tests drive that
+        // clock synthetically).
+        let io_start = self.budget.attempted_io_bytes();
+        let wall_start = crate::attach::monotonic_ns();
+        for (index, pid) in picks.into_iter().enumerate() {
+            let wall_now = wall_start.and_then(|_| crate::attach::monotonic_ns());
+            if index > 0
+                && watch_run_over_budget(
+                    io_start,
+                    self.budget.attempted_io_bytes(),
+                    wall_start.unwrap_or(0),
+                    wall_now,
+                )
+            {
+                break;
+            }
+            self.scan_owned_watch_member(pid, now_ns);
+            self.owned_watch_cursor = Some(pid);
         }
     }
 
@@ -21220,13 +21367,15 @@ impl Engine {
     /// stages any provider file the scan proves; the member then leaves
     /// rotation (its file is learned). A view that cannot be opened
     /// means the member left (dropped at once, not at the next
-    /// enumeration); any other outcome keeps it in rotation until a
-    /// proof, an exit, or the horizon drops it. The view opens fresh
-    /// per scan so an exec between scans reads as a new image to
-    /// prove, never a generation failure. The scan never feeds
-    /// eviction bookkeeping: transient views retain nothing, and the
-    /// frames' own scans mark what they retain.
-    fn scan_owned_watch_member(&mut self, pid: u32) {
+    /// enumeration) — unless the capture budget refused the open, which
+    /// is not an exit (the member stays, backed off). Any other
+    /// unproductive outcome backs the member off until a proof, an
+    /// exit, or the horizon drops it. The view opens fresh per scan so
+    /// an exec between scans reads as a new image to prove, never a
+    /// generation failure. The scan never feeds eviction bookkeeping:
+    /// transient views retain nothing, and the frames' own scans mark
+    /// what they retain.
+    fn scan_owned_watch_member(&mut self, pid: u32, now_ns: u64) {
         let Some(entry) = self.owned_watch_unproven.get_mut(&pid) else {
             return;
         };
@@ -21234,11 +21383,17 @@ impl Engine {
         let Ok(id) = self.allocate_view_id() else {
             return;
         };
-        let view = match ProcessView::open(id, pid) {
+        // The transient open charges the capture budget like frame
+        // scans: its mount-table read is real discovery work.
+        let view = match ProcessView::open_with_budget(id, pid, &mut self.budget) {
             Ok(view) => view,
             Err(_) => {
                 self.release_view_id(id);
-                self.owned_watch_unproven.remove(&pid);
+                if self.budget.stopped_now().is_some() {
+                    self.backoff_owned_watch_member(pid, now_ns);
+                } else {
+                    self.owned_watch_unproven.remove(&pid);
+                }
                 return;
             }
         };
@@ -21253,14 +21408,18 @@ impl Engine {
             None,
             None,
         );
-        // Honest work accounting; the returned skips stay with the
-        // frames (the watch files no gaps of its own).
-        let _skipped = self.absorb_scan_counters(scan_counters);
+        // Telemetry merges quietly (the watch files no gaps of its
+        // own); loud loss still publishes through the same path as
+        // frame scans.
+        self.absorb_watch_scan_counters(scan_counters);
         self.deep_scans = self.deep_scans.saturating_add(1);
         let (modules, pins, _complete) = match scan_result {
             Ok(scan) => scan,
             Err(_) => {
                 self.release_view_id(id);
+                // A failed scan proves nothing either way: back off
+                // and keep the member for the horizon.
+                self.backoff_owned_watch_member(pid, now_ns);
                 return;
             }
         };
@@ -21288,10 +21447,26 @@ impl Engine {
             .collect();
         self.release_view_id(id);
         if proofs.is_empty() {
+            // No provider proved: back off and keep the member for
+            // the horizon (a slow starter still gets rescanned).
+            self.backoff_owned_watch_member(pid, now_ns);
             return;
         }
         self.learn_owned_proofs(&pins, &proofs);
         self.owned_watch_unproven.remove(&pid);
+    }
+
+    /// Backs off one watched member after an unproductive scan: its
+    /// next rescan waits out the delay for its streak, so
+    /// provider-free mapping-heavy members stop burning every frame
+    /// while slow starters stay covered inside the rescan horizon.
+    fn backoff_owned_watch_member(&mut self, pid: u32, now_ns: u64) {
+        let Some(entry) = self.owned_watch_unproven.get_mut(&pid) else {
+            return;
+        };
+        entry.unproductive = entry.unproductive.saturating_add(1);
+        entry.next_eligible_ns =
+            now_ns.saturating_add(owned_watch_rescan_delay_ns(entry.unproductive));
     }
 
     /// Owned run-tree file learning (E1): stage scan-proven provider
@@ -24266,6 +24441,51 @@ impl Engine {
         })
     }
 
+    /// Whether a view owns a provider module or pin claim: the
+    /// exploration predicate's positive half, shared by the arming
+    /// gate below and the owned-child priority deferral in the tick
+    /// arm loop.
+    fn view_owns_provider(&self, view_id: ProcessViewId) -> bool {
+        self.modules
+            .iter()
+            .any(|module| module.scanned.view == view_id)
+            || self.pinned.view_claims(view_id).is_some_and(|claims| {
+                !(claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty())
+            })
+    }
+
+    /// The owned direct child's view when this tick's arming should
+    /// prioritize it: an owned run-tree capture whose child's live
+    /// view is scheduled in `order` (refreshed or new this tick).
+    /// Moves the child to the front so its arm lands before
+    /// descendants' arming lift; returns the child id so the arm loop
+    /// can defer provider-free descendants around it. `None` outside
+    /// owned runs or when the child is not scheduled (today's order
+    /// stands).
+    fn owned_child_arm_priority(
+        &self,
+        view_ids: &[ProcessViewId],
+        order: &mut Vec<usize>,
+    ) -> Option<ProcessViewId> {
+        let owned = self.owned_run_pid?;
+        if !matches!(self.scope, Scope::Cgroup { .. }) {
+            return None;
+        }
+        let child = self
+            .views
+            .iter()
+            .find(|view| view.pid() == owned && view.still_the_same())
+            .map(ProcessView::id)?;
+        let at = order
+            .iter()
+            .position(|position| view_ids[*position] == child)?;
+        if at != 0 {
+            let position = order.remove(at);
+            order.insert(0, position);
+        }
+        Some(child)
+    }
+
     /// Whether the ownership gate in `arm_loader_or_partial` keeps this view
     /// unarmed: in a multi-process scope, a view that owns no provider module
     /// and no pin claim stays exploratory.
@@ -24288,14 +24508,7 @@ impl Engine {
         if self.owned_run_pid.is_some() && matches!(self.scope, Scope::Cgroup { .. }) {
             return false;
         }
-        self.admits_generations()
-            && !self
-                .modules
-                .iter()
-                .any(|module| module.scanned.view == view_id)
-            && self.pinned.view_claims(view_id).is_none_or(|claims| {
-                claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty()
-            })
+        self.admits_generations() && !self.view_owns_provider(view_id)
     }
 
     fn arm_loader_or_partial(
@@ -30782,8 +30995,18 @@ impl Engine {
         // snapshot also feeds the export loop below (ids, stable across
         // retirements during arming).
         let tick_view_ids: Vec<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
-        let tick_arm_order =
+        let mut tick_arm_order =
             order_tick_arms_newcomers_first(&tick_view_ids, &refreshed_ok, &new_view_ids);
+        // Owned runs arm the direct child first: its re-arm after exec
+        // must not starve behind provider-free descendants' arming
+        // lift. When the child is scheduled this tick it moves to the
+        // front, and provider-free descendants defer — requested, so
+        // the next tick rescans and arms them, exactly like an H-1
+        // deferral but without booking frame exhaustion. Descendants
+        // spared last tick still arm, so a repeatedly-rescheduled
+        // child cannot starve them.
+        let child_priority = self.owned_child_arm_priority(&tick_view_ids, &mut tick_arm_order);
+        let mut child_priority_deferred = BTreeSet::new();
         let arm_result = if *additions_allowed {
             arm_refreshed_views_with(&tick_arm_order, |position| {
                 // H-1: a spent live frame arms no more views; each one left
@@ -30795,11 +31018,25 @@ impl Engine {
                     self.request_refresh(pid, crate::attach::monotonic_ns());
                     return Ok(false);
                 }
+                if let Some(child) = child_priority
+                    && tick_view_ids[position] != child
+                    && !self
+                        .child_priority_spared
+                        .contains(&tick_view_ids[position])
+                    && !self.view_owns_provider(tick_view_ids[position])
+                {
+                    child_priority_deferred.insert(tick_view_ids[position]);
+                    let pid = self.views[position].pid();
+                    failed_refresh_pids.insert(pid);
+                    self.request_refresh(pid, crate::attach::monotonic_ns());
+                    return Ok(false);
+                }
                 self.arm_loader_or_partial(position, session, additions_allowed, pending_views)
             })
         } else {
             Ok(false)
         };
+        self.child_priority_spared = child_priority_deferred;
         // Views whose export work the closed tick skipped, booked by the
         // helper shared with startup attach.
         let mut export_incomplete = BTreeSet::new();

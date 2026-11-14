@@ -7791,14 +7791,7 @@ pub(crate) fn kernel_thread_exclusions(
 pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
     pids.iter()
         .copied()
-        .filter(|pid| {
-            !std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).is_ok_and(
-                |text| {
-                    process::stat_flags_from_stat_text(&text)
-                        .is_some_and(|flags| flags & process::PF_KTHREAD != 0)
-                },
-            )
-        })
+        .filter(|pid| pid_is_user_process(proc_root, *pid))
         .collect()
 }
 
@@ -7934,6 +7927,43 @@ impl Engine {
         )
     }
 }
+
+/// True when `pid` is a user process under the same predicate as
+/// `user_process_pids`: everything without the `PF_KTHREAD` flag in
+/// `{proc_root}/<pid>/stat`. Fail-closed (true) on any unreadable or
+/// unparsable stat. Single-pid form so the owned-tree watch can classify
+/// lazily and stop once its rotation room fills, instead of reading every
+/// unseen pid's stat to admit zero when full.
+pub(crate) fn pid_is_user_process(proc_root: &Path, pid: u32) -> bool {
+    !std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).is_ok_and(|text| {
+        process::stat_flags_from_stat_text(&text)
+            .is_some_and(|flags| flags & process::PF_KTHREAD != 0)
+    })
+}
+
+/// Lazily selects up to `limit` user pids from `pids` in order, calling
+/// `is_user` one pid at a time and stopping once `limit` are taken (or
+/// `pids` ends). With `limit == 0` calls nothing and returns empty, so a
+/// full rotation pays zero stat reads. The owned-tree watch passes
+/// `pid_is_user_process`; tests pass a counting closure to prove the bound.
+fn select_user_pids_lazily(
+    pids: &[u32],
+    mut is_user: impl FnMut(u32) -> bool,
+    limit: usize,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    if limit == 0 {
+        return out;
+    }
+    for pid in pids {
+        if out.len() >= limit {
+            break;
+        }
+        if is_user(*pid) {
+            out.push(*pid);
+        }
+    }
+    out
 
 /// True when `pid` is provably a kernel thread with no user address
 /// space: the `PF_KTHREAD` flag in `{proc_root}/<pid>/stat` plus an
@@ -21126,13 +21156,21 @@ impl Engine {
             .collect();
         if !unseen.is_empty() {
             let room = OWNED_WATCH_UNPROVEN_CAP.saturating_sub(self.owned_watch_unproven.len());
-            for pid in user_process_pids(&unseen, &self.proc_root)
-                .into_iter()
-                .take(room)
-            {
+            // Lazily classify in pid order (`unseen` inherits the live
+            // `BTreeSet` order), stopping once `room` user pids are taken;
+            // a full rotation (`room == 0`) pays zero stat reads. Re-noticed
+            // members keep their original first-seen time (true rejoins are
+            // unaffected: `retain` above pruned their seen entry on leave,
+            // so they still get a fresh clock).
+            let selected = select_user_pids_lazily(
+                &unseen,
+                |pid| pid_is_user_process(&self.proc_root, pid),
+                room,
+            );
+            for pid in selected {
                 self.owned_watch_unproven
                     .insert(pid, OwnedWatchEntry { scans: 0 });
-                self.owned_watch_seen.insert(pid, now_ns);
+                self.owned_watch_seen.entry(pid).or_insert(now_ns);
             }
         }
         // Scan two members per run: the newest unproven member
@@ -21677,14 +21715,21 @@ impl Engine {
             attribution::note_all(&joined);
             self.counters.object_skips.extend(joined);
             for input in pinning.inputs {
-                if staged
-                    .inputs
-                    .iter()
-                    .any(|entry| entry.key == input.key && entry.path == input.path)
-                {
-                    // The witness or the operator staged this exact
-                    // key and spelling first: keep their input, and
-                    // only add the loader note the drain observed.
+                // Dedupe by file identity (key), never by path spelling
+                // for run-learned proofs: the operator's `--prearm-module`
+                // spelling may differ lexically from the scan's display
+                // spelling (symlink, `/lib` vs `/usr/lib`), but the same
+                // file stages no second input. Fanotify keeps the exact
+                // key-and-spelling match (its scan-covered backstop below
+                // already saves the divergent-spelling case silently).
+                let duplicate = staged.inputs.iter().any(|entry| {
+                    entry.key == input.key && (candidate.run_learned || entry.path == input.path)
+                });
+                if duplicate {
+                    // The witness or the operator staged this file first
+                    // (same key; same spelling for fanotify, any spelling
+                    // for run-learned): keep their input, and only add the
+                    // loader note the drain observed.
                     self.learned_notes
                         .entry(input.key)
                         .or_insert_with(|| note.clone());

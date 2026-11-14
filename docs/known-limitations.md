@@ -240,8 +240,9 @@ first mapper's own calls may be missed (measured: a 16-worker
 fixture at ~55 ms per worker observes 75 of 80 calls, missing exactly
 the first worker; the pkcs11-check smoke suite reaches oracle recall
 1.0); members too short-lived to scan at all (a few milliseconds)
-stay in the aggregate never-scanned gap. The 32-file per-capture cap
-is shared with system file learning.
+stay counted in `pid_descendant_gaps` like the other never-admitted
+members. The 32-file per-capture cap is shared with system file
+learning.
 
 ### File learning sees only the observer's mount namespace
 

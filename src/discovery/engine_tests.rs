@@ -82049,38 +82049,70 @@ fn fill_handle_table_for_test(
 ) -> Vec<crate::discovery::handle_table::Held> {
     let mut live = Vec::new();
     for n in 0..count {
-        let path = dir.join(format!("fill{n:04}.so"));
-        std::fs::write(&path, format!("fill-{n}")).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let maps = ObjectKey {
-            device: Device {
-                major: u64::from(libc::major(metadata.dev())),
-                minor: u64::from(libc::minor(metadata.dev())),
-            },
-            inode: metadata.ino(),
-        };
-        let proved = crate::discovery::identity::ProvedEntry::for_test(
-            std::fs::File::open(&path).unwrap(),
-            maps,
-            &format!("fill-{n:04}"),
-            None,
-        );
-        let crate::discovery::identity::ProvedEntry { file, meta } = proved;
-        match engine.handle_table.acquire(
-            file,
-            &meta,
-            crate::discovery::handle_table::DeferredReason::Live,
-        ) {
-            crate::discovery::handle_table::AcquireOutcome::Held(held) => {
-                assert!(held.inserted);
-                live.push(held);
-            }
-            crate::discovery::handle_table::AcquireOutcome::Deferred(reason) => {
-                panic!("prefill admits: deferred with {reason:?}")
-            }
-        }
+        fill_handle_table_row_for_test(engine, dir, n, &mut live);
     }
     live
+}
+
+/// Fill `engine`'s table up to `cap` (setting it first) with live rows
+/// over fresh tempfiles. Setup scans may have filed rows already; only
+/// the remaining room fills.
+fn fill_handle_table_to_cap_for_test(
+    engine: &mut Engine,
+    dir: &std::path::Path,
+    cap: usize,
+) -> Vec<crate::discovery::handle_table::Held> {
+    engine.set_table_cap_for_test(cap);
+    let mut live = Vec::new();
+    let mut n = 0;
+    while engine.handle_table.len() < cap {
+        assert!(
+            n < cap + 100,
+            "prefill stuck: len {} never reaches cap {cap}",
+            engine.handle_table.len()
+        );
+        fill_handle_table_row_for_test(engine, dir, n, &mut live);
+        n += 1;
+    }
+    live
+}
+
+fn fill_handle_table_row_for_test(
+    engine: &mut Engine,
+    dir: &std::path::Path,
+    n: usize,
+    live: &mut Vec<crate::discovery::handle_table::Held>,
+) {
+    let path = dir.join(format!("fill{n:04}.so"));
+    std::fs::write(&path, format!("fill-{n}")).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let maps = ObjectKey {
+        device: Device {
+            major: u64::from(libc::major(metadata.dev())),
+            minor: u64::from(libc::minor(metadata.dev())),
+        },
+        inode: metadata.ino(),
+    };
+    let proved = crate::discovery::identity::ProvedEntry::for_test(
+        std::fs::File::open(&path).unwrap(),
+        maps,
+        &format!("fill-{n:04}"),
+        None,
+    );
+    let crate::discovery::identity::ProvedEntry { file, meta } = proved;
+    match engine.handle_table.acquire(
+        file,
+        &meta,
+        crate::discovery::handle_table::DeferredReason::Live,
+    ) {
+        crate::discovery::handle_table::AcquireOutcome::Held(held) => {
+            assert!(held.inserted);
+            live.push(held);
+        }
+        crate::discovery::handle_table::AcquireOutcome::Deferred(reason) => {
+            panic!("prefill admits: deferred with {reason:?}")
+        }
+    }
 }
 
 /// B1 stop-pass twin: with the table full, a live publication acquires
@@ -82201,4 +82233,219 @@ fn handle_table_deferred_record_restores_at_head_with_one_gap() {
         "the gap names the wait: {:?}",
         gaps[0].reason
     );
+}
+
+/// B2/F2 core twin: with the table full, a validated loader scan files
+/// nothing, commits nothing, drops its pins and defers for its caller
+/// to re-park.
+#[test]
+fn handle_table_loader_scan_defers_whole_on_budget_wait() {
+    let provider = E07Provider::dlopen();
+    let mut engine = e07_engine();
+    engine.module_hints = vec![provider.path.clone()];
+    let view_id = engine.views[0].id();
+    let context = e07_loader_context(&mut engine, view_id);
+    engine.set_table_cap_for_test(2);
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_for_test(&mut engine, dir.path(), 1);
+    let modules_before = engine.modules.clone();
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::LoaderScanDeferred),
+        "a full table defers the loader scan whole: {outcome:?}"
+    );
+    assert_eq!(engine.modules, modules_before, "nothing committed");
+    let _ = engine.handle_table.prune(usize::MAX);
+    assert_eq!(
+        engine.handle_table.len(),
+        1,
+        "the dropped pins freed their rows"
+    );
+    drop(live);
+}
+
+/// B2 site-1 twin: a deferred arm catch-up re-parks its key and files
+/// one gap; nothing is lost.
+#[test]
+fn handle_table_loader_arm_catchup_reparks_on_budget_wait() {
+    let (_fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let gaps_before = engine.counters.object_skips.len();
+    let outcome = service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert!(
+        matches!(
+            outcome,
+            DiscoveryRecordOutcome::Applied {
+                changed: false,
+                required_complete: false,
+            }
+        ),
+        "the catch-up defers with work outstanding: {outcome:?}"
+    );
+    assert!(
+        engine.pending_loader_arm_scans.contains(&key),
+        "the context re-parks for the next service"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len() - gaps_before,
+        1,
+        "exactly one gap row"
+    );
+    drop(live);
+}
+
+/// B2 site-2 twin: a deferred loader-scan catch-up re-parks its key
+/// with its stamps untouched, and files one gap.
+#[test]
+fn handle_table_loader_scan_catchup_reparks_with_stamps_on_budget_wait() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    let (key, stamps) = engine
+        .pending_loader_scans
+        .iter()
+        .next()
+        .map(|(key, stamps)| (*key, *stamps))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let gaps_before = engine.counters.object_skips.len();
+    let due: BTreeSet<PendingLoaderScanKey> = engine.pending_loader_scans.keys().copied().collect();
+    let mut additions_allowed = true;
+    let mut pending_views = PendingViewRetirements::new();
+    let outcome = engine
+        .service_pending_loader_scans(
+            due,
+            &mut session,
+            &mut additions_allowed,
+            &mut pending_views,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            DiscoveryRecordOutcome::Applied {
+                required_complete: false,
+                ..
+            }
+        ),
+        "the catch-up defers with work outstanding: {outcome:?}"
+    );
+    assert_eq!(
+        engine.pending_loader_scans.get(&key),
+        Some(&stamps),
+        "the context re-parks with its stamps untouched"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len() - gaps_before,
+        1,
+        "exactly one gap row"
+    );
+    drop(live);
+}
+
+/// B2 site-3 twin: an announced scan that defers parks nothing new —
+/// the key was already deferred, so no double insert — and files one gap.
+#[test]
+fn handle_table_announced_loader_scan_keeps_single_park_on_budget_wait() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    record.announced_count = 1;
+    let gaps_before = engine.counters.object_skips.len();
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(
+        engine.pending_loader_scans.len(),
+        1,
+        "the announced key parks exactly once"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len() - gaps_before,
+        1,
+        "exactly one gap row"
+    );
+    drop(live);
+}
+
+/// B2 site-4 twin (resolving parked): a deferred memory scan re-inserts
+/// its resolving stamps and files one gap.
+#[test]
+fn handle_table_loader_record_reparks_resolving_on_budget_wait() {
+    let (_fixture, mut engine, context, mut record, mut session) = armed_seed_route(1);
+    let view = engine.views[0].id();
+    let key = PendingLoaderScanKey { view, context };
+    engine.pending_loader_scans.insert(key, (12345, 7));
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    record.announced_count = 0;
+    let gaps_before = engine.counters.object_skips.len();
+    let mut additions_allowed = true;
+    let mut pending_views = PendingViewRetirements::new();
+    let mut deferred_mismatches = Vec::new();
+    // Producer-counter authority for one direct record (the batch
+    // machinery normally reads this from the session).
+    engine.counter_snapshot.loader_hits = 1;
+    let outcome = engine
+        .process_loader_record(
+            QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut additions_allowed,
+            &mut pending_views,
+            &mut deferred_mismatches,
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::LoaderScanDeferred),
+        "the record scan defers: {outcome:?}"
+    );
+    assert_eq!(
+        engine.pending_loader_scans.get(&key),
+        Some(&(12345, 7)),
+        "the resolving stamps re-insert untouched"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len() - gaps_before,
+        1,
+        "exactly one gap row"
+    );
+    drop(live);
+}
+
+/// B2 site-4 twin (no resolving): a deferred memory scan with nothing
+/// parked restores its record and files one gap.
+#[test]
+fn handle_table_loader_record_restores_without_resolving_on_budget_wait() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    record.announced_count = 0;
+    let gaps_before = engine.counters.object_skips.len();
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert!(
+        engine.pending_discovery_records.iter().any(|queued| {
+            queued.record.case_id == record.case_id && queued.record.pid_tgid == record.pid_tgid
+        }),
+        "the record restores for the next pass"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len() - gaps_before,
+        1,
+        "exactly one gap row"
+    );
+    drop(live);
 }

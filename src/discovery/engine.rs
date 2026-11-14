@@ -5777,6 +5777,11 @@ enum DiscoveryRecordOutcome {
     /// applied, and the record pass restores the untouched record plus
     /// the unprocessed rest at the head of the pending FIFO.
     HandlesDeferred,
+    /// A validated loader scan that waited for library handles:
+    /// nothing was committed, and the caller re-parks only its own
+    /// context (a catch-up service re-queues the key; a record handler
+    /// re-inserts its resolving stamps or restores its record).
+    LoaderScanDeferred,
 }
 
 impl DiscoveryRecordOutcome {
@@ -5790,9 +5795,10 @@ impl DiscoveryRecordOutcome {
     fn changed(self) -> bool {
         match self {
             Self::Applied { changed, .. } => changed,
-            Self::Rejected(_) | Self::TerminalSelectionHandoff { .. } | Self::HandlesDeferred => {
-                false
-            }
+            Self::Rejected(_)
+            | Self::TerminalSelectionHandoff { .. }
+            | Self::HandlesDeferred
+            | Self::LoaderScanDeferred => false,
         }
     }
 
@@ -20265,6 +20271,14 @@ impl Engine {
                 pending_views,
                 None,
             )?;
+            if matches!(outcome, DiscoveryRecordOutcome::LoaderScanDeferred) {
+                // The table is full for every remaining key too: re-park
+                // this context, file one gap and end the service.
+                self.pending_loader_arm_scans.insert(key);
+                self.file_handles_wait_gap();
+                complete = false;
+                break;
+            }
             changed |= outcome.changed();
             complete &= outcome.required_complete();
         }
@@ -20449,7 +20463,7 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
                 None,
-                Filing::Adopt(&mut self.handle_table),
+                Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
             ),
             LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
                 &self.views[position],
@@ -20458,7 +20472,7 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
-                Filing::Adopt(&mut self.handle_table),
+                Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
             ),
         };
         // 6.14 Option B: learn the scanned generation's executable path.
@@ -20715,12 +20729,13 @@ impl Engine {
                 .cloned()
                 .collect();
             let pin_start = crate::attach::monotonic_ns();
-            let pinned = pin_scanned_view_objects_with_filing(
+            let pinned = pin_scanned_view_objects_with_table(
                 &self.views[position],
                 &new_modules,
                 &mut self.budget,
                 None,
-                Filing::Adopt(&mut self.handle_table),
+                &mut self.handle_table,
+                DeferredReason::Live,
             );
             self.stage_timings.span(
                 crate::timing::StageKind::Pin,
@@ -20801,12 +20816,13 @@ impl Engine {
                 .cloned()
                 .collect();
             let pin_start = crate::attach::monotonic_ns();
-            let pinned = pin_scanned_view_objects_with_filing(
+            let pinned = pin_scanned_view_objects_with_table(
                 &self.views[position],
                 &new_modules,
                 &mut self.budget,
                 None,
-                Filing::Adopt(&mut self.handle_table),
+                &mut self.handle_table,
+                DeferredReason::Live,
             );
             self.stage_timings.span(
                 crate::timing::StageKind::Pin,
@@ -20865,6 +20881,13 @@ impl Engine {
             }
             (candidate_pins, raw_modules)
         };
+        // A budget wait anywhere in the fresh or revalidation pins
+        // leaves the pin set incomplete: drop the candidate uncommitted
+        // and let the caller re-park only its own context — never a
+        // partial commit, never a double apply.
+        if pins_waited_for_handles_budget(&skipped) {
+            return Ok(DiscoveryRecordOutcome::LoaderScanDeferred);
+        }
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
@@ -20973,7 +20996,7 @@ impl Engine {
                 self.note_frame_deferral();
                 break;
             }
-            let Some((hook_ts_ns, _announced)) = self.pending_loader_scans.remove(&key) else {
+            let Some((hook_ts_ns, announced)) = self.pending_loader_scans.remove(&key) else {
                 continue;
             };
             if let Some(reason) = self.budget.stopped_now() {
@@ -21015,6 +21038,16 @@ impl Engine {
                 pending_views,
                 None,
             ) {
+                Ok(DiscoveryRecordOutcome::LoaderScanDeferred) => {
+                    // The table is full for every remaining key too:
+                    // re-park this context with its stamps untouched,
+                    // file one gap and end the service.
+                    self.pending_loader_scans
+                        .insert(key, (hook_ts_ns, announced));
+                    self.file_handles_wait_gap();
+                    required_complete = false;
+                    break;
+                }
                 Ok(outcome) => {
                     changed |= outcome.changed();
                     required_complete &= outcome.required_complete();
@@ -21905,6 +21938,11 @@ impl Engine {
                     false,
                 );
             }
+            // The key was already deferred above: nothing to re-park (a
+            // re-insert would add it twice), just the counted gap.
+            if matches!(&result, Ok(DiscoveryRecordOutcome::LoaderScanDeferred)) {
+                self.file_handles_wait_gap();
+            }
             result
         } else {
             let resolving = self.pending_loader_scans.remove(&key);
@@ -21942,6 +21980,25 @@ impl Engine {
                 self.record_pending_loader_scan_loss(&format!(
                     "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
                 ));
+            }
+            if matches!(&result, Ok(DiscoveryRecordOutcome::LoaderScanDeferred)) {
+                // Re-park only this context: the resolving stamps when
+                // the scan took some, else the record itself for the
+                // next pass. Either way the work is preserved exactly
+                // once, with its counted gap.
+                match resolving {
+                    Some(stamps) => {
+                        self.pending_loader_scans.insert(key, stamps);
+                    }
+                    None => {
+                        self.prepend_pending_records(vec![QueuedDiscoveryRecord {
+                            record: *record,
+                            terminal_owner,
+                            terminal_exports,
+                        }]);
+                    }
+                }
+                self.file_handles_wait_gap();
             }
             result
         }

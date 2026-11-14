@@ -5738,6 +5738,45 @@ fn tick_still_marks_unreadable_pid_without_view() {
     );
 }
 
+/// An unreadable pid whose tracked view already settled (closed admission,
+/// no longer pending) is the same dead generation, never a newcomer: a
+/// readdir race may still list it just after reap; it must not mark.
+#[test]
+fn tick_does_not_remark_unreadable_pid_with_settled_view() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    let (mut engine, scope_dir) = engine_over_cgroup_naming(&[pid]);
+    let view = ProcessView::open(ProcessViewId(7007), pid).expect("track the sleeper");
+    engine.views.push(view);
+    engine.next_view_id = 7008;
+    engine.seed_initial_cgroup_views();
+    child.kill().expect("exit the sleeper");
+    wait_until_zombie(pid);
+    // Settle the view as an earlier tick would after observing the exit:
+    // the admission closes (retained), the view drops.
+    engine.close_cgroup_admissions_at_removal(&BTreeSet::from([ProcessViewId(7007)]));
+    engine.views.retain(|view| view.id() != ProcessViewId(7007));
+    // No fixture stat at all: reaped between enumeration and admission.
+    let procdir = tempfile::tempdir().expect("fixture proc root");
+    engine.proc_root = procdir.path().to_path_buf();
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.newcomer_first_seen.contains_key(&pid),
+        "unreadable settled pid re-marked as newcomer"
+    );
+    child.wait().expect("reap the sleeper");
+    std::fs::write(scope_dir.path().join("cgroup.procs"), "").expect("empty scope");
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        0,
+        "reap of an unreadable settled pid filed a prune gap"
+    );
+}
+
 /// A REUSED pid (new running generation, different start_time) while the old
 /// view pends removal still marks: only the same lingering generation skips.
 #[test]

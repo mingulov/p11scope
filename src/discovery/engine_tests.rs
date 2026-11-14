@@ -82633,6 +82633,97 @@ fn handle_table_learned_candidate_pushed_back_on_budget_wait() {
     drop(live);
 }
 
+/// Live-wait dedupe twin: two consecutive budget-wait deferrals file
+/// exactly one counted row, and the mark dirties the publication
+/// inputs — a full table over many ticks must not grow the gap list.
+#[test]
+fn handle_table_live_wait_gap_files_once_across_deferrals() {
+    let mut engine = Engine::empty();
+    let revision_before = engine.facts_revision;
+    engine.file_handles_wait_gap();
+    engine.file_handles_wait_gap();
+    let waits = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| {
+            skip.subject == crate::fd_budget::LIBRARY_HANDLE_BUDGET_SUBJECT
+                && skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LIVE
+        })
+        .count();
+    assert_eq!(
+        waits, 1,
+        "two consecutive deferrals file exactly one row: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.facts_revision > revision_before,
+        "the wait mark dirties the publication inputs"
+    );
+}
+
+/// Learned retry twin: two consecutive stagings of one file under a
+/// full table prove nothing — no re-hash, no mountinfo re-read — so
+/// the capture-wide I/O ceiling stands still; both candidates ride
+/// the next drain under exactly one wait row, never settled.
+#[test]
+fn handle_table_learned_retry_under_full_table_proves_nothing() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let dir = tempfile::tempdir().unwrap();
+    let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
+    let io_before = engine.budget.attempted_io_bytes();
+    let window_before = engine.budget.remaining_window_io().unwrap();
+    let gaps_before = engine.counters.object_skips.len();
+    let held = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&held).unwrap();
+    drop(held);
+    for _ in 0..2 {
+        let file = std::fs::File::open(&library).unwrap();
+        engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+        });
+    }
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        io_before,
+        "no re-hash and no mountinfo re-read while the table is full"
+    );
+    assert_eq!(
+        engine.budget.remaining_window_io().unwrap(),
+        window_before,
+        "retries consume none of the capture-wide I/O ceiling"
+    );
+    let new_rows = &engine.counters.object_skips[gaps_before..];
+    assert_eq!(
+        new_rows.len(),
+        1,
+        "two consecutive deferrals file exactly one row: {new_rows:?}"
+    );
+    assert_eq!(
+        new_rows[0].reason,
+        crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED,
+        "the one row is the learned wait: {new_rows:?}"
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        2,
+        "both candidates ride the next drain"
+    );
+    assert!(
+        !engine.learned_settled.contains(&(dev, ino)),
+        "a wait never settles"
+    );
+    drop(live);
+}
+
 /// Push-back bound twin: with the table full and `pending_learned`
 /// already at its bound, a deferred candidate refuses loudly through
 /// the per-capture cap row — the push-back path holds the same bound

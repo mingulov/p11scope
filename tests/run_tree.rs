@@ -1294,28 +1294,137 @@ fn privileged_run_tree_unprearmed_shortlived_never_pause_still_learns() {
     );
 }
 
-/// Arming-exhaustion run: 260 short-lived sleepers in 13 waves of 20
-/// (each `sleep 5`, ~65 s total) to spend all 256 loader contexts, then 32
-/// sequential SoftHSM grandchildren (each 1 iteration, 150 ms linger) with
-/// NO prearm hint — all under `--pause never`. Every owned member arms a
-/// loader context (E1, even provider-free sleepers), and contexts are 256
-/// lifetime IDs never reused, so the 257th admission exhausts: the capture
-/// names `loader context capacity 256 is exhausted` exactly once (mark
-/// dedupes), stays PARTIAL, yet the watch still stages the provider by scan
-/// (staging needs no loader context) and the later SoftHSM mappers' calls
-/// still land via the file-identity probes (coverage after the first
-/// provider worker >= 0.95, like the twin cells). Without the watch staging
+/// Unprearmed short-lived descendants in parallel waves under
+/// `--pause never`: 6 waves of 8 concurrent grandchildren (each 1
+/// iteration, 2000 ms linger, `wait` between waves) with NO prearm
+/// hint. The sequential twin above cannot catch parallel-only
+/// regressions (a fork burst that overwhelms admission while the
+/// first file stages); this cell pins the parallel shape instead.
+/// Coverage counts waves 1+ against their oracle with the first
+/// wave's whole oracle excluded (several wave-0 mappers can race the
+/// initial stage+attach, not just one first worker): the bound is the
+/// same sound lower bound as the sequential cells, over the waves
+/// that ran under attached probes. The 2000 ms linger is load-bearing
+/// (measured waves-1+ bound 0.0 at 300 ms, 0.4 at 1000 ms, 0.8 at
+/// 2000 ms): a parallel burst needs longer-lived mappers for admission
+/// and attach to catch up. Floor 0.75: the whole-wave exclusion costs
+/// the bound 20 points of conservatism when wave 0 misses honestly
+/// (against 3 for the sequential cells), so 0.95 is unreachable here;
+/// 0.75 still craters on any real staging, attach, or admission
+/// breakage.
+#[test]
+#[ignore = "privileged: run-tree unprearmed shortlived parallel never-pause cell (root BPF capture, runtime SoftHSM workload + token)"]
+fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves() {
+    const WAVES: u32 = 6;
+    const PER_WAVE: u32 = 8;
+    const LINGER_MS: u32 = 2000;
+    let dir = tempfile::tempdir().expect("cell dir");
+    let module = softhsm_path();
+    let conf = init_token(dir.path());
+    let workload = build_c(dir.path(), "rt-workload-ms", TWIN_WORKLOAD_C);
+    open_cell_dir(dir.path());
+    let (_outdir, out) = out_dir();
+    let mut ledgers = Vec::new();
+    let mut script = String::new();
+    for wave in 0..WAVES {
+        for slot in 0..PER_WAVE {
+            let ledger = dir.path().join(format!("w{wave}s{slot}"));
+            script.push_str(&format!(
+                "{} {} {} 1 {LINGER_MS} & ",
+                workload.display(),
+                module.display(),
+                ledger.display()
+            ));
+            ledgers.push(ledger);
+        }
+        script.push_str("wait; ");
+    }
+    script.push_str("exec sleep 2");
+    let mut args = vec![
+        "run".to_string(),
+        "--pause".to_string(),
+        "never".to_string(),
+        "-o".to_string(),
+        out.to_str().expect("utf8 out").to_string(),
+        "--".to_string(),
+    ];
+    args.extend(["sh".to_string(), "-c".to_string(), script]);
+    let mut capture = spawn_run(&args, &conf);
+    let status = capture.wait_expect("run");
+    assert!(status.success(), "run exits with the shell's status");
+    let profile = read_profile(&out);
+    let evidence = profile.get("evidence").expect("evidence");
+    let probes = evidence
+        .get("attached_probes")
+        .and_then(|probes| probes.as_u64())
+        .expect("attached_probes");
+    assert!(probes > 0, "the run attached probes: {profile}");
+    // Waves 1+ ran under attached file-identity probes; wave 0 raced
+    // the initial stage+attach and is excluded whole.
+    let oracle_rest = sum_ledgers(&ledgers[PER_WAVE as usize..]);
+    let oracle_rest_total: u64 = oracle_rest.values().sum();
+    let oracle_first_total: u64 = sum_ledgers(&ledgers[..PER_WAVE as usize]).values().sum();
+    assert!(oracle_rest_total > 0, "the oracle is non-empty");
+    let sha = record_sha256(&profile, &module);
+    let observed = function_calls(&profile, &sha);
+    let observed_total: u64 = observed.values().sum();
+    let oracle_all = sum_ledgers(&ledgers);
+    let oracle_all_total: u64 = oracle_all.values().sum();
+    assert!(
+        observed_total <= oracle_all_total,
+        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
+    );
+    let coverage =
+        coverage_after_first_worker(observed_total, oracle_first_total, oracle_rest_total);
+    assert!(
+        coverage >= 0.75,
+        "coverage after the first wave is {coverage:.4} ({observed_total}/{oracle_rest_total} less first-wave {oracle_first_total}): {observed:?}"
+    );
+    assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
+    let learned = evidence
+        .get("learned_staged_files")
+        .and_then(|learned| learned.as_u64())
+        .expect("learned_staged_files");
+    assert!(
+        learned >= 1,
+        "the run staged the learned provider file: {profile}"
+    );
+    let gaps = evidence
+        .get("pid_descendant_gaps")
+        .and_then(|gaps| gaps.as_u64())
+        .expect("pid_descendant_gaps");
+    assert!(
+        gaps > 0,
+        "members that retired before admission stay counted: {profile}"
+    );
+}
+
+/// Arming-exhaustion run: 280 short-lived sleepers in 14 waves of 20
+/// (each `sleep 5`, ~70 s total) to spend the member loader contexts,
+/// then 32 sequential SoftHSM grandchildren (each 1 iteration, 150 ms
+/// linger) with NO prearm hint — all under `--pause never`. Every owned
+/// member arms a loader context (E1, even provider-free sleepers), and
+/// contexts are 256 lifetime IDs never reused, so admissions past the
+/// 248-context reserve line refuse: 8 stay held for the direct child's
+/// exec chain while members name `loader context capacity 256 is
+/// exhausted` exactly once (mark dedupes), the capture stays PARTIAL,
+/// yet the watch still stages the provider by scan (staging needs no
+/// loader context) and the later SoftHSM mappers' calls still land via
+/// the file-identity probes (coverage after the first provider
+/// worker clears 0.95, like the twin cells). Without the watch staging
 /// this cell would see 0 probes; without the honest gap the exhaustion
 /// would be silent. Small waves (20, not 30+) are load-bearing for
-/// admission: 30-wide waves admit ~50 total regardless of count (frames
-/// miss retirements under fork load), while 20-wide waves admit all 260
-/// (measured admitted 260, gaps 20, exhaustion 1). The unit twin
-/// `loader_exhaustion_names_once_and_watch_still_stages` pins the same
-/// once-naming + staging logic via direct registry fill.
+/// admission:
+/// 30-wide waves admit ~50 total regardless of count (frames miss
+/// retirements under fork load), while 20-wide waves admit ~280
+/// (measured admitted 284, gaps 48, exhaustion 1); the 14th wave is
+/// admission margin (13 waves admit ~260, only 4 past the 256 gate).
+/// The unit twin `loader_exhaustion_names_once_and_watch_still_stages`
+/// pins the same once-naming + staging logic via direct registry fill.
 #[test]
 #[ignore = "privileged: run-tree arming-exhaustion cell (root BPF capture, runtime SoftHSM workload + token)"]
 fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
-    const SLEEPER_WAVES: u32 = 13;
+    const SLEEPER_WAVES: u32 = 14;
     const SLEEPERS_PER_WAVE: u32 = 20;
     const PROVIDER_WORKERS: u32 = 32;
     let dir = tempfile::tempdir().expect("cell dir");
@@ -1325,9 +1434,10 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     open_cell_dir(dir.path());
     let (_outdir, out) = out_dir();
     let mut script = String::new();
-    // Phase 1: 260 sleepers to spend every loader context. Each wave's 20
-    // sleepers run concurrently for ~5 s (light load, fast frames, all
-    // admit), then join: 13 waves admit 260 members and exhaust mid-run.
+    // Phase 1: 280 sleepers to spend every member loader context. Each
+    // wave's 20 sleepers run concurrently for ~5 s (light load, fast
+    // frames, all admit), then join: 14 waves admit ~280 members and
+    // exhaust past the reserve line mid-run.
     for _ in 0..SLEEPER_WAVES {
         for _ in 0..SLEEPERS_PER_WAVE {
             script.push_str("sleep 5 & ");
@@ -1364,7 +1474,8 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     let profile = read_profile(&out);
     let evidence = profile.get("evidence").expect("evidence");
     // Exhaustion named exactly once (non-vacuous: admitted >= 256 proves
-    // the contexts were really spent, not merely spawned).
+    // the member contexts were really spent past the reserve line, not
+    // merely spawned).
     let admitted = evidence
         .get("scheduling")
         .and_then(|scheduling| scheduling.get("newcomer_queue"))
@@ -1373,7 +1484,7 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
         .expect("newcomer_queue.admitted");
     assert!(
         admitted >= 256,
-        "the run admitted 256+ members to spend every context: admitted={admitted}"
+        "the run admitted 256+ members to spend the member contexts: admitted={admitted}"
     );
     let skipped = evidence
         .get("skipped")
@@ -1434,11 +1545,14 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
 }
 
 /// Non-member privacy: a process outside the run cgroup opens a different
-/// provider file (a copy of SoftHSM at another path) while an owned run
-/// captures its own prearmed SoftHSM grandchildren ledger-exact. The
-/// non-member's file is never staged: fanotify never arms for `run`
-/// (unit-pinned `start_file_learning` no-op), and the watch scans only
-/// owned-cgroup members. The profile lists the owned provider only.
+/// provider file (a copy of SoftHSM at another path) and the SAME provider
+/// file (the owned module itself, same inode) while an owned run captures
+/// its own prearmed SoftHSM grandchildren ledger-exact. The non-member's
+/// files are never staged and its calls never land: fanotify never arms
+/// for `run` (unit-pinned `start_file_learning` no-op), the watch scans
+/// only owned-cgroup members, and the cgroup BPF filter drops non-member
+/// hits even on the shared inode. The profile lists the owned provider
+/// only, with owned counts exact.
 #[test]
 #[ignore = "privileged: run-tree non-member privacy cell (root BPF capture, runtime SoftHSM workload + token)"]
 fn privileged_run_tree_non_member_provider_is_never_staged() {
@@ -1452,16 +1566,21 @@ fn privileged_run_tree_non_member_provider_is_never_staged() {
     std::fs::copy(&module, &copy).expect("copy SoftHSM for the non-member");
     open_cell_dir(dir.path());
     let (_outdir, out) = out_dir();
-    // Non-member script: loop opening the copy while the run captures.
-    // Runs as the test (outside the run cgroup), proving the file was
-    // opened concurrently yet never staged.
+    // Non-member script: loop opening the copy, then the owned module
+    // itself (same inode as the owned grandchildren map), while the run
+    // captures. Runs as the test (outside the run cgroup), proving both
+    // files were opened concurrently yet never staged and never counted.
     let (nonmember_ledger, nonmember_done) =
         (dir.path().join("nm-ledger"), dir.path().join("nm-done"));
+    let nonmember_same_ledger = dir.path().join("nm-same-ledger");
     let nm_script = format!(
-        "for i in 1 2 3 4 5 6 7 8; do {} {} {} 1; sleep 0.5; done; touch {}",
+        "for i in 1 2 3 4 5 6 7 8; do {} {} {} 1; sleep 0.5; done; for i in 1 2 3 4; do {} {} {} 1; sleep 0.5; done; touch {}",
         workload.display(),
         copy.display(),
         nonmember_ledger.display(),
+        workload.display(),
+        module.display(),
+        nonmember_same_ledger.display(),
         nonmember_done.display()
     );
     let mut nonmember = Command::new("sh")
@@ -1516,6 +1635,15 @@ fn privileged_run_tree_non_member_provider_is_never_staged() {
     assert!(
         nm_ledger.values().sum::<u64>() > 0,
         "the non-member made calls through its copy: {nm_ledger:?}"
+    );
+    // Same-inode arm: the non-member also called through the owned
+    // module itself (non-vacuous: its ledger is non-empty), so the
+    // owned-exact assertion below covers the shared-inode BPF filter
+    // path — any leaked hit would break exactness.
+    let nm_same_ledger = read_ledger_file(&nonmember_same_ledger);
+    assert!(
+        nm_same_ledger.values().sum::<u64>() > 0,
+        "the non-member made calls through the shared inode: {nm_same_ledger:?}"
     );
     // Owned calls land exact; the copy never appears.
     let profile = read_profile(&out);

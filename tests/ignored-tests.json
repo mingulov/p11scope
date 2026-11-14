@@ -2222,6 +2222,12 @@
     },
     {
       "file": "tests/run_tree.rs",
+      "path": "privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves",
+      "reason": "privileged: run-tree unprearmed shortlived parallel never-pause cell (root BPF capture, runtime SoftHSM workload + token)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/run_tree.rs",
       "path": "privileged_run_tree_arming_exhaustion_still_stages_and_counts",
       "reason": "privileged: run-tree arming-exhaustion cell (root BPF capture, runtime SoftHSM workload + token)",
       "cell": "live-kernel"

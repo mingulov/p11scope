@@ -5517,7 +5517,10 @@ fn exit_tap_queue_bounds_at_16384_with_counted_overflow() {
         engine.note_exit_tap(1000 + pid, u64::from(pid));
     }
     assert_eq!(engine.exit_taps_for_test(), (16384, 0));
-    engine.note_exit_tap(9999, 9999);
+    // A genuinely new pid (outside the queued 1000..17384 range): its
+    // incoming tap drops with a counted overflow. A queued pid would
+    // replace instead, which is kept and uncounted.
+    engine.note_exit_tap(99999, 99999);
     assert_eq!(
         engine.exit_taps_for_test(),
         (16384, 1),
@@ -5539,9 +5542,10 @@ fn exit_tap_queue_bounds_at_16384_with_counted_overflow() {
 fn exit_tap_overflow_keeps_newest_same_pid_generation() {
     // F1 twin: queue full, pid exits twice with reuse — the incoming
     // (newest) tap for an already-queued pid replaces that pid's oldest
-    // tap (counted), so the later exit still retires both generations
-    // (self-healing). Fails while overflow drops incoming: the later tap
-    // is lost and the successor leaks.
+    // tap (uncounted: the later exit matches every generation the older
+    // one matched, so nothing is lost), so the later exit still retires
+    // both generations (self-healing). Fails while overflow drops
+    // incoming: the later tap is lost and the successor leaks.
     let mut engine = Engine::empty();
     let limit = crate::history::EXIT_TAP_QUEUE_LIMIT;
     for i in 0..(limit - 1) as u32 {
@@ -5552,8 +5556,8 @@ fn exit_tap_overflow_keeps_newest_same_pid_generation() {
     engine.note_exit_tap(100, 40);
     assert_eq!(
         engine.exit_taps_for_test(),
-        (16384, 1),
-        "overflow evicts oldest same-pid tap, counted"
+        (16384, 0),
+        "same-pid replacement keeps the newest tap, uncounted"
     );
     let taps = engine.take_exit_taps(usize::MAX);
     assert_eq!(taps.len(), 16384);
@@ -5601,6 +5605,27 @@ fn exit_tap_overflow_keeps_newest_same_pid_generation() {
         std::collections::BTreeSet::from([old, successor]),
         "kept later tap retires both generations"
     );
+}
+
+#[test]
+fn disarmed_engine_ignores_leader_exits() {
+    // Consumer-gating twin: an engine with intake disabled (a capture
+    // that never transfers taps) drops exits at the tap — both direct
+    // and through lifecycle dispatch — instead of filling the bounded
+    // queue. Fails while intake ignores the switch: the queue fills.
+    let mut engine = Engine::empty();
+    engine.disable_exit_taps();
+    engine.note_exit_tap(4242, 200);
+    assert_eq!(engine.exit_taps_for_test(), (0, 0));
+    let mut pending_views = PendingViewRetirements::new();
+    let exit = exit_record_for(4242, 200);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending_views);
+    assert_eq!(
+        engine.exit_taps_for_test(),
+        (0, 0),
+        "disarmed dispatch taps nothing"
+    );
+    assert!(engine.take_exit_taps(usize::MAX).is_empty());
 }
 
 #[test]

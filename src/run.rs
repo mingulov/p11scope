@@ -9453,6 +9453,11 @@ fn capture_profile(
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
+    if !profile {
+        // No EVENTS consumer, no transfer: disable tap intake so exits
+        // cost one branch instead of filling the bounded queue.
+        engine.disable_exit_taps();
+    }
     let mut collection = metrics::CaptureCollection::new(counter_inputs);
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never

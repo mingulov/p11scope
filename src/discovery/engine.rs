@@ -1144,14 +1144,23 @@ pub struct Engine {
     /// Tapped `LEADER_EXIT`/`_MAPPINGS` records awaiting transfer to the
     /// process tracker, in dispatch order. Bounded: past
     /// [`crate::history::EXIT_TAP_QUEUE_LIMIT`] an incoming tap for an
-    /// already-queued pid replaces that pid's oldest tap (counted), so
-    /// the newest generation is kept; otherwise the incoming tap drops
-    /// (counted). Drained every profile/trace tick; other commands never
-    /// transfer, so theirs counts overflow.
+    /// already-queued pid replaces that pid's oldest tap (kept, not
+    /// counted — nothing is lost), so the newest generation is kept;
+    /// otherwise the incoming tap drops (counted). Only captures with
+    /// an EVENTS consumer tap at all; the rest disable intake.
     exit_taps: VecDeque<crate::history::ExitTap>,
-    /// Full-queue tap drops, never silent: incoming drops for new pids,
-    /// oldest same-pid evictions for reused pids.
+    /// Full-queue tap drops for pids with no queued tap, never silent.
+    /// Same-pid replacements are not drops (the newer exit matches
+    /// every generation the older one matched) and are not counted.
     exit_tap_overflow: u64,
+    /// Exit-tap intake switch. Commands whose capture drains EVENTS and
+    /// transfers taps (profile with an EVENTS policy, trace) leave it
+    /// on; commands that never transfer (metrics policies) disable it,
+    /// so their exits cost one branch instead of filling the bounded
+    /// queue and then paying a scan per exit. Default on: forgetting to
+    /// disable only fills a counted queue, while forgetting to enable
+    /// would leak rows silently.
+    exit_taps_enabled: bool,
 }
 
 /// Consecutive drops that keep serviced requests queued for retry
@@ -13081,6 +13090,7 @@ impl Engine {
             initial_arming_window_ms_for_test: None,
             exit_taps: VecDeque::new(),
             exit_tap_overflow: 0,
+            exit_taps_enabled: true,
         }
     }
 
@@ -25993,22 +26003,33 @@ impl Engine {
         )
     }
 
+    /// Disables exit-tap intake for captures that never transfer taps
+    /// (metrics policies): without a consumer the queue would only fill
+    /// to its bound and then cost a scan per exit. Idempotent.
+    pub(crate) fn disable_exit_taps(&mut self) {
+        self.exit_taps_enabled = false;
+    }
+
     /// Taps one `LEADER_EXIT`/`_MAPPINGS` record for the process-exit
     /// retire path: the tracker frees the exiting process's semantic
     /// rows once the EVENTS drain reads past the tap-time producer
-    /// position. Past [`crate::history::EXIT_TAP_QUEUE_LIMIT`] an incoming
-    /// tap for an already-queued pid evicts that pid's oldest tap
-    /// (counted) and is kept — the later hook matches both generations;
-    /// otherwise the incoming tap drops and `exit_tap_overflow` counts
-    /// it — the process keeps its rows, never silently.
+    /// position. A no-op when intake is disabled (no consumer). Past
+    /// [`crate::history::EXIT_TAP_QUEUE_LIMIT`] an incoming tap for an
+    /// already-queued pid evicts that pid's oldest tap and is kept —
+    /// the later hook matches both generations, so nothing is lost and
+    /// nothing is counted; otherwise the incoming tap drops and
+    /// `exit_tap_overflow` counts it — the process keeps its rows,
+    /// never silently.
     pub(crate) fn note_exit_tap(&mut self, pid: u32, hook_ts_ns: u64) {
+        if !self.exit_taps_enabled {
+            return;
+        }
         if self.exit_taps.len() >= crate::history::EXIT_TAP_QUEUE_LIMIT {
             // Keep the newest generation for a reused pid: the later hook
             // matches every generation the evicted older hook matched, so
             // nothing leaks for that pid. New pids still drop incoming.
             if let Some(index) = self.exit_taps.iter().position(|tap| tap.pid == pid) {
                 self.exit_taps.remove(index);
-                self.exit_tap_overflow = self.exit_tap_overflow.saturating_add(1);
             } else {
                 self.exit_tap_overflow = self.exit_tap_overflow.saturating_add(1);
                 return;
@@ -26026,10 +26047,15 @@ impl Engine {
         self.exit_taps.drain(..take).collect()
     }
 
+    /// `(queued taps, overflow drops)` for the A0 sampler.
+    pub(crate) fn exit_tap_stats(&self) -> (usize, u64) {
+        (self.exit_taps.len(), self.exit_tap_overflow)
+    }
+
     /// `(queued taps, overflow drops)` for tests.
     #[cfg(test)]
     pub(crate) fn exit_taps_for_test(&self) -> (usize, u64) {
-        (self.exit_taps.len(), self.exit_tap_overflow)
+        self.exit_tap_stats()
     }
 
     fn dispatch_lifecycle_record(

@@ -90,7 +90,8 @@ Edwards/Montgomery key types do not authorize curve decoding), the
 requested-values promotion rule and the establishment rule. The keymeta
 section adds the three operation-length rows. Until both reviews pass,
 the implemented boundary stays EC parameter lengths 7/10, value lengths
-16/24/32, the four-member derive set and no promotion.
+16/24/32, key types without 0x42, the four-member derive set and no
+promotion.
 Apart from the sections the status line lists, this document does not
 enable capture, describe implemented fields, or qualify a release. The
 implemented contracts remain

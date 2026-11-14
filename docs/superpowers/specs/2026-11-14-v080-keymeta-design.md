@@ -110,7 +110,8 @@ flavor list stated.
 
 Controller rulings (fix9, binding, dispose the Opus r4 review
 R1–R8): R1 — `INFO_KIND` follows `ENDPOINT_OBJECT` exactly
-(written per endpoint at admission with read-back, re-publication
+(written per endpoint at admission [timing refined by t0-fix1:
+published after the return link] with read-back, re-publication
 refused, never frozen; `Freeze("INFO_KIND")` dropped). R2 — the
 info header carries the full 16-B `ImageIdentity` (48-B header,
 176-B record, every figure updated; the Global flavour emits a
@@ -1456,7 +1457,7 @@ curve decoding), the requested-values promotion rule and the
 establishment rule. The keymeta section adds the three
 operation-length rows. Until both reviews pass, the implemented
 boundary stays EC parameter lengths 7/10, value lengths 16/24/32,
-the four-member derive set and no promotion.
+key types without 0x42, the four-member derive set and no promotion.
 There is no descriptor-table edit and no authority-condition edit:
 evidence reads add no descriptors and change no entry gating
 (§8.1, §8.4) — the amendment adds fields, not entries.
@@ -1483,8 +1484,9 @@ R2 block (merged by the same Task 0, reviewed together): the
 R2 promotion rule, v6 scope — 115 changed lines) with the
 per-field `source` refinement (`creation_success` on promoted
 fields, `query` on queried fields, §6/K5) instead of R2's
-sourceless promotion. Task 1 consumes this approved block; there
-is no other R2-amendment owner.
+sourceless promotion, plus the t0-fix1 review edits. Task 1
+consumes this approved block; there is no other R2-amendment
+owner.
 
 New section body (normative):
 
@@ -2601,6 +2603,12 @@ block: "provider never watched" is derivable from the JSON
 already (no rows for its module beside coverage notes), so no
 new field marks it.
 
+Gaps surfaced in this section, all named and counted:
+`info_aliased_endpoint` (per endpoint, §17.4),
+`info_return_deferred` (per endpoint/group, §17.4),
+`info_caller_unavailable` (per refused row, §17.4) and the
+`mechanism_info_refused: too_many` cap counter above.
+
 Text: concise gains one provider line only where Task 7 content
 exists (byte-stable otherwise), pinned wording:
 `provider: <libraryDescription> <libraryVersion> (cryptoki
@@ -2688,6 +2696,10 @@ journal-refused run equal the unrefused run's; join twins
 (fix8 C2): two processes' same-slot tokens stay separate rows
 under one (module, caller) each, and a manifest run attaches
 the proved instance id while a no-manifest run carries none;
+caller-unavailable twin: an injected helper failure at return
+publishes `provider_info` while its `tokens[]`/`mechanisms[]`
+rows are refused with the named counted `info_caller_unavailable`
+gap, never keyed under a shared zero caller;
 sentinel twin: a provider
 returning sentinel serial/label/session/memory/utcTime bytes and
 sentinel `CK_INFO` pad bytes publishes none of those bytes

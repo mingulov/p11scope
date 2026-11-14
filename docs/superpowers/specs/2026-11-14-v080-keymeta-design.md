@@ -2,7 +2,7 @@
 <!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # v0.8.0 Key Metadata: Inferred Family, Size Class, Creation Sources
 
-Status: design (spark lane, round 6). Base: task/v080-design-keymeta 763b29998.
+Status: design (spark lane, round 7). Base: task/v080-design-keymeta 763b29998.
 Branch: task/v080-design-keymeta. Plan: `docs/superpowers/plans/2026-11-14-v080-keymeta.md`.
 
 Owner direction (2026-11-14 07:05): v0.8.0 carries much more key
@@ -30,15 +30,30 @@ and Task 7 stays required; size display names the standard size
 with its source and renders no bit range anywhere (§5.2, §10.2,
 §10.3, §15 K3).
 
+Owner ruling (2026-11-14 08:50, binding, §15 K7): the
+length-based size inference that needs new reads on hot per-call
+paths (Opus B7 put hot `C_Encrypt`/`C_Decrypt`/`C_Sign` record
+growth at ~70% with a classification change) is OPTIONAL and OFF
+by default behind one flag, `--key-sizes` (valid only with
+`--key-operations`, §10.5). Without the flag the user still gets
+family-from-mechanism (§4, no new reads), creation-template facts
+(§6) and token-reported sizes — plus a one-line `-v` hint that
+size-from-length needs the flag. With the flag off, hot-path
+records, ring/journal load, the linked program set at hot
+endpoints, standard verifier counts and classification are
+exactly today's (§8.6, §12.1 identity contract). Task 7 stays ON
+by default (cold calls, §17.4/§17.7).
+
 ## 1. Goal, non-goals, constraints
 
 Goal: per-key rows carry, beside established token-reported facts,
 three new fact classes with explicit provenance — inferred family
-("probably RSA (from mechanism)"), size class from operation lengths
-("RSA 2048 (from signature length)"), and
-creation-template facts with requested-with-success provenance —
-without ever silently promoting a request or an inference into an
-established fact.
+("probably RSA (from mechanism)", on by default), size class from
+operation lengths ("RSA 2048 (from signature length)", opt-in
+behind `--key-sizes`, off by default per the 08:50 ruling), and
+creation-template facts with requested-with-success provenance (on
+by default) — without ever silently promoting a request or an
+inference into an established fact.
 
 Non-goals: exact RSA modulus bits for non-standard octet lengths
 (masked class + byte count only, §5.2); `CKA_ID`-joined twin
@@ -55,7 +70,13 @@ Constraints: never capture PINs/keys/payloads/env;
 stay unknown with named reasons; concise CLI default; profile, trace
 and metrics never carry object facts; observed-profile v2/v3 schemas
 untouched; bounded steps for I/O/close/join/scan; Linux x86-64 LP64
-first, ia32 claims require actual ABI cells.
+first, ia32 claims require actual ABI cells; with `--key-sizes`
+off, hot-path records, ring/journal load, the linked program set
+at hot endpoints, standard verifier counts and classification are
+exactly today's (§8.6 — separate variant objects selected at
+load time, never a runtime branch inside the hot programs; the
+only linked-set additions are the cold-only Task 7 info
+variants).
 
 ## 2. Prior work and dispositions
 
@@ -96,6 +117,13 @@ first, ia32 claims require actual ABI cells.
   interface and the order. Keyrows owns row existence, voids, fences,
   births and seals; keymeta adds evidence columns only and touches no
   void/fence/birth/seal path.
+- Opus review B7 (hot-call cost: hot `C_Encrypt`/`C_Decrypt`/`C_Sign`
+  records growing ~70% with a classification change) is disposed by
+  the owner 08:50 ruling (§15 K7), not by narrowing the capture:
+  length capture on hot paths moves behind `--key-sizes` (off by
+  default, §10.5) in a separately loaded variant object (§8.6), the
+  §12.3 gate becomes the opt-in's acceptance, and family (§4),
+  creation (§6) and Task 7 info (§17) stay on by default.
 
 ## 3. Provenance vocabulary: every fact carries its source
 
@@ -132,6 +160,9 @@ no wire change. Input: `OpMachine.mechanism: Option<u64>` (bound at
 the Init) for Init-based operations, and the already-captured call
 mechanism for single-call operations (`C_WrapKey`, `C_UnwrapKey`,
 `C_EncapsulateKey`, `C_DecapsulateKey`, `C_DeriveKey` base-key use).
+Family inference stays ON by default: it needs no `--key-sizes`
+(§10.5, §15 K7) and its cost is a userspace table lookup per
+attributed completion.
 
 ### 4.2 Finite family sets (full-width equality, explicit members)
 
@@ -278,17 +309,29 @@ infer nothing.
 
 ## 5. D3: size class from operation lengths
 
+This whole section is the `--key-sizes` opt-in (owner 08:50,
+§15 K7, flag §10.5): every capture protocol below (§5.1) runs
+only when the flag is on, in the separately loaded length-variant
+object (§8.6). With the flag off no length word is acquired on
+any path, and `inferred_size` from lengths is absent (§9, §10.2).
+The maps (§5.2), the closed non-map list (§5.3) and the join
+rules (§5.4) are unchanged — they just never see evidence when
+the flag is off.
+
 ### 5.1 Capture protocols (F2, exact)
 
 Arguments are zero-based. LP64: 8-byte words, args 0–5 in registers,
 arg 6 at entry SP+8 (existing `target_stack_arg_address` helper).
 ia32: 4-byte words on the stack, zero-extended after a successful
 four-byte read, high-bit refusal. All indices are ≤ 6: no new
-argument-7 exception is needed. FULL builds only (`KEM_CAPTURE_WIRED`
-gate reused for the length adapters); P0 acquires nothing and reports
-explicit unavailability. No length-cell pointer is retained beyond
-its matching call; every terminal/loss/cancellation/exec/teardown
-path clears it, exactly like the result-handle pointer row.
+argument-7 exception is needed. FULL builds with `--key-sizes`
+only: the length adapters live in the separately loaded variant
+object (§8.6), so without the flag there is no length code on any
+loaded path at all (stronger than the `KEM_CAPTURE_WIRED`
+FULL/P0 split — P0 also refuses the flag, §10.5). No length-cell
+pointer is retained beyond its matching call; every
+terminal/loss/cancellation/exec/teardown path clears it, exactly
+like the result-handle pointer row.
 
 Two protocols (F2: never one shared read):
 
@@ -495,6 +538,13 @@ never to a neighboring class.
 
 ### 5.4 Operation/session incarnation and late-result provenance (N5)
 
+Length evidence is admitted to the join only when `--key-sizes`
+is on (§9): with the flag off the reducer drops any length
+trailer unclassified with the named reason `size_inference_off`
+(never stored, classified, counted or published — the same
+drop rule as query values, §10.2). The family path (§4) is
+unaffected by the flag.
+
 Completion length binds to the existing operation identity, never to
 a re-looked-up key: every completed-call record at an evidence
 endpoint carries (operation generation from `OpMachine`, fixed
@@ -583,16 +633,28 @@ work if it persists, not to keymeta. Task 1 acceptance is the
 RED→GREEN twins plus the R2 finite-set twins on the v0.8.0 base,
 not browser yield (yield is Task 5, after keyrows Task 3).
 
+Creation-template facts stay ON by default (owner 08:50, §15 K7):
+creation calls are cold (not hot per-call paths), the R2 reads
+ride the existing creation adapters, and no `--key-sizes` is
+needed to see them. The R2 BPF delta is finite-set const data on
+those cold paths; the §12.1 off-mode identity twin pins the
+standard programs' verifier counts equal to today's pins, and if
+the Task 1 lane cannot hold that pin it moves its BPF delta into
+a cold creation variant (§8.6 rule) instead of growing the
+standard programs.
+
 ## 7. Other cheap facts, ranked by value/cost
 
 1. Attribute results apps already query — zero cost, already
    captured (H7-E4), already projected. Value: high wherever apps
    query (pkcs11-tool, OpenSSL provider); zero for browsers (measured
    R2 §1). No work; Task 5 measures the yield per app.
-2. §4 family inference — userspace only, no BPF. High value
-   everywhere (every successful operation carries a mechanism).
-3. §5 wrap/unwrap lengths — same S/V adapters, two more functions.
-   Medium value (wrapping-key class; wrapped-material length).
+2. §4 family inference — userspace only, no BPF, on by default.
+   High value everywhere (every successful operation carries a
+   mechanism).
+3. §5 wrap/unwrap lengths — same S/V adapters, two more functions,
+   behind `--key-sizes` like all §5 lengths. Medium value
+   (wrapping-key class; wrapped-material length).
 4. §6 R2 creation-template facts — port + review. High value for
    Firefox new-site keys; zero for Chromium (no creation calls).
 5. O1 EC pair-mate inheritance (optional, Task 6): extend
@@ -619,7 +681,8 @@ sole-complete-table claims (v3:106-161) already grant key-operations
 runs without a manifest the SAME read set — a scan-derived claim
 "never adds a field, an argument or a read beyond the rows below".
 Every §4/§5/§6 fact therefore rides wherever rows exist, manifest
-or not. The D6 row gap (rows not produced without a manifest) is a
+or not (§5 lengths additionally need `--key-sizes`, like everywhere
+else). The D6 row gap (rows not produced without a manifest) is a
 row-existence question owned by keyrows follow-up, not keymeta:
 keymeta consumes the §13 row interface and inherits D6's outcome.
 Task 6 verifies the inheritance on one no-manifest `--system` run
@@ -670,6 +733,13 @@ existing Unwrap adapter and stays authorized exactly as today
 and nothing in this design removes or re-gates it. Evidence rows
 carry no template pairs (T0-style: never authorized).
 
+Variant mapping (mechanism in §8.6): the 11 length rows link the
+length-variant object iff `--key-sizes` is on, else the standard
+programs exactly as today; the 3 info rows link the info variants
+in the standard object (default-on, §17.4). The table above names
+positions, never programs: which program runs at a position is an
+attach-time routing decision.
+
 Non-interference (why the four B7 pins stand — Task 2 re-runs
 each as a twin, §12.1):
 
@@ -700,10 +770,10 @@ each as a twin, §12.1):
 
 ### 8.2 Adapters
 
-`adapter_length_entry` (shared, host-tested with injected readers,
-BPF bindings only in `crates/ebpf/src/main.rs` beside
-`object_entry_kem`): FULL-gate first (P0: mark unavailable, fetch
-nothing); V-scalars snapshot via `arg_u64` (LP64 regs / ia32 stack /
+`adapter_length_entry` (shared source, host-tested with injected
+readers; BPF bindings compile into the length-variant object only,
+§8.6 — never into the standard entry/return programs):
+V-scalars snapshot via `arg_u64` (LP64 regs / ia32 stack /
 LP64 arg 6 via the existing SP+8 helper); S-cells retained with the
 §5.1 entry guards (null → no retention; entry capacity read with
 the `1<<20` cap; full-span; disjointness vs the §5.1 per-function
@@ -718,19 +788,27 @@ forked: the Wrap (Access), Unwrap, Encapsulate and Decapsulate
 entry adapters still acquire their §8.1 existing positions
 (inputs, result pointers, the unwrap template), and the length
 adapters compose onto the same calls for the length positions only
-(the KEM entry adapter is NOT forked either).
+(the KEM entry adapter is NOT forked either). (There is no
+FULL/P0 runtime gate inside the adapters any more: the whole
+length path is absent unless the variant object loads, §8.6.)
 
-Retention reuses the two existing in-flight maps (no new map):
-neutral endpoints stash in the S1 `START` map (`CallStart` gains
-`ev_cell: u64` — retained S-cell pointer, V-scalar snapshot or
-info pointer — plus `ev_kind: u8` and 7 pad bytes: +16 B/row ×
-16384 entries = +256 KiB worst case); the 4 object endpoints stash
-in `OBJECT_START` (`ObjectStart` gains `length_cell: u64`,
-`length_scalar: u64`, `length_status: u8`, 7 pad bytes: +24 B/row
-× 16384 = +384 KiB worst case). Every terminal/loss/cancellation/
-exec/teardown path clears the stash, exactly like the result-handle
-pointer row. Emission is reserve-and-fill (never stack-built), one
-record per completed call: base + trailer (§8.3).
+Retention, split by object (still no new map KIND — each object
+carries its own instances of the two existing in-flight maps):
+the length-variant object carries its own `START`/`OBJECT_START`
+instances whose rows carry the evidence stash (`CallStart` +16 B:
+`ev_cell: u64` — retained S-cell pointer or V-scalar snapshot —
+plus `ev_kind: u8` and 7 pad bytes; `ObjectStart` +24 B:
+`length_cell: u64`, `length_scalar: u64`, `length_status: u8`, 7
+pad bytes; +256 KiB / +384 KiB worst case at 16384 entries — all
+reserved only when the variant object loads). The standard
+object's `OBJECT_START` is untouched; its `START` (`CallStart`)
+gains the same +16 B row ONLY for the Task 7 info-pointer stash
+(`ev_cell` = info pointer, §17.4 — cold retention, reservation
+cost only, zero per-call traffic delta at non-info endpoints).
+Every terminal/loss/cancellation/exec/teardown path clears the
+stash, exactly like the result-handle pointer row. Emission is
+reserve-and-fill (never stack-built), one record per completed
+call: base + trailer (§8.3).
 
 ### 8.3 Wire: trailer forms and sizes
 
@@ -744,10 +822,13 @@ Five exact record forms; dispatch is by exact length only:
 | object | 608 | `EventRecord` + 240-byte v1 tail (UNCHANGED — `OBJECT_CALL_VERSION` stays 1, the `object_wire.rs:363` check and the v1 validator are byte-identical) |
 | object+length | 624 | 608 + the same 16-byte length trailer |
 
-FULL builds emit the trailer form at evidence endpoints on every
-completed call (the status field marks unavailable shapes);
-P0 builds emit the base form (nothing acquired, explicit
-unavailability). Length-based dispatch (`object_record_form`,
+The length-variant programs emit the trailer form at their
+endpoints on every completed call (the status field marks
+unavailable shapes); the standard programs always emit the base
+form there, so with the flag off every length endpoint yields
+only 368/608-byte records exactly as today (§8.6 identity
+contract). P0 builds carry no variant object and refuse the flag
+(§10.5). Length-based dispatch (`object_record_form`,
 `object_wire.rs:614-633`, plus its userspace mirror
 `decode_object_record`, `src/events.rs:294-313`) gains the exact
 lengths 384/496/624; every other length stays malformed. The
@@ -761,15 +842,19 @@ adapter code, and records are reserve-filled, never stack-built;
 if frames do not fit, the lane stops and reports — no silent
 bound raise).
 
-No new maps. No new arg-7 exception (all indices ≤ 6, §5.1).
+No new map kinds, no new arg-7 exception (all indices ≤ 6, §5.1).
 Attach/plan: +0 newly probed functions and +0 endpoints — all 14
 evidence endpoints already carry S1 probes (info:
-`kinds.rs:184-191`; length: `kinds.rs:274-308`). The real cost is
-per-call bytes on already-hot endpoints (368→384 on `C_Sign`/
-`C_Encrypt`/`C_Decrypt` et al; 608→624 on Wrap/Unwrap/KEM;
-368→496 on the rare info calls) plus the in-flight-row growth
-above — sized by the ring-loss gate (§12.3), not by endpoint
-count. The 8192 slot budget is unchanged.
+`kinds.rs:184-191`; length: `kinds.rs:274-308`). The length cost
+is per-call bytes on already-hot endpoints (368→384 on `C_Sign`/
+`C_Encrypt`/`C_Decrypt` et al; 608→624 on Wrap/Unwrap/KEM —
++16 B each: +4.3% / +2.6%, ≈ +160 kB/s ring per hot endpoint at
+10k calls/s) plus the variant-object in-flight rows (§8.2) —
+paid ONLY with `--key-sizes`, and sized by the ring-loss gate
+(§12.3, now the opt-in's acceptance), not by endpoint count. The 8192 slot budget
+is unchanged. Info cost (default-on): 368→496 on the three rare
+info calls plus the cold info-pointer stash — §17.4 sizes it as
+negligible and it never touches a hot program (§8.6).
 
 ### 8.4 Authority: no decoder-read-set change (no condition-(c) edit)
 
@@ -784,18 +869,123 @@ with a named reason at that entry and never refuses the provider
 "per-entry-optional length descriptors" split is deleted: there is
 nothing to gate, because no entry is added. A provider with NULL
 `C_SignRecover` keeps working exactly as today (no evidence at a
-NULL entry — the entry does not exist).
+NULL entry — the entry does not exist). Variant selection (§8.6)
+changes no entry gating either: the same admitted endpoints link
+a different program, under the same admission rules.
 
 ### 8.5 Verifier and size budget
 
 Per changed program: ≥5% verifier headroom on the 6.6 floor (R-52
 precedent), `object_producer_compiled_frames_are_bounded` green,
-`bpf-noninterference` baseline unchanged (no new maps, no new hook
-sites, no new endpoints — all 14 evidence endpoints ride their
-existing probes), `bpf loads` on vng 6.6/6.12 + host 7.x, LP64 +
-ia32 load cells. The 6.1 E2BIG-style refusal precedent applies: if
-a floor kernel refuses, the lane reports the named refusal instead
-of simplifying the program.
+`bpf-noninterference` baseline unchanged (no new map kinds, no new
+hook sites, no new endpoints — all 14 evidence endpoints ride
+their existing probes), `bpf loads` on vng 6.6/6.12 + host 7.x,
+LP64 + ia32 load cells. The 6.1 E2BIG-style refusal precedent
+applies: if a floor kernel refuses, the lane reports the named
+refusal instead of simplifying the program.
+
+Standard programs (flag off): their verifier counts are pinned
+EQUAL to today's cells in `tests/bpf-verifier-budgets.json` — the
+Task 2/7 lanes must not re-pin them. Today's hot pins (processed
+insns, 115%-margined; limit 1,000,000): `detailed/p11_entry` max
+323,799 (32.4%; 6.6 floor 97,593), `detailed/p11_return` max
+175,663 (17.6%; 6.6 floor 77,950). The §12.1 identity contract
+enforces the equality; if the Task 1 const delta or the Task 7
+`CallStart` growth perturbs a standard count, that lane moves its
+retention to a dedicated map/object (§8.6 fallbacks) instead of
+re-pinning.
+
+Variant programs (flag on / info): each linked variant gets its
+own budget cell per measured kernel in
+`tests/bpf-verifier-budgets.json`, recorded via
+`scripts/record-verifier-budgets.py` (same 115% margin rule):
+`detailed/p11_entry_length`, `detailed/p11_return_length`,
+`detailed/p11_entry_info`, `detailed/p11_return_info` (plus gate1
+rows if those flavors link them — every linked variant on every
+measured kernel gets a cell; ia32 entry counterparts follow the
+`p11_entry_ia32` precedent, which carries no cell today but must
+still pass the LP64+ia32 `bpf loads` cells). BUD-1 applies to
+every new cell: any pin past 750,000 (75% of the 1M limit) is
+refused — growth past 75% needs restructuring, never a
+mechanical pin — and the 95% budgets-cap contract still
+enforces the file. The variants share helpers with the standard
+programs plus the §8.2 adapters, so their pins will sit above
+today's hot pins; the acceptance is recorded cells, every cell
+under 750,000, and ≥5% headroom on the 6.6 floor. The variant
+object's own `frames_are_bounded` 512-byte frame check must pass
+with the limit unmodified.
+
+### 8.6 Opt-in variants: separate objects selected at load time
+
+Rule (owner 08:50): no keymeta length instruction executes in a
+standard program, and no runtime branch inside a hot program
+selects length behavior. Length capture lives in SEPARATE
+programs in a SEPARATELY LOADED object; attach-time routing
+decides which program links at each endpoint.
+
+Objects and programs (names are this design's; the lane keeps
+them unless the integrator renames):
+
+- Standard Detailed object (as today, always loaded): the
+  standard `p11_entry` / `p11_entry_ia32` / `p11_return`
+  programs with today's code, plus the Task 7 info variants
+  `p11_entry_info` / `p11_return_info` (default-on, linked ONLY
+  at the 3 cold info endpoints, §17.4). The standard programs'
+  code is untouched: the variants are new entry points sharing
+  helpers (the `p11_entry_ia32` precedent), never edits inside
+  `p11_entry`/`p11_return`.
+- Length-variant object (new build flavor, FULL only): the
+  length entry/return programs `p11_entry_length` /
+  `p11_return_length` (+ ia32 entry counterpart) with their own
+  `START`/`OBJECT_START` map instances and their own ring
+  (§8.2). It is embedded beside the standard object (the
+  diagnostic/small/wide/inventory/counter flavor precedent in
+  `build.rs`) and loaded into the kernel ONLY when
+  `--key-sizes` is on. P0 builds carry no length object and
+  refuse the flag (§10.5).
+
+Attach-time routing (Task 2, `src/attach.rs` group routing +
+planner mode input; `src/attach/journal.rs` and classification
+stay untouched): a multi-attach unit already pairs "one return
+link plus one entry link" per (attach path, entry program)
+(`attach.rs` static-group rule), so routing is per group, in
+both backends (multi and singles):
+
+- Flag on (FULL): the 11 length-endpoint groups link the
+  length-variant entry/return pair (entry and return always as
+  a pair — a mixed pair would split the stash across objects
+  and is a planner bug, pinned by the routing twin); every
+  other non-info group links standard programs as today.
+- Flag off: every group EXCEPT the 3 cold info groups links
+  standard programs — the linked set at every hot endpoint is
+  exactly today's, the length-variant object never loads (no
+  verification, no maps, no ring, no floor-kernel refusal risk
+  from length code), and userspace drains only the standard
+  ring.
+- Both modes: the 3 info-endpoint groups link the info
+  variants (cold, default-on); no hot endpoint ever links a
+  non-standard program (pinned by the routing twin, §12.1).
+
+Userspace drains the variant ring alongside the standard ring
+when the variant object loads; completed-call records are
+self-contained (no entry/return pairing, §9), so the two
+streams need no merge order. The lane sizes the variant
+object's maps/rings and records its on-disk bytes; growth
+there is flag-gated cost, sized by the §12.3 gate.
+
+Off-mode identity (the §12.1 contract proves each, none is
+assumed): per-endpoint record bytes identical to the no-length
+baseline (368/608 forms only, byte-identical `EventRecord`s);
+linked program set at hot endpoints exactly today's; standard
+verifier counts equal today's budget cells (§8.5 — the lanes
+must not re-pin them); journal classification, census,
+sole-complete set and alias agreement byte-identical (the four
+existing pins); ring bytes/s at the gate workload equal to the
+baseline. Fallbacks if a default-on lane cannot hold the
+standard-count pin: Task 7 info retention moves from the shared
+`CallStart` row to a dedicated info map (with a baseline update
++ review), and any Task 1 BPF code delta moves to a cold
+creation variant — the standard counts never move.
 
 ## 9. Userspace join (N5 decided)
 
@@ -803,7 +993,11 @@ No mechanism dimension on `AggKey`: rows stay (instance, object,
 category, role, metadata_at_use). Result-derived evidence gets its
 own row keys (`inferred_family`, `inferred_size`, §10) and never
 rewrites `metadata_at_use` — the frozen-at-Init contract and its
-pins stand. The binding path, end to end:
+pins stand. Length evidence enters the join only when
+`--key-sizes` is on: with the flag off the reducer drops any
+length trailer unclassified (`size_inference_off`, §5.4 — a
+stale or replayed trailer can never classify), while family
+evidence joins in both modes. The binding path, end to end:
 
 1. The completed-call record (base + length trailer, one record —
    no pairing) decodes in `src/events.rs` (`decode_object_record`
@@ -856,6 +1050,9 @@ catalog coverage test).
   row carries a non-blank `inferred_family`/`inferred_size`;
   v1–v6 stay frozen and byte-stable. (Per-field `source` lives in
   v6 — a view carrying a non-`query` source emits v6, never v7.)
+  With `--key-sizes` off, family alone emits v7
+  (`inferred_family` valued, `inferred_size` unknown) — v7 is not
+  gated on the flag, only its size half is.
 - Version allocation is the integrator's: if keyrows claims a section
   version first for gap subjects, keymeta takes the next free number
   and this §10 is re-pointed (numbers only, shapes unchanged). The
@@ -892,6 +1089,9 @@ On every `key_operations[]` row (absent below v7):
 
 `unknown`: no evidence or evidence outside every map (§5.3, with the
 named reason in `-v`/JSONL detail, not in this closed shape).
+With `--key-sizes` off, `inferred_size` is always `unknown` with
+the `-v`/JSONL reason `size_inference_off` ("needs --key-sizes");
+`inferred_family` is unaffected and infers in both modes.
 `conflicting`: two distinct values observed — `detail` holds the
 first, the second rides `conflict_detail` (same shape; omitted when
 absent); for families the second rides `conflict_value` +
@@ -928,14 +1128,20 @@ gains v6+v7 acceptance (extends 2d37b0e28's v6 acceptance).
 
 Concise default keeps existing tallies; inferred facts appear only
 as a parenthetical where they add information (rows whose
-`metadata_at_use` is `unknown`):
+`metadata_at_use` is `unknown`). With `--key-sizes` on:
 
 - `sign: 12 operations (probably RSA 2048: 10; unknown: 2)`
 - `verify: 10 operations (probably EC P-256: 10)`
 - Non-standard RSA tallies as `probably RSA (non-standard length)`;
   `-v`/JSON carry the masked class + byte count.
-- No inferred content anywhere → line renders exactly as today
-  (byte-stable when v7 is absent).
+
+With the flag off, tallies are family-only (sizes need the flag):
+
+- `sign: 12 operations (probably RSA: 10; unknown: 2)`
+- `verify: 10 operations (probably EC: 10)`
+
+In both modes: no inferred content anywhere → the line renders
+exactly as today (byte-stable when v7 is absent).
 
 `-v` per-row detail (exact wording pinned by twins):
 
@@ -959,6 +1165,13 @@ as a parenthetical where they add information (rows whose
   Further distinct values append `, +N more` (`family conflicting
   (RSA: 9, EC: 1, +2 more)`); sizes likewise (`RSA 2048
   (from signature length), +1 more conflicting size`).
+- With the flag off, per-row size detail reads `size unknown (needs
+  --key-sizes)`; family detail is unchanged in both modes.
+
+With the flag off, `-v` prints this one line once per run (in the
+key-operations section, exact wording pinned by a twin):
+
+`sizes from operation lengths need --key-sizes (families, creation and token-reported sizes still shown)`
 
 ### 10.4 CBOM and profile
 
@@ -974,6 +1187,38 @@ as a parenthetical where they add information (rows whose
   `metadata.properties` provenance tallies. If K4 review disagrees,
   the fallback is query-only qualification (one predicate, no
   schema change).
+
+### 10.5 The `--key-sizes` opt-in flag
+
+One flag (owner 08:50, §15 K7), on `p11scope inventory` beside
+`--key-operations`:
+
+- Name: `--key-sizes`. Valid only with `--key-operations`:
+  without it the CLI refuses with `--key-sizes requires
+  --key-operations` (the same refusal shape as `--key-operations
+  requires --capture auto or native`, `cli.rs:2179-2183`).
+  Under P0 builds (no length-variant object, §8.6) it refuses
+  with a named FULL-only reason. Default off.
+- Help/usage text (added beside the `--key-operations` line,
+  `cli.rs:828` style; exact wording pinned by a twin):
+  `--key-sizes also infers key sizes from operation lengths
+  (needs --key-operations; off by default — token-reported and
+  creation-template sizes and inferred families are still shown
+  without it).`
+- What the user sees WITHOUT the flag: token-reported sizes
+  (H7-E4, unchanged), creation-template curves/parameter sets
+  and value lengths (§6), inferred families with the
+  `mechanism` source (§4 — `probably RSA (from mechanism)` in
+  `-v`, family-only concise tallies, §10.3); `inferred_size`
+  from lengths is absent (`unknown` /
+  `size_inference_off`, §10.2); `-v` prints the one-line hint
+  (§10.3). Task 7 provider/token/mechanism info is unaffected
+  by the flag (§17.7).
+- What the flag adds: the length-variant object loads (§8.6),
+  length trailers flow, and `inferred_size` classifies per §5.2
+  (concise `probably RSA 2048` tallies, §10.3). Family,
+  creation and token-reported output are identical in both
+  modes (pinned by the §12.1 mode twins).
 
 ## 11. Allowlist-v3 amendment text (PROPOSED, written by this design)
 
@@ -1000,7 +1245,9 @@ dereference; admitted userspace-side on CKR_OK only; same
 retention/publication); `KEM length lift` (encapsulate arg 6 cell /
 decapsulate arg 6 scalar snapshot; T0 stays for template headers,
 values, ciphertext bytes and bounds — arg 6 as a *bound* stays
-forbidden, as *evidence* it is snapshotted).
+forbidden, as *evidence* it is snapshotted). All three rows are
+gated by `--key-sizes` (off by default, §10.5): without the flag
+no length word is acquired on any path.
 
 R2 block (merged by the same Task 0, reviewed together): the
 `eba746421` allowlist-v3 hunk (finite creation-template read set,
@@ -1060,13 +1307,23 @@ New section body (normative):
 > already-captured mechanism ids and the §4.2 explicit sets;
 > unlisted and vendor ids infer nothing.
 >
+> Length capture is opt-in (owner 08:50, §15 K7): the length words
+> above are acquired only under `--key-sizes` (valid only with
+> `--key-operations`, off by default), in the separately loaded
+> length-variant object (§8.6) — never in the standard hot
+> programs. Without the flag no length word is acquired on any
+> path, and family, creation-template and token-reported facts are
+> still published as above.
+>
 > Required evidence before activation: the §12 twin tables (host
 > RED/GREEN at the journal seam, hostile-width, overlap/alias,
-> 2041-bit and DER/padding negative controls), canary lanes with
-> length-cell sentinel positions on every §5.1 shape (LP64+ia32)
-> proving no payload byte reaches output/maps/logs, verifier
-> headroom + `bpf loads` (§8.5), full `artifact_contracts`, and the
-> Task 5 live matrix (Firefox/Chromium/pkcs11-tool/OpenSSL
+> 2041-bit and DER/padding negative controls), the §12.1 off-mode
+> identity contract (byte-identical records, same linked set,
+> pinned standard counts), canary lanes with length-cell sentinel
+> positions on every §5.1 shape (LP64+ia32) proving no payload byte
+> reaches output/maps/logs, verifier headroom + `bpf loads` for
+> standard AND variant programs (§8.5), full `artifact_contracts`,
+> and the Task 5 live matrix (Firefox/Chromium/pkcs11-tool/OpenSSL
 > provider, ≥5 runs each, 6.6+).
 
 ## 12. Tests and live proof
@@ -1127,6 +1384,26 @@ twin (`C_Verify`/`C_VerifyFinal` still agree), journal-class
 snapshot (info still irrelevant, length still neutral),
 dispatch twins (384/496/624 accept, neighbors malformed, old
 lengths unchanged).
+Off-mode identity contract (§8.6, one `artifact_contracts` case
+plus host twins): with `--key-sizes` off on the scripted gate
+workload — every length-endpoint record is the base form
+(368/608, never 384/624) with byte-identical `EventRecord`s vs
+the no-length baseline; the attach plan links standard programs
+at every group except the 3 cold info groups (pinned name list =
+today's set there; the length-variant object never loads —
+asserted, not assumed); standard verifier counts equal today's
+budget cells (no re-pin); ring bytes/s equal the baseline. Routing twins: flag on → the 11
+length-endpoint groups link the variant pair (entry+return
+always paired — a mixed-pair plan is refused), all other
+non-info groups link standard programs, and no hot endpoint
+ever links a non-standard program in either mode (both
+backends).
+Mode twins (Task 3): flag off → `inferred_size` always
+`unknown`/`size_inference_off`, family/creation/token-reported
+output identical to flag-on output minus sizes, `-v` hint line
+exact (§10.3), `--key-sizes` without `--key-operations`
+refused, P0 refuses the flag; a replayed length trailer with
+the flag off drops unclassified (§9).
 R2 port (§6): RED→GREEN twins + finite-set twins on the new base;
 generic unlisted-type twins (`0x33`/`0x34` promote the
 value-length fact with no label; use-side family still infers).
@@ -1147,32 +1424,41 @@ high-bit, `1<<16`/`1<<32` OR-alias) classify to nothing. The
 AES-GCM canary: a GCM encrypt of sentinel plaintext publishes no
 length anywhere (the captured word is dropped unclassified, §5.3).
 The positive control proves the scanner sees planted length values.
+The lane runs both modes: flag on (positions active, above) and
+flag off (no 384/624 record emitted, no length value published
+anywhere — the off-mode canary is a negative control).
 
 ### 12.3 Gates and live proof (Task 5)
 
 Canonical gates on the candidate (fmt/check/test/clippy, release
 toolchain), full `artifact_contracts` (no blanket excludes, no
 zero-match selectors), privileged lib cells, `bpf-kernels.yml`
-loads, public-CLI cells. Per-call overhead + ring-loss gate
+loads, public-CLI cells. Per-call overhead + ring-loss gate — now the OPT-IN's acceptance
 (Task 2 measures, Task 5 re-runs on the candidate): scripted
-`C_Encrypt` AES-GCM and `C_Sign` at 5k and 10k calls/s each, with
-and without the lane — record per-call ns delta, ring bytes/s
-(384/624-byte forms), and ring-loss counts; the lane passes if
-loss at 5k calls/s stays zero and loss at 10k calls/s does not
-regress vs the no-lane baseline (numbers recorded, not
-threshold-gamed — a regression stops the lane for a design
-revisit). Live matrix on 6.6+ (vng 6.6/6.12 + host
-7.x split): Firefox (Playwright, strict), Chromium (Playwright,
-strict), pkcs11-tool (scripted RSA/ECDSA sign+verify, keygen),
-OpenSSL provider (pkcs11-provider + SoftHSM signs) — ≥5 runs EACH
-(20 runs; per-app proof is required because yields differ by
-mechanism: Chromium RSA signs vs Firefox ECDH/HKDF/AES/KEM).
-Per-run denominator: eligible rows (successful attributed
-completions under listed mechanisms) → inferred fraction, with
-named reasons for every residual unknown. Chromium client-cert
-expectation: RSA rows → RSA 2048; Firefox new-site:
-R2 curves + inferred families on created keys, ECDH/HKDF rows
-family-only where no length map exists.
+`C_Encrypt` AES-GCM and `C_Sign` at 5k and 10k calls/s each, in
+three configurations: no-lane baseline, flag off, flag on.
+Record per-call ns delta, ring bytes/s (base vs 384/624-byte
+forms), and ring-loss counts. Flag off must EQUAL the baseline
+on all three (the identity contract, §12.1 — any delta stops the
+lane). Flag on passes if loss at 5k calls/s stays zero and loss
+at 10k calls/s does not regress vs the baseline (numbers
+recorded, not threshold-gamed — a regression stops the lane for
+a design revisit). This default-vs-opt-in measurement follows
+the R-28/29 extensive-mode precedent (overhead measured default
+vs extensive and disclosed). Live matrix on 6.6+ (vng 6.6/6.12 +
+host 7.x split): Firefox (Playwright, strict), Chromium
+(Playwright, strict), pkcs11-tool (scripted RSA/ECDSA
+sign+verify, keygen), OpenSSL provider (pkcs11-provider + SoftHSM
+signs) — ≥5 runs EACH (20 runs; per-app proof is required because
+yields differ by mechanism: Chromium RSA signs vs Firefox
+ECDH/HKDF/AES/KEM), each app both with the flag on (size yield)
+and off (family-only baseline + hint check). Per-run
+denominator: eligible rows (successful attributed completions
+under listed mechanisms) → inferred fraction, with named reasons
+for every residual unknown. Chromium client-cert expectation
+(flag on): RSA rows → RSA 2048; Firefox new-site: R2 curves +
+inferred families on created keys, ECDH/HKDF rows family-only
+where no length map exists.
 
 ## 13. Composition with keyrows: interface, DAG and file ownership
 
@@ -1190,16 +1476,23 @@ One DAG (keyrows plan `4cca0dd88`; keymeta tasks are this plan):
 keyrows T0 ──► keyrows T1 ──► keymeta T1 ──► keyrows T3 ──► keyrows T4 ──► keymeta T3 ──► keymeta T7 ──► keymeta T6
                   │                │                                                     ▲
                   │                └────► keymeta T2 ────────────────────────────────────┘
-                  │                              (wire base for T3/T7)
+                  │                   (variants + flag + routing; wire base for T3/T7)
                   ▼
              keymeta T0 ──► Task 7 Step 0 (§17.3 allowlist block)
              (docs; independent of code order)
 
 keymeta T4 (canaries) after keymeta T3 + keymeta T7 merges (owns canary files;
-  Task 7 positions arrive as specified input, §17.6) — parallel-safe with keyrows.
+  Task 7 positions arrive as specified input, §17.6; runs both flag modes,
+  §12.2) — parallel-safe with keyrows.
 keymeta T5 (live proof) after keymeta T4 + keymeta T7 + keyrows T4 (yield needs
-  rows AND facts; carries the Task 7 info positives, §17.6).
+  rows AND facts; on+off matrix per app + Task 7 info positives, §17.6).
 ```
+
+The order is unchanged by the 08:50 opt-in (round 7): Task 2
+produces the variants, the flag and the attach-time routing
+before Task 3 consumes the flag for join gating and rendering,
+which is already the T2→T3 direction above. No new edge, no new
+task — only wider node contents (plan Tasks 2/3/4/5/7).
 
 Why this order: keymeta Task 1 edits `state.rs`,
 `semantics_key_use.rs` and `semantics_objects/journal.rs` — the
@@ -1209,11 +1502,15 @@ so the old "disjoint files" claim is dropped and the merge
 serializes. Keymeta T1 lands between keyrows T1 and T3 (its R2
 hunks are small and region-disjoint; keyrows T3 rebases over them
 and re-runs). Keymeta T2 (ebpf-common evidence table/trailers,
-`main.rs`, `CallStart`, `src/events.rs` dispatch) is file-disjoint
-from keyrows but consumes the T1 base (shared
+variant object flavor, `CallStart`, `src/events.rs` dispatch,
+`--key-sizes` flag parse/refusal/help in `src/cli.rs`, attach-time
+routing in `src/attach.rs` + planner mode input) is file-disjoint
+from keyrows except the CLI/planner inputs (integrator checks
+keyrows writers there at merge) but consumes the T1 base (shared
 `object_policy.rs`/`object_flow.rs`/`object_wire.rs` — one writer
 at a time, never parallel with T1). Keymeta T3 (join + v7 +
-projection) consumes sealed rows, so it merges after keyrows T4,
+projection + flag consumption: join gating, family-only default,
+`-v` hint) consumes sealed rows, so it merges after keyrows T4,
 developing against recorded fixtures until then. Keymeta T7
 consumes the T2 wire base through the T3 chain and shares
 projection/schema/test files with T3 — merges after T3. Task 4
@@ -1234,7 +1531,10 @@ twins on the merged SHA):
 | `src/semantics_edge.rs`, `src/events.rs` | keymeta T2 (dispatch) → keymeta T3 (effects/compat) → keymeta T7 (info decode) |
 | `crates/ebpf-common/src/object_{policy,flow,wire}.rs` | keymeta T1 (R2 finite sets) → T2 (length) → T7 (info) |
 | `crates/ebpf-common/src/evidence_table.rs` (new) | keymeta T2 → keymeta T7 |
-| `crates/ebpf/src/main.rs`, `ebpf-common/src/lib.rs` (`CallStart`) | keymeta T2 → keymeta T7 |
+| `crates/ebpf/src/main.rs`, `ebpf-common/src/lib.rs` (`CallStart`) | keymeta T2 (length variants) → keymeta T7 (info variants) |
+| `build.rs` (length flavor), length-variant object (new) | keymeta T2 alone |
+| `src/cli.rs` (`--key-sizes`) | keymeta T2 (flag) — integrator checks keyrows writers at merge |
+| `src/attach.rs` (group routing), planner mode input | keymeta T2 (routing) — integrator checks keyrows writers at merge |
 | `docs/privacy/allowlist-v3.md` | keymeta T0 (§11 + R2 block) → Task 7 Step 0 (§17.3) |
 | `docs/schema/inventory-v1.md`, `scripts/qualify-key-operations.py` | keymeta T1 (v6) → T3 (v7) → T7 (v8) → T6 |
 | `src/inventory/cbom/render.rs`, `docs/cbom-export.md` | keymeta T3 → keymeta T7 |
@@ -1263,9 +1563,16 @@ task depends on the postponed Task 8 (§18).
   integrator allocation (§10.1).
 - Ring pressure from longer records (368→384, 608→624 on hot
   endpoints): +0 endpoints, so slot budgets are untouched — the
-  cost is bytes/s. Sized by the §12.3 ring-loss gate; a regression
-  stops the lane for a design revisit, never a silent budget or
-  threshold change.
+  cost is bytes/s, and only with `--key-sizes` (default runs are
+  unaffected by construction, §8.6). Sized by the §12.3 ring-loss
+  gate as the opt-in's acceptance; a regression stops the lane
+  for a design revisit, never a silent budget or threshold change.
+- Length-variant/standard skew: shared helpers evolve and the two
+  objects drift (a helper change alters variant behavior but not
+  standard, or vice versa). Mitigation: one shared source for
+  adapters/helpers (no forks, §8.2), the off-mode identity
+  contract re-run on every candidate (§12.1), and the routing
+  twin proving which object serves each group.
 
 ## 15. Open decisions (DECIDED by controller rulings)
 
@@ -1300,6 +1607,15 @@ task depends on the postponed Task 8 (§18).
 - K6: Live matrix 5 runs/app (20) vs 5 total. DECIDED 5/APP
   (per-app mechanism yields differ; a 5-total matrix cannot prove
   both Chromium-RSA and Firefox-new-site).
+- K7: Length capture on hot paths opt-in vs default-on. DECIDED
+  OPT-IN by owner 2026-11-14 08:50 (after Opus B7): one flag,
+  `--key-sizes`, valid only with `--key-operations`, off by
+  default (§10.5); separate length-variant object selected at
+  load time, never a runtime branch in the hot programs (§8.6).
+  Family-from-mechanism, creation-template facts and
+  token-reported sizes stay on by default; Task 7 stays on by
+  default (cold calls, §17.4/§17.7). The §12.3 gate is the
+  opt-in's acceptance.
 
 ## 16. Review provenance
 
@@ -1354,6 +1670,16 @@ rules repeats, lands in default inventory/CBOM (§17.7), takes
 the third 496-byte form (§17.4), and pins supplier/slot-mapping
 rules; ChaCha20/Poly1305 corrected to `0x33`/`0x34` (generic
 unlisted-type row).
+Round 7 (owner ruling 2026-11-14 08:50 after Opus B7, §15 K7):
+length capture on hot paths is opt-in behind `--key-sizes` (off
+by default, §10.5: help text, refusal, per-mode output, `-v`
+hint); separate length-variant object + attach-time routing with
+an off-mode identity contract (§8.6, §12.1); variant budget
+cells under BUD-1 750,000 with standard pins frozen (§8.5);
+§12.3 gate becomes the opt-in's acceptance (baseline/flag-off/
+flag-on); Task 7 stays default-on via cold-only info variants
+(§17.4, §17.7); family (§4.1) and creation (§6) stay default-on;
+DAG order unchanged, node contents widened (§13).
 
 ## 17. Required: provider, token and mechanism info (Task 7)
 
@@ -1480,8 +1806,10 @@ scalars; return reads the fixed bytes on `CKR_OK` only. NULL
 pointer → unavailable; any other return → never (no
 BUFFER_TOO_SMALL/query-shape rule: these are not length cells).
 Every terminal/loss path clears the retained pointer, exactly like
-the S-protocol cell. FULL builds only; P0 reports explicit
-unavailability.
+the S-protocol cell. FULL builds only: in P0 builds the info
+variants compile stubbed (base form, explicit unavailability —
+the `stub-object-attributes` precedent), so P0 acquires no info
+bytes.
 
 Padded fixed-width strings (`CK_INFO.manufacturerID`,
 `CK_INFO.libraryDescription`, `CK_TOKEN_INFO.manufacturerID`,
@@ -1566,7 +1894,7 @@ New section body (normative):
 > states, `CKA_ID`/payload/PIN prohibitions and every other
 > exclusion stay in force. Allowlist-v1 bytes are unchanged.
 > Task 7 ships in default inventory and CBOM, not only under
-> `--key-operations` (§17.7).
+> `--key-operations`, and independent of `--key-sizes` (§17.7).
 >
 > Required evidence before activation: the §17.6 host twins
 > (LP64+ia32 layouts, sentinel non-publication, 129th-mechanism
@@ -1582,15 +1910,33 @@ New section body (normative):
 No new `ObjectAction` (`OBJECT_ACTION_MAX` stays 14): the 3 info
 functions are rows 12–14 of `EVIDENCE_POSITIONS` (§8.1) with the
 §17.1 info kind + read ranges; no inputs, no templates (never
-authorized). Retention is the info pointer only
-(`CallStart.ev_cell`, §8.2) — slot and mechanism scalars ride the
-base S1 record, never the stash. +0 endpoints (all three already
-carry S1 probes, `kinds.rs:184-191`); no new maps. Entry-guard
-spans are the full struct sizes (88/76, 208/160, 24/12 LP64/ia32);
-bytes read are the field ranges only (76/72, 76/64, 24/12 —
-§17.1). The 512-byte frame test must pass unmodified in limit.
-Verifier: same §8.5 gates (≥5% headroom on the 6.6 floor, `bpf
-loads` on vng 6.6/6.12 + host 7.x, LP64 + ia32).
+authorized). The info adapters live ONLY in the info variants
+`p11_entry_info` / `p11_return_info` (new entry points in the
+standard object sharing helpers, §8.6 rule) — the standard
+`p11_entry`/`p11_return` code is untouched, so Task 7 never
+touches a hot program: the variants link only at the 3 cold info
+endpoints (pinned by the §17.6 selection twin). Retention is the
+info pointer only (`CallStart.ev_cell`, §8.2) — slot and
+mechanism scalars ride the base S1 record, never the stash. +0
+endpoints (all three already carry S1 probes,
+`kinds.rs:184-191`); no new map kinds. Entry-guard spans are the
+full struct sizes (88/76, 208/160, 24/12 LP64/ia32); bytes read
+are the field ranges only (76/72, 76/64, 24/12 — §17.1). The
+512-byte frame test must pass unmodified in limit. Verifier: the
+info variants get their own budget cells (§8.5: recorded,
+<750,000, ≥5% headroom on the 6.6 floor), `bpf loads` on vng
+6.6/6.12 + host 7.x, LP64 + ia32.
+
+Cold cost (default-on, negligible by construction): +128 record
+bytes per info call (368→496, §8.3) at application poll rates
+(Hz, not the kHz of hot paths — the Task 7 lane records the
+observed info-call rates on the Task 5 matrix apps as coldness
+evidence); one pointer stash per in-flight info call in the
+shared `CallStart` row (§8.2 reservation cost); zero per-call
+record, ring or count delta at any non-info endpoint (covered
+by the §12.1 identity contract). If the shared-row growth
+perturbs a standard verifier count, the fallback in §8.6
+applies (dedicated info map) — the standard pins never move.
 
 Wire: the third 496-byte form (368-byte base + fixed 128-byte info
 trailer: `version: u16`, `kind: u8`, `status: u8`, `layout: u8`,
@@ -1687,7 +2033,10 @@ Serials never appear (no such key exists anywhere).
 
 Host twins per call (LP64 + ia32 layouts): CKR_OK positive
 (exact parsed fields), NULL-pointer negative, failure-RV
-negative, owner-mismatch negative; sentinel twin: a provider
+negative, owner-mismatch negative; selection twin: the 3 info
+groups link the info variants in both flag modes while every hot
+endpoint links standard programs (cold-only proof); sentinel
+twin: a provider
 returning sentinel serial/label/session/memory/utcTime bytes and
 sentinel `CK_INFO` pad bytes publishes none of those bytes
 anywhere (JSON/logs/maps scanned — the B6 padding-sentinel twin);
@@ -1722,9 +2071,12 @@ amendment rows (§17.3) are approved and the calls are observed.
 Cost in default runs: +0 endpoints (all three already probed),
 +128 bytes per info call (rare — apps poll tokens, not hot paths),
 +16 bytes per in-flight S1 row (§8.2). No `--key-operations`
-+requirement, no object-lane dependency. (Keymeta Tasks 1–3 DO
-need `--key-operations`: inferred facts ride per-key rows, which
-exist only there.)
+requirement, no object-lane dependency, no `--key-sizes`
+interaction: Task 7 output is identical with the flag on or off
+(§10.5; pinned by a both-modes twin in Task 7). (Keymeta Tasks
+1–3 DO need `--key-operations`: inferred facts ride per-key rows,
+which exist only there; §5 sizes additionally need
+`--key-sizes`.)
 
 ## 18. Later (not v0.8.0): small fixed-size mechanism parameters
 

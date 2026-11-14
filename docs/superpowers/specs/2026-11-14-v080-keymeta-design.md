@@ -2,7 +2,7 @@
 <!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # v0.8.0 Key Metadata: Inferred Family, Size Class, Creation Sources
 
-Status: design (spark lane, round 1). Base: task/v080-design-keymeta 763b29998.
+Status: design (spark lane, round 3). Base: task/v080-design-keymeta 763b29998.
 Branch: task/v080-design-keymeta. Plan: `docs/superpowers/plans/2026-11-14-v080-keymeta.md`.
 
 Owner direction (2026-11-14 07:05): v0.8.0 carries much more key
@@ -12,8 +12,15 @@ curves and parameter sets. Owner privacy stance (binding): the host
 owner runs p11scope, so more observability is fine; the hard line is
 PINs, key material, payloads and environment. Lengths, mechanism ids,
 curve OIDs and parameter-set ids are NOT secrets. The allowlist-v3
-amendment text below is written by this design (no owner wording
-round-trip); `docs/privacy/allowlist-v1.md` stays byte-identical.
+amendment texts below (§11, §17.3, §18.5) are written by this design
+(no owner wording round-trip); `docs/privacy/allowlist-v1.md` stays
+byte-identical.
+
+Owner decisions (2026-11-14 07:35, binding): Task 7 (provider,
+token and mechanism info, §17) is REQUIRED for v0.8.0, no longer
+optional; Task 8 (small fixed-size mechanism parameters, §18) is a
+new required design in this document; findings/enforcement (8.05)
+and correlation (8.06) are out of scope for v0.8.0 (later).
 
 ## 1. Goal, non-goals, constraints
 
@@ -32,7 +39,8 @@ attribution (O3, deferred); cross-session key joining (D5, separate
 task, opt-in with per-provider proof); `C_GetObjectSize` result reads;
 `C_FindObjectsInit` template reads; new attribute selectors; Message*
 (v3.0 Begin/Next/Final) param-block lengths; any payload, key-material,
-PIN or environment read.
+PIN or environment read; findings/enforcement (8.05) and correlation
+(8.06) — owner 07:35: later, not v0.8.0.
 
 Constraints: never capture PINs/keys/payloads/env;
 `docs/privacy/allowlist-v1.md` byte-identical; missing observations
@@ -601,6 +609,9 @@ section; exhaustive const tables + coverage test).
   version first for gap subjects, keymeta takes the next free number
   and this §10 is re-pointed (numbers only, shapes unchanged). The
   plan's Task 3 checks the allocation before writing schemas.
+- Task 7 takes the next free number after v7 (suggest v8, §17.5).
+  Task 8 needs no object-observations section: its combos are
+  operation-level `mechanisms[].params[]` keys (§18.6).
 
 ### 10.2 v7 row keys (exact, closed)
 
@@ -858,7 +869,13 @@ integration: keyrows first, keymeta rebases). Keymeta Task 3
 develops against recorded row fixtures until the keyrows base
 merges, then re-runs the join twins on the merged SHA. Keymeta
 Task 5 (live proof) runs after BOTH lanes merge (yield needs rows
-AND facts). Schema version allocation is the integrator's (§10.1).
+AND facts). Task 7 runs after Task 2 (shared object_policy/flow/
+wire files, one writer at a time — the same rule). Task 8 runs
+after Task 7 (both touch `crates/ebpf/src/main.rs`: Task 7 for
+ProviderInfo bindings, Task 8 for the decode arms). Task 5 also
+carries the required Task 7 info positives and Task 8 param
+positives (§17.6, §18.7). Schema version allocation is the
+integrator's (§10.1).
 
 ## 14. Risks
 
@@ -877,6 +894,18 @@ AND facts). Schema version allocation is the integrator's (§10.1).
   integrator allocation (§10.1).
 - Slot growth (~+7 endpoints/provider) pressures the 8192 budget on
   dense hosts: measured in Task 2, reported, no silent budget change.
+- Task 8 registry coordination: `code_for` needs one exact shape
+  string per §18.2 family from the pkcs11-types registry; a missing
+  or renamed string degrades that family to `NONE` (safe, but
+  silent yield loss) — the lane pins the strings with a registry
+  test, and Task 5 checks per-family yield.
+- Task 8 honored-only seam: if the `param_combos` aggregation point
+  cannot see the completion RV, the lane reports back instead of
+  publishing un-gated combos (admitting requested params as honored
+  would break the §18.1 contract).
+- Task 8 DH-PKCS/X9.42 pin: if the lane cannot pin an exact layout,
+  those mechanisms refuse with `param_layout_unpinned` (§18.2) —
+  a named partial, never a guessed offset.
 
 ## 15. Open decisions (DECIDED by controller rulings)
 
@@ -911,14 +940,25 @@ retention wording, keep-first-two-count-extras conflicts, Task 5
 executable PQC pointer); K1–K6 recorded as decided (§15); §17
 added (optional provider/token/mechanism info, owner question
 pending, droppable).
+Round 3 (owner decisions 2026-11-14 07:35): §17 Task 7 REQUIRED
+(exact §17.3 amendment block written, string-trimming rule,
+library/token/device CBOM components + algorithm limits, pinned
+concise wording, unconditional canary/live); new §18 Task 8
+mechanism parameters (exact per-mechanism field lists against
+cryptoki-sys 0.5 bindings, exact-length pointer-safety rule, new
+shape codes, honored-only publication, §18.5 amendment block,
+§18.8 exclusions); 8.05/8.06 noted out of scope (§1); order and
+risks extended (§13, §14).
 
-## 17. Optional: provider, token and mechanism info (Task 7, droppable)
+## 17. Required: provider, token and mechanism info (Task 7)
 
-Owner question pending: whether v0.8.0 also captures `C_GetInfo`,
+Owner decision 2026-11-14 07:35: v0.8.0 captures `C_GetInfo`,
 `C_GetTokenInfo` and `C_GetMechanismInfo` results for the inventory
-and CBOM. This section designs that capture as optional plan Task 7;
-dropping Task 7 changes nothing in Tasks 0–6 (no shared wire
-version, no shared schema section, separate amendment rows).
+(JSON + concise/`-v` text) and CBOM. This section designs that
+capture as required plan Task 7; it shares no wire version and no
+schema section with Tasks 0–6 (separate amendment rows, §17.3), so
+its review lane stays independent even though it now ships with
+them.
 
 ### 17.1 Read set (fixed-size struct reads at return)
 
@@ -943,6 +983,15 @@ Every terminal/loss path clears the retained pointer, exactly like
 the S-protocol cell. FULL builds only; P0 reports explicit
 unavailability.
 
+Padded fixed-width strings (`CK_INFO.manufacturerID`,
+`CK_INFO.libraryDescription`, `CK_TOKEN_INFO.manufacturerID`,
+`CK_TOKEN_INFO.model`) are space-padded per the PKCS#11 spec:
+userspace trims trailing spaces and NULs, truncates at the first
+embedded NUL, and publishes the trimmed text; an all-spaces field
+publishes as the empty string, never as spaces. Non-UTF8 bytes
+refuse the field with a named reason (the row still publishes its
+numeric fields).
+
 ### 17.2 Excluded fields (never read, not read-and-scrubbed)
 
 `CK_TOKEN_INFO` excluded ranges are never fetched from the target
@@ -961,19 +1010,63 @@ The schema (§17.5) has no serial/label/PIN/count/clock keys, so the
 exclusion is structural: there is nowhere to publish them even by
 accident.
 
-### 17.3 Privacy rows (PROPOSED, separate block)
+### 17.3 Allowlist-v3 amendment block (PROPOSED, written by this design)
 
-Task 7 ships its own allowlist-v3 amendment block (same Task 0
-review gate: no BPF change before owner/Opus + Codex approval;
-PROPOSED until then). Rows: `Provider info struct (C_GetInfo)`
-(whole `CK_INFO`, entry retention, full-span guard, CKR_OK return
-read, private in-flight + completed-call transport; public parsed
-fields only); `Token info ranges (C_GetTokenInfo)` (the three
-§17.1 ranges + slot scalar; §17.2 bytes never read); `Mechanism
-info struct (C_GetMechanismInfo)` (whole `CK_MECHANISM_INFO` +
-slot/mechanism scalars). Authority: per-entry optional (NULL/
+Status when merged: PROPOSED for owner/Opus privacy review + Codex
+re-review (the Task 0 gate applies to this block too); not active
+until reviewed. Placement: a new `## Provider, token and mechanism
+info (v0.8.0 keymeta Task 7)` section appended after the §11 keymeta
+section, plus the two row edits below. Header status line gains the
+section (PROPOSED). v1/v2 bytes unchanged.
+
+Edit 1 — descriptor table (§Exact object descriptor combinations):
+append rows for the three §17.1 functions (`C_GetInfo`: no inputs,
+info pointer arg 0; `C_GetTokenInfo`: slot scalar arg 0, info
+pointer arg 1; `C_GetMechanismInfo`: slot scalar arg 0, mechanism
+scalar arg 1, info pointer arg 2). No template column entry for any
+of them (never authorized).
+
+Edit 2 — field inventory (§Field inventory and retention): append
+rows: `Provider info struct (C_GetInfo)` (whole `CK_INFO`, entry
+retention, full-span guard, CKR_OK return read only, clear on every
+terminal path; private in-flight + completed-call transport; public
+parsed fields only: cryptoki/library versions, manufacturer,
+description, flags); `Token info ranges (C_GetTokenInfo)` (the
+three §17.1 ranges + slot scalar; §17.2 bytes never fetched, not
+read-and-scrubbed); `Mechanism info struct (C_GetMechanismInfo)`
+(whole `CK_MECHANISM_INFO` + slot/mechanism scalars; min/max key
+size, flags incl. `CKF_HW`). Authority: per-entry optional (NULL/
 foreign/degraded entry → that entry count-only, provider still
 admitted — the §8.4 rule, never provider-gating).
+
+New section body (normative):
+
+> **Status: PROPOSED (v0.8.0 keymeta Task 7 2026-11-14);
+> owner/Opus privacy review and Codex re-review required before
+> activation.** This section scopes the Task 7 schema section
+> (§17.5): the per-instance `provider_info`, per-slot `tokens[]`
+> and per-mechanism `mechanisms[]` keys. Reads are fixed-size
+> struct/range reads at return on `CKR_OK` only (§17.1); entry
+> retains the info pointer with a full-span guard and snapshots
+> the slot/mechanism scalars. `CK_TOKEN_INFO.serialNumber`,
+> `label`, PIN lengths, session counts, memory sizes and `utcTime`
+> are never fetched (§17.2); there is no opt-in flag for the
+> serial in v0.8.0, and the schema has no keys for any excluded
+> byte. Padded fixed-width strings publish trimmed (§17.1).
+> Provider build metadata, token manufacturer/model/versions/
+> flags and mechanism limits/flags are not secrets (owner stance
+> 2026-11-14). Terminal states, `CKA_ID`/payload/PIN
+> prohibitions and every other exclusion stay in force.
+> Allowlist-v1 bytes are unchanged.
+>
+> Required evidence before activation: the §17.6 host twins
+> (LP64+ia32 layouts, sentinel non-publication, 129th-mechanism
+> cap, CBOM serial-absence), canary lanes with Task 7 sentinel
+> positions proving no excluded byte reaches output/maps/logs,
+> verifier headroom + `bpf loads` (§17.4), full
+> `artifact_contracts`, and the Task 5 live positives (SoftHSM
+> info calls with parsed fields matching the provider's own
+> reports).
 
 ### 17.4 BPF design and budget
 
@@ -1008,11 +1101,32 @@ content is present; v1–v7 stay frozen and byte-stable:
 
 Join: completed-call record → owning instance; no `AggKey`
 contact (these are not key rows) and no `metadata_at_use` contact.
+A provider with no completed Task 7 calls has no `provider_info`
+block: "provider never watched" is derivable from the JSON
+already (no rows for its instance beside coverage notes), so no
+new field marks it.
+
 Text: concise gains one provider line only where Task 7 content
-exists (byte-stable otherwise); `-v`/JSON carry tokens and
-mechanisms. CBOM (re-projection only): provider component
-supplier/name/version from `provider_info`, token facts as
-component properties; serials never appear (no such key exists).
+exists (byte-stable otherwise), pinned wording:
+`provider: <libraryDescription> <libraryVersion> (cryptoki
+<cryptokiVersion>, <manufacturerID>)`. `-v` adds per-slot token
+lines (`token slot <N>: <manufacturerID> <model> fw
+<firmwareVersion> hw <hardwareVersion>`) and per-mechanism limit
+lines; JSON carries the full keys.
+
+CBOM (re-projection only, `docs/cbom-export.md` gains a provider
+section): the existing `type: library` provider component gains
+`supplier`/`name`/`version` from `provider_info`; each token
+projects to a `type: device` component named `<manufacturerID>
+<model>` with hardware/firmware versions and flags in
+`properties[]`, linked to its library via `dependencies[]`;
+mechanism min/max key sizes and flags (incl. `CKF_HW`) ride the
+matching `type: cryptographic-asset` algorithm components as
+`properties[]` entries (`p11scope:min-key-size`,
+`p11scope:max-key-size`, `p11scope:mechanism-hw`) — the lane
+pins the exact property names against the CycloneDX spec version
+in use and never invents enum spellings. Serials never appear
+(no such key exists anywhere).
 
 ### 17.6 Tests
 
@@ -1024,7 +1138,293 @@ of those bytes anywhere (JSON/logs/maps scanned); cap twin: the
 129th mechanism on a slot refuses with the named reason while
 the first 128 stand; CBOM twin: no serial key in any CBOM
 output. Canary lane: Task 7 positions join the Task 4 workload
-only if Task 7 ships. Live (conditional, inside the Task 5
-matrix): SoftHSM `C_GetInfo`/`C_GetTokenInfo`/
+(Task 7 ships, so this is unconditional). Live (inside the Task 5
+matrix, required): SoftHSM `C_GetInfo`/`C_GetTokenInfo`/
 `C_GetMechanismInfo` positives with parsed fields matching the
 provider's own reports.
+
+## 18. Required: small fixed-size mechanism parameters (Task 8)
+
+Owner decision 2026-11-14 07:35: v0.8.0 also captures the
+non-secret scalar fields of small fixed-size mechanism parameter
+structs where they classify the operation. This section designs
+that capture as required plan Task 8. It builds on the existing
+entry-time `p11_decode_params` seam (`crates/ebpf/src/main.rs`,
+`MECH_SHAPE` map, `src/shapes.rs` registry codes, `param_combos`
+aggregation, `mechanisms[].params` rendering) — today gated to
+the `unsafe-unvalidated-metadata` preview with PSS+GCM shapes —
+and allowlists a widened shape set for safe builds with honored-
+only (CKR_OK) publication.
+
+### 18.1 Where and when: entry decode, honored-only publication
+
+Call set (11): `C_SignInit`, `C_VerifyInit`, `C_EncryptInit`,
+`C_DecryptInit`, `C_WrapKey`, `C_UnwrapKey`, `C_DeriveKey`,
+`C_EncapsulateKey`, `C_DecapsulateKey`, `C_GenerateKey`,
+`C_GenerateKeyPair`. `pMechanism` is uniformly arg 1 on all of
+them. Excluded: `C_DigestInit` (no params of interest),
+`C_Message*` (§1 non-goal), calls without a mechanism arg.
+
+Decode runs at entry (the existing hook position): parameters
+are caller inputs the provider never writes, and the pointer may
+be gone at return. Userspace admits a decoded combo into
+`mechanisms[].params` only when the call completes with `CKR_OK`
+("honored params"): failed calls keep their existing error
+counts and the combo is dropped — no new counter, the outcome is
+already recorded. `classify_derive_mechanism` is untouched
+(still reads only the type word at entry; the param decode is a
+separate step after it). NULL `pMechanism` keeps the existing
+cancel semantics (no decode, no new reason).
+
+Params classify the operation at the `mechanisms[]` level, never
+on key rows: no `AggKey` contact, no `metadata_at_use` contact
+(the §9/N5 decision again — result-derived operation evidence
+rides its own keys).
+
+The allowlisted decodes use NEW `shape::` codes (lane assigns
+values ≥ 5: `RSA_PSS_OK`, `OAEP`, `GCM_V220_OK`, `GCM_V240_OK`,
+`AES_CTR`, `ECDH1`, `HKDF`, `SP800_108`, `DH_PARAMGEN`,
+`DSA_PARAMGEN`; names are code, values are wire). They never
+reuse the unsafe-preview codes: the allowlisted GCM decode reads
+`ulIvBits` where the preview reads `ulAADLen` (§18.2), so one
+code with two offset sets would misparse across policies.
+
+### 18.2 Per-mechanism field table (exact)
+
+W = target word bytes (8 LP64, 4 ia32). Every size below is an
+exact byte match on `ulParameterLen` (§18.3), pinned against
+cryptoki-sys 0.5 LP64 bindings (verified while writing: PSS,
+OAEP, ECDH1, CTR, HKDF field order, SP800-108 pair, DSA param)
+with ia32 by the same header; the lane adds static offset/size
+asserts per ABI and any mismatch refuses with
+`param_layout_unpinned`, never a guessed offset.
+
+- PSS: the 10 PSS ids (`CKM_RSA_PKCS_PSS` + the 9
+  `SHA*_RSA_PKCS_PSS` from §4.2). `CK_RSA_PKCS_PSS_PARAMS`
+  `{hashAlg, mgf, sLen}`, len 24/12. Read: words 0,1,2 → p0/p1/
+  p2. Never: nothing (no pointers).
+- OAEP: `CKM_RSA_PKCS_OAEP` + `CKM_RSA_PKCS_OAEP_TPM_1_1`.
+  `CK_RSA_PKCS_OAEP_PARAMS` `{hashAlg, mgf, source, pSourceData,
+  ulSourceDataLen}`, len 40/20. Read: words 0,1,2 (hashAlg, mgf,
+  source) → p0/p1/p2. Never fetched: words 3,4. Never
+  dereferenced: `pSourceData` (label bytes).
+- GCM: `CKM_AES_GCM`, two layouts (the existing v220/v240
+  precedent). v220 `{pIv, ulIvLen, pAAD, ulAADLen, ulTagBits}`,
+  len 40/20: read words 1,4 → p0/p2 (p1 empty). v240 (inserts
+  `ulIvBits`), len 48/24: read words 1,2,5 → p0/p1/p2. Never
+  fetched: both pointer words + the `ulAADLen` word. Never
+  dereferenced: `pIv`, `pAAD`. Deliberate divergence from the
+  unsafe preview (which reads `ulAADLen`): `ulIvBits` classifies
+  the IV size while `ulAADLen` classifies nothing, so Task 8
+  keeps every AAD word untouched.
+- CTR: `CKM_AES_CTR`. `CK_AES_CTR_PARAMS` `{ulCounterBits,
+  cb[16]}`, len 24/20 (byte-exact — NOT a word multiple on
+  ia32). Read: word 0 → p0. Never fetched: `cb[0..16]` (counter
+  block).
+- ECDH1: `CKM_ECDH1_DERIVE` + `CKM_ECDH1_COFACTOR_DERIVE`.
+  `CK_ECDH1_DERIVE_PARAMS` `{kdf, ulSharedDataLen, pSharedData,
+  ulPublicDataLen, pPublicData}`, len 40/20. Read: word 0 (kdf)
+  → p0. Never fetched: words 1–4. Never dereferenced:
+  `pSharedData`, `pPublicData`.
+- HKDF: `CKM_HKDF_DERIVE`. `CK_HKDF_PARAMS` `{bExtract@0,
+  bExpand@1, prfHashMechanism@W, ulSaltType@2W, pSalt, ulSaltLen,
+  hSaltKey, pInfo, ulInfoLen}`, len 64/32. Read: words 1,2 (PRF
+  id, salt-type id) → p0/p1. Never fetched: word 0 (extract/
+  expand flags + pad) and words 3–7. Never dereferenced: `pSalt`,
+  `pInfo`; the `hSaltKey` value is never read (no key join).
+- SP800-108: `CKM_SP800_108_COUNTER_KDF` and
+  `CKM_SP800_108_DOUBLE_PIPELINE_KDF` → `CK_SP800_108_KDF_PARAMS`
+  (5 words), len 40/20; `CKM_SP800_108_FEEDBACK_KDF` →
+  `CK_SP800_108_FEEDBACK_KDF_PARAMS` (adds `ulIVLen`, `pIV`),
+  len 56/28. Read: word 0 (prfType) → p0. Never fetched: all
+  other words. Never dereferenced: `pDataParams`, `pIV`,
+  `pAdditionalDerivedKeys`.
+- DH-PKCS param-gen: `CKM_DH_PKCS_PARAMETER_GEN` via
+  `C_GenerateKeyPair`. `{ulPrimeBits, ulBaseBits}`, len 16/8 —
+  CONDITIONAL: cryptoki-sys 0.5 carries no binding for this
+  struct, so the lane pins the 2-word layout against the system
+  header with static asserts or the mechanism refuses with
+  `param_layout_unpinned`. Read: words 0,1 → p0/p1. Never:
+  nothing.
+- DSA param-gen: `CKM_DSA_PARAMETER_GEN` via `C_GenerateKeyPair`.
+  `CK_DSA_PARAMETER_GEN_PARAM` `{hash, pSeed, ulSeedLen,
+  ulIndex}`, len 32/16. Read: words 0,3 (hash id, index) →
+  p0/p1. Never fetched: words 1,2. Never dereferenced: `pSeed`.
+- X9.42 DH param-gen: same pin-or-refuse rule as DH-PKCS (lane
+  pins the exact layout or `param_layout_unpinned`).
+
+RSA/EC keygen sizes live in creation templates (R2 §6), not in
+params — no param row covers them. 22 mechanism ids in 9 shape
+families (10 codes: GCM takes one per layout), plus X9.42 DH
+param-gen conditional on the pin rule.
+
+### 18.3 Pointer-safety rule (exact)
+
+The `CK_MECHANISM` header itself needs a full-span validation of
+3W at `pMechanism` first. Then, per call: `ulParameterLen` must
+EQUAL the §18.2 size for (mechanism, ABI) in bytes — never `>=`
+(the GCM pointer-disclosure lesson documented at
+`decode_params_impl`: `>=` reuses legacy offsets against a
+modern struct and reads a pointer as a scalar). Violations
+refuse with named reasons, and partial decodes are never
+emitted (the existing rule stays):
+
+- `param_length_mismatch`: length equals no §18.2 size for this
+  mechanism (incl. GCM lengths other than 40/48, CTR lengths
+  other than 24/20).
+- `param_null_pointer`: NULL `pParameter` with a nonzero
+  expected size. (Length 0 + NULL keeps the existing "null
+  params" counting, unchanged.)
+- `param_span_invalid`: `[pParameter, pParameter+len)` fails
+  full-span validation.
+- `param_read_failure`: a listed word read fails (the existing
+  `PARAMS_DECODE_FAILURE` maps here).
+- `param_shape_unlisted`: mechanism outside the §18.2 set —
+  counted with the existing `init_no_shape`, no new counter.
+- `param_layout_unpinned`: the lane could not pin the layout
+  (DH-PKCS/X9.42 rule, §18.2).
+
+### 18.4 BPF design and budget
+
+`decode_params_impl` gains one exact-match arm per §18.2
+(struct, ABI) pair — match arms only, no loops, no new maps
+(`MECH_SHAPE` reused; `ParamsOutput` stays 3 words: PSS/OAEP/
+GCM-v240 use 3 scalars, GCM-v220/HKDF/DH/DSA use 2,
+CTR/ECDH1/SP800-108 use 1, unused slots zero with arity known
+from the shape tag).
+`src/shapes.rs::code_for` gains the new registry strings; the
+lane coordinates the exact strings with the pkcs11-types
+registry, and an unknown string degrades to `NONE` as today.
+The entry hook's per-call coverage over the §18.1 set is a
+pinned table with twins (§18.7), not an accident of shared
+code. Same §8.5 gates: ≥5% verifier headroom on the 6.6 floor,
+`bpf loads` on vng 6.6/6.12 + host 7.x, LP64 + ia32.
+
+### 18.5 Allowlist-v3 amendment block (PROPOSED, written by this design)
+
+Status when merged: PROPOSED for owner/Opus privacy review +
+Codex re-review (the Task 0 gate applies to this block too);
+not active until reviewed. Placement: a new `## Operation
+mechanism parameters (v0.8.0 keymeta Task 8)` section appended
+after the Task 7 section, plus field-inventory rows below (no
+descriptor-table edit: the decode rides the existing S1 entry
+hook, not object descriptors). Header status line gains the
+section (PROPOSED). v1/v2 bytes unchanged.
+
+Field-inventory rows (one per shape family): `PSS params`
+(hashAlg, mgf, sLen — whole struct, no pointers); `OAEP params`
+(hashAlg, mgf, source; trailing pointer+len words never
+fetched, label bytes never dereferenced); `GCM params`
+(ulIvLen, ulTagBits, + ulIvBits on v240; pointer and AAD words
+never fetched, IV/AAD bytes never dereferenced); `CTR params`
+(ulCounterBits; counter block never fetched); `ECDH1 params`
+(kdf; lens/pointers never fetched, shared/public bytes never
+dereferenced); `HKDF params` (PRF id, salt-type id; flags word,
+lens, pointers, salt-key handle never fetched, salt/info bytes
+never dereferenced); `SP800-108 params` (prfType; all other
+words never fetched, data/IV/derived-key targets never
+dereferenced); `DH/DSA param-gen` (prime/base bits; hash + index
+— seed pointer/len never fetched, seed bytes never
+dereferenced). All: entry decode under the §18.3 exact-length +
+span guards; userspace publishes only on `CKR_OK`; private
+in-flight + completed-call transport; public scalars only.
+
+New section body (normative):
+
+> **Status: PROPOSED (v0.8.0 keymeta Task 8 2026-11-14);
+> owner/Opus privacy review and Codex re-review required before
+> activation.** This section scopes allowlisted mechanism-
+> parameter decodes on the §18.1 call set: the §18.2 field lists
+> are exhaustive — every listed word reads, every unlisted word
+> is never fetched, every pointer target behind a param struct
+> is never dereferenced. `ulParameterLen` must equal the listed
+> size for (mechanism, ABI) exactly; anything else refuses with
+> a named §18.3 reason. Publication is honored-only (`CKR_OK`
+> completions). Mechanism parameter scalars (hash/MGF/sLen,
+> padding source types, IV/tag/counter lengths, KDF/PRF ids,
+> param-gen bit sizes) are not secrets (owner stance
+> 2026-11-14); IV, AAD, label, shared/public data, salt, info,
+> seed and counter-block bytes are payload-adjacent and never
+> captured. The unsafe-preview decode keeps its own codes and
+> policy gate; the two vocabularies never mix. Terminal states,
+> `CKA_ID`/payload/PIN prohibitions and every other exclusion
+> stay in force. Allowlist-v1 bytes are unchanged.
+>
+> Required evidence before activation: the §18.7 host twins
+> (exact-length positives, ±word/±byte mismatch negatives,
+> layout twins, trailing-word non-publication, wrong-RV drop),
+> canary lanes with Task 8 sentinel positions on every §18.1
+> call (LP64+ia32) proving no payload-adjacent byte reaches
+> output/maps/logs, verifier headroom + `bpf loads` (§18.4),
+> full `artifact_contracts`, and the Task 5 live positives
+> (SoftHSM PSS/OAEP/GCM params matching the passed values).
+
+### 18.6 Schema, output, CBOM, text
+
+No new object-observations section: params are operation-level
+and publish on the S1/inventory/profile `mechanisms[].params[]`
+combos as shape-tagged objects (`shape` + named scalar fields +
+`count`; the lane pins the exact key names in
+`docs/schema/inventory-v1.md` — additive keys only). Render
+rule: allowlisted-shape combos publish regardless of policy;
+unsafe-preview combos stay behind the existing policy gate, and
+`params_omitted: "policy"` remains for mechanisms whose shapes
+are unsafe-only under a safe policy. Combos ride the existing
+`param_combos` table; the lane states its bound in
+`docs/schema/inventory-v1.md` and overflow keeps its existing
+named evidence.
+
+CBOM (re-projection only): algorithm components gain `padding`
+(OAEP/PSS, lane-pinned CycloneDX enum spellings), `mode`
+(gcm/ctr, confirmed by params), and hash/MGF/sLen/IV/tag/KDF/
+PRF facts as `properties[]` entries (`p11scope:param-*`, names
+pinned by the lane) — never defaults, never guesses. This
+amends the `docs/cbom-export.md` "no sizes, curves or
+parameters" line for parameters only; sizes/curves stay absent.
+
+Text: concise stays byte-stable (no new line); `-v` gains one
+per-mechanism param line whose wording the twins pin.
+
+### 18.7 Tests and canaries
+
+Decode twins per shape × ABI (fixture-driven BPF runs — no host
+unit seam exists for `decode_params_impl`, so arms are proven
+through fixtures, like the preview): exact-length positive
+(scalars publish exactly); off-by-size negatives (`len±W`, and
+CTR `len±1` — byte-exact); NULL-`pParameter` negative;
+span-invalid negative; read-failure negative;
+unlisted-mechanism negative; GCM v220-vs-v240 layout twins (40 →
+two-scalar v220, 48 → three-scalar v240, 44 → mismatch);
+trailing-word twins (sentinel values in never-read words never
+publish); DH-PKCS pin-or-refuse twin; hook-coverage twins (each
+§18.1 call decodes, `C_DigestInit` never attempts). Userspace
+twins at the event/semantics/render seam with synthetic shaped
+events: wrong-RV drop (non-OK completion admits no combo),
+`-v` wording pins, CBOM property pins.
+
+Canaries: `canary_workload.c` gains Task 8 param structs on
+every §18.1 call with sentinel IV/AAD/label/public-data/
+shared-data/salt/info/seed/pIV/data-param/counter-block bytes
+(sentinels chosen to collide with accepted scalar values, the
+§12.2 technique); the scanner asserts the scalars publish
+exactly and no sentinel byte appears in JSON/logs/maps. LP64 +
+ia32, with a positive control that fails loudly without the
+readers (non-vacuous).
+
+Live (inside the Task 5 matrix, required): SoftHSM PSS/OAEP/
+GCM operations with known params → combos match the passed
+values; one ECDH derive kdf-only positive.
+
+### 18.8 Explicit exclusions (refuse, never guess)
+
+`param_shape_unlisted` for: `CKM_AES_XTS` (params embed a key
+handle), `CKM_RSA_AES_KEY_WRAP` (params embed key-size + peer
+public-key bytes), `CKM_ECDH_AES_KEY_WRAP` (shared-data
+pointers), CCM/ChaCha20/Poly1305 params, TLS/WTLS/SSL3 PRF/KDF
+params, `CKM_PKCS5_PBKD2` (salt pointer), HOTP params, KEA
+(randoms + public data), X9.42 DH derive/MQV (same-shape as
+ECDH1 but unlisted — a later amendment row), DSA
+probabilistic/Shaw–Taylor param-gen (seed), every vendor id.
+Adding one later is an amendment row + decode arm, not a
+redesign. `C_DigestInit` and `C_Message*` have no call coverage
+(§18.1) even for listed mechanisms.

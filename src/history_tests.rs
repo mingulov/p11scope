@@ -458,6 +458,64 @@ fn retired_cookie_reopens_and_clears_exit_timestamp() {
 }
 
 #[test]
+fn trace_drain_retires_exits_like_profile() {
+    // B1 step-5 twin: an exit tapped on the trace path retires through
+    // the trace drain once past the tap position — State rows freed,
+    // the exit timestamp set, `closed` never set. Fails while the trace
+    // drain consumes no exits: nothing ever retires.
+    use crate::discovery::engine::Engine;
+    let (mut s, mut t, _) = setup(64);
+    let mut first = ev(100, 90, 0, 0);
+    first.ts_ns = 100;
+    let mut drain = EventDrain::over_test_domain(ScriptedRecords::events([first], usize::MAX), 1);
+    let mut tracer = trace::Tracer::new(&plan());
+    let mut output = Vec::new();
+    drain_trace_events_from(
+        &mut drain,
+        &mut None,
+        &mut s,
+        &mut t,
+        &scope(),
+        &mut tracer,
+        &mut output,
+        &mut true,
+        &mut None::<Vec<u8>>,
+        None,
+    )
+    .unwrap();
+    assert_eq!(vector(&s), (1, 0, 0, 1, 1, 0));
+    let old = key(90, 0);
+    let mut engine = Engine::empty_for_test();
+    engine.note_exit_tap(100, 200);
+    let stamp = crate::events::event_drain_positions(&drain).producer;
+    transfer_exit_taps(&mut engine, &mut t, stamp);
+    drain_trace_events_from(
+        &mut drain,
+        &mut None,
+        &mut s,
+        &mut t,
+        &scope(),
+        &mut tracer,
+        &mut output,
+        &mut true,
+        &mut None::<Vec<u8>>,
+        None,
+    )
+    .unwrap();
+    assert!(!s.has_process_state(old));
+    assert_eq!(vector(&s), (1, 0, 1, 0, 1, 0));
+    assert_eq!(t.pending_exit_taps_for_test(), 0);
+    // `closed` was never set: a post-exit event reopens the task
+    // instead of being refused.
+    let image = ImageIdentity {
+        task_cookie: 90,
+        exec_id: 0,
+    };
+    assert!(t.admit_history(1, 100, image, 250).0.is_some());
+    assert_eq!(t.exit_counters_for_test(), (0, 0, 1, 0));
+}
+
+#[test]
 fn history_cookie_fd_and_pid_changes_never_order_independent_producer_histories() {
     let (mut s, mut t, a) = setup(16);
     feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);

@@ -1015,8 +1015,7 @@ pub(crate) fn collect_with(
     let mut noise = DiscoveryNoiseAggregator::default();
     // The cgroup run owns its table across members, like the
     // system/pid runs own theirs.
-    let mut handles =
-        HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
+    let mut handles = HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
     // Hold the count manifests' rows before the member scans below
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.

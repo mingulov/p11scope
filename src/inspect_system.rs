@@ -1587,8 +1587,7 @@ fn collect_identity(
     let mut timings = StageTimings::new();
     // One table for the run: member pins and manifest objects share
     // the same cap, since member pins stay held across members.
-    let mut handles =
-        HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
+    let mut handles = HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
     // Hold the count manifests' rows before the member scans below
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.
@@ -1801,8 +1800,7 @@ pub(crate) fn collect_pid_with_count_manifests(
     let mut noise = DiscoveryNoiseAggregator::default();
     // One table for the run: the member pin and manifest objects
     // share the same cap.
-    let mut handles =
-        HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
+    let mut handles = HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
     // Hold the count manifests' rows before the member scan below
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.
@@ -5079,8 +5077,7 @@ pub(crate) fn collect_system_with_identity(
     let mut timings = StageTimings::new();
     // One table for the run: member pins and manifest objects share
     // the same cap, since member pins stay held across members.
-    let mut handles =
-        HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
+    let mut handles = HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
     // Hold the count manifests' rows before the member scans below
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.

@@ -733,8 +733,7 @@ fn run_with_view(
     // The inspect lane owns its table for the run: same cap as a
     // capture, no shared state with one. A full table stops the pin
     // with the shared budget-stop gap; the run never retries.
-    let mut handles =
-        HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
+    let mut handles = HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
     let result = scan_and_pin_application_with(
         &mut context,
         |context| context.0.view().still_the_same(),

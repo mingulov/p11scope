@@ -21071,6 +21071,10 @@ mod tests {
                 RunningRearmRefusal::PublicationPending,
                 "the unfinished pass was still standing after the abandon",
             ),
+            (
+                RunningRearmRefusal::H3SlotHeld,
+                "the untaken H3 slot was still held for another producer",
+            ),
         ] {
             assert_eq!(
                 ClassicDriver::joint_lane_stop_suffix(None, 0, Some(refusal)),

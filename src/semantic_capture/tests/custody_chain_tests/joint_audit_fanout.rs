@@ -11785,6 +11785,81 @@ fn joint_machine_auditing_permanent_refusal_keeps_the_latch() {
     );
 }
 
+/// Failure twin for a foreign-held H3 slot at the audit step: the
+/// namespace's untaken disposition is bound to producers no live
+/// machine holds (posed: no production path binds foreign producers,
+/// the lane domain pins the machine's pair), so the audit preflight
+/// refuses and the re-arm stops instead of continuing past a slot it
+/// cannot take. The abandon already ran, so the hold finds the
+/// publication as-is and the stop names the stuck slot.
+#[test]
+fn joint_machine_auditing_foreign_h3_hold_refuses_the_rearm() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.reach_auditing();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .pose_foreign_h3_hold_for_test();
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the preflight's foreign-hold refusal latches the running machine"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Auditing");
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "the refused quantum's publication stands before the re-arm"
+    );
+    assert_eq!(fixture.rearm("semantic_unavailable"), None);
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::H3SlotHeld),
+        "the stop names the foreign-held H3 slot"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "the latch stands for the hold"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Auditing");
+    assert!(fixture.h3_pending(), "the foreign slot stays untaken");
+    assert!(
+        !fixture.scene.real.scene.coordinator.publication_pending(),
+        "the abandon ran before the refusal, so the hold finds no publication"
+    );
+    assert_eq!(fixture.machine.running_rearms_for_test(), 0);
+    let subjects = fixture.all_gap_subjects();
+    assert!(
+        subjects
+            .iter()
+            .any(|seen| seen == "unfinished joint publication abandoned"),
+        "the abandon is named: {subjects:?}"
+    );
+    assert!(
+        !subjects.iter().any(|seen| seen == QUANTUM_ABANDONED),
+        "no re-arm is named: {subjects:?}"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "a refused re-arm stays refused"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+}
+
 /// Bound twin across both steps: Audited and Auditing re-arms spend
 /// one shared per-run limit; past it an Auditing refusal keeps the
 /// latch with its raw quantum and H3 slot held.

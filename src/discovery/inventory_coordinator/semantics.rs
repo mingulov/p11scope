@@ -41,6 +41,7 @@ use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
 pub(super) use finalizer::SessionFinalizerState;
 pub(crate) use finalizer::{
     JointPublicationPorts, SessionAuditInput, SessionDisposedAuditInput, SessionH3Finalizer,
+    UnauditedH3Take,
 };
 pub(super) use joint::JointCommitInput;
 pub(crate) use joint::PreparedSemanticBatch;

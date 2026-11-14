@@ -11,6 +11,7 @@ use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
 use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::semantics::CompletedJointFinish;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+use crate::discovery::engine::inventory_coordinator::semantics::UnauditedH3Take;
 use crate::discovery::engine::inventory_coordinator::{
     BatchReceipt, InventoryCoordinator, JointCommitProgress,
 };
@@ -104,6 +105,10 @@ pub(crate) enum RunningRearmRefusal {
     CannotResync,
     /// The abandon left the unfinished publication standing.
     PublicationPending,
+    /// The untaken H3 disposition at the audit step is bound to
+    /// another producer pair: the slot is stuck, so the re-arm stops
+    /// instead of continuing past custody it cannot take.
+    H3SlotHeld,
 }
 
 impl RunningRearmRefusal {
@@ -121,6 +126,7 @@ impl RunningRearmRefusal {
             Self::LaneNotLive => "the lane was no longer live",
             Self::CannotResync => "the journal stream could not re-sync",
             Self::PublicationPending => "the unfinished pass was still standing after the abandon",
+            Self::H3SlotHeld => "the untaken H3 slot was still held for another producer",
         }
     }
 }
@@ -1748,9 +1754,18 @@ impl LiveJointMachine {
         // below. Its calls stay counted (the cancelled publication kept
         // their staged registry facts) and its journal custody is
         // voided, named, by the next collect, like any abandoned
-        // quantum. An Audited frame already took its slot.
+        // quantum. An Audited frame already took its slot. A slot held
+        // for another producer stops the re-arm instead, named: the
+        // next preparation would refuse it anyway, and the hold then
+        // finds the abandoned publication as-is.
         if matches!(self.phase, Some(Phase::Auditing { .. })) {
-            coordinator.take_unaudited_joint_h3(&self.producers);
+            match coordinator.take_unaudited_joint_h3(&self.producers) {
+                UnauditedH3Take::Taken | UnauditedH3Take::NothingPending => {}
+                UnauditedH3Take::ForeignHeld => {
+                    self.rearm_refusal = Some(RunningRearmRefusal::H3SlotHeld);
+                    return None;
+                }
+            }
         }
         if self.producers.journal_linked() {
             coordinator

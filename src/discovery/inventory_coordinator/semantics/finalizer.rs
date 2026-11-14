@@ -384,6 +384,21 @@ impl H3FinalizerPort for SessionH3Finalizer<'_> {
     }
 }
 
+/// One unaudited H3 take's outcome: the running re-arm at the audit
+/// step continues past a taken or absent disposition, and stops,
+/// named, on a slot another producer still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnauditedH3Take {
+    /// The slot was taken, exactly as the audit takes it.
+    Taken,
+    /// No slot was pending (or no namespace exists): nothing is
+    /// stuck, so the re-arm continues.
+    NothingPending,
+    /// A disposition is pending but bound to another domain or
+    /// producer pair: the slot is stuck, so the re-arm stops.
+    ForeignHeld,
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// No insertion/rebinding, H3 take or revision change. The existing
     /// Session and retained EVENTS allocation must already match the owner.
@@ -483,19 +498,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// carries positions, not calls: every call of the quantum is
     /// counted through its staged registry facts and the next collect's
     /// unlocalized void. Only the retained Session's own producers take
-    /// it; returns whether a disposition was taken.
-    pub(crate) fn take_unaudited_joint_h3(&mut self, producers: &SessionDrainProducers) -> bool {
+    /// it. An absent disposition (or namespace) is not stuck: the next
+    /// preparation refuses on its own named terms if the namespace
+    /// itself mismatches.
+    pub(crate) fn take_unaudited_joint_h3(
+        &mut self,
+        producers: &SessionDrainProducers,
+    ) -> UnauditedH3Take {
         let Some(state) = self.semantic_finalizer.as_mut() else {
-            return false;
+            return UnauditedH3Take::NothingPending;
         };
+        if state.h3_pending.is_none() {
+            return UnauditedH3Take::NothingPending;
+        }
         if state.domain != producers.native_domain()
-            || state.h3_pending.is_none()
             || state
                 .producers
                 .as_ref()
                 .is_some_and(|held| !held.same_producers(producers))
         {
-            return false;
+            return UnauditedH3Take::ForeignHeld;
         }
         let mut finalizer = SessionH3Finalizer { state, producers };
         // The taken evidence is discarded, as an Audited re-arm discards
@@ -503,7 +525,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let _taken = crate::semantics_objects::journal::H3EvidenceSource::take_h3_disposition(
             &mut finalizer,
         );
-        true
+        UnauditedH3Take::Taken
+    }
+
+    /// Pose a foreign-held untaken H3 slot for the re-arm twin: keep
+    /// the namespace's domain and pending disposition, but bind the
+    /// retained producers to a fresh pair no live machine holds, so
+    /// the next preflight and the re-arm's take both see a foreign
+    /// hold. No production path binds foreign producers (the lane
+    /// domain pins the machine's pair), so the twin poses the
+    /// mismatch directly.
+    #[cfg(test)]
+    pub(crate) fn pose_foreign_h3_hold_for_test(&mut self) {
+        let Some(state) = self.semantic_finalizer.as_mut() else {
+            panic!("the foreign-hold pose needs a bound finalizer namespace");
+        };
+        assert!(
+            state.h3_pending.is_some(),
+            "the foreign-hold pose needs an untaken H3 slot"
+        );
+        state.producers = Some(SessionDrainProducers::test_pair(
+            state.domain,
+            crate::events::EventsDomain::test_standin(0xF0E1),
+        ));
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // The actual Session machine consumes this staged negative port later.
@@ -584,6 +628,121 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attach::Scope;
+    use crate::discovery::caller_registry::{OsProcessSource, RegistryLimits};
+    use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+    use crate::discovery::hooks::HookRegistry;
+
+    fn take_coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    fn take_producers(native: NativeDomainId, events: u64) -> SessionDrainProducers {
+        SessionDrainProducers::test_pair(native, crate::events::EventsDomain::test_standin(events))
+    }
+
+    #[test]
+    fn take_unaudited_joint_h3_without_namespace_reports_nothing_pending() {
+        // No finalizer namespace (no preparation ever ran): nothing is
+        // held, so the re-arm continues.
+        let mut coordinator = take_coordinator();
+        let producers = take_producers(NativeDomainId::mint(), 91);
+        assert_eq!(
+            coordinator.take_unaudited_joint_h3(&producers),
+            UnauditedH3Take::NothingPending,
+        );
+    }
+
+    #[test]
+    fn take_unaudited_joint_h3_without_slot_reports_nothing_pending() {
+        // A bound namespace with no untaken disposition: nothing is
+        // stuck, so the re-arm continues.
+        let mut coordinator = take_coordinator();
+        let domain = NativeDomainId::mint();
+        let own = take_producers(domain, 91);
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
+        assert!(
+            coordinator
+                .semantic_finalizer
+                .as_mut()
+                .unwrap()
+                .bind_producers(&own)
+        );
+        assert_eq!(
+            coordinator.take_unaudited_joint_h3(&own),
+            UnauditedH3Take::NothingPending,
+        );
+    }
+
+    #[test]
+    fn take_unaudited_joint_h3_takes_the_own_slot() {
+        let mut coordinator = take_coordinator();
+        let domain = NativeDomainId::mint();
+        let own = take_producers(domain, 91);
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
+        coordinator
+            .semantic_finalizer
+            .as_mut()
+            .unwrap()
+            .h3_pending = Some(H3DispositionEvidence::genesis());
+        assert_eq!(
+            coordinator.take_unaudited_joint_h3(&own),
+            UnauditedH3Take::Taken,
+        );
+        assert_eq!(coordinator.reference_h3_audit_state(), (1, false));
+    }
+
+    #[test]
+    fn take_unaudited_joint_h3_reports_a_foreign_held_slot() {
+        // The untaken disposition is bound to another producer pair
+        // (same domain, a different EVENTS allocation): the slot is
+        // stuck, so the caller stops instead of continuing past it.
+        let mut coordinator = take_coordinator();
+        let domain = NativeDomainId::mint();
+        let own = take_producers(domain, 91);
+        let foreign = take_producers(domain, 92);
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
+        let state = coordinator.semantic_finalizer.as_mut().unwrap();
+        assert!(state.bind_producers(&foreign));
+        state.h3_pending = Some(H3DispositionEvidence::genesis());
+        assert_eq!(
+            coordinator.take_unaudited_joint_h3(&own),
+            UnauditedH3Take::ForeignHeld,
+        );
+        assert!(
+            coordinator.reference_h3_audit_state().1,
+            "the foreign slot stays untaken"
+        );
+    }
+
+    #[test]
+    fn take_unaudited_joint_h3_reports_a_foreign_domain_slot() {
+        // Same, with the namespace's domain moved: still stuck.
+        let mut coordinator = take_coordinator();
+        let own = take_producers(NativeDomainId::mint(), 91);
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(NativeDomainId::mint()));
+        coordinator
+            .semantic_finalizer
+            .as_mut()
+            .unwrap()
+            .h3_pending = Some(H3DispositionEvidence::genesis());
+        assert_eq!(
+            coordinator.take_unaudited_joint_h3(&own),
+            UnauditedH3Take::ForeignHeld,
+        );
+        assert!(
+            coordinator.reference_h3_audit_state().1,
+            "the foreign slot stays untaken"
+        );
+    }
 
     #[test]
     fn session_h3_finalizer_retains_exact_native_and_events_pair() {

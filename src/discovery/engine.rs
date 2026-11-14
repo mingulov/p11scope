@@ -25996,12 +25996,6 @@ impl Engine {
     /// position. Past [`crate::history::EXIT_TAP_QUEUE_LIMIT`] the
     /// incoming tap drops and `exit_tap_overflow` counts it — the
     /// process keeps its rows, never silently.
-    /// Taps one `LEADER_EXIT`/`_MAPPINGS` record for the process-exit
-    /// retire path: the tracker frees the exiting process's semantic
-    /// rows once the EVENTS drain reads past the tap-time producer
-    /// position. Past [`crate::history::EXIT_TAP_QUEUE_LIMIT`] the
-    /// incoming tap drops and `exit_tap_overflow` counts it — the
-    /// process keeps its rows, never silently.
     pub(crate) fn note_exit_tap(&mut self, pid: u32, hook_ts_ns: u64) {
         if self.exit_taps.len() >= crate::history::EXIT_TAP_QUEUE_LIMIT {
             self.exit_tap_overflow = self.exit_tap_overflow.saturating_add(1);

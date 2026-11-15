@@ -87099,6 +87099,23 @@ fn member_stop_release_withdraws_a_gone_members_row() {
     );
 }
 
+/// An unknown stop instant proves nothing: doubt resumes a stopped
+/// member moved out of the tree rather than leaving it stopped.
+#[test]
+fn member_stop_unknown_stop_instant_is_doubt() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    stop_member_for_test(pid);
+    let pin = crate::process::PidPin::open(pid).unwrap();
+    assert!(super::stopped_member_moved_out(&pin, 0));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Twin: without a service pass the stopped member stays stopped (the
 /// resume above is the service's, not the fixture's).
 #[test]

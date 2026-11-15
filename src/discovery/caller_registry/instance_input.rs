@@ -3420,6 +3420,23 @@ impl CallerRegistry {
                 return;
             }
         };
+        if let Some(cause) = input.plain_s1_cause() {
+            // The admission could not be certified as Joint evidence, so
+            // it reduced S1-direct on either path (capture-wide Joint
+            // accounting may still be inactive before the first Joint
+            // feed). Count the one lost per-key detail for its caller
+            // under the exact cause. Historical, downgrade, capacity and
+            // reducer refusals return before this point and keep their
+            // own counted reasons.
+            self.record_gap(RegistryGap {
+                caller: Some(input.caller),
+                module: None,
+                pid: None,
+                subject: "Joint key operations unavailable; retained S1".into(),
+                reason: cause.reason().into(),
+                budget: None,
+            });
+        }
         let state = self
             .instance_state
             .semantics
@@ -3456,8 +3473,9 @@ impl CallerRegistry {
         // is observed history that cannot name a Joint subject: it
         // reduces as plain S1 (keeping its return) beside the feed's
         // normal calls, never as a Joint stage whose H8 the next
-        // delivery would refuse. Its one counted gap is recorded after
-        // the reduction succeeds, naming this caller and the exact cause.
+        // delivery would refuse. `apply_instance_call` records its one
+        // counted gap once the reduction succeeds, naming this caller
+        // and the exact cause.
         let plain_s1 = input.plain_s1_cause();
         let mut joint = plain_s1.is_none()
             && self
@@ -3683,20 +3701,9 @@ impl CallerRegistry {
         );
         let refused =
             reducer.observe_with_resources_and_effects(&input.facts, &origin, &mut tee)?;
-        if let Some(cause) = plain_s1 {
-            // The call actually reduced S1-direct: count the one lost
-            // per-key detail for its caller under the exact cause. A
-            // refused or history-only application above returns before
-            // this point and is counted by its own reason instead.
-            self.record_gap(RegistryGap {
-                caller: Some(input.caller),
-                module: None,
-                pid: None,
-                subject: "Joint key operations unavailable; retained S1".into(),
-                reason: cause.reason().into(),
-                budget: None,
-            });
-        }
+        // The one counted retained-S1 gap is recorded by the caller
+        // (`apply_instance_call`) after this reduction succeeds, on both
+        // the Joint-accounting and S1-direct paths.
         Ok(fallback_refused.saturating_add(refused))
     }
 

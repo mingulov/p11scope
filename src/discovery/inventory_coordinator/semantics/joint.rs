@@ -1466,6 +1466,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let Some(Ok(input)) = &entry.input else {
                 continue;
             };
+            // A retained plain-S1 admission carries no claim: associating
+            // a birth with it would refuse the birth for a missing claim
+            // instead of the honest absence the preamble already skips.
+            if input.plain_s1() {
+                continue;
+            }
             let (_, image, router, _) = input.journal_binding();
             if let Ok(index) = association.binary_search_by_key(
                 &((image.task_cookie, image.exec_id), router.get()),

@@ -5240,36 +5240,42 @@ impl JournalAdapter {
         .then_some(entry)
     }
 
-    /// Whether a void wiped this admission's retained H8 original before
-    /// its claim. The caller has already proved the admission does not
-    /// match the current quantum and no retained original claims it, so
-    /// the remaining facts are: a void has happened on this stream, the
-    /// admission was collected (it has an H0 origin), and its exact H8
-    /// invocation is no longer retained. Such a call was observed before
-    /// the void and can no longer be certified; the claim step routes it
-    /// to plain S1 with a counted gap instead of refusing the whole
-    /// semantic lane. The H0 wire position stays in its own device
-    /// domain: it is never compared with the journal consumption ordinal
-    /// a fence records.
+    /// Whether this admission may be retained as plain S1 because a void
+    /// wiped its retained H8 original before its claim. The caller has
+    /// already proved the admission does not match the current quantum and
+    /// no retained original claims it, so the remaining facts are: a void
+    /// has happened on this stream, the admission was collected (it has an
+    /// H0 origin whose position is its own H0 ordinal), its exact H8
+    /// invocation is no longer retained, and the resource origin belongs
+    /// to this adapter's producers. Such a call was observed before the
+    /// void and can no longer be certified; the claim step routes it to
+    /// plain S1 with a counted gap instead of refusing the whole semantic
+    /// lane. The H0 wire position stays in its own device domain: it is
+    /// never compared with the journal consumption ordinal a fence
+    /// records.
     ///
-    /// Not every removal from `open` is a void: image-taint pruning and
-    /// the stop path also drop retained entries without raising
-    /// `voided_through`. An admission whose original left that way is
-    /// assumed never to be re-offered for claim (the lane stash consumes
-    /// each outcome once and the claim cursor only moves forward); the
-    /// fence check keeps the fenceless case refusing. If a later re-offer
-    /// of such an admission ever exists, it would be retained as plain S1
-    /// under the void gap, so it must be proven here first.
+    /// Not every removal from `open` is a void: image-taint pruning,
+    /// claim-time ambiguity and the stop path also drop retained entries
+    /// without raising `voided_through`. A stashed admission whose
+    /// original an earlier taint removed is offered for claim once (the
+    /// lane stash consumes each outcome once and the claim cursor only
+    /// moves forward). Before any void it refuses; after an earlier,
+    /// unrelated void it is retained here under a gap that does not name
+    /// the removal that actually happened. That history dependence is
+    /// tracked as F4; this predicate reports only what it can observe.
     pub(crate) fn admission_voided(&self, admitted: &AdmittedInstanceCall) -> bool {
         if self.voided_through == 0 {
             return false;
         }
-        let (Some(_origin), Some(resource)) = (
+        let (Some(origin), Some(resource)) = (
             admitted.collected_origin(),
             admitted.joint_resource_origin(),
         ) else {
             return false;
         };
+        if origin.position() != admitted.h0_ordinal() {
+            return false;
+        }
         !self.open.contains_key(&resource.invocation())
             && self
                 .resource_producers

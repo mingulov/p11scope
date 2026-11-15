@@ -10935,9 +10935,12 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         fixture.machine.disposition_reason(),
         fixture.machine.latched_phase_label()
     );
-    // The idle void wiped the collected original and fenced its
-    // position, so the same admission is a voided pre-void claim (the
-    // positive side of the route the claim step took above).
+    // The pre-void batch's own admitted call lost its collected original
+    // to the idle void too, so the predicate reports it as voided. That
+    // call was already claimed and reduced; it is not the stashed orphan
+    // the post-void claim routed to plain S1. The orphan's route is
+    // pinned by the published post-void quantum and its counted S1
+    // reduction above and below.
     assert!(
         fixture
             .scene
@@ -10947,7 +10950,7 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
             .joint_capture()
             .adapter()
             .admission_voided(&pre_void_admission),
-        "the idle void fenced the collected original"
+        "the idle void also fenced the already-claimed call's original"
     );
     // The route is scoped to this journal's own producers and domain: a
     // same-shaped admission from another native domain is never this
@@ -11228,37 +11231,33 @@ fn joint_claim_refuses_an_absent_original_without_a_void() {
 }
 
 /// Keyrows N1 negative control for the invocation-containment clause:
-/// after a real void, an older-quantum admission whose native
-/// invocation is present in `open` again (a fresh call with the same
-/// caller, image, function and sequence) is not a proven voided claim.
-/// Presence of any retained entry under the invocation means the void
-/// did not account for the older original, so the claim must refuse.
-/// Dropping the `open` containment check would route this admission to
-/// plain S1 instead of refusing.
+/// after a real void fence, an older-quantum admission whose own
+/// original is still retained in `open` (claimed, not yet converted)
+/// fails the unclaimed retained-original match and must refuse. The
+/// containment check keeps it out of the voided route: a present
+/// invocation means the void did not account for this admission's
+/// original. Dropping the `open` containment check would route the
+/// admission to plain S1 instead of refusing.
 #[test]
 fn joint_claim_refuses_an_older_admission_with_a_retained_invocation_after_a_void() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
+    // Quantum 1: one ordinary call consumes history, so the real
+    // ingest-break void below raises a nonzero fence.
     fixture.push(pid, 0, "C_SignInit", 1);
     let raw1 = fixture.prepare(1);
-    let older = fixture
+    let (ingested1, _proof, grant) = fixture.ingest_with_grant(raw1);
+    let claimed = claim_and_finish(&mut fixture, &ingested1);
+    assert_eq!(claimed.len(), 1, "the first call claims");
+    fixture
         .real
         .scene
         .coordinator
-        .prepared_semantic_batch()
-        .unwrap()
-        .admissions()
-        .next()
-        .expect("one prepared admission")
-        .clone();
-    let (ingested1, _proof, grant) = fixture.ingest_with_grant(raw1);
-    assert!(
-        ingested1.matches_admission(&older),
-        "the first quantum owns the older admission"
-    );
+        .commit_batch_with_semantics(false, Some(&mut fixture.real.lane))
+        .unwrap();
     // The real ingest-break void fences the consumed history and wipes
-    // every retained original; the stream re-syncs on the next collect.
+    // every retained original; the next collect re-syncs above it.
     {
         let owner = fixture.real.scene.coordinator.joint_capture_mut();
         owner.adapter_mut().break_stream_for_test();
@@ -11272,26 +11271,58 @@ fn joint_claim_refuses_an_older_admission_with_a_retained_invocation_after_a_voi
             owner.adapter().voided_through_for_test() > 0,
             "the real void raised its fence"
         );
+    }
+    // After the void a fresh quantum prepares an admission; its own
+    // retained original is ingested and stays open, but claiming the
+    // identity outside the batch leaves it unclaimable there.
+    fixture.push(pid, 0, "C_SignInit", 2);
+    let raw2 = fixture.prepare(1);
+    let older = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    let (ingested2, _proof, _grant2) = fixture.ingest_with_grant(raw2);
+    assert!(
+        ingested2.matches_admission(&older),
+        "the post-void quantum owns the prepared admission"
+    );
+    {
+        let owner = fixture.real.scene.coordinator.joint_capture_mut();
+        owner
+            .adapter_mut()
+            .attest_key(&older)
+            .expect("the open original claims");
         assert!(
-            !ingested1.matches_retained_admission(&older, owner.adapter()),
-            "the void wiped the older admission's original"
+            !ingested2.matches_retained_admission(&older, owner.adapter()),
+            "a claimed original no longer matches as unclaimed"
+        );
+        assert_eq!(
+            owner.adapter().retained_starts_for_test().len(),
+            1,
+            "the claimed original is still retained in `open`"
         );
     }
-    // A fresh call with the same native invocation re-opens that key.
-    // The older admission's original is gone; this entry is not it.
-    fixture.push(pid, 0, "C_SignInit", 1);
-    let raw2 = fixture.collect_with_fault(&BirthFault);
-    fixture.real.h0.0.borrow_mut().collected = Some(raw2);
-    let _batch2 = fixture.real.tick();
-    let raw2 = fixture
+    // A newer quantum makes the prepared admission older than the
+    // current one; its original is still present and claimed.
+    fixture.push(pid, 0, "C_SignInit", 3);
+    let raw3 = fixture.collect_with_fault(&BirthFault);
+    fixture.real.h0.0.borrow_mut().collected = Some(raw3);
+    let _batch3 = fixture.real.tick();
+    let raw3 = fixture
         .real
         .h0
         .0
         .borrow_mut()
         .collected
         .take()
-        .expect("the second tick returns the collected raw");
-    let ingested2 = raw2
+        .expect("the third tick returns the collected raw");
+    let ingested3 = raw3
         .ingest(
             fixture
                 .real
@@ -11302,16 +11333,16 @@ fn joint_claim_refuses_an_older_admission_with_a_retained_invocation_after_a_voi
             &fixture.producers,
             &grant,
         )
-        .unwrap_or_else(|(_, reason)| panic!("the post-void quantum ingests: {reason:?}"));
+        .unwrap_or_else(|(_, reason)| panic!("the later quantum ingests: {reason:?}"));
     assert!(
-        !ingested2.matches_admission(&older),
+        !ingested3.matches_admission(&older),
         "the older admission belongs to the earlier quantum"
     );
     let refusal = match fixture
         .real
         .scene
         .coordinator
-        .claim_next_prepared_admission(&fixture.producers, &ingested2)
+        .claim_next_prepared_admission(&fixture.producers, &ingested3)
     {
         Ok(claim) => {
             panic!("an older admission with a retained invocation must not claim: {claim:?}")
@@ -11325,11 +11356,11 @@ fn joint_claim_refuses_an_older_admission_with_a_retained_invocation_after_a_voi
     );
     let adapter = fixture.real.scene.coordinator.joint_capture().adapter();
     assert!(
-        !ingested2.matches_retained_admission(&older, adapter),
-        "the fresh same-invocation call is not the older admission's original"
+        !ingested3.matches_retained_admission(&older, adapter),
+        "the claimed original is not an unclaimed retained match"
     );
     assert!(
-        !ingested2.admission_voided(&older, adapter),
+        !ingested3.admission_voided(&older, adapter),
         "a retained invocation is not a proven voided original"
     );
 }

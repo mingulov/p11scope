@@ -1320,7 +1320,7 @@ impl AdmittedInstanceCall {
 
     /// Whether this admission's retained H8 original was wiped by a
     /// void before its claim: the call keeps its observed return as
-    /// plain S1, so claiming never consoles the whole semantic lane
+    /// plain S1, so claiming never stops the whole semantic lane
     /// for one orphaned pre-void admission.
     pub(crate) fn plain_s1(&self) -> bool {
         self.plain_s1

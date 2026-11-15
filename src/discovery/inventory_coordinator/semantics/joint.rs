@@ -1087,9 +1087,13 @@ impl PreparedSemanticBatch {
                     // original after it was observed. Observed history
                     // that can no longer be certified still counts:
                     // retain the call as plain S1 with a counted gap
-                    // instead of refusing the whole semantic lane. Any
-                    // other mismatch (a replay, a duplicate or a
-                    // fenceless foreign original) stays a claim refusal.
+                    // instead of refusing the whole semantic lane. A
+                    // replay, a duplicate or a fenceless foreign
+                    // original whose invocation is still retained stays
+                    // a claim refusal. An original an earlier taint
+                    // removed is a first offer: it refuses before any
+                    // void and is retained under the void gap after one
+                    // (tracked as F4).
                     if ingested.admission_voided(input, adapter) {
                         input.retain_as_plain_s1();
                         self.voided_s1 = self.voided_s1.saturating_add(1);

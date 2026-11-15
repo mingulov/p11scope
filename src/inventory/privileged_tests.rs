@@ -5962,6 +5962,9 @@ struct JointEdgeSnapshot {
     api_returns: Option<u64>,
     reduced: u64,
     joint: bool,
+    /// Lossiness at this checkpoint: q3 excuses a shed edge only when it
+    /// was already lossy at the q2 checkpoint that proved the equation.
+    lossy: bool,
     started: Option<u64>,
     completed: Option<u64>,
     /// S1 mechanism rows as (mechanism, attributed calls, errors), by id.
@@ -5995,6 +5998,7 @@ fn joint_edge_snapshot(
         api_returns: record.api_returns,
         reduced: record.feed.reduced(),
         joint: record.feed.mode() == crate::semantics_key_use::FeedMode::Joint,
+        lossy: record.lossy,
         started: record.semantics.as_ref().map(|edge| edge.started()),
         completed: record.semantics.as_ref().map(|edge| edge.completed()),
         mechanisms,
@@ -9775,6 +9779,16 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     // DONE lands after the CALLS flush, so the ledger read below sees
     // H's whole pair.
     process_h.wait_for("DONE ", Duration::from_secs(30))?;
+    // Capture the EVENTS producer once right after DONE: no fixture CALL
+    // can enter the system-wide ring after this watermark, so a consumer
+    // that reaches it has consumed every pre-DONE record, all fixture
+    // calls included. Ambient FORKs keep arriving, which is exactly why
+    // the drain below anchors on this fixed watermark instead of
+    // `producer == consumer` read after publication (that never settles
+    // under steady churn).
+    let target_producer = lane
+        .events_drain_producer_for_test()
+        .context("r16b-q2: the live EVENTS drain exposes no producer watermark")?;
     let h_enter = ledger_stamp(&process_h.out, "HELD ")?;
     let h_exit = ledger_stamp(&process_h.out, "RETURNED ")?;
     ensure!(
@@ -9786,16 +9800,20 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         h_bad == 0 && h_total == 2,
         "H made exactly SignInit plus its held Sign"
     );
-    // Drain to quiescence before reading the checkpoint: each transaction
-    // delivers at most one H0 quantum, so under a fork flood fixture
-    // calls buried behind ambient records surface only after several
-    // transactions. Idle (ring consumer at producer with nothing staged)
-    // proves every submitted record reached a quantum, hence H0, hence
-    // the same transaction's finalize; with H released and DONE waited,
-    // no new call can arrive after. The bound (15 transactions cover a
+    // Drain to the post-DONE producer watermark before reading the
+    // checkpoint: each transaction delivers at most one H0 quantum, so
+    // under a fork flood fixture calls buried behind ambient records
+    // surface only after several transactions. Every record below the
+    // watermark was committed before DONE (so every fixture call is
+    // among them), and a logical consumer at or past the watermark has
+    // consumed them into the same transaction's finalize. Records that
+    // arrive after DONE are deliberately not chased: the system-wide
+    // ring has no quiet point under steady ambient churn, and demanding
+    // `producer == consumer` here failed every transaction even with an
+    // empty fixture backlog. The bound (15 transactions cover a
     // ~15k-record backlog; the heaviest observed flood needed 8) fails
     // loudly, never passes partial. Quiet runs pay nothing: the first
-    // check already reads idle.
+    // transaction already reaches the watermark.
     let q2_polls = {
         let polls = std::cell::Cell::new(0u64);
         let txns = crate::events::drive_until_idle(15, || {
@@ -9806,17 +9824,20 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
             };
             let taken = service_to_published(&mut lane, &mut coordinator, false, tag)?;
             polls.set(polls.get() + taken);
-            Ok::<bool, anyhow::Error>(lane.events_drain_idle_for_test().is_some_and(|idle| idle))
+            Ok::<bool, anyhow::Error>(
+                lane.events_drain_reached_for_test(target_producer)
+                    .is_some_and(|reached| reached),
+            )
         })?;
         let Some(txns) = txns else {
             bail!(
-                "r16b-q2: EVENTS backlog never drained within 15 transactions \
-                 (collected {:?})",
+                "r16b-q2: EVENTS backlog never reached the post-DONE watermark \
+                 {target_producer} within 15 transactions (collected {:?})",
                 lane.semantic_stop_call_counts()
             );
         };
         eprintln!(
-            "JOINT_R16 r16b-q2 drained txns={txns} polls={}",
+            "JOINT_R16 r16b-q2 drained txns={txns} polls={} watermark={target_producer}",
             polls.get()
         );
         polls.get()
@@ -10406,10 +10427,12 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     // Fault-world shed edges: when a fault era moved and the q2 equation
     // balanced over disclosed fault-era shed, a lossy owner edge carries
     // exactly the shed disclosure (not a stop): excuse it under the
-    // strict shed verdict pinned to its q2 count. Non-lossy owners and
-    // every other edge keep the twins; without a moved era and a
-    // fault-era shed row the list stays empty and the check is exactly
-    // the quiet one.
+    // strict shed verdict pinned to its q2 count. Only an edge already
+    // lossy at the q2 checkpoint may be excused: an edge that became
+    // lossy between q2 and q3 is a new loss, not the shed the equation
+    // proved. Non-lossy owners and every other edge keep the twins;
+    // without a moved era and a fault-era shed row the list stays empty
+    // and the check is exactly the quiet one.
     let fault_shed = lane.semantic_era_counts().1 > 0
         && coordinator.registry().gaps().iter().any(|gap| {
             (gap.subject == "semantic calls unrouted"
@@ -10420,18 +10443,13 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         let module_soft = module_of(&coordinator, "soft-copy.so")?;
         let module_held = module_of(&coordinator, "live-joint-held.so")?;
         [
-            (caller_e, module_soft, edge_e.api_returns),
-            (caller_c, module_soft, edge_c.api_returns),
-            (caller_h, module_held, edge_h.api_returns),
+            (caller_e, module_soft, edge_e.api_returns, edge_e.lossy),
+            (caller_c, module_soft, edge_c.api_returns, edge_c.lossy),
+            (caller_h, module_held, edge_h.api_returns, edge_h.lossy),
         ]
         .into_iter()
-        .filter(|(caller, module, _)| {
-            coordinator
-                .registry()
-                .instance_semantic_edges()
-                .any(|record| record.caller == *caller && record.module == *module && record.lossy)
-        })
-        .map(|(caller, module, api_returns)| ShedEdge {
+        .filter(|(_caller, _module, _api_returns, lossy)| *lossy)
+        .map(|(caller, module, api_returns, _lossy)| ShedEdge {
             caller,
             module,
             api_returns,

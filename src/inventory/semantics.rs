@@ -2647,18 +2647,34 @@ impl AttestedSemanticLane {
         self.disclosed_calls_shed
     }
 
-    /// Tests-only EVENTS quiescence: the retained drain holds no
-    /// undelivered record. The positions are staging-aware (the logical
-    /// consumer moves only on consumption), so staged-but-undelivered
-    /// records still read pending. `None` without a live lane or drain
-    /// reads as unknown, never idle.
+    /// Tests-only EVENTS watermark: sample the retained drain's current
+    /// producer position once, after the last fixture call can enter the
+    /// system-wide ring. Draining until the logical consumer reaches the
+    /// sample proves every record committed before it (all fixture calls)
+    /// was consumed, without chasing ambient records that arrive later.
+    /// `None` without a live lane or drain reads as unknown.
     #[cfg(test)]
-    pub(crate) fn events_drain_idle_for_test(&self) -> Option<bool> {
+    pub(crate) fn events_drain_producer_for_test(&self) -> Option<u64> {
         let live = self.live.as_deref()?;
         live.session
             .ring_positions()
             .events
-            .map(|(producer, consumer)| producer == consumer)
+            .map(|(producer, _consumer)| producer)
+    }
+
+    /// Tests-only EVENTS drain progress: the logical consumer has reached
+    /// (or passed) `target_producer` in wrapping ring order. Positions are
+    /// staging-aware (the logical consumer moves only on consumption), so
+    /// staged-but-undelivered records below the watermark still read
+    /// unreached. `None` without a live lane or drain reads as unknown,
+    /// never reached.
+    #[cfg(test)]
+    pub(crate) fn events_drain_reached_for_test(&self, target_producer: u64) -> Option<bool> {
+        let live = self.live.as_deref()?;
+        live.session
+            .ring_positions()
+            .events
+            .map(|(_producer, consumer)| (consumer.wrapping_sub(target_producer) as i64) >= 0)
     }
 
     /// Cumulative disclosed EVENTS ring loss in records: the stop

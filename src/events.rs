@@ -1612,9 +1612,11 @@ pub(crate) fn events_head_pending<S: BoundedRecordSource>(drain: &EventDrain<S>)
 }
 
 /// Drive `step` until it reports idle, at most `bound` times: one bounded
-/// transaction per call, quiescence proven by the step itself (usually
-/// `!events_head_pending` read after the transaction published, so every
-/// submitted record reached a quantum). Returns transactions driven, or
+/// transaction per call, quiescence proven by the step itself: either
+/// `!events_head_pending` read after the transaction published (every
+/// submitted record reached a quantum), or a sampled producer watermark
+/// the step has drained past (immune to fresh ambient records arriving
+/// on a system-wide ring). Returns transactions driven, or
 /// `None` when the bound hit first: the caller fails loudly on `None`
 /// (backlog never drained is not a pass), never treats it as quiescent.
 #[cfg(test)]

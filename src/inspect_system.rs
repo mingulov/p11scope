@@ -164,6 +164,58 @@ pub(crate) fn progress_lines_on() -> bool {
     PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Serializes test-side progress-line toggles with the test-visible
+/// production owners ([`StderrCapture`](crate::inventory_dashboard) and
+/// the quiet guard).
+#[cfg(test)]
+pub(crate) static PROGRESS_LINES_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Locks the test-side progress-line mutation window.
+#[cfg(test)]
+pub(crate) fn lock_progress_lines_for_test() -> std::sync::MutexGuard<'static, ()> {
+    PROGRESS_LINES_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sets the switch under the shared test-side lock without holding it
+/// beyond the single mutation.
+#[cfg(test)]
+pub(crate) fn set_progress_lines_for_test(on: bool) -> bool {
+    let _serial = lock_progress_lines_for_test();
+    set_progress_lines(on)
+}
+
+/// A test-side progress-line change restoring the previous value on drop.
+#[cfg(test)]
+pub(crate) struct ProgressLinesGuard {
+    was: bool,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ProgressLinesGuard {
+    pub(crate) fn new(on: bool) -> Self {
+        let serial = lock_progress_lines_for_test();
+        let was = set_progress_lines(on);
+        Self {
+            was,
+            _serial: serial,
+        }
+    }
+
+    pub(crate) fn set(&self, on: bool) -> bool {
+        set_progress_lines(on)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProgressLinesGuard {
+    fn drop(&mut self) {
+        set_progress_lines(self.was);
+    }
+}
+
 /// `P11SCOPE_STAGE_TIMINGS=1` prints each pass's per-stage wall time to
 /// stderr (the system-scale cost measurement); stdout never carries it.
 pub(crate) fn stage_timings_requested() -> bool {
@@ -5826,12 +5878,12 @@ mod tests {
         // The `progress!` gate (and the census lines routed through
         // it) reads this switch: off while the dashboard owns the
         // terminal, restored after. Output-only while flipped; the
-        // previous setting is restored before return.
-        let was = super::set_progress_lines(false);
+        // guard restores the previous setting and serializes with
+        // every other test-side owner.
+        let guard = super::ProgressLinesGuard::new(false);
         assert!(!super::progress_lines_on());
-        super::set_progress_lines(true);
+        guard.set(true);
         assert!(super::progress_lines_on());
-        super::set_progress_lines(was);
     }
 
     #[test]

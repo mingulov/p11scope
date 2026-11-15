@@ -4,7 +4,6 @@
 
 use super::super::activation::validate_capture_activation;
 use super::*;
-use crate::fixture_guard::DieWithParent as _;
 use std::sync::{Arc, Weak};
 
 fn accepts_cgroup(backend: AttachBackend) {
@@ -198,44 +197,14 @@ impl RetiringCapture {
     /// Run intentional process-exit retention in one owned, bounded child.
     /// Every gated worker is released before assertions, including RED.
     pub(crate) fn run_host_exit_child(test_name: &str, body: impl FnOnce()) {
-        const CHILD: &str = "P11SCOPE_INVENTORY_EXIT_RETENTION_CHILD";
-        if std::env::var(CHILD).as_deref() == Ok(test_name) {
-            body();
+        if !crate::test_support::isolation::enter_with_timeout(
+            test_name,
+            "host-exit-retention",
+            Duration::from_secs(5),
+        ) {
             return;
         }
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-            .env(CHILD, test_name)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut expired = false;
-        loop {
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                expired = true;
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let output = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !expired
-                && output.status.success()
-                && stdout.contains("running 1 test")
-                && stdout.contains("1 passed"),
-            "owned retention child failed (expired={expired}): {}{}",
-            stdout,
-            String::from_utf8_lossy(&output.stderr),
-        );
+        body();
     }
 }
 

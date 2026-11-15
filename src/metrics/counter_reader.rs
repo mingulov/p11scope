@@ -3306,41 +3306,11 @@ mod tests {
         set(need, need)
     }
 
-    // rlim_t is 32-bit on ia32, so the u64 casts are needed off LP64.
+    // rlim_t is 32-bit on ia32, so the u64 cast is needed off LP64.
     #[allow(clippy::unnecessary_cast)]
-    fn ensure_growth_fd_budget(final_count: usize) {
+    fn ensure_growth_fd_budget(final_count: usize) -> crate::test_support::isolation::FdLimitGuard {
         let need = growth_fd_soft_floor(final_count);
-        ensure_fd_budget_with(
-            need,
-            || {
-                let mut limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                // SAFETY: getrlimit writes one initialized rlimit; no limit changes.
-                if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok((limit.rlim_cur as u64, limit.rlim_max as u64))
-            },
-            |soft, hard| {
-                let limit = libc::rlimit {
-                    rlim_cur: soft as libc::rlim_t,
-                    rlim_max: hard as libc::rlim_t,
-                };
-                // SAFETY: setrlimit only raises this process's NOFILE caps to
-                // the growth run's staged budget; it never lowers a limit.
-                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            },
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "growth run needs soft RLIMIT_NOFILE {need} for {final_count} endpoints: {error}"
-            )
-        });
+        crate::test_support::isolation::FdLimitGuard::raise_soft_to_at_least(need as libc::rlim_t)
     }
 
     struct GrowthDriver {
@@ -4170,6 +4140,8 @@ mod tests {
     }
 
     struct NativeGrowthRun {
+        // Hold the staged fd budget until the run finishes.
+        _fd_limit: crate::test_support::isolation::FdLimitGuard,
         // Kill/reap an owned blocked driver before the Session drops on failure.
         fixture: GrowthDriver,
         session: Session,
@@ -4206,7 +4178,7 @@ mod tests {
                 env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
                 "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
             );
-            ensure_growth_fd_budget(final_count);
+            let fd_limit = ensure_growth_fd_budget(final_count);
             let provider = PathBuf::from(
                 std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER")
                     .expect("prebuild counter-bank-growth.c with -DCOUNTER_BANK_GROWTH_PROVIDER"),
@@ -4336,6 +4308,7 @@ mod tests {
                 rv_keys: 65536,
             };
             let mut run = Self {
+                _fd_limit: fd_limit,
                 fixture,
                 session,
                 collector: CounterCollector::new(limits, pool.reserver()),
@@ -5901,40 +5874,20 @@ mod tests {
         format!("\n{SOFT1024_DONE_MARKER} {cell}\n")
     }
 
+    // rlim_t is 32-bit on ia32, so the u64 casts are needed off LP64.
+    #[allow(clippy::unnecessary_cast)]
     fn soft_nofile() -> u64 {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized rlimit value; no change.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-            0
-        );
-        limit.rlim_cur
+        crate::test_support::isolation::FdLimitGuard::current().rlim_cur as u64
     }
 
+    #[allow(clippy::unnecessary_cast)]
     fn hard_nofile() -> u64 {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized rlimit value; no change.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-            0
-        );
-        limit.rlim_max
+        crate::test_support::isolation::FdLimitGuard::current().rlim_max as u64
     }
 
-    fn set_soft_nofile(soft: u64) {
-        let hard = hard_nofile();
-        let limit = libc::rlimit {
-            rlim_cur: soft,
-            rlim_max: hard,
-        };
-        // SAFETY: lowering the soft limit never exceeds the hard limit.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    #[allow(clippy::unnecessary_cast)]
+    fn set_soft_nofile(soft: u64) -> crate::test_support::isolation::FdLimitGuard {
+        crate::test_support::isolation::FdLimitGuard::set_soft(soft as libc::rlim_t)
     }
 
     /// Verifies a soft-1024 child's captured stdout: the child must have
@@ -6131,7 +6084,7 @@ mod tests {
         );
         soft1024_cell("raise", TEST, 180, || {
             assert_eq!(hard_nofile(), hard);
-            set_soft_nofile(1024);
+            let _limit = set_soft_nofile(1024);
             assert_eq!(soft_nofile(), 1024);
             let mut parts = engine_counter_fixture();
             let first = parts.slots[..512].to_vec();
@@ -6179,7 +6132,7 @@ mod tests {
             "the bypass proves nothing without a high hard limit, got {hard}"
         );
         soft1024_cell("bypass", TEST, 180, || {
-            set_soft_nofile(1024);
+            let _limit = set_soft_nofile(1024);
             assert_eq!(soft_nofile(), 1024);
             let parts = engine_counter_fixture();
             // Direct preparation bypasses the start chain raise.

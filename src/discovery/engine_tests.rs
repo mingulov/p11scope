@@ -39480,32 +39480,8 @@ fn named_generation_change_during_attach_drops_before_event_consumption() {
 /// child: lowering the hard limit is process-global and irreversible.
 #[test]
 fn named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup() {
-    const CHILD: &str = "P11SCOPE_NAMED_WAIT_CHILD";
-    const COMPLETED: &str = "P11SCOPE_NAMED_WAIT_COMPLETED";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "discovery::engine::tests::named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "named-wait child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line == COMPLETED),
-            "named-wait child did not complete its assertions:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+    const TEST: &str = "discovery::engine::tests::named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup";
+    if !crate::test_support::isolation::enter(TEST, "named-wait") {
         return;
     }
     const SOFT: u64 = 256;
@@ -39515,27 +39491,12 @@ fn named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup() {
     let provider = E07Provider::dlopen();
     let live_pid = std::process::id();
     let named_view = ProcessView::open(ProcessViewId(0), live_pid).expect("the named view opens");
-    let mut current = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit writes one initialized writable rlimit.
-    assert_eq!(
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-        0
-    );
+    let current = crate::test_support::isolation::FdLimitGuard::current();
     assert!(
         current.rlim_max >= SOFT,
         "the box must allow a 256 hard fd limit for the named-wait child"
     );
-    let lowered = libc::rlimit {
-        rlim_cur: SOFT,
-        rlim_max: SOFT,
-    };
-    // SAFETY: lowering both limits in the isolated child; the child
-    // exits after its assertions, so the irreversible hard-limit drop
-    // never escapes to siblings.
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(SOFT);
     // Blockers hold the table to zero projected pin-opens above the
     // reserve (the intra-scan-stop twin's arithmetic): the loop-top
     // still admits, the view pin consumes one more, and the first pin
@@ -39694,7 +39655,6 @@ fn named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup() {
         engine.views[0].still_the_same(),
         "the retried view is still the original generation"
     );
-    println!("\n{COMPLETED}");
 }
 
 /// View-collapse fix8 F3 at the loop-top (same defect shape as the
@@ -39705,59 +39665,20 @@ fn named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup() {
 /// retry on the same view. Runs in an isolated child.
 #[test]
 fn named_initial_reserve_deferral_pends_for_retry_instead_of_terminating_startup() {
-    const CHILD: &str = "P11SCOPE_NAMED_RESERVE_CHILD";
-    const COMPLETED: &str = "P11SCOPE_NAMED_RESERVE_COMPLETED";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "discovery::engine::tests::named_initial_reserve_deferral_pends_for_retry_instead_of_terminating_startup",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "named-reserve child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line == COMPLETED),
-            "named-reserve child did not complete its assertions:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+    const TEST: &str = "discovery::engine::tests::named_initial_reserve_deferral_pends_for_retry_instead_of_terminating_startup";
+    if !crate::test_support::isolation::enter(TEST, "named-reserve") {
         return;
     }
     const SOFT: u64 = 256;
     let provider = E07Provider::dlopen();
     let live_pid = std::process::id();
     let named_view = ProcessView::open(ProcessViewId(0), live_pid).expect("the named view opens");
-    let mut current = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit writes one initialized writable rlimit.
-    assert_eq!(
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-        0
-    );
+    let current = crate::test_support::isolation::FdLimitGuard::current();
     assert!(
         current.rlim_max >= SOFT,
         "the box must allow a 256 hard fd limit for the named-reserve child"
     );
-    let lowered = libc::rlimit {
-        rlim_cur: SOFT,
-        rlim_max: SOFT,
-    };
-    // SAFETY: lowering both limits in the isolated child; the child
-    // exits after its assertions, so the irreversible hard-limit drop
-    // never escapes to siblings.
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(SOFT);
     // Blockers hold the table past the reserve before the pass starts,
     // so the loop-top gate defers before any scan opens.
     let target_open = SOFT - crate::fd_budget::FD_RESERVE + 1;
@@ -39891,7 +39812,6 @@ fn named_initial_reserve_deferral_pends_for_retry_instead_of_terminating_startup
         engine.views[0].still_the_same(),
         "the retried view is still the original generation"
     );
-    println!("\n{COMPLETED}");
 }
 
 /// Mutation caught: retrying without subtracting an originally accepted stale
@@ -51092,32 +51012,9 @@ fn scan_pins_waited_only_for_budget_names_the_preemptive_stop() {
 /// the first pin deterministically. Runs in an isolated child.
 #[test]
 fn intra_scan_reserve_stop_defers_whole_view_for_retry() {
-    const CHILD: &str = "P11SCOPE_INTRA_SCAN_STOP_CHILD";
-    const COMPLETED: &str = "P11SCOPE_INTRA_SCAN_STOP_COMPLETED";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "discovery::engine::tests::intra_scan_reserve_stop_defers_whole_view_for_retry",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "intra-scan-stop child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line == COMPLETED),
-            "intra-scan-stop child did not complete its assertions:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+    const TEST: &str =
+        "discovery::engine::tests::intra_scan_reserve_stop_defers_whole_view_for_retry";
+    if !crate::test_support::isolation::enter(TEST, "intra-scan-stop") {
         return;
     }
     const SOFT: u64 = 256;
@@ -51125,27 +51022,12 @@ fn intra_scan_reserve_stop_defers_whole_view_for_retry() {
     // a hintless self-scan sees no provider modules, while the hinted
     // scan below deterministically yields the fixture's pins.
     let provider = E07Provider::dlopen();
-    let mut current = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit writes one initialized writable rlimit.
-    assert_eq!(
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-        0
-    );
+    let current = crate::test_support::isolation::FdLimitGuard::current();
     assert!(
         current.rlim_max >= SOFT,
         "the box must allow a 256 hard fd limit for the intra-scan-stop child"
     );
-    let lowered = libc::rlimit {
-        rlim_cur: SOFT,
-        rlim_max: SOFT,
-    };
-    // SAFETY: lowering both limits in the isolated child; the child
-    // exits after its assertions, so the irreversible hard-limit drop
-    // never escapes to siblings.
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(SOFT);
     // Blockers hold the table to zero projected pin-opens above the
     // reserve: the loop-top still admits (127 leaves 129), the view
     // open consumes one more, and the first pin would breach — so the
@@ -51264,7 +51146,6 @@ fn intra_scan_reserve_stop_defers_whole_view_for_retry() {
         engine.handles_last_retry_delay_ns.is_some(),
         "the retry measures its defer-to-retry delay"
     );
-    println!("\n{COMPLETED}");
 }
 
 /// View-collapse fix8 F2 at the admission seam (codex blocking
@@ -51416,6 +51297,7 @@ fn intra_scan_budget_stop_defers_whole_view_for_retry() {
 /// asserted only for presence: it rides host scheduling, never a bound.
 #[test]
 fn library_handle_deferral_marks_handles_first_and_retries() {
+    let child = spawn_execed_sleep();
     let mut engine = Engine::empty();
     for id in [1001u32, 1002] {
         let pins = crate::discovery::identity::test_fixture::real_scan_pin(
@@ -51435,7 +51317,7 @@ fn library_handle_deferral_marks_handles_first_and_retries() {
     }
     engine.file_fixture_pins_for_test();
     engine.set_table_cap_for_test(2);
-    let live_pid = std::process::id();
+    let live_pid = child.id();
     let tick_start = 1_000_000u64;
     engine
         .scheduler
@@ -51491,6 +51373,7 @@ fn library_handle_deferral_marks_handles_first_and_retries() {
         .handles_last_retry_delay_ns
         .expect("the retry measures its defer-to-retry delay");
     eprintln!("handles_retry_delay_ns={delay}");
+    drop(child);
 }
 
 /// View-collapse fix7 21:10 addendum (deferred-first ordering): a
@@ -71407,20 +71290,11 @@ fn collected_graph_peak_fits_pool_at_system_scale() {
     // FD headroom for the 4096 pin files plus the 16384 native links.
     // Unprivileged: the soft cap rises only within the hard cap, and the
     // test fails loudly when the box cannot host the population.
-    unsafe {
-        let mut current = std::mem::zeroed::<libc::rlimit>();
-        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut current), 0);
-        current.rlim_cur = current.rlim_cur.max(32768).min(current.rlim_max);
-        assert_eq!(
-            libc::setrlimit(libc::RLIMIT_NOFILE, &current),
-            0,
-            "the box must allow 32768 fds for the sizing population"
-        );
-        assert!(
-            current.rlim_cur >= 32768,
-            "the hard fd cap is below the sizing population"
-        );
-    }
+    let _limit = crate::test_support::isolation::FdLimitGuard::raise_soft_to_at_least(32768);
+    assert!(
+        crate::test_support::isolation::FdLimitGuard::current().rlim_cur >= 32768,
+        "the hard fd cap is below the sizing population"
+    );
     const VIEWS: u32 = 4096;
     // One shared tempfile backs all 4096 pins: real pins (matching the
     // opened file, so retention succeeds) with distinct overridden keys.
@@ -82614,10 +82488,9 @@ fn handle_table_owned_loader_unavailable_on_budget_wait() {
 /// so the rescan must wait rather than share.
 #[test]
 fn handle_table_refresh_rescan_defers_on_budget_wait() {
-    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let (fixture, view, _module, _pins) = loaded_seed_provider();
     let pid = view.pid();
     let mut engine = lifecycle_discovered(vec![view]);
-    let provider = E07Provider::dlopen();
     let views = BTreeSet::from([ProcessViewId(0)]);
     let dir = tempfile::tempdir().unwrap();
     let live = fill_handle_table_to_cap_for_test(&mut engine, dir.path(), 1);
@@ -82653,7 +82526,7 @@ fn handle_table_refresh_rescan_defers_on_budget_wait() {
         engine.counters.object_skips
     );
     drop(live);
-    drop(provider);
+    drop(fixture);
 }
 
 /// D1 twin: with the table full, a learned candidate is pushed back
@@ -83224,11 +83097,72 @@ fn handle_table_loader_record_restores_without_resolving_on_budget_wait() {
 #[test]
 fn handle_table_mixed_capture_holds_len_within_cap() {
     const CAP: usize = 4;
-    let first = E07Provider::dlopen();
-    let second = E07Provider::dlopen();
-    let live_pid = std::process::id();
+    // An owned child maps the providers: scanning this test process would
+    // race every sibling that dlopens the E07 fixture. The first four are
+    // mapped before the first tick; the fifth waits behind a gate file so
+    // the refresh below still meets a genuinely late provider.
+    let (seed, _seed_view, _seed_module, _seed_pins) = loaded_seed_provider();
+    let bytes = std::fs::read(seed._dir.path().join("seed-provider.so")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("load-late");
+    let runner_source = dir.path().join("provider-runner.c");
+    let runner = dir.path().join("provider-runner");
+    std::fs::write(
+        &runner_source,
+        r#"
+#include <dlfcn.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc < 3) return 2;
+    for (int i = 2; i + 1 < argc; i++) {
+        if (dlopen(argv[i], RTLD_NOW | RTLD_LOCAL) == 0) return 3;
+    }
+    while (access(argv[1], F_OK) != 0) usleep(5000);
+    if (dlopen(argv[argc - 1], RTLD_NOW | RTLD_LOCAL) == 0) return 4;
+    for (;;) pause();
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .arg("-o")
+            .arg(&runner)
+            .arg(&runner_source)
+            .arg("-ldl")
+            .status()
+            .unwrap()
+            .success(),
+        "the provider runner must compile"
+    );
+    let providers: Vec<PathBuf> = (0..CAP + 1)
+        .map(|n| {
+            let path = dir.path().join(format!("provider-{n}.so"));
+            std::fs::write(&path, &bytes).unwrap();
+            path
+        })
+        .collect();
+    let mut child = std::process::Command::new(&runner)
+        .arg(&gate)
+        .args(&providers)
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let live_pid = child.id();
+    let mapped = |path: &PathBuf| {
+        std::fs::read_to_string(format!("/proc/{live_pid}/maps"))
+            .is_ok_and(|maps| maps.contains(path.to_str().unwrap()))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !providers[..CAP].iter().all(&mapped) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owned provider process maps its first providers"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let mut engine = Engine::empty();
-    engine.module_hints = vec![first.path.clone(), second.path.clone()];
+    engine.module_hints = providers[..CAP].to_vec();
     engine.set_table_cap_for_test(CAP);
     let tick_start = 1_000_000u64;
     engine
@@ -83336,8 +83270,15 @@ fn handle_table_mixed_capture_holds_len_within_cap() {
     // an expired quantum would skip the rescan instead of testing it.
     let topup_dir = tempfile::tempdir().unwrap();
     let topup = fill_handle_table_to_cap_for_test(&mut engine, topup_dir.path(), CAP);
-    let third = E07Provider::dlopen();
-    engine.module_hints.push(third.path.clone());
+    std::fs::write(&gate, b"load\n").unwrap();
+    while !mapped(&providers[CAP]) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owned provider process maps the late provider"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    engine.module_hints.push(providers[CAP].clone());
     // The F1 shape: the view stays retained but its scan state is
     // dropped, so the rescan below faces a full candidate (including
     // the late provider) instead of revalidating retained modules.
@@ -83373,4 +83314,7 @@ fn handle_table_mixed_capture_holds_len_within_cap() {
         "every deferral files a counted gap"
     );
     drop(topup);
+    drop(seed);
+    let _ = child.kill();
+    let _ = child.wait();
 }

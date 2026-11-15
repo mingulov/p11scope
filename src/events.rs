@@ -3525,28 +3525,9 @@ mod tests {
 
     #[test]
     fn domain_boundary_retention_survives_session_and_temporary_drains() {
-        const CHILD: &str = "P11SCOPE_EVENTS_RETENTION_CHILD";
-        const COMPLETE: &str = "EVENTS_RETENTION_CHILD_COMPLETE";
-        if std::env::var_os(CHILD).is_none() {
-            // A parallel OwnedChild test may fork while this fixture's socket
-            // is open. Its child then retains the socket until exec, despite
-            // our local FD being closed. Create this fixture only after exec.
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "events::tests::domain_boundary_retention_survives_session_and_temporary_drains",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .expect("run isolated EVENTS retention fixture");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success() && stdout.lines().any(|line| line == COMPLETE),
-                "isolated retention fixture: {}\nstdout: {stdout}\nstderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
+        const TEST: &str =
+            "events::tests::domain_boundary_retention_survives_session_and_temporary_drains";
+        if !crate::test_support::isolation::enter(TEST, "events-retention") {
             return;
         }
         // A real owned file descriptor tests lifetime only, NOT BPF map identity.
@@ -3596,7 +3577,6 @@ mod tests {
         );
         drop(tracker);
         assert!(weak.upgrade().is_none());
-        println!("\n{COMPLETE}");
     }
 
     #[test]

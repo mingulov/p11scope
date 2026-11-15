@@ -1420,7 +1420,6 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
-    use crate::fixture_guard::DieWithParent as _;
 
     fn watched(path: &Path, soname: &[u8]) -> WatchedProvider {
         let (dev, ino) = record_identity_of(path);
@@ -2742,7 +2741,6 @@ mod tests {
     // adverse analysis runs in an owned child with a bounded wait: the
     // parent kills a blocked child and fails, so RED never hangs the
     // suite. Cold/cached x executable/intermediate.
-    const FIFO_CHILD_MARKER: &str = "P11SCOPE_614B_FIFO_CHILD";
     const FIFO_CHILD_DIR: &str = "P11SCOPE_614B_FIFO_DIR";
     const FIFO_CHILD_TIMEOUT_SECS: u64 = 15;
 
@@ -2764,63 +2762,32 @@ mod tests {
     /// Parent side: respawn this same test in an owned child with a
     /// bounded wait; child side: run `child` in the parent-owned dir.
     /// A blocked child is killed and fails the test instead of hanging
-    /// it. The `1 passed` plus marker assertions keep a misnamed
-    /// `--exact` selector (zero tests run) from passing vacuously.
+    /// it. The helper's exact one-test check plus the marker assertion
+    /// keep a misnamed selector (zero tests run) from passing vacuously.
     fn fifo_child_or_spawn(test_name: &str, case: &str, child: fn(&Path)) {
-        use std::process::{Command, Stdio};
-        if std::env::var_os(FIFO_CHILD_MARKER).is_some() {
+        let test = format!("discovery::elf_needed::tests::{test_name}");
+        if crate::test_support::isolation::in_child(&test, case) {
             let dir = std::env::var_os(FIFO_CHILD_DIR).expect("fifo child dir");
             child(Path::new(&dir));
             println!("FIFO-CASE {case} DONE");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let mut spawned = Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg(format!("discovery::elf_needed::tests::{test_name}"))
-            .arg("--nocapture")
-            .env(FIFO_CHILD_MARKER, "1")
-            .env(FIFO_CHILD_DIR, dir.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(FIFO_CHILD_TIMEOUT_SECS);
-        loop {
-            match spawned.try_wait().unwrap() {
-                Some(status) => {
-                    let mut stdout = String::new();
-                    use std::io::Read as _;
-                    spawned
-                        .stdout
-                        .take()
-                        .unwrap()
-                        .read_to_string(&mut stdout)
-                        .unwrap();
-                    assert!(
-                        status.success()
-                            && stdout.contains("1 passed")
-                            && stdout.contains(&format!("FIFO-CASE {case} DONE")),
-                        "fifo case {case} child failed: status={status} stdout={stdout:?}"
-                    );
-                    return;
-                }
-                None => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = spawned.kill();
-                        let _ = spawned.wait();
-                        panic!(
-                            "fifo case {case} blocked: a replaced-path open must refuse a \
-                             writerless FIFO promptly"
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
-        }
+        let output = crate::test_support::isolation::run_child_with_timeout(
+            &test,
+            case,
+            std::time::Duration::from_secs(FIFO_CHILD_TIMEOUT_SECS),
+            |command| {
+                command
+                    .env(FIFO_CHILD_DIR, dir.path())
+                    .stderr(std::process::Stdio::inherit());
+            },
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("FIFO-CASE {case} DONE")),
+            "fifo case {case} child did not complete: stdout={stdout:?}"
+        );
     }
 
     fn fifo_case_exe_cold(dir: &Path) {

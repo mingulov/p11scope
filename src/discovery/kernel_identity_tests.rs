@@ -297,33 +297,8 @@ fn anchor_mapping_held(mapping: &MapEntry) -> bool {
 
 #[test]
 fn d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass() {
-    const CHILD: &str = "P11SCOPE_D3B_ANCHOR_REUSE_CHILD";
-    const COMPLETED: &str = "P11SCOPE_D3B_ANCHOR_REUSE_REFUSALS_COMPLETED";
-    if std::env::var_os(CHILD).is_none() {
-        // Keep deliberate address reuse out of other tests' address space.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "discovery::kernel_identity::tests::d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "anchor reuse child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line == COMPLETED),
-            "anchor reuse child did not complete its refusal assertions:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+    const TEST: &str = "discovery::kernel_identity::tests::d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass";
+    if !crate::test_support::isolation::enter(TEST, "anchor-reuse") {
         return;
     }
 
@@ -404,7 +379,6 @@ fn d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass() {
         );
         assert_eq!(before, read_count(), "refusal performed iterator I/O");
     }
-    println!("\n{COMPLETED}");
 }
 
 #[test]
@@ -680,26 +654,9 @@ impl ClosedFdEvidence {
 
 #[test]
 fn d3c_fd_close_snapshot_survives_rebound_same_inode() {
-    const CHILD: &str = "P11SCOPE_D3C_FD_CLOSE_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        // Isolate dup2 from other tests' descriptor allocation. The child
-        // runs this exact cell with one harness thread and owns its FDs.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "discovery::kernel_identity::tests::d3c_fd_close_snapshot_survives_rebound_same_inode",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "FD close child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    const TEST: &str =
+        "discovery::kernel_identity::tests::d3c_fd_close_snapshot_survives_rebound_same_inode";
+    if !crate::test_support::isolation::enter(TEST, "fd-close-snapshot") {
         return;
     }
 
@@ -6566,93 +6523,10 @@ fn custody_discarded_scan_returns_ledger_headroom() {
 
 #[test]
 fn custody_scan_boundary_recounts_pins_before_ledger_take() {
-    const CHILD: &str = "P11SCOPE_CUSTODY_PIN_RECENSUS_CHILD";
-    const COMPLETED: &str = "P11SCOPE_CUSTODY_PIN_RECENSUS_COMPLETED";
-    if std::env::var_os(CHILD).is_none() {
-        // The low-headroom phase lowers RLIMIT_NOFILE, which is
-        // process-global: run it in an isolated child with one harness
-        // thread so sibling tests never observe the lowered ceiling.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "discovery::kernel_identity::tests::custody_scan_boundary_recounts_pins_before_ledger_take",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "pin-recensus child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line == COMPLETED),
-            "pin-recensus child did not complete its assertions:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+    const TEST: &str =
+        "discovery::kernel_identity::tests::custody_scan_boundary_recounts_pins_before_ledger_take";
+    if !crate::test_support::isolation::enter(TEST, "pin-recensus") {
         return;
-    }
-
-    // Guards a temporarily lowered soft RLIMIT_NOFILE, restoring the saved
-    // limit on demand and on drop. The child runs single-threaded, so no
-    // suite-wide serial is needed.
-    struct LoweredFdLimit {
-        saved: libc::rlimit,
-        restored: bool,
-    }
-    impl LoweredFdLimit {
-        fn lower_to(soft: libc::rlim_t) -> Self {
-            let mut saved = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            // SAFETY: getrlimit/setrlimit only read and write the owned
-            // structs; the soft limit is lowered, never raised past the
-            // retained hard limit.
-            assert_eq!(
-                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
-                0
-            );
-            assert!(
-                saved.rlim_cur > soft,
-                "the lowered limit must sit below the current one"
-            );
-            let lowered = libc::rlimit {
-                rlim_cur: soft,
-                rlim_max: saved.rlim_max,
-            };
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
-            Self {
-                saved,
-                restored: false,
-            }
-        }
-        fn restore(&mut self) {
-            if !self.restored {
-                // SAFETY: the saved limit was read from this process and
-                // only ever lowers-then-restores the soft ceiling.
-                assert_eq!(
-                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) },
-                    0
-                );
-                self.restored = true;
-            }
-        }
-    }
-    impl Drop for LoweredFdLimit {
-        fn drop(&mut self) {
-            if !self.restored {
-                // SAFETY: as in restore; errors are ignored so a panic
-                // cannot turn into an abort here.
-                let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
-                self.restored = true;
-            }
-        }
     }
 
     fn open_fds() -> usize {
@@ -6693,7 +6567,8 @@ fn custody_scan_boundary_recounts_pins_before_ledger_take() {
     // fail; the lowered ceiling still leaves 32 descriptors spare.
     let (press_file, press_examined) = opened(dir.path(), "pressured.so");
     let held_before = custody.candidates.len();
-    let mut limit = LoweredFdLimit::lower_to((open_fds() as libc::rlim_t) + 32);
+    let mut limit =
+        crate::test_support::isolation::FdLimitGuard::lower_soft((open_fds() as libc::rlim_t) + 32);
     let scan3 = custody.begin_scan();
     let (took3, third) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
         custody.offer(scan3, press_examined, press_file)
@@ -6718,7 +6593,6 @@ fn custody_scan_boundary_recounts_pins_before_ledger_take() {
             .all(|held| held.file.metadata().is_ok()),
         "the refusal dropped earlier custody"
     );
-    println!("\n{COMPLETED}");
 }
 
 #[test]

@@ -18259,15 +18259,7 @@ pub(crate) mod tests {
     /// current limit so the twins run wherever the suite runs (the
     /// typical soft limit is 1024, giving marker 512 under limit 256).
     fn lowered_limit_pair() -> (libc::c_int, libc::rlim_t) {
-        let mut current = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit only writes the owned struct.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-            0
-        );
+        let current = crate::test_support::isolation::FdLimitGuard::current();
         assert!(
             current.rlim_cur >= 48,
             "the suite needs headroom above a lowered fd limit"
@@ -18294,79 +18286,6 @@ pub(crate) mod tests {
         unsafe { std::os::fd::OwnedFd::from_raw_fd(high) }
     }
 
-    /// Guards a temporarily lowered soft RLIMIT_NOFILE, restoring the
-    /// saved limit on demand and on drop (the drop path never panics,
-    /// so a failing twin cannot abort the harness during unwinding).
-    struct LoweredFdLimit {
-        saved: libc::rlimit,
-        restored: bool,
-        // Held for the whole lowered window: the soft limit is
-        // process-global, so two twins lowering at once corrupt each
-        // other's window (and every sibling's fd opens). The guard
-        // serializes all lowerings suite-wide.
-        _serial: std::sync::MutexGuard<'static, ()>,
-    }
-
-    static LOWERED_FD_LIMIT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    impl LoweredFdLimit {
-        fn lower_to(soft: libc::rlim_t) -> Self {
-            // A poisoned mutex still yields its guard: a failed twin
-            // must not wedge the rest of the suite.
-            let serial = LOWERED_FD_LIMIT_SERIAL
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut saved = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            // SAFETY: getrlimit/setrlimit only read and write the
-            // owned structs; the soft limit is lowered, never raised
-            // past the retained hard limit.
-            assert_eq!(
-                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
-                0
-            );
-            assert!(
-                saved.rlim_cur > soft,
-                "the lowered limit must sit below the current one"
-            );
-            let lowered = libc::rlimit {
-                rlim_cur: soft,
-                rlim_max: saved.rlim_max,
-            };
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
-            Self {
-                saved,
-                restored: false,
-                _serial: serial,
-            }
-        }
-
-        fn restore(&mut self) {
-            if !self.restored {
-                // SAFETY: the saved limit was read from this process
-                // and only ever lowers-then-restores the soft ceiling.
-                assert_eq!(
-                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) },
-                    0
-                );
-                self.restored = true;
-            }
-        }
-    }
-
-    impl Drop for LoweredFdLimit {
-        fn drop(&mut self) {
-            if !self.restored {
-                // SAFETY: as in restore; errors are ignored so a
-                // panic cannot turn into an abort here.
-                let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
-                self.restored = true;
-            }
-        }
-    }
-
     #[test]
     fn rust_spawn_scrubs_fds_above_lowered_limit() {
         // Lowered-limit twin for the Rust pre-exec scrub: a marker fd
@@ -18384,7 +18303,7 @@ pub(crate) mod tests {
         let (marker_min, lowered) = lowered_limit_pair();
         let high = dup_high_marker(&held, marker_min);
         let target = std::fs::read_link(format!("/proc/self/fd/{}", high.as_raw_fd())).unwrap();
-        let mut limit = LoweredFdLimit::lower_to(lowered);
+        let mut limit = crate::test_support::isolation::FdLimitGuard::lower_soft(lowered);
         // The child's table is fixed at spawn, so the suite's limit
         // is restored inside the handshake: concurrent tests never
         // observe the lowered ceiling.
@@ -18427,7 +18346,7 @@ pub(crate) mod tests {
         let high = dup_high_marker(&held, marker_min);
         let target = std::fs::read_link(format!("/proc/self/fd/{}", high.as_raw_fd())).unwrap();
         let ready = dir.path().join("ready");
-        let mut limit = LoweredFdLimit::lower_to(lowered);
+        let mut limit = crate::test_support::isolation::FdLimitGuard::lower_soft(lowered);
         // The driver inherits the lowered limit at fork; restoring
         // the suite's limit right after spawn cannot reopen what its
         // startup sweep already decided.

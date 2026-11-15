@@ -19,8 +19,6 @@ use std::time::{Duration, Instant};
 
 /// Re-exec entrypoint selector for fixture children.
 const ENTRYPOINT: &str = "attach::prearm_witness::prearm_witness_tests::witness_fixture_entrypoint";
-/// Fixture protocol environment.
-const ENV_CHILD: &str = "P11SCOPE_PW_CHILD";
 const ENV_SO: &str = "P11SCOPE_PW_SO";
 const ENV_MEMBER_PID: &str = "P11SCOPE_PW_MEMBER_PID";
 const ENV_RELEASE: &str = "P11SCOPE_PW_RELEASE";
@@ -105,10 +103,8 @@ impl FixtureChild {
     /// Spawns the re-exec entrypoint with `mode` and extra env. `pipes`
     /// selects stdin/stdout pipes (null otherwise).
     fn spawn(mode: &str, envs: &[(&str, &str)], pipes: bool) -> Self {
-        let exe = std::env::current_exe().expect("current test binary");
-        let mut command = Command::new(exe);
-        command.args([ENTRYPOINT, "--exact", "--ignored", "--nocapture"]);
-        command.env(ENV_CHILD, mode);
+        let mut command = crate::test_support::isolation::command(ENTRYPOINT, mode);
+        command.arg("--ignored");
         for (key, value) in envs {
             command.env(key, value);
         }
@@ -796,11 +792,14 @@ fn privileged_walk_scale_completes() {
 }
 
 /// Re-exec entrypoint for fixture children (manifest-helper precedent):
-/// the mode comes from `P11SCOPE_PW_CHILD`. Not a standalone cell.
+/// the mode comes from the shared isolated-child gate. Not a standalone cell.
 #[test]
 #[ignore = "private witness fixture helper; invoked by P2-7 cells"]
 fn witness_fixture_entrypoint() {
-    match std::env::var(ENV_CHILD).expect("fixture mode").as_str() {
+    match crate::test_support::isolation::child_key(ENTRYPOINT)
+        .expect("fixture mode")
+        .as_str()
+    {
         "scripted" => fixture_scripted(),
         "just_exit" => std::process::exit(42),
         "holder" => fixture_holder(),
@@ -896,11 +895,9 @@ fn fixture_scripted() {
             }
             "EXEC_JUST_EXIT" => {
                 use std::os::unix::process::CommandExt as _;
-                let exe = std::env::current_exe().expect("current exe");
-                let error = Command::new(exe)
-                    .args([ENTRYPOINT, "--exact", "--ignored", "--nocapture"])
-                    .env(ENV_CHILD, "just_exit")
-                    .exec();
+                let mut command = crate::test_support::isolation::command(ENTRYPOINT, "just_exit");
+                command.arg("--ignored");
+                let error = command.exec();
                 panic!("exec just_exit failed: {error}");
             }
             "QUIT" => {
@@ -1074,14 +1071,10 @@ fn fixture_nested_probe() {
         0,
         "unshare pidns (need privileges)"
     );
-    let exe = std::env::current_exe().expect("current exe");
     let so = std::env::var(ENV_SO).expect("fixture so path");
-    let inner = Command::new(exe)
-        .args([ENTRYPOINT, "--exact", "--ignored", "--nocapture"])
-        .env(ENV_CHILD, "nested_inner")
-        .env(ENV_SO, so)
-        .output()
-        .expect("spawn nested inner");
+    let mut inner_command = crate::test_support::isolation::command(ENTRYPOINT, "nested_inner");
+    inner_command.arg("--ignored").env(ENV_SO, so);
+    let inner = inner_command.output().expect("spawn nested inner");
     let report = String::from_utf8_lossy(&inner.stdout);
     for line in report.lines() {
         say(&format!("INNER {line}"));

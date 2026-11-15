@@ -1805,14 +1805,17 @@ mod tests {
     /// shed reopen of an invoker-owned pipe fails EACCES. The preserve
     /// runs in a child (a fresh `OnceLock`, piped stdout), with a
     /// reopen that always fails the way the shed one does.
-    const PRESERVE_CHILD: &str = "P11SCOPE_SINK_PRESERVE_CHILD";
     const PRESERVED_LINE: &[u8] = b"PRESERVED STDOUT\n";
 
-    fn preserve_child() {
-        let mode = std::env::var(PRESERVE_CHILD).unwrap_or_default();
-        if mode.is_empty() {
+    fn scoped_test(test: &str) -> String {
+        let module = module_path!().split_once("::").unwrap().1;
+        format!("{module}::{test}")
+    }
+
+    fn preserve_child(test: &str) {
+        let Some(mode) = crate::test_support::isolation::child_key(&scoped_test(test)) else {
             return;
-        }
+        };
         // The parent pipes our stdout: fd 1 must be the FIFO case.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::fstat(1, &raw mut stat) }, 0);
@@ -1891,18 +1894,14 @@ mod tests {
     }
 
     fn preserve_command(test: &str, mode: &str) -> std::process::Command {
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        let module = module_path!().split_once("::").unwrap().1;
-        command
-            .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
-            .env(PRESERVE_CHILD, mode)
-            .stdout(std::process::Stdio::piped());
+        let mut command = crate::test_support::isolation::command(&scoped_test(test), mode);
+        command.stdout(std::process::Stdio::piped());
         command
     }
 
     #[test]
     fn preserved_stdout_bypasses_a_failing_reopen() {
-        preserve_child();
+        preserve_child("preserved_stdout_bypasses_a_failing_reopen");
         let output = preserve_command("preserved_stdout_bypasses_a_failing_reopen", "preserve")
             .output()
             .unwrap();
@@ -1925,7 +1924,7 @@ mod tests {
     /// saved one (the child's original stdout).
     #[test]
     fn retargeted_stdout_ignores_the_preserved_description() {
-        preserve_child();
+        preserve_child("retargeted_stdout_ignores_the_preserved_description");
         let output = preserve_command(
             "retargeted_stdout_ignores_the_preserved_description",
             "retarget",
@@ -1948,7 +1947,7 @@ mod tests {
 
     #[test]
     fn unpreserved_stdout_still_uses_the_reopen() {
-        preserve_child();
+        preserve_child("unpreserved_stdout_still_uses_the_reopen");
         let output = preserve_command("unpreserved_stdout_still_uses_the_reopen", "no-preserve")
             .output()
             .unwrap();
@@ -2151,31 +2150,20 @@ mod tests {
     /// fresh process (a new `OnceLock`, piped stderr, stdout on null so
     /// only stderr preservation takes a fd), preserves, then — in the
     /// exhausted modes — drops `RLIMIT_NOFILE` to 4 before the call.
-    const EXHAUST_CHILD: &str = "P11SCOPE_SINK_EXHAUST_CHILD";
     const EXHAUST_REFUSAL: &[u8] =
         b"p11scope: inventory --system: live capture did not start: Too many open files\n";
 
-    fn exhaust_child() {
-        let mode = std::env::var(EXHAUST_CHILD).unwrap_or_default();
-        if mode.is_empty() {
+    fn exhaust_child(test: &str) {
+        let Some(mode) = crate::test_support::isolation::child_key(&scoped_test(test)) else {
             return;
-        }
+        };
         // The parent piped our stderr: fd 2 must be the FIFO case.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::fstat(2, &raw mut stat) }, 0);
         assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
         let eacces = || io::Error::from_raw_os_error(libc::EACCES);
         let exhaust = || {
-            let limit = libc::rlimit {
-                rlim_cur: 4,
-                rlim_max: 4,
-            };
-            assert_eq!(
-                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
-                0,
-                "setrlimit failed: {}",
-                io::Error::last_os_error()
-            );
+            let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(4);
         };
         match mode.as_str() {
             "oneshot-healthy" => {
@@ -2215,11 +2203,8 @@ mod tests {
     }
 
     fn exhaust_command(test: &str, mode: &str) -> std::process::Command {
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        let module = module_path!().split_once("::").unwrap().1;
+        let mut command = crate::test_support::isolation::command(&scoped_test(test), mode);
         command
-            .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
-            .env(EXHAUST_CHILD, mode)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
@@ -2227,7 +2212,7 @@ mod tests {
     }
 
     fn assert_exhaust_delivers(test: &str, mode: &str) {
-        exhaust_child();
+        exhaust_child(test);
         let output = exhaust_command(test, mode).output().unwrap();
         assert!(
             output.status.success(),

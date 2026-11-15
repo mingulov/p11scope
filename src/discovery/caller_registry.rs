@@ -7345,10 +7345,13 @@ pub(crate) mod tests {
     /// this is never a self-skip.
     #[test]
     fn exe_identity_denied_for_pid_1_as_a_nonroot_observer() {
-        const MARKER: &str = "P11SCOPE_B1_NONROOT_PROBE_DONE";
-        const CHILD_ENV: &str = "P11SCOPE_B1_NONROOT_PROBE";
-        const CHILD_TEST: &str = "exe_identity_denied_for_pid_1_as_a_nonroot_observer";
-        if std::env::var_os(CHILD_ENV).is_some() {
+        // libtest names omit the crate prefix that `module_path!` carries.
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or(module_path!());
+        let test = format!("{module}::exe_identity_denied_for_pid_1_as_a_nonroot_observer");
+        if crate::test_support::isolation::in_child(&test, "nonroot") {
             // SAFETY: reading the effective uid has no preconditions.
             if unsafe { libc::geteuid() } == 0 {
                 let name = std::ffi::CString::new("nobody").unwrap();
@@ -7381,32 +7384,9 @@ pub(crate) mod tests {
             let own = std::process::id();
             let exe = read_exe_identity(own).expect("our own exe reads");
             assert!(exe.path.is_some(), "our own exe carries its path: {exe:?}");
-            println!("{MARKER}");
-            std::process::exit(0);
+            return;
         }
-        let exe = std::env::current_exe().expect("test binary path");
-        // libtest names omit the crate prefix that `module_path!` carries.
-        let module = module_path!()
-            .split_once("::")
-            .map(|(_, rest)| rest)
-            .unwrap_or(module_path!());
-        let test = format!("{module}::{CHILD_TEST}");
-        let out = std::process::Command::new(&exe)
-            .env(CHILD_ENV, "1")
-            .args(["--exact", &test, "--nocapture"])
-            .output()
-            .expect("spawn the non-root probe");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success(),
-            "the non-root probe passes: status={} stdout={stdout} stderr={stderr}",
-            out.status
-        );
-        assert!(
-            stdout.contains(MARKER),
-            "the probe ran to completion (no vacuous filter miss): stdout={stdout} stderr={stderr}"
-        );
+        crate::test_support::isolation::run_child(&test, "nonroot");
     }
 
     /// B1 consumer contract: a scoped mint with no exe identity must not

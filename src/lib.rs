@@ -227,3 +227,5 @@ mod s1_tests;
 mod s2s3_tests;
 #[cfg(test)]
 pub(crate) mod test_alloc;
+#[cfg(test)]
+pub(crate) mod test_support;

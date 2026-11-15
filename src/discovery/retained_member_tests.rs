@@ -33,29 +33,11 @@ fn fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd").map_or(usize::MAX, Iterator::count)
 }
 
-/// FD counts are process-global, so the two twins that assert them re-run
-/// their whole body in a quiescent single-test subprocess (env-gated). The
-/// parent only checks the child's exit + its `1 passed` line; the child runs
-/// the body. Returns true in the child (run the body), false in the parent.
+/// FD counts are process-global, so the twins that assert them re-run their
+/// whole body in a quiescent single-test subprocess. Returns true in the child
+/// (run the body), false after the parent verified one passed test.
 fn ensure_quiescent_child(selector: &str) -> bool {
-    if std::env::var_os("P11SCOPE_R4_FD_CHILD").is_some() {
-        return true;
-    }
-    let exe = std::env::current_exe().expect("test binary path is known");
-    let output = std::process::Command::new(exe)
-        .arg("--exact")
-        .arg(selector)
-        .arg("--test-threads=1")
-        .env("P11SCOPE_R4_FD_CHILD", "1")
-        .output()
-        .expect("quiescent child spawns");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "quiescent child failed: status={} stdout={stdout}",
-        output.status
-    );
-    false
+    crate::test_support::isolation::enter(selector, "retained-fd")
 }
 
 /// One in-process thread parked until released; always released and joined,

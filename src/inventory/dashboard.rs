@@ -2504,12 +2504,16 @@ impl StderrCapture {
             return Err(std::io::Error::last_os_error());
         }
         drop(write);
+        #[cfg(test)]
+        let progress_was = crate::inspect_system::set_progress_lines_for_test(false);
+        #[cfg(not(test))]
+        let progress_was = crate::inspect_system::set_progress_lines(false);
         Ok(Self {
             fd,
             saved: Some(saved),
             captured,
             drained: Some(drained),
-            progress_was: crate::inspect_system::set_progress_lines(false),
+            progress_was,
         })
     }
 
@@ -2549,6 +2553,9 @@ impl StderrCapture {
         let Some(saved) = self.saved.take() else {
             return Ok(());
         };
+        #[cfg(test)]
+        crate::inspect_system::set_progress_lines_for_test(self.progress_was);
+        #[cfg(not(test))]
         crate::inspect_system::set_progress_lines(self.progress_was);
         loop {
             // SAFETY: `dup2` of our own saved descriptor onto the stderr

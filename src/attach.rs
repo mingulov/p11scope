@@ -14375,19 +14375,10 @@ mod tests {
     #[test]
     fn root_seed_uses_exact_original_pidfd_abi_and_same_fd_readback() {
         use std::os::fd::{AsFd as _, AsRawFd as _};
-        use std::process::{Command, Stdio};
 
-        const FD0_CHILD: &str = "P11SCOPE_ROOT_SEED_FD0_CHILD";
-        if std::env::var_os(FD0_CHILD).is_none() {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("attach::tests::root_seed_uses_exact_original_pidfd_abi_and_same_fd_readback")
-                .arg("--nocapture")
-                .env(FD0_CHILD, "1")
-                .stdin(Stdio::from(std::fs::File::open("/dev/null").unwrap()))
-                .status()
-                .unwrap();
-            assert!(status.success());
+        const TEST: &str =
+            "attach::tests::root_seed_uses_exact_original_pidfd_abi_and_same_fd_readback";
+        if !crate::test_support::isolation::enter(TEST, "root-seed-fd0") {
             return;
         }
 

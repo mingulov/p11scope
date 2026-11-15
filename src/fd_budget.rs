@@ -554,55 +554,16 @@ mod tests {
     /// assertion.
     #[test]
     fn handle_table_inserted_rows_debit_the_fd_reserve() {
-        const CHILD: &str = "P11SCOPE_FD_TABLE_DEBIT_CHILD";
-        const COMPLETED: &str = "P11SCOPE_FD_TABLE_DEBIT_COMPLETED";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "fd_budget::tests::handle_table_inserted_rows_debit_the_fd_reserve",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "pin-reserve child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line == COMPLETED),
-                "pin-reserve child did not complete its assertions:\n{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
+        const TEST: &str = "fd_budget::tests::handle_table_inserted_rows_debit_the_fd_reserve";
+        if !crate::test_support::isolation::enter(TEST, "pin-reserve") {
             return;
         }
-        let mut current = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized writable rlimit.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-            0
-        );
+        let current = crate::test_support::isolation::FdLimitGuard::current();
         assert!(
             current.rlim_max >= 512,
             "the box must allow a 512 hard fd limit for the pin-reserve child"
         );
-        let lowered = libc::rlimit {
-            rlim_cur: 512,
-            rlim_max: 512,
-        };
-        // SAFETY: lowering both limits in the isolated child; the child
-        // exits after its assertions, so the irreversible hard-limit drop
-        // never escapes to siblings.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(512);
         let mut tick = FdReserveTick::sample().expect("a readable snapshot under 512");
         assert_eq!(tick.soft, 512);
         let dir = tempfile::tempdir().expect("a pin file directory");
@@ -651,7 +612,6 @@ mod tests {
             open as u64 + FD_RESERVE <= 512 + 4,
             "held {open} fds against soft 512 with reserve {FD_RESERVE}: the estimate undercounted"
         );
-        println!("\n{COMPLETED}");
     }
 
     /// View-collapse fix5 F2 healthy control: pidfd-only admissions (no
@@ -661,54 +621,16 @@ mod tests {
     /// when the accounting is complete.
     #[test]
     fn reviewed_fd_snapshot_pidfd_only_views_hold_reserve() {
-        const CHILD: &str = "P11SCOPE_FD_PIDFD_ONLY_CHILD";
-        const COMPLETED: &str = "P11SCOPE_FD_PIDFD_ONLY_COMPLETED";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "fd_budget::tests::reviewed_fd_snapshot_pidfd_only_views_hold_reserve",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "pidfd-only child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line == COMPLETED),
-                "pidfd-only child did not complete its assertions:\n{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
+        const TEST: &str = "fd_budget::tests::reviewed_fd_snapshot_pidfd_only_views_hold_reserve";
+        if !crate::test_support::isolation::enter(TEST, "pidfd-only") {
             return;
         }
-        let mut current = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized writable rlimit.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-            0
-        );
+        let current = crate::test_support::isolation::FdLimitGuard::current();
         assert!(
             current.rlim_max >= 512,
             "the box must allow a 512 hard fd limit for the pidfd-only child"
         );
-        let lowered = libc::rlimit {
-            rlim_cur: 512,
-            rlim_max: 512,
-        };
-        // SAFETY: lowering both limits in the isolated child; the child
-        // exits after its assertions.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(512);
         let mut tick = FdReserveTick::sample().expect("a readable snapshot under 512");
         assert_eq!(tick.soft, 512);
         let mut held: Vec<std::fs::File> = Vec::new();
@@ -732,7 +654,6 @@ mod tests {
             open as u64 + FD_RESERVE <= 512 + 4,
             "held {open} fds against soft 512 with reserve {FD_RESERVE}"
         );
-        println!("\n{COMPLETED}");
     }
 
     /// Healthy: the unreadable snapshot reports under its fixed name, once.

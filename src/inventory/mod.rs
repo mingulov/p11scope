@@ -824,9 +824,13 @@ struct QuietGuard {
 
 impl QuietGuard {
     fn arm(quiet: bool) -> Self {
+        #[cfg(test)]
+        let progress_was = crate::inspect_system::set_progress_lines_for_test(!quiet);
+        #[cfg(not(test))]
+        let progress_was = crate::inspect_system::set_progress_lines(!quiet);
         Self {
             summary_was: crate::inventory_present::set_snapshot_summary_only(quiet),
-            progress_was: crate::inspect_system::set_progress_lines(!quiet),
+            progress_was,
         }
     }
 }
@@ -834,6 +838,9 @@ impl QuietGuard {
 impl Drop for QuietGuard {
     fn drop(&mut self) {
         crate::inventory_present::set_snapshot_summary_only(self.summary_was);
+        #[cfg(test)]
+        crate::inspect_system::set_progress_lines_for_test(self.progress_was);
+        #[cfg(not(test))]
         crate::inspect_system::set_progress_lines(self.progress_was);
     }
 }
@@ -13694,7 +13701,7 @@ mod tests {
             // A separate warning-only control isolates default scan progress.
             // The default-path control retains the progress diagnostics.
             if isolate_progress {
-                crate::inspect_system::set_progress_lines(false);
+                crate::inspect_system::set_progress_lines_for_test(false);
             }
             // stdin is the owned inherited slave. The libtest banner was sent
             // to /dev/null before this child-only descriptor redirection.

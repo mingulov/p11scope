@@ -21133,32 +21133,9 @@ mod tests {
     /// the hard limit is process-global and irreversible.
     #[test]
     fn reviewed_pin_open_exhaustion_waits_and_retries() {
-        const CHILD: &str = "P11SCOPE_PIN_WAIT_CHILD";
-        const COMPLETED: &str = "P11SCOPE_PIN_WAIT_COMPLETED";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "discovery::identity::tests::reviewed_pin_open_exhaustion_waits_and_retries",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "pin-wait child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line == COMPLETED),
-                "pin-wait child did not complete its assertions:\n{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
+        const TEST: &str =
+            "discovery::identity::tests::reviewed_pin_open_exhaustion_waits_and_retries";
+        if !crate::test_support::isolation::enter(TEST, "pin-wait") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -21166,27 +21143,12 @@ mod tests {
         let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
             .unwrap();
         let modules = pin_wait_modules(&view, dir.path(), 96, &mut budget);
-        let mut current = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized writable rlimit.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-            0
-        );
+        let current = crate::test_support::isolation::FdLimitGuard::current();
         assert!(
             current.rlim_max >= 64,
             "the box must allow a 64 hard fd limit for the pin-wait child"
         );
-        let lowered = libc::rlimit {
-            rlim_cur: 64,
-            rlim_max: 64,
-        };
-        // SAFETY: lowering both limits in the isolated child; the child
-        // exits after its assertions, so the irreversible hard-limit drop
-        // never escapes to siblings.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(64);
         let (pins, skipped) = pin_scanned_view_objects(&view, &modules, &mut budget).unwrap();
         let waited: Vec<_> = skipped
             .iter()
@@ -21233,7 +21195,6 @@ mod tests {
             "the retry pins cleanly: {retry_skipped:?}"
         );
         assert_eq!(retry_pins.entry_count_for_test(), 1);
-        println!("\n{COMPLETED}");
     }
 
     /// Healthy control for the intra-scan burst twin below: one pin with
@@ -21269,32 +21230,8 @@ mod tests {
     /// the hard limit is process-global and irreversible.
     #[test]
     fn multi_pin_scan_must_defer_before_emfile() {
-        const CHILD: &str = "P11SCOPE_PIN_BURST_CHILD";
-        const COMPLETED: &str = "P11SCOPE_PIN_BURST_COMPLETED";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "discovery::identity::tests::multi_pin_scan_must_defer_before_emfile",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "pin-burst child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line == COMPLETED),
-                "pin-burst child did not complete its assertions:\n{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
+        const TEST: &str = "discovery::identity::tests::multi_pin_scan_must_defer_before_emfile";
+        if !crate::test_support::isolation::enter(TEST, "pin-burst") {
             return;
         }
         const PINS: usize = 64;
@@ -21307,27 +21244,12 @@ mod tests {
         let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
             .unwrap();
         let modules = pin_wait_modules(&view, dir.path(), PINS, &mut budget);
-        let mut current = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized writable rlimit.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-            0
-        );
+        let current = crate::test_support::isolation::FdLimitGuard::current();
         assert!(
             current.rlim_max >= SOFT,
             "the box must allow a 256 hard fd limit for the pin-burst child"
         );
-        let lowered = libc::rlimit {
-            rlim_cur: SOFT,
-            rlim_max: SOFT,
-        };
-        // SAFETY: lowering both limits in the isolated child; the child
-        // exits after its assertions, so the irreversible hard-limit drop
-        // never escapes to siblings.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(SOFT);
         // Blockers hold the table to exactly HEADROOM projected pin-opens
         // above the reserve; real room stays ample (~136 free), so only
         // the projection can stop this scan — never a real `EMFILE`.
@@ -21415,7 +21337,6 @@ mod tests {
             "the retry pins cleanly: {retry_skipped:?}"
         );
         assert_eq!(retry_pins.entry_count_for_test(), PINS);
-        println!("\n{COMPLETED}");
     }
 
     /// View-collapse fix8 F2 (blocking reserve probe, kept as the
@@ -21428,32 +21349,9 @@ mod tests {
     /// process-global and irreversible.
     #[test]
     fn review_many_distinct_pins_in_one_scan_respects_reserve() {
-        const CHILD: &str = "P11SCOPE_F2_RESERVE_CHILD";
-        const COMPLETED: &str = "P11SCOPE_F2_RESERVE_COMPLETED";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "discovery::identity::tests::review_many_distinct_pins_in_one_scan_respects_reserve",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "f2-reserve child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line == COMPLETED),
-                "f2-reserve child did not complete its assertions:\n{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
+        const TEST: &str =
+            "discovery::identity::tests::review_many_distinct_pins_in_one_scan_respects_reserve";
+        if !crate::test_support::isolation::enter(TEST, "f2-reserve") {
             return;
         }
         const PINS: usize = 300;
@@ -21466,27 +21364,12 @@ mod tests {
         let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
             .unwrap();
         let modules = pin_wait_modules(&view, dir.path(), PINS, &mut budget);
-        let mut current = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized writable rlimit.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
-            0
-        );
+        let current = crate::test_support::isolation::FdLimitGuard::current();
         assert!(
             current.rlim_max >= SOFT,
             "the box must allow a 512 hard fd limit for the f2-reserve child"
         );
-        let lowered = libc::rlimit {
-            rlim_cur: SOFT,
-            rlim_max: SOFT,
-        };
-        // SAFETY: lowering both limits in the isolated child; the child
-        // exits after its assertions, so the irreversible hard-limit drop
-        // never escapes to siblings.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(SOFT);
         // Blockers hold the table at exactly the review's 350 snapshot;
         // real room stays ample (~162 free), so only the projection can
         // stop this scan — never a real `EMFILE`.
@@ -21564,7 +21447,6 @@ mod tests {
             "the retry pins cleanly: {retry_skipped:?}"
         );
         assert_eq!(retry_pins.entry_count_for_test(), PINS);
-        println!("\n{COMPLETED}");
     }
 
     /// Handle-table twin (script A, no mid-scan change) of
@@ -21575,45 +21457,22 @@ mod tests {
     /// `pin_wait_modules` fixture, same rlimit raise and restore.
     #[test]
     fn handle_table_scan_stops_at_exactly_the_cap() {
+        const TEST: &str = "discovery::identity::tests::handle_table_scan_stops_at_exactly_the_cap";
+        if !crate::test_support::isolation::enter(TEST, "handle-cap") {
+            return;
+        }
         const PINS: usize = 1001;
         let dir = tempfile::tempdir().unwrap();
         let mut budget = CaptureWorkBudget::default();
         let view = ProcessView::open_with_budget(ProcessViewId(7), std::process::id(), &mut budget)
             .unwrap();
         let modules = pin_wait_modules(&view, dir.path(), PINS, &mut budget);
-        let mut saved = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized writable rlimit.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
-            0
-        );
+        let current = crate::test_support::isolation::FdLimitGuard::current();
         assert!(
-            saved.rlim_max >= 2048,
+            current.rlim_max >= 2048,
             "the box must allow a wide soft fd limit for the 1001-handle twin"
         );
-        let raised = libc::rlimit {
-            rlim_cur: saved.rlim_max,
-            rlim_max: saved.rlim_max,
-        };
-        // Restores the saved limits on drop, even when an assertion
-        // below panics: raising soft toward hard is process-global.
-        struct RestoreRlimit(libc::rlimit);
-        impl Drop for RestoreRlimit {
-            fn drop(&mut self) {
-                // SAFETY: restoring the exact saved limits.
-                unsafe {
-                    libc::setrlimit(libc::RLIMIT_NOFILE, &self.0);
-                }
-            }
-        }
-        // SAFETY: raising the soft limit toward the hard limit in this
-        // test only; the guard above restores it. The twin runs alone
-        // (`--test-threads=1` in the focused gate).
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) }, 0);
-        let _restore = RestoreRlimit(saved);
+        let _limit = crate::test_support::isolation::FdLimitGuard::raise_soft_to_hard();
         {
             let tick = crate::fd_budget::FdReserveTick::sample().expect("a readable snapshot");
             assert!(
@@ -21933,41 +21792,19 @@ mod tests {
     /// twin); the two lenders carry the same ext4 `0xef53` proofs.
     #[test]
     fn handle_table_full_table_shares_without_gaps() {
+        const TEST: &str =
+            "discovery::identity::tests::handle_table_full_table_shares_without_gaps";
+        if !crate::test_support::isolation::enter(TEST, "handle-full-share") {
+            return;
+        }
         const PREFILL: usize = 998;
         let dir = tempfile::tempdir().unwrap();
-        let mut saved = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one initialized writable rlimit.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
-            0
-        );
+        let current = crate::test_support::isolation::FdLimitGuard::current();
         assert!(
-            saved.rlim_max >= 2048,
+            current.rlim_max >= 2048,
             "the box must allow a wide soft fd limit for the full-table twin"
         );
-        let raised = libc::rlimit {
-            rlim_cur: saved.rlim_max,
-            rlim_max: saved.rlim_max,
-        };
-        // Restores the saved limits on drop, even when an assertion
-        // below panics: raising soft toward hard is process-global.
-        struct RestoreRlimit(libc::rlimit);
-        impl Drop for RestoreRlimit {
-            fn drop(&mut self) {
-                // SAFETY: restoring the exact saved limits.
-                unsafe {
-                    libc::setrlimit(libc::RLIMIT_NOFILE, &self.0);
-                }
-            }
-        }
-        // SAFETY: raising the soft limit toward the hard limit in this
-        // test only; the guard above restores it. The twin runs alone
-        // (`--test-threads=1` in the focused gate).
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) }, 0);
-        let _restore = RestoreRlimit(saved);
+        let _limit = crate::test_support::isolation::FdLimitGuard::raise_soft_to_hard();
         let mut table = HandleTable::new(crate::fd_budget::MAX_CONCURRENT_LIBRARY_HANDLES);
         let mut live = Vec::new();
         for n in 0..PREFILL {

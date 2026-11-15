@@ -1325,84 +1325,16 @@ mod tests {
     #[test]
     fn cold_fd_pressure_refuses_recovers_and_releases_owned_descriptors() {
         use std::collections::BTreeSet;
-        const CHILD: &str = "P11SCOPE_COLD_FD_RESOURCE_CHILD";
-        const COMPLETED: &str = "R56_FD_RESOURCE_COMPLETED";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "process::view_filesystem::tests::cold_fd_pressure_refuses_recovers_and_releases_owned_descriptors",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, std::process::id().to_string())
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "isolated FD child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line == COMPLETED),
-                "the exact child must execute every resource assertion"
-            );
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        const TEST: &str = "process::view_filesystem::tests::cold_fd_pressure_refuses_recovers_and_releases_owned_descriptors";
+        let Some(parent) = crate::test_support::isolation::child_key(TEST) else {
+            let key = std::process::id().to_string();
+            crate::test_support::isolation::run_child(TEST, &key);
             return;
-        }
-        let parent: u32 = std::env::var(CHILD).unwrap().parse().unwrap();
+        };
+        let parent: u32 = parent.parse().expect("the parent pid key");
         // SAFETY: getppid reads the current process's parent; no ownership changes.
         assert_eq!(unsafe { libc::getppid() } as u32, parent);
-        assert!(std::env::args().any(|arg| arg == "--test-threads=1"));
 
-        struct LoweredFdLimit {
-            saved: libc::rlimit,
-            restored: bool,
-        }
-        impl LoweredFdLimit {
-            fn new(highest_owned_fd: i32) -> Self {
-                let mut saved = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                // SAFETY: owned output struct; only this isolated child's soft limit changes.
-                assert_eq!(
-                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
-                    0
-                );
-                let soft = saved.rlim_cur.min(256);
-                assert!(soft > highest_owned_fd as libc::rlim_t + 16);
-                let lowered = libc::rlimit {
-                    rlim_cur: soft,
-                    rlim_max: saved.rlim_max,
-                };
-                // SAFETY: lower only the isolated child's soft ceiling.
-                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
-                Self {
-                    saved,
-                    restored: false,
-                }
-            }
-            fn restore(&mut self) {
-                // SAFETY: restore the exact saved limit; the hard ceiling was never changed.
-                assert_eq!(
-                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) },
-                    0
-                );
-                self.restored = true;
-            }
-        }
-        impl Drop for LoweredFdLimit {
-            fn drop(&mut self) {
-                if !self.restored {
-                    // SAFETY: same restoration on an assertion's unwind.
-                    let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
-                }
-            }
-        }
         fn identity(fd: i32) -> (u64, u64, u32) {
             let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
             // SAFETY: fstat writes one valid stat on success and never takes FD ownership.
@@ -1466,7 +1398,11 @@ mod tests {
             .chain([anchor.as_raw_fd()])
             .max()
             .unwrap();
-        let mut limit = LoweredFdLimit::new(highest_owned_fd);
+        let mut limit = crate::test_support::isolation::FdLimitGuard::lower_soft_at_most(256);
+        assert!(
+            crate::test_support::isolation::FdLimitGuard::current().rlim_cur
+                > highest_owned_fd as libc::rlim_t + 16
+        );
         let mut fillers = Vec::new();
         loop {
             match anchor.try_clone() {
@@ -1618,8 +1554,6 @@ mod tests {
         let anchor_fd = anchor.as_raw_fd();
         drop(anchor);
         assert_closed(anchor_fd);
-        // libtest's nocapture label may still occupy the current stdout line.
-        println!("\n{COMPLETED}");
     }
 
     #[test]

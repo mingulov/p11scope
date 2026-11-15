@@ -64,6 +64,7 @@ use p11scope_ebpf_common::ImageIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DOC_ID: &str = "p11scope/inventory/v1";
@@ -1400,12 +1401,42 @@ pub(crate) fn reset_reclaim_pass_heap_calls() {
 pub(crate) fn reclaim_pass_heap() {
     #[cfg(test)]
     RECLAIM_PASS_HEAP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    trim_pass_heap();
+}
+
+/// The trim half of [`reclaim_pass_heap`], for sites that are not a
+/// pass publication boundary (no test counter).
+pub(crate) fn trim_pass_heap() {
     // SAFETY: malloc_trim takes a pad length and releases free top pages;
     // it is thread-safe, takes no pointers, and cannot free live state.
     #[cfg(target_env = "gnu")]
     unsafe {
         libc::malloc_trim(0);
     }
+}
+
+/// Drop `value` on a short-lived worker thread and wait for its pthread
+/// teardown (`tcache_thread_shutdown`) before trimming the heap. Pass
+/// transients allocated on the collector thread are freed into that
+/// thread's arena/tcache; freeing them on the main thread would leave the
+/// owning arena's pages resident. The worker's exit flushes its tcache, so
+/// the trim can then hand the pages back.
+pub(crate) fn drop_off_main_thread<T: Send>(value: T) {
+    let slot = std::sync::Mutex::new(Some(value));
+    std::thread::scope(|scope| {
+        if let Ok(handle) = std::thread::Builder::new()
+            .name("p11scope-reclaim".into())
+            .spawn_scoped(scope, || {
+                if let Ok(mut guard) = slot.lock() {
+                    drop(guard.take());
+                }
+            })
+        {
+            let _ = handle.join();
+        }
+    });
+    drop(slot);
+    trim_pass_heap();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1799,13 +1830,13 @@ fn run_with_terminal_budget(
     // The opening prior for pending views and the final: the same
     // pass-zero read as the prologue, so a final always has a prior
     // even when no pass completed.
-    stream_state.last_stream_view = Some(Presentation::capture(
+    stream_state.last_stream_view = Some(Arc::new(Presentation::capture(
         &coordinator,
         &scope_label,
         started_ns,
         started_ns,
         0,
-    ));
+    )));
     // The deferred scan seal consumes per-pass mint sources the
     // coordinator only retains when told an attempt will come.
     if manifests.is_empty() && key_operations && native_available {
@@ -1918,14 +1949,16 @@ fn run_with_terminal_budget(
                         inventory_diagnostic(line);
                     }
                 }
-                // The pass freed its pin batch; hand the peak back before
-                // the next pass allocates (see `reclaim_pass_heap`).
-                reclaim_pass_heap();
                 if let Some(error) = stream.attempt("pass publication", |writer| {
                     emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
                 }) {
                     let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
                 }
+                drop(presentation);
+                // The pass freed its pin batch and transient view; hand
+                // the peak back now that both are dead (see
+                // `reclaim_pass_heap`).
+                reclaim_pass_heap();
                 // A0 periodic line: every loop pass publishes through
                 // this arm, so the 60 s check lives here.
                 driver.coordinator.maybe_emit_memory_line();
@@ -8321,7 +8354,7 @@ pub(crate) struct StreamState {
     /// user-visible view reuses while a Joint publication pends. The
     /// run functions seed it with the opening capture; `None` only
     /// before seeding (and in harnesses that never publish).
-    last_stream_view: Option<Presentation>,
+    last_stream_view: Option<Arc<Presentation>>,
     emitted_suppressed: u64,
     /// Unbound witness rows per (module, reason) already counted on a
     /// pass marker.
@@ -8715,9 +8748,12 @@ fn dashboard_stream_pass<S: ProcessSource>(
     now_ns: u64,
     semantic: crate::inventory_semantics::SemanticCaptureSummary,
 ) -> (Presentation, Option<String>) {
+    state.last_stream_view = None;
+    trim_pass_heap();
     let (stream_view, display_view) =
         dashboard_pass_views(coordinator, scope_label, started_ns, now_ns, semantic);
-    state.last_stream_view = Some(stream_view.clone());
+    let stream_view = Arc::new(stream_view);
+    state.last_stream_view = Some(Arc::clone(&stream_view));
     let error = stream.attempt("pass publication", |writer| {
         emit_pass_events(writer, state, report, &stream_view, now_ns)
     });
@@ -8747,13 +8783,20 @@ fn stream_view_guarded(
     scope_label: &str,
     started_ns: u64,
     now_ns: u64,
-) -> Option<Presentation> {
+) -> Option<Arc<Presentation>> {
     if publication_pending_for_view(driver) {
         return None;
     }
+    // Release the previous view and its pass heap before allocating the
+    // next, larger one: a retained prior at the top of the heap pins every
+    // freed pass block below it, so malloc_trim cannot compact (the pass
+    // heap then staircases up with each growing view).
+    state.last_stream_view = None;
+    trim_pass_heap();
     let mut presentation = stream_presentation(driver.coordinator, scope_label, started_ns, now_ns);
     presentation.semantic_capture = driver.semantic_summary();
-    state.last_stream_view = Some(presentation.clone());
+    let presentation = Arc::new(presentation);
+    state.last_stream_view = Some(Arc::clone(&presentation));
     Some(presentation)
 }
 
@@ -8804,7 +8847,7 @@ fn final_view_guarded(
     if publication_pending_for_view(driver)
         && let Some(prior) = state.last_stream_view.as_ref()
     {
-        let mut view = prior.clone();
+        let mut view = (**prior).clone();
         view.semantic_capture = driver.semantic_summary();
         // Terminal pre-arm rows are a pure coordinator read, not a
         // registry publication: the hook already ended the watches, so
@@ -8894,13 +8937,13 @@ fn run_dashboard(
     // The opening prior for pending views and the final: the same
     // pass-zero read as the prologue, so a final always has a prior
     // even when no pass completed.
-    stream_state.last_stream_view = Some(Presentation::capture(
+    stream_state.last_stream_view = Some(Arc::new(Presentation::capture(
         &coordinator,
         &scope_label,
         started_ns,
         started_ns,
         0,
-    ));
+    )));
     let initial_error = start_event_log(&mut stream, &coordinator, &scope_label, started_ns);
     let initial_error = match (diagnostics.is_some(), initial_error) {
         (false, Some(error)) => return Err(error),
@@ -25605,8 +25648,13 @@ mod promotion_driver_tests {
                     // Production installs this opening view before any
                     // refusal/publication staging. A pending final must reuse
                     // it instead of taking a fresh read through the guard.
-                    stream_state.last_stream_view =
-                        Some(Presentation::capture(&coordinator, "system", 1, 1, 0));
+                    stream_state.last_stream_view = Some(Arc::new(Presentation::capture(
+                        &coordinator,
+                        "system",
+                        1,
+                        1,
+                        0,
+                    )));
                     let headless = headless_display();
                     let mut driver = driver_with_display(&mut coordinator, headless.display);
                     let drops = Rc::new(Cell::new(0));

@@ -5156,6 +5156,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // between this collection's end and this apply reconcile the
         // same way next pass.
         self.reconcile_exec_newcomers(&catalog);
+        self.prune_departed_native_state(now_ns);
+        // Release the collected catalog (objects, observations, processes)
+        // on a short-lived thread: it was allocated on the collector
+        // thread, and freeing it here would leave its arena's pages
+        // resident. The worker's teardown flushes its tcache first.
+        crate::inventory::drop_off_main_thread(catalog);
         self.completed_scan_pass = true;
         PassReport {
             pass,
@@ -6522,9 +6528,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // actually attempt that seal: the stash's pins would
         // otherwise outlive broad admission for providers it
         // never took.
-        let crate::inspect_system::CatalogLowering { pins, modules, .. } = lowering;
+        let crate::inspect_system::CatalogLowering {
+            plan,
+            pins,
+            modules,
+        } = lowering;
         if self.scan_mint_requested && !modules.is_empty() {
             self.scan_mint_sources = Some((modules, pins));
+        } else {
+            // The lowering is the pass's largest transient and was built
+            // on the collector thread; free it on a short-lived thread so
+            // its arena/tcache pages return to the kernel instead of
+            // staying resident on the main thread's heap.
+            crate::inventory::drop_off_main_thread((plan, pins, modules));
         }
         self.record_absorbed(absorbed)
     }

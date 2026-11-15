@@ -76,35 +76,45 @@ privileged_run_tree_non_member_provider_is_never_staged
 # a cell has no entry left, turn the workflow's --intermittent-failure
 # for it back into --require.
 #
+# The cells judge exact accounting (owner ruling 2026-11-15): every call
+# that started after the report's disclosed pre-attach window must be
+# observed, so any undisclosed miss fails, however small.
+#
 # never_pause_still_learns:
 # - PLAN-REPLACE-GAP (base bug, not the run-tree learning). A new worker's
 #   view makes the provider slots shared, the rebuilt plan downgrades
 #   them to count-only and the replace path detaches and reattaches all
-#   68 probes; calls in that 33-59 ms window are lost, so coverage stays
-#   under the 0.95 floor (CI 43704790202: 0.9355 on v6.12, 0.8459 on
-#   v7.3). The floor is not lowered.
+#   68 probes; calls in that 33-59 ms window are lost after the first
+#   attach: an undisclosed miss (CI 43704790202 under the old floor:
+#   0.9355 on v6.12, 0.8459 on v7.3).
 # - SLOT-RECLAIM (plan.rs lane). The same downgrade leaves the
 #   descriptor-replaced slots of one pinned object unreclaimed, so each
 #   worker grows the plan by 68 slots until the attach plan exceeds the
 #   2112-slot ceiling and the capture aborts (CI 43704790202 host:
 #   2176 > 2112).
+# parallel_never_pause_covers_waves:
+# - PLAN-REPLACE-GAP, as above: undisclosed misses after the first attach
+#   (host 2026-11-15, 1 of 2 runs: 21 of 80 C_GetSlotInfo calls).
 # arming_exhaustion_still_stages_and_counts:
-# - PLAN-REPLACE-GAP, as above: the coverage dip under 0.95 after the
-#   first provider worker (CI 43704790202 v6.6: 0.8996). It passes on
-#   the CI host.
+# - PLAN-REPLACE-GAP, as above: undisclosed misses after the first
+#   provider attach (CI 43704790202 v6.6 under the old floor: 0.8996).
+#   It passes on the CI host.
 EXPECTED_FAILURES=(
 privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
 privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
+privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves
 privileged_run_tree_arming_exhaustion_still_stages_and_counts
 )
 EXPECTED_SIGNATURES=(
-'coverage after the first worker is 0\.[0-9]+ '
+'undisclosed miss: [0-9]+ calls after the pre-attach window'
 'attach plan requires [0-9]+ allocated slots but only [0-9]+ are available'
-'coverage after the first worker is 0\.[0-9]+ '
+'undisclosed miss: [0-9]+ calls after the pre-attach window'
+'undisclosed miss: [0-9]+ calls after the pre-attach window'
 )
 EXPECTED_REASONS=(
 'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
 'SLOT-RECLAIM: descriptor-replaced slots of the same pinned object are never reused'
+'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
 'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
 )
 
@@ -236,9 +246,10 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     done
     local never=privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
     local arming=privileged_run_tree_arming_exhaustion_still_stages_and_counts
+    local parallel=privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves
     # Each declared signature of a cell is an expected failure...
-    LOG_BODY="thread 'x' panicked at tests/run_tree.rs:1274:5:
-coverage after the first worker is 0.9355 (270/279 less first-worker 9): {}
+    LOG_BODY="thread 'x' panicked at tests/run_tree.rs:330:5:
+exact accounting failed: [\"undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 30 of 31 that started after 1)\"]
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$never" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
     LOG_BODY="p11scope: attach plan requires 2176 allocated slots but only 2112 are available; refusing to attach a prefix
@@ -246,10 +257,11 @@ thread 'x' panicked at tests/run_tree.rs:1249:5:
 run exits with the shell's status
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$never" 101 0 False expected-failure 'SLOT-RECLAIM: descriptor-replaced slots'
-    LOG_BODY="thread 'x' panicked at tests/run_tree.rs:1549:5:
-coverage after the first worker is 0.8996 (251/279 less first-worker 9): {}
+    LOG_BODY="thread 'x' panicked at tests/run_tree.rs:330:5:
+exact accounting failed: [\"undisclosed miss: 28 calls after the pre-attach window (C_GetSlotList: observed 50 of 62 that started after 1)\"]
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.00s"
     check "$arming" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
+    check "$parallel" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
     # ...while any other failure of it stays failed (never masked): the
     # arming cell declares no capacity signature, and its reserve-row
     # failure is not declared at all...
@@ -265,7 +277,7 @@ run exits with the shell's status
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$never" 101 1 False failed 'rc=101'
     # ...and so does a timeout, even with a signature in the log.
-    LOG_BODY='coverage after the first worker is 0.9355 (1/2 less first-worker 0): {}'
+    LOG_BODY='undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 1 of 2)'
     check "$never" 124 1 False failed 'TIMEOUT after 300s'
     # A failing cell keeps its shape.
     LOG_BODY='test one ... FAILED

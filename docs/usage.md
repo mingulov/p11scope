@@ -2812,8 +2812,9 @@ export, loader and table-refusal facts into the next pass, keyed and
 pinned by file identity, size and change time. An unchanged object is read
 once rather than on every pass while its facts fit the retained-fact
 ceilings (128 entries per map and 16 MiB of accounted bytes); beyond
-them the pass re-reads the file rather than dropping coverage, and a
-changed file is always read again. Identity
+them the pass re-reads the file, spending more of the shared window (an
+exhausted window names an I/O-ceiling gap) rather than dropping
+coverage, and a changed file is always read again. Identity
 hashing reads the whole file once
 against the window allowance, and memory snapshots read in bounded
 chunks — a large object degrades through a named gap when an

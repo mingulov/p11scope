@@ -3364,9 +3364,9 @@ impl LiveJointMachine {
                         // history here, preserving their observed
                         // completions. A no-op unless calls were
                         // staged. Pinned by the held-call twin. (A
-                        // stashed pre-void outcome instead latches the
-                        // post-void quantum at claiming; see the N1
-                        // pin.)
+                        // stashed pre-void outcome is instead retained
+                        // as plain S1 with a counted gap and the lane
+                        // continues; see the N1 twin.)
                         coordinator.drop_abandoned_joint_staged();
                         coordinator.note_scope_gap(
                             "Joint key operations unavailable; retained S1".to_string(),

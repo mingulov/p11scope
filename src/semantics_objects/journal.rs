@@ -5251,6 +5251,15 @@ impl JournalAdapter {
     /// semantic lane. The H0 wire position stays in its own device
     /// domain: it is never compared with the journal consumption ordinal
     /// a fence records.
+    ///
+    /// Not every removal from `open` is a void: image-taint pruning and
+    /// the stop path also drop retained entries without raising
+    /// `voided_through`. An admission whose original left that way is
+    /// assumed never to be re-offered for claim (the lane stash consumes
+    /// each outcome once and the claim cursor only moves forward); the
+    /// fence check keeps the fenceless case refusing. If a later re-offer
+    /// of such an admission ever exists, it would be retained as plain S1
+    /// under the void gap, so it must be proven here first.
     pub(crate) fn admission_voided(&self, admitted: &AdmittedInstanceCall) -> bool {
         if self.voided_through == 0 {
             return false;

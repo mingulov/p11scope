@@ -18579,6 +18579,11 @@ pub(crate) mod tests {
             "the second pass must reclaim dead carried entries instead of re-reading: {second_ceiling:?}"
         );
         assert!(
+            second_io > 40_000_000,
+            "the second pass read the large table's 40,000,016-byte dynamic \
+             spans: {second_io} attempted bytes"
+        );
+        assert!(
             second_io < crate::discovery::scan::INVENTORY_WINDOW_IO_BYTES,
             "the second member reused the first member's facts instead of \
              re-reading the table: {second_io} attempted bytes"

@@ -86413,9 +86413,13 @@ fn member_stop_row(
     }
 }
 
+/// Budgets widened so a loaded host never ends an intake early: a
+/// hold's assertions must not depend on the machine's speed.
 fn member_stop_engine() -> Engine {
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
+    engine.member_stops.pass_budget = Some(std::time::Duration::from_secs(30));
+    engine.member_stops.member_budget = Some(std::time::Duration::from_secs(30));
     engine
 }
 
@@ -86621,7 +86625,11 @@ fn member_stop_bound_resumes_a_held_member_while_the_table_is_unreadable() {
     let mut session = ScriptedSession::default();
     engine.pause_owned_batch = true;
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held());
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     io.fail_pending = true;
     engine.service_member_stops(
         &mut io,
@@ -87152,7 +87160,11 @@ fn member_stop_watchdog_loss_releases_every_member() {
     let mut session = ScriptedSession::default();
     engine.pause_owned_batch = true;
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held());
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     io.guard_lost = true;
     engine.service_member_stops(&mut io, &mut session, Some(20));
     assert!(io.deactivated, "no new stops");
@@ -87264,7 +87276,11 @@ fn member_stop_departed_unattached_hold_keeps_the_provider_uncleared() {
     let mut session = ScriptedSession::default();
     engine.pause_owned_batch = true;
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held());
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     let _ = fixture.child.kill();
     let _ = fixture.child.wait();
     engine.service_member_stops(&mut io, &mut session, Some(20));
@@ -87291,7 +87307,11 @@ fn member_stop_watchdog_loss_keeps_a_departed_holds_provider_uncleared() {
     let mut session = ScriptedSession::default();
     engine.pause_owned_batch = true;
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held());
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     let _ = fixture.child.kill();
     let _ = fixture.child.wait();
     io.guard_lost = true;
@@ -87449,7 +87469,11 @@ fn member_stop_holds_a_provider_mapper_until_its_staging_attaches() {
         1,
         "the provider stages"
     );
-    assert!(engine.member_stops_held(), "the provider mapper is held");
+    assert!(
+        engine.member_stops_held(),
+        "the provider mapper is held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     assert!(
         !io.cleared.contains(&key),
         "the provider is not cleared before its attach"
@@ -87511,11 +87535,19 @@ fn member_stop_keeps_holding_when_the_staging_apply_preflight_refuses() {
         engine.learned_unapplied,
         "a refused preflight applied nothing"
     );
-    assert!(engine.member_stops_held(), "the provider mapper stays held");
+    assert!(
+        engine.member_stops_held(),
+        "the provider mapper stays held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     assert!(!io.cleared.contains(&key), "the provider is not cleared");
     assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
     engine.service_member_stops(&mut io, &mut session, Some(20));
-    assert!(engine.member_stops_held(), "still held on the next pass");
+    assert!(
+        engine.member_stops_held(),
+        "still held on the next pass: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
 }
 
@@ -87578,7 +87610,8 @@ fn member_stop_counts_a_provider_attached_only_from_real_attach_stamps() {
     assert_eq!(engine.learned_staged_files_for_test(), 1);
     assert!(
         engine.member_stops_held(),
-        "no attach stamp, no attached resume"
+        "no attach stamp, no attached resume: {:?}",
+        engine.member_stop_stats_for_test()
     );
     assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
     engine.service_member_stops(
@@ -87650,7 +87683,11 @@ fn member_stop_resumes_at_the_bound_and_files_the_first_use_row() {
     let mut session = ScriptedSession::default();
     engine.pause_owned_batch = true;
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held());
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     engine.service_member_stops(
         &mut io,
         &mut session,
@@ -87658,7 +87695,8 @@ fn member_stop_resumes_at_the_bound_and_files_the_first_use_row() {
     );
     assert!(
         engine.member_stops_held(),
-        "inside the bound the hold stays"
+        "inside the bound the hold stays: {:?}",
+        engine.member_stop_stats_for_test()
     );
     engine.service_member_stops(
         &mut io,
@@ -87708,7 +87746,11 @@ fn member_stop_release_resumes_held_and_untaken_members() {
     engine.pause_owned_batch = true;
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held());
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     // A row the service never took (it arrived after the last pass).
     io.rows
         .insert(other_pid, member_stop_row(pid, &library, key));
@@ -88051,7 +88093,11 @@ fn member_stop_watchdog_loss_files_the_row_for_a_departed_unattached_hold() {
     let mut session = ScriptedSession::default();
     engine.pause_owned_batch = true;
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held());
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     let _ = fixture.child.kill();
     let _ = fixture.child.wait();
     io.guard_lost = true;
@@ -88108,7 +88154,11 @@ fn member_stop_watchdog_loss_after_a_departed_hold_files_the_row() {
     let mut session = ScriptedSession::default();
     engine.pause_owned_batch = true;
     engine.service_member_stops(&mut io, &mut session, Some(10));
-    assert!(engine.member_stops_held());
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     let _ = fixture.child.kill();
     let _ = fixture.child.wait();
     engine.service_member_stops(&mut io, &mut session, Some(20));
@@ -88262,7 +88312,11 @@ fn member_stop_stages_a_provider_the_module_selection_names() {
         1,
         "the named provider stages"
     );
-    assert!(engine.member_stops_held(), "its mapper is held");
+    assert!(
+        engine.member_stops_held(),
+        "its mapper is held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
     assert!(!io.cleared.contains(&key));
     assert!(!resumed);
 }

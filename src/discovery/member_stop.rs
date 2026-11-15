@@ -139,6 +139,9 @@ pub(crate) struct MemberStopState {
     /// Test override of [`MEMBER_STOP_PASS_BUDGET`].
     #[cfg(test)]
     pub(crate) pass_budget: Option<std::time::Duration>,
+    /// Test override of [`MEMBER_STOP_MEMBER_BUDGET`].
+    #[cfg(test)]
+    pub(crate) member_budget: Option<std::time::Duration>,
     /// Tgids whose pin open fails (descriptor or `/proc` pressure), for
     /// the tests.
     #[cfg(test)]
@@ -525,6 +528,15 @@ impl Engine {
         !self.member_stops.held.is_empty()
     }
 
+    /// [`MEMBER_STOP_MEMBER_BUDGET`], or its test override.
+    fn member_budget(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(budget) = self.member_stops.member_budget {
+            return budget;
+        }
+        MEMBER_STOP_MEMBER_BUDGET
+    }
+
     #[cfg(test)]
     pub(crate) fn member_stop_stats_for_test(&self) -> MemberStopStats {
         self.member_stops.stats
@@ -753,7 +765,7 @@ impl Engine {
                 return false;
             }
         }
-        let deadline = (std::time::Instant::now() + MEMBER_STOP_MEMBER_BUDGET).min(pass_deadline);
+        let deadline = (std::time::Instant::now() + self.member_budget()).min(pass_deadline);
         #[cfg(test)]
         let scripted_maps_failure = self.member_stops.maps_fail.contains(&tgid);
         #[cfg(not(test))]
@@ -1542,7 +1554,7 @@ impl Engine {
         if !self.member_stops.unsettled {
             return;
         }
-        let deadline = std::time::Instant::now() + MEMBER_STOP_MEMBER_BUDGET;
+        let deadline = std::time::Instant::now() + self.member_budget();
         let _ = pin
             .open_proc_dir()
             .and_then(|proc| proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES));

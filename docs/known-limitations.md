@@ -278,7 +278,11 @@ overlay device numbers). If the watchdog is
 lost, every held and pending member resumes at once, with the same
 row when its provider was not attached yet, or when a provider a stop
 staged has not attached yet (no later mapper is stopped for it once
-the stops are off). When the stops end (capture end or a lost
+the stops are off). That check counts doubt as unattached: a staged
+provider whose slots have since left the attach plan (its last mapper
+exited) also files the row then, so a lost watchdog can add one
+first-use row for a provider whose calls were all observed. When the
+stops end (capture end or a lost
 watchdog) the observer switches the hook off, then waits one RCU grace
 period for hook calls already running before it resumes anyone: one
 update of a private map-in-map (it returns only after the kernel's

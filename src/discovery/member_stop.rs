@@ -13,7 +13,8 @@
 //! first-use row, so a missed first run is never silent.
 //!
 //! Privacy: the service reads the member's maps rows (ranges, inode
-//! identities, path spelling) and opens the mapped files read-only, like
+//! identities, path spelling) and its `mountinfo` (keeping only FUSE and
+//! overlay device numbers), and opens the mapped files read-only, like
 //! the owned-tree watch scan. No memory, argument, environment or
 //! payload is read.
 
@@ -457,8 +458,9 @@ fn with_stopping_row(
 }
 
 /// Opens the file a maps row names. The `map_files` link follows the
-/// VMA's own file and needs `CAP_SYS_ADMIN`; without it the row's path is
-/// opened through the member's root. Either way the opened file must
+/// VMA's own file and needs `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`;
+/// without either (or when that open fails) the row's path is opened
+/// through the member's root. Either way the opened file must
 /// still be the row's (see [`opened_row_file`]). A refusal only means the
 /// row is not proven this pass.
 fn open_exec_row(
@@ -1407,8 +1409,10 @@ impl Engine {
     /// under the member's `mmap_lock`, held for writing by the mapping,
     /// and a maps read takes it: the read returns only after that
     /// invocation has inserted its row and sent its stop, so the resume
-    /// that follows is the last signal. Bounded; a failed read resumes
-    /// without the wait.
+    /// that follows is the last signal. The deadline is checked between
+    /// reads only: a read blocked on that lock (behind a fault the member
+    /// cannot finish) waits with it. A failed read resumes without the
+    /// wait.
     fn settle_member(&mut self, pin: &crate::process::PidPin) {
         if !self.member_stops.unsettled {
             return;

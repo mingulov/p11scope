@@ -19824,6 +19824,7 @@ pub(crate) mod tests {
             68,
             "exact active, calls countable"
         );
+        assert_eq!(plan.module_ambiguous, 0, "one module owns the cells");
     }
 
     /// F2 companion RED (reserve): heuristic churn in a named capture must
@@ -20308,52 +20309,47 @@ pub(crate) mod tests {
     /// Semantic cross-ID reclaim keeps one module identity: a same-file
     /// new pin reoccupies retired semantic cells under the historical
     /// module id (positive identity donation), so no cell turns ambiguous
-    /// and no PARTIAL is latched.
+    /// and no PARTIAL is latched. The semantic table is a real one (sole
+    /// complete, export-agreeing), so merge itself issues the tickets.
     #[test]
     fn slot_reclaim_semantic_same_file_keeps_module_id() {
-        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let gen1 = sole_complete_module();
         let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
-        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
-        let semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
-        for slot in &mut plan.slots {
-            slot.descriptor_index = descriptor;
-            slot.semantics = semantics;
-            slot.semantic_authorized = true;
-        }
+        assert_eq!(plan.slots.len(), 68, "gen1 admits");
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the admitted generation is semantic"
+        );
         plan.object_identities
-            .insert(PinnedObjectId(82), test_identity(82, "sha-semantic-cross"));
+            .insert(PinnedObjectId(42), test_identity(42, "sha-semantic-cross"));
         let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
         plan.extend_exact(rebuilt).unwrap();
         plan.revivable.clone_from(&plan.retired_keys);
-        let mut returning = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut returning = sole_complete_module();
         returning.object = PinnedObjectId(90);
         returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
         let identities =
-            BTreeMap::from([(PinnedObjectId(90), test_identity(82, "sha-semantic-cross"))]);
-        let mut rebuilt = plan.rebuild_from_sources_with_identities(
+            BTreeMap::from([(PinnedObjectId(90), test_identity(42, "sha-semantic-cross"))]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
             std::slice::from_ref(&returning),
             &[],
             &identities,
         );
-        for slot in &mut rebuilt.slots {
-            slot.descriptor_index = descriptor;
-            slot.semantics = semantics;
-            slot.semantic_authorized = true;
-        }
-        // This synthetic provider's scan evidence is count-only, so merge
-        // cannot predict the semantic shape; issue the equivalent tickets
-        // directly to exercise extension's application (predicate,
-        // identity donation and aggregate ownership) in isolation.
-        for (old_key, position) in &plan.retired_keys {
-            rebuilt.reclaimed.insert(
-                AttachKey {
-                    object: PinnedObjectId(90),
-                    file_offset: old_key.file_offset,
-                },
-                *position,
-            );
-        }
-        assert_eq!(rebuilt.reclaimed.len(), 68, "semantic cells are ticketed");
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "merge tickets the real semantic cells itself: {:?}",
+            rebuilt.reclaimed
+        );
+        assert!(
+            rebuilt
+                .slots
+                .iter()
+                .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+            "the returning semantic table keeps its layout proof"
+        );
         let delta = plan.extend_exact(rebuilt).unwrap();
         assert_eq!(
             delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>(),

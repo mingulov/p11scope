@@ -87129,8 +87129,10 @@ fn member_stop_watchdog_loss_releases_every_member() {
 /// owed a resume: every later pass drains the whole table.
 #[test]
 fn member_stop_row_after_watchdog_loss_is_resumed() {
-    let mut io = ScriptedMemberStops::default();
-    io.guard_lost = true;
+    let mut io = ScriptedMemberStops {
+        guard_lost: true,
+        ..Default::default()
+    };
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));

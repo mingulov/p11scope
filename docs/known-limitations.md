@@ -1094,7 +1094,13 @@ it starts can leave its own startup calls there. A `run` child that
 waits for the `p11scope: capturing: ` line before calling keeps its
 later calls inside the window, but that covers the opening boundary
 only: a child still calling when a `--duration` window closes can
-tear the close read (as above).
+tear the close read (as above). With `--pause never`, the observer
+attaches a provider's export hooks shortly after the child loads it
+(return hook first, then entry hook). A `C_GetFunctionList` or
+`C_GetInterface` call that runs between those two attaches counts one
+discovery update failure, and that withholds the detail as
+`promotion_caller_changed`. The default pause policy holds the child at
+its provider load until those hooks are live.
 With `run`, a host whose kernel and userspace monotonic clocks cannot
 be compared (a time namespace offset, or a kernel without the time
 namespace files) refuses the selection as `promotion_scope_unsupported`.

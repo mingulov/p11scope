@@ -21106,6 +21106,268 @@ pub(crate) mod tests {
         assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize);
     }
 
+    /// A count-only copy of a semantic provider: the same exact targets
+    /// (object, path, offsets) with no semantic authority. `unknown` clears
+    /// the export witness too, so every presented name is `unknown`; without
+    /// it the names stay authorized but the unfinished scan keeps the table
+    /// count-only.
+    fn count_only_copy(module: &ReconciledModule, unknown: bool) -> ReconciledModule {
+        let mut copy = module.clone();
+        copy.scanned.tables_scan_finished = false;
+        for table in &mut copy.scanned.tables {
+            table.live_return = false;
+            table.manifest_supported = false;
+        }
+        if unknown {
+            copy.exports = Default::default();
+            copy.getter_present = false;
+        }
+        copy
+    }
+
+    /// O2: a same-key count-only return reoccupies its own retired index,
+    /// keeps the old authorized names (as the kept path does for `unknown`)
+    /// and attaches count-only on a new link. Before the fix, a retired
+    /// semantic generation whose names the kept path had restored rejected
+    /// the returning `unknown` shape and burned 68 fresh slots.
+    #[test]
+    fn slot_reclaim_same_key_count_only_return_reoccupies_its_retired_index() {
+        for (label, unknown) in [("unknown names", true), ("authorized names", false)] {
+            let semantic = sole_complete_module();
+            let mut plan = scoped_plan(std::slice::from_ref(&semantic), AdmissionScope::Shared);
+            assert_eq!(plan.slots.len(), 68, "{label}");
+            assert_eq!(plan.active_slot_count(), 68, "{label}");
+            assert!(
+                plan.slots
+                    .iter()
+                    .any(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+                "{label}: the generation carries semantic authority"
+            );
+            assert_eq!(plan.standard_layout_slots.len(), 68, "{label}");
+            let old_names: Vec<Vec<String>> =
+                plan.slots.iter().map(|slot| slot.names.clone()).collect();
+            let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan.extend_exact(rebuilt).unwrap();
+            assert_eq!(plan.retired_slots.len(), 68, "{label}");
+            plan.revivable.clone_from(&plan.retired_keys);
+
+            let returning = count_only_copy(&semantic, unknown);
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&returning),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            assert_eq!(rebuilt.slots.len(), 68, "{label}");
+            assert!(
+                rebuilt
+                    .slots
+                    .iter()
+                    .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+                "{label}: the rebuilt generation is count-only"
+            );
+            assert_eq!(
+                rebuilt.reclaimed.len(),
+                68,
+                "{label}: merge tickets the same-key count-only return"
+            );
+            let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+                panic!("{label}: a same-key count-only reclaim must not refuse: {error}")
+            });
+            assert!(delta.retire.is_empty(), "{label}");
+            assert_eq!(delta.new.len(), 68, "{label}: new links, not replacements");
+            assert!(
+                delta
+                    .new
+                    .iter()
+                    .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+                "{label}: the reoccupied cells attach count-only"
+            );
+            assert_eq!(plan.slots.len(), 68, "{label}: no fresh slot was burned");
+            assert_eq!(plan.active_slot_count(), 68, "{label}");
+            assert!(plan.retired_slots.is_empty(), "{label}");
+            for (index, names) in old_names.iter().enumerate() {
+                let slot = &plan.slots[index];
+                assert_eq!(slot.descriptor_index, 0, "{label}: descriptor 0");
+                assert!(!slot.semantic_authorized, "{label}");
+                assert!(
+                    !plan.standard_layout_slots.contains(&(index as u32)),
+                    "{label}: the count-only cell keeps no standard-layout basis"
+                );
+                assert_eq!(slot.names, *names, "{label}: the old authorized names stay");
+                assert_eq!(
+                    plan.effective_semantics(slot),
+                    SlotSemantics::COUNT_ONLY,
+                    "{label}"
+                );
+                assert!(!plan.slot_is_module_ambiguous(index as u32), "{label}");
+            }
+            assert_eq!(
+                delta
+                    .new
+                    .iter()
+                    .map(|slot| slot.index)
+                    .collect::<BTreeSet<_>>(),
+                (0..68u32).collect(),
+                "{label}: every retired index is reoccupied"
+            );
+            plan.validate_slot_index().expect("topology stays clean");
+        }
+    }
+
+    /// O2 twin: the semantic -> count-only -> retired -> count-only flip
+    /// cycle reuses one generation instead of burning 68 fresh slots per
+    /// cycle. Thirty-two cycles stay at 68 slots, no refusal and no abort.
+    #[test]
+    fn slot_reclaim_count_only_flip_cycles_reuse_their_generation() {
+        let semantic = sole_complete_module();
+        let count_only = count_only_copy(&semantic, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&semantic), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68);
+        let authorized: Vec<Vec<String>> =
+            plan.slots.iter().map(|slot| slot.names.clone()).collect();
+        for cycle in 0..32 {
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&semantic),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            plan.extend_exact(rebuilt)
+                .unwrap_or_else(|error| panic!("cycle {cycle} semantic rebuild: {error}"));
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&count_only),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            plan.extend_exact(rebuilt)
+                .unwrap_or_else(|error| panic!("cycle {cycle} count-only rebuild: {error}"));
+            assert_eq!(
+                plan.slots.len(),
+                68,
+                "cycle {cycle}: the flip burns no cell"
+            );
+            assert_eq!(plan.active_slot_count(), 68, "cycle {cycle}");
+            assert!(
+                plan.slots.iter().all(|slot| slot.descriptor_index == 0),
+                "cycle {cycle}: every cell is count-only"
+            );
+
+            let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan.extend_exact(rebuilt)
+                .unwrap_or_else(|error| panic!("cycle {cycle} retire all: {error}"));
+            assert_eq!(plan.retired_slots.len(), 68, "cycle {cycle}");
+            plan.revivable.clone_from(&plan.retired_keys);
+
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&count_only),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            assert_eq!(
+                rebuilt.reclaimed.len(),
+                68,
+                "cycle {cycle}: merge tickets its own retired generation"
+            );
+            assert!(
+                rebuilt.modules_skipped.is_empty(),
+                "cycle {cycle}: no counted refusal: {:?}",
+                rebuilt.modules_skipped
+            );
+            plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+                panic!("cycle {cycle}: the flipped generation must not abort: {error}")
+            });
+            assert_eq!(
+                plan.slots.len(),
+                68,
+                "cycle {cycle}: the count-only return reoccupies its own cells"
+            );
+            assert_eq!(plan.active_slot_count(), 68, "cycle {cycle}");
+            assert!(plan.retired_slots.is_empty(), "cycle {cycle}");
+            assert!(plan.standard_layout_slots.is_empty(), "cycle {cycle}");
+            assert!(
+                plan.slots.iter().all(|slot| !slot.semantic_authorized),
+                "cycle {cycle}: a count-only reclaim clears semantic authority"
+            );
+        }
+        for (index, names) in authorized.iter().enumerate() {
+            assert_eq!(plan.slots[index].names, *names);
+            assert_eq!(plan.slots[index].descriptor_index, 0);
+            assert!(!plan.slots[index].semantic_authorized);
+        }
+    }
+
+    /// Growth omission at true capacity: an extension that would exceed the
+    /// lifetime budget drops whole overflowing NEW module objects, records
+    /// them as counted named refusals, and keeps every retire/replace/active
+    /// cell. Nothing here may reach the engine's fatal capacity branch.
+    #[test]
+    fn extend_at_capacity_drops_whole_overflowing_new_modules() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 100, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&filler), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize - 100);
+        let active_keys: BTreeSet<AttachKey> = plan.slot_by_key.keys().copied().collect();
+        let new = provider_with_tables(52, "/opt/new.so", 1, 101, true);
+        let kept = provider_with_tables(51, "/opt/filler.so", 1, 512, true);
+        // The rebuilt snapshot is valid on its own (613 <= 2,112): only the
+        // capture-lifetime prior allocation makes the extension overflow.
+        let rebuilt = scoped_plan(&[kept, new.clone()], AdmissionScope::Shared);
+        assert_eq!(rebuilt.slots.len(), 613);
+        let added: BTreeSet<AttachKey> = rebuilt
+            .slot_by_key
+            .keys()
+            .filter(|key| !active_keys.contains(key))
+            .copied()
+            .collect();
+        assert_eq!(added.len(), 101);
+        let delta = plan
+            .extend_exact_with_stable_module_ids(rebuilt)
+            .unwrap_or_else(|error| {
+                panic!("an at-capacity new module must be a counted refusal, not an abort: {error}")
+            });
+        assert_eq!(delta.retire.len(), MAX_SLOTS as usize - 100 - 512);
+        assert!(
+            delta.new.is_empty(),
+            "the overflowing new object is dropped whole"
+        );
+        assert_eq!(
+            plan.slots.len(),
+            MAX_SLOTS as usize - 100,
+            "capacity is unchanged"
+        );
+        assert_eq!(plan.active_slot_count(), 512, "the kept cells stay active");
+        assert_eq!(
+            plan.retired_slots.len(),
+            MAX_SLOTS as usize - 100 - 512,
+            "the retired cells stay retired"
+        );
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.object != PinnedObjectId(52)),
+            "the new object owns no cell"
+        );
+        assert!(
+            plan.modules
+                .iter()
+                .all(|module| module.object != PinnedObjectId(52))
+        );
+        let refusals: Vec<_> = plan.refused_modules_typed().collect();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        let (object, skipped, kind) = refusals[0];
+        assert_eq!(object, PinnedObjectId(52));
+        assert_eq!(skipped.subject, "/opt/new.so");
+        assert_eq!(kind, RefusalKind::CapacityWhole);
+        assert_eq!(
+            whole_refusal_needed_count(&skipped.reason),
+            Some(101),
+            "the refusal counts the omitted endpoints: {}",
+            skipped.reason
+        );
+        assert_eq!(plan.modules_skipped.len(), 1);
+        assert_eq!(plan.modules_skipped[0].subject, "/opt/new.so");
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
     /// B1: an ambiguous ticketed reclaim must reserve the room later
     /// mandatory fresh additions need. The plan holds 2,044 of the 2,112
     /// slots with 68 retired semantic cells; the same file returns with a

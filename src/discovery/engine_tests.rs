@@ -30076,6 +30076,74 @@ impl Drop for ChildReaper {
     }
 }
 
+/// O2 / GrowthOmission engine twin: at `capacity - 100`, a rebuilt snapshot
+/// whose whole new module object would push the capture-lifetime allocation
+/// past the budget must return a counted named refusal from the extension
+/// seam `live_candidate` uses, keeping every retire and active cell — never
+/// the fatal capacity branch.
+#[test]
+fn live_extension_at_capacity_refuses_a_whole_new_module_without_aborting() {
+    let capacity = p11scope_ebpf_common::MAX_SLOTS;
+    let (mut engine, raw) = engine_admitting_overlay(70, capacity - 100);
+    assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
+    assert_eq!(engine.plan.active_slot_count(), capacity as usize - 100);
+    let kept = with_endpoints(raw.clone(), 512);
+    let new = with_endpoints(overlay_module(overlay_key(71)), 101);
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(overlay_pins(&[(new.key, OVERLAY_SHA, 1)]));
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let (modules, skipped) = bind_scanned_modules(&[kept, new.clone()], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let new_object = modules
+        .iter()
+        .find(|module| module.scanned.key == new.key)
+        .map(|module| module.object)
+        .expect("the new module is reconciled");
+    // Valid on its own (613 <= 2,112): only the prior lifetime allocation
+    // makes the extension overflow.
+    let rebuilt = plan::build_from_reconciled_modules(&modules);
+    assert_eq!(rebuilt.slots.len(), 613);
+    let delta = engine
+        .plan
+        .extend_exact_with_stable_module_ids(rebuilt)
+        .unwrap_or_else(|error| {
+            panic!("at capacity a whole new module is a counted refusal, not an abort: {error}")
+        });
+    assert_eq!(
+        delta.retire.len(),
+        capacity as usize - 100 - 512,
+        "the prior cells outside the rebuilt snapshot retire"
+    );
+    assert!(
+        delta.new.is_empty(),
+        "the overflowing new object is dropped whole"
+    );
+    assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
+    assert_eq!(engine.plan.active_slot_count(), 512);
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|slot| slot.object != new_object),
+        "the new object owns no cell"
+    );
+    let refusals: Vec<_> = engine.plan.refused_modules_typed().collect();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    let (object, refused, kind) = refusals[0];
+    assert_eq!(object, new_object);
+    assert_eq!(refused.subject, new.path);
+    assert_eq!(kind, plan::RefusalKind::CapacityWhole);
+    assert_eq!(
+        plan::whole_refusal_needed_count(&refused.reason),
+        Some(101),
+        "the refusal carries its counted demand: {}",
+        refused.reason
+    );
+    assert_eq!(engine.plan.modules_skipped.len(), 1);
+    assert_eq!(engine.plan.modules_skipped[0].subject, new.path);
+}
+
 #[test]
 fn post_mutation_generation_loss_never_owns_the_cell_it_allocated() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();

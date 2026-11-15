@@ -2833,9 +2833,13 @@ impl AttachPlan {
     /// Keys that migrate onto an active index are excluded (migration takes
     /// precedence: it leaves no retired cell and no detach gap). A reclaim
     /// that would newly make a semantic cell ambiguous prefers a fresh index
-    /// that keeps the descriptor while the final allocation still fits; only
-    /// when that fresh charge would be refused does it reoccupy the retired
-    /// index as count-only (still counted, reported ambiguous).
+    /// that keeps the descriptor while the final allocation still fits. The
+    /// mandatory additions are counted first: a later-merged fresh key (a
+    /// provider built after this one, a selection table's new key) has
+    /// already been charged by merge, so the preference may only take room
+    /// beyond `slots + mandatory`. Only when that fresh charge would be
+    /// refused does an ambiguous reclaim reoccupy the retired index as
+    /// count-only (still counted, reported ambiguous).
     fn reclaim_assignment(
         &self,
         rebuilt: &AttachPlan,
@@ -2846,7 +2850,8 @@ impl AttachPlan {
         let capacity = self.admission_policy.endpoint_limit();
         let mut assigned = BTreeMap::new();
         let mut claimed_positions = BTreeSet::new();
-        let mut additions = 0usize;
+        let mut mandatory = 0usize;
+        let mut preferred: Vec<(AttachKey, usize)> = Vec::new();
         for slot in &rebuilt.slots {
             if !rebuilt.is_active(slot.index) {
                 continue;
@@ -2861,20 +2866,20 @@ impl AttachPlan {
                 None
             };
             let Some(position) = position else {
-                additions += 1;
+                mandatory += 1;
                 continue;
             };
             if claimed_positions.contains(&position) {
-                additions += 1;
+                mandatory += 1;
                 continue;
             }
             let Some(old_slot) = memory.slots.get(position) else {
-                additions += 1;
+                mandatory += 1;
                 continue;
             };
             let old_key = AttachKey::of(old_slot);
             let Some(facts) = memory.facts(&old_key) else {
-                additions += 1;
+                mandatory += 1;
                 continue;
             };
             if facts.position != position
@@ -2883,21 +2888,35 @@ impl AttachPlan {
                     &reclaim_target_from_slot(slot, &rebuilt.object_identities),
                 )
             {
-                additions += 1;
+                mandatory += 1;
                 continue;
             }
-            if self.reuse_makes_new_ambiguity(position, rebuilt, slot)
-                && self.slots.len().saturating_add(additions) < capacity
-            {
-                // Keep the descriptor on a fresh index; the retired cell
-                // keeps its own (already counted) history untouched.
-                additions += 1;
-                continue;
-            }
-            assigned.insert(key, position);
             claimed_positions.insert(position);
+            if self.reuse_makes_new_ambiguity(position, rebuilt, slot) {
+                preferred.push((key, position));
+            } else {
+                assigned.insert(key, position);
+            }
         }
-        (assigned, additions)
+        // Only room the mandatory additions leave may hold a preferred fresh
+        // index: `slots + mandatory + preferred < capacity`. Everything else
+        // reoccupies its retired index as a counted count-only ambiguity, so
+        // no later-charged addition is ever left without its index.
+        let mut preferred_count = 0usize;
+        for (key, position) in preferred {
+            if self
+                .slots
+                .len()
+                .saturating_add(mandatory)
+                .saturating_add(preferred_count)
+                < capacity
+            {
+                preferred_count += 1;
+            } else {
+                assigned.insert(key, position);
+            }
+        }
+        (assigned, mandatory + preferred_count)
     }
 
     /// Both exact-reuse assignments and the fresh-addition count extend will
@@ -3249,11 +3268,11 @@ impl AttachPlan {
                 aggregate_owners[*position] = merged;
                 if merged == AggregateOwner::Ambiguous && updated.descriptor_index != 0 {
                     // The gate in `migration_assignment` rejects a migration
-                    // that would newly make the owners ambiguous, so this is
-                    // an already ambiguous cell (whose kernel cookie is
-                    // count-only). Replace the link if it still carries a
-                    // descriptor for any reason: a plan-side downgrade of a
-                    // linked cell must never be silent.
+                    // that would newly make the owners ambiguous, so this
+                    // branch is defensive: it should only be reachable for
+                    // an already ambiguous cell. If such a cell ever still
+                    // carries a descriptor, replace the link rather than
+                    // downgrade the plan silently.
                     updated.descriptor_index = 0;
                     updated.semantics = SlotSemantics::COUNT_ONLY;
                     updated.semantic_ambiguous = true;

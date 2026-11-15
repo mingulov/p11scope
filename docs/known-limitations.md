@@ -264,8 +264,9 @@ other never-admitted members. A job-control shell in the run tree
 can see its child briefly stopped (`CLD_STOPPED`). An observer
 killed with SIGKILL (or aborted) leaves its stopped members to the
 run's watchdog, a separate process in its own session outside the
-run cgroup that sends SIGCONT to every stopped member of the run tree
-except the direct child (a bounded walk: 256 cgroups, 8 levels, 4 MiB
+run cgroup, holding only `CAP_KILL` and no-new-privileges, that sends
+SIGCONT to every stopped member of the run tree (any stopped thread
+counts, also after the main thread exited) except the direct child (a bounded walk: 256 cgroups, 8 levels, 4 MiB
 per process list), in sweeps scheduled up to 1.6 s after the death (a
 slow sweep delays the later ones; measured 0.2-0.5 s under load); that sweep also
 resumes a member stopped on purpose, and does not see a member moved

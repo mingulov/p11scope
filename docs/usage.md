@@ -895,8 +895,13 @@ file costs one short stop for its first mapper; a hold that cannot
 attach, and a stopped member the observer cannot pin or place in the
 run tree, resumes at most 1 s after its stop (or in the pass that
 first reads it when the observer is busier than that) and files the
-learned-file gap row. A member moved out of the run cgroup while
-stopped is resumed too. A job-control shell inside the command can
+learned-file gap row. So does a member whose file sits on a FUSE
+mount (never opened while its server may be stopped), and the row is
+filed when the kernel refused any stop (table full, signal or file
+identity refused). A member moved out of the run cgroup while
+stopped is resumed too. Stopping ends with the capture loop: the hook
+is switched off and detached before the final drain, so no member is
+stopped while the observer settles. A job-control shell inside the command can
 see such a child briefly stopped (`CLD_STOPPED`). With `--pause never`
 (or when the kernel refuses the stop object) descendants are never
 stopped: a short-lived descendant that cold-loads the provider teaches

@@ -753,12 +753,13 @@ fn spawn_run_observer(
         "--gate",
         gate.to_str().context("gate path")?,
     ]);
-    // A gated owned child waits for the same gate before its own setup:
-    // its provider is already mapped and bound (so attach and discovery
-    // see the image and --prearm-module resolves the name), but no
-    // PKCS#11 call can race the selection-time broad read. A call that
-    // completes inside that read pairs one component's stats with the
-    // other's return-value counts and voids the whole window as torn.
+    // A gated owned child waits for the same gate before binding or
+    // calling: its provider is already mapped (dlopen), so attach and
+    // discovery see the image and --prearm-module resolves the name,
+    // while binding and every provider call wait for the gate. A call
+    // that completes inside the selection-time broad read pairs one
+    // component's stats with the other's return-value counts and voids
+    // the whole window as torn.
     if gate != Path::new("-") {
         command.arg("--gate-before-setup");
     }

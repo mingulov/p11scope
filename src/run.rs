@@ -28422,7 +28422,7 @@ int main(int argc, char **argv) {
     /// and then overrun. The loops need a live session, so the order
     /// is pinned statically; the acceptance transcripts prove it runs.
     #[test]
-    fn capture_loops_arm_before_ready_for_pid_and_after_for_wide_scopes() {
+    fn capture_loops_arm_before_ready_for_pid_and_owned_run_and_after_for_wide_scopes() {
         let source = include_str!("run.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         assert_eq!(
@@ -28473,8 +28473,11 @@ int main(int argc, char **argv) {
             if name == "profile" {
                 // The selection sits between the completion and the
                 // pre-ready emission: its detail window is open before
-                // `capturing:` on the pid and owned-run paths.
+                // `capturing:` on the pid and owned-run paths. The
+                // stage only resolves the endpoint; the production
+                // open is the broad read that actually opens it.
                 markers.push("run_metrics_selection_stage(");
+                markers.push("open_k0_production(");
             }
             markers.extend_from_slice(&[
                 "if arm_before_ready {",

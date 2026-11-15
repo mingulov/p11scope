@@ -18,9 +18,10 @@
  *   --iters N        main-phase iterations (default 4)
  *   --gate FILE|-    wait for FILE to exist before the main phase (default -: no gate)
  *   --gate-before-setup
- *                    (mech) also wait for --gate before any API call: providers
- *                    are mapped (and bound) first, so attach/discovery see the
- *                    image, but no PKCS#11 call races the observer's startup
+ *                    (mech) also wait for --gate before binding or calling:
+ *                    providers are mapped (dlopen) first, so attach/discovery
+ *                    see the image; binding and every provider call wait
+ *                    for the gate
  *   --hold           after teardown, wait for SIGTERM/SIGINT before exiting
  *   --late           (mech) dlopen only after the gate opens: a late provider     [P7]
  *   --late-from N    (mech) modules N.. load only after the gate; modules below N
@@ -529,9 +530,9 @@ static void mech_generation(long iters, int gated) {
             s[m] = setup(m, PH_SETUP);
         }
     } else if (opt.gate_before_setup) {
-        for (int m = 0; m < split; m++) { load_module(m); bind_module(m, PH_SETUP); }
+        for (int m = 0; m < split; m++) load_module(m);
         wait_gate(opt.gate);
-        for (int m = 0; m < split; m++) s[m] = setup(m, PH_SETUP);
+        for (int m = 0; m < split; m++) { bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
     } else {
         for (int m = 0; m < split; m++) { load_module(m); bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
     }

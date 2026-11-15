@@ -971,7 +971,9 @@ most windows. A call that completes inside the selection-time read
 itself tears the same way: an owned `run` child that calls as soon as
 it starts can leave its own startup calls there. A `run` child that
 waits for the `p11scope: capturing: ` line before calling keeps its
-workload inside the window.
+later calls inside the window, but that covers the opening boundary
+only: a child still calling when a `--duration` window closes can
+tear the close read (as above).
 With `run`, a host whose kernel and userspace monotonic clocks cannot
 be compared (a time namespace offset, or a kernel without the time
 namespace files) refuses the selection as `promotion_scope_unsupported`.

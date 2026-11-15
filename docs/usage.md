@@ -1431,8 +1431,11 @@ Limits that matter in pods:
   owned child before the selection-time read, so the window may start
   after the child has started and early calls can fall outside the
   detail; a child that waits for the `p11scope: capturing: ` line
-  before calling has its whole workload inside the window. If the
-  watched process replaces
+  before calling has its calls from that point inside the window, but
+  this covers the opening boundary only: a child still calling when a
+  `--duration` window closes can tear the close read and withhold the
+  detail as `broad_plan_topology` (see the torn-window note below). If
+  the watched process replaces
   itself (exec) between the two reads, the slot retires, or the close
   boundary cannot be proven clean, the detail is withheld with a named
   reason; a leader exit that is the last lifecycle record ends the

@@ -87944,3 +87944,81 @@ fn member_stop_failed_deactivate_settles_each_member() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Runs one member-stop pass over a stopped provider mapper with the
+/// given `--module` hints and `--exclude-module` inputs; returns the
+/// engine, the scripted table and the member's file key.
+fn member_stop_selection_pass(
+    hints: impl FnOnce(&std::path::Path) -> Vec<std::path::PathBuf>,
+    excludes: impl FnOnce(&std::path::Path) -> Vec<std::path::PathBuf>,
+) -> (
+    Engine,
+    ScriptedMemberStops,
+    p11scope_ebpf_common::MemberFileKey,
+    bool,
+) {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    engine.module_hints = hints(&library);
+    engine.budget.set_excludes(excludes(&library));
+    engine.pause_owned_batch = true;
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    let resumed = member_resumed_for_test(pid);
+    (engine, io, key, resumed)
+}
+
+/// `--module` narrows discovery: a stopped member's provider outside
+/// the named modules is no provider for this capture. It is cleared and
+/// the member resumes at once, with no staging and no first-use row
+/// (a browser's own NSS softoken under `run --module <token>`).
+#[test]
+fn member_stop_never_stages_a_provider_outside_the_module_selection() {
+    let (engine, io, key, resumed) = member_stop_selection_pass(
+        |library| vec![library.with_file_name("another-provider.so")],
+        |_| Vec::new(),
+    );
+    assert_eq!(engine.learned_staged_files_for_test(), 0, "nothing stages");
+    assert!(!engine.member_stops_held(), "the member is not held");
+    assert!(io.cleared.contains(&key), "the unselected file is cleared");
+    assert!(resumed, "the member resumes at once");
+    assert!(
+        !files_the_first_use_row(&engine),
+        "an unselected provider owes no first-use row"
+    );
+}
+
+/// `--exclude-module` wins the same way: an excluded provider is
+/// cleared, never staged.
+#[test]
+fn member_stop_never_stages_an_excluded_provider() {
+    let (engine, io, key, resumed) =
+        member_stop_selection_pass(|_| Vec::new(), |library| vec![library.to_path_buf()]);
+    assert_eq!(engine.learned_staged_files_for_test(), 0, "nothing stages");
+    assert!(!engine.member_stops_held());
+    assert!(io.cleared.contains(&key));
+    assert!(resumed);
+    assert!(!files_the_first_use_row(&engine));
+}
+
+/// Twin: a provider the `--module` selection names stages and holds
+/// its mapper exactly as without a selection.
+#[test]
+fn member_stop_stages_a_provider_the_module_selection_names() {
+    let (engine, io, key, resumed) =
+        member_stop_selection_pass(|library| vec![library.to_path_buf()], |_| Vec::new());
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the named provider stages"
+    );
+    assert!(engine.member_stops_held(), "its mapper is held");
+    assert!(!io.cleared.contains(&key));
+    assert!(!resumed);
+}

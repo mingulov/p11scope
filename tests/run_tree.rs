@@ -265,6 +265,136 @@ fn function_calls(profile: &serde_json::Value, sha256: &str) -> BTreeMap<String,
     counts
 }
 
+/// One workload call's `CLOCK_MONOTONIC` bounds from its ledger's
+/// `CALL name start_ns end_ns` lines.
+struct CallTime {
+    name: String,
+    start_ns: u64,
+}
+
+/// Every timed call of `ledgers` (the ledger line itself must exist: the
+/// read waits for it like `sum_ledgers`).
+fn read_call_times(ledgers: &[PathBuf]) -> Vec<CallTime> {
+    let mut calls = Vec::new();
+    for ledger in ledgers {
+        read_ledger_file(ledger);
+        let text = std::fs::read_to_string(ledger).expect("read ledger");
+        for line in text.lines().filter(|line| line.starts_with("CALL ")) {
+            let mut fields = line.split_whitespace().skip(1);
+            let name = fields.next().expect("CALL name").to_string();
+            let start_ns = fields
+                .next()
+                .and_then(|start| start.parse().ok())
+                .expect("CALL start");
+            calls.push(CallTime { name, start_ns });
+        }
+    }
+    calls
+}
+
+/// The end of the report's disclosed first-use window for `module`: the
+/// module record's `first_attached_at_ns` (the first complete attach),
+/// which must lie inside a disclosed `pre_attach`/`late_discovery`
+/// unobserved window starting at scope start. Panics naming what is
+/// missing when the report does not disclose it.
+fn first_use_window_end(profile: &serde_json::Value, module: &Path) -> u64 {
+    let want = module.to_str().expect("utf8 module path");
+    let records: Vec<_> = profile
+        .get("evidence")
+        .and_then(|evidence| evidence.get("discovery"))
+        .and_then(|discovery| discovery.as_array())
+        .expect("evidence.discovery")
+        .iter()
+        .filter(|record| record.get("path").and_then(|p| p.as_str()) == Some(want))
+        .collect();
+    let first = records
+        .iter()
+        .filter_map(|record| record.get("first_attached_at_ns")?.as_u64())
+        .min()
+        .unwrap_or_else(|| panic!("no first_attached_at_ns for {want}: {records:?}"));
+    let disclosed = records
+        .iter()
+        .filter_map(|record| record.get("unobserved_windows")?.as_array())
+        .flatten()
+        .any(|window| {
+            matches!(
+                window.get("reason").and_then(|r| r.as_str()),
+                Some("pre_attach" | "late_discovery")
+            ) && window.get("end_ns").and_then(|end| end.as_u64()) >= Some(first)
+        });
+    assert!(
+        disclosed,
+        "no disclosed first-use window reaches the first attach {first}: {records:?}"
+    );
+    first
+}
+
+/// Exact accounting for a learned provider (owner ruling 2026-11-15: a
+/// percentage floor is the wrong check). Per function, the observed calls
+/// plus the calls inside the disclosed pre-attach window must account for
+/// the ground truth: every call that started after the window's end (the
+/// module's first complete attach, `first_attached_at_ns`) must be
+/// observed, and nothing may be observed beyond the ground truth. A
+/// call that started inside the window may land or not (its probe may
+/// attach while the call runs); the window is the report's disclosure of
+/// the first-use gap (the gap row names it, the observer cannot count
+/// calls it never saw). Any other miss, however small, is an undisclosed
+/// miss and fails (a mid-capture detach/replace window, slot churn).
+fn assert_exact_first_use_accounting(
+    profile: &serde_json::Value,
+    module: &Path,
+    ledgers: &[PathBuf],
+) {
+    let sha = record_sha256(profile, module);
+    let observed = function_calls(profile, &sha);
+    let calls = read_call_times(ledgers);
+    let oracle = sum_ledgers(ledgers);
+    let timed: u64 = calls.len() as u64;
+    assert_eq!(
+        timed,
+        oracle.values().sum::<u64>(),
+        "every ledger call carries its time bounds"
+    );
+    let window_end = first_use_window_end(profile, module);
+    let mut problems = Vec::new();
+    let mut summary = Vec::new();
+    for (name, total) in &oracle {
+        let after = calls
+            .iter()
+            .filter(|call| &call.name == name && call.start_ns > window_end)
+            .count() as u64;
+        let seen = observed.get(name).copied().unwrap_or(0);
+        summary.push(format!(
+            "{name}: observed {seen}, after-window {after}, total {total}"
+        ));
+        if seen > *total {
+            problems.push(format!(
+                "{name}: observed {seen} exceeds the {total}-call ground truth"
+            ));
+        }
+        if seen < after {
+            problems.push(format!(
+                "undisclosed miss: {} calls after the pre-attach window ({name}: observed {seen} of {after} that started after {window_end})",
+                after - seen
+            ));
+        }
+    }
+    let invented: Vec<_> = observed
+        .iter()
+        .filter(|(name, calls)| **calls > 0 && !oracle.contains_key(*name))
+        .collect();
+    if !invented.is_empty() {
+        problems.push(format!(
+            "observed functions the workload never called: {invented:?}"
+        ));
+    }
+    assert!(
+        problems.is_empty(),
+        "exact accounting failed: {problems:?}; window end {window_end}; {summary:?}"
+    );
+    eprintln!("exact accounting ok: window end {window_end}; {summary:?}");
+}
+
 /// The `evidence.discovery[]` record's `sha256` for `module`.
 fn record_sha256(profile: &serde_json::Value, module: &Path) -> String {
     let want = module.to_str().expect("utf8 module path");
@@ -591,6 +721,29 @@ typedef ck_rv_t (*c_get_slot_list_t)(unsigned char, ck_slot_id_t *, ck_ulong_t *
 typedef ck_rv_t (*c_get_slot_info_t)(ck_slot_id_t, unsigned char *);
 typedef ck_rv_t (*c_get_token_info_t)(ck_slot_id_t, unsigned char *);
 
+/* Per-call CLOCK_MONOTONIC bounds, written after the LEDGER line as
+   `CALL name start_ns end_ns` (exact accounting against the report's
+   attach instants). */
+struct call_time { const char *name; unsigned long long start, end; };
+static struct call_time *calls;
+static long ncalls, max_calls;
+
+static unsigned long long mono_ns(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (unsigned long long)now.tv_sec * 1000000000ULL + (unsigned long long)now.tv_nsec;
+}
+
+#define TIMED(label, expr) do { \
+        unsigned long long t0_ = mono_ns(); \
+        expr; \
+        if (ncalls < max_calls) { \
+            calls[ncalls].name = (label); calls[ncalls].start = t0_; \
+            calls[ncalls].end = mono_ns(); ncalls++; \
+        } \
+    } while (0)
+
 static void *need_symbol(void *handle, const char *name)
 {
     dlerror();
@@ -621,6 +774,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "workload: bad counts\n");
         return 2;
     }
+    max_calls = 2 + iterations * (3 + 2 * 64);
+    calls = calloc((size_t)max_calls, sizeof *calls);
+    if (calls == NULL) {
+        fprintf(stderr, "workload: no memory for call times\n");
+        return 3;
+    }
     void *handle = dlopen(module, RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) {
         fprintf(stderr, "workload: cannot open %s: %s\n", module, dlerror());
@@ -632,7 +791,8 @@ int main(int argc, char **argv)
     c_get_slot_list_t c_get_slot_list = need_symbol(handle, "C_GetSlotList");
     c_get_slot_info_t c_get_slot_info = need_symbol(handle, "C_GetSlotInfo");
     c_get_token_info_t c_get_token_info = need_symbol(handle, "C_GetTokenInfo");
-    ck_rv_t rv = c_initialize(NULL);
+    ck_rv_t rv;
+    TIMED("C_Initialize", rv = c_initialize(NULL));
     if (rv != 0) {
         fprintf(stderr, "workload: C_Initialize failed: 0x%lx\n", rv);
         return 3;
@@ -644,30 +804,30 @@ int main(int argc, char **argv)
     long get_info = 0, get_slot_list = 0, get_slot_info = 0, get_token_info = 0;
     for (long i = 0; i < iterations; i++) {
         memset(info, 0, sizeof info);
-        c_get_info(info);
+        TIMED("C_GetInfo", c_get_info(info));
         get_info++;
         ck_ulong_t count = 0;
-        c_get_slot_list(0, NULL, &count);
+        TIMED("C_GetSlotList", c_get_slot_list(0, NULL, &count));
         get_slot_list++;
         if (count > 64)
             count = 64;
         if (count > 0) {
             ck_ulong_t have = count;
-            c_get_slot_list(0, slots, &have);
+            TIMED("C_GetSlotList", c_get_slot_list(0, slots, &have));
             get_slot_list++;
             if (have > count)
                 have = count;
             for (ck_ulong_t s = 0; s < have; s++) {
                 memset(slot_info, 0, sizeof slot_info);
-                c_get_slot_info(slots[s], slot_info);
+                TIMED("C_GetSlotInfo", c_get_slot_info(slots[s], slot_info));
                 get_slot_info++;
                 memset(token_info, 0, sizeof token_info);
-                c_get_token_info(slots[s], token_info);
+                TIMED("C_GetTokenInfo", c_get_token_info(slots[s], token_info));
                 get_token_info++;
             }
         }
     }
-    rv = c_finalize(NULL);
+    TIMED("C_Finalize", rv = c_finalize(NULL));
     if (rv != 0) {
         fprintf(stderr, "workload: C_Finalize failed: 0x%lx\n", rv);
         return 3;
@@ -681,6 +841,8 @@ int main(int argc, char **argv)
             "LEDGER C_Initialize=1 C_Finalize=1 C_GetInfo=%ld C_GetSlotList=%ld "
             "C_GetSlotInfo=%ld C_GetTokenInfo=%ld\n",
             get_info, get_slot_list, get_slot_info, get_token_info);
+    for (long c = 0; c < ncalls; c++)
+        fprintf(ledger, "CALL %s %llu %llu\n", calls[c].name, calls[c].start, calls[c].end);
     fclose(ledger);
     if (get_info != iterations || get_slot_list < iterations) {
         fprintf(stderr, "workload: hot counts drifted\n");
@@ -1211,6 +1373,9 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
 /// scans and arms every mapper (heavy under shared-host load), so 150 ms
 /// workers time out before slow frames (measured 0.54 coverage in the
 /// 8-cell gate); 300 ms survives and holds 1.0.
+/// Judged by exact accounting (owner ruling 2026-11-15), not a floor:
+/// every call that started after the report's disclosed pre-attach
+/// window must be observed (`assert_exact_first_use_accounting`).
 #[test]
 #[ignore = "privileged: run-tree unprearmed shortlived never-pause cell (root BPF capture, runtime SoftHSM workload + token)"]
 fn privileged_run_tree_unprearmed_shortlived_never_pause_still_learns() {
@@ -1254,27 +1419,7 @@ fn privileged_run_tree_unprearmed_shortlived_never_pause_still_learns() {
         .and_then(|probes| probes.as_u64())
         .expect("attached_probes");
     assert!(probes > 0, "the run attached probes: {profile}");
-    let oracle_rest = sum_ledgers(&ledgers[1..]);
-    let oracle_rest_total: u64 = oracle_rest.values().sum();
-    let oracle_first_total: u64 = sum_ledgers(&ledgers[..1]).values().sum();
-    assert!(oracle_rest_total > 0, "the oracle is non-empty");
-    let sha = record_sha256(&profile, &module);
-    let observed = function_calls(&profile, &sha);
-    let observed_total: u64 = observed.values().sum();
-    let oracle_all = sum_ledgers(&ledgers);
-    let oracle_all_total: u64 = oracle_all.values().sum();
-    assert!(
-        observed_total <= oracle_all_total,
-        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
-    );
-    // The bound excludes the first worker's masking effect (its landed
-    // calls cannot inflate later-worker recall).
-    let coverage =
-        coverage_after_first_worker(observed_total, oracle_first_total, oracle_rest_total);
-    assert!(
-        coverage >= 0.95,
-        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total} less first-worker {oracle_first_total}): {observed:?}"
-    );
+    assert_exact_first_use_accounting(&profile, &module, &ledgers);
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
     let learned = evidence
         .get("learned_staged_files")
@@ -1300,18 +1445,14 @@ fn privileged_run_tree_unprearmed_shortlived_never_pause_still_learns() {
 /// hint. The sequential twin above cannot catch parallel-only
 /// regressions (a fork burst that overwhelms admission while the
 /// first file stages); this cell pins the parallel shape instead.
-/// Coverage counts waves 1+ against their oracle with the first
-/// wave's whole oracle excluded (several wave-0 mappers can race the
-/// initial stage+attach, not just one first worker): the bound is the
-/// same sound lower bound as the sequential cells, over the waves
-/// that ran under attached probes. The 2000 ms linger is load-bearing
-/// (measured waves-1+ bound 0.0 at 300 ms, 0.4 at 1000 ms, 0.8 at
-/// 2000 ms): a parallel burst needs longer-lived mappers for admission
-/// and attach to catch up. Floor 0.75: the whole-wave exclusion costs
-/// the bound 20 points of conservatism when wave 0 misses honestly
-/// (against 3 for the sequential cells), so 0.95 is unreachable here;
-/// 0.75 still craters on any real staging, attach, or admission
-/// breakage.
+/// Judged by exact accounting (owner ruling 2026-11-15), not a floor:
+/// wave-0 mappers may race the initial stage+attach, so their calls
+/// inside the report's disclosed pre-attach window may be missed, and
+/// every call that started after it must be observed
+/// (`assert_exact_first_use_accounting`). The 2000 ms linger keeps the
+/// mappers alive while admission and attach catch up under the burst
+/// (measured waves-1+ floor bound 0.0 at 300 ms, 0.4 at 1000 ms, 0.8 at
+/// 2000 ms under the old check).
 #[test]
 #[ignore = "privileged: run-tree unprearmed shortlived parallel never-pause cell (root BPF capture, runtime SoftHSM workload + token)"]
 fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves() {
@@ -1359,27 +1500,7 @@ fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves()
         .and_then(|probes| probes.as_u64())
         .expect("attached_probes");
     assert!(probes > 0, "the run attached probes: {profile}");
-    // Waves 1+ ran under attached file-identity probes; wave 0 raced
-    // the initial stage+attach and is excluded whole.
-    let oracle_rest = sum_ledgers(&ledgers[PER_WAVE as usize..]);
-    let oracle_rest_total: u64 = oracle_rest.values().sum();
-    let oracle_first_total: u64 = sum_ledgers(&ledgers[..PER_WAVE as usize]).values().sum();
-    assert!(oracle_rest_total > 0, "the oracle is non-empty");
-    let sha = record_sha256(&profile, &module);
-    let observed = function_calls(&profile, &sha);
-    let observed_total: u64 = observed.values().sum();
-    let oracle_all = sum_ledgers(&ledgers);
-    let oracle_all_total: u64 = oracle_all.values().sum();
-    assert!(
-        observed_total <= oracle_all_total,
-        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
-    );
-    let coverage =
-        coverage_after_first_worker(observed_total, oracle_first_total, oracle_rest_total);
-    assert!(
-        coverage >= 0.75,
-        "coverage after the first wave is {coverage:.4} ({observed_total}/{oracle_rest_total} less first-wave {oracle_first_total}): {observed:?}"
-    );
+    assert_exact_first_use_accounting(&profile, &module, &ledgers);
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
     let learned = evidence
         .get("learned_staged_files")
@@ -1411,8 +1532,8 @@ fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves()
 /// dedupes), the capture stays PARTIAL,
 /// yet the watch still stages the provider by scan (staging needs no
 /// loader context) and the later SoftHSM mappers' calls still land via
-/// the file-identity probes (coverage after the first provider
-/// worker clears 0.95, like the twin cells). Without the watch staging
+/// the file-identity probes (exact accounting like the twin cells:
+/// every call after the disclosed pre-attach window is observed). Without the watch staging
 /// this cell would see 0 probes; without the honest gap the exhaustion
 /// would be silent. Small waves (20, not 30+) are load-bearing for
 /// admission:
@@ -1525,30 +1646,9 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
         learned >= 1,
         "the run staged the learned provider file: {profile}"
     );
-    // Later calls still counted: coverage after the first provider worker
-    // clears 95% (the first may be missed honestly before the stage+attach
-    // lands; file-identity probes need no loader context).
-    let oracle_rest = sum_ledgers(&ledgers[1..]);
-    let oracle_rest_total: u64 = oracle_rest.values().sum();
-    let oracle_first_total: u64 = sum_ledgers(&ledgers[..1]).values().sum();
-    assert!(oracle_rest_total > 0, "the oracle is non-empty");
-    let sha = record_sha256(&profile, &module);
-    let observed = function_calls(&profile, &sha);
-    let observed_total: u64 = observed.values().sum();
-    let oracle_all = sum_ledgers(&ledgers);
-    let oracle_all_total: u64 = oracle_all.values().sum();
-    assert!(
-        observed_total <= oracle_all_total,
-        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
-    );
-    // The bound excludes the first worker's masking effect (its landed
-    // calls cannot inflate later-worker recall).
-    let coverage =
-        coverage_after_first_worker(observed_total, oracle_first_total, oracle_rest_total);
-    assert!(
-        coverage >= 0.95,
-        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total} less first-worker {oracle_first_total}): {observed:?}"
-    );
+    // Every call after the disclosed pre-attach window lands
+    // (file-identity probes need no loader context).
+    assert_exact_first_use_accounting(&profile, &module, &ledgers);
 }
 
 /// Non-member privacy: a process outside the run cgroup opens a different

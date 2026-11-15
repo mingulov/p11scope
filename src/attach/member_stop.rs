@@ -324,10 +324,22 @@ mod tests {
                 hooks.clear(key).unwrap();
             }
         }
+        assert!(stop.vm_start < stop.vm_end, "{stop:?}");
         assert!(
-            maps.lines()
-                .any(|line| line.contains(&format!(" {} ", stop.file.ino))),
-            "the row names a file the member maps"
+            maps.lines().any(|line| {
+                let Some((range, rest)) = line.split_once(' ') else {
+                    return false;
+                };
+                let Some((start, end)) = range.split_once('-') else {
+                    return false;
+                };
+                let start = u64::from_str_radix(start, 16).unwrap_or(u64::MAX);
+                let end = u64::from_str_radix(end, 16).unwrap_or(0);
+                rest.as_bytes().get(2) == Some(&b'x')
+                    && start <= stop.vm_start
+                    && stop.vm_start < end
+            }),
+            "the row's range names an executable mapping of the member: {stop:?}\n{maps}"
         );
         // The row's own kernel key: for an overlayfs mapping it differs
         // from the device `maps` prints, and clearing it is what the

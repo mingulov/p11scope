@@ -28,6 +28,8 @@ struct file___p11ms {
     struct inode___p11ms *f_inode;
 } MS_BTF;
 struct vm_area_struct___p11ms {
+    unsigned long vm_start;
+    unsigned long vm_end;
     unsigned long vm_flags;
     struct file___p11ms *vm_file;
 } MS_BTF;
@@ -141,6 +143,12 @@ int p11_member_map_stop(u64 *ctx)
     }
     if (ms_map_lookup(&MS_CLEARED, &stop.file))
         return 0;
+    /* The exact mapping: userspace finds this file's maps row by range,
+     * whatever inode or device `maps` prints for it (overlayfs). */
+    if (MS_READ(stop.vm_start, vma->vm_start) || MS_READ(stop.vm_end, vma->vm_end)) {
+        ms_count(MS_COUNT_IDENTITY_UNREAD);
+        return 0;
+    }
     stop.hook_ts_ns = ms_ktime_ns();
     rc = ms_map_update(&MS_STOPS, &tgid, &stop, MS_NOEXIST);
     if (rc == -MS_EEXIST)

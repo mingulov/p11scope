@@ -24,6 +24,8 @@
 #     metrics::counter_reader::tests::counter_reader_requires_exact_maps_and_health
 #   uretprobe hazard probe:
 #     events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict
+#   run member first-map stop (loads the member-stop object, its watchdog):
+#     attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_map
 #
 # Default kernels: v6.6.157 v6.12.111.
 #
@@ -92,6 +94,7 @@ attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm
 metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes
 metrics::counter_reader::tests::counter_reader_requires_exact_maps_and_health
 events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict
+attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_map
 )
 
 VNG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/virtme-ng"
@@ -125,6 +128,8 @@ fi
 T=/tmp/libcells-work
 mkdir -p "$T" && mount -t tmpfs -o mode=700,size=2G tmpfs "$T" || exit 2
 df -T "$T" | tail -n 1
+# The member-stop cell builds a run cgroup under the cgroup2 root.
+mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup || exit 2
 ulimit -n 65536
 INNER_EOF
         i=0

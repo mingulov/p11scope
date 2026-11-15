@@ -91,7 +91,11 @@ pub(crate) struct MemberStopStats {
 struct ExecRow {
     start: u64,
     end: u64,
+    /// The identity cleared for this row: the `maps` one, or the kernel
+    /// row's own for the stopping mapping.
     key: MemberFileKey,
+    /// The inode number `maps` printed: what an opened file must match.
+    maps_ino: u64,
     path: Vec<u8>,
 }
 
@@ -161,6 +165,7 @@ fn exec_rows(maps: &[u8]) -> Vec<ExecRow> {
                 dev: kernel_dev(major, minor),
                 ino,
             },
+            maps_ino: ino,
             path: path.to_vec(),
         });
     }
@@ -169,21 +174,32 @@ fn exec_rows(maps: &[u8]) -> Vec<ExecRow> {
 
 /// Puts the stopping file first under its kernel key. `maps` prints the
 /// user-visible inode, while the hook reads the VMA's own file: for an
-/// overlayfs (backing-file) mapping the device differs (the overlay's
-/// versus the real filesystem's) and the inode number usually matches.
-/// The row with the exact key, else the first with the same inode
-/// number, is proven again under the kernel key, so clearing that key
-/// is what stops later mappers from stopping on the same file. Neighbor
-/// rows keep their `maps` keys (correct whenever the two agree; a
-/// mismatched one only costs one more stop for its first mapper).
-fn with_stopping_row(mut rows: Vec<ExecRow>, kernel: MemberFileKey) -> Vec<ExecRow> {
-    if let Some(at) = rows.iter().position(|row| row.key == kernel) {
+/// overlayfs (backing-file) mapping the device, and possibly the inode
+/// number, differ from the row's. The kernel row names its mapping's
+/// exact range, so the `maps` row holding that range's start is the
+/// stopping file whatever it prints; it is proven again under the kernel
+/// key, so clearing that key is what stops later mappers from stopping on
+/// the same file. Neighbor rows keep their `maps` keys (correct whenever
+/// the two agree; a mismatched one costs one more stop for the first
+/// mapper of that file, which then clears it under its own kernel key).
+/// No row holds the range when it was unmapped since: nothing is added,
+/// and the file stays uncleared.
+fn with_stopping_row(mut rows: Vec<ExecRow>, stop: &MemberStop) -> Vec<ExecRow> {
+    let Some(at) = rows
+        .iter()
+        .position(|row| row.start <= stop.vm_start && stop.vm_start < row.end)
+    else {
+        return rows;
+    };
+    if rows[at].key == stop.file {
         let row = rows.remove(at);
         rows.insert(0, row);
-        return rows;
-    }
-    if let Some(row) = rows.iter().find(|row| row.key.ino == kernel.ino).cloned() {
-        rows.insert(0, ExecRow { key: kernel, ..row });
+    } else {
+        let row = ExecRow {
+            key: stop.file,
+            ..rows[at].clone()
+        };
+        rows.insert(0, row);
     }
     rows
 }
@@ -212,7 +228,7 @@ fn open_exec_row(
     let meta = file
         .metadata()
         .map_err(|error| format!("member file metadata: {error}"))?;
-    if meta.ino() != row.key.ino {
+    if meta.ino() != row.maps_ino {
         return Err("member file path no longer names the mapped inode".into());
     }
     Ok(file)
@@ -291,7 +307,7 @@ impl Engine {
             .open_proc_dir()
             .and_then(|proc| {
                 let maps = proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES)?;
-                Ok((proc, with_stopping_row(exec_rows(&maps), stop.file)))
+                Ok((proc, with_stopping_row(exec_rows(&maps), &stop)))
             })
             .map(|(proc, rows)| self.prove_member_rows(&pin, &proc, rows, deadline));
         let (cleared, providers) = match rows {
@@ -530,27 +546,44 @@ mod tests {
             start,
             end: start + 0x1000,
             key: MemberFileKey { dev, ino },
+            maps_ino: ino,
             path: b"/usr/lib/libx.so".to_vec(),
+        };
+        let stop = |dev, ino, vm_start| MemberStop {
+            file: MemberFileKey { dev, ino },
+            hook_ts_ns: 1,
+            vm_start,
+            vm_end: vm_start + 0x1000,
         };
         // Same domain: the exact row moves first, nothing is added.
         let rows = with_stopping_row(
             vec![row(1, 5, 0x1000), row(1, 7, 0x3000)],
-            MemberFileKey { dev: 1, ino: 7 },
+            &stop(1, 7, 0x3000),
         );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].key, MemberFileKey { dev: 1, ino: 7 });
-        // Overlay: maps shows the overlay device (43), the hook the real
-        // filesystem's (23); the same-inode row is proven under 23 too.
+        // Overlay, other device: the row at the stopping range is proven
+        // under the kernel key too.
         let rows = with_stopping_row(
             vec![row(43, 5, 0x1000), row(43, 7, 0x3000)],
-            MemberFileKey { dev: 23, ino: 7 },
+            &stop(23, 7, 0x3000),
         );
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].key, MemberFileKey { dev: 23, ino: 7 });
         assert_eq!(rows[0].start, 0x3000, "it reads the same mapping");
-        // Unmapped since: nothing to prove, nothing added.
-        let rows = with_stopping_row(vec![row(43, 5, 0x1000)], MemberFileKey { dev: 23, ino: 9 });
-        assert_eq!(rows.len(), 1);
+        // Overlay, other device and inode number: found by range alone.
+        let rows = with_stopping_row(
+            vec![row(43, 5, 0x1000), row(43, 7, 0x3000)],
+            &stop(23, 991, 0x3000),
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].key, MemberFileKey { dev: 23, ino: 991 });
+        assert_eq!(rows[0].start, 0x3000);
+        assert_eq!(rows[0].maps_ino, 7, "an open still matches what maps names");
+        // A same-inode row elsewhere is not the stopping mapping.
+        let rows = with_stopping_row(vec![row(43, 7, 0x1000)], &stop(23, 7, 0x8000));
+        assert_eq!(rows.len(), 1, "unmapped since: nothing to prove");
+        assert_eq!(rows[0].key, MemberFileKey { dev: 43, ino: 7 });
     }
 
     #[test]

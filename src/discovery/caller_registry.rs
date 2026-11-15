@@ -4056,6 +4056,22 @@ impl CallerRegistry {
                 size_of::<(ModuleKey, ModuleId)>(),
                 HEAP_MODULE_KEY,
             ),
+            // Unidentified caller-image sets (capped, saturation
+            // disclosed): the run-wide union and the per-module sums.
+            unbound_images: counter_row(
+                self.unidentified_images.len(),
+                size_of::<(DomainCookie, UnboundPid)>(),
+                HEAP_MODULE_KEY,
+            ),
+            unbound_module_images: counter_row(
+                self.modules
+                    .values()
+                    .filter_map(|module| module.unbound_use.as_ref())
+                    .map(|unbound| unbound.images.len())
+                    .sum(),
+                size_of::<(DomainCookie, UnboundPid)>(),
+                HEAP_MODULE_KEY,
+            ),
             gap_index: counter_row(
                 self.gap_index.len(),
                 size_of::<(RegistryGap, usize)>(),

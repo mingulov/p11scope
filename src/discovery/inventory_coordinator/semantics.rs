@@ -1282,7 +1282,7 @@ impl SemanticBindingSet {
 
     /// Whether a bound caller holds this Detailed ticket: proven-image
     /// retention keys on it, so the map never outgrows the binding cap.
-    fn has_ticket(&self, domain: NativeDomainId, ticket: u64) -> bool {
+    pub(crate) fn has_ticket(&self, domain: NativeDomainId, ticket: u64) -> bool {
         self.bindings
             .iter()
             .any(|binding| binding.domain() == domain && binding.image().task_cookie == ticket)

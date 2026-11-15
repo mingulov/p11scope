@@ -112,6 +112,10 @@ pub(crate) struct NativeRetentionLens {
     pub placement_generations: CounterRow,
     pub recoveries: CounterRow,
     pub rendered_callers: CounterRow,
+    pub ever_enumerated: CounterRow,
+    pub scan_freshness: CounterRow,
+    pub proven_images: CounterRow,
+    pub exe_probe_cache: CounterRow,
 }
 
 /// R3 lens: per-edge session/operation/mechanism maps, summed over
@@ -139,6 +143,8 @@ pub(crate) struct RegistryLens {
     pub edges: CounterRow,
     pub modules_by_key: CounterRow,
     pub gap_index: CounterRow,
+    pub unbound_images: CounterRow,
+    pub unbound_module_images: CounterRow,
     pub edge: EdgeLens,
     pub mech_pool_used_bytes: u64,
 }
@@ -356,12 +362,18 @@ pub(crate) struct MemorySnapshot {
     r1_native_placement_generations: Option<CounterRow>,
     r1_native_recoveries: Option<CounterRow>,
     r1_native_rendered_callers: Option<CounterRow>,
+    r1_native_ever_enumerated: Option<CounterRow>,
+    r1_native_scan_freshness: Option<CounterRow>,
+    r1_native_proven_images: Option<CounterRow>,
+    r1_native_exe_probe_cache: Option<CounterRow>,
     r2_registry_callers: Option<CounterRow>,
     r2_registry_retired: Option<CounterRow>,
     r2_registry_modules: Option<CounterRow>,
     r2_registry_edges: Option<CounterRow>,
     r2_modules_by_key: Option<CounterRow>,
     r2_gap_index: Option<CounterRow>,
+    r2_registry_unbound_images: Option<CounterRow>,
+    r2_registry_unbound_module_images: Option<CounterRow>,
     r3_edge_open: Option<CounterRow>,
     r3_edge_active: Option<CounterRow>,
     r3_edge_mechs: Option<CounterRow>,
@@ -524,12 +536,18 @@ impl MemorySnapshot {
             r1_native_placement_generations: None,
             r1_native_recoveries: None,
             r1_native_rendered_callers: None,
+            r1_native_ever_enumerated: None,
+            r1_native_scan_freshness: None,
+            r1_native_proven_images: None,
+            r1_native_exe_probe_cache: None,
             r2_registry_callers: None,
             r2_registry_retired: None,
             r2_registry_modules: None,
             r2_registry_edges: None,
             r2_modules_by_key: None,
             r2_gap_index: None,
+            r2_registry_unbound_images: None,
+            r2_registry_unbound_module_images: None,
             r3_edge_open: None,
             r3_edge_active: None,
             r3_edge_mechs: None,
@@ -621,12 +639,18 @@ impl MemorySnapshot {
             r1_native_placement_generations: Some(lens.native.placement_generations),
             r1_native_recoveries: Some(lens.native.recoveries),
             r1_native_rendered_callers: Some(lens.native.rendered_callers),
+            r1_native_ever_enumerated: Some(lens.native.ever_enumerated),
+            r1_native_scan_freshness: Some(lens.native.scan_freshness),
+            r1_native_proven_images: Some(lens.native.proven_images),
+            r1_native_exe_probe_cache: Some(lens.native.exe_probe_cache),
             r2_registry_callers: Some(lens.registry.callers),
             r2_registry_retired: Some(lens.registry.retired),
             r2_registry_modules: Some(lens.registry.modules),
             r2_registry_edges: Some(lens.registry.edges),
             r2_modules_by_key: Some(lens.registry.modules_by_key),
             r2_gap_index: Some(lens.registry.gap_index),
+            r2_registry_unbound_images: Some(lens.registry.unbound_images),
+            r2_registry_unbound_module_images: Some(lens.registry.unbound_module_images),
             r3_edge_open: Some(lens.registry.edge.open),
             r3_edge_active: Some(lens.registry.edge.active),
             r3_edge_mechs: Some(lens.registry.edge.mechs),
@@ -963,6 +987,10 @@ mod tests {
                 placement_generations: row(29),
                 recoveries: row(30),
                 rendered_callers: row(31),
+                ever_enumerated: row(33),
+                scan_freshness: row(34),
+                proven_images: row(35),
+                exe_probe_cache: row(36),
             },
             registry: RegistryLens {
                 callers: row(3),
@@ -971,6 +999,8 @@ mod tests {
                 edges: row(6),
                 modules_by_key: row(7),
                 gap_index: row(8),
+                unbound_images: row(37),
+                unbound_module_images: row(38),
                 edge: EdgeLens {
                     open: row(7),
                     active: row(8),
@@ -1119,6 +1149,22 @@ mod tests {
         assert_eq!(
             inventory.r1_native_rendered_callers.expect("native").len,
             31
+        );
+        assert_eq!(inventory.r1_native_ever_enumerated.expect("native").len, 33);
+        assert_eq!(inventory.r1_native_exe_probe_cache.expect("native").len, 36);
+        assert_eq!(
+            inventory
+                .r2_registry_unbound_images
+                .expect("unbound images")
+                .len,
+            37
+        );
+        assert_eq!(
+            inventory
+                .r2_registry_unbound_module_images
+                .expect("unbound module images")
+                .len,
+            38
         );
         assert!(profile.r1_native_exec_exe.is_none());
         assert!(trace.r1_native_pair_targets.is_none());

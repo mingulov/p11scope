@@ -4394,6 +4394,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 size_of::<CallerId>(),
                 HEAP_MAP_ENTRY,
             ),
+            ever_enumerated: counter_row(
+                self.ever_enumerated.len(),
+                size_of::<(u32, Option<u64>)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            scan_freshness: counter_row(
+                self.scan_freshness.len(),
+                size_of::<(u32, Option<u64>)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            proven_images: counter_row(
+                self.proven_images.len(),
+                size_of::<((NativeDomainId, u64), u64)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            exe_probe_cache: counter_row(
+                self.exe_probe_cache.len(),
+                size_of::<(String, Option<(u64, u64)>)>(),
+                crate::memory_counters::HEAP_MODULE_KEY,
+            ),
         }
     }
 
@@ -5344,6 +5364,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         for cookie in pruned {
             self.note_exec_pruned(cookie);
         }
+        // H0 image proofs are read only for a live binding ticket:
+        // dropping proofs whose ticket no longer has a binding keeps the
+        // map bounded by live tickets instead of every scanned image.
+        let bindings = &self.semantic_bindings;
+        self.proven_images
+            .retain(|(domain, cookie), _| bindings.has_ticket(*domain, *cookie));
         self.prune_dropped_pair_targets(now_ns);
     }
 
@@ -23476,6 +23502,28 @@ exit 0
         assert_eq!(
             native.scene.coordinator.dropped_pair_base_total_for_test(),
             0
+        );
+    }
+
+    /// H0 image proofs outlive neither their binding nor the pass: only
+    /// a live binding ticket can ever read one.
+    #[test]
+    fn proven_image_proofs_are_pruned_with_their_bindings() {
+        let (mut native, _caller) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .proven_images
+            .insert((native.domain, 9), 9);
+        assert_eq!(native.scene.coordinator.proven_image_count(), 1);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(native.stamps.tick());
+        assert_eq!(
+            native.scene.coordinator.proven_image_count(),
+            0,
+            "a proof with no live binding ticket is never read"
         );
     }
 

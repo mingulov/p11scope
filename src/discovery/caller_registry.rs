@@ -1954,6 +1954,21 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         true
     }
 
+    /// Release per-pid incarnation counters that no retained caller row
+    /// (live or retired-with-evidence) holds any more. The counter only
+    /// orders incarnations of one numeric pid; once no row for the pid
+    /// remains, a later reuse cannot collide with one and starts a fresh
+    /// admission order. Bounded by the retained caller budget, so the
+    /// once-per-ever pid map cannot grow on a busy host.
+    pub(crate) fn prune_incarnations(&mut self) {
+        let held: BTreeSet<u32> = self
+            .callers
+            .values()
+            .map(|tracked| tracked.record.pid)
+            .collect();
+        self.incarnations.retain(|pid, _| held.contains(pid));
+    }
+
     /// A natively proven exec transition (Task 6 C4): the live incarnation
     /// `id`'s image ended while its pin held. It retires exec-retired with
     /// its evidence and the pid is admitted again as its successor. A
@@ -3763,6 +3778,59 @@ fn aggregated_unrouted_reason(
     }
 }
 
+/// Bounded refusal tombstones for retired caller IDs. Caller IDs are
+/// minted monotonically and never reused, so one inclusive range per
+/// contiguous retired run refuses every late mapping evidence exactly
+/// while a long capture keeps one entry per gap between retained
+/// callers (bounded by the caller budget), never one per retired row.
+#[derive(Debug, Default)]
+struct RetiredCallers {
+    /// Inclusive `start -> end` retired ID runs.
+    ranges: BTreeMap<u32, u32>,
+    /// Total retired IDs ever recorded (published as the counted
+    /// aggregate, not retained per row).
+    ids: u64,
+}
+
+impl RetiredCallers {
+    fn contains(&self, id: CallerId) -> bool {
+        self.ranges
+            .range(..=id.0)
+            .next_back()
+            .is_some_and(|(_, end)| *end >= id.0)
+    }
+
+    fn insert(&mut self, id: CallerId) {
+        if self.contains(id) {
+            return;
+        }
+        let id = id.0;
+        let mut start = id;
+        let mut end = id;
+        if let Some((&before, &before_end)) = self.ranges.range(..id).next_back() {
+            debug_assert!(before_end < id);
+            if before_end.saturating_add(1) == id {
+                start = before;
+                self.ranges.remove(&before);
+            }
+        }
+        if let Some(next) = id.checked_add(1)
+            && let Some((&after, &after_end)) = self.ranges.range(next..).next()
+            && after == next
+        {
+            end = after_end;
+            self.ranges.remove(&after);
+        }
+        self.ranges.insert(start, end);
+        self.ids = self.ids.saturating_add(1);
+    }
+
+    /// Structural rows (one per retired ID run), the memory lens value.
+    fn range_count(&self) -> usize {
+        self.ranges.len()
+    }
+}
+
 /// Staged physical and semantic inputs share one publication revision.
 pub(crate) struct CallerRegistry {
     semantic_resources: crate::semantics_edge::resources::SemanticResourcePool,
@@ -3770,7 +3838,7 @@ pub(crate) struct CallerRegistry {
     limits: RegistryLimits,
     next_module: u32,
     callers: BTreeSet<CallerId>,
-    retired: BTreeMap<CallerId, String>,
+    retired: RetiredCallers,
     modules: BTreeMap<ModuleId, ModuleRecord>,
     modules_by_key: BTreeMap<ModuleKey, ModuleId>,
     edges: BTreeMap<(CallerId, ModuleId), EdgeRecord>,
@@ -3865,6 +3933,10 @@ pub(crate) struct CallerRegistry {
     published_revision: u64,
     endpoints_total: usize,
     callers_refused: u64,
+    /// Late mapping evidence refused because its caller incarnation
+    /// retired, even after its exact range tombstone took over from the
+    /// per-caller entry (monotonic, saturating).
+    retired_mapping_refusals: u64,
     modules_refused: u64,
     edges_refused: u64,
     endpoints_refused: u64,
@@ -3961,9 +4033,12 @@ impl CallerRegistry {
         let row = |(len, bytes): (u64, u64)| crate::memory_counters::CounterRow { len, bytes };
         crate::memory_counters::RegistryLens {
             callers: counter_row(self.callers.len(), size_of::<CallerId>(), HEAP_MAP_ENTRY),
+            // One range per contiguous retired-ID run, never one row
+            // per retired caller: late evidence is still refused
+            // exactly, and a long capture keeps this flat.
             retired: counter_row(
-                self.retired.len(),
-                size_of::<(CallerId, String)>(),
+                self.retired.range_count(),
+                size_of::<(u32, u32)>(),
                 HEAP_MAP_ENTRY,
             ),
             modules: counter_row(
@@ -4050,7 +4125,7 @@ impl CallerRegistry {
             limits,
             next_module: 0,
             callers: BTreeSet::new(),
-            retired: BTreeMap::new(),
+            retired: RetiredCallers::default(),
             modules: BTreeMap::new(),
             modules_by_key: BTreeMap::new(),
             edges: BTreeMap::new(),
@@ -4085,6 +4160,7 @@ impl CallerRegistry {
             published_revision: 0,
             endpoints_total: 0,
             callers_refused: 0,
+            retired_mapping_refusals: 0,
             modules_refused: 0,
             edges_refused: 0,
             endpoints_refused: 0,
@@ -4296,7 +4372,7 @@ impl CallerRegistry {
     /// mapping evidence for the incarnation must still be refused, not
     /// admitted under a dead caller ID.
     pub(crate) fn compact_retired_caller(&mut self, caller: CallerId) {
-        if self.retired.contains_key(&caller) && !self.caller_has_rendered_state(caller) {
+        if self.retired.contains(caller) && !self.caller_has_rendered_state(caller) {
             self.callers.remove(&caller);
         }
     }
@@ -4353,6 +4429,12 @@ impl CallerRegistry {
     /// overflows — loss counters are not gaps.
     pub(crate) fn callers_refused(&self) -> u64 {
         self.callers_refused
+    }
+
+    /// Late mapping notes refused for a retired caller incarnation
+    /// (counted, never merged into a fresh caller row).
+    pub(crate) fn retired_mapping_refusals(&self) -> u64 {
+        self.retired_mapping_refusals
     }
 
     pub(crate) fn modules_refused(&self) -> u64 {
@@ -6002,7 +6084,8 @@ impl CallerRegistry {
         evidence: MappingEvidence,
         at_ns: u64,
     ) {
-        if self.retired.contains_key(&caller) {
+        if self.retired.contains(caller) {
+            self.retired_mapping_refusals = self.retired_mapping_refusals.saturating_add(1);
             self.push_gap(RegistryGap {
                 caller: Some(caller),
                 module: None,
@@ -6852,7 +6935,7 @@ impl CallerRegistry {
     }
 
     fn apply_coverage(&mut self, caller: CallerId, module: &ModuleKey, note: CoverageNote) {
-        let retired = self.retired.contains_key(&caller);
+        let retired = self.retired.contains(caller);
         let admitted = self
             .modules_by_key
             .get(module)
@@ -7040,7 +7123,7 @@ impl CallerRegistry {
         delta: u64,
         at_ns: u64,
     ) -> EntryOutcome {
-        if self.retired.contains_key(&caller) {
+        if self.retired.contains(caller) {
             return EntryOutcome::FrozenRetired;
         }
         let Some(id) = self.modules_by_key.get(module).copied() else {
@@ -7098,7 +7181,7 @@ impl CallerRegistry {
     /// `max_semantic_states` budget (past it: a refusal gap plus the
     /// loss counter, never an eviction of retained state).
     fn apply_semantic(&mut self, caller: CallerId, module: &ModuleKey, call: &SemanticCall) {
-        if self.retired.contains_key(&caller) {
+        if self.retired.contains(caller) {
             return;
         }
         let Some(id) = self.modules_by_key.get(module).copied() else {
@@ -7219,7 +7302,7 @@ impl CallerRegistry {
         shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         let _ = at_ns;
-        self.retired.insert(caller, reason.clone());
+        self.retired.insert(caller);
         self.invalidate_physical_instances(caller, None, true, shared);
         let mut modules = BTreeSet::new();
         for edge in self
@@ -8935,6 +9018,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn forgotten_retired_caller_still_refuses_late_mapping_evidence() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let caller = CallerId(5);
+        registry.retire_caller(caller, "caller retired".into(), 10);
+        registry.publish();
+        registry.compact_retired_caller(caller);
+        assert_eq!(registry.memory_lens().callers.len, 0);
+        let info = module_info("/opt/late.so", 60, AdmissionState::Admitted);
+        registry.note_mapping(caller, 42, info, 20);
+        registry.publish();
+        assert_eq!(
+            registry.memory_lens().callers.len,
+            0,
+            "late evidence never invents a caller row"
+        );
+        assert_eq!(
+            registry.retired_mapping_refusals(),
+            1,
+            "the refusal is counted"
+        );
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "mapping for a retired caller"),
+            "the refusal is disclosed, never silent"
+        );
+    }
+
+    #[test]
+    fn retired_id_ranges_stay_flat_and_exact_across_late_evidence() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        // Retire a long contiguous run with one gap, as a busy host's
+        // short-lived callers produce: two ranges, not one row per ID.
+        for id in 0..10_000u32 {
+            if id != 5_000 {
+                registry.retire_caller(CallerId(id), "retired".into(), 1);
+            }
+        }
+        registry.publish();
+        let lens = registry.memory_lens();
+        assert_eq!(lens.retired.len, 2, "one range per contiguous run");
+        assert!(registry.retired.contains(CallerId(4_999)));
+        assert!(registry.retired.contains(CallerId(5_001)));
+        assert!(!registry.retired.contains(CallerId(5_000)));
+        // The never-retired ID is a normal first mapping; every retired
+        // ID is still refused exactly, however long the capture ran.
+        let info = module_info("/opt/fresh.so", 61, AdmissionState::Admitted);
+        registry.note_mapping(CallerId(5_000), 43, info.clone(), 2);
+        registry.note_mapping(CallerId(9_999), 44, info, 2);
+        registry.publish();
+        assert_eq!(registry.memory_lens().callers.len, 1);
+        assert_eq!(registry.retired_mapping_refusals(), 1);
+    }
+
+    #[test]
     fn exit_then_pid_reuse_mints_distinct_retained_incarnations() {
         let (source, mut adapter) = adapter();
         source.spawn(4242, 1000);
@@ -8972,6 +9111,54 @@ pub(crate) mod tests {
         assert!(!new.retired);
         // The old incarnation is retained with disjoint evidence.
         assert!(old.retired && old.last_seen_ns == 20 && new.first_seen_ns == 30);
+    }
+
+    #[test]
+    fn forgotten_callers_release_their_incarnation_counters() {
+        let (source, mut adapter) = adapter();
+        source.spawn(4242, 1000);
+        let first = adapter.admit(4242, AUTHORITY, 10).unwrap();
+        source.kill(4242);
+        let events = adapter.reconcile(&BTreeSet::new(), &mut |_| AUTHORITY, 20);
+        assert!(matches!(events[0], CallerEvent::Exited { id, .. } if id == first));
+        // A retained retired row still needs the pid's counter: a reused
+        // pid must mint a distinct incarnation while any row is visible.
+        adapter.prune_incarnations();
+        assert_eq!(adapter.memory_lens().incarnations.len, 1);
+        source.spawn(4242, 2000);
+        let mut observed = BTreeSet::new();
+        observed.insert(4242);
+        let events = adapter.reconcile(&observed, &mut |_| AUTHORITY, 30);
+        let _second = match &events[0] {
+            CallerEvent::Admitted { id } => *id,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert_eq!(
+            adapter.record(first).unwrap().incarnation,
+            0,
+            "the retained first row keeps its evidence"
+        );
+        // Forget both rendered/retired rows: the counter is released and
+        // the per-ever pid map cannot grow with capture length.
+        assert!(adapter.forget_caller(first));
+        let second = adapter.live_id(4242).unwrap();
+        source.kill(4242);
+        adapter.reconcile(&BTreeSet::new(), &mut |_| AUTHORITY, 40);
+        assert!(adapter.forget_caller(second));
+        adapter.prune_incarnations();
+        assert_eq!(
+            adapter.memory_lens().incarnations.len,
+            0,
+            "no retained row holds the pid any more"
+        );
+        // The pid may be reused with a fresh admission order: nothing
+        // that could collide (a retained row with the same identity)
+        // remains.
+        source.spawn(4242, 3000);
+        let third = adapter.admit(4242, AUTHORITY, 50).unwrap();
+        assert_eq!(adapter.record(third).unwrap().incarnation, 0);
+        adapter.prune_incarnations();
+        assert_eq!(adapter.memory_lens().incarnations.len, 1);
     }
 
     #[test]

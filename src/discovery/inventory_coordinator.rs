@@ -688,15 +688,16 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     pair_targets: HashMap<PairKey, PairTarget>,
     /// Dropped pair bases pruned out of `pair_targets`, bounded. A late
     /// row for one of these pairs still rebases past this exact base,
-    /// so pruning never double-counts it. Past the bound the prune
-    /// stops and `pair_prune_overflow` counts the retained rows.
+    /// so pruning never double-counts it. Past the bound a due row is
+    /// folded into `pair_dropped_totals` and `pair_prune_overflow`
+    /// counts it once, so neither the map nor the counters grow.
     pair_dropped_tombstones: HashMap<PairKey, PrunedPairBase>,
     /// Exact aggregate of pruned dropped-pair bases per key class
     /// (domain and object): rows and saturating base total. Counts stay
     /// exact when the per-pair rows leave the map.
     pair_dropped_totals: HashMap<PairKeyClass, DroppedPairTotal>,
-    /// Dropped rows that stayed in `pair_targets` because the tombstone
-    /// bound was full (sticky, saturating).
+    /// Dropped rows folded into `pair_dropped_totals` because the
+    /// tombstone bound was full (sticky, saturating; counted once).
     pair_prune_overflow: u64,
     pair_prune_cap: usize,
     /// Outstanding publication-time count placements (P3): each staged
@@ -911,9 +912,10 @@ const DEFAULT_MAX_EXEC_EXE_STASH: usize = 16_384;
 /// retained; only evidence no retained caller can consult prunes here.
 const EXEC_STATE_GRACE_NS: u64 = 180 * 1_000_000_000;
 /// Dropped pair bases kept as exact revival tombstones. Never lowered:
-/// each entry is ~40 B, so the full bound is a few MiB. Past it the
-/// prune stops (the rows stay in `pair_targets`) and
-/// `pair_prune_overflow` counts them; no base is ever forgotten.
+/// each entry is ~40 B, so the full bound is a few MiB. Past it a due
+/// row is folded into the exact class aggregate and
+/// `pair_prune_overflow` counts it once; no base is ever forgotten and
+/// `pair_targets` stays bounded.
 const MAX_PRUNED_PAIR_TOMBSTONES: usize = 65_536;
 /// Pruned EXEC stashes remembered per cookie. Past it the domain latches
 /// EXEC loss and `exec_pruned_overflow` counts the discarded tombstones;
@@ -4324,6 +4326,80 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// A0 snapshot over the coordinator's owned structures (R1-R4,
     /// R6, metadata). Read-only; the R3 aggregation is O(edges) on
     /// the emit path, never on the hot path.
+    /// R1 native-retention rows: every coordinator-owned per-ever map
+    /// that the pass prune bounds, so a soak attributes the native lane
+    /// instead of lumping it into the RSS residual.
+    fn native_memory_lens(&self) -> crate::memory_counters::NativeRetentionLens {
+        use crate::memory_counters::{HEAP_MAP_ENTRY, counter_row};
+        use std::mem::size_of;
+        let preadmission = self
+            .capture
+            .as_ref()
+            .map_or(0, |capture| capture.preadmission.len);
+        crate::memory_counters::NativeRetentionLens {
+            exec_exe: counter_row(
+                self.exec_exe.len(),
+                size_of::<(DomainCookie, StashedExec)>(),
+                0,
+            ),
+            exec_pruned: counter_row(
+                self.exec_pruned.len(),
+                size_of::<DomainCookie>(),
+                HEAP_MAP_ENTRY,
+            ),
+            exec_loss_domains: counter_row(
+                self.exec_loss_domains.len(),
+                size_of::<NativeDomainId>(),
+                HEAP_MAP_ENTRY,
+            ),
+            pair_targets: counter_row(
+                self.pair_targets.len(),
+                size_of::<(PairKey, PairTarget)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            pair_counts: counter_row(
+                self.pair_counts.len(),
+                size_of::<(PairKey, HeldPairCount)>(),
+                0,
+            ),
+            pair_tombstones: counter_row(
+                self.pair_dropped_tombstones.len(),
+                size_of::<(PairKey, PrunedPairBase)>(),
+                0,
+            ),
+            pair_totals: counter_row(
+                self.pair_dropped_totals.len(),
+                size_of::<(PairKeyClass, DroppedPairTotal)>(),
+                0,
+            ),
+            preadmission: counter_row(
+                preadmission,
+                size_of::<(u32, PreadmissionEntry)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            pending_ids: counter_row(
+                self.pending_ids.len(),
+                size_of::<(u64, PendingCountObservation)>(),
+                0,
+            ),
+            placement_generations: counter_row(
+                self.placement_generations.len(),
+                size_of::<(PairKey, Option<u64>)>(),
+                0,
+            ),
+            recoveries: counter_row(
+                self.recoveries.len(),
+                size_of::<(PairKey, PairRecovery)>(),
+                HEAP_MAP_ENTRY,
+            ),
+            rendered_callers: counter_row(
+                self.rendered_callers.len(),
+                size_of::<CallerId>(),
+                HEAP_MAP_ENTRY,
+            ),
+        }
+    }
+
     pub(crate) fn memory_snapshot(
         &self,
         elapsed_secs: u64,
@@ -4332,6 +4408,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             elapsed_secs,
             crate::memory_counters::InventoryLens {
                 adapter: self.adapter.memory_lens(),
+                native: self.native_memory_lens(),
                 registry: self.registry.memory_lens(),
                 history: self.engine.memory_history_lens(),
                 model: self.joint_capture.memory_lens(),
@@ -5290,7 +5367,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Prune dropped pair targets whose base is older than the grace
     /// into the exact per-class aggregate. A tombstone keeps the base
     /// so a late revival rebases past it; past the tombstone bound the
-    /// row stays and the overflow counts.
+    /// row is folded into the same exact aggregate and the overflow
+    /// counts it once, so `pair_targets` never grows without bound and
+    /// no base is forgotten silently (only exact per-pair revival is
+    /// lost, and the published overflow count says so).
     fn prune_dropped_pair_targets(&mut self, now_ns: u64) {
         let due: Vec<PairKey> = self
             .pair_targets
@@ -5305,10 +5385,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
             .collect();
         for key in due {
-            if self.pair_dropped_tombstones.len() >= self.pair_prune_cap {
-                self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
-                continue;
-            }
             let Some(PairTarget::Dropped { base, base_since }) = self.pair_targets.get(&key) else {
                 continue;
             };
@@ -5321,9 +5397,65 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let total = self.pair_dropped_totals.entry(class).or_default();
             total.rows = total.rows.saturating_add(1);
             total.base = total.base.saturating_add(base);
-            self.pair_dropped_tombstones
-                .insert(key, PrunedPairBase { base, base_since });
+            // One due row leaves the map here exactly once: the
+            // tombstone keeps the exact base while the bound has room,
+            // otherwise the row is aggregate-only and counted.
+            if self.pair_dropped_tombstones.len() < self.pair_prune_cap {
+                self.pair_dropped_tombstones
+                    .insert(key, PrunedPairBase { base, base_since });
+            } else {
+                self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
+            }
         }
+    }
+
+    /// Take one pruned dropped-pair tombstone back into the live map
+    /// (revival or re-drop): the base is about to be represented by the
+    /// target row again, so folding it out of the class aggregate here
+    /// keeps `sum(live targets) + aggregate` exact and lets a later
+    /// re-prune count the base exactly once.
+    fn take_pruned_pair_base(&mut self, key: &PairKey) -> Option<PrunedPairBase> {
+        let pruned = self.pair_dropped_tombstones.remove(key)?;
+        let class = PairKeyClass {
+            domain: key.image.domain(),
+            object: key.object,
+        };
+        let mut empty = false;
+        if let Some(total) = self.pair_dropped_totals.get_mut(&class) {
+            total.rows = total.rows.saturating_sub(1);
+            total.base = total.base.saturating_sub(pruned.base);
+            empty = total.rows == 0;
+        }
+        if empty {
+            self.pair_dropped_totals.remove(&class);
+        }
+        Some(pruned)
+    }
+
+    /// Exact aggregate of pruned dropped-pair rows and their absolute
+    /// bases, folded per key class (published as evidence that pruning
+    /// never forgets a base).
+    pub(crate) fn pruned_pair_totals(&self) -> (u64, u64) {
+        self.pair_dropped_totals
+            .values()
+            .fold((0u64, 0u64), |(rows, base), total| {
+                (
+                    rows.saturating_add(total.rows),
+                    base.saturating_add(total.base),
+                )
+            })
+    }
+
+    /// Dropped pair rows folded past the exact tombstone bound (each
+    /// counted once, when it leaves the map).
+    pub(crate) fn pair_prune_overflow(&self) -> u64 {
+        self.pair_prune_overflow
+    }
+
+    /// Pruned EXEC stashes discarded past the tombstone bound (each
+    /// counted once; the domain latches EXEC loss).
+    pub(crate) fn exec_prune_overflow(&self) -> u64 {
+        self.exec_pruned_overflow
     }
 
     /// Test-only: the retained EXEC exe stash size.
@@ -5418,6 +5550,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 retired += 1;
             }
         }
+        // Every forgotten row releases its pid's incarnation counter;
+        // the map then tracks only retained rows (bounded by the caller
+        // budget), never every pid the capture ever met.
+        self.adapter.prune_incarnations();
         retired
     }
 
@@ -8482,7 +8618,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             recovery.blocked = false;
         }
         self.bump_placement_generation(key);
-        self.pair_dropped_tombstones.remove(&key);
+        let _ = self.take_pruned_pair_base(&key);
         self.pair_targets.insert(
             key,
             PairTarget::Pending {
@@ -9483,6 +9619,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .get(&key)
                     .map(|pruned| (pruned.base, pruned.base_since))
             })
+            .or_else(|| match self.pair_targets.get(&key) {
+                Some(
+                    PairTarget::Pending {
+                        base, base_since, ..
+                    }
+                    | PairTarget::Bound {
+                        base, base_since, ..
+                    }
+                    | PairTarget::Dropped { base, base_since }
+                    | PairTarget::Suspended {
+                        base, base_since, ..
+                    },
+                ) => Some((*base, *base_since)),
+                None => None,
+            })
             .unwrap_or((0, 0));
         if let Some(recorder) = &mut self.diagnostics {
             let held = self.pair_counts.get(&key).map(|held| held.read);
@@ -9502,7 +9653,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             recorder.record(record);
         }
-        self.pair_dropped_tombstones.remove(&key);
+        let _ = self.take_pruned_pair_base(&key);
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
         self.pair_counts.remove(&key);
@@ -33633,11 +33784,11 @@ int main(void) {
         assert_eq!(exes[0].resolution, ExeResolution::ExecRecordLost);
     }
 
-    /// Past the pruned-pair tombstone bound no base is forgotten: the
-    /// row stays in the map and the overflow counts, so the aggregate
-    /// plus the map still sums exactly.
+    /// Past the pruned-pair tombstone bound the row leaves the map into
+    /// the exact class aggregate and the overflow counts it once: no
+    /// base is forgotten silently and `pair_targets` stays bounded.
     #[test]
-    fn dropped_pair_tombstone_overflow_keeps_rows_and_counts() {
+    fn dropped_pair_tombstone_overflow_folds_rows_and_counts_once() {
         let (mut native, _caller) = NativeScene::new();
         native.scene.coordinator.set_pair_prune_cap_for_test(1);
         let keys = [
@@ -33665,27 +33816,92 @@ int main(void) {
             .scene
             .coordinator
             .prune_departed_native_state(1_000 + EXEC_STATE_GRACE_NS);
+        assert!(
+            native.scene.coordinator.pair_targets.is_empty(),
+            "every due dropped row leaves the map at the bound"
+        );
         assert_eq!(
-            native.scene.coordinator.pair_targets.len(),
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
             1,
-            "the over-bound row stays in the map"
+            "the bounded exact tombstone is full"
         );
         assert_eq!(native.scene.coordinator.pair_prune_overflow_for_test(), 1);
-        let remaining: u64 = native
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (2, 21),
+            "the fold keeps every base exactly once"
+        );
+        // A later pass has no due row left: the overflow is not
+        // re-counted and the aggregate does not move.
+        native
             .scene
             .coordinator
-            .pair_targets
-            .values()
-            .filter_map(|target| match target {
-                PairTarget::Dropped { base, .. } => Some(*base),
-                _ => None,
-            })
-            .sum();
-        assert_eq!(
-            remaining + native.scene.coordinator.dropped_pair_base_total_for_test(),
-            21,
-            "no base is forgotten at the tombstone bound"
+            .prune_departed_native_state(1_000 + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.pair_prune_overflow_for_test(), 1);
+        assert_eq!(native.scene.coordinator.pruned_pair_totals(), (2, 21));
+    }
+
+    /// A pruned dropped pair that revives, re-drops and is pruned again
+    /// moves its exact base between the live map and the aggregate: the
+    /// base is counted once, never zero times or twice, and the
+    /// published totals always match the live state.
+    #[test]
+    fn revived_redropped_pair_base_stays_exact_across_prunes() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 5,
+                base_since: at,
+            },
         );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.pruned_pair_totals(), (1, 5));
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        // A late row revives the pruned pair: its base returns to the
+        // live target and leaves the aggregate (no double count).
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (0, 0),
+            "revival moves the base back out of the aggregate"
+        );
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Pending { base: 5, .. })
+            ),
+            "the revival rebases past the exact pruned base"
+        );
+        // The revived target is dropped again without a newer count and
+        // re-pruned: the same base lands in the aggregate exactly once.
+        let _ = native
+            .scene
+            .coordinator
+            .drop_pair_count(&row, DiagnosticReason::NotAdmitted);
+        assert!(matches!(
+            native.scene.coordinator.pair_targets.get(&key),
+            Some(PairTarget::Dropped { base: 5, .. })
+        ));
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 1);
+        assert_eq!(native.scene.coordinator.pruned_pair_totals(), (1, 5));
+        assert_eq!(native.scene.coordinator.pair_prune_overflow_for_test(), 0);
     }
 
     /// Resolution source (b): the coordinator exposes the

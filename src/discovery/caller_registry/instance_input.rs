@@ -55,7 +55,7 @@ impl CallerRegistry {
             || !std::sync::Arc::ptr_eq(current.original_pin(), &binding.pin())
             || !binding.scope_current()
             || !self.callers.contains(&binding.caller())
-            || self.retired.contains_key(&binding.caller())
+            || self.retired.contains(binding.caller())
         {
             return None;
         }
@@ -1863,7 +1863,7 @@ impl CallerRegistry {
         {
             return false;
         }
-        if self.retired.contains_key(&input.caller) {
+        if self.retired.contains(input.caller) {
             return false;
         }
         let module = self.modules_by_key.get(&input.key.module).copied();
@@ -2090,7 +2090,7 @@ impl CallerRegistry {
                 .map_or(record.state.label(), InstanceReason::label);
             return Some(format!("joint_birth_{cause}"));
         }
-        if self.retired.contains_key(&record.caller) {
+        if self.retired.contains(record.caller) {
             return Some("joint_birth_caller_retired".into());
         }
         let Some(semantics) = self.instance_state.semantics.get(&id) else {
@@ -3074,7 +3074,7 @@ impl CallerRegistry {
             || input.key.image.task_cookie == 0
         {
             Some(InstanceReason::ProviderInstanceUnproven)
-        } else if self.retired.contains_key(&input.caller)
+        } else if self.retired.contains(input.caller)
             || module.is_none_or(|m| !self.edges.contains_key(&(input.caller, m)))
         {
             Some(InstanceReason::CallerUnbound)

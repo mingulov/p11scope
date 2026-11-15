@@ -235,8 +235,11 @@ and never proves an app identity. See the app identity rows of
   keeps its row until a published presentation has rendered it; the
   coordinator then folds the row into the exact
   `budgets.callers.retired` aggregate (additive within v1) and removes
-  it. A row that still backs an edge, a gap, an instance or pending
-  native work keeps its facts until that consumer releases it. `image.authority` is `native_exact`
+  it; the retired ID stays refused as a bounded ID range
+  (`budgets.callers.late_refused` counts late evidence), so a late
+  mapping never invents a caller with no row. A row that still backs an
+  edge, a gap, an instance or pending native work keeps its facts until
+  that consumer releases it. `image.authority` is `native_exact`
   (BPF task-cookie/exec-ID identity) or `scan_pinned` (pidfd/start-time
   pin with exe-identity exec detection); `exec_observed` is false when
   the exe identity was unreadable and exec changes were undetectable.
@@ -1060,6 +1063,22 @@ Additive budgets are:
 
 - `callers.retired`: proven-ended caller-incarnation rows retired into the
   counted aggregate after a presentation rendered them (see `callers[]`).
+- `callers.late_refused`: late mapping notes refused for a retired caller
+  incarnation. Counted, never merged into a fresh `callers[]` row; the
+  refusal is retained as bounded caller-ID ranges, so a long capture still
+  refuses every retired ID exactly without one entry per retired caller.
+- `native_departed`: `{pair_dropped_rows, pair_dropped_base,
+  pair_prune_overflow, exec_prune_overflow}` — departed native retention
+  accounting. `pair_dropped_rows`/`pair_dropped_base` are the exact
+  aggregate of dropped witness-pair rows whose base passed the 180 s grace
+  and left `pair_targets`, and of their absolute counted bases (folded per
+  domain and object class). `pair_prune_overflow` counts the rows folded
+  into that aggregate past the exact per-pair revival-tombstone bound; each
+  row is counted once, its base is still in the aggregate, and only exact
+  per-pair revival is lost (a revival then rebases approximately, never
+  silently re-absorbing a pre-fold count). `exec_prune_overflow` counts
+  pruned EXEC stashes discarded past their tombstone bound; the domain
+  latches EXEC loss and late rows there read `exec_record_lost`.
 - `instances`: `{limit, occupied, refused}` for lifetime retained records,
   including retired records (default limit 4096).
 - `instance_semantic_state`: `{limit, occupied, unknown_edges, refused,
@@ -1469,7 +1488,7 @@ counts at each.
                                        "unbound_images": 0, "unbound_images_saturated": false,
                                        "identity_unavailable": 0, "identity_budget_exhausted": false}},
   "budgets": {
-    "callers": {"limit": 4096, "occupied": 1, "refused": 0, "retired": 0},
+    "callers": {"limit": 4096, "occupied": 1, "refused": 0, "retired": 0, "late_refused": 0},
     "modules": {"limit": 4096, "occupied": 1, "refused": 0},
     "edges": {"limit": 32768, "occupied": 1, "refused": 0},
     "endpoints": {"limit": 1048576, "occupied": 68, "refused": 0},
@@ -1477,7 +1496,9 @@ counts at each.
     "inventory_attach_modules": {"limit": 32768, "occupied": 1, "refused": 0},
     "counters": {"cap": 18446744073709551615, "observed_edges": 0, "saturated_edges": 0},
     "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1, "refused": 0},
-    "retained_history": {"limit": 1024, "retained": 1, "suppressed": 0}
+    "retained_history": {"limit": 1024, "retained": 1, "suppressed": 0},
+    "native_departed": {"pair_dropped_rows": 0, "pair_dropped_base": 0,
+                        "pair_prune_overflow": 0, "exec_prune_overflow": 0}
   },
   "callers": [
     {

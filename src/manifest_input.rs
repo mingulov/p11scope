@@ -875,6 +875,7 @@ fn validate_getters(m: &Manifest, object_ids: &BTreeSet<u32>, problems: &mut Vec
         return;
     }
     let mut names = BTreeSet::new();
+    let mut locations = BTreeSet::new();
     for getter in &m.getters {
         bounded("getter name", &getter.name, 128, problems);
         if !GETTER_NAMES.contains(&getter.name.as_str()) {
@@ -898,6 +899,14 @@ fn validate_getters(m: &Manifest, object_ids: &BTreeSet<u32>, problems: &mut Vec
         if !object_ids.contains(&object) {
             problems.push(format!(
                 "getter {} refers to missing object id {object}",
+                getter.name
+            ));
+        }
+        // One code location hooks one return: two names there would be two
+        // hooks publishing one table under an aliased slot.
+        if !locations.insert((object, file_offset)) {
+            problems.push(format!(
+                "getter {} shares its location (object {object}, offset {file_offset:#x}) with another getter",
                 getter.name
             ));
         }

@@ -74,7 +74,9 @@ versioned separately and are opaque, exact dispatch keys.
   returned it, so the report always names that window and stays
   `PARTIAL`; names are not layout-proved (no mechanism decoding);
   `--module` together with a getter-only manifest for the same program
-  names a static probe gap at exit although no call is lost.
+  names a false static probe gap at exit (no call is lost; the exit
+  retirement becomes a slot replacement, planned with gapless
+  replacement).
 - On a busy host, a long `inventory --system --key-operations`
   capture can stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Since

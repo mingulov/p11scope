@@ -21,8 +21,9 @@ Usage:
   getter-manifest.py BINARY -o MANIFEST [--getter NAME]...
 
 Without --getter, every standard getter the symbol table defines is
-written. Exit 0 on success, 1 when a requested getter is missing or lies
-outside every executable segment, 2 on usage or ELF errors.
+written. Exit 0 on success; 1 when a requested getter is missing, lies
+outside every executable segment or shares its address with another
+getter; 2 on usage errors or a malformed ELF file.
 """
 
 import argparse
@@ -98,6 +99,8 @@ class Elf:
         for section in sections:
             if section["kind"] != kind or not section["entsize"]:
                 continue
+            if section["link"] >= len(sections):
+                raise ElfError("a symbol table links to a missing string table")
             strtab = sections[section["link"]]
             for at in range(section["offset"], section["offset"] + section["size"],
                             section["entsize"]):
@@ -172,6 +175,12 @@ def manifest(path, requested):
         if offset is None:
             problems.append(f"{name} lies outside every executable segment")
             continue
+        twin = next((g["name"] for g in getters
+                     if g["resolution"]["file_offset"] == offset), None)
+        if twin is not None:
+            problems.append(f"{name} is at the same address as {twin}; "
+                            "name only one of them with --getter")
+            continue
         getters.append({"name": name,
                         "resolution": {"status": "resolved", "object": 0,
                                        "file_offset": offset}})
@@ -217,7 +226,7 @@ def main(argv):
         return 2
     try:
         document, problems = manifest(path, args.getter)
-    except (OSError, ElfError, struct.error, ValueError) as error:
+    except (OSError, ElfError, struct.error, ValueError, IndexError) as error:
         print(f"getter-manifest: {path}: {error}", file=sys.stderr)
         return 2
     if problems:

@@ -53,21 +53,42 @@ fn observer_binary() -> Result<PathBuf> {
         .context("no observer binary: set P11SCOPE_E2E_OBSERVER or build p11scope beside this test binary")
 }
 
-/// The fixture program, linked fully static (no `-rdynamic`).
+/// The fixture program, linked fully static (no `-rdynamic`). A host
+/// without a C toolchain's static libc (a test-only host) takes a prebuilt
+/// copy through `P11SCOPE_GETTER_STATIC_APP`, copied here so the manifest
+/// describes the exact file the cell runs. A missing `libc.a` fails the
+/// cell by name, never skips it.
 fn build_app(dir: &Path) -> Result<PathBuf> {
     let app = dir.join("static_getter_app");
-    let status = Command::new("cc")
-        .args([
-            "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static", "-o",
-        ])
-        .arg(&app)
-        .arg(repo("tests/fixtures/manifest-getter/static_getter_app.c"))
-        .status()
-        .context("running cc")?;
-    ensure!(
-        status.success(),
-        "static fixture build failed (needs static libc)"
-    );
+    if let Some(prebuilt) = std::env::var_os("P11SCOPE_GETTER_STATIC_APP") {
+        std::fs::copy(&prebuilt, &app).with_context(|| {
+            format!(
+                "copying P11SCOPE_GETTER_STATIC_APP={}",
+                Path::new(&prebuilt).display()
+            )
+        })?;
+    } else {
+        let libc = Command::new("cc")
+            .arg("-print-file-name=libc.a")
+            .output()
+            .context("running cc (a C compiler is required to build the static fixture)")?;
+        let libc = PathBuf::from(String::from_utf8_lossy(&libc.stdout).trim());
+        ensure!(
+            libc.is_absolute() && libc.exists(),
+            "the static fixture needs libc.a, which cc cannot find (install libc6-dev on \
+             Debian/Ubuntu or glibc-static on Fedora, or set P11SCOPE_GETTER_STATIC_APP to a \
+             prebuilt `cc -static` build of tests/fixtures/manifest-getter/static_getter_app.c)"
+        );
+        let status = Command::new("cc")
+            .args([
+                "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static", "-o",
+            ])
+            .arg(&app)
+            .arg(repo("tests/fixtures/manifest-getter/static_getter_app.c"))
+            .status()
+            .context("running cc")?;
+        ensure!(status.success(), "static fixture build failed");
+    }
     // The shape under test: no dynamic symbol table at all.
     let output = Command::new("readelf")
         .arg("--dyn-syms")

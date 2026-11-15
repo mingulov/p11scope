@@ -680,8 +680,8 @@ usage or ELF error. You can also write the manifest yourself: it is a
 `{"name": ..., "resolution": {"status": "resolved", "object": ID,
 "file_offset": N}}` records with `surfaces: []`; the field is optional and
 manifests without it are unchanged. Each name may appear once, must be one
-of the three standard getters, and must resolve to a listed object inside
-one of its executable segments. Manifest trust is unchanged: the file is
+of the three standard getters, must resolve to a listed object inside one
+of its executable segments, and no two getters may share one location. Manifest trust is unchanged: the file is
 pinned, its SHA-256 and identity must match the mapped program, and a
 getter named beside a walked surface must agree with that surface's
 record of the same function. `C_GetFunctionList` and `C_GetInterface` can
@@ -691,7 +691,8 @@ is counted once whichever table it went through.
 What you get: named call counts for every table function, exact once the
 table's probes are attached. The table is attached only after its getter
 returns it, so calls the program makes through it in that moment can be
-missed; every getter-only capture therefore names that window
+missed; every capture with a manifest that names getters (a getter-only
+one, or one that also walks a surface) therefore names that window
 (`calls made while probes were being attached may be missing`,
 `unprotected_live_windows`) and reads `PARTIAL`. A program that fetches
 its table once at start-up and calls it right away loses those first

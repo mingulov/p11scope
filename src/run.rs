@@ -14491,13 +14491,12 @@ pub(crate) fn evidence_for(
         // resolved benignly loaded nothing the capture could have missed
         // calls through. The design forbids publishing a count, so this
         // only gates the verdict.
-        // A getter-only manifest's table attaches after its getter
-        // returned it, a window no pause covers (`run` pauses at loader
-        // hits only).
+        // A manifest getter's table attaches after the getter returned it,
+        // a window no pause covers (`run` pauses at loader hits only).
         unprotected_live_windows: usize::from(
             (facts.loader_discovery().hits > facts.loader_discovery().benign_hits
                 && pause_status != PauseStatus::Sigstop)
-                || engine.getter_publication_windows() > 0,
+                || engine.getter_manifest_active(),
         ),
         module_unresolved_slots: reports
             .iter()

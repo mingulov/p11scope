@@ -8543,7 +8543,7 @@ fn pin_manifest_objects_with_read_policy(
             skipped.push(Skipped {
                 subject: object.path.clone(),
                 reason: format!(
-                    "manifest object unavailable: {bad_offsets} function offset(s) outside every executable ELF segment, first {name}+{file_offset:#x}"
+                    "manifest object unavailable: {bad_offsets} function or getter offset(s) outside every executable ELF segment, first {name}+{file_offset:#x}"
                 ),
             });
             continue;

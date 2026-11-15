@@ -161,6 +161,37 @@ class GetterManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("named twice", result.stderr)
 
+    def test_truncated_elf_exits_2_without_a_traceback(self):
+        data = self.binary.read_bytes()
+        for cut in (64, len(data) // 2, len(data) - 64):
+            truncated = self.out(f"truncated-{cut}")
+            truncated.write_bytes(data[:cut])
+            result = run(truncated, "-o", self.out(f"truncated-{cut}.json"))
+            self.assertIn(result.returncode, (1, 2), result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        # A section header table pointing past the file is an ELF error.
+        broken = bytearray(data)
+        broken[0x28:0x30] = (len(data) + 4096).to_bytes(8, "little")  # e_shoff
+        target = self.out("broken")
+        target.write_bytes(bytes(broken))
+        result = run(target, "-o", self.out("broken.json"))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_two_getters_at_one_address_are_refused(self):
+        source = self.out("alias.c")
+        source.write_text(
+            "__attribute__((noinline, used)) int C_GetFunctionList(void) { return 0; }\n"
+            "int C_GetInterface(void) __attribute__((alias(\"C_GetFunctionList\")));\n"
+            "int main(void) { return C_GetInterface(); }\n")
+        binary = self.out("alias")
+        subprocess.run(["cc", "-O2", "-o", str(binary), str(source)], check=True)
+        target = self.out("alias.json")
+        result = run(binary, "-o", target)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("same address", result.stderr)
+        self.assertFalse(target.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

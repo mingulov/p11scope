@@ -1051,11 +1051,15 @@ pub struct Engine {
     /// gets one id, detached when the view retires.
     view_getter_contexts: BTreeMap<ProcessViewId, LoaderContextId>,
     next_view_getter_context: u16,
-    /// Live windows opened by getter-only manifests: a getter returned a
-    /// table whose probes were attached only afterwards, so calls the
-    /// program made through it before that attach completed were not
-    /// observed. No pause covers a getter return.
-    getter_publication_windows: u64,
+    /// Manifest getter contexts of views released before their hooks were
+    /// detached; the next pass with a Session detaches them. Cleared from
+    /// `view_getter_contexts` at release, so a reused view id never
+    /// inherits an old owner.
+    orphaned_getter_contexts: Vec<LoaderContextId>,
+    /// Views whose manifest getter sites are settled since their last scan
+    /// (all mapped getters hooked, or none mapped): skipped until a rescan,
+    /// retirement or release, so a tick reads no maps for them.
+    getter_sites_settled: BTreeSet<ProcessViewId>,
     /// The deduplicated bound-context set behind `loader_discovery`'s
     /// strategy/timing/capture counts (design §9.2). Keyed by the exact
     /// internal `{process generation, bound identity state, load kind}` — so
@@ -2603,6 +2607,49 @@ pub(crate) fn capture_manifest_object_key(
     ))
 }
 
+/// The resolutions a manifest's corroboration compares with the scan. A
+/// getter-only manifest's targets are its getters. Beside a walked surface
+/// a getter's code is not a table entry, so it stays out of the exact
+/// walked set (it would manufacture a Conflict).
+pub(crate) fn manifest_target_resolutions(m: &Manifest) -> Vec<&Resolution> {
+    let getters = if crate::manifest_input::is_getter_only(m) {
+        &m.getters[..]
+    } else {
+        &[]
+    };
+    m.surfaces
+        .iter()
+        .flat_map(|surface| &surface.functions)
+        .map(|function| &function.resolution)
+        .chain(getters.iter().map(|getter| &getter.resolution))
+        .collect()
+}
+
+/// Whether any accepted manifest names getters (see
+/// [`Engine::getter_manifest_active`]).
+pub(crate) fn manifests_name_getters(manifests: &[Manifest]) -> bool {
+    manifests
+        .iter()
+        .any(|manifest| !manifest.getters.is_empty())
+}
+
+/// Whether `manifest` locates a `C_GetInterface` getter inside exactly
+/// `object`: the export fact belongs to the getter's own resolved object,
+/// never to a provider whose getter lives elsewhere.
+fn locates_interface_getter_in(
+    manifest: &Manifest,
+    pinned: &PinnedObjects,
+    object: PinnedObjectId,
+) -> bool {
+    manifest.getters.iter().any(|getter| {
+        getter.name == "C_GetInterface"
+            && matches!(getter.resolution, Resolution::Resolved { object: id, .. }
+                if capture_manifest_object_key(manifest, id)
+                    .and_then(|(key, path)| pinned.id_for_manifest(key, path))
+                    == Some(object))
+    })
+}
+
 fn manifest_module_object(manifest: &Manifest, pinned: &PinnedObjects) -> Option<PinnedObjectId> {
     let module = manifest
         .objects
@@ -3218,13 +3265,9 @@ impl CaptureFacts {
             // A trusted manifest that locates this object's C_GetInterface
             // states the same fact as a `.dynsym` export of it (a record a
             // getter hook published names only its own hook).
-            let located = manifests.iter().any(|manifest| {
-                manifest
-                    .getters
-                    .iter()
-                    .any(|getter| getter.name == "C_GetInterface")
-                    && manifest_module_object(manifest, pinned) == Some(module.object)
-            });
+            let located = manifests
+                .iter()
+                .any(|manifest| locates_interface_getter_in(manifest, pinned, module.object));
             history.standard_exports.entry(owner).or_default().insert(
                 if located
                     || module
@@ -3484,10 +3527,7 @@ impl CaptureFacts {
                 .ok_or_else(|| anyhow!("manifest provider has no exact opened identity"))?;
             // A located C_GetInterface getter is the export fact itself: the
             // manifest names where the getter is, so it is present.
-            let located = manifest
-                .getters
-                .iter()
-                .any(|getter| getter.name == "C_GetInterface");
+            let located = locates_interface_getter_in(manifest, pinned, object);
             let export = match manifest.selection_evidence.acquisition {
                 _ if located => StandardExportFact::Present,
                 SelectionAcquisition::Queried => StandardExportFact::Present,
@@ -6907,13 +6947,8 @@ fn manifest_targets(
     m: &Manifest,
     pinned: &PinnedObjects,
 ) -> Option<BTreeSet<(PinnedObjectId, u64)>> {
-    // Located getters lower to targets like function records, so they
-    // belong to the manifest's own target set.
-    m.surfaces
-        .iter()
-        .flat_map(|surface| &surface.functions)
-        .map(|function| &function.resolution)
-        .chain(m.getters.iter().map(|getter| &getter.resolution))
+    manifest_target_resolutions(m)
+        .into_iter()
         .filter_map(|resolution| match *resolution {
             Resolution::Resolved {
                 object,
@@ -13529,7 +13564,8 @@ impl Engine {
             selection_bindings: BTreeMap::new(),
             view_getter_contexts: BTreeMap::new(),
             next_view_getter_context: 0,
-            getter_publication_windows: 0,
+            orphaned_getter_contexts: Vec::new(),
+            getter_sites_settled: BTreeSet::new(),
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
@@ -14818,20 +14854,13 @@ impl Engine {
         std::mem::take(&mut self.learned_frame_owed)
     }
 
-    /// Live windows getter-only manifests opened (see the field): each
-    /// is a table whose probes attached after its getter returned it.
-    pub(crate) fn getter_publication_windows(&self) -> u64 {
-        self.getter_publication_windows
-    }
-
-    /// The timing keys of the objects getter-only manifests describe.
-    fn getter_only_manifest_keys(&self, pinned: &PinnedObjects) -> BTreeSet<PinnedTimingKey> {
-        self.manifests
-            .iter()
-            .filter(|manifest| crate::manifest_input::is_getter_only(manifest))
-            .filter_map(|manifest| manifest_module_object(manifest, pinned))
-            .filter_map(|object| pinned.owned_timing_key(object))
-            .collect()
+    /// Whether an accepted manifest names getters. Every table such a
+    /// getter leads to attaches only after the getter returned it (or
+    /// never, when the program fetched it before its hook attached), and
+    /// no pause covers a getter return: calls in that window can be
+    /// missed, so the capture always names it.
+    pub(crate) fn getter_manifest_active(&self) -> bool {
+        manifests_name_getters(&self.manifests)
     }
 
     pub(crate) fn gap_exe_hints(&self) -> Option<&elf_needed::GapExeHints> {
@@ -15544,6 +15573,13 @@ impl Engine {
         // never returns to the free list (no reuse after Q; the Engine ends
         // with its Session). Ordinary behavior is otherwise unchanged (§1.5).
         self.trace_provider_views.remove(&id);
+        // A removal path that did not retire the view's manifest getter
+        // owner hands it to the next Session pass for detach; the id never
+        // carries it to a later view.
+        self.getter_sites_settled.remove(&id);
+        if let Some(context) = self.view_getter_contexts.remove(&id) {
+            self.orphaned_getter_contexts.push(context);
+        }
         self.pending_loader_arm_scans.retain(|key| key.view != id);
         self.exec_rearm_views.remove(&id);
         self.pending_leader_exit_order.remove(&id);
@@ -20652,19 +20688,7 @@ impl Engine {
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
         self.observe_causal_timing(&observed, hook_ts_ns);
-        let getter_keys = self.getter_only_manifest_keys(&candidate.pinned);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
-        // A getter-only manifest's table attaches only once its getter
-        // returned it: calls made through it before the attach completed
-        // were not observed. Name that window whenever this publication
-        // newly attached the manifest object's slots.
-        if outcome.static_completions.iter().any(|(modules, _)| {
-            modules
-                .iter()
-                .any(|module| observed.contains(module) && getter_keys.contains(module))
-        }) {
-            self.getter_publication_windows = self.getter_publication_windows.saturating_add(1);
-        }
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
         Ok(DiscoveryRecordOutcome::applied(
@@ -24631,19 +24655,6 @@ impl Engine {
                     .object_matches_key(*id, key.device.major, key.device.minor, key.inode)
             })
         });
-        // A finished scan of the same object in this view already found
-        // and attached its file-backed tables before any call, and a
-        // getter-only manifest admits no other kind: a getter hook there
-        // would only republish a table already watched, behind an attach
-        // window it does not need.
-        sites.retain(|(id, _, _)| {
-            !self.modules.iter().any(|module| {
-                module.scanned.view == view
-                    && module.object == *id
-                    && module.scanned.tables_scan_finished
-                    && module.scanned.tables.iter().any(|table| !table.live_return)
-            })
-        });
         sites.sort();
         sites.dedup();
         Ok(sites)
@@ -24730,6 +24741,48 @@ impl Engine {
         {
             return (false, true, false, false);
         }
+        self.detach_orphaned_getter_contexts(session, additions_allowed);
+        // Settled since its last scan: every mapped getter is hooked (or
+        // none is mapped). Only a rescan changes that, so no maps read.
+        if self.getter_sites_settled.contains(&view) {
+            return (false, true, false, false);
+        }
+        let outcome = self.attach_manifest_getters_unsettled(view, session, additions_allowed);
+        if outcome.1 && !outcome.2 {
+            self.getter_sites_settled.insert(view);
+        }
+        outcome
+    }
+
+    #[cfg(test)]
+    fn manifest_getter_context_cached(&self, view: ProcessViewId) -> Option<LoaderContextId> {
+        self.view_getter_contexts.get(&view).copied()
+    }
+
+    /// Detaches the getter owners of views released without retirement.
+    fn detach_orphaned_getter_contexts(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+    ) {
+        for context in std::mem::take(&mut self.orphaned_getter_contexts) {
+            let (_, detach_failed) = session.detach_dynamic_context(context);
+            if detach_failed {
+                *additions_allowed = false;
+                self.mark_partial(
+                    "live manifest getter detach",
+                    "a released view's manifest getter hook detach failed; replacement was blocked for this cycle",
+                );
+            }
+        }
+    }
+
+    fn attach_manifest_getters_unsettled(
+        &mut self,
+        view: ProcessViewId,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+    ) -> (bool, bool, bool, bool) {
         let sites = match self.manifest_getter_sites(view) {
             Ok(sites) => sites,
             Err(error) => {
@@ -26546,6 +26599,7 @@ impl Engine {
         additions_allowed: &mut bool,
         closure: &mut PauseClosure,
     ) {
+        self.getter_sites_settled.remove(&view);
         let Some(context) = self.view_getter_contexts.remove(&view) else {
             return;
         };
@@ -30078,6 +30132,8 @@ impl Engine {
         admission: ViewAdmission,
         modules: &[ScannedModule],
     ) {
+        // A rescan may have found a newly mapped getter object.
+        self.getter_sites_settled.remove(&view);
         if !modules.is_empty() {
             self.exploratory_dirty.insert(view);
         }
@@ -30106,6 +30162,12 @@ impl Engine {
             return false;
         }
         if self.exploratory_dirty.contains(&id) {
+            return false;
+        }
+        // Its manifest getter hooks are its only provider evidence (a
+        // static program has no module or loader context): evicting it
+        // would leave them attached to a view nobody owns.
+        if self.view_getter_contexts.contains_key(&id) {
             return false;
         }
         if self.modules.iter().any(|module| module.scanned.view == id) {

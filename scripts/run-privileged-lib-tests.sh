@@ -621,7 +621,9 @@ attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_m
 # named, including a call reached through both getters' tables (counted
 # once); calls made right after the getter returns must name the attach
 # window instead of reading exact. Builds the fixture with `cc -static`
-# (libc.a from libc6-dev); spawns the observer (P11SCOPE_E2E_OBSERVER,
+# (libc.a: libc6-dev on Debian/Ubuntu, glibc-static on Fedora; a host
+# without it gets a prebuilt copy via P11SCOPE_GETTER_STATIC_APP, else the
+# cell fails naming libc.a); spawns the observer (P11SCOPE_E2E_OBSERVER,
 # else the test binary's p11scope sibling).
 manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly
 manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed

@@ -33477,6 +33477,94 @@ fn exploratory_eviction_clears_rebuild_stability() {
     );
 }
 
+/// A static program's view whose only provider evidence is its manifest
+/// getter owner is not exploratory ballast (twin: its provider-free
+/// sibling stays evictable). Any removal that still finds the owner hands
+/// it to the next Session pass for detach, and a reused view id never
+/// inherits it or its settled state.
+#[test]
+fn a_view_owning_manifest_getter_hooks_is_never_evicted_and_its_id_inherits_nothing() {
+    let sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let evictable: Vec<ProcessViewId> = engine
+        .views
+        .iter()
+        .map(|view| view.id())
+        .filter(|id| engine.exploratory_evictable(*id))
+        .collect();
+    assert!(
+        evictable.len() >= 2,
+        "two evictable sleep views: {evictable:?}"
+    );
+    let (owner, sibling) = (evictable[0], evictable[1]);
+    let context = LoaderContextId::view_owned(0).unwrap();
+    engine.view_getter_contexts.insert(owner, context);
+    engine.getter_sites_settled.insert(owner);
+    assert!(
+        !engine.exploratory_evictable(owner),
+        "a getter owner is not ballast"
+    );
+    assert!(
+        engine.exploratory_evictable(sibling),
+        "twin: the sibling still is"
+    );
+    assert!(!engine.exploratory_evictable_views().contains(&owner));
+
+    // Rotation never evicts it, even when asked to.
+    engine.evict_exploratory_views(&BTreeSet::from([owner, sibling]));
+    assert!(engine.views.iter().any(|view| view.id() == owner));
+    assert!(!engine.views.iter().any(|view| view.id() == sibling));
+    assert_eq!(engine.manifest_getter_context_cached(owner), Some(context));
+
+    // Any other removal path that releases the id without retiring the
+    // owner first.
+    engine.release_view_id(owner);
+    assert!(!engine.view_getter_contexts.contains_key(&owner));
+    assert!(!engine.getter_sites_settled.contains(&owner));
+    assert_eq!(engine.orphaned_getter_contexts, vec![context]);
+    // A later view on the same id starts with no owner and no settled
+    // state, so its getters are attached afresh under a new owner id.
+    assert!(engine.manifest_getter_context_cached(owner).is_none());
+    // The next Session pass detaches the orphaned owner exactly once.
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    engine.detach_orphaned_getter_contexts(&mut session, &mut additions_allowed);
+    assert_eq!(session.detached, vec![context]);
+    assert!(additions_allowed);
+    assert!(engine.orphaned_getter_contexts.is_empty());
+    engine.detach_orphaned_getter_contexts(&mut session, &mut additions_allowed);
+    assert_eq!(session.detached, vec![context]);
+}
+
+/// The settled cache skips the per-tick maps read only until the view is
+/// rescanned, retired or released.
+#[test]
+fn settled_manifest_getter_sites_reopen_on_rescan_and_release() {
+    let sleeps = e06_spawn_sleeps(1);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let view = engine.views[0].id();
+    let admission = engine.views[0].view_admission();
+    engine.getter_sites_settled.insert(view);
+    engine.note_scan_observed(view, admission, &[]);
+    assert!(
+        !engine.getter_sites_settled.contains(&view),
+        "a rescan reopens it"
+    );
+    engine.getter_sites_settled.insert(view);
+    engine.release_view_id(view);
+    assert!(
+        !engine.getter_sites_settled.contains(&view),
+        "a release clears it"
+    );
+}
+
 /// Two single-view exploratory evictions file the same message. The
 /// second is a dedup hit in `object_skips`, but it still removed a view,
 /// its pins and its scan inputs, so the facts revision must move

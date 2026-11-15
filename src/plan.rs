@@ -12003,6 +12003,66 @@ mod tests {
         m
     }
 
+    /// The attach window is named whenever a manifest names getters, the
+    /// mixed shape too; a manifest without getters opens none.
+    #[test]
+    fn every_manifest_naming_getters_activates_the_attach_window() {
+        use crate::discovery::engine::manifests_name_getters;
+        let plain = manifest_with(vec![FunctionRecord {
+            name: "C_Initialize".into(),
+            resolution: Resolution::Resolved {
+                object: 0,
+                file_offset: 0x1000,
+            },
+        }]);
+        let mut mixed = plain.clone();
+        mixed.getters = getter_only_manifest(&[("C_GetInterface", 0x1b00)]).getters;
+        let getter_only = getter_only_manifest(&[("C_GetFunctionList", 0x1a70)]);
+        assert!(!manifests_name_getters(&[]));
+        assert!(!manifests_name_getters(std::slice::from_ref(&plain)));
+        assert!(manifests_name_getters(std::slice::from_ref(&mixed)));
+        assert!(manifests_name_getters(&[plain, getter_only]));
+    }
+
+    /// Corroboration targets: a getter-only manifest compares its getters;
+    /// a mixed manifest compares only its walked functions, so its getter
+    /// (not a table entry) cannot manufacture a scan Conflict.
+    #[test]
+    fn getter_targets_join_corroboration_only_for_getter_only_manifests() {
+        use crate::discovery::engine::manifest_target_resolutions;
+        let offsets = |m: &Manifest| -> Vec<u64> {
+            manifest_target_resolutions(m)
+                .into_iter()
+                .filter_map(|resolution| match resolution {
+                    Resolution::Resolved { file_offset, .. } => Some(*file_offset),
+                    _ => None,
+                })
+                .collect()
+        };
+        let getter_only = getter_only_manifest(&[("C_GetFunctionList", 0x1a70)]);
+        assert_eq!(offsets(&getter_only), vec![0x1a70]);
+        let mut mixed = manifest_with(vec![FunctionRecord {
+            name: "C_Initialize".into(),
+            resolution: Resolution::Resolved {
+                object: 0,
+                file_offset: 0x1000,
+            },
+        }]);
+        mixed.getters = getter_only.getters.clone();
+        assert!(!crate::manifest_input::is_getter_only(&mixed));
+        assert_eq!(offsets(&mixed), vec![0x1000]);
+    }
+
+    #[test]
+    fn two_getters_at_one_location_are_refused() {
+        let m = getter_only_manifest(&[("C_GetFunctionList", 0x1a70), ("C_GetInterface", 0x1a70)]);
+        let problems = crate::manifest_input::validate_structure(&m);
+        assert!(
+            problems.iter().any(|p| p.contains("shares its location")),
+            "{problems:?}"
+        );
+    }
+
     #[test]
     fn getter_only_manifest_is_a_valid_trusted_input() {
         // All three owner shapes: only the legacy getter, only the

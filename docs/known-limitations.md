@@ -3075,7 +3075,8 @@ a silent drop.
 
 ### Getter-only manifests count tables read at run time
 
-- What the user sees: with a getter-only manifest
+- What the user sees: with a getter-only manifest (or any manifest that
+  names getters)
   ([usage](usage.md#getter-only-manifests-providers-linked-into-a-program)),
   a program that embeds its provider gets named per-function counts,
   but the report stays `PARTIAL`:
@@ -3102,7 +3103,11 @@ a silent drop.
   - `--module <program>` together with a getter-only manifest for the
     same program counts every call, but the report names a
     `static probe coverage gap incomplete` at the program's exit even
-    though no call was lost (cause not yet found). Use one or the other.
+    though no call was lost: the scan's claim and the getter's claim on
+    the same object make the exit retirement a slot replacement, which
+    is not yet gapless (planned with the gapless slot-replacement work).
+    The withheld attribution there is the expected getter result, not
+    part of the false gap. Use one or the other.
 - Kernels/conditions: all kernels; programs `p11scope-discover` cannot
   load, mainly ones with a statically linked provider.
 - Disclosure: the observation and attribution causes above, in text and

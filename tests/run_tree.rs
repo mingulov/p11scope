@@ -559,24 +559,6 @@ fn has_physical_gap_row(profile: &serde_json::Value) -> bool {
         })
 }
 
-/// Whether the report files the learned-provider-file first-use row (a
-/// provider learned after its first use; its earlier calls unobserved).
-fn has_learned_first_use_row(profile: &serde_json::Value) -> bool {
-    profile
-        .get("evidence")
-        .and_then(|evidence| evidence.get("skipped"))
-        .and_then(|skipped| skipped.as_array())
-        .expect("evidence.skipped")
-        .iter()
-        .any(|entry| {
-            entry.get("name").and_then(|name| name.as_str()) == Some("learned provider file")
-                && entry.get("reason").and_then(|reason| reason.as_str())
-                    == Some(
-                        "a provider file was learned after its first use; its earlier calls were not observed",
-                    )
-        })
-}
-
 /// The `evidence.discovery[]` record's `sha256` for `module`.
 fn record_sha256(profile: &serde_json::Value, module: &Path) -> String {
     let want = module.to_str().expect("utf8 module path");
@@ -1671,14 +1653,6 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
     // lands; the first mapper's earlier calls fall in the disclosed
     // first-use window.
     let early = assert_exact_first_use_accounting(&profile, &module, &ledgers);
-    // The stop works or says it did not: calls before a first attach are
-    // unobserved only with the learned-provider-file first-use row, and
-    // without that row every call landed (a held first mapper resumed
-    // attached).
-    assert!(
-        early == 0 || has_learned_first_use_row(&profile),
-        "{early} calls entered before their first attach without the learned-provider-file first-use row: {profile}"
-    );
     // The member-stop hook loads on every supported kernel (its own lib
     // cell runs on the host and in the vng guests), so here every first
     // mapper is held until its provider attaches: no call precedes a
@@ -1687,7 +1661,8 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
         early, 0,
         "calls entered before their first attach with the member-stop hook armed: {profile}"
     );
-    // Honesty half: the first mapper's miss stays disclosed, never silent.
+    // The verdict stays PARTIAL: members that retired before admission
+    // stay counted gaps (checked below).
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
     let learned = evidence
         .get("learned_staged_files")

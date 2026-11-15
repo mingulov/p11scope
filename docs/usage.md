@@ -888,16 +888,26 @@ SIGTERM does not escalate.
 child is placed in a dedicated cgroup under the observer's own cgroup;
 that is the root only when the observer itself runs in the root cgroup,
 so every descendant — `fork`/`exec` children, `sh -c` and `env`
-wrappers, double forks — is born in the cgroup. Only the direct child
-is paused; descendants are never paused. A descendant that loads an
-already-attached provider file is observed from its first call via the
-shared links. A short-lived descendant that cold-loads the provider
-teaches the run its file: the provider attaches by file identity for
-every later mapper, while the first mapper's own calls made before
-the attach stay missing and the run reports `PARTIAL` with
-`pid_descendant_gaps` plus the learned-file gap row. Pass
-`--prearm-module` for the provider when the very first mapper's calls
-must land too. (`sudo`/`setuid` inside the command cannot elevate under the
+wrappers, double forks — is born in the cgroup. The direct child is
+held by the pause chain. With the pause armed (the default),
+descendants are stopped too, but only briefly: the first time a member
+of the run cgroup maps an executable file the capture has not seen,
+the kernel stops it (`SIGSTOP`) before it runs that file's code. The
+observer proves the file, attaches a provider's probes, and resumes
+the member (`SIGCONT`), so even a short-lived descendant that
+cold-loads the provider is observed from its first call. Each distinct
+file costs one short stop for its first mapper; a hold that cannot
+attach resumes the member at most 1 s after its stop (or in the pass
+that first reads it when the observer is busier than that) and files
+the learned-file gap row. A job-control shell inside the command can
+see such a child briefly stopped (`CLD_STOPPED`). With `--pause never`
+(or when the kernel refuses the stop object) descendants are never
+stopped: a short-lived descendant that cold-loads the provider teaches
+the run its file for every later mapper, while the first mapper's own
+calls made before the attach stay missing and the run reports
+`PARTIAL` with `pid_descendant_gaps` plus the learned-file gap row.
+Pass `--prearm-module` for the provider when the very first mapper's
+calls must land then too. (`sudo`/`setuid` inside the command cannot elevate under the
 child's `no_new_privs` hardening, so privilege hops are not a
 supported shape.) The run still ends with the direct child's exit:
 descendants still alive are handed back alive, never killed, and
@@ -986,7 +996,18 @@ capture keeps running after logout. SIGQUIT keeps its default disposition
 (core dump, for debugging). SIGKILL cannot be handled: if the observer is killed that way there is no
 final frame and no `-o` file. The observed program still survives: the child
 arms `PR_SET_PDEATHSIG` to SIGCONT, so a child the pause holds stopped
-resumes when the observer dies, while a running child never notices. Its own
+resumes when the observer dies, while a running child never notices. A
+descendant held at its first map is resumed by `run`'s watchdog: a small
+`p11scope` process in its own session, outside the run cgroup, started before
+any member can stop. When the observer dies without its cleanup the watchdog
+sends SIGCONT to every stopped member of the run cgroup tree (pinned by pidfd,
+rechecked as stopped and as a member), in sweeps up to 1.6 s after the death
+(measured: every member ran again 0.2-0.5 s after a SIGKILL under load), then
+exits. That sweep also resumes a member the user had stopped on purpose. If
+the watchdog itself is killed, the observer stops stopping and resumes every
+member at once. Killing the observer and the watchdog together (a whole-session
+or cgroup kill, the OOM killer taking both) is not covered; check the tree with
+`ps` after such a kill. Its own
 session leaves its process group already orphaned, so the kernel sends no
 hangup when the observer dies. A capture error likewise hands a live child
 back running — exit 1 names the error and the surviving PID — instead of

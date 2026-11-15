@@ -280,12 +280,18 @@ row when its provider was not attached yet, or when a provider a stop
 staged has not attached yet (no later mapper is stopped for it once
 the stops are off). When the stops end (capture end or a lost
 watchdog) the observer switches the hook off, then waits one RCU grace
-period (`membarrier`) for hook calls already running before it resumes
-anyone. Where the kernel gives no such wait (`nohz_full`, one online
-CPU) it instead reads each pending member's maps before the resume
-(which waits out a hook call inside that member's mapping) and scans
-the table once more; a hook call preempted past that second scan can
-still leave a member stopped (send it SIGCONT). In the microseconds
+period for hook calls already running before it resumes anyone: one
+update of a private map-in-map (it returns only after the kernel's
+wait for running BPF programs, on every kernel and CPU count), or
+`membarrier` when that update is refused. Only when neither wait is
+proven (or the switch-off write itself failed) does it fall back: it
+reads each pending member's maps before the resume (which waits out a
+hook call inside that member's mapping; that read is not interrupted
+by its deadline while the mapping is blocked), yields 20 ms and scans
+the table once more, and then ends the watchdog by its sweeps instead
+of in order, so a stop that still lands is resumed within 1.6 s; on
+such a host those sweeps also resume a member stopped on purpose (job
+control). In the microseconds
 between a member's resume and the withdrawal of its row, a file it
 maps first is not stopped (the kernel keeps one row per process) and
 that refusal is not counted; the owned-tree watch still learns the

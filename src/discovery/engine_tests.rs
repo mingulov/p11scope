@@ -83422,6 +83422,10 @@ fn member_stop_resumes_a_stopped_member_moved_out_of_the_run_tree() {
     let stats = engine.member_stop_stats_for_test();
     assert_eq!(stats.moved_out_resumes, 1);
     assert_eq!(stats.not_members, 0);
+    assert!(
+        files_the_first_use_row(&engine),
+        "its stopping file was never proven: the gap is named"
+    );
     let _ = child.kill();
     let _ = child.wait();
 }

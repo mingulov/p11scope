@@ -874,6 +874,10 @@ fn exit_clocks_comparable_with(
 /// complete in milliseconds at ~64 B per entry (~1 MiB at the cap).
 /// Never lowered.
 const DEFAULT_MAX_EXEC_EXE_STASH: usize = 16_384;
+/// How long a gone process's EXEC evidence stays retained: a row read
+/// shortly after its exit still resolves; older rows cannot bind a live
+/// caller and are pruned.
+const EXEC_STATE_GRACE_NS: u64 = 180 * 1_000_000_000;
 
 /// Scan-learned exe-probe cache: one entry per distinct caller path
 /// at most, so the retained set cannot outnumber admitted callers
@@ -5164,6 +5168,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             events,
             timings,
         }
+    }
+
+    /// Release native-discovery bookkeeping that belongs to processes
+    /// that are gone. A capture-lifetime map keyed by process generation
+    /// otherwise grows with every short-lived process until its hard
+    /// limit: rows for a gone generation can no longer bind to a live
+    /// caller, so their exec stashes and ordering instants only cost
+    /// memory. The hard limits and live entries are untouched.
+    fn prune_departed_native_state(&mut self, now_ns: u64) {
+        let source = self.adapter.source();
+        if let Some(capture) = self.capture.as_mut() {
+            // Existing bounded stash: entries for gone pids (or a pid
+            // reused by another process) can never matter again.
+            capture.preadmission.prune(source);
+        }
+        self.binder
+            .prune_departed(|pid| source.gone(pid), now_ns, EXEC_STATE_GRACE_NS);
+        self.exec_exe.retain(|_, exec| {
+            !source.gone(exec.pid_host)
+                || now_ns.saturating_sub(exec.hook_ts_ns) < EXEC_STATE_GRACE_NS
+        });
+    }
+
+    /// Test-only: the retained EXEC exe stash size.
+    #[cfg(test)]
+    pub(crate) fn exec_exe_len_for_test(&self) -> usize {
+        self.exec_exe.len()
     }
 
     /// One pass with no scan behind it: the collection failed after at
@@ -22762,6 +22793,71 @@ exit 0
                 .contains(&"discovery coverage ended before stop".to_string()),
             "mid-capture deaths are not post-pass newcomers: {:?}",
             native.gap_subjects()
+        );
+    }
+
+    /// N churn cycles of short-lived processes must not retain their
+    /// native-discovery state for the whole capture: a real pass past the
+    /// grace prunes each departed generation's EXEC stash and ordering
+    /// instant, so the structures stay bounded by the live set instead of
+    /// growing with every fork.
+    #[test]
+    fn departed_process_exec_state_is_pruned_at_the_pass_seam() {
+        let (mut native, caller) = NativeScene::new();
+        const CHURN: u32 = 64;
+        let mut last = 0;
+        for index in 0..CHURN {
+            let at = native.stamps.tick();
+            last = at;
+            let pid = 60_000 + index;
+            let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+            // SAFETY: DiscoveryRecord contains only integer fields; this is
+            // the same fixed EXEC wire shape the producer emits.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.hook_ts_ns = at;
+            record.binding_id = 9_000 + u64::from(index);
+            record.pointers[0] = 8;
+            record.pointers[1] = 99;
+            drain.records.push(record);
+            native.stage(NativeBatch::Lifecycle(drain));
+        }
+        assert_eq!(
+            native.scene.coordinator.exec_exe_len_for_test(),
+            CHURN as usize
+        );
+        assert_eq!(
+            native.scene.coordinator.binder.exec_instants_for_test(),
+            CHURN as usize
+        );
+        let generation = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .map(|record| crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            });
+        let now = last + super::EXEC_STATE_GRACE_NS + 1;
+        let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+        native.scene.coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            now,
+        );
+        assert_eq!(
+            native.scene.coordinator.exec_exe_len_for_test(),
+            0,
+            "departed EXEC stashes must be pruned by the pass"
+        );
+        assert_eq!(
+            native.scene.coordinator.binder.exec_instants_for_test(),
+            0,
+            "departed exec instants must be pruned by the pass"
         );
     }
 

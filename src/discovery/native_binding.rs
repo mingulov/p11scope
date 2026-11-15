@@ -627,6 +627,9 @@ struct DomainState {
 struct ExecSeen {
     bound: Option<CallerId>,
     last_t0_ns: u64,
+    /// The tgid of the latest row for this exec sequence: liveness for
+    /// pruning a gone process's cookie.
+    last_tgid: u32,
 }
 
 impl DomainState {
@@ -874,6 +877,59 @@ impl NativeBinder {
     /// drain that emptied the ring (no bound, deadline, failure, or busy
     /// head) covers every read that finished before it started; a failed
     /// record is dated at the quantum's end.
+    /// Free per-process exec state for departed tasks (R-C51-5): a gone
+    /// process can never start a new incarnation, so its remembered exec
+    /// instant only orders rows that can no longer bind. Rows still
+    /// pending are kept, as are live processes' entries and anything
+    /// younger than `grace_ns`. The hard limits are unchanged; this only
+    /// stops a churn of short-lived processes from filling them.
+    pub(crate) fn prune_departed<G: Fn(u32) -> bool>(
+        &mut self,
+        gone: G,
+        now_ns: u64,
+        grace_ns: u64,
+    ) {
+        for domain in &mut self.domains {
+            if domain.finished {
+                continue;
+            }
+            let pending_tgids: std::collections::HashSet<u32> = domain
+                .pending
+                .iter()
+                .map(|pending| pending.row.host_tgid)
+                .collect();
+            domain.exec_ns.retain(|tgid, latest| {
+                !gone(*tgid)
+                    || pending_tgids.contains(tgid)
+                    || now_ns.saturating_sub(*latest) < grace_ns
+            });
+            // An image cookie whose latest row is older than the grace and
+            // whose process is gone cannot receive a new row; keeping its
+            // exec sequences only grows the per-image map. A bound caller
+            // or a pending row still needs it.
+            let live_cookies: std::collections::HashSet<DomainCookie> =
+                domain.callers.values().map(|(cookie, _)| *cookie).collect();
+            let pending_cookies: std::collections::HashSet<DomainCookie> = domain
+                .pending
+                .iter()
+                .map(|pending| pending.row.cookie())
+                .collect();
+            domain.cookies.retain(|cookie, execs| {
+                live_cookies.contains(cookie)
+                    || pending_cookies.contains(cookie)
+                    || execs.values().any(|seen| {
+                        !gone(seen.last_tgid) || now_ns.saturating_sub(seen.last_t0_ns) < grace_ns
+                    })
+            });
+        }
+    }
+
+    /// Test-only: remembered exec instants across all open domains.
+    #[cfg(test)]
+    pub(crate) fn exec_instants_for_test(&self) -> usize {
+        self.domains.iter().map(|domain| domain.exec_ns.len()).sum()
+    }
+
     pub(crate) fn absorb_lifecycle(&mut self, batch: &DiscoveryBatch) {
         let index = self.domain_index(batch.domain);
         let limit = self.limits.exec_tgids;
@@ -977,6 +1033,7 @@ impl NativeBinder {
                 .entry(row.exec_id())
                 .or_default();
             seen.last_t0_ns = seen.last_t0_ns.max(row.recorded_at_ns);
+            seen.last_tgid = row.host_tgid;
             let sighting = lookup.live_caller(row.host_tgid).map(|caller| Sighting {
                 caller: caller.id,
                 first_seen_ns: caller.first_seen_ns,

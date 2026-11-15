@@ -18,6 +18,8 @@ pub(crate) mod cgroup_context;
 pub(crate) mod leader_exit;
 mod view_filesystem;
 use std::sync::{Arc, Weak};
+#[cfg(test)]
+pub(crate) use view_filesystem::pin_mountinfo_for_test;
 pub(crate) use view_filesystem::{
     MappedOpenError, ViewFilesystem, cold_filesystem_deadline, observer_mount_namespace,
     snapshot_leader_is_zombie, with_cold_snapshot_filesystem,

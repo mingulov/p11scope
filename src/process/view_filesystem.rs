@@ -14,6 +14,33 @@ const STATUS_LIMIT: usize = 8192;
 const PROOF_GRACE: Duration = Duration::from_secs(1);
 const PF_EXITING: u32 = 4;
 
+#[cfg(test)]
+thread_local! {
+    static PINNED_MOUNTINFO: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct PinnedMountinfoGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for PinnedMountinfoGuard {
+    fn drop(&mut self) {
+        PINNED_MOUNTINFO.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Pins `ViewFilesystem::open_mountinfo` on the current thread to a static file
+/// snapshot of a live mountinfo table so budget-boundary tests stay immune to
+/// concurrent host mount-namespace edits.
+#[cfg(test)]
+pub(crate) fn pin_mountinfo_for_test(path: &Path) -> PinnedMountinfoGuard {
+    let previous = PINNED_MOUNTINFO.with(|slot| slot.borrow_mut().replace(path.to_path_buf()));
+    PinnedMountinfoGuard { previous }
+}
+
 /// One allowance for an entire serial cold-snapshot stage, never per PID.
 pub(crate) fn cold_filesystem_deadline(work: &CaptureWorkBudget) -> Instant {
     let now = Instant::now();
@@ -676,6 +703,10 @@ impl<'a> ViewFilesystem<'a> {
     }
 
     pub(crate) fn open_mountinfo(&self) -> std::io::Result<std::fs::File> {
+        #[cfg(test)]
+        if let Some(path) = PINNED_MOUNTINFO.with(|slot| slot.borrow().clone()) {
+            return std::fs::File::open(path);
+        }
         std::fs::File::open(self.owned_path("mountinfo"))
     }
 

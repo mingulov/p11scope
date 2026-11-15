@@ -86067,6 +86067,8 @@ struct ScriptedMemberStops {
     fail_pending: bool,
     /// A scripted watchdog loss.
     guard_lost: bool,
+    /// Ordered log of withdrawals (and of a test's own signal sends).
+    events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
 }
 
 impl MemberStopIo for ScriptedMemberStops {
@@ -86087,6 +86089,7 @@ impl MemberStopIo for ScriptedMemberStops {
     fn withdraw(&mut self, tgid: u32) -> Result<(), String> {
         self.rows.remove(&tgid);
         self.withdrawn.push(tgid);
+        self.events.borrow_mut().push("withdraw");
         Ok(())
     }
     fn counters(&mut self) -> Result<[u64; 4], String> {
@@ -86421,6 +86424,79 @@ fn member_stop_resume_keeps_the_row_without_signal_authority() {
     assert!(Engine::resume_member_for_test(&mut io, &fallback));
     assert_eq!(io.withdrawn, vec![pid]);
     assert!(member_resumed_for_test(pid));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A stopped `sleep` with its pending row stamped after its birth on the
+/// hook's clock: the process its row names.
+fn stopped_member_with_row(io: &mut ScriptedMemberStops) -> (std::process::Child, u32, u64) {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    stop_member_for_test(pid);
+    let stop_ns = crate::attach::monotonic_ns().unwrap();
+    io.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+            hook_ts_ns: stop_ns,
+            vm_start: 0x1000,
+            vm_end: 0x2000,
+        },
+    );
+    (child, pid, stop_ns)
+}
+
+/// Whether `pid` is still stopped after a short wait (nobody resumed it).
+fn member_still_stopped_for_test(pid: u32) -> bool {
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::discovery::pause::read_task_states(pid)
+        .unwrap()
+        .values()
+        .all(|state| *state == b'T')
+}
+
+/// The resume signal goes first; the row is withdrawn only after it was
+/// sent.
+#[test]
+fn member_stop_resume_signals_before_it_withdraws_the_row() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, _) = stopped_member_with_row(&mut io);
+    let pin = crate::process::PidPin::open(pid).unwrap();
+    let events = io.events.clone();
+    let mut send = |pin: &crate::process::PidPin| {
+        events.borrow_mut().push("signal");
+        pin.send_signal(libc::SIGCONT)
+    };
+    assert!(Engine::resume_member_with_for_test(
+        &mut io, &pin, &mut send
+    ));
+    assert_eq!(*io.events.borrow(), vec!["signal", "withdraw"]);
+    assert!(member_resumed_for_test(pid));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Twin: a resume signal that fails for a live member keeps its row (a
+/// later pass, the bound, the release and the watchdog still resume it).
+#[test]
+fn member_stop_failed_resume_signal_keeps_the_row() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, _) = stopped_member_with_row(&mut io);
+    let pin = crate::process::PidPin::open(pid).unwrap();
+    let mut refuse = |_: &crate::process::PidPin| Err("scripted EPERM".to_string());
+    assert!(!Engine::resume_member_with_for_test(
+        &mut io,
+        &pin,
+        &mut refuse
+    ));
+    assert!(io.rows.contains_key(&pid), "the row stays");
+    assert!(io.withdrawn.is_empty());
+    assert!(member_still_stopped_for_test(pid));
     let _ = child.kill();
     let _ = child.wait();
 }

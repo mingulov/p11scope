@@ -258,29 +258,26 @@ fn signal_by_number(tgid: u32) -> std::io::Result<()> {
 /// between the two clocks; a suspend only makes the process look older.
 /// The start is floored to a clock tick, so a number reused within one
 /// tick of the stop is not told apart. A zero stamp or an unreadable
-/// clock proves nothing.
-fn born_before_stop(start_ticks: u64, stop_ns: u64) -> bool {
+/// clock proves nothing: `None`, which callers treat as doubt (and
+/// doubt resumes).
+fn born_before_stop(start_ticks: u64, stop_ns: u64) -> Option<bool> {
     if stop_ns == 0 {
-        return false;
+        return None;
     }
-    let (Some(monotonic), Some(boot)) = (
-        crate::attach::monotonic_ns(),
-        crate::discovery::pause::boot_ns(),
-    ) else {
-        return false;
-    };
+    let monotonic = crate::attach::monotonic_ns()?;
+    let boot = crate::discovery::pause::boot_ns()?;
     let started = start_ticks.saturating_mul(crate::discovery::pause::clock_tick_ns());
-    boot.saturating_sub(started) >= monotonic.saturating_sub(stop_ns)
+    Some(boot.saturating_sub(started) >= monotonic.saturating_sub(stop_ns))
 }
 
 /// Whether a pinned process outside the run tree is still the member a
 /// row stopped at `stop_ns`, moved out of the run cgroup while stopped:
-/// its pinned start precedes the stop and it is stopped now. Such a
-/// member is resumed; any other process its number names is left as it
-/// is.
+/// its pinned start precedes the stop (or the stop instant proves
+/// nothing: doubt resumes) and it is stopped now. Such a member is
+/// resumed; any other process its number names is left as it is.
 pub(crate) fn stopped_member_moved_out(pin: &crate::process::PidPin, stop_ns: u64) -> bool {
     pin.start_time()
-        .is_some_and(|start| born_before_stop(start, stop_ns))
+        .is_some_and(|start| born_before_stop(start, stop_ns) != Some(false))
         && crate::attach::member_stop::process_stopped(pin.pid())
         && pin.still_the_same()
 }
@@ -1013,9 +1010,14 @@ impl Engine {
             Some(start) => Ok(start),
             None => crate::process::process_start_time(tgid),
         };
-        let original = match start {
-            Ok(start) => born_before_stop(start, stop_ns),
-            Err(_) => io.tgid_in_run_tree(tgid) != Ok(false),
+        // A start time that proves nothing (no stop instant, no clock)
+        // takes the same doubt branch as an unreadable one.
+        let original = match start
+            .ok()
+            .and_then(|start| born_before_stop(start, stop_ns))
+        {
+            Some(original) => original,
+            None => io.tgid_in_run_tree(tgid) != Ok(false),
         };
         if !original {
             let _ = io.withdraw(tgid);

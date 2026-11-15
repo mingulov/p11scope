@@ -637,7 +637,11 @@ then the maximum over the endpoints. `attached_at_ns` follows the current
 slots, so a probe replaced mid-capture moves it later; `first_attached_at_ns`
 stays at the first attach. It is absent when any endpoint never attached.
 Calls after it are observed unless another disclosed window says
-otherwise; it bounds the first-use gap, it is not a missed-call count. It may stand beside a
+otherwise, with one known exception: a mid-capture probe replacement can
+miss calls in its detach-reattach interval, and that interval is not yet
+disclosed as a window (at most a `physical static probe gap` row in
+`skipped`, without times).
+It bounds the first-use gap, it is not a missed-call count. It may stand beside a
 null `attached_at_ns` when a replacement attach failed after the first
 complete attach. `first_attach_points` (additive) lists each endpoint that
 ever attached as `{file_offset, began_ns, attached_ns}`: the instant just
@@ -645,7 +649,8 @@ before that endpoint's own first native attach call (its return side;
 the attach batch's start when that round has no usable clock; `null`
 when no clock could be read) and that attach's completion stamp. Counts are completed calls, so no call that
 entered before `began_ns` is counted and every call that entered after
-`attached_ns` is, unless another disclosed window says otherwise; only
+`attached_ns` is, unless another disclosed window says otherwise (or a
+later replacement's interval missed it, as above); only
 calls entering while that first attach ran are ambiguous. Absent when no
 endpoint attached. `unobserved_windows` is a list of
 `{start_ns, end_ns, reason}` with `reason` exactly `pre_attach`,

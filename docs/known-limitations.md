@@ -313,7 +313,11 @@ same fixed learned-file gap row plus descendant gaps for members
 that retired before admission. Members too short-lived to scan at all
 (a few milliseconds) stay counted in `pid_descendant_gaps` like the
 other never-admitted members. A job-control shell in the run tree
-can see its child briefly stopped (`CLD_STOPPED`). An observer
+can see its child briefly stopped (`CLD_STOPPED`). The stop and its
+`SIGCONT` act on the whole thread group, so other threads of a stopped
+member see the same interruption: a blocking call without `SA_RESTART`
+semantics, such as `epoll_wait`, `semop`, `sigtimedwait` or a socket
+read under `SO_RCVTIMEO`, may return `EINTR` once after the resume. An observer
 killed with SIGKILL (or aborted) leaves its stopped members to the
 run's watchdog, a separate process in its own session outside the
 run cgroup, holding only `CAP_KILL` (plus `CAP_SYS_PTRACE` when
@@ -341,8 +345,9 @@ the learned first-use row is filed. Two FUSE cases are still opened: a
 neighbor file on an overlay whose layer is FUSE (its row names the
 overlay device), and a FUSE superblock not mounted in the member's
 namespace (lazily unmounted, or reached through an inherited
-descriptor); such an open can block like the next case. One more
-blocking open remains: the owned-tree watch opens a FUSE-backed provider on the
+descriptor); such an open can block like the next case. Two more
+blocking opens remain: the owned-tree watch, and the frame-admission scan
+of a member that maps a provider file, open a FUSE-backed provider on the
 capture thread, so if that file's FUSE server is a run member stopped
 at the same moment (at its own first map of a new file), the open, and
 with it the capture loop and every hold bound, waits for a server that

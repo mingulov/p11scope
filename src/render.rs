@@ -1225,13 +1225,18 @@ pub struct DiscoveredModule {
     /// endpoints. `attached_at_ns` reads the current slots, so a probe
     /// replaced mid-capture moves it later; this instant stays at the
     /// first attach. Calls after it are observed unless another disclosed
-    /// window says otherwise. Absent when any endpoint never attached.
+    /// window says otherwise, with one known exception: a mid-capture probe
+    /// replacement can miss calls in its detach-reattach interval, which is
+    /// not yet disclosed as a window (at most a `physical static probe gap`
+    /// row, without times). Absent when any endpoint never attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_attached_at_ns: Option<u64>,
     /// The first attach of each endpoint that ever attached, by file
     /// offset: no call that entered before `began_ns` can be counted and
     /// every call that entered after `attached_ns` is counted unless a
-    /// disclosed window says otherwise. Absent when no endpoint attached.
+    /// disclosed window says otherwise (or a later probe replacement's
+    /// detach-reattach interval, not yet disclosed as a window, missed it).
+    /// Absent when no endpoint attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_attach_points: Option<Vec<FirstAttachPoint>>,
     /// Who first loaded this file, learned modules only. `None` — and

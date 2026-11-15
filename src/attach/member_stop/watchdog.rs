@@ -426,18 +426,13 @@ pub(crate) fn resume_if_stopped_member(pid: u32, tree: &RunTree) -> bool {
     pin.send_signal(libc::SIGCONT).is_ok()
 }
 
-/// Whether `/proc/<pid>/stat` shows the stopped state `T`.
+/// Whether any task of `pid` shows the stopped state `T` in its
+/// `/proc/<pid>/task/<tid>/stat`: a thread group whose main thread exited
+/// (`pthread_exit`) reads `Z` for its leader while its other threads are
+/// stopped.
 pub(crate) fn process_stopped(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    let Some(close) = stat.iter().rposition(|byte| *byte == b')') else {
-        return false;
-    };
-    stat.get(close + 1..).and_then(|tail| {
-        tail.split(|byte| *byte == b' ')
-            .find(|token| !token.is_empty())
-    }) == Some(b"T".as_slice())
+    crate::discovery::pause::read_task_states(pid)
+        .is_ok_and(|states| states.values().any(|state| *state == b'T'))
 }
 
 #[cfg(test)]
@@ -562,6 +557,40 @@ mod tests {
         );
         let _ = member.kill();
         let _ = member.wait();
+    }
+
+    /// A process whose main thread exited while another thread lives is
+    /// still stopped (its leader reads `Z`): the sweep must see it.
+    #[test]
+    fn a_stopped_process_with_an_exited_leader_reads_stopped() {
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import threading, time, ctypes\n\
+                 threading.Thread(target=time.sleep, args=(30,)).start()\n\
+                 ctypes.CDLL(None).pthread_exit(None)\n",
+            ])
+            .die_with_parent()
+            .spawn()
+            .expect("python3 for the exited-leader fixture");
+        let pid = child.id();
+        let leader_gone = (0..500).any(|_| {
+            std::thread::sleep(Duration::from_millis(5));
+            crate::discovery::pause::read_task_states(pid)
+                .is_ok_and(|states| states.get(&pid) == Some(&b'Z') && states.len() >= 2)
+        });
+        assert!(leader_gone, "the leader exited while a thread lives");
+        // SAFETY: signals our own child.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGSTOP);
+        }
+        let stopped = (0..500).any(|_| {
+            std::thread::sleep(Duration::from_millis(2));
+            process_stopped(pid)
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(stopped, "a stopped thread group reads stopped");
     }
 
     /// An abandoned watchdog sweeps past the observer's bounded wait; it

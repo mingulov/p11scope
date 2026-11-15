@@ -85542,6 +85542,25 @@ fn member_stop_failed_resume_signal_keeps_the_row() {
     let _ = child.wait();
 }
 
+/// A stopped member moved out of the run cgroup (its process provably
+/// the one its row stopped) resumes; it is not left stopped.
+#[test]
+fn member_stop_resumes_a_stopped_member_moved_out_of_the_run_tree() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    io.non_members.insert(pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(member_resumed_for_test(pid), "the moved member runs again");
+    assert!(!io.rows.contains_key(&pid));
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.moved_out_resumes, 1);
+    assert_eq!(stats.not_members, 0);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// An `original_exited` read error is not a departure: the held member
 /// is not abandoned. Its row stays, and the next pass re-pins and resumes
 /// it.

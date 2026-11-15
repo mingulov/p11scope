@@ -21,6 +21,11 @@
 #   privileged_run_tree_arming_exhaustion_still_stages_and_counts
 #   privileged_run_tree_non_member_provider_is_never_staged
 #
+# Declared expected failures (EXPECTED_FAILURES below) fail only with
+# their known signature: such a row is qualification expected-failure
+# (judged a pass), a pass is an UNEXPECTED PASS (judged a failure) and
+# any other failure stays failed, never masked.
+#
 # Each results.jsonl row carries exactly cell/pass/qualification/detail
 # (the shared cell-result contract). A zero exit alone is not a pass:
 # the log must show exactly one passed test, so a cell that gained
@@ -60,6 +65,42 @@ privileged_run_tree_arming_exhaustion_still_stages_and_counts
 privileged_run_tree_non_member_provider_is_never_staged
 )
 
+# Declared expected failures: cell, known failure signature (an ERE the
+# cell log must contain) and reason. Keep this list, the workflow's
+# --expected-failure flags and run-tree-vng.sh in step.
+#
+# never_pause_still_learns: PLAN-REPLACE-GAP (tmp task list, base bug,
+# not the run-tree learning). Each new worker mapping the provider
+# rebuilds a plan that downgrades the verified provider probes and
+# takes the replace path (detach, then reattach); the worker's first
+# calls fall in that 8-28 ms gap, so coverage stays under the 0.95
+# floor (CI 43704790202: 0.9355 on v6.12, 0.8459 on v7.3). The floor is
+# not lowered. When PLAN-REPLACE-GAP lands this cell passes, its row
+# becomes an UNEXPECTED PASS and fails the gate: then delete the entry
+# here and turn the workflow's --expected-failure back into --require.
+EXPECTED_FAILURES=(
+privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
+)
+EXPECTED_SIGNATURES=(
+'coverage after the first worker is 0\.[0-9]+ '
+)
+EXPECTED_REASONS=(
+'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
+)
+
+# expected_index NAME prints the cell's EXPECTED_FAILURES index, or
+# nothing for a required cell.
+expected_index() {
+    local i
+    for i in "${!EXPECTED_FAILURES[@]}"; do
+        if [ "${EXPECTED_FAILURES[$i]}" = "$1" ]; then
+            printf '%s' "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # One results.jsonl row: exactly cell/pass/qualification/detail.
 result() {
     python3 -I - "$1" "$2" "$3" "$4" <<'PY' | tee -a "$OUT/results.jsonl"
@@ -74,11 +115,23 @@ PY
 # gains #[ignore]), so a drifted or silent cell fails loudly.
 judge_cell() {
     local name=$1 log=$2 rc=$3 duration_ms=$4
-    local first detail
+    local first detail index signature
+    index=$(expected_index "$name") || index=
     if [ "$rc" -eq 0 ] \
         && grep -q 'test result: ok\. 1 passed' "$log" 2>/dev/null; then
+        if [ -n "$index" ]; then
+            result "$name" 1 "UNEXPECTED PASS (${EXPECTED_REASONS[$index]%%:*} may have landed): rc=0 ${duration_ms}ms ok" expected-failure
+            return 1
+        fi
         result "$name" 1 "rc=0 ${duration_ms}ms ok" qualified
         return 0
+    fi
+    if [ -n "$index" ] && [ "$rc" -ne 124 ]; then
+        signature=$(grep -m1 -oE "${EXPECTED_SIGNATURES[$index]}" "$log" 2>/dev/null)
+        if [ -n "$signature" ]; then
+            result "$name" 0 "${EXPECTED_REASONS[$index]}: rc=$rc ${duration_ms}ms: $signature" expected-failure
+            return 0
+        fi
     fi
     if [ "$rc" -eq 124 ]; then
         detail="TIMEOUT after 300s (${duration_ms}ms)"
@@ -102,6 +155,7 @@ rows=[json.loads(line) for line in open(sys.argv[1]) if line.strip()]
 expected=sys.argv[2:]; ids=[row['cell'] for row in rows]
 valid=len(ids)==len(set(ids)) and set(ids)==set(expected)
 failed=[r['cell'] for r in rows if r['qualification']=='failed']
+failed+=[r['cell'] for r in rows if r['qualification']=='expected-failure' and r['pass']]
 print('SUMMARY pass=%d fail=%d failed=%s terminal_rows_valid=%s' % (sum(r['pass'] for r in rows),len(failed),failed,valid))
 sys.exit(1 if failed or not valid else 0)
 PY
@@ -147,8 +201,27 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     # eight names: a dropped or renamed cell fails here, not silently).
     for cell in "${CELLS[@]}"; do
         LOG_BODY=$POSITIVE
-        check "$cell" 0 0 True qualified 'rc=0 42ms ok'
+        if expected_index "$cell" >/dev/null; then
+            # A declared expected failure that passes is a failure.
+            check "$cell" 0 1 True expected-failure 'UNEXPECTED PASS (PLAN-REPLACE-GAP may have landed)'
+        else
+            check "$cell" 0 0 True qualified 'rc=0 42ms ok'
+        fi
     done
+    # The declared cell's known signature is an expected failure...
+    LOG_BODY="thread 'x' panicked at tests/run_tree.rs:1274:5:
+coverage after the first worker is 0.9355 (270/279 less first-worker 9): {}
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check 'privileged_run_tree_unprearmed_shortlived_never_pause_still_learns' 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
+    # ...while any other failure of it stays failed (never masked)...
+    LOG_BODY="p11scope: attach plan requires 2176 allocated slots but only 2112 are available; refusing to attach a prefix
+thread 'x' panicked at tests/run_tree.rs:1249:5:
+run exits with the shell's status
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check 'privileged_run_tree_unprearmed_shortlived_never_pause_still_learns' 101 1 False failed 'rc=101'
+    # ...and so does its timeout, even with the signature in the log.
+    LOG_BODY='coverage after the first worker is 0.9355 (1/2 less first-worker 0): {}'
+    check 'privileged_run_tree_unprearmed_shortlived_never_pause_still_learns' 124 1 False failed 'TIMEOUT after 300s'
     # A failing cell keeps its shape.
     LOG_BODY='test one ... FAILED
 failures:
@@ -180,6 +253,29 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         || fail "summary gate rejected the full pass set"
     grep -q 'terminal_rows_valid=True' "$OUT/summary.txt" \
         || fail "summary misses terminal_rows_valid=True"
+    # The gate accepts the declared expected failure as a failed row...
+    : >"$OUT/results.jsonl"
+    for cell in "${CELLS[@]}"; do
+        if expected_index "$cell" >/dev/null; then
+            result "$cell" 0 'PLAN-REPLACE-GAP: rc=101 42ms' expected-failure >/dev/null
+        else
+            result "$cell" 1 'rc=0 42ms ok' qualified >/dev/null
+        fi
+    done
+    write_summary "$OUT/results.jsonl" "$OUT/xfail.txt" "${CELLS[@]}" >/dev/null \
+        || fail "summary gate rejected the declared expected failure"
+    # ...and rejects it as an unexpected pass.
+    : >"$OUT/results.jsonl"
+    for cell in "${CELLS[@]}"; do
+        if expected_index "$cell" >/dev/null; then
+            result "$cell" 1 'UNEXPECTED PASS' expected-failure >/dev/null
+        else
+            result "$cell" 1 'rc=0 42ms ok' qualified >/dev/null
+        fi
+    done
+    if write_summary "$OUT/results.jsonl" "$OUT/xpass.txt" "${CELLS[@]}" >/dev/null 2>&1; then
+        fail "summary gate accepted an unexpected pass"
+    fi
     # A dropped row fails the gate.
     head -n 3 "$OUT/results.jsonl" >"$OUT/short.jsonl"
     if write_summary "$OUT/short.jsonl" "$OUT/short.txt" "${CELLS[@]}" >/dev/null 2>&1; then

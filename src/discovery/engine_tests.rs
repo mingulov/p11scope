@@ -88209,3 +88209,54 @@ fn owned_run_incomplete_rescans_spend_one_retry_per_tick() {
         assert_eq!(rescan(&mut engine), owed, "tick {tick}");
     }
 }
+
+/// A released view's retry count never passes to the next view that
+/// reuses its ID: the tick prunes counts only at its start, so a view
+/// retired mid-tick whose ID is minted again for a newcomer admitted in
+/// that same tick must not hand the newcomer an exhausted budget.
+#[test]
+fn owned_run_reused_view_id_starts_a_fresh_incomplete_scan_budget() {
+    let me = std::process::id();
+    let (_dir, mut engine) = owned_run_incomplete_scan_engine(true);
+    let max_scan_pids = engine.max_scan_pids;
+    let admit = |engine: &mut Engine| {
+        INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+        inject_mapping_changed_scan();
+        engine.learned_frame_owed = false;
+        let (new_views, _, _) = engine.admit_inventory_new_views(
+            vec![me],
+            &AdmissionLedger::Free {
+                backlog: BTreeSet::new(),
+            },
+            max_scan_pids,
+            &mut || Some(0),
+        );
+        INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+        new_views
+            .into_iter()
+            .find(|(view, _, _)| view.pid() == me)
+            .expect("the admission staged the member")
+            .0
+    };
+    let view = admit(&mut engine);
+    let id = view.id();
+    engine.views.push(view);
+    // Exhaust the old view's budget over later ticks.
+    for _ in 0..OWNED_INCOMPLETE_SCAN_RETRIES {
+        engine.inventory_tick_serial += 1;
+        inject_mapping_changed_scan();
+        engine.scan_inventory_views(&BTreeSet::from([id]), "rescan", &mut || Some(0));
+        INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+    }
+    // A new tick retires the view mid-tick and admits a newcomer that
+    // reuses its ID.
+    engine.inventory_tick_serial += 1;
+    engine.views.retain(|view| view.id() != id);
+    engine.release_view_id(id);
+    let newcomer = admit(&mut engine);
+    assert_eq!(newcomer.id(), id, "the newcomer reuses the released ID");
+    assert!(
+        engine.learned_frame_owed,
+        "the newcomer's incomplete first scan owes its own prompt rescan"
+    );
+}

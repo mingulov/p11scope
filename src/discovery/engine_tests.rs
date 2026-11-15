@@ -86419,6 +86419,15 @@ fn member_stop_engine() -> Engine {
     engine
 }
 
+/// A scripted session whose attaches stamp their slots, as the real
+/// session's per-slot completion does: a hold counts its provider attached
+/// only from such stamps.
+fn attaching_session() -> ScriptedSession {
+    let mut session = ScriptedSession::default();
+    session.stamp_attached_slots = Some(5);
+    session
+}
+
 /// A member stopped at a file that is no PKCS#11 provider resumes in the
 /// same pass, and every executable file it maps (the stopping file and
 /// its neighbors) is cleared, so no later mapper stops on them.
@@ -87378,7 +87387,7 @@ fn member_stop_holds_a_provider_mapper_until_its_staging_attaches() {
     // A pause-owned batch defers the event-driven apply: the staging
     // stays unattached until the batch ends.
     engine.pause_owned_batch = true;
-    let mut session = ScriptedSession::default();
+    let mut session = attaching_session();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert_eq!(
         engine.learned_staged_files_for_test(),
@@ -87424,6 +87433,70 @@ fn member_stop_holds_a_provider_mapper_until_its_staging_attaches() {
     );
     assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 1);
     assert_eq!(engine.member_stop_stats_for_test().timed_out, 0);
+}
+
+/// Twin: an apply whose target preflight refused attached nothing, so
+/// the staging stays unapplied and the provider mapper stays held (it
+/// must not resume as attached with its first calls unobserved).
+#[test]
+fn member_stop_keeps_holding_when_the_staging_apply_preflight_refuses() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::refusing_preflight();
+    session.stamp_attached_slots = Some(5);
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert!(
+        engine.learned_unapplied,
+        "a refused preflight applied nothing"
+    );
+    assert!(engine.member_stops_held(), "the provider mapper stays held");
+    assert!(!io.cleared.contains(&key), "the provider is not cleared");
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(engine.member_stops_held(), "still held on the next pass");
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
+}
+
+/// Twin: an accepted apply whose session reports no attach-complete
+/// stamp for the provider's slots is no attach: the hold keeps waiting
+/// for real stamps, and at the bound it files the first-use row.
+#[test]
+fn member_stop_counts_a_provider_attached_only_from_real_attach_stamps() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert!(
+        engine.member_stops_held(),
+        "no attach stamp, no attached resume"
+    );
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(10 + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(!engine.member_stops_held(), "the bound ends the hold");
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
+    assert!(
+        files_the_first_use_row(&engine),
+        "an unattached resume files the first-use row"
+    );
+    assert!(member_resumed_for_test(pid));
 }
 
 /// Twin: a provider staging that never attaches resumes the member at
@@ -87526,7 +87599,7 @@ fn member_stop_attaches_and_resumes_a_provider_mapper_in_one_pass() {
     let mut io = ScriptedMemberStops::default();
     io.rows.insert(pid, member_stop_row(pid, &library, key));
     let mut engine = member_stop_engine();
-    let mut session = ScriptedSession::default();
+    let mut session = attaching_session();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert_eq!(engine.learned_staged_files_for_test(), 1);
     assert!(!engine.learned_unapplied, "the staging applied in the pass");
@@ -87893,7 +87966,7 @@ fn member_stop_watchdog_loss_after_an_attached_hold_files_no_row() {
     let mut io = ScriptedMemberStops::default();
     io.rows.insert(pid, member_stop_row(pid, &library, key));
     let mut engine = member_stop_engine();
-    let mut session = ScriptedSession::default();
+    let mut session = attaching_session();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 1);
     io.guard_lost = true;
@@ -87921,7 +87994,7 @@ fn member_stop_unproven_stopping_file_beside_a_provider_files_the_row() {
         },
     );
     let mut engine = member_stop_engine();
-    let mut session = ScriptedSession::default();
+    let mut session = attaching_session();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     let stats = engine.member_stop_stats_for_test();
     assert_eq!(stats.attached_resumes, 1, "{stats:?}");

@@ -19942,6 +19942,13 @@ impl Engine {
             self.merge_and_project_capture_facts()
         };
         outcome.disposition = candidate_publication_disposition(retired, &publication);
+        // Only an accepted candidate consumed the learned staging: it was
+        // built from the current pins (staging never runs inside a tick or
+        // an apply), so the latch clears here and nowhere else. Refused,
+        // deferred and early-returning refreshes leave it set.
+        if outcome.disposition == ApplyDisposition::Accepted {
+            self.learned_unapplied = false;
+        }
         if publication.is_err() {
             // The preflight proved this for the whole candidate, so only the
             // cleaned subset can still refuse. Keep the committed state and
@@ -22773,11 +22780,10 @@ impl Engine {
             engine.queue_apply_outcome(&outcome, &mut pending_views);
             Ok(additions_allowed)
         });
+        // An accepted apply cleared the latch itself; a preflight-refused
+        // or deferred one returns `Ok` with nothing attached and leaves it.
         match applied {
-            Ok(true) => {
-                self.learned_unapplied = false;
-            }
-            Ok(false) => {}
+            Ok(_) => {}
             Err(error) => {
                 if crate::run::capture_diagnostics_on() {
                     eprintln!(
@@ -30923,11 +30929,9 @@ impl Engine {
         if let Some(span) = diagnostic_span {
             span.finish_result(&result);
         }
-        if result.is_ok() {
-            // This refresh consumed any learned staging into its
-            // candidate; the shallow-idle latch it set is discharged.
-            self.learned_unapplied = false;
-        }
+        // The learned-staging latch clears only where a candidate was
+        // accepted (`apply_candidate`), never on an early `Ok` (pending
+        // global retirement, idle or dropped tick).
         result
     }
 
@@ -39361,6 +39365,10 @@ pub(crate) mod session_fixture {
         /// sets them; production `Session` supplies the real ones.
         pub(crate) scripted_links: BTreeSet<u32>,
         pub(crate) scripted_stamps: BTreeMap<u32, u64>,
+        /// When set, every slot an `attach_targets` call attaches gets this
+        /// attach-complete stamp (first stamp wins), like the real session's
+        /// per-slot completion. Unset, attaches leave no stamp.
+        pub(crate) stamp_attached_slots: Option<u64>,
         /// Scripted revival probe: retired slots reported physically
         /// detached, and detached slots reported counts-final. Empty
         /// unless a test sets them (fail-closed like the trait).
@@ -40078,6 +40086,14 @@ pub(crate) mod session_fixture {
             }
             if let Some(physical) = physical {
                 return physical;
+            }
+            if let Some(stamp) = self.stamp_attached_slots {
+                for slot in slots
+                    .iter()
+                    .filter(|slot| !self.fail_target_slots.contains(&slot.index))
+                {
+                    self.scripted_stamps.entry(slot.index).or_insert(stamp);
+                }
             }
             Ok((
                 slots

@@ -1465,3 +1465,33 @@ fn newcomer_share_bounded_at_the_engine_call_site() {
         );
     }
 }
+
+/// A refresh that returns early on a pending global retirement applied no
+/// candidate: a learned staging stays unapplied (the latch that keeps the
+/// next frame from skipping the apply, and that a member hold reads),
+/// whatever the refresh's `Ok` says.
+#[test]
+fn async_global_pending_refresh_keeps_a_learned_staging_unapplied() {
+    let mut case = Case::new();
+    case.hold_pending();
+    case.engine.learned_unapplied = true;
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
+    let refreshed = case.engine.refresh_inventory(
+        &mut case.session,
+        &mut true,
+        &mut Vec::new(),
+        &mut PendingViewRetirements::new(),
+        &mut *collect,
+        &mut PauseClosure::new(true),
+        &mut tick_now,
+    );
+    assert!(
+        matches!(refreshed, Ok(false)),
+        "the pending retirement ends the tick early: {refreshed:?}"
+    );
+    assert!(
+        case.engine.learned_unapplied,
+        "no candidate applied, so the staging is still unapplied"
+    );
+}

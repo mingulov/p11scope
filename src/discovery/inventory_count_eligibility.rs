@@ -1415,14 +1415,14 @@ impl CountOwnership {
             std::mem::size_of::<MembershipIndex>(),
         )
     }
-    /// One `-v` memory row per retained ownership structure: headers,
-    /// charged associations, summaries and their pending cleanup. Read
-    /// only on the memory-emit path.
-    pub(super) fn memory_rows(&self) -> [crate::memory_counters::CounterRow; 4] {
+    /// One `-v` memory row for the retained ownership structures:
+    /// headers, charged associations, summaries and their pending
+    /// cleanup. Read only on the memory-emit path.
+    pub(super) fn memory_row(&self) -> crate::memory_counters::CounterRow {
         use crate::memory_counters::{HEAP_MAP_ENTRY, counter_row};
         use std::mem::size_of;
         let cleanup = self.cleanup.iter().map(|entry| entry.cells).sum::<usize>();
-        [
+        let rows = [
             counter_row(self.callers.len(), size_of::<CallerId>(), HEAP_MAP_ENTRY),
             counter_row(self.associations, size_of::<ModuleKey>(), HEAP_MAP_ENTRY),
             counter_row(
@@ -1431,7 +1431,11 @@ impl CountOwnership {
                 HEAP_MAP_ENTRY,
             ),
             counter_row(cleanup, size_of::<ModuleKey>(), HEAP_MAP_ENTRY),
-        ]
+        ];
+        crate::memory_counters::CounterRow {
+            len: rows.iter().map(|row| row.len).sum(),
+            bytes: rows.iter().map(|row| row.bytes).sum(),
+        }
     }
     #[cfg(test)]
     pub(super) fn caller_headers(&self) -> usize {

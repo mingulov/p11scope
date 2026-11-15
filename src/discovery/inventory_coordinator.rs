@@ -4419,10 +4419,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 size_of::<(String, Option<(u64, u64)>)>(),
                 crate::memory_counters::HEAP_MODULE_KEY,
             ),
-            binder_exec_ns: binder.exec_ns,
-            binder_cookies: binder.cookies,
-            binder_pending: binder.pending,
-            binder_callers: binder.callers,
+            binder: crate::memory_counters::CounterRow {
+                len: binder.exec_ns.len.saturating_add(binder.cookies.len),
+                bytes: binder.exec_ns.bytes.saturating_add(binder.cookies.bytes),
+            },
         }
     }
 
@@ -4441,16 +4441,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 registry: self.registry.memory_lens(),
                 history: self.engine.memory_history_lens(),
                 model: self.joint_capture.memory_lens(),
-                ownership: {
-                    let [callers, associations, summaries, cleanup] =
-                        self.count_ownership.memory_rows();
-                    crate::memory_counters::OwnershipLens {
-                        callers,
-                        associations,
-                        summaries,
-                        cleanup,
-                    }
-                },
+                ownership: self.count_ownership.memory_row(),
                 metadata_rows: self
                     .caller_metadata
                     .as_ref()

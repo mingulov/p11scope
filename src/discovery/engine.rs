@@ -102,7 +102,8 @@ pub(crate) mod inventory;
 #[path = "member_stop.rs"]
 mod member_stop;
 pub(crate) use member_stop::{
-    MemberStopIo, process_gone as member_process_gone, stopped_member_moved_out,
+    MEMBER_STOP_RESCAN_DELAY, MemberStopIo, process_gone as member_process_gone,
+    stopped_member_moved_out,
 };
 #[path = "inventory_coordinator.rs"]
 pub(crate) mod inventory_coordinator;

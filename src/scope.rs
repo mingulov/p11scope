@@ -104,6 +104,11 @@ impl RunCgroup {
         &self.path
     }
 
+    /// The cgroup v2 mount root `/proc/<pid>/cgroup` paths are relative to.
+    pub fn cgroup_root(&self) -> &Path {
+        &self.cgroup_root
+    }
+
     /// Whether the retention notice may name the full cgroup path: only
     /// under `-v`. By default it names the leaf only, since the full
     /// path carries the observer's UID/session slices.

@@ -31749,6 +31749,52 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// An accepted manifest that names a getter always names the attach
+    /// window, with no loader hit at all (twin: the same engine without
+    /// it names none).
+    #[test]
+    fn evidence_for_names_the_window_of_every_accepted_manifest_getter() {
+        use crate::discovery::pause::PauseCounters;
+
+        let (mut engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let mut windows = Vec::new();
+        for accepted in [false, true] {
+            if accepted {
+                crate::discovery::engine::tests::accept_a_manifest_getter(&mut engine);
+            }
+            let evidence = evidence_for(
+                &engine,
+                engine.capture_facts(),
+                0,
+                false,
+                false,
+                Default::default(),
+                render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
+                &[],
+                &[],
+                metrics::KernelEvidence::default(),
+                process::TrackingEvidence::default(),
+                0,
+                &state,
+                false,
+                true,
+                PauseCounters::default(),
+                0,
+                None,
+                None,
+                false,
+                render::SchedulingEvidence::default(),
+                None,
+                None,
+                None,
+                0,
+            );
+            windows.push(evidence.unprotected_live_windows);
+        }
+        assert_eq!(windows, [0, 1]);
+    }
+
     #[test]
     fn evidence_for_keeps_distinct_discovery_losses_across_all_renderers() {
         let (engine, _) = crate::discovery::engine::tests::selection_output_engines();

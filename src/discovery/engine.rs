@@ -7088,8 +7088,17 @@ fn recorroborate_at_capture_end(
             .iter()
             .filter(|manifest| manifest_module_object(manifest, pinned) == Some(*object))
             .collect();
+        // Getter-only manifests claim only where their getters are: the
+        // scan corroborates them when its tables hold each getter there.
+        let getter_only = describing
+            .iter()
+            .all(|manifest| crate::manifest_input::is_getter_only(manifest));
+        // Beside a walked sibling, a getter-only manifest's getters are not
+        // part of the exact walked set: a table that lacks a getter says
+        // nothing against it, so they would only manufacture a Conflict.
         let Some(own_targets) = describing
             .iter()
+            .filter(|manifest| getter_only || !crate::manifest_input::is_getter_only(manifest))
             .map(|manifest| manifest_targets(manifest, pinned))
             .collect::<Option<Vec<_>>>()
             .filter(|sets| !sets.is_empty())
@@ -7097,11 +7106,6 @@ fn recorroborate_at_capture_end(
         else {
             continue;
         };
-        // Getter-only manifests claim only where their getters are: the
-        // scan corroborates them when its tables hold each getter there.
-        let getter_only = describing
-            .iter()
-            .all(|manifest| crate::manifest_input::is_getter_only(manifest));
         let scan_empty = scanned
             .iter()
             .flat_map(|module| &module.tables)
@@ -15577,7 +15581,11 @@ impl Engine {
         // owner hands it to the next Session pass for detach; the id never
         // carries it to a later view.
         self.getter_sites_settled.remove(&id);
+        // Its selection bindings fail closed now, as a retirement's do: a
+        // C_GetInterface selection on the released view is never reported
+        // as silently covered by a hook that is about to be detached.
         if let Some(context) = self.view_getter_contexts.remove(&id) {
+            self.retire_context_bindings(context);
             self.orphaned_getter_contexts.push(context);
         }
         self.pending_loader_arm_scans.retain(|key| key.view != id);
@@ -26604,12 +26612,7 @@ impl Engine {
             return;
         };
         let (_, detach_failed) = session.detach_dynamic_context(context);
-        for binding in self.selection_bindings.values_mut() {
-            if binding.context == context {
-                binding.retired = true;
-                binding.coverage.retire();
-            }
-        }
+        self.retire_context_bindings(context);
         if detach_failed {
             closure.fail();
             *additions_allowed = false;
@@ -26617,6 +26620,17 @@ impl Engine {
                 "live manifest getter detach",
                 "a manifest getter hook detach failed; replacement was blocked for this cycle",
             );
+        }
+    }
+
+    /// Retires every selection binding that `context`'s hooks own: their
+    /// coverage fails closed (a naturally closed one stays closed).
+    fn retire_context_bindings(&mut self, context: LoaderContextId) {
+        for binding in self.selection_bindings.values_mut() {
+            if binding.context == context {
+                binding.retired = true;
+                binding.coverage.retire();
+            }
         }
     }
 

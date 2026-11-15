@@ -33504,6 +33504,26 @@ fn a_view_owning_manifest_getter_hooks_is_never_evicted_and_its_id_inherits_noth
     let context = LoaderContextId::view_owned(0).unwrap();
     engine.view_getter_contexts.insert(owner, context);
     engine.getter_sites_settled.insert(owner);
+    // The owner's C_GetInterface selection, open; twin: another
+    // context's open selection.
+    let generation = NonZeroU64::new(1).unwrap();
+    let binding = |id, context| SelectionBindingFact {
+        id,
+        context,
+        view: owner,
+        object: PinnedObjectId(1),
+        file_offset: 0,
+        hook_id: 0,
+        abi: HookAbi::Interface,
+        attached: true,
+        retired: false,
+        provider: plan::ModuleId(0),
+        observed: false,
+        coverage: SelectionCoverageState::OwnedOpen(generation),
+    };
+    let other = LoaderContextId::view_owned(1).unwrap();
+    engine.selection_bindings.insert(1, binding(1, context));
+    engine.selection_bindings.insert(2, binding(2, other));
     assert!(
         !engine.exploratory_evictable(owner),
         "a getter owner is not ballast"
@@ -33526,18 +33546,183 @@ fn a_view_owning_manifest_getter_hooks_is_never_evicted_and_its_id_inherits_noth
     assert!(!engine.view_getter_contexts.contains_key(&owner));
     assert!(!engine.getter_sites_settled.contains(&owner));
     assert_eq!(engine.orphaned_getter_contexts, vec![context]);
+    // Its selection fails closed at release, as a retirement's does; the
+    // other context's selection is untouched.
+    let released = &engine.selection_bindings[&1];
+    assert!(released.retired);
+    assert_eq!(released.coverage, SelectionCoverageState::Uncovered);
+    let kept = &engine.selection_bindings[&2];
+    assert!(!kept.retired);
+    assert_eq!(kept.coverage, SelectionCoverageState::OwnedOpen(generation));
     // A later view on the same id starts with no owner and no settled
     // state, so its getters are attached afresh under a new owner id.
     assert!(engine.manifest_getter_context_cached(owner).is_none());
-    // The next Session pass detaches the orphaned owner exactly once.
+    // The next getter attach pass detaches the orphaned owner exactly once.
+    engine.manifests = vec![with_getters(
+        manifest_naming("/nonexistent/static-provider", None),
+        &[("C_GetInterface", 0, 0x80)],
+    )];
     let mut session = ScriptedSession::default();
     let mut additions_allowed = true;
-    engine.detach_orphaned_getter_contexts(&mut session, &mut additions_allowed);
+    engine.attach_manifest_getters(owner, &mut session, &mut additions_allowed);
     assert_eq!(session.detached, vec![context]);
     assert!(additions_allowed);
     assert!(engine.orphaned_getter_contexts.is_empty());
-    engine.detach_orphaned_getter_contexts(&mut session, &mut additions_allowed);
+    engine.attach_manifest_getters(owner, &mut session, &mut additions_allowed);
     assert_eq!(session.detached, vec![context]);
+}
+
+/// `manifest` with `getters` added, each `(name, object, file_offset)`.
+fn with_getters(mut manifest: Manifest, getters: &[(&str, u32, u64)]) -> Manifest {
+    manifest
+        .getters
+        .extend(getters.iter().map(|(name, object, file_offset)| {
+            p11scope_manifest::manifest::GetterRecord {
+                name: (*name).into(),
+                resolution: Resolution::Resolved {
+                    object: *object,
+                    file_offset: *file_offset,
+                },
+            }
+        }));
+    manifest
+}
+
+/// Lets a test outside this module name an accepted manifest getter.
+pub(crate) fn accept_a_manifest_getter(engine: &mut Engine) {
+    engine.manifests.push(with_getters(
+        manifest_naming("/nonexistent/static-provider", None),
+        &[("C_GetFunctionList", 0, 0x80)],
+    ));
+}
+
+/// A settled view's getter pass reads no maps; retirement reopens it.
+#[test]
+fn a_settled_view_skips_the_getter_maps_read_until_retirement() {
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, mut input) = same_object_scan_and_manifest(&fixture, 0x40);
+    input.manifest = with_getters(input.manifest, &[("C_GetFunctionList", 0, 0x80)]);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let mut pass = |engine: &mut Engine| {
+        let before = engine.budget.attempted_io_bytes();
+        let outcome = engine.attach_manifest_getters(id, &mut session, &mut additions_allowed);
+        assert_eq!(outcome, (false, true, false, false));
+        engine.budget.attempted_io_bytes() > before
+    };
+    assert!(pass(&mut engine), "the first pass reads the maps");
+    assert!(engine.getter_sites_settled.contains(&id));
+    assert!(!pass(&mut engine), "a settled view reads nothing");
+    let mut closure = PauseClosure::new(true);
+    engine.retire_view_getter_context(id, &mut ScriptedSession::default(), &mut true, &mut closure);
+    assert!(!engine.getter_sites_settled.contains(&id));
+    assert!(pass(&mut engine), "retirement reopens it");
+}
+
+/// A finished scan of the getter's object does not hide the getter
+/// site: it stays hooked behind the always-named window (twin: the same
+/// object mapped without execute permission offers no site).
+#[test]
+fn a_finished_scan_keeps_a_mapped_getter_site() {
+    use std::os::fd::AsRawFd as _;
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, mut input) = same_object_scan_and_manifest(&fixture, 0x40);
+    input.manifest = with_getters(input.manifest, &[("C_GetFunctionList", 0, 0x80)]);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    for module in &mut engine.modules {
+        module.scanned.tables_scan_finished = true;
+    }
+    assert!(
+        engine.modules.iter().any(|module| module
+            .scanned
+            .tables
+            .iter()
+            .any(|table| !table.live_return))
+    );
+    assert!(engine.manifest_getter_sites(id).unwrap().is_empty());
+    // SAFETY: a private read-execute mapping of the held fixture file,
+    // unmapped below before the fixture drops.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            fixture.length,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_PRIVATE,
+            fixture.file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let sites = engine.manifest_getter_sites(id).unwrap();
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(mapping, fixture.length) }, 0);
+    let object = engine.modules[0].object;
+    assert_eq!(sites, vec![(object, 0x80, "C_GetFunctionList".to_string())]);
+}
+
+/// The C_GetInterface export fact belongs to the getter's own object: a
+/// getter located in a dependency grants nothing to the provider.
+#[test]
+fn an_interface_getter_credits_only_its_own_object() {
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    // The accepted manifest carries this capture's pinned identities.
+    let mut manifest = engine.manifests[0].clone();
+    let object = engine.modules[0].object;
+    let dependency = "/nonexistent/libdependency.so";
+    let mut record = manifest.objects[0].clone();
+    record.id = 1;
+    record.path = dependency.into();
+    manifest.objects.push(record);
+    let mut provenance = manifest.provenance_objects[0].clone();
+    provenance.path = dependency.into();
+    provenance.inode += 1;
+    manifest.provenance_objects.push(provenance);
+    let own = with_getters(manifest.clone(), &[("C_GetInterface", 0, 0x80)]);
+    assert!(locates_interface_getter_in(&own, &engine.pinned, object));
+    let elsewhere = with_getters(manifest.clone(), &[("C_GetInterface", 1, 0x80)]);
+    assert!(!locates_interface_getter_in(
+        &elsewhere,
+        &engine.pinned,
+        object
+    ));
+    let legacy = with_getters(manifest, &[("C_GetFunctionList", 0, 0x80)]);
+    assert!(!locates_interface_getter_in(
+        &legacy,
+        &engine.pinned,
+        object
+    ));
+}
+
+/// One getter-only and one walking manifest on one object: the getter is
+/// not part of the exact walked set, so an agreeing walk stays agreed
+/// (twin: `a_late_scan_that_agrees_is_recorded_as_agreed_not_as_a_conflict`).
+#[test]
+fn a_getter_only_sibling_does_not_turn_an_agreeing_walk_into_a_conflict() {
+    let fixture = ScanManifestFixture::new();
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let mut getter_only = with_getters(input.manifest.clone(), &[("C_GetFunctionList", 0, 0x80)]);
+    getter_only.surfaces.clear();
+    assert!(crate::manifest_input::is_getter_only(&getter_only));
+    let sibling = ManifestInput {
+        path: PathBuf::from("getter.json"),
+        manifest: getter_only,
+        pins: input.pins.clone(),
+        stale: Vec::new(),
+    };
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input, sibling]);
+    blinded_attach_time_corroboration(&mut engine);
+
+    engine.publish_current_capture_facts().unwrap();
+
+    assert_eq!(engine.discovery.conflicts, 0);
+    assert_eq!(engine.discovery.uncorroborated, 0);
+    let module = &engine.discovery.modules[0];
+    assert_eq!(module.corroboration, vec!["agreed"], "{module:?}");
 }
 
 /// The settled cache skips the per-tick maps read only until the view is

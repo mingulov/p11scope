@@ -239,9 +239,11 @@ provider's probes, and resumes the member before it runs any of that
 file's code, so the first mapper's calls are observed too. Each
 distinct executable file costs one short stop for the first member
 that maps it (measured: 12 stops for ten python workers); a hold
-that cannot attach resumes the member at most 1 s after its kernel
-stop (or in the first pass that reads it, when the observer is busier
-than that) and files the learned first-use gap row. A staging the
+that cannot attach, and a stopped member the observer cannot pin or
+place in the run tree, resumes at most 1 s after its kernel stop (or
+in the first pass that reads it, when the observer is busier than
+that) and files the learned first-use gap row. A member moved out of
+the run cgroup while stopped resumes too. A staging the
 learned-file cap or the pin budget refuses resumes the member at once,
 beside its refusal row. Measured on the local host under 8 extra
 CPU burners: ten sequential python workers loading SoftHSM observe
@@ -258,12 +260,20 @@ that retired before admission. Members too short-lived to scan at all
 other never-admitted members. A job-control shell in the run tree
 can see its child briefly stopped (`CLD_STOPPED`). An observer
 killed with SIGKILL (or aborted) leaves its stopped members to the
-run's watchdog, a separate process outside the run cgroup that sends
-SIGCONT to every stopped member of the run tree in sweeps up to 1.6 s
+run's watchdog, a separate process in its own session outside the
+run cgroup that sends SIGCONT to every stopped member of the run tree
+except the direct child, in sweeps whose last one starts by 1.6 s
 after the death (measured 0.2-0.5 s under load); that sweep also
-resumes a member stopped on purpose. Only a kill that takes the
-observer and the watchdog together (the whole session or the OOM
-killer) can leave a member stopped; send it SIGCONT. On an overlay
+resumes a member stopped on purpose, and does not see a member moved
+out of the run cgroup. Only a kill that takes the observer and the
+watchdog together (`pkill -9 p11scope`, a kill of a cgroup holding
+both, or the OOM killer) can leave a member stopped; send it SIGCONT.
+A suspended or hung observer (Ctrl-Z left in the background) is not
+dead: a member held at that moment stays stopped until the observer
+runs again (`fg`). No heartbeat covers that case: a missed-heartbeat
+timeout would also fire on a live observer that is only slow on a busy
+host, and the watchdog would then resume a held member before its
+probes attach, without the first-use gap row. On an overlay
 filesystem a neighbor executable whose backing identity differs from
 the one `maps` prints costs one more short stop for its first mapper. The 32-file per-capture cap is shared with system file
 learning. Of the 256 loader contexts, 8 stay reserved for the direct

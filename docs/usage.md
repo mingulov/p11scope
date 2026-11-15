@@ -892,9 +892,11 @@ observer proves the file, attaches a provider's probes, and resumes
 the member (`SIGCONT`), so even a short-lived descendant that
 cold-loads the provider is observed from its first call. Each distinct
 file costs one short stop for its first mapper; a hold that cannot
-attach resumes the member at most 1 s after its stop (or in the pass
-that first reads it when the observer is busier than that) and files
-the learned-file gap row. A job-control shell inside the command can
+attach, and a stopped member the observer cannot pin or place in the
+run tree, resumes at most 1 s after its stop (or in the pass that
+first reads it when the observer is busier than that) and files the
+learned-file gap row. A member moved out of the run cgroup while
+stopped is resumed too. A job-control shell inside the command can
 see such a child briefly stopped (`CLD_STOPPED`). With `--pause never`
 (or when the kernel refuses the stop object) descendants are never
 stopped: a short-lived descendant that cold-loads the provider teaches
@@ -993,16 +995,24 @@ final frame and no `-o` file. The observed program still survives: the child
 arms `PR_SET_PDEATHSIG` to SIGCONT, so a child the pause holds stopped
 resumes when the observer dies, while a running child never notices. A
 descendant held at its first map is resumed by `run`'s watchdog: a small
-`p11scope` process in its own session, outside the run cgroup, started before
-any member can stop. When the observer dies without its cleanup the watchdog
-sends SIGCONT to every stopped member of the run cgroup tree (pinned by pidfd,
-rechecked as stopped and as a member), in sweeps up to 1.6 s after the death
-(measured: every member ran again 0.2-0.5 s after a SIGKILL under load), then
-exits. That sweep also resumes a member the user had stopped on purpose. If
-the watchdog itself is killed, the observer stops stopping and resumes every
-member at once. Killing the observer and the watchdog together (a whole-session
-or cgroup kill, the OOM killer taking both) is not covered; check the tree with
-`ps` after such a kill. Its own
+`p11scope` process in its own session, outside the run cgroup, started after
+the hook attaches and before it can stop anyone. When the observer dies without
+its cleanup the watchdog sends SIGCONT to every stopped member of the run
+cgroup tree except the direct child (pinned by pidfd, rechecked as stopped and
+as a member). Its sweeps start between 0 and 1.6 s after the death, so the
+last one starts by 1.6 s (measured: every member ran again 0.2-0.5 s after a
+SIGKILL under load); then it exits. A capture end that could not resume a
+member itself leaves it to the same sweep. That sweep also resumes a member the
+user had stopped on purpose; it does not see a member moved out of the run
+cgroup. If the watchdog itself is killed, the observer stops stopping and
+resumes every member at once. Killing the observer and the watchdog together
+(`pkill -9 p11scope`, a kill of a cgroup holding both, the OOM killer taking
+both) is not covered: the watchdog's own session keeps a terminal hangup or
+Ctrl-C away from it, but nothing resumes a member then; check the tree with
+`ps` after such a kill and send SIGCONT to a member left stopped. A suspended
+or hung observer is not dead: after Ctrl-Z (or a hang) the watchdog keeps
+waiting, and a member held at that moment stays stopped until the observer
+runs again (`fg`); the 1 s bound counts only while the observer runs. Its own
 session leaves its process group already orphaned, so the kernel sends no
 hangup when the observer dies. A capture error likewise hands a live child
 back running — exit 1 names the error and the surviving PID — instead of

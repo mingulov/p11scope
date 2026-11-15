@@ -41,8 +41,14 @@ pub(crate) const DONE: u8 = b'D';
 /// resumed (measured: every member ran again 0.2-0.5 s after a `SIGKILL`
 /// under load).
 pub(crate) const SWEEP_DELAYS_MS: [u64; 8] = [0, 20, 50, 100, 200, 400, 800, 1600];
-/// The one capability the watchdog keeps (`linux/capability.h`).
+/// The capability the watchdog keeps (`linux/capability.h`).
 const CAP_KILL: u32 = 5;
+/// Kept too when `/proc` hides other users' processes (`hidepid`):
+/// `/proc/<pid>` visibility then goes through the ptrace access check.
+const CAP_SYS_PTRACE: u32 = 19;
+/// The prefix of a line the watchdog prints before its ready line: a
+/// setup step that failed (the observer prints it under `-v`).
+const NOTE: &str = "p11scope-member-stop-watchdog-note: ";
 /// Bounded walk of the run cgroup tree: members may create subgroups.
 const MAX_GROUPS: usize = 256;
 const MAX_DEPTH: usize = 8;
@@ -147,10 +153,19 @@ impl Watchdog {
         let ready = stdout
             .ok_or_else(|| "watchdog stdout missing".to_string())
             .and_then(wait_ready);
-        if let Err(error) = ready {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
+        match ready {
+            Ok(notes) => {
+                if crate::run::capture_diagnostics_on() {
+                    for note in notes {
+                        eprintln!("p11scope: member-stop watchdog: {note}");
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
         }
         Ok(Self { child, alive })
     }
@@ -226,7 +241,7 @@ impl Watchdog {
 
 /// Reads the child's stdout until the ready line, within [`READY_TIMEOUT`]
 /// and a bounded byte count (the test harness prints its own lines first).
-fn wait_ready(stdout: std::process::ChildStdout) -> Result<(), String> {
+fn wait_ready(stdout: std::process::ChildStdout) -> Result<Vec<String>, String> {
     use std::os::fd::AsRawFd as _;
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     let mut stdout = stdout;
@@ -266,10 +281,51 @@ fn wait_ready(stdout: std::process::ChildStdout) -> Result<(), String> {
             .split(|byte| *byte == b'\n')
             .any(|line| line == READY.as_bytes())
         {
-            return Ok(());
+            return Ok(ready_notes(&seen));
         }
     }
     Err("the member-stop watchdog printed no ready line".into())
+}
+
+/// Whether a `mountinfo` listing mounts `/proc` with `hidepid` set (any
+/// value but `off`), as `ProtectProc=` does.
+fn proc_hides_pids(mountinfo: &str) -> bool {
+    mountinfo.lines().any(|line| {
+        let Some((mount, source)) = line.split_once(" - ") else {
+            return false;
+        };
+        let mut source = source.split(' ');
+        let (Some(fstype), Some(_), Some(options)) = (source.next(), source.next(), source.next())
+        else {
+            return false;
+        };
+        fstype == "proc"
+            && mount.split(' ').nth(4) == Some("/proc")
+            && options.split(',').any(|option| {
+                option
+                    .strip_prefix("hidepid=")
+                    .is_some_and(|value| value != "off" && value != "0")
+            })
+    })
+}
+
+/// The capability set the watchdog keeps.
+fn watchdog_keep_set(proc_hides_pids: bool) -> u64 {
+    let ptrace = if proc_hides_pids {
+        1u64 << CAP_SYS_PTRACE
+    } else {
+        0
+    };
+    (1u64 << CAP_KILL) | ptrace
+}
+
+/// The setup notes printed before the ready line.
+fn ready_notes(seen: &[u8]) -> Vec<String> {
+    seen.split(|byte| *byte == b'\n')
+        .take_while(|line| *line != READY.as_bytes())
+        .filter_map(|line| line.strip_prefix(NOTE.as_bytes()))
+        .map(|note| String::from_utf8_lossy(note).into_owned())
+        .collect()
 }
 
 /// The `p11scope` entry: `Some(exit code)` when the first argument is
@@ -301,13 +357,28 @@ pub(crate) fn entry(mut args: impl Iterator<Item = std::ffi::OsString>) -> Optio
 /// blocks on the pipe. `exempt_tgid` is never signalled.
 pub(crate) fn watchdog_main(tree: RunTree, exempt_tgid: u32) -> i32 {
     // It only reads `/proc` and the cgroup tree and sends SIGCONT: it
-    // keeps `CAP_KILL` alone (a `--user` member runs under another uid),
+    // keeps `CAP_KILL` (a `--user` member runs under another uid), plus
+    // `CAP_SYS_PTRACE` only when `/proc` hides other users' processes,
     // and never gains privilege again (a setcap observer re-executed
-    // here would otherwise hold its whole file grant for the run).
-    let _ = crate::caps::drop_to_keep(1u64 << CAP_KILL);
+    // here would otherwise hold its whole file grant for the run). A
+    // failed step leaves it working with more privilege: noted.
+    let mut notes = Vec::new();
+    let hides = std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|mountinfo| proc_hides_pids(&mountinfo))
+        .unwrap_or_else(|error| {
+            notes.push(format!("reading mountinfo: {error}"));
+            // Doubt keeps the access a hidden /proc would need.
+            true
+        });
+    if let Err(error) = crate::caps::drop_to_keep(watchdog_keep_set(hides)) {
+        notes.push(format!("dropping capabilities: {error}"));
+    }
     // SAFETY: `PR_SET_NO_NEW_PRIVS` takes integer arguments only.
-    unsafe {
-        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        notes.push(format!(
+            "setting no_new_privs: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     for signal in [
         libc::SIGINT,
@@ -326,9 +397,13 @@ pub(crate) fn watchdog_main(tree: RunTree, exempt_tgid: u32) -> i32 {
     }
     {
         let mut stdout = std::io::stdout().lock();
-        // On a line of its own (the test harness prints a partial line
-        // before it).
-        if writeln!(stdout, "\n{READY}")
+        // On lines of their own (the test harness prints a partial line
+        // before them).
+        let mut lines = String::from("\n");
+        for note in &notes {
+            lines.push_str(&format!("{NOTE}{note}\n"));
+        }
+        if writeln!(stdout, "{lines}{READY}")
             .and_then(|()| stdout.flush())
             .is_err()
         {
@@ -472,6 +547,51 @@ mod tests {
             },
             exempt.parse().expect("exempt tgid"),
         ));
+    }
+
+    /// `hidepid` (any value but `off`, as `ProtectProc=` mounts it) on
+    /// the `/proc` mount hides other users' processes from a watchdog
+    /// without the ptrace capability.
+    #[test]
+    fn hidepid_proc_mounts_are_detected() {
+        let line = |point: &str, options: &str| {
+            format!("30 22 0:5 / {point} rw,nosuid shared:5 - proc proc {options}\n")
+        };
+        assert!(!proc_hides_pids(&line("/proc", "rw")));
+        assert!(!proc_hides_pids(&line("/proc", "rw,hidepid=off")));
+        assert!(!proc_hides_pids(&line("/proc", "rw,subset=pid")));
+        assert!(proc_hides_pids(&line("/proc", "rw,hidepid=invisible")));
+        assert!(proc_hides_pids(&line("/proc", "rw,hidepid=noaccess,gid=4")));
+        assert!(proc_hides_pids(&line("/proc", "rw,hidepid=ptraceable")));
+        assert!(proc_hides_pids(&line("/proc", "rw,hidepid=2")));
+        assert!(
+            !proc_hides_pids(&line("/run/other", "rw,hidepid=invisible")),
+            "only the /proc mount"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_keeps_ptrace_only_under_hidepid() {
+        assert_eq!(watchdog_keep_set(false), 1u64 << CAP_KILL);
+        assert_eq!(
+            watchdog_keep_set(true),
+            (1u64 << CAP_KILL) | (1u64 << CAP_SYS_PTRACE)
+        );
+    }
+
+    #[test]
+    fn ready_notes_are_collected_before_the_ready_line() {
+        let seen = format!(
+            "harness noise\n{NOTE}dropping capabilities: EPERM\n{NOTE}no_new_privs: EINVAL\n\n{READY}\n"
+        );
+        assert_eq!(
+            ready_notes(seen.as_bytes()),
+            vec![
+                "dropping capabilities: EPERM".to_string(),
+                "no_new_privs: EINVAL".to_string()
+            ]
+        );
+        assert!(ready_notes(format!("\n{READY}\n").as_bytes()).is_empty());
     }
 
     #[test]

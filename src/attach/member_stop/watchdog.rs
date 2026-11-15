@@ -12,10 +12,14 @@
 //!
 //! Every member is pinned by pidfd before it is read, and is signalled
 //! through that pidfd only while `/proc` still shows it stopped and in
-//! the run cgroup tree, so a recycled PID is never signalled. A member
-//! the user stopped on purpose (job control) also resumes, but only on
-//! that abnormal path. The watchdog reads only `cgroup.procs`, each
-//! member's `stat` state and its `cgroup` line; nothing is reported.
+//! the run cgroup tree, so a recycled PID is never signalled. The owned
+//! direct child is never signalled: the hook exempts it, the pause chain
+//! holds it, and its own `PR_SET_PDEATHSIG` resumes it after an observer
+//! death. A member the user stopped on purpose (job control) also
+//! resumes, but only on that abnormal path. The watchdog reads only
+//! `cgroup.procs`, each member's `stat` state and its `cgroup` line;
+//! nothing is reported. A handle the observer drops without an explicit
+//! end (an error return) ends it in order, like [`Watchdog::finish`].
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -46,8 +50,8 @@ const MAX_PROCS_BYTES: u64 = 4 * 1024 * 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an orderly end waits for the watchdog to exit.
 const EXIT_WAIT: Duration = Duration::from_secs(1);
-/// The test harness entry's environment variable (cgroup root, newline,
-/// run cgroup path).
+/// The test harness entry's environment variable (cgroup root, run
+/// cgroup path and exempt tgid, one per line).
 #[cfg(test)]
 pub(crate) const TEST_ENTRY_ENV: &str = "P11SCOPE_MEMBER_STOP_WATCHDOG_TEST";
 #[cfg(test)]
@@ -69,10 +73,28 @@ pub(crate) struct Watchdog {
     alive: Option<std::process::ChildStdin>,
 }
 
+impl Drop for Watchdog {
+    /// A handle neither finished nor abandoned (an error return while the
+    /// hooks start, an unwind) is an orderly end: the observer is alive,
+    /// so the watchdog must not sweep, and it is reaped.
+    fn drop(&mut self) {
+        if let Some(mut alive) = self.alive.take() {
+            let _ = alive.write_all(&[DONE]);
+            drop(alive);
+            self.reap_or_kill();
+        }
+    }
+}
+
 impl Watchdog {
     /// Starts the watchdog in its own session (a process-group kill of
     /// the observer does not reach it) and waits for its ready line.
-    pub(crate) fn start(launcher: &WatchdogLauncher, tree: &RunTree) -> Result<Self, String> {
+    /// `exempt_tgid` (the owned direct child) is never swept.
+    pub(crate) fn start(
+        launcher: &WatchdogLauncher,
+        tree: &RunTree,
+        exempt_tgid: u32,
+    ) -> Result<Self, String> {
         use std::os::unix::process::CommandExt as _;
         let mut command = match launcher {
             WatchdogLauncher::SelfExe => {
@@ -80,7 +102,8 @@ impl Watchdog {
                 command
                     .arg(WATCHDOG_ARG)
                     .arg(&tree.cgroup_root)
-                    .arg(&tree.run_cgroup);
+                    .arg(&tree.run_cgroup)
+                    .arg(exempt_tgid.to_string());
                 command
             }
             #[cfg(test)]
@@ -93,7 +116,7 @@ impl Watchdog {
                     .env(
                         TEST_ENTRY_ENV,
                         format!(
-                            "{}\n{}",
+                            "{}\n{}\n{exempt_tgid}",
                             tree.cgroup_root.display(),
                             tree.run_cgroup.display()
                         ),
@@ -130,6 +153,12 @@ impl Watchdog {
         Ok(Self { child, alive })
     }
 
+    /// The watchdog's process id.
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Whether the watchdog has exited (its guard is gone).
     pub(crate) fn lost(&mut self) -> bool {
         !matches!(self.child.try_wait(), Ok(None))
@@ -141,7 +170,7 @@ impl Watchdog {
         if let Some(mut alive) = self.alive.take() {
             let _ = alive.write_all(&[DONE]);
         }
-        self.reap();
+        self.reap_or_kill();
     }
 
     /// Closes the pipe without [`DONE`]: the watchdog sweeps as it would
@@ -157,17 +186,31 @@ impl Watchdog {
         self.alive = None;
         // Reaped in the background so no zombie outlives the test.
         std::thread::spawn(move || {
-            let _ = self.child.wait();
+            let mut this = self;
+            let _ = this.child.wait();
         });
     }
 
-    fn reap(&mut self) {
+    /// Waits (bounded) for the watchdog to exit and reaps it. True when
+    /// it was reaped.
+    fn reap(&mut self) -> bool {
         let end = std::time::Instant::now() + EXIT_WAIT;
         while std::time::Instant::now() < end {
             if !matches!(self.child.try_wait(), Ok(None)) {
-                return;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// After an orderly end: the watchdog has nothing left to do, so one
+    /// that does not exit in time is killed, and always reaped (no zombie
+    /// outlives the handle).
+    fn reap_or_kill(&mut self) {
+        if !self.reap() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
@@ -227,19 +270,27 @@ pub(crate) fn entry(mut args: impl Iterator<Item = std::ffi::OsString>) -> Optio
     if args.next().as_deref() != Some(std::ffi::OsStr::new(WATCHDOG_ARG)) {
         return None;
     }
-    let (Some(root), Some(run), None) = (args.next(), args.next(), args.next()) else {
+    let (Some(root), Some(run), Some(exempt), None) =
+        (args.next(), args.next(), args.next(), args.next())
+    else {
         return Some(2);
     };
-    Some(watchdog_main(RunTree {
-        cgroup_root: PathBuf::from(root),
-        run_cgroup: PathBuf::from(run),
-    }))
+    let Some(exempt) = exempt.to_str().and_then(|text| text.parse::<u32>().ok()) else {
+        return Some(2);
+    };
+    Some(watchdog_main(
+        RunTree {
+            cgroup_root: PathBuf::from(root),
+            run_cgroup: PathBuf::from(run),
+        },
+        exempt,
+    ))
 }
 
 /// The watchdog process: ignores the terminal and termination signals
 /// (it must outlive the observer's own end), prints its ready line, then
-/// blocks on the pipe.
-pub(crate) fn watchdog_main(tree: RunTree) -> i32 {
+/// blocks on the pipe. `exempt_tgid` is never signalled.
+pub(crate) fn watchdog_main(tree: RunTree, exempt_tgid: u32) -> i32 {
     for signal in [
         libc::SIGINT,
         libc::SIGTERM,
@@ -284,7 +335,7 @@ pub(crate) fn watchdog_main(tree: RunTree) -> i32 {
         if at > now {
             std::thread::sleep(at - now);
         }
-        resume_stopped_members(&tree);
+        resume_stopped_members(&tree, exempt_tgid);
     }
     0
 }
@@ -304,11 +355,14 @@ fn wait_for_end() -> bool {
     }
 }
 
-/// One sweep: every stopped member of the run cgroup tree resumes.
-/// Returns how many were signalled.
-pub(crate) fn resume_stopped_members(tree: &RunTree) -> usize {
+/// One sweep: every stopped member of the run cgroup tree resumes,
+/// except `exempt_tgid`. Returns how many were signalled.
+pub(crate) fn resume_stopped_members(tree: &RunTree, exempt_tgid: u32) -> usize {
     let mut resumed = 0;
     for pid in run_tree_pids(&tree.run_cgroup) {
+        if pid == exempt_tgid {
+            continue;
+        }
         if resume_if_stopped_member(pid, tree) {
             resumed += 1;
         }
@@ -393,11 +447,18 @@ mod tests {
         let Ok(spec) = std::env::var(TEST_ENTRY_ENV) else {
             return;
         };
-        let (root, run) = spec.split_once('\n').expect("root and run cgroup");
-        std::process::exit(watchdog_main(RunTree {
-            cgroup_root: PathBuf::from(root),
-            run_cgroup: PathBuf::from(run),
-        }));
+        let mut lines = spec.lines();
+        let (Some(root), Some(run), Some(exempt)) = (lines.next(), lines.next(), lines.next())
+        else {
+            panic!("root, run cgroup and exempt tgid: {spec:?}");
+        };
+        std::process::exit(watchdog_main(
+            RunTree {
+                cgroup_root: PathBuf::from(root),
+                run_cgroup: PathBuf::from(run),
+            },
+            exempt.parse().expect("exempt tgid"),
+        ));
     }
 
     #[test]
@@ -415,6 +476,109 @@ mod tests {
             entry(args(&["p11scope", WATCHDOG_ARG, "/a", "/b", "c"])),
             Some(2)
         );
+        assert_eq!(
+            entry(args(&["p11scope", WATCHDOG_ARG, "/a", "/b"])),
+            Some(2)
+        );
+        assert_eq!(
+            entry(args(&["p11scope", WATCHDOG_ARG, "/a", "/b", "7", "8"])),
+            Some(2)
+        );
+    }
+
+    /// A run tree that lists only `pids`: a scratch directory stands in
+    /// for the cgroup root, with this test process's own cgroup path
+    /// below it (so `/proc/<pid>/cgroup` of a child places it inside) and
+    /// a `cgroup.procs` naming only the given children. The sweep then
+    /// sees nothing else of the test executable's cgroup.
+    fn listed_tree(pids: &[u32]) -> (tempfile::TempDir, RunTree) {
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let relative = crate::scope::parse_cgroup_v2_relative(&own)
+            .expect("a cgroup v2 line for the test process")
+            .to_string();
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join(relative);
+        std::fs::create_dir_all(&run).unwrap();
+        let list: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+        std::fs::write(run.join("cgroup.procs"), list).unwrap();
+        let tree = RunTree {
+            cgroup_root: root.path().to_path_buf(),
+            run_cgroup: run,
+        };
+        (root, tree)
+    }
+
+    fn stopped_sleep() -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        // SAFETY: signals our own child.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGSTOP);
+        }
+        while !process_stopped(child.id()) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        child
+    }
+
+    fn resumes_within(pid: u32, wait: Duration) -> bool {
+        let end = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < end {
+            if !process_stopped(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    }
+
+    /// A handle dropped without `finish` or `abandon` (an early error
+    /// return while the hooks start) is an orderly end, not an observer
+    /// death: nothing is swept, and the watchdog is reaped.
+    #[test]
+    fn a_dropped_watchdog_ends_in_order_and_is_reaped() {
+        let mut member = stopped_sleep();
+        let (_root, tree) = listed_tree(&[member.id()]);
+        let watchdog = Watchdog::start(&WatchdogLauncher::TestHarness, &tree, 0).unwrap();
+        let watchdog_pid = watchdog.pid();
+        drop(watchdog);
+        assert!(
+            !resumes_within(member.id(), Duration::from_millis(200)),
+            "no sweep resumed the member"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{watchdog_pid}")).exists(),
+            "the watchdog exited and was reaped"
+        );
+        let _ = member.kill();
+        let _ = member.wait();
+    }
+
+    /// After an observer death the sweep resumes stopped members but
+    /// never the exempt direct child (held by the pause chain, resumed by
+    /// its own death signal).
+    #[test]
+    fn the_sweep_never_signals_the_exempt_direct_child() {
+        let mut direct = stopped_sleep();
+        let mut member = stopped_sleep();
+        let (_root, tree) = listed_tree(&[direct.id(), member.id()]);
+        let watchdog = Watchdog::start(&WatchdogLauncher::TestHarness, &tree, direct.id()).unwrap();
+        watchdog.abandon();
+        assert!(
+            resumes_within(member.id(), Duration::from_secs(2)),
+            "the member resumes"
+        );
+        assert!(
+            !resumes_within(direct.id(), Duration::from_millis(100)),
+            "the direct child stays held"
+        );
+        for child in [&mut direct, &mut member] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     #[test]

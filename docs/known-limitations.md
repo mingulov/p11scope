@@ -249,7 +249,11 @@ pass `--prearm-module PATH`) when first-run coverage matters.
 `run` learns the same way from its own tree, without fanotify: the
 observer watches its owned descendants, proves a mapped provider
 file from a live scan, and attaches it by file identity for every
-later mapper. With the pause chain armed (the default) a run member
+later mapper. Its `first_loaded_by.exe` is the same `/proc/<pid>/exe`
+link, read for the proving member through its retained pidfd (the
+scan view's, or a stopped member's own while it is stopped) at scan
+time and bracketed the same way; staging never re-resolves a bare
+pid. With the pause chain armed (the default) a run member
 is also stopped the first time it maps an executable file the
 capture has not seen yet: the observer proves the file, attaches a
 provider's probes, and resumes the member before it runs any of that

@@ -81,6 +81,12 @@ impl EndedPidRetirement {
                 .eq(self.pairs.keys().copied())
     }
 
+    /// The slots this proof names, as they were linked when the original
+    /// owner ended.
+    pub(crate) fn slots(&self) -> Vec<Slot> {
+        self.pairs.values().map(|pair| pair.slot.clone()).collect()
+    }
+
     pub(super) fn prepare(
         domain: &DiscoveryDomain,
         scope: UProbeScope,

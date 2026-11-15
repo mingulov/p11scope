@@ -1,0 +1,4 @@
+{
+    global: getter_app_main;
+    local: *;
+};

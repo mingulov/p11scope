@@ -1073,6 +1073,11 @@ pub struct Engine {
     /// is named (`GETTER_NO_RETURN`): calls through a table it fetched
     /// before the capture were not seen.
     getter_unreturned: BTreeSet<ProcessViewId>,
+    /// Views whose loader record scan mapped new objects while a getter
+    /// manifest is accepted: the next tick runs their getter pass without
+    /// a rescan (a refresh would retire the loader context the record
+    /// belongs to, with its deferred scans).
+    getter_pass_owed: BTreeSet<ProcessViewId>,
     /// The deduplicated bound-context set behind `loader_discovery`'s
     /// strategy/timing/capture counts (design §9.2). Keyed by the exact
     /// internal `{process generation, bound identity state, load kind}` — so
@@ -7396,6 +7401,33 @@ pub(crate) fn count_trusted_reservation_rows(
     total
 }
 
+/// The file identities (`st_dev`, `st_ino`) of every manifest's program
+/// object (`module_path`) whose manifest hooks table getters. The scan
+/// reads these objects for file-backed function tables, the same search
+/// `--module <program>` runs, without narrowing the scan: a process that
+/// fetched its table before the capture began is counted through the
+/// scanned table, and the getter hooks still cover runtime tables.
+/// Unreadable manifests and paths contribute nothing here; the pin path
+/// reports them through its own errors.
+pub(crate) fn getter_manifest_objects(manifests: &[PathBuf]) -> Vec<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut objects = Vec::new();
+    for path in manifests {
+        let Ok(manifest) = read_manifest_file(path) else {
+            continue;
+        };
+        if manifest.getters.is_empty() {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&manifest.module_path) {
+            objects.push((meta.dev(), meta.ino()));
+        }
+    }
+    objects.sort_unstable();
+    objects.dedup();
+    objects
+}
+
 /// One newcomer queue age in whole milliseconds: first-observed-ready minus
 /// first-seen. Either endpoint missing (a failed clock read, a dropped
 /// mark) samples unknown — never an invented zero.
@@ -9017,6 +9049,9 @@ fn discover_plan(
     discovered
         .budget
         .set_forwarding(a.forwarding_modules.clone());
+    discovered
+        .budget
+        .set_getter_objects(getter_manifest_objects(&a.manifests));
     // P-C phase 2 (§6.2): start the pre-arm witness BEFORE the scope-start
     // stamp, so its hooks precede every observation. No pre-arm modules
     // or an unavailable startup leaves no witness: today's output.
@@ -13637,6 +13672,7 @@ impl Engine {
             getter_loader_views: BTreeSet::new(),
             startup_views: BTreeSet::new(),
             getter_unreturned: BTreeSet::new(),
+            getter_pass_owed: BTreeSet::new(),
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
@@ -15655,6 +15691,7 @@ impl Engine {
         self.getter_loader_views.remove(&id);
         self.note_getter_unreturned(id);
         self.startup_views.remove(&id);
+        self.getter_pass_owed.remove(&id);
         // Its selection bindings fail closed now, as a retirement's do: a
         // C_GetInterface selection on the released view is never reported
         // as silently covered by a hook that is about to be detached.
@@ -18539,6 +18576,9 @@ impl Engine {
                 [Some(selected.len() as u64), None, None, None],
             )
         });
+        // Plan slots the ended original's whole-proof retirement detaches
+        // although the candidate keeps them; deactivated once it succeeds.
+        let mut ended_kept: Vec<u32> = Vec::new();
         let detach_slots_outcome = match ended.filter(|_| {
             candidate.delta.new.is_empty()
                 && candidate.delta.replace.is_empty()
@@ -18550,12 +18590,25 @@ impl Engine {
             // retires a subset; mint the same proof for exactly that subset
             // from the retained owner, so its exit does not open a phantom
             // physical gap. Session revalidates the original group's end.
+            // A kept slot that shares an attach group with retired ones (a
+            // getter slot a scanned table of the same object also holds)
+            // cannot detach alone without a group rebuild, and the ended
+            // original can run none of them: the whole proof retires, and
+            // the kept slots are deactivated with it.
             Some(ended) if !ended.proof.covers_exactly(&selected) => {
                 match session.prepare_ended_pid_retirement(&ended.owner, &selected) {
                     Some(narrowed) => {
                         session.detach_ended_pid_slots(&selected, &ended.owner, &narrowed)
                     }
-                    None => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),
+                    None => {
+                        let linked = ended.proof.slots();
+                        ended_kept = linked
+                            .iter()
+                            .map(|slot| slot.index)
+                            .filter(|index| !selected.iter().any(|slot| slot.index == *index))
+                            .collect();
+                        session.detach_ended_pid_slots(&linked, &ended.owner, &ended.proof)
+                    }
                 }
             }
             Some(ended) => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),
@@ -18662,6 +18715,9 @@ impl Engine {
         }
         let detach_failed = match detach_slots_outcome {
             Ok(report) => {
+                for index in ended_kept {
+                    candidate.plan.deactivate(index);
+                }
                 self.apply_group_rebuild(&mut candidate.plan, &timing_owners, report, &mut outcome);
                 false
             }
@@ -21302,12 +21358,12 @@ impl Engine {
             self.views[position].view_admission(),
             &found,
         );
-        // A loader hit can map a manifest getter's object: the getter pass
-        // runs on refreshed views only, so request one (the catch-up scan
-        // after an arm is followed by that tick's own export pass).
+        // A loader hit can map a manifest getter's object: owe the view a
+        // getter pass on the next tick (the catch-up scan after an arm is
+        // followed by that tick's own export pass). No rescan is requested:
+        // it would retire this loader context with its deferred scans.
         if record_path && self.getter_manifest_active() {
-            let pid = self.views[position].pid();
-            self.request_refresh(pid, crate::attach::monotonic_ns());
+            self.getter_pass_owed.insert(self.views[position].id());
         }
         if mode == LoaderScanMode::MetadataOnly {
             for module in &mut found {
@@ -25090,6 +25146,38 @@ impl Engine {
         }
     }
 
+    /// Runs the getter pass a loader record scan owed each retained view
+    /// (see `getter_pass_owed`), in view order. A spent frame keeps the
+    /// rest owed for the next tick.
+    fn run_owed_getter_passes(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        closure: &mut PauseClosure,
+        export_incomplete: &mut BTreeSet<ProcessViewId>,
+    ) {
+        let owed = std::mem::take(&mut self.getter_pass_owed);
+        for view in owed {
+            if !self.views.iter().any(|candidate| candidate.id() == view) {
+                continue;
+            }
+            if self.frame_work_exhausted() {
+                self.note_frame_deferral();
+                self.getter_pass_owed.insert(view);
+                continue;
+            }
+            let outcome = self.attach_manifest_getters(view, session, additions_allowed);
+            self.note_export_attach_outcome(
+                view,
+                outcome,
+                pending_views,
+                closure,
+                export_incomplete,
+            );
+        }
+    }
+
     /// Attaches every initial view's dynamic exports; returns whether any
     /// hook newly attached (publication detection, not counting coverage).
     fn attach_initial_exports(
@@ -26751,9 +26839,34 @@ impl Engine {
     /// while it was watched: a table it fetched before the capture is
     /// called without any record the observer could read.
     fn note_getter_unreturned(&mut self, view: ProcessViewId) {
-        if self.getter_unreturned.remove(&view) {
+        if self.getter_unreturned.remove(&view) && !self.view_scan_holds_getter_table(view) {
             self.mark_partial("live manifest getter hook", GETTER_NO_RETURN);
         }
+    }
+
+    /// Whether the memory scan found a file-backed function table in one
+    /// of `view`'s getter manifest program objects: calls through a table
+    /// the process fetched before the capture then reach the scanned
+    /// table's hooks, so an unreturned getter loses nothing.
+    fn view_scan_holds_getter_table(&self, view: ProcessViewId) -> bool {
+        let mut objects = BTreeSet::new();
+        for manifest in &self.manifests {
+            for getter in &manifest.getters {
+                let Resolution::Resolved { object, .. } = &getter.resolution else {
+                    continue;
+                };
+                if let Some(id) = capture_manifest_object_key(manifest, *object)
+                    .and_then(|(key, path)| self.pinned.id_for_manifest(key, path))
+                {
+                    objects.insert(id);
+                }
+            }
+        }
+        self.modules.iter().any(|module| {
+            module.scanned.view == view
+                && objects.contains(&module.object)
+                && module.scanned.tables.iter().any(|table| !table.live_return)
+        })
     }
 
     /// A getter (or export) return for `pid`: its startup views fetched a
@@ -33065,6 +33178,7 @@ impl Engine {
                         continue;
                     }
                     let outcome = self.attach_refreshed_exports(view, session, additions_allowed);
+                    self.getter_pass_owed.remove(&view);
                     self.note_export_attach_outcome(
                         view,
                         outcome,
@@ -33073,6 +33187,13 @@ impl Engine {
                         &mut export_incomplete,
                     );
                 }
+                self.run_owed_getter_passes(
+                    session,
+                    additions_allowed,
+                    pending_views,
+                    closure,
+                    &mut export_incomplete,
+                );
                 None
             }
             Err(error) => Some(error),

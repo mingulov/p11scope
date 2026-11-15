@@ -33860,11 +33860,46 @@ fn a_gated_dynamic_getter_view_attaches_under_its_armed_loader() {
     );
 }
 
-/// A loader hit can map a manifest getter's object into a tracked
-/// process; the record-path scan requests a refresh so the getter pass
-/// runs (twin: without a getter manifest it does not).
+/// The unreturned-getter cause is named only when the memory scan found
+/// no file-backed table in the getter's program object: a scanned static
+/// table already counts calls through a table fetched before the capture
+/// (twin: the same view without its scanned table is named).
 #[test]
-fn a_loader_record_scan_requests_a_getter_pass_when_getters_are_accepted() {
+fn an_unreturned_getter_with_a_scanned_table_names_nothing() {
+    for scanned in [true, false] {
+        let fixture = ScanManifestFixture::new();
+        let (view, modules, pins, mut input) = same_object_scan_and_manifest(&fixture, 0x40);
+        input.manifest = with_getters(input.manifest, &[("C_GetFunctionList", 0, 0x80)]);
+        let id = view.id();
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        assert!(
+            engine.modules.iter().any(|module| module
+                .scanned
+                .tables
+                .iter()
+                .any(|table| !table.live_return))
+        );
+        if !scanned {
+            for module in &mut engine.modules {
+                module.scanned.tables.clear();
+            }
+        }
+        engine.getter_unreturned.insert(id);
+        engine.settle_frame_deferrals_at_capture_end();
+        let named = engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason == GETTER_NO_RETURN);
+        assert_eq!(named, !scanned, "scanned table present: {scanned}");
+    }
+}
+
+/// A loader hit can map a manifest getter's object into a tracked
+/// process; the record-path scan owes the view a getter pass on the next
+/// tick without a rescan (twin: without a getter manifest it does not).
+#[test]
+fn a_loader_record_scan_owes_a_getter_pass_when_getters_are_accepted() {
     for getters in [false, true] {
         let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
         record.announced_count = 0;
@@ -33872,13 +33907,25 @@ fn a_loader_record_scan_requests_a_getter_pass_when_getters_are_accepted() {
             accept_a_manifest_getter(&mut engine);
         }
         let pid = engine.views[0].pid();
+        let view = engine.views[0].id();
         engine.refresh_requested.clear();
         apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
         assert_eq!(engine.loader_records_accepted, 1);
         assert_eq!(
-            engine.refresh_requested.contains_key(&pid),
+            engine.getter_pass_owed.contains(&view),
             getters,
             "getters={getters}"
+        );
+        // No rescan: it would retire the loader context with its deferred
+        // scans (seen live as a named loader memory discovery loss).
+        assert!(
+            !engine.refresh_requested.contains_key(&pid),
+            "getters={getters}"
+        );
+        engine.release_view_id(view);
+        assert!(
+            engine.getter_pass_owed.is_empty(),
+            "release clears the debt"
         );
     }
 }

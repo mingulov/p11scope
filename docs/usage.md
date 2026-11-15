@@ -690,20 +690,24 @@ is counted once whichever table it went through.
 
 What you get: a call count for every table function, shown under its
 standard-layout name and marked not proven, exact once the table's probes
-are attached. The table is attached only after its getter
-returns it, so calls the program makes through it in that moment can be
-missed; every capture with a manifest that names getters (a getter-only
-one, or one that also walks a surface) therefore names that window
-(`calls made while probes were being attached may be missing`,
-`unprotected_live_windows`) and reads `PARTIAL`. A program that fetches
-its table once at start-up and calls it right away loses those first
-calls. A process that fetched its table before the capture started makes
-no getter call to read, so none of its table calls are counted; when such
-a process never calls a hooked getter while watched, the report names it
-at its exit or at capture end (`a process running before the capture
-never called its hooked manifest getter`). Start the capture first
-(`run` starts the program itself), or use `--module <program>` when its
-tables are complete in its file data. The names come from the standard
+are attached. The observer also memory-scans the manifest's program
+object (`module_path`) for file-backed function tables, the same search
+`--module <program>` runs, without narrowing the scan: a table found
+there is attached at start, so a process that fetched it before the
+capture is still counted. A table found only through its getter is
+attached after the getter returns it, so calls the program makes through
+it in that moment can be missed; every capture with a manifest that
+names getters (a getter-only one, or one that also walks a surface)
+therefore names that window (`calls made while probes were being
+attached may be missing`, `unprotected_live_windows`) and reads
+`PARTIAL`. When the scan finds no table in the program (one built at run
+time) and a process that started before the capture never calls a hooked
+getter while watched, its table calls are not counted and the report
+names it at its exit or at capture end (`a process running before the
+capture never called its hooked manifest getter`); start the capture
+first (`run` starts the program itself). A provider object a process
+loads later (for example with `dlopen`) is scanned at its loader hit and
+its getters attach on the next tick. The names come from the standard
 table layout, which a getter-only manifest does not prove, so attribution
 is withheld (`semantic_unverified_slots`) and nothing is decoded: no
 mechanisms, no arguments. `inventory --manifest` refuses a manifest that

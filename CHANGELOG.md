@@ -22,7 +22,10 @@ versioned separately and are opaque, exact dispatch keys.
   writes such a manifest from the program's own symbol table. Manifest
   trust checks are unchanged. Such captures name the window before the
   table attaches (`unprotected_live_windows`) and withhold attribution
-  (layout not proved); see known limitations.
+  (layout not proved); see known limitations. The manifest's program
+  object is also memory-scanned for file-backed tables (the `--module`
+  search, without narrowing), so a process that fetched its table
+  before the capture is counted too.
 
 ### Fixed
 
@@ -71,15 +74,13 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Known limitations
 
-- Getter-only manifests: a table attaches only after its getter
-  returned it, so the report always names that window and stays
-  `PARTIAL`; names are not layout-proved (no mechanism decoding); a
-  process that fetched its table before the capture started is not
-  counted, and is named when it never calls a hooked getter;
-  `--module` together with a getter-only manifest for the same program
-  names a false static probe gap at exit (no call is lost; the exit
-  retirement becomes a slot replacement, planned with gapless
-  replacement).
+- Getter-only manifests: a table found only through its getter
+  attaches after the getter returned it, so the report always names
+  that window and stays `PARTIAL`; names are not layout-proved (no
+  mechanism decoding); a process that fetched a run-time-built table
+  before the capture started is not counted, and is named when it never
+  calls a hooked getter; under `--system`/`--cgroup` the program's exit
+  reattaches its getter probes and names that short window.
 - On a busy host, a long `inventory --system --key-operations`
   capture can stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Since

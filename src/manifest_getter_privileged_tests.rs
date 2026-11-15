@@ -15,12 +15,17 @@
 //! provider and still exports nothing) runs under `--cgroup`: the scope
 //! leaves a provider-free process unarmed, so the getter waits for its
 //! loader to arm on the next scan and attaches under it. One cell takes
-//! the helper's default output (all three getters).
+//! the helper's default output (all three getters). One cell lets the
+//! program fetch its tables before the capture: the memory scan of the
+//! manifest's program object must find them and count every call. One
+//! cell builds the provider as a shared object exporting no PKCS#11
+//! symbol, which a `p11scope run` child dlopens after the capture began.
 //!
-//! Sync without sleeps: the program prints the addresses its tables
-//! hand out, and the cell waits until each of them reads back as a
-//! breakpoint byte through `/proc/<pid>/mem` (the kernel's uprobe) before
-//! it releases the calls. Root BPF lane, run serially through
+//! Sync: the program prints the addresses its tables hand out, and the
+//! cell waits until each of them reads back as a breakpoint byte through
+//! `/proc/<pid>/mem` (the kernel's uprobe) before it releases the calls.
+//! The one sleep keeps the program alive after its calls so the
+//! observer drains the getter's return before the exit (see `settle`). Root BPF lane, run serially through
 //! `scripts/run-privileged-lib-tests.sh`; spawns the real observer
 //! (`P11SCOPE_E2E_OBSERVER`, else the `p11scope` sibling of the test
 //! binary). Prints GETTER_CELL lines.
@@ -311,6 +316,102 @@ fn wait_for_breakpoints(
     }
 }
 
+/// Keeps the program alive briefly after its calls: the observer drains
+/// a getter's return record on its next tick, and one drained after the
+/// process exited cannot be attributed to it (a named interface-selection
+/// loss for a program that exits right after its getter). The cells
+/// test the getter path, not that exit race.
+fn settle() {
+    std::thread::sleep(Duration::from_secs(2));
+}
+
+/// The manifest's getter file offsets.
+fn manifest_getter_offsets(manifest: &Path) -> Result<Vec<u64>> {
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+    written["getters"]
+        .as_array()
+        .context("manifest getters")?
+        .iter()
+        .map(|getter| {
+            getter["resolution"]["file_offset"]
+                .as_u64()
+                .context("getter file offset")
+        })
+        .collect()
+}
+
+/// Waits until the observer holds the getter hooks themselves, an entry
+/// and a return probe link for every getter offset in `object` (fdinfo
+/// names each link's path and its probes' cookies and offsets). The
+/// getter's entry breakpoint and the table slot links that also cover
+/// its address carry slot cookies (slot index in the high half); a
+/// getter hook carries a small capture-local cookie. A breakpoint byte
+/// alone does not prove the return is watched. A kernel whose fdinfo
+/// lists no probe offsets leaves the breakpoint wait as the only sync.
+fn wait_for_getter_hooks(
+    observer: &mut Child,
+    object: &Path,
+    offsets: &[u64],
+    log: &Path,
+) -> Result<()> {
+    let deadline = Instant::now() + STEP;
+    let path_line = format!("path:\t{}", object.display());
+    loop {
+        let mut listed = false;
+        let mut hooked = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fdinfo", observer.id()))? {
+            let Ok(text) = std::fs::read_to_string(entry?.path()) else {
+                continue;
+            };
+            let kind = if text.contains("link_type:\turetprobe_multi") {
+                true
+            } else if text.contains("link_type:\tuprobe_multi") {
+                false
+            } else {
+                continue;
+            };
+            listed |= text.contains("uprobe_cnt:");
+            if !text.lines().any(|line| line == path_line) {
+                continue;
+            }
+            for line in text.lines() {
+                let mut fields = line.split_whitespace();
+                let (Some(cookie), Some(offset)) = (fields.next(), fields.next()) else {
+                    continue;
+                };
+                let (Ok(cookie), Some(Ok(offset))) = (
+                    cookie.parse::<u64>(),
+                    offset
+                        .strip_prefix("0x")
+                        .map(|hex| u64::from_str_radix(hex, 16)),
+                ) else {
+                    continue;
+                };
+                if cookie < 1 << 32 && offsets.contains(&offset) {
+                    hooked.insert((kind, offset));
+                }
+            }
+        }
+        if !listed || hooked.len() == offsets.len() * 2 {
+            return Ok(());
+        }
+        if let Some(status) = observer.try_wait()? {
+            bail!(
+                "the observer exited {status} before the getter hooks attached: {}",
+                tail(log)
+            );
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "only {}/{} getter hook probes attached: {}",
+            hooked.len(),
+            offsets.len() * 2,
+            tail(log)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn parse_fields(line: &str) -> BTreeMap<String, String> {
     line.split_whitespace()
         .filter_map(|field| field.split_once('='))
@@ -323,6 +424,26 @@ fn parse_fields(line: &str) -> BTreeMap<String, String> {
 /// releasing the calls, so the counts must be exact; otherwise the calls
 /// race the table attach and the cell checks that the window is named.
 fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellScope) -> Result<()> {
+    run_cell_with(tag, getters, mode, gated, scope, false, &[], &[])
+}
+
+/// `prefetch`: the program calls its getters and fetches its tables
+/// before the capture starts, so no getter returns while it runs; the
+/// memory scan of the manifest's program object must find the tables
+/// and count every table call exactly, with no unreturned-getter cause.
+/// `extra_causes`/`extra_skips` name what the cell's shape honestly
+/// adds to the attach window.
+#[allow(clippy::too_many_arguments)]
+fn run_cell_with(
+    tag: &str,
+    getters: &[&str],
+    mode: &str,
+    gated: bool,
+    scope: CellScope,
+    prefetch: bool,
+    extra_causes: &[&str],
+    extra_skips: &[&str],
+) -> Result<()> {
     let observer = observer_binary()?;
     let dir = tempfile::tempdir()?;
     let app_path = match scope {
@@ -331,6 +452,7 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellSco
     };
     let manifest = dir.path().join("getters.json");
     getter_manifest(&app_path, &manifest, getters)?;
+    let getter_offsets = manifest_getter_offsets(&manifest)?;
     let hooked: Vec<&str> = if getters.is_empty() {
         vec!["C_GetFunctionList", "C_GetInterface", "C_GetInterfaceList"]
     } else {
@@ -365,6 +487,12 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellSco
             Ok(u64::from_str_radix(value.trim_start_matches("0x"), 16)?)
         })
         .collect::<Result<_>>()?;
+    let prefetched = if prefetch {
+        app.gate(b'G')?;
+        Some(parse_fields(&app.expect("PUBLISHED ")?))
+    } else {
+        None
+    };
     let target: Vec<String> = match scope {
         CellScope::StaticPid => vec!["--pid".into(), pid.to_string()],
         CellScope::DynamicCgroup => {
@@ -395,13 +523,20 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellSco
         // Every hooked getter is probed before the program calls one: a
         // cgroup capture attaches them only after its loader armed.
         wait_for_breakpoints(pid, &getter_addresses, &mut child, &log)?;
-        app.gate(b'G')?;
-        if !gated {
-            // Both gates at once: the table calls follow the getter's
-            // return immediately, inside the attach window.
-            app.gate(b'C')?;
-        }
-        let published = parse_fields(&app.expect("PUBLISHED ")?);
+        wait_for_getter_hooks(&mut child, &app_path, &getter_offsets, &log)?;
+        let published = match &prefetched {
+            Some(published) => published.clone(),
+            None => {
+                app.gate(b'G')?;
+                if !gated {
+                    // Both gates at once: the table calls follow the
+                    // getter's return immediately, inside the attach
+                    // window.
+                    app.gate(b'C')?;
+                }
+                parse_fields(&app.expect("PUBLISHED ")?)
+            }
+        };
         let addresses: Vec<u64> = published
             .iter()
             .filter(|(key, _)| key.starts_with("C_"))
@@ -414,6 +549,7 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellSco
         }
         let done = app.expect("DONE ")?;
         println!("GETTER_CELL {tag} ledger {done}");
+        settle();
         if !gated {
             // Keep the program alive until the late table attach landed,
             // so the report covers the window rather than an exit race.
@@ -435,35 +571,13 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellSco
         println!("GETTER_CELL {tag} observer {status}");
         ensure!(status.success(), "profile exited {status}: {}", tail(&log));
         let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report)?)?;
-        let ledger = parse_fields(&done);
-        let mut observed: BTreeMap<String, u64> = BTreeMap::new();
-        for row in report["functions"].as_array().context("functions")? {
-            let calls = row["calls"].as_u64().context("calls")?;
-            let names: Vec<&str> = row["names"]
-                .as_array()
-                .context("names")?
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect();
-            if calls != 0 {
-                println!("GETTER_CELL {tag} row names={names:?} calls={calls}");
-            }
-            for name in names {
-                *observed.entry(name.to_string()).or_default() += calls;
-            }
-        }
-        for (name, want) in &ledger {
-            let want: u64 = want.parse()?;
-            let got = observed.get(name).copied().unwrap_or(0);
+        check_counts(tag, &report, &done, &log, |name| {
             // The getters are probed from the start; only table calls can
-            // fall inside the attach window.
-            let exact = gated || getters.contains(&name.as_str());
-            ensure!(
-                if exact { got == want } else { got <= want },
-                "{name}: profile counted {got}, the program made {want}; rows {observed:?}; {}",
-                tail(&log)
-            );
-        }
+            // fall inside the attach window. A prefetching program called
+            // its getters before the capture: none of those is counted.
+            let getter = hooked.contains(&name);
+            (gated || getter, prefetch && getter)
+        })?;
         Ok(report)
     })();
     if result.is_err() {
@@ -474,6 +588,60 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellSco
     let report = result?;
     drop(app);
     drop(cgroup);
+    check_evidence(tag, &report, extra_causes, extra_skips)
+}
+
+/// Compares the report's per-function totals with the program's DONE
+/// ledger. `rule(name)` gives `(exact, uncounted)`: an exact name must
+/// match, any other may only fall short; an uncounted name ran before
+/// the capture, so the report must hold none of its calls.
+fn check_counts(
+    tag: &str,
+    report: &serde_json::Value,
+    done: &str,
+    log: &Path,
+    rule: impl Fn(&str) -> (bool, bool),
+) -> Result<()> {
+    let ledger = parse_fields(done);
+    let mut observed: BTreeMap<String, u64> = BTreeMap::new();
+    for row in report["functions"].as_array().context("functions")? {
+        let calls = row["calls"].as_u64().context("calls")?;
+        let names: Vec<&str> = row["names"]
+            .as_array()
+            .context("names")?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if calls != 0 {
+            println!("GETTER_CELL {tag} row names={names:?} calls={calls}");
+        }
+        for name in names {
+            *observed.entry(name.to_string()).or_default() += calls;
+        }
+    }
+    for (name, want) in &ledger {
+        let want: u64 = want.parse()?;
+        let got = observed.get(name).copied().unwrap_or(0);
+        let (exact, uncounted) = rule(name);
+        let want = if uncounted { 0 } else { want };
+        ensure!(
+            if exact { got == want } else { got <= want },
+            "{name}: the report counted {got}, the program made {want}; rows {observed:?}; {}",
+            tail(log)
+        );
+    }
+    Ok(())
+}
+
+/// The evidence every getter cell must show: no loss but the always-named
+/// attach window, and no named skip (an unreturned-getter cause would be
+/// one).
+fn check_evidence(
+    tag: &str,
+    report: &serde_json::Value,
+    extra_causes: &[&str],
+    extra_skips: &[&str],
+) -> Result<()> {
     let evidence = &report["evidence"];
     println!(
         "GETTER_CELL {tag} completeness={} verdict_detail={} gap_classes={} skipped={}",
@@ -482,22 +650,43 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellSco
         evidence["gap_classes"],
         evidence["skipped"]
     );
-    // The only observation cause is the attach window: the table
-    // attaches after its getter returned it, and calls made before that
-    // may be missing. It is named in every getter-only capture (the
-    // observer cannot know the program waited); no other loss, real or
-    // phantom, is reported. Attribution stays withheld (tables reached
-    // through a getter-only manifest carry no layout proof).
+    // The only observation cause is the attach window: a table a getter
+    // returns attaches after the return, and calls made before that may
+    // be missing. It is named in every getter-only capture (the observer
+    // cannot know the program waited, nor that the scan already held the
+    // table); no other loss, real or phantom, is reported beyond the
+    // cell's own named `extra_causes`/`extra_skips`. Attribution stays
+    // withheld (tables reached through a getter-only manifest carry no
+    // layout proof).
+    let mut causes: Vec<&str> = evidence["gap_classes"]["observation"]["causes"]
+        .as_array()
+        .context("observation causes")?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    causes.sort_unstable();
+    let mut want: Vec<&str> = ["unprotected_live_windows"]
+        .into_iter()
+        .chain(extra_causes.iter().copied())
+        .collect();
+    want.sort_unstable();
     ensure!(
-        evidence["gap_classes"]["observation"]["causes"]
-            == serde_json::json!(["unprotected_live_windows"])
-            && evidence["unprotected_live_windows"] == 1,
-        "observation causes are not exactly the attach window: {}",
+        causes == want && evidence["unprotected_live_windows"] == 1,
+        "observation causes are not exactly {want:?}: {}",
         evidence["gap_classes"]
     );
+    let mut skips: Vec<&str> = evidence["skipped"]
+        .as_array()
+        .context("skipped")?
+        .iter()
+        .filter_map(|skip| skip["reason"].as_str())
+        .collect();
+    skips.sort_unstable();
+    let mut want_skips = extra_skips.to_vec();
+    want_skips.sort_unstable();
     ensure!(
-        evidence["skipped"].as_array().is_some_and(Vec::is_empty),
-        "named skips: {}",
+        skips == want_skips,
+        "named skips are not exactly {want_skips:?}: {}",
         evidence["skipped"]
     );
     Ok(())
@@ -548,11 +737,204 @@ fn privileged_default_getter_manifest_counts_static_program_exactly() -> Result<
 #[test]
 #[ignore = "privileged: profile --cgroup arms a dynamically linked embedding program's loader for its getters and counts its table calls exactly"]
 fn privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly() -> Result<()> {
-    run_cell(
+    // At the program's exit its scanned table's probes retire, while the
+    // getter probes stay for later processes of the scope; they share one
+    // attach group, so they are reattached and the report names that
+    // short reattach window (a real interval, though nothing ran in it).
+    run_cell_with(
         "cgroup",
         &["C_GetFunctionList", "C_GetInterface"],
         "both",
         true,
         CellScope::DynamicCgroup,
+        false,
+        &["skipped", "multi_rebuild_gaps"],
+        &[
+            "discovery unavailable",
+            "static probes detached and exact pairs reattached",
+        ],
     )
+}
+
+#[test]
+#[ignore = "privileged: a static program that fetched its tables before the capture is counted exactly through the scanned program object"]
+fn privileged_getter_manifest_counts_a_program_that_fetched_before_the_capture() -> Result<()> {
+    // The program selected its interface before the capture, so which
+    // interface it chose stays unknown: named, never hidden.
+    run_cell_with(
+        "prefetch",
+        &[],
+        "both",
+        true,
+        CellScope::StaticPid,
+        true,
+        &["interface_selection"],
+        &[],
+    )
+}
+
+/// The embedding provider as a shared object a `run` child loads after
+/// the capture started: `static_getter_app.c` built `-shared` with only
+/// `getter_app_main` exported, and `dlopen_loader.c` to load and run it.
+fn build_dlopen_fixture(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let library = dir.join("libembedded_getter.so");
+    let status = Command::new("cc")
+        .args([
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fPIC",
+            "-shared",
+            "-Dmain=getter_app_main",
+        ])
+        .arg(format!(
+            "-Wl,--version-script={}",
+            repo("tests/fixtures/manifest-getter/embedded.map").display()
+        ))
+        .arg("-o")
+        .arg(&library)
+        .arg(repo("tests/fixtures/manifest-getter/static_getter_app.c"))
+        .status()
+        .context("running cc (a C compiler is required to build the fixture)")?;
+    ensure!(status.success(), "embedded library build failed");
+    exports_no_getter(&library)?;
+    let loader = dir.join("dlopen_loader");
+    let status = Command::new("cc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&loader)
+        .arg(repo("tests/fixtures/manifest-getter/dlopen_loader.c"))
+        .arg("-ldl")
+        .status()
+        .context("running cc")?;
+    ensure!(status.success(), "loader build failed");
+    Ok((library, loader))
+}
+
+/// The observer's stdout, which carries the `run` child's protocol lines
+/// (the child inherits it); other lines are skipped.
+struct RunLines(mpsc::Receiver<String>);
+
+impl RunLines {
+    fn expect(&self, prefix: &str) -> Result<String> {
+        let deadline = Instant::now() + STEP;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = self
+                .0
+                .recv_timeout(left)
+                .with_context(|| format!("the run child never printed {prefix:?}"))?;
+            if line.starts_with(prefix) {
+                return Ok(line);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "privileged: run with a getter-only manifest counts a provider object its child dlopens after the capture started exactly"]
+fn privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child() -> Result<()> {
+    let tag = "dlopen";
+    let observer = observer_binary()?;
+    let dir = tempfile::tempdir()?;
+    let (library, loader) = build_dlopen_fixture(dir.path())?;
+    let manifest = dir.path().join("getters.json");
+    getter_manifest(&library, &manifest, &[])?;
+    let getter_offsets = manifest_getter_offsets(&manifest)?;
+    let report = dir.path().join("run.json");
+    let log = dir.path().join("observer.log");
+    let log_file = std::fs::File::create(&log)?;
+    let mut child = Command::new(&observer)
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("-o")
+        .arg(&report)
+        .arg("--")
+        .arg(&loader)
+        .arg(&library)
+        .args(["25", "both"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(log_file)
+        .die_with_parent()
+        .spawn()
+        .context("spawning the observer")?;
+    let mut stdin = child.stdin.take().context("observer stdin")?;
+    let stdout = child.stdout.take().context("observer stdout")?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let lines = RunLines(receiver);
+    let mut gate = |byte: u8| -> Result<()> {
+        stdin.write_all(&[byte])?;
+        stdin.flush()?;
+        Ok(())
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        let loader_line = parse_fields(&lines.expect("LOADER ")?);
+        let pid: u32 = loader_line.get("pid").context("loader pid")?.parse()?;
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
+        ensure!(
+            !maps.contains(&library.display().to_string()),
+            "the provider object is mapped before the dlopen"
+        );
+        gate(b'L')?;
+        let ready = parse_fields(&lines.expect("READY ")?);
+        let getters: Vec<u64> = ["C_GetFunctionList", "C_GetInterface", "C_GetInterfaceList"]
+            .iter()
+            .map(|name| {
+                let value = ready
+                    .get(&format!("getter_{name}"))
+                    .with_context(|| format!("ready getter {name}"))?;
+                Ok(u64::from_str_radix(value.trim_start_matches("0x"), 16)?)
+            })
+            .collect::<Result<_>>()?;
+        // The loader hit's rescan attaches the getters in the newly
+        // mapped object before the program calls one.
+        wait_for_breakpoints(pid, &getters, &mut child, &log)?;
+        wait_for_getter_hooks(&mut child, &library, &getter_offsets, &log)?;
+        gate(b'G')?;
+        let published = parse_fields(&lines.expect("PUBLISHED ")?);
+        let addresses: Vec<u64> = published
+            .iter()
+            .filter(|(key, _)| key.starts_with("C_"))
+            .map(|(_, value)| u64::from_str_radix(value.trim_start_matches("0x"), 16))
+            .collect::<Result<_, _>>()?;
+        wait_for_breakpoints(pid, &addresses, &mut child, &log)?;
+        gate(b'C')?;
+        let done = lines.expect("DONE ")?;
+        println!("GETTER_CELL {tag} ledger {done}");
+        settle();
+        gate(b'X')?;
+        let deadline = Instant::now() + STEP * 3;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "the observer never stopped: {}",
+                tail(&log)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        println!("GETTER_CELL {tag} observer {status}");
+        ensure!(status.success(), "run exited {status}: {}", tail(&log));
+        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report)?)?;
+        check_counts(tag, &report, &done, &log, |_| (true, false))?;
+        Ok(report)
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        println!("GETTER_CELL {tag} observer log:\n{}", tail(&log));
+    }
+    check_evidence(tag, &result?, &[], &[])
 }

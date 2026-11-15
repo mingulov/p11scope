@@ -3082,44 +3082,55 @@ a silent drop.
   under standard-layout names marked not proven, but the report stays
   `PARTIAL`:
   - observation names `unprotected_live_windows` ("calls made while
-    probes were being attached may be missing"): a table attaches only
-    after its getter returned it, and no pause covers a getter return,
-    so calls in that moment can be missed. A program that fetches its
-    table once and calls it at once loses those first calls;
+    probes were being attached may be missing"): a table found only
+    through its getter attaches after the getter returned it, and no
+    pause covers a getter return, so calls in that moment can be missed
+    (a program that fetches such a table and calls it at once loses
+    those first calls). The cause is named in every such capture, also
+    when the memory scan already held the table;
   - attribution is withheld (`semantic_unverified_slots`): the names
     follow the standard table layout, which a getter-only manifest does
     not prove, so nothing is decoded (no mechanisms, no arguments); a
     `C_GetInterface` table
     adds `function list counted without names` for its interface
     selection;
+  - the manifest's program object (`module_path`) is also memory-scanned
+    for file-backed function tables, the same search `--module <program>`
+    runs, without narrowing the scan; a table found there is attached at
+    start and counted, also for a process that fetched it before the
+    capture;
   - the getters attach in the capture's initial and refresh passes; a
-    getter object a tracked process loads later (a library) gets them at
-    the rescan its loader hit requests;
+    getter object a tracked process loads later (a library) is scanned
+    at its loader hit and gets its getters in the next tick's getter
+    pass;
   - under `--system` or a cgroup scope, a dynamically linked program
     that owns no other provider gets its getters at its next scan, once
     its loader is armed; calls before then fall in the named window;
   - a getter that returns a table outside the program's file data
     (heap or anonymous memory) is refused with a named gap;
-  - a process that already fetched its table before the capture started
-    gives no getter return to read, so none of its table calls are
-    counted; when it never calls a hooked getter while watched, the
-    report names it at its exit or at capture end ("a process running
-    before the capture never called its hooked manifest getter"). Start
-    the capture first, or use `--module <program>` for file-backed
-    tables;
+  - a process that fetched its table before the capture started is
+    counted through the scanned table when the table lives in the
+    program's file data. When the scan finds no table there (a table
+    built at run time) and the process never calls a hooked getter while
+    watched, its table calls are not counted and the report names it at
+    its exit or at capture end ("a process running before the capture
+    never called its hooked manifest getter"); start the capture first.
+    A process that selected its `C_GetInterface` interface before the
+    capture leaves that selection unknown (`interface_selection`);
+  - a getter return the observer drains after its process already
+    exited cannot be attributed to it: a program that exits within a
+    moment of its `C_GetInterface` call reads `interface_selection`;
+  - under `--system` or a cgroup scope, when the program exits its
+    scanned table's probes retire while its getter probes stay for later
+    processes; they share one attach group, so the getter probes are
+    reattached and the report names that short reattach window
+    (`multi_rebuild_gaps`, "static probes detached and exact pairs
+    reattached"), although nothing ran in it;
   - `inventory --manifest` refuses a manifest that names getters
     (inventory never hooks a getter);
   - under `metrics`, a `C_GetInterface` getter is not hooked (a named
     gap); calls reached only through its table are not counted;
   - a getter record still queued when its process exits is a named loss.
-  - `--module <program>` together with a getter-only manifest for the
-    same program counts every call, but the report names a
-    `static probe coverage gap incomplete` at the program's exit even
-    though no call was lost: the scan's claim and the getter's claim on
-    the same object make the exit retirement a slot replacement, which
-    is not yet gapless (planned with the gapless slot-replacement work).
-    The withheld attribution there is the expected getter result, not
-    part of the false gap. Use one or the other.
 - Kernels/conditions: all kernels; programs `p11scope-discover` cannot
   load, mainly ones with a statically linked provider.
 - Disclosure: the observation and attribution causes above, in text and
@@ -3128,7 +3139,8 @@ a silent drop.
   `--module <program>` alone finds and attaches them at start, with no
   window and with the layout proved. A getter-only manifest is for
   tables the file scan cannot read, such as ones the program fills in
-  at run time inside its own data.
+  at run time inside its own data; it scans the program object as well,
+  so the two may also be combined.
 
 ## Scopes (cgroup and pod)
 

@@ -1293,6 +1293,12 @@ pub struct CaptureWorkBudget {
     /// scanning). Unlike excludes they filter nothing: evidence assembly
     /// matches them against mapped files to mark declared layers.
     forwarding: Vec<PathBuf>,
+    /// File identities (`st_dev`, `st_ino`) of the program objects named
+    /// by accepted manifests that hook table getters. Unlike `--module`
+    /// they narrow nothing: a mapped file with one of these identities is
+    /// memory-scanned for function tables like a provider, so a process
+    /// that fetched its table before the capture is still counted.
+    getter_objects: Vec<(u64, u64)>,
     /// Explicit `--identity-backend userspace`: the deep-scan witness
     /// stays off (no BPF load) and refused overlay ranges keep a named
     /// reason instead of proving.
@@ -1536,6 +1542,7 @@ impl CaptureWorkBudget {
             excludes: Vec::new(),
             excluded: Vec::new(),
             forwarding: Vec::new(),
+            getter_objects: Vec::new(),
             explicit_userspace: false,
         }
     }
@@ -1564,6 +1571,22 @@ impl CaptureWorkBudget {
 
     pub(crate) fn forwarding(&self) -> &[PathBuf] {
         &self.forwarding
+    }
+
+    /// Set the getter manifests' program-object identities before
+    /// scanning (see `getter_objects`).
+    pub(crate) fn set_getter_objects(&mut self, objects: Vec<(u64, u64)>) {
+        self.getter_objects = objects;
+    }
+
+    /// Whether `file` is a getter manifest's program object, which the
+    /// scan reads for tables although it exports no hooked symbol.
+    pub(crate) fn scans_getter_object(&self, file: &File) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        !self.getter_objects.is_empty()
+            && file
+                .metadata()
+                .is_ok_and(|meta| self.getter_objects.contains(&(meta.dev(), meta.ino())))
     }
 
     pub(crate) fn excludes(&self) -> &[PathBuf] {
@@ -7930,7 +7953,8 @@ fn scan_view_examined_mode(
             .filter(|(name, _)| request.hooks.abi(name).is_some())
             .map(|(name, _)| name.clone())
             .collect();
-        if request.hints.is_empty() && hook_exports.is_empty() {
+        let getter_object = hook_exports.is_empty() && budget.scans_getter_object(&file);
+        if request.hints.is_empty() && hook_exports.is_empty() && !getter_object {
             // Opened, identified, and read: examined, and not a provider.
             if let Some(held) = held {
                 offer_examined_file(&mut examined, &mut custody, key, held, file, budget);
@@ -8021,7 +8045,10 @@ fn scan_view_examined_mode(
                         .filter(|(name, _)| request.hooks.abi(name).is_some())
                         .map(|(name, _)| name.clone())
                         .collect();
-                    if request.hints.is_empty() && lower_hooks.is_empty() {
+                    if request.hints.is_empty()
+                        && lower_hooks.is_empty()
+                        && !budget.scans_getter_object(&proof.file)
+                    {
                         // Opened, identified, and read: examined, and not
                         // a provider.
                         offer_examined_file(
@@ -8238,7 +8265,10 @@ fn scan_view_examined_mode(
                     subject: module.path.clone(),
                     reason: undecoded_file_reason(budget),
                 });
-            } else if !io_exhausted && !budget.scan_stopped() {
+            } else if !io_exhausted && !budget.scan_stopped() && !(getter_object && !hinted) {
+                // A getter manifest's program object with no file-backed
+                // table is no loss: its getter hooks publish a runtime
+                // table, and an unreturned getter names its own cause.
                 skipped.push(Skipped {
                     subject: module.path.clone(),
                     reason: no_table_found_reason(&module.path, hinted),
@@ -8602,6 +8632,64 @@ mod tests {
         assert!(
             error.contains("both named by --module and matched by --exclude-module"),
             "{error}"
+        );
+    }
+
+    /// A getter manifest's program object is memory-scanned like a
+    /// provider without narrowing the scan, and an empty result there is
+    /// no loss (its getter hooks own runtime tables). Twins: without the
+    /// identity the exportless program is only examined; named by
+    /// `--module` the same empty object keeps its no-table row.
+    #[test]
+    fn a_getter_manifest_program_object_is_scanned_without_narrowing() {
+        use std::os::unix::fs::MetadataExt as _;
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("own child exe");
+        let meta = std::fs::metadata(&exe).expect("own child exe stat");
+        let exe = exe.display().to_string();
+        let hooks = HookRegistry::builtin();
+        let scan = |objects: Vec<(u64, u64)>, hints: &[PathBuf]| {
+            let mut budget = CaptureWorkBudget::default();
+            budget.set_getter_objects(objects);
+            match scan_pid(
+                &ScanRequest {
+                    pid,
+                    hints,
+                    hooks: &hooks,
+                },
+                &mut budget,
+            )
+            .expect("own stopped child scans")
+            {
+                ScanOutcome::Scanned {
+                    modules, skipped, ..
+                } => (modules, skipped),
+                ScanOutcome::Unavailable { reason, .. } => {
+                    panic!("own stopped child memory is readable: {reason}")
+                }
+            }
+        };
+        let has_module = |modules: &[ScannedModule]| modules.iter().any(|m| m.path == exe);
+        let no_table_row = |skipped: &[Skipped]| {
+            skipped
+                .iter()
+                .any(|skip| skip.subject == exe && skip.reason.contains(NO_TABLE_FOUND_MARKER))
+        };
+        let (modules, _) = scan(Vec::new(), &[]);
+        assert!(
+            !has_module(&modules),
+            "an exportless program is not scanned"
+        );
+        let (modules, skipped) = scan(vec![(meta.dev(), meta.ino())], &[]);
+        assert!(has_module(&modules), "the getter program object is scanned");
+        assert!(!no_table_row(&skipped), "{skipped:?}");
+        let (modules, skipped) = scan(Vec::new(), &[PathBuf::from(&exe)]);
+        assert!(has_module(&modules));
+        assert!(
+            no_table_row(&skipped),
+            "--module keeps its row: {skipped:?}"
         );
     }
 

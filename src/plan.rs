@@ -2571,7 +2571,39 @@ impl AttachPlan {
                             && aggregate_owners[position] != AggregateOwner::Ambiguous
                             && slot.names == old.names
                             && slot.module_ids.len() < 2;
-                        if carry_verified {
+                        // A count-only slot that only a manifest still
+                        // claims, under the same name, after the scanned
+                        // table that also held it retired (a getter-only
+                        // manifest's getter slot outliving its program's
+                        // scanned table) keeps its live descriptor: both
+                        // descriptors decode nothing, so a replacement
+                        // would detach the probe for nothing. Authority
+                        // follows the rebuilt evidence: the kept index
+                        // only spares the attached probe. A rescan that
+                        // still contributes (a forged or rival table)
+                        // replaces as before.
+                        let sources = |plan: &AttachPlan, ids: &[ModuleId]| -> Vec<&'static str> {
+                            ids.iter()
+                                .filter_map(|id| plan.modules.iter().find(|m| m.id == *id))
+                                .map(|module| module.source)
+                                .collect()
+                        };
+                        let scan_retired = sources(self, &old.module_ids)
+                            .iter()
+                            .any(|source| source.contains("scan"))
+                            && {
+                                let rebuilt_sources = sources(&rebuilt, &slot.module_ids);
+                                !rebuilt_sources.is_empty()
+                                    && rebuilt_sources.iter().all(|source| *source == "manifest")
+                            };
+                        let count_only_same = scan_retired
+                            && old.semantics == SlotSemantics::COUNT_ONLY
+                            && updated.semantics == SlotSemantics::COUNT_ONLY
+                            && aggregate_owners[position] != AggregateOwner::Ambiguous
+                            && slot.names == old.names;
+                        if count_only_same {
+                            updated.descriptor_index = old.descriptor_index;
+                        } else if carry_verified {
                             updated.descriptor_index = old.descriptor_index;
                             updated.semantics = old.semantics;
                             updated.semantic_authorized = old.semantic_authorized;
@@ -6531,9 +6563,11 @@ fn lower_manifest<'m>(
     // calls under its standard name); the observer reads the tables they
     // return at run time. They lower count-only: no walked table proves
     // their layout here, and the live table that later holds the same
-    // getter is count-only too, so the slot never changes descriptor (a
-    // change would detach and reattach the static probe). A getter a
-    // walked surface already records at the same place lowers once.
+    // getter is count-only too. A scanned table of the program object may
+    // give the shared slot a count-only descriptor; when that table
+    // retires, the merge keeps the descriptor rather than replacing the
+    // probe (see `count_only_same`). A getter a walked surface already
+    // records at the same place lowers once.
     for getter in &m.getters {
         let recorded = m
             .surfaces
@@ -9689,6 +9723,57 @@ pub(crate) mod tests {
             plan.slots.iter().all(|slot| slot.descriptor_index != 0),
             "attached descriptors survive the confirming scan"
         );
+    }
+
+    /// A getter slot that a scanned table also held keeps its live
+    /// descriptor when the table retires and only the getter-only
+    /// manifest still claims it: no replacement detaches the probe
+    /// (twin: the forged rescan below still replaces).
+    #[test]
+    fn a_getter_slot_outliving_its_scanned_table_is_not_replaced() {
+        let scanned = sole_complete_module();
+        let offset = scanned.scanned.tables[0]
+            .entries
+            .iter()
+            .find(|entry| entry.name == "C_GetFunctionList")
+            .expect("C_GetFunctionList entry")
+            .file_offset;
+        let manifest = getter_only_manifest(&[("C_GetFunctionList", offset)]);
+        let lookup = |key: ObjectKey, _: &str| u32::try_from(key.inode).ok().map(PinnedObjectId);
+        let mut plan = build_from_test_sources(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+        );
+        let getter = plan
+            .slots
+            .iter()
+            .find(|slot| slot.file_offset == offset)
+            .cloned()
+            .expect("the shared getter slot");
+        assert_ne!(getter.descriptor_index, 0, "the scanned table grants first");
+        assert_eq!(plan.modules[0].source, "scan+manifest");
+        let rebuilt = plan.rebuild_from_sources_with(
+            &[],
+            std::slice::from_ref(&manifest),
+            &[],
+            lookup,
+            |_, _| true,
+            false,
+            plan.admission_policy,
+            false,
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.replace.is_empty(), "{:?}", delta.replace);
+        assert!(delta.new.is_empty(), "{:?}", delta.new);
+        assert_eq!(delta.retire.len(), plan.slots.len() - 1);
+        let kept = plan
+            .slots
+            .iter()
+            .find(|slot| slot.index == getter.index)
+            .expect("kept getter slot");
+        assert!(plan.is_active(kept.index));
+        assert_eq!(kept.descriptor_index, getter.descriptor_index);
+        assert!(!kept.semantic_authorized, "authority follows the manifest");
     }
 
     #[test]

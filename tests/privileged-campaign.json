@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 260,
+  "default_floor": 262,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -251,6 +251,8 @@
     "attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_map",
     "manifest_getter_privileged_tests::privileged_default_getter_manifest_counts_static_program_exactly",
     "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly",
+    "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child",
+    "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_program_that_fetched_before_the_capture",
     "manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly",
     "manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed",
     "manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_counts_static_program_exactly",

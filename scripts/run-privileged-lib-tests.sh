@@ -627,9 +627,14 @@ attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_m
 # else the test binary's p11scope sibling). One cell takes the helper's
 # default output (all three getters); one builds the program dynamically
 # (still exporting nothing) and captures it with profile --cgroup in a
-# scratch cgroup v2 leaf, where its loader arms for the getters.
+# scratch cgroup v2 leaf, where its loader arms for the getters. One
+# starts the program's table fetch before the capture (the memory scan of
+# the program object must count it exactly), and one has a `run` child
+# dlopen the provider as a shared object after the capture started.
 manifest_getter_privileged_tests::privileged_default_getter_manifest_counts_static_program_exactly
 manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly
+manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child
+manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_program_that_fetched_before_the_capture
 manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly
 manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed
 manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_counts_static_program_exactly

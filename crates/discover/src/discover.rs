@@ -18,7 +18,7 @@ use std::os::raw::c_void;
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 
-const INTERFACE_NAME_CAP: usize = 256;
+const INTERFACE_NAME_CAP: usize = 64;
 const MAX_OBJECTS: usize = 512;
 const MAX_TOTAL_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -752,7 +752,11 @@ struct NameRead {
     error: Option<String>,
 }
 
-fn read_name(memory: &ProcessMemory, address: usize) -> NameRead {
+/// A NUL-terminated name of at most [`INTERFACE_NAME_CAP`] bytes, read only
+/// inside the readable maps entry that contains `address`. A pointer outside
+/// a readable mapping is refused without a read, and a name without an
+/// in-mapping NUL is unreadable.
+fn read_name(memory: &ProcessMemory, maps: &maps::MapIndex<'_>, address: usize) -> NameRead {
     if address == 0 {
         return NameRead {
             raw: None,
@@ -761,10 +765,29 @@ fn read_name(memory: &ProcessMemory, address: usize) -> NameRead {
         };
     }
 
-    let mut raw = Vec::with_capacity(INTERFACE_NAME_CAP);
-    while raw.len() < INTERFACE_NAME_CAP {
+    let Some(mapping) = maps.containing(address as u64) else {
+        return NameRead {
+            raw: None,
+            lossy: None,
+            error: Some(format!("name pointer outside any mapping at 0x{address:x}")),
+        };
+    };
+    if mapping.permissions[0] != b'r' {
+        return NameRead {
+            raw: None,
+            lossy: None,
+            error: Some(format!(
+                "name pointer in a non-readable mapping at 0x{address:x}"
+            )),
+        };
+    }
+    let mapping_bytes = mapping.end - address as u64;
+    let limit = mapping_bytes.min(INTERFACE_NAME_CAP as u64) as usize;
+
+    let mut raw = Vec::with_capacity(limit);
+    while raw.len() < limit {
         let mut chunk = [0u8; 32];
-        let want = chunk.len().min(INTERFACE_NAME_CAP - raw.len());
+        let want = chunk.len().min(limit - raw.len());
         let Some(at) = address.checked_add(raw.len()) else {
             return NameRead {
                 raw: (!raw.is_empty()).then_some(raw),
@@ -802,11 +825,16 @@ fn read_name(memory: &ProcessMemory, address: usize) -> NameRead {
     }
 
     NameRead {
-        raw: Some(raw),
+        raw: (!raw.is_empty()).then_some(raw),
         lossy: None,
-        error: Some(format!(
-            "overlong interface name (cap {INTERFACE_NAME_CAP} bytes)"
-        )),
+        error: Some(if limit < INTERFACE_NAME_CAP {
+            format!(
+                "unterminated interface name at readable mapping end 0x{:x}",
+                address as u64 + limit as u64
+            )
+        } else {
+            format!("overlong interface name (cap {INTERFACE_NAME_CAP} bytes)")
+        }),
     }
 }
 
@@ -1058,7 +1086,7 @@ fn interface_records(
     let mut vendor = Vec::new();
     let mut table_ptrs = Vec::new();
     for (index, entry) in raw.into_iter().enumerate() {
-        let name = read_name(memory, entry.name_ptr as usize);
+        let name = read_name(memory, maps, entry.name_ptr as usize);
         let exact = name.raw.as_deref() == Some(b"PKCS 11".as_slice()) && name.error.is_none();
         let version = read_version(memory, entry.func_list as usize);
 
@@ -1367,7 +1395,7 @@ fn selection_acquisition(
                                 .map_err(|_| SelectionFailure::UnreadableInterface)?;
                         let inventory_matches =
                             selection_inventory_indices(inventory_tables, table_pointer);
-                        let name = read_name(memory, name_pointer);
+                        let name = read_name(memory, maps_a, name_pointer);
                         let version_read = read_version(memory, table_pointer);
                         let name_class = selection_name_class(&name, name_pointer);
                         let mut version_class =
@@ -1418,7 +1446,7 @@ fn selection_acquisition(
                         // and metadata again before accepting a heap or file view.
                         let confirmed_interface = read_interface(memory, output as usize)
                             .map_err(|_| SelectionFailure::ProviderChanged)?;
-                        let confirmed_name = read_name(memory, name_pointer);
+                        let confirmed_name = read_name(memory, maps_a, name_pointer);
                         if confirmed_interface != (name_pointer, table_pointer, returned_flags)
                             || confirmed_name.raw != name.raw
                             || confirmed_name.error != name.error
@@ -2226,7 +2254,9 @@ mod tests {
     /// Reads one provider name the way discovery does: against this
     /// process's live maps.
     fn read_name_at(memory: &ProcessMemory, address: usize) -> NameRead {
-        read_name(memory, address)
+        let entries = read_self_maps().unwrap();
+        let index = validated_map_index(&entries).unwrap();
+        read_name(memory, &index, address)
     }
 
     #[test]

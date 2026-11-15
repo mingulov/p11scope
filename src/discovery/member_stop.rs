@@ -35,10 +35,18 @@ pub(crate) trait MemberStopIo {
     fn withdraw(&mut self, tgid: u32) -> Result<(), String>;
     /// Requested, table-full, signal-refused, identity-unread totals.
     fn counters(&mut self) -> Result<[u64; 4], String>;
-    /// Stops every new stop and waits out in-flight hook invocations
-    /// (the hook is detached), so a scan after it sees every row there
-    /// will be; pending rows stay for the release.
+    /// Stops every new stop and detaches the hook; pending rows stay for
+    /// the release. The detach does not wait for invocations already
+    /// running (on 7.x every trampoline shares one ftrace ops, and beside
+    /// another `uprobe_mmap` program it only swaps the trampoline image):
+    /// [`Self::quiesce`] does.
     fn deactivate(&mut self) -> Result<(), String>;
+    /// Waits, after [`Self::deactivate`], until every hook invocation that
+    /// read `active` before it has finished (one RCU grace period: the
+    /// hook runs inside an RCU read section), so a scan after it sees
+    /// every row there will be. False when no such wait is proven
+    /// (`nohz_full`, one online CPU, no `membarrier`).
+    fn quiesce(&mut self) -> bool;
     /// Whether the pinned process is in the run cgroup tree now. A row
     /// names only a tgid: its member may have exited and the number been
     /// reused by an unrelated process, which is never read or signalled.
@@ -115,6 +123,10 @@ pub(crate) struct MemberStopState {
     /// Pinned identities whose staging was refused (cap, replaced file,
     /// pin budget, nothing pinnable): settled, but never attached.
     refused: BTreeSet<(u64, u64)>,
+    /// The release's grace-period wait was not proven: each member's maps
+    /// are read before its resume, and the capture-end table is scanned
+    /// again.
+    unsettled: bool,
     /// Test override of [`MEMBER_STOP_INTAKE_PER_PASS`].
     #[cfg(test)]
     pub(crate) intake_cap: Option<usize>,
@@ -187,6 +199,9 @@ pub(crate) struct MemberStopStats {
     pub(crate) stop_staged_overflow: u64,
     /// Members resumed unproven because a mapped file is FUSE-backed.
     pub(crate) fuse_resumes: u64,
+    /// Release-time maps reads that waited out a member's in-flight hook
+    /// invocation because no grace period was proven.
+    pub(crate) unsettled_reads: u64,
 }
 
 /// One executable file row of a member's maps.
@@ -1111,8 +1126,7 @@ impl Engine {
     /// verified, gets the start-time guarded forced resume at once: with
     /// no watchdog and no further stops, nothing else would bound it.
     fn release_after_guard_loss(&mut self, io: &mut dyn MemberStopIo, now_ns: Option<u64>) {
-        let _ = io.deactivate();
-        self.note_kernel_stop_refusals(io);
+        self.end_kernel_stops(io);
         let held = std::mem::take(&mut self.member_stops.held);
         for (tgid, member) in held {
             let HoldState {
@@ -1205,6 +1219,7 @@ impl Engine {
                 return;
             }
         };
+        self.settle_member(&pin);
         if !Self::resume_member(io, &pin) {
             self.force_resume(io, tgid, since_ns, "watchdog lost; no signal authority");
             return;
@@ -1286,6 +1301,8 @@ impl Engine {
     /// first-use row discloses them (over-reporting is the safe
     /// direction). An unreadable counter is doubt, and files it too.
     fn note_kernel_stop_refusals(&mut self, io: &mut dyn MemberStopIo) {
+        // Read after the grace-period wait: a refusal by an invocation in
+        // flight at the deactivation counts.
         let refused = io.counters().map_or(1, |counts| {
             counts[1]
                 .saturating_add(counts[2])
@@ -1299,39 +1316,56 @@ impl Engine {
         }
     }
 
+    /// Ends the kernel half's stops before a release reads anything: no
+    /// new stop, then the wait for hook invocations already running (the
+    /// detach does not wait for them), then the refusal counters.
+    fn end_kernel_stops(&mut self, io: &mut dyn MemberStopIo) {
+        let _ = io.deactivate();
+        self.member_stops.unsettled = !io.quiesce();
+        if self.member_stops.unsettled && crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "p11scope: no grace period proven after the member-stop deactivation; \
+                 each member's maps are read before its resume"
+            );
+        }
+        self.note_kernel_stop_refusals(io);
+    }
+
+    /// Without a proven grace period, waits out a hook invocation still
+    /// inside this member's mapping before its resume. The hook runs
+    /// under the member's `mmap_lock`, held for writing by the mapping,
+    /// and a maps read takes it: the read returns only after that
+    /// invocation has inserted its row and sent its stop, so the resume
+    /// that follows is the last signal. Bounded; a failed read resumes
+    /// without the wait.
+    fn settle_member(&mut self, pin: &crate::process::PidPin) {
+        if !self.member_stops.unsettled {
+            return;
+        }
+        let deadline = std::time::Instant::now() + MEMBER_STOP_MEMBER_BUDGET;
+        let _ = pin
+            .open_proc_dir()
+            .and_then(|proc| proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES));
+        self.member_stops.stats.unsettled_reads =
+            self.member_stops.stats.unsettled_reads.saturating_add(1);
+    }
+
     /// Capture end: no new stops, every held or pending member resumes.
     /// Pending rows the service never took resume too.
     pub(crate) fn release_member_stops(&mut self, io: &mut dyn MemberStopIo) {
-        let _ = io.deactivate();
-        self.note_kernel_stop_refusals(io);
+        self.end_kernel_stops(io);
         // A resume that cannot be sent keeps its row: the hooks' own
-        // release and the watchdog still resume that member.
+        // release and the watchdog still resume that member. A held
+        // member's stop completed before its intake read its maps.
         let held = std::mem::take(&mut self.member_stops.held);
         for (_, member) in held {
             Self::resume_member(io, &member.pin);
         }
-        for (tgid, stop) in io.pending().unwrap_or_default() {
-            let Ok(pin) = crate::process::PidPin::open(tgid) else {
-                // Gone: nothing is stopped, and a row left behind would
-                // make the hooks' release hand a normal end to the
-                // watchdog's sweep.
-                if process_gone(tgid) {
-                    let _ = io.withdraw(tgid);
-                }
-                continue;
-            };
-            match io.is_run_member(&pin) {
-                Ok(true) => {
-                    Self::resume_member(io, &pin);
-                }
-                Ok(false) if stopped_member_moved_out(&pin, stop.hook_ts_ns) => {
-                    Self::resume_member(io, &pin);
-                }
-                Ok(false) => {
-                    let _ = io.withdraw(tgid);
-                }
-                Err(_) => {}
-            }
+        self.resume_pending_at_release(io);
+        if self.member_stops.unsettled {
+            // A row inserted after that scan by an invocation the
+            // unproven wait did not cover.
+            self.resume_pending_at_release(io);
         }
         if crate::run::capture_diagnostics_on() {
             let stats = self.member_stops.stats;
@@ -1343,7 +1377,7 @@ impl Engine {
                  {} not members, {} kept for a retry, {} resumed unverified at bound, \
                  {} moved out and resumed, {} resumed unproven, \
                  {} resumed at watchdog loss, {} staged identities over the cap, \
-                 {} resumed with a FUSE-backed file; \
+                 {} resumed with a FUSE-backed file, {} settled by a maps read; \
                  kernel requested {}, table full {}, signal refused {}, identity unread {}",
                 stats.stopped,
                 stats.cleared_files,
@@ -1361,11 +1395,41 @@ impl Engine {
                 stats.lost_guard_resumes,
                 stats.stop_staged_overflow,
                 stats.fuse_resumes,
+                stats.unsettled_reads,
                 kernel[0],
                 kernel[1],
                 kernel[2],
                 kernel[3],
             );
+        }
+    }
+
+    /// Resumes every pending row at capture end (one table scan).
+    fn resume_pending_at_release(&mut self, io: &mut dyn MemberStopIo) {
+        for (tgid, stop) in io.pending().unwrap_or_default() {
+            let Ok(pin) = crate::process::PidPin::open(tgid) else {
+                // Gone: nothing is stopped, and a row left behind would
+                // make the hooks' release hand a normal end to the
+                // watchdog's sweep.
+                if process_gone(tgid) {
+                    let _ = io.withdraw(tgid);
+                }
+                continue;
+            };
+            match io.is_run_member(&pin) {
+                Ok(true) => {
+                    self.settle_member(&pin);
+                    Self::resume_member(io, &pin);
+                }
+                Ok(false) if stopped_member_moved_out(&pin, stop.hook_ts_ns) => {
+                    self.settle_member(&pin);
+                    Self::resume_member(io, &pin);
+                }
+                Ok(false) => {
+                    let _ = io.withdraw(tgid);
+                }
+                Err(_) => {}
+            }
         }
     }
 }

@@ -86261,18 +86261,30 @@ struct ScriptedMemberStops {
     /// The kernel's counters (requested, table full, signal refused,
     /// identity unread).
     counters: [u64; 4],
+    /// Ordered log of deactivate, quiesce, pending and counters calls.
+    calls: Vec<&'static str>,
+    /// A scripted unproven grace period (`nohz_full`, one CPU).
+    no_grace: bool,
+    /// Rows an in-flight hook invocation inserts only after the first
+    /// table read that follows the deactivation.
+    late_rows: BTreeMap<u32, p11scope_ebpf_common::MemberStop>,
 }
 
 impl MemberStopIo for ScriptedMemberStops {
     fn pending(&mut self) -> Result<Vec<(u32, p11scope_ebpf_common::MemberStop)>, String> {
+        self.calls.push("pending");
         if self.fail_pending {
             return Err("scripted MS_STOPS read failure".into());
         }
-        Ok(self
+        let rows = self
             .rows
             .iter()
             .map(|(tgid, stop)| (*tgid, *stop))
-            .collect())
+            .collect();
+        if self.deactivated {
+            self.rows.append(&mut self.late_rows);
+        }
+        Ok(rows)
     }
     fn clear(&mut self, file: p11scope_ebpf_common::MemberFileKey) -> Result<(), String> {
         self.cleared.insert(file);
@@ -86285,11 +86297,17 @@ impl MemberStopIo for ScriptedMemberStops {
         Ok(())
     }
     fn counters(&mut self) -> Result<[u64; 4], String> {
+        self.calls.push("counters");
         Ok(self.counters)
     }
     fn deactivate(&mut self) -> Result<(), String> {
+        self.calls.push("deactivate");
         self.deactivated = true;
         Ok(())
+    }
+    fn quiesce(&mut self) -> bool {
+        self.calls.push("quiesce");
+        !self.no_grace
     }
     fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {
         self.tgid_in_run_tree(pin.pid())
@@ -87684,4 +87702,106 @@ int main(void) {
     );
     heavy.kill().unwrap();
     heavy.wait().unwrap();
+}
+
+/// Asserts `deactivate`, then `quiesce`, come before the first table read
+/// and the first counter read of a release.
+fn assert_release_waits_before_reading(calls: &[&str], what: &str) {
+    let at = |name: &str| calls.iter().position(|call| *call == name);
+    let (Some(deactivate), Some(quiesce), Some(pending), Some(counters)) = (
+        at("deactivate"),
+        at("quiesce"),
+        at("pending"),
+        at("counters"),
+    ) else {
+        panic!("{what}: a release step is missing: {calls:?}");
+    };
+    assert!(deactivate < quiesce, "{what}: {calls:?}");
+    assert!(
+        quiesce < pending,
+        "{what}: the wait precedes the scan: {calls:?}"
+    );
+    assert!(
+        quiesce < counters,
+        "{what}: the refusals are read after the wait: {calls:?}"
+    );
+}
+
+/// The detach does not wait for hook invocations already running (a
+/// shared ftrace ops on 7.x, a swapped trampoline image beside another
+/// `uprobe_mmap` program): both releases wait one grace period after the
+/// deactivation and before their first table and counter reads.
+#[test]
+fn member_stop_releases_wait_for_in_flight_hooks_before_the_first_scan() {
+    let mut io = ScriptedMemberStops::default();
+    let mut engine = member_stop_engine();
+    engine.release_member_stops(&mut io);
+    assert_release_waits_before_reading(&io.calls, "capture end");
+    let mut lost = ScriptedMemberStops {
+        guard_lost: true,
+        ..Default::default()
+    };
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut lost, &mut session, Some(10));
+    assert_release_waits_before_reading(&lost.calls, "watchdog loss");
+}
+
+/// Without a proven grace period (`nohz_full`, one CPU) the capture-end
+/// release reads each member's maps before its resume (waiting out a
+/// hook still inside that member's mapping) and scans the table once
+/// more, so a row inserted after the first scan still resumes. With a
+/// proven wait neither is needed.
+#[test]
+fn member_stop_release_without_a_grace_period_settles_and_rescans() {
+    let mut healthy = ScriptedMemberStops::default();
+    let (mut child, pid, _) = stopped_member_with_row(&mut healthy);
+    let mut engine = member_stop_engine();
+    engine.release_member_stops(&mut healthy);
+    assert!(member_resumed_for_test(pid));
+    assert_eq!(engine.member_stop_stats_for_test().unsettled_reads, 0);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut io = ScriptedMemberStops {
+        no_grace: true,
+        ..Default::default()
+    };
+    let (mut seen, seen_pid, _) = stopped_member_with_row(&mut io);
+    let mut other = ScriptedMemberStops::default();
+    let (mut late, late_pid, _) = stopped_member_with_row(&mut other);
+    io.late_rows.append(&mut other.rows);
+    let mut engine = member_stop_engine();
+    engine.release_member_stops(&mut io);
+    assert!(member_resumed_for_test(seen_pid));
+    assert!(
+        member_resumed_for_test(late_pid),
+        "a row inserted after the first scan resumes: {:?}",
+        io.calls
+    );
+    assert!(io.rows.is_empty(), "{:?}", io.rows.keys());
+    assert_eq!(engine.member_stop_stats_for_test().unsettled_reads, 2);
+    for child in [&mut seen, &mut late] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// The same at a watchdog loss: each pending member's maps are read
+/// before its resume when no grace period is proven.
+#[test]
+fn member_stop_loss_release_without_a_grace_period_settles_each_member() {
+    let mut io = ScriptedMemberStops {
+        no_grace: true,
+        guard_lost: true,
+        ..Default::default()
+    };
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1));
+    assert!(member_resumed_for_test(pid));
+    assert_eq!(engine.member_stop_stats_for_test().unsettled_reads, 1);
+    let _ = child.kill();
+    let _ = child.wait();
 }

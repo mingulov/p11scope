@@ -20010,7 +20010,7 @@ pub(crate) mod tests {
         assert_eq!(plan.active_slot_count(), ceiling - 30);
         // Failed attaches: the 30 endpoints are still listed, so the reserve
         // is not armed and a newcomer that fits the raw budget is admitted.
-        let late = provider_with_tables(53, "/opt/late.so", 1, 100, false);
+        let late = provider_with_tables(53, "/opt/late.so", 1, 20, false);
         let rebuilt = plan.rebuild_from_sources(
             &[filler.clone(), busy.clone(), late.clone()],
             &[],
@@ -20021,7 +20021,7 @@ pub(crate) mod tests {
             "a still-listed retry does not arm the reserve: {:?}",
             rebuilt.modules_skipped
         );
-        assert_eq!(slots_of(&rebuilt, 53), 100, "the newcomer is admitted");
+        assert_eq!(slots_of(&rebuilt, 53), 20, "the newcomer is admitted");
         plan.extend_exact(rebuilt).unwrap();
         // The busy provider departs: the next extend retires its endpoints
         // and remembers them as churn.
@@ -20038,7 +20038,7 @@ pub(crate) mod tests {
         );
         // Now a new heuristic provider crosses the reserve-free ceiling and
         // is refused whole with the named-reserve wording.
-        let newcomer = provider_with_tables(54, "/opt/newcomer.so", 1, 100, false);
+        let newcomer = provider_with_tables(54, "/opt/newcomer.so", 1, 40, false);
         let rebuilt =
             plan.rebuild_from_sources(&[filler, late, newcomer], &[], &PinnedObjects::empty());
         let skipped = refusal_of(&rebuilt, "/opt/newcomer.so").expect("reserve refusal");
@@ -20048,7 +20048,7 @@ pub(crate) mod tests {
             skipped.reason
         );
         plan.extend_exact(rebuilt).unwrap();
-        assert_eq!(plan.active_slot_count(), ceiling - 30 + 100);
+        assert_eq!(plan.active_slot_count(), ceiling - 30 + 20);
     }
 
     /// An already-admitted heuristic module keeps its active endpoints but

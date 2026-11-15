@@ -2705,8 +2705,11 @@ def semantic_join_eligible(function, module, *, has_manifest_object_fallback):
 
 def exact_prearm_keys(module):
     """Packet 6.13 additive keys: `watch`, `attached_at_ns`,
-    `unobserved_windows`. Absent unless pre-arm named the module; present
-    keys must match the frozen shapes."""
+    `unobserved_windows`, plus the additive first-attach keys
+    `first_attached_at_ns` and `first_attach_points` and the learned
+    `first_loaded_by`. `watch` is pre-arm-only; present keys must match
+    their frozen shapes, and the first-attach instant must be the maximum
+    of the points and never follow a known current attach."""
     if "watch" in module:
         watch = module["watch"]
         require(
@@ -2812,6 +2815,18 @@ def exact_prearm_keys(module):
                 ),
                 f"invalid first attach point: {module}",
             )
+    if "first_attached_at_ns" in module:
+        # Assembled together: the module instant is the maximum over its
+        # endpoints' first attaches, so it needs the points and equals
+        # their latest completion (and, with the check above, no point
+        # follows a known current attach).
+        points = module.get("first_attach_points")
+        require(
+            isinstance(points, list)
+            and points
+            and module["first_attached_at_ns"] == max(point["attached_ns"] for point in points),
+            f"first_attached_at_ns is not the maximum of first_attach_points: {module}",
+        )
     if "unobserved_windows" in module:
         windows = module["unobserved_windows"]
         require(isinstance(windows, list), f"invalid unobserved_windows: {module}")
@@ -5139,12 +5154,21 @@ def self_test():
         {"file_offset": 8192, "began_ns": None, "attached_ns": 120},
     ]
     for good in (
-        {"attached_at_ns": None, "first_attached_at_ns": 120},
         {"attached_at_ns": 900, "first_attached_at_ns": 120, "first_attach_points": points},
         {"attached_at_ns": None, "first_attached_at_ns": 120, "first_attach_points": points},
+        # An endpoint never attached: no module instant, the points stand.
+        {"attached_at_ns": None, "first_attach_points": points},
     ):
         exact_prearm_keys(dict(attach_module, **good))
     for bad in (
+        # The module instant is the maximum over its endpoints' first
+        # attaches, assembled together with the points: one without the
+        # points, or one that is not their maximum, is a producer bug.
+        {"attached_at_ns": None, "first_attached_at_ns": 120},
+        {"attached_at_ns": 900, "first_attached_at_ns": 130, "first_attach_points": points},
+        {"attached_at_ns": 900, "first_attached_at_ns": 100, "first_attach_points": points},
+        # A point never follows a known current attach (via the maximum).
+        {"attached_at_ns": 110, "first_attached_at_ns": 120, "first_attach_points": points},
         {"attached_at_ns": 100, "first_attached_at_ns": 120},
         {"first_attached_at_ns": -1},
         {"first_attached_at_ns": None},

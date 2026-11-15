@@ -167,6 +167,27 @@ fn exec_rows(maps: &[u8]) -> Vec<ExecRow> {
     rows
 }
 
+/// Puts the stopping file first under its kernel key. `maps` prints the
+/// user-visible inode, while the hook reads the VMA's own file: for an
+/// overlayfs (backing-file) mapping the device differs (the overlay's
+/// versus the real filesystem's) and the inode number usually matches.
+/// The row with the exact key, else the first with the same inode
+/// number, is proven again under the kernel key, so clearing that key
+/// is what stops later mappers from stopping on the same file. Neighbor
+/// rows keep their `maps` keys (correct whenever the two agree; a
+/// mismatched one only costs one more stop for its first mapper).
+fn with_stopping_row(mut rows: Vec<ExecRow>, kernel: MemberFileKey) -> Vec<ExecRow> {
+    if let Some(at) = rows.iter().position(|row| row.key == kernel) {
+        let row = rows.remove(at);
+        rows.insert(0, row);
+        return rows;
+    }
+    if let Some(row) = rows.iter().find(|row| row.key.ino == kernel.ino).cloned() {
+        rows.insert(0, ExecRow { key: kernel, ..row });
+    }
+    rows
+}
+
 /// Opens the file a maps row names. The `map_files` link is exact (the
 /// kernel follows the VMA's own file) and needs `CAP_SYS_ADMIN`; without
 /// it the row's path is opened through the member's root and accepted
@@ -270,7 +291,7 @@ impl Engine {
             .open_proc_dir()
             .and_then(|proc| {
                 let maps = proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES)?;
-                Ok((proc, exec_rows(&maps)))
+                Ok((proc, with_stopping_row(exec_rows(&maps), stop.file)))
             })
             .map(|(proc, rows)| self.prove_member_rows(&pin, &proc, rows, deadline));
         let (cleared, providers) = match rows {
@@ -289,10 +310,9 @@ impl Engine {
             self.clear_member_file(io, *key);
         }
         if providers.is_empty() {
-            // The stopping file was not proven (unmapped since, or
-            // unreadable): it stays uncleared, so a later mapper stops
-            // and tries again.
-            let _ = stop;
+            // A stopping file that was not proven (unmapped since, or
+            // unreadable) stays uncleared, so a later mapper stops and
+            // tries again.
             Self::resume_member(io, &pin);
             return false;
         }
@@ -503,6 +523,35 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stopping_row_is_proven_under_its_kernel_key() {
+        let row = |dev, ino, start| ExecRow {
+            start,
+            end: start + 0x1000,
+            key: MemberFileKey { dev, ino },
+            path: b"/usr/lib/libx.so".to_vec(),
+        };
+        // Same domain: the exact row moves first, nothing is added.
+        let rows = with_stopping_row(
+            vec![row(1, 5, 0x1000), row(1, 7, 0x3000)],
+            MemberFileKey { dev: 1, ino: 7 },
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, MemberFileKey { dev: 1, ino: 7 });
+        // Overlay: maps shows the overlay device (43), the hook the real
+        // filesystem's (23); the same-inode row is proven under 23 too.
+        let rows = with_stopping_row(
+            vec![row(43, 5, 0x1000), row(43, 7, 0x3000)],
+            MemberFileKey { dev: 23, ino: 7 },
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].key, MemberFileKey { dev: 23, ino: 7 });
+        assert_eq!(rows[0].start, 0x3000, "it reads the same mapping");
+        // Unmapped since: nothing to prove, nothing added.
+        let rows = with_stopping_row(vec![row(43, 5, 0x1000)], MemberFileKey { dev: 23, ino: 9 });
+        assert_eq!(rows.len(), 1);
+    }
 
     #[test]
     fn exec_rows_keep_only_executable_file_rows_with_kernel_dev() {

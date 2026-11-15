@@ -86386,6 +86386,47 @@ fn member_stop_clears_non_provider_files_and_resumes_at_once() {
     let _ = child.wait();
 }
 
+/// On overlayfs the hook keys the backing file (its own superblock
+/// device) while `maps` prints the overlay device: the stopping file is
+/// cleared under the kernel's key, so its next mapper does not stop on it.
+#[test]
+fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let exe = loop {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            && exe.file_name().is_some_and(|name| name == "sleep")
+        {
+            break exe;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    stop_member_for_test(pid);
+    let maps_key = member_exec_key_for_test(pid, &exe);
+    let kernel = p11scope_ebpf_common::MemberFileKey {
+        dev: maps_key.dev ^ 0x7f,
+        ino: maps_key.ino,
+    };
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(kernel));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(
+        io.cleared.contains(&kernel),
+        "the kernel key of the stopping file is cleared: {:?}",
+        io.cleared
+    );
+    assert!(io.cleared.contains(&maps_key), "its maps key clears too");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Twin: without a service pass the stopped member stays stopped (the
 /// resume above is the service's, not the fixture's).
 #[test]

@@ -37,6 +37,11 @@ pub(crate) trait MemberStopIo {
     fn counters(&mut self) -> Result<[u64; 4], String>;
     /// Stops every new stop; pending rows stay for the final release.
     fn deactivate(&mut self) -> Result<(), String>;
+    /// Whether the pinned process is in the run cgroup tree now. A row
+    /// names only a tgid: its member may have exited and the number been
+    /// reused by an unrelated process, which is never read or signalled.
+    /// `Ok(false)` also when the pinned process exited meanwhile.
+    fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String>;
 }
 
 /// The longest a member stays stopped for one provider attach. Past it
@@ -84,6 +89,8 @@ pub(crate) struct MemberStopStats {
     pub(crate) timed_out: u64,
     pub(crate) unreadable: u64,
     pub(crate) departed: u64,
+    /// Rows whose tgid now names a process outside the run tree.
+    pub(crate) not_members: u64,
 }
 
 /// One executable file row of a member's maps.
@@ -319,6 +326,26 @@ impl Engine {
             self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
             return false;
         };
+        match io.is_run_member(&pin) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Not a run member (any more): the stopped member is gone
+                // and its number names another process, which is left
+                // exactly as it is.
+                let _ = io.withdraw(tgid);
+                self.member_stops.stats.not_members =
+                    self.member_stops.stats.not_members.saturating_add(1);
+                return false;
+            }
+            Err(error) => {
+                self.member_stops.stats.unreadable =
+                    self.member_stops.stats.unreadable.saturating_add(1);
+                if crate::run::capture_diagnostics_on() {
+                    eprintln!("p11scope: stopped run member {tgid} unverified: {error}; kept");
+                }
+                return false;
+            }
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         let rows = pin
             .open_proc_dir()
@@ -524,10 +551,15 @@ impl Engine {
             Self::resume_member(io, &member.pin);
         }
         for (tgid, _) in io.pending().unwrap_or_default() {
-            if let Ok(pin) = crate::process::PidPin::open(tgid) {
-                Self::resume_member(io, &pin);
-            } else {
-                let _ = io.withdraw(tgid);
+            let Ok(pin) = crate::process::PidPin::open(tgid) else {
+                continue;
+            };
+            match io.is_run_member(&pin) {
+                Ok(true) => Self::resume_member(io, &pin),
+                Ok(false) => {
+                    let _ = io.withdraw(tgid);
+                }
+                Err(_) => {}
             }
         }
         if crate::run::capture_diagnostics_on() {
@@ -535,7 +567,8 @@ impl Engine {
             let kernel = io.counters().unwrap_or_default();
             eprintln!(
                 "p11scope: run member stops: {} stopped, {} files cleared, {} provider holds, \
-                 {} resumed attached, {} resumed at bound, {} unreadable, {} departed; \
+                 {} resumed attached, {} resumed at bound, {} unreadable, {} departed, \
+                 {} not members; \
                  kernel requested {}, table full {}, signal refused {}, identity unread {}",
                 stats.stopped,
                 stats.cleared_files,
@@ -544,6 +577,7 @@ impl Engine {
                 stats.timed_out,
                 stats.unreadable,
                 stats.departed,
+                stats.not_members,
                 kernel[0],
                 kernel[1],
                 kernel[2],

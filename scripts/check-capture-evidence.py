@@ -492,6 +492,7 @@ SELECTED_DETAIL_LATENCY_BUCKETS = 32
 # evidence); schema: docs/schema/observed-profile-v3.schema.json. Never
 # feeds verdicts or completeness (a declared choice, not a loss).
 EXCLUDED_MODULE_KEYS = {"path", "dev", "ino", "processes"}
+FIRST_ATTACH_POINT_KEYS = {"file_offset", "began_ns", "attached_ns"}
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "kernel_control", "attach_backend", "object_capture",
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
@@ -2783,11 +2784,34 @@ def exact_prearm_keys(module):
     if "first_attached_at_ns" in module:
         first = module["first_attached_at_ns"]
         require(u64(first), f"invalid first_attached_at_ns: {module}")
+        # A replacement attach that failed after the first complete attach
+        # leaves the current instant null; a known one never precedes the
+        # first.
         attached = module.get("attached_at_ns")
         require(
-            attached is not None and first <= attached,
+            attached is None or first <= attached,
             f"first_attached_at_ns after attached_at_ns: {module}",
         )
+    if "first_attach_points" in module:
+        points = module["first_attach_points"]
+        require(
+            isinstance(points, list) and points,
+            f"invalid first_attach_points: {module}",
+        )
+        for point in points:
+            require(
+                isinstance(point, dict) and set(point) == FIRST_ATTACH_POINT_KEYS,
+                f"invalid first attach point keys: {module}",
+            )
+            require(
+                u64(point["file_offset"])
+                and u64(point["attached_ns"])
+                and (
+                    point["began_ns"] is None
+                    or (u64(point["began_ns"]) and point["began_ns"] <= point["attached_ns"])
+                ),
+                f"invalid first attach point: {module}",
+            )
     if "unobserved_windows" in module:
         windows = module["unobserved_windows"]
         require(isinstance(windows, list), f"invalid unobserved_windows: {module}")
@@ -5104,6 +5128,33 @@ def self_test():
             lambda bad=bad: exact_prearm_keys(dict(learned_module, first_loaded_by=bad))
         )
     print("first_loaded_by closed shape validates both arms and rejects extras: OK")
+    # First complete attach (additive `first_attached_at_ns` and
+    # `first_attach_points`): a replacement attach that failed after an
+    # earlier complete attach leaves `attached_at_ns` null while the first
+    # attach stays disclosed; the first attach never follows a known
+    # current one, and each point's begin never follows its completion.
+    attach_module = dict(discovery_fixture(("prearm",))[0])
+    points = [
+        {"file_offset": 4096, "began_ns": 90, "attached_ns": 100},
+        {"file_offset": 8192, "began_ns": None, "attached_ns": 120},
+    ]
+    for good in (
+        {"attached_at_ns": None, "first_attached_at_ns": 120},
+        {"attached_at_ns": 900, "first_attached_at_ns": 120, "first_attach_points": points},
+        {"attached_at_ns": None, "first_attached_at_ns": 120, "first_attach_points": points},
+    ):
+        exact_prearm_keys(dict(attach_module, **good))
+    for bad in (
+        {"attached_at_ns": 100, "first_attached_at_ns": 120},
+        {"first_attached_at_ns": -1},
+        {"first_attached_at_ns": None},
+        {"first_attach_points": []},
+        {"first_attach_points": [{"file_offset": 1, "began_ns": 130, "attached_ns": 120}]},
+        {"first_attach_points": [{"file_offset": 1, "attached_ns": 120}]},
+        {"first_attach_points": [dict(points[0], pid=7)]},
+    ):
+        rejected(lambda bad=bad: exact_prearm_keys(dict(attach_module, **bad)))
+    print("first attach keys survive a failed replacement and pin their shape: OK")
     # The always-emitted standard-layout withheld count (ruling
     # 2026-11-11 clause 2): zero and nonzero ride the clean lane
     # without moving completeness, and malformed values are refused

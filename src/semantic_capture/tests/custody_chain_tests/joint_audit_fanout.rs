@@ -10949,6 +10949,43 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
             .admission_voided(&pre_void_admission),
         "the idle void fenced the collected original"
     );
+    // The route is scoped to this journal's own producers and domain: a
+    // same-shaped admission from another native domain is never this
+    // void's claim, even with `voided_through` already raised here.
+    let mut foreign = JointScene::new(1);
+    let foreign_pid = std::process::id();
+    foreign.bind(
+        foreign_pid,
+        ImageIdentity {
+            task_cookie: 74,
+            exec_id: 0,
+        },
+        &[0],
+    );
+    foreign.push(foreign_pid, 0, "C_SignInit", 9);
+    let foreign_raw = foreign.prepare(1);
+    let foreign_admission = foreign
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("the foreign lane admits one call")
+        .clone();
+    let _ = foreign.ingest(foreign_raw);
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .admission_voided(&foreign_admission),
+        "another native domain's admission is not this void's claim"
+    );
     // Both calls were applied: the orphaned pre-void call as plain
     // S1 (its observed return is kept) and the fresh post-void call
     // on its feed.
@@ -11079,6 +11116,115 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         "the later call still applies"
     );
     assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// Keyrows N1 fix negative control: an admission from an earlier H0
+/// quantum whose retained original is gone from `open` without a void
+/// must still refuse at the claim step. The stop path clears every
+/// retained entry and raises no void fence, so this absence is not a
+/// voided claim even though the producer and quantum facts resemble
+/// one. Removing the `voided_through` fence check would route the call
+/// to plain S1 instead of refusing.
+#[test]
+fn joint_claim_refuses_an_absent_original_without_a_void() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let older = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    let (ingested1, _proof, grant) = fixture.ingest_with_grant(raw1);
+    assert!(
+        ingested1.matches_admission(&older),
+        "the first quantum owns the older admission"
+    );
+    // The second quantum leaves the older admission in an earlier H0
+    // quantum; its exact retained entry is still open and unclaimed.
+    fixture.push(pid, 0, "C_SignInit", 2);
+    let raw2 = fixture.collect_with_fault(&BirthFault);
+    fixture.real.h0.0.borrow_mut().collected = Some(raw2);
+    let _batch2 = fixture.real.tick();
+    let raw2 = fixture
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .expect("the second tick returns the collected raw");
+    let ingested2 = raw2
+        .ingest(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.producers,
+            &grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("the second quantum ingests: {reason:?}"));
+    assert!(
+        !ingested2.matches_admission(&older),
+        "the older admission belongs to the earlier quantum"
+    );
+    {
+        let adapter = fixture.real.scene.coordinator.joint_capture().adapter();
+        assert!(
+            ingested2.matches_retained_admission(&older, adapter),
+            "the older admission still owns its exact retained entry"
+        );
+        assert!(
+            !ingested2.admission_voided(&older, adapter),
+            "no void has fenced the older admission"
+        );
+    }
+    // The stop path clears every retained entry without raising the
+    // void fence, so the original is gone while `voided_through` stays
+    // zero.
+    {
+        let (adapter, model) = fixture.real.scene.coordinator.joint_capture_mut().parts();
+        let _ = adapter.stop(model);
+        assert_eq!(
+            adapter.voided_through_for_test(),
+            0,
+            "the stop path removes retained entries without a void"
+        );
+        assert!(
+            !ingested2.matches_retained_admission(&older, adapter),
+            "the stopped journal retains no original"
+        );
+    }
+    let refusal = match fixture
+        .real
+        .scene
+        .coordinator
+        .claim_next_prepared_admission(&fixture.producers, &ingested2)
+    {
+        Ok(claim) => panic!("an unvoided absent original must not claim: {claim:?}"),
+        Err(refusal) => refusal,
+    };
+    assert_eq!(
+        refusal,
+        RawQuantumRefusal::Admission,
+        "the claim refuses an original removed without a void"
+    );
+    assert!(
+        !ingested2.admission_voided(
+            &older,
+            fixture.real.scene.coordinator.joint_capture().adapter()
+        ),
+        "an absent original with no void fence is not a voided claim"
+    );
 }
 
 /// Keyrows T1 fix4 B1 twin: a Joint feed's seal waits (BoundNotReady)

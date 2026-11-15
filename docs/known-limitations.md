@@ -265,9 +265,32 @@ place in the run tree, resumes at most 1 s after its kernel stop (or
 in the first pass that reads it, when the observer is busier than
 that) and files the learned first-use gap row. So does a member whose
 maps or stopping file could not be read, and a member moved out of
-the run cgroup while stopped (it resumes at once). If the watchdog is
+the run cgroup while stopped (it resumes at once). The stopping
+mapping is matched exactly (same range, and in the hook's own device
+domain the same inode); on another device it counts only on an
+overlay mount, and opened by path rather than through `map_files`
+(which needs `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`) it must also
+be the stopped inode; otherwise the stopping file stays unproven and
+the row is filed, also when another mapped file holds the member for
+its provider. The observer reads the stopped member's `mountinfo`
+after its maps (the whole file, up to 4 MiB, keeping only FUSE and
+overlay device numbers). If the watchdog is
 lost, every held and pending member resumes at once, with the same
-row when its provider was not attached yet. A staging the
+row when its provider was not attached yet, or when a provider a stop
+staged has not attached yet (no later mapper is stopped for it once
+the stops are off). When the stops end (capture end or a lost
+watchdog) the observer switches the hook off, then waits one RCU grace
+period (`membarrier`) for hook calls already running before it resumes
+anyone. Where the kernel gives no such wait (`nohz_full`, one online
+CPU) it instead reads each pending member's maps before the resume
+(which waits out a hook call inside that member's mapping) and scans
+the table once more; a hook call preempted past that second scan can
+still leave a member stopped (send it SIGCONT). In the microseconds
+between a member's resume and the withdrawal of its row, a file it
+maps first is not stopped (the kernel keeps one row per process) and
+that refusal is not counted; the owned-tree watch still learns the
+file, but when another member's stop already staged it, its first-use
+row can be missed. A staging the
 learned-file cap or the pin budget refuses resumes the member at once,
 beside its refusal row. Measured on the local host under 8 extra
 CPU burners: ten sequential python workers loading SoftHSM observe
@@ -285,7 +308,10 @@ other never-admitted members. A job-control shell in the run tree
 can see its child briefly stopped (`CLD_STOPPED`). An observer
 killed with SIGKILL (or aborted) leaves its stopped members to the
 run's watchdog, a separate process in its own session outside the
-run cgroup, holding only `CAP_KILL` and no-new-privileges, that sends
+run cgroup, holding only `CAP_KILL` (plus `CAP_SYS_PTRACE` when
+`/proc` is mounted with `hidepid`, as `ProtectProc=` does, so it can
+still see members of other users) and no-new-privileges (a failed drop
+is printed under `-v`), that sends
 SIGCONT to every stopped member of the run tree (any stopped thread
 counts, also after the main thread exited) except the direct child (a bounded walk: 256 cgroups, 8 levels, 4 MiB
 per process list), in sweeps scheduled up to 1.6 s after the death (a
@@ -300,10 +326,15 @@ runs again (`fg`). No heartbeat covers that case: a missed-heartbeat
 timeout would also fire on a live observer that is only slow on a busy
 host, and the watchdog would then resume a held member before its
 probes attach, without the first-use gap row. A stopped member's
-file on a FUSE mount (`fuse`, `fuse.*`, `fuseblk`) is never opened,
-because its server may itself be a stopped member: that member resumes
-at once and the learned first-use row is filed. One blocking open
-remains: the owned-tree watch opens a FUSE-backed provider on the
+file on a FUSE mount (`fuse`, `fuse.*`, `fuseblk`, `fuseblk.*`, by the
+device numbers its `mountinfo` lists) is not opened, because its
+server may itself be a stopped member: that member resumes at once and
+the learned first-use row is filed. Two FUSE cases are still opened: a
+neighbor file on an overlay whose layer is FUSE (its row names the
+overlay device), and a FUSE superblock not mounted in the member's
+namespace (lazily unmounted, or reached through an inherited
+descriptor); such an open can block like the next case. One more
+blocking open remains: the owned-tree watch opens a FUSE-backed provider on the
 capture thread, so if that file's FUSE server is a run member stopped
 at the same moment (at its own first map of a new file), the open, and
 with it the capture loop and every hold bound, waits for a server that

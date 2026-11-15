@@ -1142,6 +1142,9 @@ pub struct Engine {
     /// needs a real dying thread group.
     #[cfg(test)]
     final_exit_views_for_test: BTreeSet<ProcessViewId>,
+    /// Caller line seen by the latest `queue_retirement_within` call.
+    #[cfg(test)]
+    last_retirement_caller_line_for_test: Option<u32>,
     /// Fails the next loader locate with the `ENOENT` an exiting group's
     /// executable or mappings return.
     #[cfg(test)]
@@ -13199,6 +13202,8 @@ impl Engine {
             pin_probe_script: RefCell::new(VecDeque::new()),
             #[cfg(test)]
             final_exit_views_for_test: BTreeSet::new(),
+            #[cfg(test)]
+            last_retirement_caller_line_for_test: None,
             #[cfg(test)]
             fail_next_loader_locate_for_test: false,
             #[cfg(test)]
@@ -25427,6 +25432,7 @@ impl Engine {
     /// [`Self::queue_stale_views`] with one final-exit read budget shared by
     /// the whole batch: a spent budget answers "not ending" and the loss
     /// stays counted.
+    #[track_caller]
     fn queue_stale_views_within(
         &mut self,
         stale: &BTreeSet<ProcessViewId>,
@@ -25502,7 +25508,9 @@ impl Engine {
     }
 
     /// [`Self::queue_retirement`] charging its final-exit proof to a
-    /// caller-owned budget, so batch callers share one bound.
+    /// caller-owned budget, so batch callers share one bound. It tracks
+    /// its caller, so the loss witness names the real enqueue site.
+    #[track_caller]
     fn queue_retirement_within(
         &mut self,
         view: ProcessViewId,
@@ -25510,6 +25518,10 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         work: &mut crate::process::leader_exit::LeaderExitReadBudget,
     ) {
+        #[cfg(test)]
+        {
+            self.last_retirement_caller_line_for_test = Some(std::panic::Location::caller().line());
+        }
         // One exit observation per call: a positive proof below must
         // survive a later observation failure instead of becoming fatal
         // loss, so the merge reuses this verdict and never re-reads.
@@ -25740,13 +25752,27 @@ impl Engine {
     ) -> bool {
         // One bound for the whole batch: a large retirement set spends at
         // most one proof's budget, and a spent budget keeps the gap.
-        let mut work = crate::process::leader_exit::LeaderExitReadBudget::for_final_exit_proof();
+        self.postpones_only_ending_cleanup_within(
+            no_new_views,
+            no_refreshed_views,
+            &mut crate::process::leader_exit::LeaderExitReadBudget::for_final_exit_proof(),
+        )
+    }
+
+    /// [`Self::postpones_only_ending_cleanup`] charging every retained
+    /// view's final-exit proof to one caller-owned budget.
+    fn postpones_only_ending_cleanup_within(
+        &self,
+        no_new_views: bool,
+        no_refreshed_views: bool,
+        work: &mut crate::process::leader_exit::LeaderExitReadBudget,
+    ) -> bool {
         no_new_views
             && no_refreshed_views
             && self.pending_rejected_keys.is_empty()
             && self.pending_retirements.iter().all(|view| {
                 !self.views.iter().any(|retained| retained.id() == *view)
-                    || self.original_ending_within(*view, &mut work)
+                    || self.original_ending_within(*view, work)
             })
     }
 

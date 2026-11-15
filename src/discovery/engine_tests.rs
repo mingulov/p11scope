@@ -84180,3 +84180,75 @@ fn stale_batch_shares_one_final_exit_budget() {
         .count();
     assert_eq!(losses, 1, "{:?}", engine.counters.object_skips);
 }
+
+/// The postponement check shares one final-exit read budget across the
+/// pending-retirement batch: with room for one proof, the first ending
+/// group is proven and the second, out of budget, is postponed work.
+#[test]
+fn postponement_check_shares_one_final_exit_budget() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let first = engine.views[0].id();
+    let other = ProcessViewId(4);
+    engine
+        .views
+        .push(ProcessView::open(other, second.id()).unwrap());
+    engine.next_view_id = 5;
+    engine.set_final_exit_for_test(first);
+    engine.set_final_exit_for_test(other);
+    engine.pending_retirements.insert(first);
+    let one = |engine: &Engine| {
+        engine.postpones_only_ending_cleanup_within(
+            true,
+            true,
+            &mut crate::process::leader_exit::LeaderExitReadBudget::for_test(1),
+        )
+    };
+    assert!(one(&engine), "one proof fits the budget");
+    engine.pending_retirements.insert(other);
+    assert!(
+        !one(&engine),
+        "the spent budget proves nothing for the second view"
+    );
+    assert!(
+        engine.postpones_only_ending_cleanup(true, true),
+        "the production budget covers both"
+    );
+    for c in [&mut child, &mut second] {
+        c.kill().unwrap();
+        c.wait().unwrap();
+    }
+}
+
+/// `#[track_caller]` reaches `queue_retirement_within` through the
+/// single and batch wrappers, so the loss witness's `enqueue_line` names
+/// the real enqueue site, not an internal helper line.
+#[test]
+fn queue_retirement_reports_the_real_enqueue_line() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    let mut pending = PendingViewRetirements::new();
+
+    let direct = line!() + 1;
+    engine.queue_retirement(view, RetirementCause::GenerationLost, &mut pending);
+    assert_eq!(engine.last_retirement_caller_line_for_test, Some(direct));
+
+    let stale = line!() + 1;
+    engine.queue_stale_views(&BTreeSet::from([view]), &mut pending);
+    assert_eq!(engine.last_retirement_caller_line_for_test, Some(stale));
+
+    let outcome = ApplyOutcome {
+        stale_views: BTreeSet::from([view]),
+        ..ApplyOutcome::default()
+    };
+    let applied = line!() + 1;
+    engine.queue_apply_outcome(&outcome, &mut pending);
+    assert_eq!(engine.last_retirement_caller_line_for_test, Some(applied));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}

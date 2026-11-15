@@ -336,6 +336,29 @@ fn metadata_record(
 }
 
 #[test]
+fn departed_exec_instants_prune_within_the_grace_but_keep_live_tasks() {
+    let mut run = Run::new();
+    for pid in 100..132u32 {
+        let at = run.clock;
+        run.clock += 10;
+        run.binder
+            .absorb_lifecycle(&drained(run.domain, &[(pid, at)], at));
+    }
+    assert_eq!(run.binder.exec_instants_for_test(), 32);
+    let live = 100u32;
+    run.binder.prune_departed(
+        |pid| pid != live,
+        run.clock + 180_000_000_000,
+        180_000_000_000,
+    );
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        1,
+        "only the live task's instant survives the grace"
+    );
+}
+
+#[test]
 fn metadata_binding_requires_genuine_settled_postcoverage_image_not_record_authority() {
     use super::super::caller_registry::ImageAuthority;
     for exec in [0, 0x8000_0000_0000_0001] {

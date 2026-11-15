@@ -86275,6 +86275,7 @@ fn member_stop_clears_non_provider_files_and_resumes_at_once() {
 /// On overlayfs the hook keys the backing file (its own superblock
 /// device) while `maps` prints the overlay device: the stopping file is
 /// cleared under the kernel's key, so its next mapper does not stop on it.
+/// (The maps device is declared an overlay mount.)
 #[test]
 fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
     let mut child = std::process::Command::new("sleep")
@@ -86300,6 +86301,7 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
     let mut io = ScriptedMemberStops::default();
     io.rows.insert(pid, member_stop_row(pid, &exe, kernel));
     let mut engine = member_stop_engine();
+    engine.member_stops.overlay_devs = Some(BTreeSet::from([maps_key.dev]));
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert!(
@@ -86315,9 +86317,12 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
 
 /// Twin: the overlay's backing inode number differs from the one `maps`
 /// prints as well. The kernel row's range still names the stopping
-/// mapping, so its kernel key is cleared.
+/// mapping, but neither open reaches the kernel row's inode here (by
+/// path: the inode maps printed; through `map_files`: the same, on a
+/// filesystem that is not really an overlay), so the stopping file is
+/// unproven: its kernel key stays uncleared and the named row is filed.
 #[test]
-fn member_stop_clears_the_kernel_key_when_maps_show_another_inode() {
+fn member_stop_leaves_an_overlay_inode_mismatch_unproven() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
         .die_with_parent()
@@ -86341,13 +86346,16 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_inode() {
     let mut io = ScriptedMemberStops::default();
     io.rows.insert(pid, member_stop_row(pid, &exe, kernel));
     let mut engine = member_stop_engine();
+    engine.member_stops.overlay_devs = Some(BTreeSet::from([maps_key.dev]));
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert!(
-        io.cleared.contains(&kernel),
-        "the kernel key of the stopping file is cleared: {:?}",
+        !io.cleared.contains(&kernel),
+        "an unproven stopping file stays uncleared: {:?}",
         io.cleared
     );
+    assert_eq!(engine.member_stop_stats_for_test().unproven_resumes, 1);
+    assert!(files_the_first_use_row(&engine));
     assert!(member_resumed_for_test(pid), "the member runs again");
     let _ = child.kill();
     let _ = child.wait();

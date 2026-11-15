@@ -212,6 +212,31 @@ mod tests {
     use super::*;
     use crate::fixture_guard::DieWithParent as _;
 
+    /// Waits for `child` to exit within 10 s; on timeout fails with the
+    /// pending rows and the child's executable maps rows, never hangs.
+    fn wait_bounded(
+        child: &mut std::process::Child,
+        hooks: &mut MemberStopHooks,
+        what: &str,
+    ) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let pending = hooks.pending().unwrap_or_default();
+                let maps = std::fs::read_to_string(format!("/proc/{}/maps", child.id()))
+                    .unwrap_or_default();
+                let exec: Vec<&str> = maps.lines().filter(|line| line.contains(" r-x")).collect();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what} never finished: pending {pending:?}; maps {exec:#?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     fn task_states(pid: u32) -> Vec<u8> {
         crate::discovery::pause::read_task_states(pid)
             .map(|states| states.into_values().collect())
@@ -272,7 +297,7 @@ mod tests {
             "the exempt tgid never stops"
         );
         assert!(
-            exempt.wait().unwrap().success(),
+            wait_bounded(&mut exempt, &mut hooks, "the exempt child").success(),
             "the exempt child runs through"
         );
         let mut stopped = false;
@@ -304,6 +329,11 @@ mod tests {
                 .any(|line| line.contains(&format!(" {} ", stop.file.ino))),
             "the row names a file the member maps"
         );
+        // The row's own kernel key: for an overlayfs mapping it differs
+        // from the device `maps` prints, and clearing it is what the
+        // engine does for the stopping file.
+        hooks.clear(stop.file).unwrap();
+        let mut cleared = std::collections::BTreeSet::from([stop.file]);
         hooks.withdraw(member.id()).unwrap();
         let pin = crate::process::PidPin::open(member.id()).unwrap();
         pin.send_signal(libc::SIGCONT).unwrap();
@@ -318,6 +348,7 @@ mod tests {
             for (tgid, later) in hooks.pending().unwrap() {
                 if tgid == member.id() {
                     hooks.clear(later.file).unwrap();
+                    cleared.insert(later.file);
                     hooks.withdraw(tgid).unwrap();
                     let _ = pin.send_signal(libc::SIGCONT);
                 }
@@ -339,16 +370,35 @@ mod tests {
         group.place(again.id()).unwrap();
         again.stdin.take().unwrap().write_all(b"go\n").unwrap();
         let counted_before = hooks.counters().unwrap()[0];
-        assert!(
-            again.wait().unwrap().success(),
-            "cleared files never stop a mapper"
-        );
-        assert_eq!(
-            hooks.counters().unwrap()[0],
-            counted_before,
-            "no stop requested for cleared files"
-        );
         assert!(counted_before >= 1);
+        // A file it stops on must be new: never a cleared kernel key. (A
+        // file `maps` named under another device on an overlay may still
+        // stop it once; it is cleared under its own key and resumed.)
+        let again_pin = crate::process::PidPin::open(again.id()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = again.try_wait().unwrap() {
+                break status;
+            }
+            for (tgid, later) in hooks.pending().unwrap() {
+                if tgid == again.id() {
+                    assert!(
+                        cleared.insert(later.file),
+                        "a cleared file stopped the second mapper: {later:?}"
+                    );
+                    hooks.clear(later.file).unwrap();
+                    hooks.withdraw(tgid).unwrap();
+                    let _ = again_pin.send_signal(libc::SIGCONT);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second mapper never finished: pending {:?}",
+                hooks.pending().unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert!(status.success(), "the second mapper runs through");
         drop(hooks);
     }
 }

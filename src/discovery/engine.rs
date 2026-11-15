@@ -15438,6 +15438,10 @@ impl Engine {
         self.exec_rearm_views.remove(&id);
         self.pending_leader_exit_order.remove(&id);
         self.leader_exit_hook_ns.remove(&id);
+        // The tick prunes retry counts only at its start: a view released
+        // mid-tick must not pass its spent budget to a newcomer admitted
+        // under the reused ID in the same tick.
+        self.owned_incomplete_scans.remove(&id);
         if let Some(seed) = self.trace_by_view.get(&id).copied() {
             if let Some(proof) = &self.trace_owner
                 && let Some(candidate) = self.trace_seeds.get(&seed)

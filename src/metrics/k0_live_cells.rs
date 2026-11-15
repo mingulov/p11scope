@@ -736,9 +736,8 @@ fn spawn_run_observer(
         "-o",
         out.to_str().context("out path")?,
     ]);
-    // The gate-less probe overrides the pause policy through the
-    // environment; every other shape runs explicit `never` (the
-    // pre-0.7.0 default the cells were qualified under).
+    // The caller picks the pause policy (`k0_owned_run`); `never` when
+    // it names none.
     command.args(["--pause", pause.unwrap_or("never")]);
     command.args([
         "--",
@@ -877,6 +876,20 @@ fn k0_owned_run(
         Path::new("-")
     } else {
         &gate
+    };
+    // A gated child binds (its C_GetFunctionList) as soon as the gate
+    // opens, while the observer may still be attaching the provider's
+    // dynamic export hooks for its load: the return hook goes live
+    // first, so a call that enters between the two attaches returns
+    // with no entry state and counts a discovery state failure, which
+    // voids the window as caller-changed (traced: return hook live, the
+    // call, then the entry hook). `--pause always` holds the child at
+    // its provider load until those hooks are live, so its binding is
+    // always observed whole. The gate-less probe keeps its own policy
+    // (environment, else `never`).
+    let pause = match shape {
+        OwnedChild::Gateless => pause,
+        OwnedChild::Held | OwnedChild::ExitsAfter { .. } => pause.or(Some("always")),
     };
     let mut child = spawn_run_observer(
         observer,

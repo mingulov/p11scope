@@ -93,6 +93,15 @@ impl CollectedCallOrigin {
     pub(crate) fn position(&self) -> u64 {
         self.position
     }
+
+    /// Whether this origin was collected in a newer quantum than
+    /// `ingested`. Quantum identities are minted from one monotone
+    /// counter in collection order, so a higher identity is a newer
+    /// allocation supplied against a stale ingest; an equal one is the
+    /// current quantum.
+    pub(crate) fn newer_than(&self, ingested: RawQuantumIdentity) -> bool {
+        self.quantum.0 > ingested.0
+    }
 }
 
 #[cfg(test)]
@@ -580,11 +589,9 @@ impl IngestedRaw {
             && adapter.matches_retained_admission(admitted)
     }
 
-    /// Whether a void wiped this admission's retained original before the
-    /// claim: a same-domain collected admission whose exact H8 invocation
-    /// is no longer retained after a void. The claim step retains such an
-    /// orphan as plain S1 with a counted gap, preserving the observed
-    /// call instead of stopping the lane.
+    /// Whether a void recorded wiping this admission's retained original
+    /// before the claim: a same-domain collected admission whose exact H8
+    /// invocation left `open` under the latest void wipe.
     pub(crate) fn admission_voided(
         &self,
         admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
@@ -592,6 +599,27 @@ impl IngestedRaw {
     ) -> bool {
         admitted.journal_binding().0 == self.raw.producers.native_domain()
             && adapter.admission_voided(admitted)
+    }
+
+    /// Classify an admission whose exact claim failed, so the claim step
+    /// can retain it as plain S1 instead of stopping the lane. An
+    /// admission collected in a newer quantum than this ingest means the
+    /// caller supplied a stale quantum, which stays a refusal (`None`).
+    /// Classification then names only what the adapter can observe
+    /// exactly.
+    pub(crate) fn claim_refusal_cause(
+        &self,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        adapter: &JournalAdapter,
+    ) -> Option<crate::discovery::caller_registry::instance_input::PlainS1Cause> {
+        if admitted.journal_binding().0 != self.raw.producers.native_domain() {
+            return None;
+        }
+        let origin = admitted.collected_origin()?;
+        if origin.newer_than(self.raw.identity) {
+            return None;
+        }
+        Some(adapter.claim_refusal_cause(admitted))
     }
 
     pub(crate) fn disposition_s1only_original<'adapter, 'input>(

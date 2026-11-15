@@ -902,12 +902,11 @@ impl PreparedAdmission {
     }
 }
 
-/// One claim-scan step: the next claim, plus the batch's one-shot
-/// disclosure of admissions routed to plain S1 because a void wiped
-/// their retained original.
+/// One claim-scan step: the next claim. Admissions that cannot be
+/// certified on this scan are marked plain S1 with their cause and
+/// counted at reduction, never here.
 pub(super) struct ClaimStep {
     pub(super) claim: Option<PreparedClaim>,
-    pub(super) voided_s1: Option<u64>,
 }
 
 pub(super) struct PreparedH3 {
@@ -930,11 +929,6 @@ pub(crate) struct PreparedSemanticBatch {
     claim_cursor: usize,
     stage_cursor: usize,
     births_decided: bool,
-    /// Admissions whose retained H8 original a void wiped before the
-    /// claim; they reduce as plain S1 instead of refusing the lane.
-    voided_s1: u64,
-    /// The batch staged its one counted disclosure for `voided_s1`.
-    voided_s1_disclosed: bool,
     // Buffers and nested owned payloads drop before their retained charge.
     storage: Option<ResourceLease>,
     /// Test-only legacy switch: file fingerprint claims even without
@@ -971,8 +965,6 @@ impl PreparedSemanticBatch {
             claim_cursor: 0,
             stage_cursor: 0,
             births_decided: false,
-            voided_s1: 0,
-            voided_s1_disclosed: false,
             storage: None,
             #[cfg(test)]
             test_legacy_claims: false,
@@ -1080,27 +1072,31 @@ impl PreparedSemanticBatch {
             // Conversion refusals need no journal claim. Their original
             // positions remain owned until the staging/refusal cursor moves.
             if let Some(Ok(input)) = &mut entry.input {
+                // An already-retained admission has no claim to make; a
+                // rescan must not re-decide or re-count it.
+                if input.plain_s1() {
+                    next += 1;
+                    continue;
+                }
                 if !ingested.matches_admission(input)
                     && !ingested.matches_retained_admission(input, adapter)
                 {
-                    // A void may have wiped this admission's retained
-                    // original after it was observed. Observed history
-                    // that can no longer be certified still counts:
-                    // retain the call as plain S1 with a counted gap
-                    // instead of refusing the whole semantic lane. A
-                    // replay, a duplicate or a fenceless foreign
-                    // original whose invocation is still retained stays
-                    // a claim refusal. An original an earlier taint
-                    // removed is a first offer: it refuses before any
-                    // void and is retained under the void gap after one
-                    // (tracked as F4).
-                    if ingested.admission_voided(input, adapter) {
-                        input.retain_as_plain_s1();
-                        self.voided_s1 = self.voided_s1.saturating_add(1);
-                        next += 1;
-                        continue;
-                    }
-                    return Err(RawQuantumRefusal::Admission);
+                    // A stashed admission may no longer certify its
+                    // retained original (a void wiped it, a taint
+                    // removed it, or a replay/duplicate/foreign row
+                    // owns the invocation). Observed history still
+                    // counts: retain the call as plain S1 under a named
+                    // cause and keep scanning instead of refusing the
+                    // whole semantic lane. The gap is counted once at
+                    // reduction, where the caller is known. Only a
+                    // caller-supplied stale ingest (an admission newer
+                    // than it) stays a refusal.
+                    let Some(cause) = ingested.claim_refusal_cause(input, adapter) else {
+                        return Err(RawQuantumRefusal::Admission);
+                    };
+                    input.retain_as_plain_s1(cause);
+                    next += 1;
+                    continue;
                 }
                 // Without a journal BEGIN feed no fingerprint claim can
                 // ever be consumed: the store would fill after 2048
@@ -1134,16 +1130,7 @@ impl PreparedSemanticBatch {
     /// S1. A mid-scan claim keeps the count for the final step, so one
     /// batch stages one counted gap however its claims interleave.
     fn claim_step(&mut self, claim: Option<PreparedClaim>) -> ClaimStep {
-        let voided_s1 = if self.claim_cursor == self.entries.len()
-            && self.voided_s1 > 0
-            && !self.voided_s1_disclosed
-        {
-            self.voided_s1_disclosed = true;
-            Some(self.voided_s1)
-        } else {
-            None
-        };
-        ClaimStep { claim, voided_s1 }
+        ClaimStep { claim }
     }
 
     pub(super) fn dispose_claims_s1(&mut self) {
@@ -1357,7 +1344,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(RawQuantumRefusal::Admission);
         }
         for entry in &batch.entries {
-            // A voided pre-void admission is claimed as plain S1, not
+            // An admission retained as plain S1 is not claimed as
             // Joint evidence: it stages no birth and names no original.
             if let Some(Ok(input)) = &entry.input
                 && !input.plain_s1()
@@ -1749,20 +1736,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(RawQuantumRefusal::ForeignCapture);
         }
         let step = batch.claim_next(adapter, ingested, producers.journal_linked())?;
-        if let Some(retained) = step.voided_s1 {
-            // The lost per-key detail is disclosed as one counted gap;
-            // the calls themselves stay as plain S1 evidence.
-            self.registry.record_gap(RegistryGap {
-                caller: None,
-                module: None,
-                pid: None,
-                subject: "Joint key operations unavailable; retained S1".into(),
-                reason: format!(
-                    "joint_void_stashed_claim_history_loss ({retained} call(s) retained S1)"
-                ),
-                budget: None,
-            });
-        }
         Ok(step.claim)
     }
 

@@ -4799,6 +4799,8 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
         "joint_journal_unavailable",
         "joint_void_fault_changed_history_loss",
         "joint_void_ingest_break_loss_history_loss",
+        "joint_unretained_claim_history_loss",
+        "joint_unclaimable_claim_history_loss",
         "joint_resume_deferred_below_fence",
     ] {
         presentation.gaps.push(GapView {
@@ -4858,9 +4860,9 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     let lines: Vec<&str> = out.lines().collect();
     let start = lines
         .iter()
-        .position(|line| *line == "gaps: 6")
+        .position(|line| *line == "gaps: 8")
         .expect("gaps header");
-    for line in &lines[start..start + 6] {
+    for line in &lines[start..] {
         assert!(
             line.chars().count() <= 100,
             "over 100 chars: {line:?}:\n{out}"
@@ -4871,6 +4873,8 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
         "joint_fallback_",
         "joint_journal_unavailable",
         "joint_void_",
+        "joint_unretained_",
+        "joint_unclaimable_",
         "joint_resume_",
         "keeps S1",
     ] {
@@ -4889,6 +4893,8 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     for token in [
         "(joint_void_fault_changed_history_loss)",
         "(joint_void_ingest_break_loss_history_loss)",
+        "(joint_unretained_claim_history_loss)",
+        "(joint_unclaimable_claim_history_loss)",
         "(joint_resume_deferred_below_fence)",
     ] {
         assert!(verbose.contains(token), "{token} missing: {verbose}");

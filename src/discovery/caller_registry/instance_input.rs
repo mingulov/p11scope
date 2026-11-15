@@ -1056,7 +1056,7 @@ impl AdmittedInstanceCall {
             object: None,
             joint_resource: None,
             collected_origin: None,
-            plain_s1: false,
+            plain_s1: None,
         }
     }
 
@@ -1229,11 +1229,35 @@ pub(crate) struct AdmittedInstanceCall {
     /// consulted to decide admission, coverage or semantic attribution.
     joint_resource: Option<JointResourceOrigin>,
     collected_origin: Option<crate::semantics_objects::journal::joint_driver::CollectedCallOrigin>,
-    /// The retained journal original this admission named was wiped by a
-    /// void before its claim: the call is observed history that can no
-    /// longer be certified, so it reduces as plain S1 (its observed
-    /// return is kept) with a counted gap, never refuses the lane.
-    plain_s1: bool,
+    /// Why this admission could not be certified against its retained
+    /// journal original and reduces as plain S1 (its observed return is
+    /// kept) with a counted gap, never stopping the lane.
+    plain_s1: Option<PlainS1Cause>,
+}
+
+/// Why the claim step routed one observed admission to plain S1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlainS1Cause {
+    /// A void recorded wiping the exact H8 original before the claim.
+    Voided,
+    /// The exact H8 original is gone with no recorded void wipe (an
+    /// image taint removed it, or the journal stopped).
+    Unretained,
+    /// The invocation is still retained, or the admission cannot name a
+    /// consistent original (a replay, a duplicate, a tainted row or a
+    /// foreign origin).
+    Unclaimable,
+}
+
+impl PlainS1Cause {
+    /// Stable gap reason for one call retained as plain S1.
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::Voided => "joint_void_stashed_claim_history_loss",
+            Self::Unretained => "joint_unretained_claim_history_loss",
+            Self::Unclaimable => "joint_unclaimable_claim_history_loss",
+        }
+    }
 }
 
 impl fmt::Debug for AdmittedInstanceCall {
@@ -1318,19 +1342,25 @@ impl AdmittedInstanceCall {
         self.joint_resource.as_ref()
     }
 
-    /// Whether this admission's retained H8 original was wiped by a
-    /// void before its claim: the call keeps its observed return as
-    /// plain S1, so claiming never stops the whole semantic lane
-    /// for one orphaned pre-void admission.
+    /// Whether this admission reduces as plain S1 because its retained
+    /// H8 original could not be certified at the claim step.
     pub(crate) fn plain_s1(&self) -> bool {
+        self.plain_s1.is_some()
+    }
+
+    /// Why this admission reduces as plain S1, when it does.
+    pub(crate) fn plain_s1_cause(&self) -> Option<PlainS1Cause> {
         self.plain_s1
     }
 
-    /// Route this voided pre-void admission to plain S1. Set only by
-    /// the claim step, after the adapter proved the exact original was
-    /// voided; no other path may clear a Joint evidence claim.
-    pub(crate) fn retain_as_plain_s1(&mut self) {
-        self.plain_s1 = true;
+    /// Route this uncertifiable admission to plain S1. Set only by the
+    /// claim step; no other path may clear a Joint evidence claim.
+    pub(crate) fn retain_as_plain_s1(&mut self, cause: PlainS1Cause) {
+        debug_assert!(
+            self.plain_s1.is_none(),
+            "one admission is retained as plain S1 once"
+        );
+        self.plain_s1 = Some(cause);
     }
 
     /// Journal per-call authority (H8): this admitted call's
@@ -3422,11 +3452,14 @@ impl CallerRegistry {
         input: &AdmittedInstanceCall,
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> Result<u64, crate::semantics_edge::resources::SemanticResourceRefusal> {
-        // A voided pre-void admission is observed history that can no
-        // longer be certified: it reduces as plain S1 (keeping its
-        // return) beside the feed's normal calls, never as a Joint
-        // stage whose wiped H8 the next delivery would refuse.
-        let mut joint = !input.plain_s1()
+        // An admission whose retained original could not be certified
+        // is observed history that cannot name a Joint subject: it
+        // reduces as plain S1 (keeping its return) beside the feed's
+        // normal calls, never as a Joint stage whose H8 the next
+        // delivery would refuse. Its one counted gap is recorded after
+        // the reduction succeeds, naming this caller and the exact cause.
+        let plain_s1 = input.plain_s1_cause();
+        let mut joint = plain_s1.is_none()
             && self
                 .instance_state
                 .semantics
@@ -3436,7 +3469,7 @@ impl CallerRegistry {
                 .mode()
                 == FeedMode::Joint;
         if !joint
-            && !input.plain_s1()
+            && plain_s1.is_none()
             && ledger.is_some()
             && crate::semantics_key_use::is_clean_point(&input.facts.function)
         {
@@ -3591,7 +3624,7 @@ impl CallerRegistry {
                 }
             }
         }
-        if input.plain_s1() {
+        if plain_s1.is_some() {
             // Counted once as a call reduced S1-direct without Joint
             // evidence. A later plain-S1 call must not overtake calls
             // still awaiting their seals: fall back in order first
@@ -3617,7 +3650,7 @@ impl CallerRegistry {
                 fallback_refused = self.fallback_joint_for_order(
                     id,
                     input.caller,
-                    "voided_admission",
+                    "stashed_admission",
                     ledger.as_deref_mut(),
                 );
             }
@@ -3650,6 +3683,20 @@ impl CallerRegistry {
         );
         let refused =
             reducer.observe_with_resources_and_effects(&input.facts, &origin, &mut tee)?;
+        if let Some(cause) = plain_s1 {
+            // The call actually reduced S1-direct: count the one lost
+            // per-key detail for its caller under the exact cause. A
+            // refused or history-only application above returns before
+            // this point and is counted by its own reason instead.
+            self.record_gap(RegistryGap {
+                caller: Some(input.caller),
+                module: None,
+                pid: None,
+                subject: "Joint key operations unavailable; retained S1".into(),
+                reason: cause.reason().into(),
+                budget: None,
+            });
+        }
         Ok(fallback_refused.saturating_add(refused))
     }
 
@@ -4395,7 +4442,7 @@ pub(crate) fn admit_call_from_evidence(
         joint_resource: evidence
             .joint_resource
             .filter(|origin| origin.matches_native(evidence.domain)),
-        plain_s1: false,
+        plain_s1: None,
     })
 }
 
@@ -4680,7 +4727,7 @@ mod reference {
             object: None,
             joint_resource: None,
             collected_origin: None,
-            plain_s1: false,
+            plain_s1: None,
         }
     }
     pub(crate) enum Scope {

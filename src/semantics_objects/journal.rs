@@ -263,7 +263,7 @@ use super::{
     SessionHandle,
 };
 use crate::attach::capture::NativeDomainId;
-use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
+use crate::discovery::caller_registry::instance_input::{AdmittedInstanceCall, PlainS1Cause};
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -1490,6 +1490,11 @@ pub(crate) struct JournalAdapter {
     /// created after a void cannot certify the voided interval.
     /// Monotone; every fence-voiding seal advances it.
     voided_through: u64,
+    /// Exact native invocations the most recent `void_staged` wiped.
+    /// Replaced at every void (an admission from an older wipe falls to
+    /// the cause-neutral unretained route), bounded by the open table
+    /// (`limits.open_calls`) and never identity authority by itself.
+    void_wiped: BTreeSet<JournalNativeKey>,
     /// Last sealed checked-fault epoch: the cumulative chain. Each
     /// seal's collection must open at this epoch and the seal-time
     /// re-read must still show the audited one; a move anywhere in
@@ -1577,6 +1582,7 @@ impl JournalAdapter {
             last_audit_failure: None,
             h3_voided_below: 0,
             voided_through: 0,
+            void_wiped: BTreeSet::new(),
             last_fault: None,
             drain_pins: BTreeMap::new(),
             invalidated: false,
@@ -1656,6 +1662,13 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn voided_through_for_test(&self) -> u64 {
         self.voided_through
+    }
+
+    /// Test-only route to the production image taint, for a stashed
+    /// admission whose retained original a taint (not a void) removed.
+    #[cfg(test)]
+    pub(crate) fn taint_image_for_test(&mut self, image: (u64, u64)) {
+        self.taint_image(image, TaintCause::SightingFailure);
     }
 
     /// Test-only read of the stream break flag: the re-sync
@@ -5240,47 +5253,54 @@ impl JournalAdapter {
         .then_some(entry)
     }
 
-    /// Whether this admission may be retained as plain S1 because a void
-    /// wiped its retained H8 original before its claim. The caller has
-    /// already proved the admission does not match the current quantum and
-    /// no retained original claims it, so the remaining facts are: a void
-    /// has happened on this stream, the admission was collected (it has an
-    /// H0 origin whose position is its own H0 ordinal), its exact H8
-    /// invocation is no longer retained, and the resource origin belongs
-    /// to this adapter's producers. Such a call was observed before the
-    /// void and can no longer be certified; the claim step routes it to
-    /// plain S1 with a counted gap instead of refusing the whole semantic
-    /// lane. The H0 wire position stays in its own device domain: it is
-    /// never compared with the journal consumption ordinal a fence
-    /// records.
-    ///
-    /// Not every removal from `open` is a void: image-taint pruning,
-    /// claim-time ambiguity and the stop path also drop retained entries
-    /// without raising `voided_through`. A stashed admission whose
-    /// original an earlier taint removed is offered for claim once (the
-    /// lane stash consumes each outcome once and the claim cursor only
-    /// moves forward). Before any void it refuses; after an earlier,
-    /// unrelated void it is retained here under a gap that does not name
-    /// the removal that actually happened. That history dependence is
-    /// tracked as F4; this predicate reports only what it can observe.
+    /// Whether a void recorded wiping this admission's exact retained H8
+    /// original before its claim. The caller has already proved the
+    /// admission does not match the current quantum and no retained
+    /// original claims it; this reports only the exact wipe record. The
+    /// H0 wire position stays in its own device domain: it is never
+    /// compared with the journal consumption ordinal a fence records.
     pub(crate) fn admission_voided(&self, admitted: &AdmittedInstanceCall) -> bool {
-        if self.voided_through == 0 {
-            return false;
-        }
+        self.claim_refusal_cause(admitted) == PlainS1Cause::Voided
+    }
+
+    /// Why an admission whose exact claim failed reduces as plain S1.
+    /// The classification is exact about what it can observe:
+    ///
+    /// - `Voided`: the latest `void_staged` wiped this exact
+    ///   invocation (recorded before the table cleared);
+    /// - `Unretained`: the invocation is gone with no recorded
+    ///   void wipe (image-taint pruning, claim-time ambiguity or the
+    ///   stop path), so the reason stays cause-neutral;
+    /// - `Unclaimable`: the invocation is still retained, or
+    ///   the admission cannot name a consistent original (a replay, a
+    ///   duplicate, a tainted present row or a foreign origin).
+    ///
+    /// The decision never depends on an unrelated earlier void: only
+    /// the wipe record names a void, and that record is replaced at
+    /// every void rather than accumulated.
+    pub(crate) fn claim_refusal_cause(&self, admitted: &AdmittedInstanceCall) -> PlainS1Cause {
         let (Some(origin), Some(resource)) = (
             admitted.collected_origin(),
             admitted.joint_resource_origin(),
         ) else {
-            return false;
+            return PlainS1Cause::Unclaimable;
         };
-        if origin.position() != admitted.h0_ordinal() {
-            return false;
-        }
-        !self.open.contains_key(&resource.invocation())
-            && self
+        if origin.position() != admitted.h0_ordinal()
+            || !self
                 .resource_producers
                 .as_ref()
                 .is_some_and(|producers| resource.matches_producers(producers))
+        {
+            return PlainS1Cause::Unclaimable;
+        }
+        if self.open.contains_key(&resource.invocation()) {
+            return PlainS1Cause::Unclaimable;
+        }
+        if self.void_wiped.contains(&resource.invocation()) {
+            PlainS1Cause::Voided
+        } else {
+            PlainS1Cause::Unretained
+        }
     }
 
     /// Continued admission authority still requires an unclaimed original.
@@ -6989,6 +7009,13 @@ impl JournalAdapter {
     /// explicitly lost, so later proof resumes at or above the fence
     /// instead of silently skipping it.
     fn void_staged(&mut self) {
+        // Record every invocation this void is about to wipe, before the
+        // table clears. The set is replaced, not accumulated: it stays
+        // bounded by the open-table limit, and an admission older than
+        // the latest void is classified cause-neutrally.
+        self.void_wiped.clear();
+        self.void_wiped.extend(self.open.keys().copied());
+        debug_assert!(self.void_wiped.len() <= self.limits.open_calls);
         self.open.clear();
         self.ledger.release_all_h8open();
         self.refused.clear();

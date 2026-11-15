@@ -3216,7 +3216,10 @@ fn key_observation_plain_reason(reason: &str) -> &str {
 /// paused, never unstarted.
 fn gap_plain_subject<'a>(subject: &'a str, reason: &'a str) -> &'a str {
     if subject == "Joint key operations unavailable; retained S1" {
-        if reason.strip_prefix("joint_void_").is_some() {
+        if reason.strip_prefix("joint_void_").is_some()
+            || reason.strip_prefix("joint_unretained_").is_some()
+            || reason.strip_prefix("joint_unclaimable_").is_some()
+        {
             return "Per-key tracking lost history for tracked processes; function counts above are unaffected";
         }
         if reason == "joint_resume_deferred_below_fence" {
@@ -3262,10 +3265,14 @@ fn gap_plain_reason<'a>(subject: &str, reason: &'a str) -> &'a str {
     if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
         return "per-key tracking fell back to plain counts";
     }
-    // Scope-wide void gaps (every sub-cause) and the per-feed
-    // below-fence deferral: history loss with retained counts, and
-    // the wait to restart past it.
-    if reason.strip_prefix("joint_void_").is_some() {
+    // Scope-wide void gaps (every sub-cause), the one-call retained-S1
+    // claim gaps (exact void, cause-neutral unretained, and unclaimable),
+    // and the per-feed below-fence deferral: history loss with retained
+    // counts, and the wait to restart past it.
+    if reason.strip_prefix("joint_void_").is_some()
+        || reason.strip_prefix("joint_unretained_").is_some()
+        || reason.strip_prefix("joint_unclaimable_").is_some()
+    {
         return "per-key tracking lost part of its history";
     }
     if reason == "joint_resume_deferred_below_fence" {

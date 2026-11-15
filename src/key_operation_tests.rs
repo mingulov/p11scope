@@ -15455,14 +15455,14 @@ fn key_operation_joint_staging_charges_shared_ledger() {
     guarded.scene.adapter.ledger_mut().set_byte_limit(u64::MAX);
 }
 
-/// A voided pre-void claim on a Joint feed reduces as plain S1: the
+/// A retained-S1 claim on a Joint feed reduces as plain S1: the
 /// observed call keeps its return, never stages against the wiped H8
 /// (which would wedge the next delivery), and the feed stays Joint
 /// for its other calls. S1 direct is the one disposition that keeps
 /// the data without inventing a Joint evidence claim.
 #[test]
 fn key_operation_voided_claim_reduces_s1_on_a_joint_feed() {
-    use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
+    use crate::discovery::caller_registry::instance_input::{AdmittedInstanceCall, PlainS1Cause};
     let mut guarded = GuardedScene::new();
     let bootstrap = guarded.scene.bootstrap();
     let joint_key = guarded.key(1);
@@ -15474,7 +15474,7 @@ fn key_operation_voided_claim_reduces_s1_on_a_joint_feed() {
     let (facts, position) = guarded.admit_shape(&shape);
     let mut admitted =
         AdmittedInstanceCall::scripted(joint_key.clone(), guarded.caller, position, facts);
-    admitted.retain_as_plain_s1();
+    admitted.retain_as_plain_s1(PlainS1Cause::Unclaimable);
     guarded.registry.observe_instance_semantic(admitted);
     guarded
         .registry
@@ -15482,7 +15482,7 @@ fn key_operation_voided_claim_reduces_s1_on_a_joint_feed() {
     assert_eq!(
         guarded.edge_calls(joint_id),
         1,
-        "the voided claim reduces S1 direct, keeping its observed call"
+        "the retained-S1 claim reduces S1 direct, keeping its observed call"
     );
     assert_eq!(
         guarded.registry.joint_direct_fallback(),
@@ -15501,16 +15501,16 @@ fn key_operation_voided_claim_reduces_s1_on_a_joint_feed() {
     );
 }
 
-/// N1/C4: a voided pre-void claim whose own Joint feed still holds a
+/// N1/C4: a retained-S1 claim whose own Joint feed still holds a
 /// queued call falls that feed back in order before reducing the claim
 /// direct. The queued call replays first, the ending is named
-/// `joint_fallback_voided_admission` once for its caller, and the
+/// `joint_fallback_stashed_admission` once for its caller, and the
 /// orphan keeps its observed call as a plain S1 row. Reducing direct
 /// without the ordered fallback would overtake the queued call and
 /// leave its staging behind.
 #[test]
 fn key_operation_voided_claim_behind_a_queued_call_falls_back_in_order() {
-    use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
+    use crate::discovery::caller_registry::instance_input::{AdmittedInstanceCall, PlainS1Cause};
     let mut guarded = GuardedScene::new();
     let bootstrap = guarded.scene.bootstrap();
     let joint_key = guarded.key(1);
@@ -15535,13 +15535,13 @@ fn key_operation_voided_claim_behind_a_queued_call_falls_back_in_order() {
         1,
         "the Init is queued awaiting its seal"
     );
-    // A voided pre-void admission from the same instance arrives after
+    // A retained-S1 admission from the same instance arrives after
     // the queued Init; reducing it direct must not overtake it.
     let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
     let (facts, position) = guarded.admit_shape(&sign);
     let mut orphan =
         AdmittedInstanceCall::scripted(joint_key.clone(), guarded.caller, position, facts);
-    orphan.retain_as_plain_s1();
+    orphan.retain_as_plain_s1(PlainS1Cause::Unclaimable);
     guarded.registry.observe_instance_semantic(orphan);
     guarded
         .registry
@@ -15552,14 +15552,14 @@ fn key_operation_voided_claim_behind_a_queued_call_falls_back_in_order() {
         .iter()
         .cloned()
         .chain(guarded.registry.staged_gaps_for_test())
-        .filter(|gap| gap.reason == "joint_fallback_voided_admission")
+        .filter(|gap| gap.reason == "joint_fallback_stashed_admission")
         .map(|gap| (gap.caller, gap.reason))
         .collect();
     assert_eq!(
         ended,
         [(
             Some(guarded.caller),
-            "joint_fallback_voided_admission".to_string()
+            "joint_fallback_stashed_admission".to_string()
         )],
         "the voided-claim fallback is named once, for its caller"
     );

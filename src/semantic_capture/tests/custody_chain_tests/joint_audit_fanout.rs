@@ -10691,7 +10691,7 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         task_cookie: 73,
         exec_id: 0,
     };
-    fixture.scene.real.bind(c, c_image, 0);
+    let orphan_caller = fixture.scene.real.bind(c, c_image, 0);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
     fixture.scene.push(c, 0, "C_SignInit", 1);
     let mut raw = fixture.scene.collect_with_fault(&BirthFault);
@@ -11061,17 +11061,23 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         1,
         "the void closed exactly the Joint feed's segment at its fence: {stranded_after:?}"
     );
-    // The lost per-key detail is one counted named gap, not a
-    // stopped view.
+    // The lost per-key detail is one counted, named gap for the
+    // orphan's caller, not a stopped view and not a void mislabel. The
+    // reduction stages it during apply, so it is published by the next
+    // pass (read from the staged rows here).
     let registry = fixture.scene.real.scene.coordinator.registry();
+    let staged = registry.staged_gaps_for_test();
     let retained: Vec<_> = registry
         .gaps()
         .iter()
         .zip(registry.gap_repeats())
-        .filter(|(gap, _)| {
-            gap.reason
-                .starts_with("joint_void_stashed_claim_history_loss")
-        })
+        .filter(|(gap, _)| gap.reason == "joint_void_stashed_claim_history_loss")
+        .chain(
+            staged
+                .iter()
+                .filter(|gap| gap.reason == "joint_void_stashed_claim_history_loss")
+                .map(|gap| (gap, &1u64)),
+        )
         .collect();
     assert_eq!(
         retained.len(),
@@ -11080,7 +11086,7 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         registry
             .gaps()
             .iter()
-            .map(|gap| (&gap.subject, &gap.reason))
+            .map(|gap| (gap.caller, &gap.subject, &gap.reason))
             .collect::<Vec<_>>()
     );
     let (gap, repeats) = retained[0];
@@ -11088,10 +11094,10 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
         gap.subject, "Joint key operations unavailable; retained S1",
         "the gap keeps the Joint-unavailable subject"
     );
-    assert!(
-        gap.reason.contains("1 call(s) retained S1"),
-        "the gap counts the retained call: {}",
-        gap.reason
+    assert_eq!(
+        gap.caller,
+        Some(orphan_caller),
+        "the gap names the orphan's caller"
     );
     assert_eq!(*repeats, 1, "one retained call, counted once");
     // The lane keeps running: a later call still applies and
@@ -11121,15 +11127,312 @@ fn joint_machine_stashed_pre_void_call_reduces_to_s1_and_lane_continues() {
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
-/// Keyrows N1 fix negative control: an admission from an earlier H0
-/// quantum whose retained original is gone from `open` without a void
-/// must still refuse at the claim step. The stop path clears every
-/// retained entry and raises no void fence, so this absence is not a
-/// voided claim even though the producer and quantum facts resemble
-/// one. Removing the `voided_through` fence check would route the call
-/// to plain S1 instead of refusing.
+/// Keyrows F4 machine twin for the non-void class (Opus keyrows-n1-fix
+/// I1 probe): the same stashed pre-break call whose retained original a
+/// production image taint removes, with no void wipe at all. The lane
+/// must keep running: the orphan reduces as plain S1 under the
+/// cause-neutral unretained gap for its caller, the concurrent post-break
+/// call still claims and publishes, and a later call still publishes.
 #[test]
-fn joint_claim_refuses_an_absent_original_without_a_void() {
+fn joint_machine_tainted_stashed_call_reduces_to_s1_and_lane_continues() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let _child_c = OwnedStoppedChild::new();
+    let c = _child_c.id();
+    let c_image = ImageIdentity {
+        task_cookie: 73,
+        exec_id: 0,
+    };
+    let orphan_caller = fixture.scene.real.bind(c, c_image, 0);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.push(c, 0, "C_SignInit", 1);
+    let mut raw = fixture.scene.collect_with_fault(&BirthFault);
+    let first = {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        io.script.fail_cookie = Some(c_image.task_cookie);
+        let first = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(first.calls().count(), 1, "the complete call ticks");
+        assert!(
+            first.awaiting_floor().is_some(),
+            "the unadmitted call holds the H3 floor"
+        );
+        first
+    };
+    {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *h0;
+        io.script.fail_cookie = None;
+        let mut completed = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(completed.calls().count(), 1, "the retry admits the call");
+        assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
+        assert!(
+            stash.min_outcome_position().is_some(),
+            "the admitted call waits in the lane stash"
+        );
+    }
+    let first = SemanticBatch::from_tick_report(
+        fixture.scene.real.lane.domain(),
+        first,
+        Vec::new(),
+        now_ns(),
+    )
+    .unwrap();
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        coordinator.stage_semantic_batch(first);
+        coordinator
+            .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+            .unwrap();
+    }
+    let grant = fixture
+        .machine
+        .retained_drain_grant_for_test()
+        .expect("prime bound the drain grant");
+    let ingested = raw
+        .ingest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.scene.producers,
+            grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("same original ingestion: {reason:?}"));
+    assert_eq!(
+        claim_and_finish(&mut fixture.scene, &ingested).len(),
+        1,
+        "the pre-break call claims"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let attached = fixture.scene.attached.as_ref().unwrap();
+    let mut frame = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .audit_ingested_quantum(ingested, &fixture.scene.producers, attached, &BirthFault)
+        .unwrap_or_else(|(_, reason)| panic!("actual finished audit: {reason:?}"));
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            frame.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::AwaitFutureInput),
+            "the clean pending frame retires through the continuation"
+        );
+        let (retained, reason) = frame
+            .finish_frame(&mut ports)
+            .err()
+            .expect("generic finish has no continuation authority");
+        assert_eq!(reason, RawQuantumRefusal::H3Undisposed);
+        frame = retained;
+        frame
+            .finish_pending_h3(&mut ports, &fixture.scene.real.lane)
+            .unwrap_or_else(|(_, reason)| {
+                panic!("the clean pending frame must retire: {reason:?}")
+            });
+    }
+    let stranded: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| {
+            (
+                record.feed.staged_len(),
+                record.feed.mode(),
+                record.feed.segment_fence_for_test(),
+            )
+        })
+        .collect();
+    assert!(
+        stranded
+            .iter()
+            .any(|feed| feed.0 == 1 && feed.1 == FeedMode::Joint && feed.2.is_none()),
+        "one Joint feed holds the pending quantum's call: {stranded:?}"
+    );
+    // The production taint removes the stashed call's retained original
+    // without any void wipe.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .taint_image_for_test((c_image.task_cookie, c_image.exec_id));
+    let api_before = fixture.api_returns_total();
+    let edge_calls_before = fixture.edge_calls_total();
+    let direct_fallback_before = fixture.direct_fallback_total();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!(
+                "the tainted stashed claim stopped the lane at {reason:?} ({:?}, staging {:?})",
+                fixture.machine.latched_phase_label(),
+                fixture.machine.staging_detail_for_test(),
+            ),
+        }
+    }
+    assert!(
+        published,
+        "the post-taint quantum publishes with the orphan retained as S1"
+    );
+    assert!(
+        fixture.machine.disposition_reason().is_none()
+            && fixture.machine.latched_phase_label().is_none(),
+        "the lane never latches: {:?} / {:?}",
+        fixture.machine.disposition_reason(),
+        fixture.machine.latched_phase_label()
+    );
+    assert_eq!(
+        fixture.api_returns_total(),
+        api_before + 2,
+        "the orphan is kept as plain S1 and the fresh call is delivered"
+    );
+    assert_eq!(
+        fixture.edge_calls_total(),
+        edge_calls_before + 3,
+        "the pre-break call replays, the orphan reduces, and the fresh call replays"
+    );
+    assert_eq!(
+        fixture.direct_fallback_total(),
+        direct_fallback_before + 1,
+        "the orphan is counted once as S1-direct without Joint evidence"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let child = registry
+        .instance_semantic_edges()
+        .find(|record| record.caller == orphan_caller)
+        .expect("the orphan's edge is retained");
+    assert_eq!(
+        child.api_returns,
+        Some(1),
+        "the orphan's observed call is kept"
+    );
+    assert_eq!(
+        child.semantics.as_ref().map(|semantics| semantics.calls()),
+        Some(1),
+        "the orphan reduces exactly once"
+    );
+    assert_eq!(
+        child.feed.mode(),
+        FeedMode::S1Only,
+        "the orphan's feed falls back for its queued call"
+    );
+    // The exact named gap: cause-neutral (no void), for the orphan's
+    // caller, counted once. It is staged during apply and published by
+    // the next pass.
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let staged = registry.staged_gaps_for_test();
+    let retained: Vec<_> = registry
+        .gaps()
+        .iter()
+        .chain(staged.iter())
+        .filter(|gap| {
+            gap.subject == "Joint key operations unavailable; retained S1"
+                && gap.reason.starts_with("joint_unretained_")
+        })
+        .collect();
+    assert_eq!(
+        retained.len(),
+        1,
+        "one counted cause-neutral gap names the retained call: {:?}",
+        registry
+            .gaps()
+            .iter()
+            .chain(staged.iter())
+            .map(|gap| (gap.caller, &gap.subject, &gap.reason))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        retained[0].caller,
+        Some(orphan_caller),
+        "the gap names the orphan's caller"
+    );
+    assert_eq!(
+        retained[0].reason, "joint_unretained_claim_history_loss",
+        "the gap names the observed removal cause-neutrally"
+    );
+    assert!(
+        !registry
+            .gaps()
+            .iter()
+            .chain(staged.iter())
+            .any(|gap| gap.reason == "joint_void_stashed_claim_history_loss"),
+        "no void is named: the stream was never fenced"
+    );
+    // The lane keeps running after the degradation.
+    let api_after_publish = fixture.api_returns_total();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    let mut published_again = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published_again = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the lane stopped after the taint: {reason:?}"),
+        }
+    }
+    assert!(
+        published_again,
+        "the semantic lane keeps publishing after the taint"
+    );
+    assert_eq!(
+        fixture.api_returns_total(),
+        api_after_publish + 1,
+        "the later call still applies"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// Keyrows F4: an admission from an earlier H0 quantum whose retained
+/// original is gone from `open` without a void is degraded per item.
+/// The stop path clears every retained entry and records no void wipe,
+/// so this absence is not an exactly voided claim; the claim scan keeps
+/// the observed call as plain S1 and continues instead of latching the
+/// whole semantic lane (owner "partial, never stop").
+#[test]
+fn joint_claim_retains_an_absent_original_without_a_void_as_s1() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
@@ -11207,39 +11510,107 @@ fn joint_claim_refuses_an_absent_original_without_a_void() {
             "the stopped journal retains no original"
         );
     }
-    let refusal = match fixture
+    let persisted = fixture
         .real
         .scene
         .coordinator
         .claim_next_prepared_admission(&fixture.producers, &ingested2)
-    {
-        Ok(claim) => panic!("an unvoided absent original must not claim: {claim:?}"),
-        Err(refusal) => refusal,
-    };
+        .expect("an unvoided absent original degrades instead of refusing");
     assert_eq!(
-        refusal,
-        RawQuantumRefusal::Admission,
-        "the claim refuses an original removed without a void"
+        persisted, None,
+        "the claim scan reaches the batch end after retaining the call"
+    );
+    let prepared = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let retained = prepared
+        .admissions()
+        .next()
+        .expect("the retained admission stays prepared");
+    assert!(retained.plain_s1(), "the observed call is kept as plain S1");
+    assert_eq!(
+        retained.plain_s1_cause(),
+        Some(crate::discovery::caller_registry::instance_input::PlainS1Cause::Unretained),
+        "a gone original with no recorded void names the cause-neutral reason"
     );
     assert!(
         !ingested2.admission_voided(
             &older,
             fixture.real.scene.coordinator.joint_capture().adapter()
         ),
-        "an absent original with no void fence is not a voided claim"
+        "an absent original with no recorded void wipe is not a voided claim"
+    );
+    // M1: nothing is counted at the claim. The one gap is recorded only
+    // when the call actually reduces as S1.
+    let registry = fixture.real.scene.coordinator.registry();
+    assert!(
+        !registry
+            .gaps()
+            .iter()
+            .chain(registry.staged_gaps_for_test().iter())
+            .any(|gap| gap.reason.contains("claim_history_loss")),
+        "a claim decision alone records no retained-S1 gap"
+    );
+    // M2: a rescan retries the same marked admission without refusing,
+    // re-marking or counting it again.
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .claim_next_prepared_admission(&fixture.producers, &ingested2)
+            .expect("a rescan of a retained admission degrades, never refuses"),
+        None,
+        "the marked admission is scanned again without a new claim"
+    );
+    let prepared = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    assert_eq!(
+        prepared
+            .admissions()
+            .next()
+            .expect("the retained admission stays prepared")
+            .plain_s1_cause(),
+        Some(crate::discovery::caller_registry::instance_input::PlainS1Cause::Unretained),
+        "a rescan keeps the one retained cause"
+    );
+    assert!(
+        !fixture
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .chain(
+                fixture
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .staged_gaps_for_test()
+                    .iter()
+            )
+            .any(|gap| gap.reason.contains("claim_history_loss")),
+        "a rescan records no second retained-S1 gap"
     );
 }
 
-/// Keyrows N1 negative control for the invocation-containment clause:
-/// after a real void fence, an older-quantum admission whose own
-/// original is still retained in `open` (claimed, not yet converted)
-/// fails the unclaimed retained-original match and must refuse. The
-/// containment check keeps it out of the voided route: a present
-/// invocation means the void did not account for this admission's
-/// original. Dropping the `open` containment check would route the
-/// admission to plain S1 instead of refusing.
+/// Keyrows F4 for the invocation-containment class: after a real void,
+/// an older-quantum admission whose own original is still retained in
+/// `open` (claimed, not yet converted) fails the unclaimed retained
+/// match. It now degrades per item as plain S1 under the unclaimable
+/// cause instead of refusing the whole semantic lane; the exact void
+/// predicate stays false because the invocation is still present.
 #[test]
-fn joint_claim_refuses_an_older_admission_with_a_retained_invocation_after_a_void() {
+fn joint_claim_retains_an_older_admission_with_a_retained_invocation_after_a_void() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
@@ -11338,21 +11709,31 @@ fn joint_claim_refuses_an_older_admission_with_a_retained_invocation_after_a_voi
         !ingested3.matches_admission(&older),
         "the older admission belongs to the earlier quantum"
     );
-    let refusal = match fixture
+    let persisted = fixture
         .real
         .scene
         .coordinator
         .claim_next_prepared_admission(&fixture.producers, &ingested3)
-    {
-        Ok(claim) => {
-            panic!("an older admission with a retained invocation must not claim: {claim:?}")
-        }
-        Err(refusal) => refusal,
-    };
+        .expect("an older unclaimable admission degrades instead of refusing");
     assert_eq!(
-        refusal,
-        RawQuantumRefusal::Admission,
-        "the claim refuses while a retained entry owns the invocation"
+        persisted, None,
+        "the claim scan reaches the batch end after retaining the call"
+    );
+    let prepared = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let retained = prepared
+        .admissions()
+        .next()
+        .expect("the retained admission stays prepared");
+    assert!(retained.plain_s1(), "the observed call is kept as plain S1");
+    assert_eq!(
+        retained.plain_s1_cause(),
+        Some(crate::discovery::caller_registry::instance_input::PlainS1Cause::Unclaimable),
+        "a present but unclaimable original names the cause-neutral reason"
     );
     let adapter = fixture.real.scene.coordinator.joint_capture().adapter();
     assert!(
@@ -11361,18 +11742,19 @@ fn joint_claim_refuses_an_older_admission_with_a_retained_invocation_after_a_voi
     );
     assert!(
         !ingested3.admission_voided(&older, adapter),
-        "a retained invocation is not a proven voided original"
+        "a retained invocation is not an exactly voided original"
     );
 }
 
-/// Keyrows N1 consistency control: a self-inconsistent admission whose
-/// collected-origin position disagrees with its own H0 ordinal is not a
-/// voided claim, even after a real fence and with its invocation gone.
-/// The retained-original predicate requires those positions to agree,
-/// so the voided route must not accept what that predicate rejects.
-/// Dropping the position check would route this admission to plain S1.
+/// Keyrows F4/I1b exactness control: a self-inconsistent admission whose
+/// collected-origin position disagrees with its own H0 ordinal is not an
+/// exactly voided claim, even after a real void and with its invocation
+/// gone. The retained-original predicate requires those positions to
+/// agree, so the void-wipe predicate must not accept what that predicate
+/// rejects; the call degrades under the unclaimable cause, never the
+/// void one.
 #[test]
-fn joint_voided_admission_with_a_misaligned_origin_stays_a_refusal() {
+fn joint_voided_admission_with_a_misaligned_origin_is_not_voided() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
@@ -11411,6 +11793,138 @@ fn joint_voided_admission_with_a_misaligned_origin_stays_a_refusal() {
             "an origin position that disagrees with the admission's H0 ordinal is not a voided claim"
         );
     }
+}
+
+/// Keyrows F4/I1b probe (Opus keyrows-n1-fix I1, as a real test): an
+/// older-quantum admission whose retained original an image taint
+/// removed after an unrelated earlier void is not a voided claim. The
+/// exact void-wipe record does not name its invocation, so the call
+/// degrades as plain S1 under the cause-neutral unretained reason; the
+/// old predicate would have named a void that never touched it.
+#[test]
+fn joint_tainted_stashed_original_after_an_unrelated_void_is_unretained_s1() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    // One fully consumed call, then a real unrelated void: the fence is
+    // raised while no later admission exists yet.
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let (ingested1, _proof, grant) = fixture.ingest_with_grant(raw1);
+    let claimed = claim_and_finish(&mut fixture, &ingested1);
+    assert_eq!(claimed.len(), 1, "the first call claims");
+    fixture
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.real.lane))
+        .unwrap();
+    {
+        let owner = fixture.real.scene.coordinator.joint_capture_mut();
+        owner.adapter_mut().break_stream_for_test();
+        assert!(
+            owner
+                .void_ingest_break()
+                .expect("the test void fits its ledger"),
+            "the broken stream raises one void fence"
+        );
+    }
+    // A post-void admission owns a fresh retained original.
+    fixture.push(pid, 0, "C_SignInit", 2);
+    let raw2 = fixture.prepare(1);
+    let older = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    let (ingested2, _proof, _grant2) = fixture.ingest_with_grant(raw2);
+    assert!(
+        ingested2.matches_admission(&older),
+        "the fresh quantum owns the prepared admission"
+    );
+    // The production taint removes that original after ingestion. It
+    // does not raise or record a void wipe for this invocation.
+    {
+        let (_, image, _, _) = older.journal_binding();
+        fixture
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .taint_image_for_test((image.task_cookie, image.exec_id));
+    }
+    // A later quantum makes the admission older than the current one.
+    fixture.push(pid, 0, "C_SignInit", 3);
+    let raw3 = fixture.collect_with_fault(&BirthFault);
+    fixture.real.h0.0.borrow_mut().collected = Some(raw3);
+    let _batch3 = fixture.real.tick();
+    let raw3 = fixture
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .expect("the third tick returns the collected raw");
+    let ingested3 = raw3
+        .ingest(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.producers,
+            &grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("the later quantum ingests: {reason:?}"));
+    {
+        let adapter = fixture.real.scene.coordinator.joint_capture().adapter();
+        assert!(
+            !ingested3.matches_admission(&older),
+            "the older admission belongs to the earlier quantum"
+        );
+        assert!(
+            !ingested3.matches_retained_admission(&older, adapter),
+            "the tainted original is gone"
+        );
+        assert!(
+            !ingested3.admission_voided(&older, adapter),
+            "an unrelated earlier void did not wipe this invocation"
+        );
+    }
+    let persisted = fixture
+        .real
+        .scene
+        .coordinator
+        .claim_next_prepared_admission(&fixture.producers, &ingested3)
+        .expect("a taint-removed stashed original degrades instead of refusing");
+    assert_eq!(
+        persisted, None,
+        "the claim scan reaches the batch end after retaining the call"
+    );
+    let prepared = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let retained = prepared
+        .admissions()
+        .next()
+        .expect("the retained admission stays prepared");
+    assert!(retained.plain_s1(), "the observed call is kept as plain S1");
+    assert_eq!(
+        retained.plain_s1_cause(),
+        Some(crate::discovery::caller_registry::instance_input::PlainS1Cause::Unretained),
+        "the gap names the removal it can observe, never the unrelated void"
+    );
 }
 
 /// Keyrows T1 fix4 B1 twin: a Joint feed's seal waits (BoundNotReady)

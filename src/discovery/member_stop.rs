@@ -143,6 +143,8 @@ pub(crate) struct MemberStopStats {
     /// Members resumed at the bound without a pin or a verified
     /// membership (their files unproven): named first-use gap.
     pub(crate) forced_resumes: u64,
+    /// Stopped members moved out of the run tree, resumed.
+    pub(crate) moved_out_resumes: u64,
 }
 
 /// One executable file row of a member's maps.
@@ -187,6 +189,18 @@ fn born_before_stop(start_ticks: u64, stop_ns: u64) -> bool {
     };
     let started = start_ticks.saturating_mul(crate::discovery::pause::clock_tick_ns());
     boot.saturating_sub(started) >= monotonic.saturating_sub(stop_ns)
+}
+
+/// Whether a pinned process outside the run tree is still the member a
+/// row stopped at `stop_ns`, moved out of the run cgroup while stopped:
+/// its pinned start precedes the stop and it is stopped now. Such a
+/// member is resumed; any other process its number names is left as it
+/// is.
+pub(crate) fn stopped_member_moved_out(pin: &crate::process::PidPin, stop_ns: u64) -> bool {
+    pin.start_time()
+        .is_some_and(|start| born_before_stop(start, stop_ns))
+        && crate::attach::member_stop::process_stopped(pin.pid())
+        && pin.still_the_same()
 }
 
 /// When a row's bound starts: the kernel's stamp (never later than this
@@ -517,6 +531,20 @@ impl Engine {
         };
         match io.is_run_member(&pin) {
             Ok(true) => {}
+            Ok(false) if stopped_member_moved_out(&pin, since_ns) => {
+                // The stopped member itself, moved out of the run cgroup:
+                // no longer this run's to hold, but never left stopped.
+                if Self::resume_member(io, &pin) {
+                    self.member_stops.stats.moved_out_resumes =
+                        self.member_stops.stats.moved_out_resumes.saturating_add(1);
+                    if crate::run::capture_diagnostics_on() {
+                        eprintln!("p11scope: stopped member {tgid} left the run tree; resumed");
+                    }
+                } else {
+                    self.retry_or_force(io, tgid, since_ns, now_ns, "no signal authority");
+                }
+                return false;
+            }
             Ok(false) => {
                 // Not a run member (any more): the stopped member is gone
                 // and its number names another process, which is left
@@ -926,12 +954,15 @@ impl Engine {
         for (_, member) in held {
             Self::resume_member(io, &member.pin);
         }
-        for (tgid, _) in io.pending().unwrap_or_default() {
+        for (tgid, stop) in io.pending().unwrap_or_default() {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {
                 continue;
             };
             match io.is_run_member(&pin) {
                 Ok(true) => {
+                    Self::resume_member(io, &pin);
+                }
+                Ok(false) if stopped_member_moved_out(&pin, stop.hook_ts_ns) => {
                     Self::resume_member(io, &pin);
                 }
                 Ok(false) => {
@@ -947,7 +978,8 @@ impl Engine {
                 "p11scope: run member stops: {} stopped, {} files cleared, {} provider holds, \
                  {} resumed attached, {} resumed at bound, {} resumed refused, \
                  {} unreadable, {} departed, \
-                 {} not members, {} kept for a retry, {} resumed unverified at bound; \
+                 {} not members, {} kept for a retry, {} resumed unverified at bound, \
+                 {} moved out and resumed; \
                  kernel requested {}, table full {}, signal refused {}, identity unread {}",
                 stats.stopped,
                 stats.cleared_files,
@@ -960,6 +992,7 @@ impl Engine {
                 stats.not_members,
                 stats.resume_unavailable,
                 stats.forced_resumes,
+                stats.moved_out_resumes,
                 kernel[0],
                 kernel[1],
                 kernel[2],

@@ -2223,21 +2223,131 @@ mod tests {
         assert!(err.contains("absolute path"), "{err}");
     }
 
+    /// Reads one provider name the way discovery does: against this
+    /// process's live maps.
+    fn read_name_at(memory: &ProcessMemory, address: usize) -> NameRead {
+        read_name(memory, address)
+    }
+
     #[test]
     fn provider_names_are_read_through_a_bounded_snapshot() {
         let memory = ProcessMemory::open().unwrap();
         let exact = b"PKCS 11\0ignored";
-        let name = read_name(&memory, exact.as_ptr() as usize);
+        let name = read_name_at(&memory, exact.as_ptr() as usize);
         assert_eq!(name.raw.as_deref(), Some(b"PKCS 11".as_slice()));
         assert_eq!(name.lossy.as_deref(), Some("PKCS 11"));
         assert_eq!(name.error, None);
 
         let overlong = [b'x'; INTERFACE_NAME_CAP];
-        let name = read_name(&memory, overlong.as_ptr() as usize);
+        let name = read_name_at(&memory, overlong.as_ptr() as usize);
         assert!(name.error.as_deref().unwrap().contains("overlong"));
         assert_eq!(name.raw.as_deref(), Some(overlong.as_slice()));
 
         assert!(memory.read_exact(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn interface_name_read_stops_at_the_readable_mapping_end() {
+        let memory = ProcessMemory::open().unwrap();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        const PREFIX: &[u8] = b"EDGE!";
+        const ADJACENT: &[u8] = b"ADJACENT_SECRET\0";
+        let address = unsafe { (base as *mut u8).add(page - PREFIX.len()) };
+        let second = unsafe { (base as *mut u8).add(page) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(PREFIX.as_ptr(), address, PREFIX.len());
+            std::ptr::copy_nonoverlapping(ADJACENT.as_ptr(), second, ADJACENT.len());
+        }
+        assert_eq!(
+            unsafe { libc::mprotect(second.cast(), page, libc::PROT_READ) },
+            0
+        );
+        let entries = read_self_maps().unwrap();
+        let containing = entries
+            .iter()
+            .find(|entry| entry.start <= address as u64 && (address as u64) < entry.end)
+            .expect("the name pointer is mapped");
+        assert_eq!(containing.permissions[0], b'r');
+        assert_eq!(containing.end, address as u64 + PREFIX.len() as u64);
+
+        let name = read_name_at(&memory, address as usize);
+        assert_eq!(unsafe { libc::munmap(base, page * 2) }, 0);
+
+        let error = name.error.as_deref().expect("an in-VMA NUL is required");
+        assert!(error.contains("mapping end"), "{error}");
+        assert!(
+            name.raw
+                .as_deref()
+                .is_none_or(|raw| raw.len() <= PREFIX.len()),
+            "the read crossed into the adjacent mapping: {:?}",
+            name.raw
+        );
+    }
+
+    #[test]
+    fn interface_name_outside_readable_mappings_is_refused() {
+        let memory = ProcessMemory::open().unwrap();
+
+        let unmapped = read_name_at(&memory, usize::MAX);
+        assert!(unmapped.raw.is_none());
+        let error = unmapped
+            .error
+            .as_deref()
+            .expect("an unmapped pointer is refused");
+        assert!(error.contains("outside any mapping"), "{error}");
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let secret = b"PROTECTED\0";
+        unsafe {
+            std::ptr::copy_nonoverlapping(secret.as_ptr(), base.cast::<u8>(), secret.len());
+        }
+        assert_eq!(unsafe { libc::mprotect(base, page, libc::PROT_NONE) }, 0);
+
+        let unreadable = read_name_at(&memory, base as usize);
+        assert_eq!(unsafe { libc::munmap(base, page) }, 0);
+
+        assert!(unreadable.raw.is_none());
+        let error = unreadable
+            .error
+            .as_deref()
+            .expect("a non-readable mapping is refused");
+        assert!(error.contains("non-readable"), "{error}");
+    }
+
+    #[test]
+    fn interface_name_read_is_capped_at_64_bytes() {
+        let memory = ProcessMemory::open().unwrap();
+        let overlong = vec![b'x'; 256];
+        let name = read_name_at(&memory, overlong.as_ptr() as usize);
+        assert_eq!(name.raw.as_deref().map(<[u8]>::len), Some(64));
+        let error = name
+            .error
+            .as_deref()
+            .expect("a name without a NUL is refused");
+        assert!(error.contains("overlong"), "{error}");
+        assert!(error.contains("cap 64 bytes"), "{error}");
     }
 
     #[test]

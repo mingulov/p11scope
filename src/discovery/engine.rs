@@ -505,7 +505,10 @@ pub struct Engine {
     /// Incomplete scans per owned run member view, for the bounded
     /// prompt rescan (`OWNED_INCOMPLETE_SCAN_RETRIES`). A complete scan
     /// forgets the view; each tick prunes views no longer retained.
-    owned_incomplete_scans: BTreeMap<ProcessViewId, u32>,
+    owned_incomplete_scans: BTreeMap<ProcessViewId, (u32, u64)>,
+    /// Inventory refresh ticks so far: one bounded incomplete-scan retry
+    /// is spent per tick, however many rescans the tick runs.
+    pub(crate) inventory_tick_serial: u64,
     /// First-seen mono-ns per noticed owned-tree pid, for the rescan
     /// horizon. Pruned by liveness every run (an exit forgets, so a
     /// later pid reuse notices fresh); entries outlive rotation
@@ -13263,6 +13266,7 @@ impl Engine {
             learned_frame_owed: false,
             owned_watch_unproven: BTreeMap::new(),
             owned_incomplete_scans: BTreeMap::new(),
+            inventory_tick_serial: 0,
             owned_watch_seen: BTreeMap::new(),
             owned_watch_last_ns: None,
             owned_watch_cursor: None,
@@ -22064,7 +22068,8 @@ impl Engine {
     /// scan of an owned member keeps a refresh queued and owes an
     /// expedited frame (the learned-staging hint), so the rescan runs on
     /// the next loop tick instead of the next frame boundary, at most
-    /// `OWNED_INCOMPLETE_SCAN_RETRIES` times per view; then the
+    /// `OWNED_INCOMPLETE_SCAN_RETRIES` ticks per view (a tick's second
+    /// rescan of the same view spends no further retry); then the
     /// partial result and the scan's own gaps stand, as before. Only a scan
     /// that found no module retries: a rescan replaces the view's modules,
     /// so retrying a partial result that already attached could detach it
@@ -22086,9 +22091,18 @@ impl Engine {
             self.owned_incomplete_scans.remove(&view);
             return false;
         }
-        let count = self.owned_incomplete_scans.entry(view).or_insert(0);
-        *count = count.saturating_add(1);
-        let owed = *count <= OWNED_INCOMPLETE_SCAN_RETRIES;
+        // One retry per inventory tick: the tick's post-retirement rescan
+        // of the same view keeps the request without spending another.
+        let tick = self.inventory_tick_serial;
+        let entry = self
+            .owned_incomplete_scans
+            .entry(view)
+            .or_insert((0, u64::MAX));
+        if entry.1 != tick {
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = tick;
+        }
+        let owed = entry.0 <= OWNED_INCOMPLETE_SCAN_RETRIES;
         // The inventory tick runs on the frame cadence; only an expedited
         // frame lands the rescan inside a short-lived worker's life.
         self.learned_frame_owed |= owed;
@@ -30940,6 +30954,7 @@ impl Engine {
         new_views: &mut Vec<InventoryNewView>,
         tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
+        self.inventory_tick_serial = self.inventory_tick_serial.wrapping_add(1);
         if !self.owned_incomplete_scans.is_empty() {
             let retained: BTreeSet<ProcessViewId> =
                 self.views.iter().map(ProcessView::id).collect();

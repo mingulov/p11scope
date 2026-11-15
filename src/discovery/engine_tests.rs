@@ -88132,6 +88132,8 @@ fn owned_run_incomplete_rescans_stop_at_their_bound() {
         let id = view.id();
         engine.views.push(view);
         for retry in 1..=OWNED_INCOMPLETE_SCAN_RETRIES {
+            // Each retry is its own inventory tick.
+            engine.inventory_tick_serial += 1;
             let complete = complete_at == Some(retry);
             if !complete {
                 inject_mapping_changed_scan();
@@ -88154,5 +88156,52 @@ fn owned_run_incomplete_rescans_stop_at_their_bound() {
             !engine.owned_incomplete_scans.contains_key(&id) || complete_at.is_none(),
             "a complete rescan forgets the retry count"
         );
+    }
+}
+
+/// A retry is one tick: the tick's post-retirement rescan of the same view
+/// is a second scan in the same tick and must not spend a second retry, or
+/// the 3-retry bound buys only two ticks.
+#[test]
+fn owned_run_incomplete_rescans_spend_one_retry_per_tick() {
+    let me = std::process::id();
+    let (_dir, mut engine) = owned_run_incomplete_scan_engine(true);
+    INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+    inject_mapping_changed_scan();
+    let max_scan_pids = engine.max_scan_pids;
+    let (new_views, _, _) = engine.admit_inventory_new_views(
+        vec![me],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut || Some(0),
+    );
+    INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+    let (view, _, _) = new_views
+        .into_iter()
+        .find(|(view, _, _)| view.pid() == me)
+        .expect("the admission staged the member");
+    let id = view.id();
+    engine.views.push(view);
+    let rescan = |engine: &mut Engine| {
+        inject_mapping_changed_scan();
+        let (scans, _, deferred, _) =
+            engine.scan_inventory_views(&BTreeSet::from([id]), "rescan", &mut || Some(0));
+        INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+        assert_eq!(scans.len(), 1, "the rescan ran");
+        deferred.contains(&me)
+    };
+    // Tick 1: the refreshed rescan and the post-retirement rescan.
+    engine.inventory_tick_serial += 1;
+    assert!(rescan(&mut engine), "tick 1 owes a retry");
+    assert!(
+        rescan(&mut engine),
+        "the same tick's second rescan still owes it"
+    );
+    // Ticks 2 and 3 still owe their retries; tick 4 is past the bound.
+    for (tick, owed) in [(2, true), (3, false)] {
+        engine.inventory_tick_serial += 1;
+        assert_eq!(rescan(&mut engine), owed, "tick {tick}");
     }
 }

@@ -236,8 +236,8 @@ listed with its path, the program that first loaded it
 (`first_loaded_by`), and its missed first use as an unobserved
 window; the capture stays `PARTIAL` with the fixed learned-file gap
 row. The first use itself is still missed. Learning covers detailed
-`profile`/`trace` under `--system` only (cgroup, pid, run, inventory
-and counter scopes keep their existing gaps), needs privilege for
+`profile`/`trace` under `--system` only (cgroup, pid, inventory and
+counter scopes keep their existing gaps), needs privilege for
 fanotify filesystem marks (a capture without it keeps today's gaps
 and files the unavailable-learning gap), caps at 32 learned files per
 capture (named aggregate refusal beyond), and cannot see providers
@@ -245,6 +245,25 @@ only on filesystems invisible to the observer's mount namespace (such
 as a container-private tmpfs): those stay unknown, never guessed.
 Wrap such tools in `sudo p11scope run --user $USER -- <tool>` (or
 pass `--prearm-module PATH`) when first-run coverage matters.
+
+`run` learns the same way from its own tree, without fanotify: the
+observer watches its owned descendants, proves a mapped provider
+file from a live scan, and attaches it by file identity for every
+later mapper. The learned provider lists with its path,
+`first_loaded_by`, and its missed first use as an unobserved window;
+the capture stays `PARTIAL` with the same fixed learned-file gap row
+plus descendant gaps for members that retired before admission. The
+first mapper's own calls may be missed (measured: a 16-worker
+fixture at ~55 ms per worker observes 75 of 80 calls, missing exactly
+the first worker; the pkcs11-check smoke suite reaches oracle recall
+1.0); members too short-lived to scan at all (a few milliseconds)
+stay counted in `pid_descendant_gaps` like the other never-admitted
+members. The 32-file per-capture cap is shared with system file
+learning. Of the 256 loader contexts, 8 stay reserved for the direct
+child's exec chain: member arms past 248 refuse with the capacity gap
+(their later calls still land via file-identity probes once the file
+stages), so a fork burst cannot spend the child's own re-arm
+contexts.
 
 ### File learning sees only the observer's mount namespace
 

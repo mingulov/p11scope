@@ -20577,11 +20577,15 @@ fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
     // Provider-free under a generation-admitting scope: both gate.
     assert!(engine.loader_arming_gated(ProcessViewId(0)));
     assert!(engine.loader_arming_gated(ProcessViewId(1)));
-    // The owned run child is the one named generation: it always
-    // arms, so the pause follows its exec chain; other members stay
-    // exploratory.
+    // Owned run tree (E1): every member arms so short-lived
+    // descendants catch first use, not just the named child.
     engine.owned_run_pid = Some(std::process::id());
     assert!(!engine.loader_arming_gated(ProcessViewId(0)));
+    assert!(!engine.loader_arming_gated(ProcessViewId(1)));
+    // Scopes the run does not own keep exploration: the same
+    // provider-free members gate once ownership clears.
+    engine.owned_run_pid = None;
+    assert!(engine.loader_arming_gated(ProcessViewId(0)));
     assert!(engine.loader_arming_gated(ProcessViewId(1)));
     // Exact-PID scope never gates (base behavior, unaffected).
     engine.scope = Scope::Pid(1);
@@ -20590,6 +20594,1005 @@ fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
     assert!(!engine.loader_arming_gated(ProcessViewId(1)));
     sleeper.kill().expect("kill sleeper");
     sleeper.wait().expect("reap sleeper");
+}
+
+#[test]
+fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    // Unbounded run budget: this test pins exact per-run scan counts,
+    // and a wall budget is inherently load-sensitive (the budget
+    // mechanism itself is pinned separately with a tight budget).
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    engine.owned_tree_watch(Some(1_000));
+    assert_eq!(
+        engine.owned_watch_unproven.len(),
+        2,
+        "unseen members join the rescan rotation"
+    );
+    assert!(
+        engine.owned_watch_seen.contains_key(&me)
+            && engine.owned_watch_seen.contains_key(&sleeper.id()),
+        "noticed members take first-seen times"
+    );
+    assert!(
+        engine.refresh_requested.is_empty() && engine.newcomer_first_seen.is_empty(),
+        "the watch never queues frame work nor marks (exits gap exactly)"
+    );
+    // Newest plus oldest scan per run (neither maps a provider, so
+    // both stay unproven for the rotation).
+    let scanned: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(scanned, 2, "newest plus oldest scan per watch run");
+    assert!(engine.pending_learned.is_empty(), "no proof, no staging");
+    // Within the throttle window nothing reruns.
+    engine.owned_tree_watch(Some(1_000 + 1_000_000));
+    let rerun: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(rerun, 2, "watch work throttles across ticks");
+    // Past the window the rotation scans both members again.
+    engine.owned_tree_watch(Some(1_000 + OWNED_WATCH_SCAN_MIN_NS));
+    let rotated: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(rotated, 4, "the rotation advances past the throttle");
+    assert!(
+        engine
+            .owned_watch_unproven
+            .values()
+            .all(|entry| entry.scans == 2),
+        "fair rotation reaches every member"
+    );
+    // Scopes the run does not own stay quiet (increasing clocks so
+    // the throttle cannot vacate the gate assertions).
+    engine.owned_run_pid = None;
+    engine.owned_watch_unproven.clear();
+    engine.owned_tree_watch(Some(100_000_000));
+    assert!(
+        engine.owned_watch_unproven.is_empty(),
+        "an unowned cgroup scope stays quiet"
+    );
+    engine.owned_run_pid = Some(me);
+    engine.scope = Scope::Pid(me);
+    engine.owned_tree_watch(Some(200_000_000));
+    assert!(
+        engine.owned_watch_unproven.is_empty(),
+        "a degraded exact-PID run has no tree to watch"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+#[test]
+fn owned_tree_watch_skips_retained_prunes_exited_and_aged_members() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine.owned_tree_watch(Some(1_000));
+    assert!(
+        !engine.owned_watch_unproven.contains_key(&me),
+        "a retained member stays with the frames"
+    );
+    assert!(
+        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        "an unretained member joins the rotation"
+    );
+    assert_eq!(
+        engine.owned_watch_unproven[&sleeper.id()].scans,
+        1,
+        "one member scans once when newest and oldest coincide"
+    );
+    assert!(
+        !engine.owned_watch_seen.contains_key(&me),
+        "a retained member is never noticed"
+    );
+    // A member that leaves the tree drops at the next run.
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{me}\n"))
+        .expect("rewrite cgroup.procs");
+    engine.owned_tree_watch(Some(1_000 + OWNED_WATCH_SCAN_MIN_NS));
+    assert!(
+        engine.owned_watch_unproven.is_empty(),
+        "a departed member leaves the rotation"
+    );
+    // A member that never proves a provider ages out at the horizon,
+    // so a stable tree costs no steady-state scans.
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("rewrite cgroup.procs");
+    let rejoined = 1_000 + 2 * OWNED_WATCH_SCAN_MIN_NS;
+    engine.owned_tree_watch(Some(rejoined));
+    assert!(
+        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        "the member rejoins while live"
+    );
+    engine.owned_tree_watch(Some(rejoined + OWNED_WATCH_RESCAN_HORIZON_NS));
+    assert!(
+        engine.owned_watch_unproven.is_empty(),
+        "an unproven member ages out at the horizon"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// A re-noticed member keeps its original first-seen time: a live but
+/// transiently unopenable member (its view fails to open, so the scan
+/// drops it from rotation) rejoins with its old clock, not a fresh one,
+/// so it still ages out at the 5 s horizon instead of pinning a slot.
+#[test]
+fn owned_tree_watch_renotice_keeps_first_seen_time() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    // A fake pid that stays listed as live but never opens as a view:
+    // every scan drops it from rotation, every watch re-notices it.
+    let ghost: u32 = 424242;
+    assert!(
+        ProcessView::open(ProcessViewId(99), ghost).is_err(),
+        "the ghost pid must not open"
+    );
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{me}\n{ghost}\n"))
+        .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 100;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    // The ghost was noticed (fail-closed user) then dropped from rotation
+    // when its view failed to open — but its first-seen stays.
+    assert!(
+        !engine.owned_watch_unproven.contains_key(&ghost),
+        "an unopenable member leaves rotation at once"
+    );
+    assert_eq!(
+        engine.owned_watch_seen.get(&ghost).copied(),
+        Some(first),
+        "the first notice takes the clock"
+    );
+    // A later watch re-notices the still-live ghost: the clock must not
+    // refresh, or the member never ages out.
+    let later = first + OWNED_WATCH_SCAN_MIN_NS;
+    engine.owned_tree_watch(Some(later));
+    assert_eq!(
+        engine.owned_watch_seen.get(&ghost).copied(),
+        Some(first),
+        "a re-noticed member keeps its original first-seen time"
+    );
+    // And it still ages out at the horizon from the original clock.
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_RESCAN_HORIZON_NS));
+    assert!(
+        !engine.owned_watch_seen.contains_key(&ghost)
+            || engine
+                .owned_watch_seen
+                .get(&ghost)
+                .is_some_and(|seen| *seen == first),
+        "the ghost never refreshes past the horizon: {:?}",
+        engine.owned_watch_seen.get(&ghost)
+    );
+}
+
+/// An unproven member that scans clean backs off: after two prompt
+/// scans it is not rescanned until its backoff expires, so
+/// provider-free mapping-heavy members stop burning every frame,
+/// while a slow starter still gets a rescan once the delay passes.
+#[test]
+fn owned_tree_watch_backs_off_unproductive_members() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    // Unbounded run budget: this test pins exact per-run scan counts,
+    // and a wall budget is inherently load-sensitive.
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    let scans = |engine: &Engine| {
+        engine
+            .owned_watch_unproven
+            .values()
+            .map(|entry| entry.scans)
+            .sum::<u32>()
+    };
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    assert_eq!(scans(&engine), 2, "fresh members scan promptly");
+    let second = first + OWNED_WATCH_SCAN_MIN_NS;
+    engine.owned_tree_watch(Some(second));
+    assert_eq!(scans(&engine), 4, "the first rescan stays prompt");
+    // Inside the second backoff nothing rescans.
+    engine.owned_tree_watch(Some(second + OWNED_WATCH_SCAN_MIN_NS));
+    assert_eq!(
+        scans(&engine),
+        4,
+        "unproductive members back off instead of rescanning"
+    );
+    // Past the backoff the rotation resumes.
+    engine.owned_tree_watch(Some(second + 25_000_000));
+    assert_eq!(scans(&engine), 6, "a slow starter still gets rescanned");
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Rotation reaches every member, not just the extremes: with three
+/// unproven members the middle pid scans within three runs instead
+/// of starving behind the newest and oldest.
+#[test]
+fn owned_tree_watch_rotation_reaches_the_middle_member() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut first_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn first sleeper");
+    let mut second_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn second sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    // Unbounded run budget: this test pins exact per-run scan counts,
+    // and a wall budget is inherently load-sensitive.
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
+    engine.owned_tree_watch(Some(first + 2 * OWNED_WATCH_SCAN_MIN_NS));
+    let mut pids = vec![me, first_sleeper.id(), second_sleeper.id()];
+    pids.sort_unstable();
+    for pid in &pids {
+        assert_eq!(
+            engine
+                .owned_watch_unproven
+                .get(pid)
+                .map(|entry| entry.scans),
+            Some(2),
+            "fair rotation scans every member, extremes and middle: {pids:?}"
+        );
+    }
+    first_sleeper.kill().expect("kill first sleeper");
+    first_sleeper.wait().expect("reap first sleeper");
+    second_sleeper.kill().expect("kill second sleeper");
+    second_sleeper.wait().expect("reap second sleeper");
+}
+
+/// A rotation member that gains a retained view leaves the rotation:
+/// the frames own it now, so the watch must not scan it twice.
+#[test]
+fn owned_tree_watch_prunes_members_that_gain_retained_views() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 1;
+    engine.owned_tree_watch(Some(1_000));
+    assert!(
+        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        "the unretained member joins the rotation"
+    );
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), sleeper.id()).expect("sleeper view opens"));
+    engine.owned_tree_watch(Some(1_000 + OWNED_WATCH_SCAN_MIN_NS));
+    assert!(
+        !engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        "a newly retained member leaves the rotation for the frames"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Telemetry-only watch scans merge quietly: a scan that finds
+/// nothing new must not invalidate the loader-plan cache nor dirty
+/// the publication revision, or every 10 ms watch run forces a tail
+/// republish and a plan rebuild.
+#[test]
+fn owned_tree_watch_telemetry_scans_keep_the_loader_plan_cache() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{me}\n{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.loader_plan_cache = Some(LoaderPlanCache {
+        revision: engine.published_facts_revision,
+        broad_admit: engine.broad_admit,
+        counter_hint: engine.counter_hint,
+        plan: plan_with(0, 0),
+    });
+    let revision = engine.facts_revision;
+    engine.owned_tree_watch(Some(1_000));
+    assert_eq!(
+        engine.facts_revision, revision,
+        "a telemetry-only watch run dirties no publication input"
+    );
+    assert!(
+        engine.loader_plan_cache.is_some(),
+        "a telemetry-only watch run keeps the cached loader plan"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Transient watch view opens charge the capture budget: even a
+/// failed open attempted real work, and a ghost member (no view, no
+/// scan) proves no scan ran to charge anything else.
+#[test]
+fn owned_tree_watch_charges_transient_view_opens() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let ghost: u32 = 424242;
+    assert!(
+        ProcessView::open(ProcessViewId(99), ghost).is_err(),
+        "the ghost pid must not open"
+    );
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{ghost}\n"))
+        .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    let before = engine.budget.work_units_count();
+    engine.owned_tree_watch(Some(1_000));
+    assert!(
+        engine.budget.work_units_count() > before,
+        "the attempted transient open charges the capture budget"
+    );
+    assert!(
+        !engine.owned_watch_unproven.contains_key(&ghost),
+        "an unopenable member still drops at once"
+    );
+}
+
+/// A budget refusal is not an exit: when the capture budget is
+/// stopped, an unopenable member stays in rotation for a later run
+/// instead of dropping as departed.
+#[test]
+fn owned_tree_watch_keeps_members_refused_by_a_stopped_budget() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let ghost: u32 = 424242;
+    assert!(
+        ProcessView::open(ProcessViewId(99), ghost).is_err(),
+        "the ghost pid must not open"
+    );
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{ghost}\n"))
+        .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.budget.note_io_refusal();
+    engine.owned_tree_watch(Some(1_000));
+    assert!(
+        engine.owned_watch_unproven.contains_key(&ghost),
+        "a budget-refused member stays in rotation"
+    );
+}
+
+/// The exploration predicate's positive half: a view with a provider
+/// module owns; a view with neither module nor claim does not.
+#[test]
+fn view_owns_provider_pins_the_exploration_predicate() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.next_view_id = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+    assert!(!engine.view_owns_provider(ProcessViewId(0)));
+    assert!(!engine.view_owns_provider(ProcessViewId(1)));
+    let (_fixture, _view, scanned, _pins) = loaded_seed_provider();
+    let mut owned = scanned;
+    owned.view = ProcessViewId(1);
+    engine.modules.push(ReconciledModule {
+        scanned: owned,
+        object: PinnedObjectId(7),
+        entry_objects: Vec::new(),
+        forward_verified: Vec::new(),
+        exports: std::sync::Arc::from([]),
+        getter_present: false,
+        witness_fault: false,
+    });
+    assert!(
+        engine.view_owns_provider(ProcessViewId(1)),
+        "a provider module owns its view"
+    );
+    assert!(
+        !engine.view_owns_provider(ProcessViewId(0)),
+        "a module elsewhere owns nothing here"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// The owned child's scheduled arm moves first: newcomer order that
+/// buries the child behind descendants rotates it to the front, and
+/// outside owned runs (or when the child is not scheduled) the order
+/// stands.
+#[test]
+fn owned_child_arm_priority_moves_the_scheduled_child_first() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.next_view_id = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+    engine.owned_run_pid = Some(std::process::id());
+    let ids = vec![ProcessViewId(0), ProcessViewId(1)];
+    let mut order = vec![1usize, 0];
+    assert_eq!(
+        engine.owned_child_arm_priority(&ids, &mut order),
+        Some(ProcessViewId(0))
+    );
+    assert_eq!(order, vec![0, 1], "the scheduled child arms first");
+    // The child unscheduled: no priority, order stands.
+    let mut backlog = vec![1usize];
+    assert_eq!(engine.owned_child_arm_priority(&ids, &mut backlog), None);
+    assert_eq!(backlog, vec![1]);
+    // Outside owned runs: no priority either.
+    engine.owned_run_pid = None;
+    let mut unordered = vec![1usize, 0];
+    assert_eq!(engine.owned_child_arm_priority(&ids, &mut unordered), None);
+    assert_eq!(unordered, vec![1, 0]);
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Watch scans count memory-refused races per cause instead of marking
+/// generic gaps: the scan already noted the refusal in its noise tally,
+/// so the watch merges the count and files no row (a transient member's
+/// mid-scan exit is already counted exactly as an exit, and a live
+/// member's race retries on backoff — a permanent row for either would
+/// mislead).
+#[test]
+fn absorb_watch_scan_counters_counts_refusals_without_marking_gaps() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    let mut engine = Engine::empty();
+    let mut counters = DiscoveryCounters::default();
+    let skipped = Skipped {
+        subject: "capture discovery".into(),
+        reason: "memory scan refused: process generation changed during acquisition".into(),
+    };
+    // The scan notes every skip it returns (scan_and_pin_with_proof).
+    counters.noise.note_skip(&skipped.subject, &skipped.reason);
+    counters.object_skips.push(skipped);
+    engine.absorb_watch_scan_counters(counters);
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a watch refusal files no gap row"
+    );
+    assert_eq!(
+        engine
+            .counters
+            .noise
+            .count(DiscoveryNoiseClass::ProcessEnded),
+        1,
+        "the refusal cause still counts exactly once"
+    );
+}
+
+/// The watch run budget binds time and I/O: either ceiling stops the
+/// run's further scans, while a failed clock read alone stops nothing.
+#[test]
+fn watch_run_over_budget_bounds_time_and_io() {
+    assert!(!watch_run_over_budget(
+        100,
+        100,
+        1_000,
+        Some(1_000),
+        OWNED_WATCH_RUN_BUDGET_NS
+    ));
+    assert!(watch_run_over_budget(
+        100,
+        100,
+        1_000,
+        Some(1_000 + OWNED_WATCH_RUN_BUDGET_NS),
+        OWNED_WATCH_RUN_BUDGET_NS
+    ));
+    assert!(watch_run_over_budget(
+        100,
+        100 + OWNED_WATCH_RUN_IO_CAP_BYTES,
+        1_000,
+        Some(1_000),
+        OWNED_WATCH_RUN_BUDGET_NS
+    ));
+    assert!(!watch_run_over_budget(
+        100,
+        100,
+        1_000,
+        None,
+        OWNED_WATCH_RUN_BUDGET_NS
+    ));
+}
+
+/// A spent run budget stops the run after its first scan (progress is
+/// kept, the rest waits): with a 1 ns budget every run scans exactly
+/// one member however many are eligible, deterministically (elapsed
+/// wall time is always >= 1 ns on a monotonic clock).
+#[test]
+fn owned_tree_watch_spent_budget_scans_exactly_one_member_per_run() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let me = std::process::id();
+    let mut first_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn first sleeper");
+    let mut second_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn second sleeper");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.owned_watch_run_budget_ns = 1;
+    engine.owned_tree_watch(Some(1_000));
+    let scans: u32 = engine
+        .owned_watch_unproven
+        .values()
+        .map(|entry| entry.scans)
+        .sum();
+    assert_eq!(scans, 1, "a spent budget scans exactly one member");
+    assert_eq!(
+        engine.owned_watch_unproven.len(),
+        2,
+        "the unscanned member keeps its rotation slot"
+    );
+    first_sleeper.kill().expect("kill first sleeper");
+    first_sleeper.wait().expect("reap first sleeper");
+    second_sleeper.kill().expect("kill second sleeper");
+    second_sleeper.wait().expect("reap second sleeper");
+}
+
+/// The lazy user-pid selector stops once its room fills: two user pids
+/// taken from five costs two predicate calls, not five — and a full
+/// rotation (room zero) costs zero stat reads.
+#[test]
+fn select_user_pids_lazily_stops_after_limit() {
+    let pids = vec![1u32, 2, 3, 4, 5];
+    let mut calls = 0usize;
+    let out = select_user_pids_lazily(
+        &pids,
+        |_| {
+            calls += 1;
+            true
+        },
+        2,
+    );
+    assert_eq!(out, vec![1, 2]);
+    assert_eq!(calls, 2, "stops after the limit, not all pids");
+    let mut calls_zero = 0usize;
+    let out_zero = select_user_pids_lazily(
+        &pids,
+        |_| {
+            calls_zero += 1;
+            true
+        },
+        0,
+    );
+    assert!(out_zero.is_empty());
+    assert_eq!(calls_zero, 0, "a full rotation reads no stats");
+    // Kernel threads skip without counting toward the room.
+    let mut thread_calls = 0usize;
+    let mixed = select_user_pids_lazily(
+        &[10u32, 11, 12],
+        |pid| {
+            thread_calls += 1;
+            pid != 11
+        },
+        2,
+    );
+    assert_eq!(mixed, vec![10, 12]);
+    assert_eq!(thread_calls, 3, "skipped threads still cost one read each");
+}
+
+#[test]
+fn learn_owned_proofs_stages_a_scan_proven_file_once() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let backing = dir.path().join("libprov.so");
+    std::fs::write(&backing, "p11scope-fixture:shared-provider-bytes").expect("write backing");
+    let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    let object = pins.pinned().next().expect("one pin").id;
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    // The proving view is a descendant (the sleeper), not the owned
+    // child: only transient descendants teach the run their files.
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(7),
+        path: backing.to_string_lossy().into_owned(),
+        object,
+        // Naming travels with the proof (pinned by the twins
+        // below); staging itself is naming-agnostic.
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the scan-proven file stages exactly once"
+    );
+    assert_eq!(
+        engine.pending_learned[0].display_path,
+        backing.to_string_lossy(),
+        "the staging carries the scanned spelling"
+    );
+    // A second proof of the same file stages nothing more.
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "a pending identity never duplicates"
+    );
+    // Settled identities stay silent even with an empty pending queue.
+    let staged = engine.pending_learned.pop().expect("one staged");
+    engine.learned_settled.insert((staged.dev, staged.ino));
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert!(
+        engine.pending_learned.is_empty(),
+        "a settled identity never re-stages"
+    );
+    // Scopes the run does not own stage nothing.
+    engine.owned_run_pid = None;
+    engine.learned_settled.clear();
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert!(
+        engine.pending_learned.is_empty(),
+        "an unowned scope stages nothing"
+    );
+    // The direct child's own files stage nothing either: its view
+    // spans the run, so its scan-owned slots never need learning.
+    engine.owned_run_pid = Some(me);
+    let child_proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(0),
+        path: backing.to_string_lossy().into_owned(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+    }];
+    engine.learn_owned_proofs(&pins, &child_proofs);
+    assert!(
+        engine.pending_learned.is_empty(),
+        "the direct child's files need no learning"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Learning records whether the proving view was still retained: a
+/// retained prover's scan-owned slots persist, so its staging owes no
+/// first-use gap when the key is scan-covered; a transient prover's
+/// slots retire with it, so its staging still owes the row.
+#[test]
+fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let retained_backing = dir.path().join("libretained.so");
+    let transient_backing = dir.path().join("libtransient.so");
+    std::fs::write(
+        &retained_backing,
+        "p11scope-fixture:retained-provider-bytes",
+    )
+    .expect("write retained backing");
+    std::fs::write(
+        &transient_backing,
+        "p11scope-fixture:transient-provider-bytes",
+    )
+    .expect("write transient backing");
+    let retained_pins = real_scan_pin(&retained_backing, None, 400, &"ab".repeat(32));
+    let transient_pins = real_scan_pin(&transient_backing, None, 400, &"cd".repeat(32));
+    let retained_object = retained_pins.pinned().next().expect("one pin").id;
+    let transient_object = transient_pins.pinned().next().expect("one pin").id;
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+    // A proof from the retained sleeper view and one from a released
+    // transient view id (never retained): distinct files, so neither
+    // proof dedupes the other.
+    let retained_proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(7),
+        path: retained_backing.to_string_lossy().into_owned(),
+        object: retained_object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+    }];
+    let transient_proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: transient_backing.to_string_lossy().into_owned(),
+        object: transient_object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+    }];
+    engine.learn_owned_proofs(&retained_pins, &retained_proofs);
+    engine.learn_owned_proofs(&transient_pins, &transient_proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        2,
+        "both proofs stage (distinct files)"
+    );
+    assert!(
+        engine.pending_learned[0].proving_retained,
+        "a retained prover stages as retained"
+    );
+    assert!(
+        !engine.pending_learned[1].proving_retained,
+        "a transient prover stages as transient"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Staging stages the proof's stored loader naming and resolves
+/// nothing behind the proof: the name was captured under the
+/// proving view's pidfd at scan time, since the proving generation
+/// may have exited and its pid recycled by an unrelated process. A
+/// proof whose capture found the loader gone stages the finite
+/// unknown even while the loader reads live.
+#[test]
+fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let backing = dir.path().join("libprov.so");
+    std::fs::write(&backing, "p11scope-fixture:shared-provider-bytes").expect("write backing");
+    let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    let object = pins.pinned().next().expect("one pin").id;
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+    // The capture found the loader gone: the stored naming is the
+    // finite unknown, while the loader reads live (a recycled pid's
+    // exe link must never leak into the staged file).
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(7),
+        path: backing.to_string_lossy().into_owned(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the scan-proven file still stages"
+    );
+    assert_eq!(
+        engine.pending_learned[0].loader_exe, None,
+        "a gone loader is never named behind the proof"
+    );
+    assert_eq!(
+        engine.pending_learned[0].loader_unknown_reason,
+        Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        "the stored finite unknown travels with the proof"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// A still-live loader is named through the proving view's pidfd
+/// bracket: the live twin of the exited case below.
+#[test]
+fn owned_proof_loader_name_names_the_live_loader_through_its_pidfd() {
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let view = ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens");
+    let (exe, reason) = loader_name_for_proving_view(&view);
+    assert_eq!(reason, None, "a live loader names without a reason");
+    assert!(
+        exe.as_deref().is_some_and(|exe| exe.ends_with("sleep")),
+        "the live sleeper is named: {exe:?}"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Once the loader exits, the same proving view yields only the
+/// finite unknown — an exited (potentially recycled) pid is never
+/// named. The live twin above names the same view while it lives.
+#[test]
+fn owned_proof_loader_name_is_unknown_once_the_loader_exits() {
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let view = ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens");
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+    assert!(
+        !view.still_the_same(),
+        "the reaped view no longer names its generation"
+    );
+    let (exe, reason) = loader_name_for_proving_view(&view);
+    assert_eq!(exe, None, "an exited loader is never named");
+    assert_eq!(
+        reason,
+        Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        "the exited loader resolves to the finite unknown"
+    );
 }
 
 #[test]
@@ -80336,6 +81339,8 @@ fn learned_candidate_stages_through_prearm_and_marks_first_run_gap() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80466,6 +81471,8 @@ fn learned_scan_covered_file_stays_unstaged_and_silent() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80491,6 +81498,211 @@ fn learned_scan_covered_file_stays_unstaged_and_silent() {
     );
 }
 
+/// A run-learned candidate stages despite scan coverage: the proving
+/// mapper is a transient descendant whose scan-owned slots retire with
+/// it, so only the persistent piece covers later mappers. Twin of the
+/// fanotify control above (which stays unstaged): deleting the
+/// `run_learned` bypass must fail this test while the control stays green.
+#[test]
+fn learned_run_learned_scan_covered_file_still_stages() {
+    let (fixture, _view, _module, pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: true,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned.absorb(pins);
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the run-learned file stages despite scan coverage"
+    );
+    assert_eq!(
+        engine.learned_notes.len(),
+        1,
+        "one loader note per staged file"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was learned after its first use; \
+                         its earlier calls were not observed"
+        }),
+        "staging files the named first-run gap: {public:?}"
+    );
+}
+
+/// A run-learned proof from a still-retained view over a scan-covered
+/// key stages silently: ordinary discovery already observes this
+/// long-lived mapper's calls, so a first-use gap row would mislead.
+/// The persistent piece still stages (later mappers stay covered).
+#[test]
+fn learned_run_learned_retained_covered_file_stages_silently() {
+    let (fixture, _view, _module, pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: true,
+            proving_retained: true,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned.absorb(pins);
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the covered file still stages its persistent piece"
+    );
+    assert_eq!(
+        engine.learned_notes.len(),
+        1,
+        "one loader note per staged file"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public.iter().any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was learned after its first use; \
+                         its earlier calls were not observed"
+        }),
+        "no first-use gap for observed calls: {public:?}"
+    );
+}
+
+/// A run-learned proof of an already-prearmed file dedupes by file
+/// identity, never by path spelling: the operator's `--prearm-module`
+/// spelling may differ lexically from the scan's display spelling
+/// (symlink, `/lib` vs `/usr/lib`), but the same key stages no second
+/// input and files no spurious first-use gap — only the loader note.
+#[test]
+fn learned_run_learned_prearmed_file_dedupes_by_identity_not_spelling() {
+    use crate::discovery::identity::{PrearmPinRequest, pin_prearm_requests_in_views_with_budget};
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("dedupe.c");
+    let real = dir.path().join("libdedupe-real.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&real)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let link = dir.path().join("libdedupe-link.so");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // Operator prearm at the real spelling (no learned gap: prearm first).
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let prearm = pin_prearm_requests_in_views_with_budget(
+        &[PrearmPinRequest::path(real.clone())],
+        &[],
+        None,
+        0,
+        0,
+        &mut budget,
+        crate::discovery::handle_table::Filing::Untracked,
+    )
+    .expect("the prearm pins");
+    assert_eq!(prearm.inputs.len(), 1, "one prearmed input");
+    let prearmed_key = prearm.inputs[0].key;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.prearm_input = Some(PrearmInput {
+        pins: prearm.pins,
+        inputs: prearm.inputs,
+    });
+    // Run-learned proof of the same file under the symlink spelling.
+    let file = std::fs::File::open(&real).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: link.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: true,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "the same file under another spelling stages nothing new"
+    );
+    assert!(
+        engine.learned_notes.contains_key(&prearmed_key),
+        "the duplicate still gains the loader note"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public
+            .iter()
+            .any(|skip| skip.name == "learned provider file"),
+        "no spurious first-use gap for an already-prearmed file: {public:?}"
+    );
+}
+
 /// The per-capture learned-file cap names its excess once: the 33rd file
 /// is refused loudly, the first 32 are unaffected.
 #[test]
@@ -80508,6 +81720,8 @@ fn learned_cap_names_the_excess_once() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80588,6 +81802,8 @@ fn learned_service_bounds_pins_per_tick() {
                 display_path: so.to_string_lossy().into_owned(),
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
+                run_learned: false,
+                proving_retained: false,
             },
         ))
         .unwrap();
@@ -80649,6 +81865,8 @@ fn learned_capture_end_flushes_pending_candidates() {
                 display_path: so.to_string_lossy().into_owned(),
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
+                run_learned: false,
+                proving_retained: false,
             },
         ))
         .unwrap();
@@ -80706,6 +81924,8 @@ fn learned_shutdown_stages_unserviced_channel() {
             display_path: so.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80759,6 +81979,8 @@ fn learned_clean_shutdown_after_drain_join_files_no_loss() {
             display_path: so.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80814,6 +82036,8 @@ fn learned_terminal_record_publishes_unserviced_file() {
             display_path: so.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80884,6 +82108,8 @@ fn learned_pin_refusal_after_proof_settles_without_staging() {
             display_path: bogus.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -80935,6 +82161,8 @@ fn learned_staging_invalidates_a_stable_plan() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81023,6 +82251,8 @@ fn learned_replaced_file_at_same_path_stages_fresh() {
                 display_path: display.clone(),
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
+                run_learned: false,
+                proving_retained: false,
             },
         ))
         .unwrap();
@@ -81083,6 +82313,8 @@ fn learned_deleted_held_file_is_refused_not_staged() {
             display_path,
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81158,6 +82390,8 @@ fn learned_file_deleted_between_check_and_pin_is_refused_not_staged() {
             display_path,
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81247,6 +82481,8 @@ fn learned_file_replaced_over_opened_path_with_hard_link_is_refused() {
             display_path,
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -81321,6 +82557,392 @@ fn learned_unavailable_files_a_named_gap() {
     assert!(pid_engine.counters.object_skips.is_empty());
 }
 
+/// File learning never arms for an owned `run`: `start_file_learning`
+/// is a no-op on the run-tree cgroup scope, so a non-member process
+/// opening a provider during a run is never staged (privacy, run-tree
+/// only via the watch's direct scans — fanotify marks are
+/// filesystem-wide and never armed here).
+#[test]
+fn start_file_learning_is_noop_for_owned_run_tree() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.start_file_learning();
+    assert!(
+        engine.file_learner.is_none(),
+        "an owned run never arms the fanotify drain"
+    );
+    assert!(
+        engine.learned_rx.is_none(),
+        "an owned run never opens the learn channel"
+    );
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a no-op arming files no gap: {:?}",
+        engine.counters.object_skips
+    );
+    // A plain user cgroup (no owned run) likewise never arms.
+    let mut cgroup_engine = Engine::empty();
+    cgroup_engine.scope = Scope::Cgroup {
+        id: 2,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    cgroup_engine.start_file_learning();
+    assert!(cgroup_engine.file_learner.is_none());
+    assert!(cgroup_engine.learned_rx.is_none());
+}
+
+/// Loader exhaustion names once and never blocks run-tree learning: with
+/// all 256 contexts spent, the 257th preflight refuses with the exact
+/// capacity reason, two real arms through the arming path file exactly
+/// one deduped gap row, and a run-learned provider still stages
+/// (staging needs no loader context, so post-exhaustion mappers'
+/// calls still land via the file-identity probes). Twin of the
+/// privileged many-shortlived cell, which pins that short-lived churn
+/// never reaches exhaustion at all.
+#[test]
+fn loader_exhaustion_names_once_and_watch_still_stages() {
+    use crate::discovery::loader::{LoaderContextSpec, MAX_LOADER_CONTEXTS};
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    // Spend all 256 contexts through direct registry commits (pressure
+    // precedent): each preflight+prepare mints one lifetime ID.
+    let view = ProcessViewId(0);
+    for _ in 0..MAX_LOADER_CONTEXTS {
+        let prepared = engine
+            .loader_registry
+            .preflight(LoaderContextSpec {
+                view,
+                loader: PinnedObjectId(9),
+                mapping: None,
+                hook: p11scope_manifest::elf::SymbolFact {
+                    virtual_address: 0x2100,
+                    file_offset: 0x2100,
+                },
+                state_address: None,
+            })
+            .expect("envelope fill must preflight below capacity");
+        engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("envelope fill must prepare");
+    }
+    // The 257th refuses with the exact named reason.
+    let refusal = engine
+        .loader_registry
+        .preflight(LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(9),
+            mapping: None,
+            hook: p11scope_manifest::elf::SymbolFact {
+                virtual_address: 0x2100,
+                file_offset: 0x2100,
+            },
+            state_address: None,
+        })
+        .expect_err("the 257th preflight must refuse");
+    assert_eq!(
+        refusal, "loader context capacity 256 is exhausted",
+        "the capacity names itself exactly"
+    );
+    // Two real arms through the arming path file exactly one gap row
+    // (mark dedupes): the refusal must surface from the arm, not from
+    // a test that files the row itself.
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+    let mut session = ScriptedSession::default();
+    let arms_before = engine.loader_arms;
+    for _ in 0..2 {
+        engine
+            .arm_loader_or_partial(
+                0,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new(),
+            )
+            .expect("a refused arm is ordinary, never fatal");
+    }
+    assert_eq!(
+        engine.loader_arms,
+        arms_before + 2,
+        "both arms ran through the arming path"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+    let exhaustion_rows = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| {
+            skip.subject == "live loader arming"
+                && skip.reason == "loader context capacity 256 is exhausted"
+        })
+        .count();
+    assert_eq!(
+        exhaustion_rows, 1,
+        "exhaustion names itself once, never twice: {:?}",
+        engine.counters.object_skips
+    );
+    // Run-tree learning still stages despite the full registry.
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: true,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "run-learned staging needs no loader context"
+    );
+}
+
+/// The owned-child loader-context reserve: under owned runs,
+/// non-child members refuse past 248 contexts so the direct child's
+/// exec chain keeps 8; the child itself, and every view outside owned
+/// runs, draws to 256.
+#[test]
+fn loader_reserve_holds_contexts_for_the_owned_child() {
+    use crate::discovery::loader::{
+        LOADER_CAPACITY_EXHAUSTED_REASON, MAX_LOADER_CONTEXTS, OWNED_CHILD_CONTEXT_RESERVE,
+    };
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    let me = std::process::id();
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+    let fill = |engine: &mut Engine, count: usize| {
+        use crate::discovery::loader::LoaderContextSpec;
+        for _ in 0..count {
+            let prepared = engine
+                .loader_registry
+                .preflight(LoaderContextSpec {
+                    view: ProcessViewId(0),
+                    loader: PinnedObjectId(9),
+                    mapping: None,
+                    hook: p11scope_manifest::elf::SymbolFact {
+                        virtual_address: 0x2100,
+                        file_offset: 0x2100,
+                    },
+                    state_address: None,
+                })
+                .expect("reserve fill must preflight below capacity");
+            engine
+                .loader_registry
+                .prepare(prepared)
+                .expect("reserve fill must prepare");
+        }
+    };
+    // One below the reserve line nobody refuses.
+    fill(
+        &mut engine,
+        MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE - 1,
+    );
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(1)).is_none(),
+        "a member below the reserve line draws normally"
+    );
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(0)).is_none(),
+        "the child below the reserve line draws normally"
+    );
+    // At the line members refuse with the capacity reason while the
+    // child still draws.
+    fill(&mut engine, 1);
+    assert_eq!(
+        engine.loader_reserve_refusal(ProcessViewId(1)).as_deref(),
+        Some(LOADER_CAPACITY_EXHAUSTED_REASON),
+        "a member past the line refuses with the capacity reason"
+    );
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(0)).is_none(),
+        "the child past the line still draws from the reserve"
+    );
+    // Outside owned runs nobody refuses, however full the registry.
+    engine.owned_run_pid = None;
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(1)).is_none(),
+        "an unowned scope draws to capacity"
+    );
+    engine.owned_run_pid = Some(me);
+    engine.scope = Scope::Pid(me);
+    assert!(
+        engine.loader_reserve_refusal(ProcessViewId(1)).is_none(),
+        "a non-tree scope draws to capacity"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// End to end through the real arm path: with 248 contexts spent, the
+/// owned child's arm still binds the 249th context while a member arm
+/// refuses with the one deduped capacity row.
+#[test]
+fn loader_reserve_refuses_member_arms_but_arms_the_child() {
+    use crate::discovery::loader::{MAX_LOADER_CONTEXTS, OWNED_CHILD_CONTEXT_RESERVE};
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    let me = std::process::id();
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 3;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let mut first_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn first sleeper");
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), first_sleeper.id()).expect("sleeper view opens"));
+    let mut second_sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn second sleeper");
+    engine.views.push(
+        ProcessView::open(ProcessViewId(2), second_sleeper.id()).expect("sleeper view opens"),
+    );
+    let mut session = ScriptedSession::default();
+    // Bind one real context first: the fill below reuses its loader
+    // object, so later admissions still resolve every context (a fill
+    // on a phantom loader object would poison admission for all of
+    // them, and a fill on a real view would short-circuit its arm).
+    engine
+        .arm_loader_or_partial(
+            1,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect("the establishing arm binds");
+    assert_eq!(
+        engine.loader_registry.allocated_contexts(),
+        1,
+        "the establishing arm minted one context"
+    );
+    let loader = engine
+        .loader_registry
+        .context(crate::discovery::loader::LoaderContextId::from_case_id(0))
+        .expect("one bound context")
+        .spec
+        .loader;
+    for _ in 1..(MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE) {
+        let prepared = engine
+            .loader_registry
+            .preflight(crate::discovery::loader::LoaderContextSpec {
+                view: ProcessViewId(7),
+                loader,
+                mapping: None,
+                hook: p11scope_manifest::elf::SymbolFact {
+                    virtual_address: 0x2100,
+                    file_offset: 0x2100,
+                },
+                state_address: None,
+            })
+            .expect("reserve fill must preflight below capacity");
+        engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("reserve fill must prepare");
+    }
+    // The child binds past the line from the reserve.
+    engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect("the child arms past the reserve line");
+    assert_eq!(
+        engine.loader_registry.allocated_contexts(),
+        MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE + 1,
+        "the child minted past the reserve line"
+    );
+    // A member arm then refuses with the capacity row.
+    engine
+        .arm_loader_or_partial(
+            2,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect("a refused member arm is ordinary, never fatal");
+    assert!(
+        engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(2))
+            .is_empty(),
+        "the refused member bound no context"
+    );
+    first_sleeper.kill().expect("kill first sleeper");
+    first_sleeper.wait().expect("reap first sleeper");
+    second_sleeper.kill().expect("kill second sleeper");
+    second_sleeper.wait().expect("reap second sleeper");
+    let exhaustion_rows = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| {
+            skip.subject == "live loader arming"
+                && skip.reason == "loader context capacity 256 is exhausted"
+        })
+        .count();
+    assert_eq!(
+        exhaustion_rows, 1,
+        "the reserve refusal names itself once: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// The file-only apply attaches a staged learned file without any
 /// discovery batch or inventory refresh: the plan gains the module in
 /// the same service tick, and the shallow-idle latch discharges.
@@ -81339,6 +82961,8 @@ fn learned_staging_applies_without_a_discovery_batch() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         },
     ))
     .unwrap();
@@ -82564,6 +84188,8 @@ fn handle_table_learned_candidate_pushed_back_on_budget_wait() {
         display_path: library.to_string_lossy().into_owned(),
         loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
         loader_unknown_reason: None,
+        run_learned: false,
+        proving_retained: false,
     };
     let gaps_before = engine.counters.object_skips.len();
     engine.stage_learned_candidate(candidate);
@@ -82686,6 +84312,8 @@ fn handle_table_learned_retry_shares_a_resident_row() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         });
     };
     stage(&mut engine);
@@ -82779,6 +84407,8 @@ fn handle_table_learned_retry_under_full_table_proves_nothing() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         });
     };
     let io_before = engine.budget.attempted_io_bytes();
@@ -82852,6 +84482,8 @@ fn handle_table_learned_same_subject_defers_file_once() {
             display_path: display.clone(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
         });
         (dev, ino)
     };
@@ -82915,6 +84547,8 @@ fn handle_table_learned_push_back_holds_the_pending_bound() {
                 display_path: path.to_string_lossy().into_owned(),
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
+                run_learned: false,
+                proving_retained: false,
             });
     }
     let candidate = crate::fanotify::LearnedCandidate {
@@ -82924,6 +84558,8 @@ fn handle_table_learned_push_back_holds_the_pending_bound() {
         display_path: library.to_string_lossy().into_owned(),
         loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
         loader_unknown_reason: None,
+        run_learned: false,
+        proving_retained: false,
     };
     engine.stage_learned_candidate(candidate);
     assert_eq!(
@@ -82985,6 +84621,8 @@ fn handle_table_learned_flush_under_full_table_holds_the_pending_bound() {
                 display_path: path.to_string_lossy().into_owned(),
                 loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
                 loader_unknown_reason: None,
+                run_learned: false,
+                proving_retained: false,
             },
         ))
         .unwrap();
@@ -83283,6 +84921,8 @@ int main(int argc, char **argv) {
         display_path: trusted[3].to_string_lossy().into_owned(),
         loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
         loader_unknown_reason: None,
+        run_learned: false,
+        proving_retained: false,
     });
     engine.service_learned_files();
     assert!(

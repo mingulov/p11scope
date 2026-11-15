@@ -16,6 +16,16 @@ use super::loader_lifetime::{
 };
 
 pub(crate) const MAX_LOADER_CONTEXTS: usize = 256;
+/// Loader contexts held for the owned direct child's exec chain: under
+/// owned runs, non-child member arms refuse at
+/// `MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE` so the child's
+/// own re-arms after exec never lose the last contexts to descendant
+/// churn. The refusal names the capacity reason, like exhaustion.
+pub(crate) const OWNED_CHILD_CONTEXT_RESERVE: usize = 8;
+/// Finite reason when no loader context is available: the registry is
+/// full, or the owned-child reserve holds the remainder.
+pub(crate) const LOADER_CAPACITY_EXHAUSTED_REASON: &str =
+    "loader context capacity 256 is exhausted";
 /// Generation pinned by the pre-reuse token adapter: production allocation
 /// issues each context exactly once and never recycles storage, so every
 /// allocated context is its slot's first incarnation.
@@ -171,7 +181,7 @@ impl LoaderRegistry {
 
     fn preflight_checked(&self, spec: LoaderContextSpec) -> Result<PreparedLoaderContext, String> {
         if self.allocated == MAX_LOADER_CONTEXTS {
-            return Err("loader context capacity 256 is exhausted".into());
+            return Err(LOADER_CAPACITY_EXHAUSTED_REASON.into());
         }
         let expected_hook_ip = spec
             .mapping
@@ -433,6 +443,12 @@ impl LoaderRegistry {
 
     pub(crate) fn discovery_truncated(&self) -> u64 {
         self.discovery_truncated
+    }
+
+    /// Committed lifetime contexts: the owned-child reserve gates
+    /// member arms against this, never against the 256 hard ceiling.
+    pub(crate) fn allocated_contexts(&self) -> usize {
+        self.allocated
     }
 
     pub(crate) fn context_failures(&self) -> u64 {

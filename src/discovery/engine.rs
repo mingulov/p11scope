@@ -3905,6 +3905,9 @@ fn merge_discovered_module(
     if incoming.first_attached_at_ns.is_some() {
         retained.first_attached_at_ns = incoming.first_attached_at_ns;
     }
+    if incoming.first_attach_points.is_some() {
+        retained.first_attach_points = incoming.first_attach_points;
+    }
     // The loader note only moves forward into set, like the attach keys:
     // a learned module stays learned however many snapshots merge.
     if incoming.first_loaded_by.is_some() {
@@ -4013,9 +4016,9 @@ pub(crate) trait EngineSession {
     fn slot_attached_at(&self, _: u32) -> Option<u64> {
         None
     }
-    /// The session's first attach-complete instant for one attach point
-    /// over every slot that ever held it. Scripted sessions override.
-    fn key_first_attached_at(&self, _: plan::AttachKey) -> Option<u64> {
+    /// The session's first attach (begin instant, completion stamp) for
+    /// one attach point over every slot that ever held it.
+    fn key_first_attach(&self, _: plan::AttachKey) -> Option<(Option<u64>, u64)> {
         None
     }
     fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
@@ -4318,8 +4321,8 @@ impl EngineSession for Session {
     fn slot_attached_at(&self, slot: u32) -> Option<u64> {
         Session::slot_attached_at(self, slot)
     }
-    fn key_first_attached_at(&self, key: plan::AttachKey) -> Option<u64> {
-        Session::key_first_attached_at(self, key)
+    fn key_first_attach(&self, key: plan::AttachKey) -> Option<(Option<u64>, u64)> {
+        Session::key_first_attach(self, key)
     }
     fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
         Session::physical_gap_summary(self)
@@ -9878,6 +9881,7 @@ fn discovery_evidence(
                 attached_at_ns: None,
                 unobserved_windows: None,
                 first_attached_at_ns: None,
+                first_attach_points: None,
                 first_loaded_by: pinned
                     .summary(m.object)
                     .and_then(|pin| learned.get(&pin.key).cloned()),
@@ -21724,6 +21728,7 @@ impl Engine {
                 attached_at_ns: Some(None),
                 unobserved_windows: None,
                 first_attached_at_ns: None,
+                first_attach_points: None,
                 first_loaded_by: Some(note.clone()),
             });
         }
@@ -38046,13 +38051,13 @@ impl Engine {
             self.prearm.scope_start_ns(),
             &self.pinned,
         ));
-        let first_stamps: BTreeMap<plan::AttachKey, u64> = self
+        let first_stamps: BTreeMap<plan::AttachKey, (Option<u64>, u64)> = self
             .plan
             .slots
             .iter()
             .filter_map(|slot| {
                 let key = plan::AttachKey::of(slot);
-                session.key_first_attached_at(key).map(|stamp| (key, stamp))
+                session.key_first_attach(key).map(|first| (key, first))
             })
             .collect();
         self.prearm.assemble(

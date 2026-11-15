@@ -1882,11 +1882,14 @@ pub struct Session {
     /// instant coverage began. Detach never removes these: they are
     /// historical facts, and capture-held ordering evidence reads them.
     slot_attached_at: BTreeMap<u32, u64>,
-    /// The first real attach-complete instant per attach point (object,
-    /// file offset), across every slot that ever held it: a probe replaced
-    /// mid-capture gets a new slot (and a new `slot_attached_at` entry)
-    /// but keeps this first instant. First wins; detach never removes it.
-    key_first_attached_at: BTreeMap<crate::plan::AttachKey, u64>,
+    /// The first real attach per attach point (object, file offset), across
+    /// every slot that ever held it: the instant that `attach_targets` call
+    /// began (no call entered before it can be counted) and its
+    /// attach-complete stamp (every call entered after it is counted). A
+    /// probe replaced mid-capture gets a new slot (and a new
+    /// `slot_attached_at` entry) but keeps this first attach. First wins;
+    /// detach never removes it.
+    key_first_attach: BTreeMap<crate::plan::AttachKey, (Option<u64>, u64)>,
     /// Reserved once before BPF preparation, in process-local allocation order.
     /// Collection identity only; this grants no capture or lifetime authority.
     counter_collection_generation: NonZeroU64,
@@ -8216,7 +8219,7 @@ impl Session {
                 detach_wall_ms: 0,
                 attach_mono_ns: None,
                 slot_attached_at: BTreeMap::new(),
-                key_first_attached_at: BTreeMap::new(),
+                key_first_attach: BTreeMap::new(),
                 counter_collection_generation,
                 successful_static: BTreeSet::new(),
                 dynamic_attach_evidence: DynamicAttachEvidence::default(),
@@ -9116,6 +9119,7 @@ impl Session {
         objects: &PinnedObjects,
         ended: &BTreeSet<crate::plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
+        let attach_began_ns = monotonic_ns();
         // No probe attaches after its watch's `until_ns` (packet 6.13,
         // R2-D1-7): ended-watch targets skip (with a stderr note each) so
         // the rest of the batch still attaches. The engine also deactivates
@@ -9461,9 +9465,9 @@ impl Session {
             if let Some(stamp) = stamp {
                 self.slot_attached_at.entry(*slot).or_insert(*stamp);
                 if let Some(target) = targets.iter().find(|target| target.index == *slot) {
-                    self.key_first_attached_at
+                    self.key_first_attach
                         .entry(crate::plan::AttachKey::of(target))
-                        .or_insert(*stamp);
+                        .or_insert((attach_began_ns, *stamp));
                 }
             }
         }
@@ -10543,10 +10547,14 @@ impl Session {
         self.slot_attached_at.get(&slot).copied()
     }
 
-    /// The first attach-complete instant for one attach point over every
-    /// slot that ever held it (a replaced probe keeps its first instant).
-    pub(crate) fn key_first_attached_at(&self, key: crate::plan::AttachKey) -> Option<u64> {
-        self.key_first_attached_at.get(&key).copied()
+    /// The first attach for one attach point over every slot that ever
+    /// held it (a replaced probe keeps its first attach): the attach call's
+    /// begin instant, when the clock read, and its completion stamp.
+    pub(crate) fn key_first_attach(
+        &self,
+        key: crate::plan::AttachKey,
+    ) -> Option<(Option<u64>, u64)> {
+        self.key_first_attach.get(&key).copied()
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {

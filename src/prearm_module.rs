@@ -598,7 +598,7 @@ impl PrearmState {
         records: &mut [crate::render::DiscoveredModule],
         plan: &crate::plan::AttachPlan,
         attached: &BTreeMap<u32, u64>,
-        first_attached: &BTreeMap<AttachKey, u64>,
+        first_attached: &BTreeMap<AttachKey, (Option<u64>, u64)>,
         proofs: &BTreeMap<PinnedObjectId, ExactnessProof>,
     ) {
         let objects: BTreeMap<crate::plan::ModuleId, PinnedObjectId> = plan
@@ -634,7 +634,21 @@ impl PrearmState {
                     .max(),
             };
             record.attached_at_ns = Some(attached_at);
-            record.first_attached_at_ns = first_attached_at(plan, first_attached, record.id, watch);
+            let endpoints = module_endpoints(plan, record.id, watch);
+            record.first_attached_at_ns = first_attached_at(&endpoints, first_attached);
+            let points: Vec<crate::render::FirstAttachPoint> = endpoints
+                .iter()
+                .filter_map(|key| {
+                    first_attached.get(key).map(|(began_ns, attached_ns)| {
+                        crate::render::FirstAttachPoint {
+                            file_offset: key.file_offset,
+                            began_ns: *began_ns,
+                            attached_ns: *attached_ns,
+                        }
+                    })
+                })
+                .collect();
+            record.first_attach_points = (!points.is_empty()).then_some(points);
             let Some(attached_at) = attached_at else {
                 continue;
             };
@@ -696,19 +710,14 @@ impl PrearmState {
     }
 }
 
-/// The module's first complete attach instant: per endpoint, the first
-/// attach-complete stamp over every slot that ever held that attach point
-/// (`first_attached`, kept by the session: a replaced probe keeps its first
-/// instant); then the maximum over the endpoints. The endpoints are the
-/// watch's declared set, else every attach point of the module's current
-/// slots. `None` when any endpoint never carried a stamp.
-fn first_attached_at(
+/// A module's endpoints: the watch's declared set, else every attach
+/// point of the module's current slots.
+fn module_endpoints(
     plan: &crate::plan::AttachPlan,
-    first_attached: &BTreeMap<AttachKey, u64>,
     module: crate::plan::ModuleId,
     watch: Option<&PrearmWatch>,
-) -> Option<u64> {
-    let endpoints: BTreeSet<AttachKey> = match watch {
+) -> BTreeSet<AttachKey> {
+    match watch {
         Some(watch) => watch.declared.iter().copied().collect(),
         None => plan
             .slots
@@ -716,13 +725,24 @@ fn first_attached_at(
             .filter(|slot| slot.module_ids.contains(&module))
             .map(AttachKey::of)
             .collect(),
-    };
+    }
+}
+
+/// The module's first complete attach instant: per endpoint, the first
+/// attach-complete stamp over every slot that ever held that attach point
+/// (`first_attached`, kept by the session: a replaced probe keeps its first
+/// attach); then the maximum over the endpoints. `None` when there is no
+/// endpoint or any endpoint never carried a stamp.
+fn first_attached_at(
+    endpoints: &BTreeSet<AttachKey>,
+    first_attached: &BTreeMap<AttachKey, (Option<u64>, u64)>,
+) -> Option<u64> {
     if endpoints.is_empty() {
         return None;
     }
     let mut latest: Option<u64> = None;
-    for key in &endpoints {
-        let first = first_attached.get(key).copied()?;
+    for key in endpoints {
+        let (_, first) = first_attached.get(key).copied()?;
         latest = Some(latest.map_or(first, |known| known.max(first)));
     }
     latest
@@ -1024,6 +1044,7 @@ mod tests {
             attached_at_ns: None,
             unobserved_windows: None,
             first_attached_at_ns: None,
+            first_attach_points: None,
             first_loaded_by: None,
         }
     }
@@ -1069,16 +1090,38 @@ mod tests {
         // Both current slots were (re)attached late (900, 950); the
         // session's first stamps per attach point stayed at 100 and 120.
         let current = BTreeMap::from([(0, 900), (1, 950)]);
-        let first = BTreeMap::from([(key(7, 0x1000), 100), (key(7, 0x2000), 120)]);
+        let first = BTreeMap::from([
+            (key(7, 0x1000), (Some(90), 100)),
+            (key(7, 0x2000), (None, 120)),
+        ]);
         let mut records = vec![record(3, vec!["scan"])];
         state.assemble(&mut records, &plan, &current, &first, &BTreeMap::new());
         assert_eq!(records[0].attached_at_ns, Some(Some(950)));
         assert_eq!(records[0].first_attached_at_ns, Some(120));
+        assert_eq!(
+            records[0].first_attach_points,
+            Some(vec![
+                crate::render::FirstAttachPoint {
+                    file_offset: 0x1000,
+                    began_ns: Some(90),
+                    attached_ns: 100,
+                },
+                crate::render::FirstAttachPoint {
+                    file_offset: 0x2000,
+                    began_ns: None,
+                    attached_ns: 120,
+                },
+            ])
+        );
         // An endpoint without a first stamp leaves the first attach unknown.
-        let partial = BTreeMap::from([(key(7, 0x1000), 100)]);
+        let partial = BTreeMap::from([(key(7, 0x1000), (Some(90), 100))]);
         let mut records = vec![record(3, vec!["scan"])];
         state.assemble(&mut records, &plan, &current, &partial, &BTreeMap::new());
         assert_eq!(records[0].first_attached_at_ns, None);
+        assert_eq!(
+            records[0].first_attach_points.as_ref().map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]

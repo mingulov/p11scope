@@ -6362,6 +6362,7 @@ fn history_memory_lens_moves_with_recorded_sets() {
             attached_at_ns: None,
             unobserved_windows: None,
             first_attached_at_ns: None,
+            first_attach_points: None,
             first_loaded_by: None,
         },
     );
@@ -43334,6 +43335,7 @@ fn merged_module(sources: Vec<&'static str>) -> render::DiscoveredModule {
         attached_at_ns: None,
         unobserved_windows: None,
         first_attached_at_ns: None,
+        first_attach_points: None,
         first_loaded_by: None,
     }
 }

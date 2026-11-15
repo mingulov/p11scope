@@ -48,7 +48,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_WAIT: Duration = Duration::from_secs(1);
 /// The test harness entry's environment variable (cgroup root, newline,
 /// run cgroup path).
+#[cfg(test)]
 pub(crate) const TEST_ENTRY_ENV: &str = "P11SCOPE_MEMBER_STOP_WATCHDOG_TEST";
+#[cfg(test)]
 pub(crate) const TEST_ENTRY: &str = "attach::member_stop::watchdog::tests::watchdog_harness_entry";
 
 /// How the observer starts the watchdog: the observer's own executable

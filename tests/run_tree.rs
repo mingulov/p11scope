@@ -13,7 +13,7 @@
 //! honestly). Workloads are runtime-generated C (P2-7 `TARGET_C`
 //! precedent), so no committed fixtures and no license row.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -424,14 +424,18 @@ fn assert_exact_first_use_accounting(
     let mut others = Vec::new();
     let mut summary = Vec::new();
     for (name, total) in &oracle {
+        // Rows are per counter slot: a replaced or reclaimed probe adds a
+        // row at the same offset, and the endpoint's count is their sum.
         let targets: Vec<_> = rows.iter().filter(|(row, _, _)| row == name).collect();
-        let [(_, offset, seen)] = targets.as_slice() else {
+        let offsets: BTreeSet<u64> = targets.iter().map(|(_, offset, _)| *offset).collect();
+        let [offset] = offsets.iter().collect::<Vec<_>>()[..] else {
             others.push(format!(
-                "{name}: {} function rows, want exactly one",
+                "{name}: {} function rows at file offsets {offsets:x?}, want one endpoint",
                 targets.len()
             ));
             continue;
         };
+        let seen = &targets.iter().map(|(_, _, calls)| *calls).sum::<u64>();
         let Some((began, attached)) = points.get(offset).copied() else {
             others.push(format!(
                 "{name}: the report discloses no first attach for offset {offset:#x}"
@@ -599,6 +603,58 @@ fn exact_accounting_never_lets_an_early_call_offset_a_later_miss() {
     assert!(
         lost.contains("probe loss") && !lost.contains("undisclosed miss:"),
         "{lost}"
+    );
+}
+
+/// Function rows are per counter slot: a replaced or reclaimed probe for
+/// one endpoint publishes another row at the same file offset, and the
+/// endpoint's count is their sum. Two offsets for one name stay a failure.
+#[test]
+fn exact_accounting_sums_one_endpoints_rows_across_slots() {
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let ledger = dir.path().join("l0");
+    std::fs::write(
+        &ledger,
+        "LEDGER C_GetInfo=2\nCALL C_GetInfo 600 610\nCALL C_GetInfo 700 710\n",
+    )
+    .expect("write ledger");
+    let module = Path::new("/opt/p11.so");
+    let profile = |second_offset: u64| {
+        serde_json::json!({
+            "evidence": {"discovery": [{
+                "path": "/opt/p11.so",
+                "sha256": "abc",
+                "first_attached_at_ns": 500,
+                "unobserved_windows": [{"start_ns": 10, "end_ns": 500, "reason": "late_discovery"}],
+                "first_attach_points": [
+                    {"file_offset": 16, "began_ns": 450, "attached_ns": 500}
+                ]
+            }]},
+            "functions": [
+                {"module": {"sha256": "abc"}, "names": ["C_GetInfo"],
+                 "target": {"file_offset": 16}, "calls": 1},
+                {"module": {"sha256": "abc"}, "names": ["C_GetInfo"],
+                 "target": {"file_offset": second_offset}, "calls": 1}
+            ]
+        })
+    };
+    let failure = |profile: serde_json::Value| {
+        let ledgers = vec![ledger.clone()];
+        std::panic::catch_unwind(move || {
+            assert_exact_first_use_accounting(&profile, module, &ledgers)
+        })
+        .err()
+        .map(|panic| panic.downcast_ref::<String>().cloned().unwrap_or_default())
+    };
+    assert_eq!(
+        failure(profile(16)),
+        None,
+        "two slot rows of one endpoint sum"
+    );
+    let split = failure(profile(48)).expect("two offsets for one name fail");
+    assert!(
+        split.contains("not an undisclosed miss") && split.contains("file offsets"),
+        "{split}"
     );
 }
 

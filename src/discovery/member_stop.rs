@@ -561,12 +561,16 @@ impl Engine {
             Ok(false) if stopped_member_moved_out(&pin, since_ns) => {
                 // The stopped member itself, moved out of the run cgroup:
                 // no longer this run's to hold, but never left stopped.
+                // Its stopping file stays unproven and it may come back
+                // into the tree, so the named first-use gap is filed (the
+                // same row its forced twin files).
                 if Self::resume_member(io, &pin) {
                     self.member_stops.stats.moved_out_resumes =
                         self.member_stops.stats.moved_out_resumes.saturating_add(1);
                     if crate::run::capture_diagnostics_on() {
                         eprintln!("p11scope: stopped member {tgid} left the run tree; resumed");
                     }
+                    self.note_first_use_gap(tgid, "it left the run tree while stopped");
                 } else {
                     self.retry_or_force(io, tgid, since_ns, now_ns, "no signal authority");
                 }

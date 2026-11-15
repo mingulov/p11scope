@@ -25,13 +25,28 @@ fn allowlist_v1_sha256_pin() {
 
 use std::collections::BTreeSet;
 
-/// Files allowed to keep a raw test-side `RLIMIT_NOFILE` change or the
-/// production raise sites reserved for their own lane.
-const SETRLIMIT_ALLOWED: &[&str] = &[
+/// Files that may change `RLIMIT_NOFILE` anywhere: the shared helper is
+/// the only test-side owner, and the integration-test crate cannot link a
+/// `cfg(test)` lib module.
+const SETRLIMIT_ALLOWED_FILES: &[&str] = &[
     "src/test_support/isolation.rs",
-    "src/fd_budget.rs",
-    "src/process.rs",
     "tests/capture_stderr_delivery.rs",
+];
+
+/// Exact whitespace-normalized statements after
+/// `libc::setrlimit(libc::RLIMIT_NOFILE` for the production raise sites
+/// reserved for their own lane. Matching the whole statement keeps a new
+/// raw change in a test module of the same file from hiding behind the
+/// file-level allowance.
+const SETRLIMIT_ALLOWED_SITES: &[(&str, &str)] = &[
+    (
+        "src/fd_budget.rs",
+        ",&next)}!=0{returnErr(std::io::Error::last_os_error().to_string());}Ok(())",
+    ),
+    (
+        "src/process.rs",
+        ",&raised)}==0{Ok(limit.rlim_max.min(usize::MAXaslibc::rlim_t)asusize)}else{Ok(limit.rlim_cur.min(usize::MAXaslibc::rlim_t)asusize)}",
+    ),
 ];
 
 /// Every remaining specialized re-exec child gate that is not a plain
@@ -55,10 +70,6 @@ const CHILD_GATES_ALLOWED: &[(&str, &str)] = &[
     ("src/inventory/mod.rs", "P11SCOPE_CGROUP_STOP_TEST_CHILD"),
     ("src/inventory/mod.rs", "P11SCOPE_DASHBOARD_CANCEL_CHILD"),
     ("src/inventory/mod.rs", "P11SCOPE_NAMESPACE_OUTPUT_CHILD"),
-    (
-        "src/inventory/output_tests.rs",
-        "P11SCOPE_INVENTORY_OUTPUT_FD_COUNT_CHILD",
-    ),
     (
         "src/metrics/counter_reader.rs",
         "P11SCOPE_A27_SOFT1024_CHILD",
@@ -119,13 +130,37 @@ fn setrlimit_violations(sources: &[(String, String)]) -> Vec<String> {
     let needle = concat!("libc::setrlimit(", "libc::RLIMIT_NOFILE");
     let mut violations = Vec::new();
     for (path, text) in sources {
-        if SETRLIMIT_ALLOWED.contains(&path.as_str()) {
+        if SETRLIMIT_ALLOWED_FILES.contains(&path.as_str()) {
             continue;
         }
-        for (line_number, line) in text.lines().enumerate() {
-            if !line.trim_start().starts_with("//") && line.contains(needle) {
-                violations.push(format!("{path}:{}", line_number + 1));
+        // Whitespace-normalized copy (comment-only lines dropped) so a call
+        // split across lines is matched too. `line_starts` maps compact
+        // offsets back to source lines for the report.
+        let mut compact = String::new();
+        let mut line_starts = vec![(0usize, 1usize)];
+        for (index, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
             }
+            line_starts.push((compact.len(), index + 1));
+            compact.extend(line.chars().filter(|character| !character.is_whitespace()));
+        }
+        let mut search = 0;
+        while let Some(offset) = compact[search..].find(needle) {
+            let at = search + offset;
+            let allowed = SETRLIMIT_ALLOWED_SITES.iter().any(|(site, suffix)| {
+                *site == path.as_str() && compact[at + needle.len()..].starts_with(suffix)
+            });
+            if !allowed {
+                let line = line_starts
+                    .iter()
+                    .rev()
+                    .find(|(start, _)| *start <= at)
+                    .map(|(_, line)| *line)
+                    .unwrap_or(1);
+                violations.push(format!("{path}:{line}"));
+            }
+            search = at + needle.len();
         }
     }
     violations
@@ -201,6 +236,27 @@ fn isolation_architecture_guard_detects_planted_violations() {
     assert_eq!(
         child_gate_violations(&planted),
         vec!["src/planted.rs:2 P11SCOPE_PLANTED_CHILD".to_string()]
+    );
+    // A production-file allowance is per statement, so a test module in
+    // that file cannot add a raw limit change under its cover.
+    let planted_in_production_file = vec![(
+        "src/fd_budget.rs".to_string(),
+        "mod tests {\n    fn raw() {\n        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) };\n    }\n}"
+            .to_string(),
+    )];
+    assert_eq!(
+        setrlimit_violations(&planted_in_production_file),
+        vec!["src/fd_budget.rs:3".to_string()]
+    );
+    // A call split across lines is still one statement to the scanner.
+    let planted_multiline = vec![(
+        "src/planted.rs".to_string(),
+        "let _ = unsafe {\n    libc::setrlimit(\n        libc::RLIMIT_NOFILE,\n        &saved,\n    )\n};"
+            .to_string(),
+    )];
+    assert_eq!(
+        setrlimit_violations(&planted_multiline),
+        vec!["src/planted.rs:2".to_string()]
     );
     let allowed = vec![(
         "src/test_support/isolation.rs".to_string(),

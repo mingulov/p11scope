@@ -854,80 +854,54 @@ fn writer_adapter_counts_short_writes_and_flush_failure() {
 
 #[test]
 fn fd_counts_after_success_error_and_cancel() {
-    const CHILD: &str = "P11SCOPE_INVENTORY_OUTPUT_FD_COUNT_CHILD";
-    if std::env::var_os(CHILD).is_some() {
-        let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
-        let signals = || 0;
-        let destination = File::options().write(true).open("/dev/null").unwrap();
-        let before = count();
-        for _ in 0..8 {
-            let mut stdout = FdStdout::new(destination.as_raw_fd(), &signals);
-            stdout.begin_finalization();
-            assert_eq!(stdout.write_document(b"complete").unwrap(), 8);
-        }
-        assert_eq!(count(), before, "fd leak after success");
-        eprintln!(
-            "fd success: before={before} after={}; 8 acquired transports",
-            count()
-        );
-        let (writer, peer) = UnixStream::pair().unwrap();
-        drop(peer);
-        let before = count();
-        for _ in 0..8 {
-            let mut stdout = FdStdout::new(writer.as_raw_fd(), &signals);
-            stdout.begin_finalization();
-            assert!(stdout.write_document(b"error").is_err());
-        }
-        assert_eq!(count(), before, "fd leak after I/O error");
-        eprintln!(
-            "fd I/O error: before={before} after={}; 8 acquired transports",
-            count()
-        );
-        let before = count();
-        for _ in 0..8 {
-            let mut transport =
-                crate::sink::stdout_transport_on_fd(destination.as_raw_fd()).unwrap();
-            let failure =
-                write_document(&mut transport, b"cancel", SHORT_IDLE, &|| true).unwrap_err();
-            assert!(matches!(failure.reason, StdoutFailureReason::Cancelled));
-        }
-        assert_eq!(
-            count(),
-            before,
-            "fd leak after acquired-transport cancellation"
-        );
-        eprintln!(
-            "fd cancellation: before={before} after={}; 8 acquired transports",
-            count()
-        );
+    const TEST: &str = "inventory_output::tests::fd_counts_after_success_error_and_cancel";
+    if !crate::test_support::isolation::enter_with_timeout(
+        TEST,
+        "fd-count",
+        Duration::from_secs(10),
+    ) {
         return;
     }
-    let mut child = OwnedTestChild(
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "inventory_output::tests::fd_counts_after_success_error_and_cancel",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .die_with_parent()
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(
-                status.success(),
-                "isolated descriptor proof failed: {status}"
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "descriptor proof watchdog expired"
-        );
-        thread::sleep(Duration::from_millis(10));
+    let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let signals = || 0;
+    let destination = File::options().write(true).open("/dev/null").unwrap();
+    let before = count();
+    for _ in 0..8 {
+        let mut stdout = FdStdout::new(destination.as_raw_fd(), &signals);
+        stdout.begin_finalization();
+        assert_eq!(stdout.write_document(b"complete").unwrap(), 8);
     }
+    assert_eq!(count(), before, "fd leak after success");
+    eprintln!(
+        "fd success: before={before} after={}; 8 acquired transports",
+        count()
+    );
+    let (writer, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+    let before = count();
+    for _ in 0..8 {
+        let mut stdout = FdStdout::new(writer.as_raw_fd(), &signals);
+        stdout.begin_finalization();
+        assert!(stdout.write_document(b"error").is_err());
+    }
+    assert_eq!(count(), before, "fd leak after I/O error");
+    eprintln!(
+        "fd I/O error: before={before} after={}; 8 acquired transports",
+        count()
+    );
+    let before = count();
+    for _ in 0..8 {
+        let mut transport = crate::sink::stdout_transport_on_fd(destination.as_raw_fd()).unwrap();
+        let failure = write_document(&mut transport, b"cancel", SHORT_IDLE, &|| true).unwrap_err();
+        assert!(matches!(failure.reason, StdoutFailureReason::Cancelled));
+    }
+    assert_eq!(
+        count(),
+        before,
+        "fd leak after acquired-transport cancellation"
+    );
+    eprintln!(
+        "fd cancellation: before={before} after={}; 8 acquired transports",
+        count()
+    );
 }

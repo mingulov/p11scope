@@ -19877,10 +19877,10 @@ pub(crate) mod tests {
     /// An already-admitted heuristic module keeps its active endpoints but
     /// its *new* growth never enters the shared corroborated reserve. The
     /// first plan fills the reserve-free ceiling exactly (1,574 corroborated
-    /// + 10 heuristic = 1,584); a rescan that re-lists those 10 and adds a
-    /// 528-entry second table attaches only the kept 10. Without the reserve
-    /// on kept growth the module would consume the whole reserve and reach
-    /// MAX_SLOTS (2,112).
+    /// plus 10 heuristic = 1,584); a rescan that re-lists those 10 and adds
+    /// a 528-entry second table attaches only the kept 10. Without the
+    /// reserve on kept growth the module would consume the whole reserve and
+    /// reach MAX_SLOTS (2,112).
     #[test]
     fn slot_reclaim_shared_heuristic_growth_stays_out_of_reserve() {
         let capacity = MAX_SLOTS as usize;
@@ -20401,8 +20401,11 @@ pub(crate) mod tests {
             }
             plan.object_identities
                 .insert(PinnedObjectId(42), test_identity(42, "sha-shared-target"));
-            let rebuilt =
-                plan.rebuild_from_sources(&[filler.clone()], &[], &PinnedObjects::empty());
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&filler),
+                &[],
+                &PinnedObjects::empty(),
+            );
             let delta = plan.extend_exact(rebuilt).unwrap();
             assert_eq!(delta.retire.len(), 68, "the generation retires");
             assert_eq!(plan.retired_slots.len(), 68);

@@ -84990,6 +84990,8 @@ struct ScriptedMemberStops {
     non_members: BTreeSet<u32>,
     /// A scripted pending-table read failure.
     fail_pending: bool,
+    /// A scripted watchdog loss.
+    guard_lost: bool,
 }
 
 impl MemberStopIo for ScriptedMemberStops {
@@ -85021,6 +85023,9 @@ impl MemberStopIo for ScriptedMemberStops {
     }
     fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {
         Ok(!self.non_members.contains(&pin.pid()))
+    }
+    fn guard_lost(&mut self) -> bool {
+        self.guard_lost
     }
 }
 
@@ -85529,6 +85534,36 @@ fn member_stop_refused_provider_is_no_attached_resume() {
             "{reason}: {public:?}"
         );
     }
+}
+
+/// The watchdog gone, the observer alone must not keep anyone stopped:
+/// the next pass deactivates the stops and resumes every held and
+/// pending member, and later passes do nothing.
+#[test]
+fn member_stop_watchdog_loss_releases_every_member() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.pause_owned_batch = true;
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held());
+    io.guard_lost = true;
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(io.deactivated, "no new stops");
+    assert!(!engine.member_stops_held());
+    assert!(member_resumed_for_test(pid), "the held member runs again");
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    engine.service_member_stops(&mut io, &mut session, Some(30));
+    assert!(
+        io.rows.contains_key(&pid),
+        "a disabled service takes nothing"
+    );
 }
 
 /// Twin: without a service pass the stopped member stays stopped (the

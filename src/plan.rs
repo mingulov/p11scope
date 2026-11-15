@@ -1447,6 +1447,7 @@ struct ReclaimTarget<'a> {
     path: &'a str,
     names: &'a [String],
     descriptor_index: u32,
+    semantic_authorized: bool,
     identity: Option<&'a TargetObject>,
 }
 
@@ -1463,23 +1464,40 @@ fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
         return false;
     }
     if old.key == new.key {
-        // Same pinned object and offset: the same exact target.
-    } else {
-        if old.key.file_offset != new.key.file_offset {
-            return false;
+        if old.slot.descriptor_index == new.descriptor_index && old.slot.names == new.names {
+            return true;
         }
-        if old.slot.object_path != new.path {
-            return false;
-        }
-        let (Some(old_identity), Some(new_identity)) = (old.identity, new.identity) else {
-            return false;
-        };
-        if old_identity != new_identity
-            || old_identity.sha256.is_none()
-            || new_identity.sha256.is_none()
-        {
-            return false;
-        }
+        // A same-key return that presents no learned names, or only names the
+        // retired cell already carried, is the same exact target as a
+        // count-only cell: it reoccupies its own retired index instead of
+        // burning a fresh one. Extend restores the old authorized names the
+        // way the kept path restores them over `unknown`, keeps the cell
+        // count-only, and attaches a new link, so the retired cell's
+        // descriptor is never applied. Anything wider or different, or any
+        // authorized/descriptor-bearing return, stays an exact-shape match
+        // only.
+        return new.descriptor_index == 0
+            && !new.semantic_authorized
+            && !new.names.is_empty()
+            && new
+                .names
+                .iter()
+                .all(|name| name == UNKNOWN_FUNCTION_NAME || old.slot.names.contains(name));
+    }
+    if old.key.file_offset != new.key.file_offset {
+        return false;
+    }
+    if old.slot.object_path != new.path {
+        return false;
+    }
+    let (Some(old_identity), Some(new_identity)) = (old.identity, new.identity) else {
+        return false;
+    };
+    if old_identity != new_identity
+        || old_identity.sha256.is_none()
+        || new_identity.sha256.is_none()
+    {
+        return false;
     }
     old.slot.descriptor_index == new.descriptor_index && old.slot.names == new.names
 }
@@ -1561,6 +1579,7 @@ fn reclaim_target_from_slot<'a>(
         path: &slot.object_path,
         names: &slot.names,
         descriptor_index: slot.descriptor_index,
+        semantic_authorized: slot.semantic_authorized,
         identity: identities.get(&slot.object),
     }
 }
@@ -1587,7 +1606,7 @@ fn predicted_reclaim_shape<'a>(
     group: &'a [Discovered<'a>],
     key: &AttachKey,
     policy: AdmissionPolicy,
-) -> Option<(&'a str, &'a str, u32)> {
+) -> Option<(&'a str, &'a str, u32, bool)> {
     let mut name: Option<&str> = None;
     let mut path: Option<&str> = None;
     let mut authorized: Option<bool> = None;
@@ -1630,14 +1649,15 @@ fn predicted_reclaim_shape<'a>(
     }
     let name = name?;
     let path = path?;
+    let authorized = authorized.unwrap_or(false);
     let names = [name.to_string()];
     let (descriptor, _) = crate::kinds::descriptor_index(&names);
-    let descriptor = if policy.forces_count_only() || !authorized.unwrap_or(false) {
+    let descriptor = if policy.forces_count_only() || !authorized {
         0
     } else {
         descriptor
     };
-    Some((name, path, descriptor))
+    Some((name, path, descriptor, authorized))
 }
 
 /// Merge's reclaim accounting: each new key of `group` eligible for one
@@ -1679,7 +1699,9 @@ fn reclaim_tickets(
         if shared_unstable.contains(&key) {
             continue;
         }
-        let Some((name, path, descriptor)) = predicted_reclaim_shape(group, &key, policy) else {
+        let Some((name, path, descriptor, semantic_authorized)) =
+            predicted_reclaim_shape(group, &key, policy)
+        else {
             continue;
         };
         let names = [name.to_string()];
@@ -1688,6 +1710,7 @@ fn reclaim_tickets(
             path,
             names: &names,
             descriptor_index: descriptor,
+            semantic_authorized,
             identity: new_identities.get(&key.object),
         };
         let mut found = None;
@@ -2473,6 +2496,7 @@ impl AttachPlan {
                 path: &provisional.object_path,
                 names: &names,
                 descriptor_index: 0,
+                semantic_authorized: false,
                 identity: self.object_identities.get(&provisional.object),
             };
             let same = memory
@@ -3203,7 +3227,18 @@ impl AttachPlan {
         self.mutations.bump();
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
-        self.validate_extension_capacity(&rebuilt)?;
+        let mut rebuilt = rebuilt;
+        if let Err(error) = self.validate_extension_capacity(&rebuilt) {
+            // Growth omission at true capacity: a whole new module object
+            // that cannot fit is dropped and recorded as a counted named
+            // refusal instead of aborting the capture. Retirement,
+            // replacement and every kept/active cell stay. If no new object
+            // can free a cell, the original capacity error stands.
+            if rebuilt.drop_overflowing_new_modules(self) == 0 {
+                return Err(error);
+            }
+            self.validate_extension_capacity(&rebuilt)?;
+        }
 
         // Exact reuse assignments, computed once and applied verbatim so
         // merge accounting, capacity validation and allocation agree:
@@ -3428,6 +3463,28 @@ impl AttachPlan {
                 // ambiguity rather than refusing the slot.
                 let mut updated = slot.clone();
                 updated.index = position as u32;
+                let old_slot = slots[position].clone();
+                // A same-key count-only return may carry no names (or only a
+                // subset of the retired cell's names). Reoccupy the index the
+                // same way the kept path treats `unknown`: keep the old
+                // authorized names, stay count-only, and never inherit the
+                // retired cell's descriptor (the new link carries none).
+                if slot.descriptor_index == 0
+                    && !slot.semantic_authorized
+                    && slot
+                        .names
+                        .iter()
+                        .all(|name| name == UNKNOWN_FUNCTION_NAME || old_slot.names.contains(name))
+                {
+                    updated.names.extend(old_slot.names.iter().cloned());
+                    updated.names.retain(|name| name != UNKNOWN_FUNCTION_NAME);
+                    updated.names.sort();
+                    updated.names.dedup();
+                    updated.aliased = old_slot.aliased || updated.names.len() >= 2;
+                    updated.descriptor_index = 0;
+                    updated.semantics = SlotSemantics::COUNT_ONLY;
+                    updated.semantic_authorized = false;
+                }
                 let previous_owner = aggregate_owners[position];
                 let candidate_owner = if rebuilt.slot_is_module_ambiguous(slot.index) {
                     AggregateOwner::Ambiguous
@@ -3439,6 +3496,7 @@ impl AttachPlan {
                 if merged_owner == AggregateOwner::Ambiguous && updated.descriptor_index != 0 {
                     updated.descriptor_index = 0;
                     updated.semantics = SlotSemantics::COUNT_ONLY;
+                    updated.semantic_authorized = false;
                     updated.semantic_ambiguous = true;
                 }
                 // The same function of the same file: its capture-lifetime
@@ -3492,6 +3550,7 @@ impl AttachPlan {
         let merged_standard: BTreeSet<u32> = self
             .slots
             .iter()
+            .filter(|slot| slot.semantic_authorized)
             .filter(|slot| {
                 let key = AttachKey::of(slot);
                 match rebuilt.slot_by_key.get(&key) {
@@ -3877,6 +3936,194 @@ impl AttachPlan {
             .count();
         self.prune_capture_memory();
         old_to_new
+    }
+
+    /// Growth omission at true capacity: drop every whole new module object
+    /// whose fresh cells keep the extension over budget, record each as a
+    /// counted, named capacity refusal, and return how many objects were
+    /// dropped. Retirement, replacement and every kept/active cell are
+    /// untouched: only active cells that are fresh to `prior` and owned
+    /// exclusively by new objects are given back. Returns 0, changing
+    /// nothing, when no new object can free a cell, so the caller reports
+    /// the original capacity error instead of hiding it.
+    fn drop_overflowing_new_modules(&mut self, prior: &Self) -> usize {
+        if !matches!(self.admission_policy, AdmissionPolicy::Detailed(_))
+            || !matches!(prior.admission_policy, AdmissionPolicy::Detailed(_))
+        {
+            return 0;
+        }
+        let prior_objects: BTreeSet<PinnedObjectId> =
+            prior.modules.iter().map(|module| module.object).collect();
+        let prior_keys: BTreeSet<AttachKey> = prior.slot_by_key.keys().copied().collect();
+        let object_of: BTreeMap<ModuleId, PinnedObjectId> = self
+            .modules
+            .iter()
+            .map(|module| (module.id, module.object))
+            .collect();
+        let new_ids: BTreeSet<ModuleId> = self
+            .modules
+            .iter()
+            .filter(|module| !prior_objects.contains(&module.object))
+            .map(|module| module.id)
+            .collect();
+        if new_ids.is_empty() {
+            return 0;
+        }
+        // Fresh cells owned only by new objects: their keys were not active
+        // in the prior plan and hold no reclaim ticket, so giving them back
+        // returns room the extension would otherwise need.
+        let freed: BTreeSet<usize> = self
+            .slot_by_key
+            .values()
+            .copied()
+            .filter(|position| {
+                let Some(slot) = self.slots.get(*position) else {
+                    return false;
+                };
+                let key = AttachKey::of(slot);
+                !prior_keys.contains(&key)
+                    && !self.reclaimed.contains_key(&key)
+                    && !slot.module_ids.is_empty()
+                    && slot.module_ids.iter().all(|id| new_ids.contains(id))
+            })
+            .collect();
+        if freed.is_empty() {
+            return 0;
+        }
+        // Drop every new object that owns a freeable cell; a new object that
+        // only reoccupies retired cells, or that shares all its fresh cells
+        // with an existing module, is not overflowing and stays.
+        let dropped_objects: BTreeSet<PinnedObjectId> = freed
+            .iter()
+            .filter_map(|position| self.slots.get(*position))
+            .flat_map(|slot| slot.module_ids.iter())
+            .filter_map(|id| object_of.get(id).copied())
+            .collect();
+        let dropped_ids: BTreeSet<ModuleId> = self
+            .modules
+            .iter()
+            .filter(|module| dropped_objects.contains(&module.object))
+            .map(|module| module.id)
+            .collect();
+        if dropped_ids.is_empty() {
+            return 0;
+        }
+        let capacity = self.admission_policy.endpoint_limit();
+        let in_use = prior.slots.len();
+        let retired = prior.retired_slots.len();
+        for module in &self.modules {
+            if !dropped_ids.contains(&module.id) {
+                continue;
+            }
+            let needed = self
+                .slot_by_key
+                .iter()
+                .filter(|(key, _)| {
+                    key.object == module.object
+                        && !prior_keys.contains(key)
+                        && !self.reclaimed.contains_key(key)
+                })
+                .count();
+            let reason = format!(
+                "module needs {needed} more; only {capacity} attach slots are available; {} - \
+                 refusing to attach a prefix; to capture one provider, name it with --module \
+                 <path>; to free slots, exclude an unneeded module with --exclude-module <name>",
+                slot_use(in_use, retired, &[])
+            );
+            let skipped = Skipped {
+                subject: module.path.clone(),
+                reason,
+            };
+            self.refused_module_objects.push((
+                module.object,
+                skipped.clone(),
+                RefusalKind::CapacityWhole,
+            ));
+            self.modules_skipped.push(skipped);
+        }
+        for slot in &mut self.slots {
+            slot.module_ids.retain(|id| !dropped_ids.contains(id));
+        }
+        self.modules
+            .retain(|module| !dropped_ids.contains(&module.id));
+        // Give the now-ownerless fresh cells back and renumber the snapshot.
+        let old_len = self.slots.len();
+        let mut old_to_new = vec![u32::MAX; old_len];
+        let mut slots = Vec::with_capacity(old_len.saturating_sub(freed.len()));
+        for (position, mut slot) in self.slots.drain(..).enumerate() {
+            if freed.contains(&position) {
+                continue;
+            }
+            slot.index = slots.len() as u32;
+            old_to_new[position] = slot.index;
+            slots.push(slot);
+        }
+        let mut owners = Vec::with_capacity(slots.len());
+        for (position, owner) in self.aggregate_owners.drain(..).enumerate() {
+            if !freed.contains(&position) {
+                owners.push(owner);
+            }
+        }
+        self.slots = slots;
+        self.aggregate_owners = owners;
+        self.retired_slots = self
+            .retired_slots
+            .iter()
+            .filter_map(|position| {
+                let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new as usize)
+            })
+            .collect();
+        self.standard_layout_slots = self
+            .standard_layout_slots
+            .iter()
+            .filter_map(|position| {
+                let new = old_to_new
+                    .get(*position as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new)
+            })
+            .collect();
+        self.reproven_unfinished_slots = self
+            .reproven_unfinished_slots
+            .iter()
+            .filter_map(|position| {
+                let new = old_to_new
+                    .get(*position as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new)
+            })
+            .collect();
+        for memory in [&mut self.retired_keys, &mut self.revivable] {
+            *memory = memory
+                .iter()
+                .filter_map(|(key, position)| {
+                    let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
+                    (new != u32::MAX).then_some((*key, new as usize))
+                })
+                .collect();
+        }
+        let retired_slots = self.retired_slots.clone();
+        self.slot_by_key = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| !retired_slots.contains(position))
+            .map(|(position, slot)| (AttachKey::of(slot), position))
+            .collect();
+        let slot_by_key = &self.slot_by_key;
+        self.provisional_get_function_list
+            .retain(|key, _| slot_by_key.contains_key(key));
+        self.module_ambiguous = self
+            .aggregate_owners
+            .iter()
+            .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
+            .count();
+        self.mutations.bump();
+        self.prune_capture_memory();
+        dropped_ids.len()
     }
 
     pub(crate) fn validate_slot_index(&self) -> Result<(), String> {
@@ -21123,6 +21370,80 @@ pub(crate) mod tests {
             copy.getter_present = false;
         }
         copy
+    }
+
+    #[test]
+    fn same_key_count_only_reclaim_requires_unknown_or_a_known_subset() {
+        let mut slot = Slot {
+            index: 3,
+            descriptor_index: 1,
+            object: PinnedObjectId(42),
+            object_path: "/opt/p.so".into(),
+            file_offset: 0x1000,
+            names: vec!["C_Sign".into(), "C_Verify".into()],
+            aliased: true,
+            semantics: crate::kinds::DESCRIPTORS[1],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(0)],
+        };
+        slot.semantics = crate::kinds::DESCRIPTORS[slot.descriptor_index as usize];
+        let key = AttachKey::of(&slot);
+        let facts = RetiredSlotFacts {
+            position: 3,
+            key,
+            slot: &slot,
+            identity: None,
+        };
+        let reclaim = |names: &[&str], descriptor: u32, semantic: bool, key: AttachKey| {
+            let names: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
+            let target = ReclaimTarget {
+                key,
+                path: "/opt/p.so",
+                names: &names,
+                descriptor_index: descriptor,
+                semantic_authorized: semantic,
+                identity: None,
+            };
+            reclaimable(&facts, &target)
+        };
+        assert!(
+            reclaim(&[UNKNOWN_FUNCTION_NAME], 0, false, key),
+            "an unlearned count-only return reoccupies its own index"
+        );
+        assert!(
+            reclaim(&["C_Sign"], 0, false, key),
+            "a known-name subset reoccupies its own index"
+        );
+        assert!(
+            reclaim(&["C_Sign", "C_Verify"], 0, false, key),
+            "the same names as a count-only return reoccupy it"
+        );
+        assert!(
+            !reclaim(&["C_Sign", "C_Verify", "C_InitPIN"], 0, false, key),
+            "a name the retired cell never carried fails closed"
+        );
+        assert!(
+            !reclaim(&["C_Finalize"], 0, false, key),
+            "a different name fails closed"
+        );
+        assert!(
+            !reclaim(&["C_Sign"], 2, false, key),
+            "only a count-only return takes the relaxed shape"
+        );
+        assert!(
+            !reclaim(&["C_Sign"], 0, true, key),
+            "an authorized return is not a count-only return"
+        );
+        let other_key = AttachKey {
+            object: PinnedObjectId(43),
+            file_offset: 0x1000,
+        };
+        assert!(
+            !reclaim(&[UNKNOWN_FUNCTION_NAME], 0, false, other_key),
+            "the relaxed shape is same-key only"
+        );
     }
 
     /// O2: a same-key count-only return reoccupies its own retired index,

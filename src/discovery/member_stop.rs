@@ -44,10 +44,18 @@ pub(crate) trait MemberStopIo {
     fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String>;
 }
 
-/// The longest a member stays stopped for one provider attach. Past it
-/// the member resumes unprotected and the first-use row is filed: a
-/// stuck attach never wedges the run (never-stop).
+/// The longest a member stays stopped for one provider attach, counted
+/// from the kernel's stop. Past it the member resumes unprotected and the
+/// first-use row is filed: a stuck attach never wedges the run
+/// (never-stop). A member read late (a busy pass) resumes in the pass
+/// that reads it.
 pub(crate) const MEMBER_STOP_HOLD_NS: u64 = 1_000_000_000;
+/// Stopped members taken per service pass, oldest stop first.
+const MEMBER_STOP_INTAKE_PER_PASS: usize = 64;
+/// Wall-time budget of one pass's intake (maps reads and ELF proofs).
+const MEMBER_STOP_PASS_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+/// Wall-time budget of one member's maps read and proofs.
+const MEMBER_STOP_MEMBER_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 /// Bounded maps read per stopped member.
 const MEMBER_STOP_MAPS_BYTES: usize = 4 * 1024 * 1024;
 /// Bounded files inspected per stopped member and service pass.
@@ -80,6 +88,9 @@ pub(crate) struct MemberStopState {
     pub(crate) stop_staged: BTreeSet<(u64, u64)>,
     /// Rows left in place for a retry (counted once as stopped).
     retrying: BTreeMap<u32, ()>,
+    /// Test override of [`MEMBER_STOP_INTAKE_PER_PASS`].
+    #[cfg(test)]
+    pub(crate) intake_cap: Option<usize>,
     pub(crate) stats: MemberStopStats,
 }
 
@@ -326,8 +337,10 @@ impl Engine {
         let Some(now_ns) = now_ns.or_else(crate::attach::monotonic_ns) else {
             return;
         };
+        // Bounds first: a held member never waits on this pass's intake.
+        self.resolve_member_holds(io, now_ns);
         // A failed table read skips only the intake: held members' bounds
-        // are still enforced below.
+        // are still enforced.
         let pending = match io.pending() {
             Ok(pending) => pending,
             Err(error) => {
@@ -337,12 +350,28 @@ impl Engine {
                 Vec::new()
             }
         };
+        // Bounded intake, oldest stop first: the rest stay stopped with
+        // their rows for the next pass (their bound runs from their own
+        // stop), so a fork or loader burst never stalls the capture tick.
+        let mut pending: Vec<_> = pending
+            .into_iter()
+            .filter(|(tgid, _)| !self.member_stops.held.contains_key(tgid))
+            .collect();
+        pending.sort_by_key(|(tgid, stop)| (stop.hook_ts_ns, *tgid));
+        #[cfg(test)]
+        let cap = self
+            .member_stops
+            .intake_cap
+            .unwrap_or(MEMBER_STOP_INTAKE_PER_PASS);
+        #[cfg(not(test))]
+        let cap = MEMBER_STOP_INTAKE_PER_PASS;
+        let pass_deadline = std::time::Instant::now() + MEMBER_STOP_PASS_BUDGET;
         let mut staged = false;
-        for (tgid, stop) in pending {
-            if self.member_stops.held.contains_key(&tgid) {
-                continue;
+        for (tgid, stop) in pending.into_iter().take(cap) {
+            if std::time::Instant::now() >= pass_deadline {
+                break;
             }
-            staged |= self.intake_member_stop(io, tgid, stop, now_ns);
+            staged |= self.intake_member_stop(io, tgid, stop, now_ns, pass_deadline);
         }
         if staged {
             self.service_learned_files();
@@ -363,6 +392,7 @@ impl Engine {
         tgid: u32,
         stop: MemberStop,
         now_ns: u64,
+        pass_deadline: std::time::Instant,
     ) -> bool {
         // A row kept for a retry counts once.
         if self.member_stops.retrying.remove(&tgid).is_none() {
@@ -400,7 +430,7 @@ impl Engine {
                 return false;
             }
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let deadline = (std::time::Instant::now() + MEMBER_STOP_MEMBER_BUDGET).min(pass_deadline);
         let rows = pin
             .open_proc_dir()
             .and_then(|proc| {
@@ -451,6 +481,21 @@ impl Engine {
                 self.pending_learned.push(candidate);
             }
         }
+        // The bound runs from the kernel's stop (the same monotonic clock).
+        let since_ns = match stop.hook_ts_ns {
+            0 => now_ns,
+            stamp => stamp.min(now_ns),
+        };
+        if now_ns.saturating_sub(since_ns) >= MEMBER_STOP_HOLD_NS {
+            // Read only after its bound: staged, but resumed at once, and
+            // its first calls may run before the probes.
+            for key in &files {
+                self.clear_member_file(io, *key);
+            }
+            self.resume_or_retry(io, &pin);
+            self.note_unattached_resume(tgid);
+            return true;
+        }
         self.member_stops.stats.provider_holds =
             self.member_stops.stats.provider_holds.saturating_add(1);
         self.member_stops.held.insert(
@@ -459,10 +504,25 @@ impl Engine {
                 pin,
                 files,
                 providers: identities,
-                since_ns: now_ns,
+                since_ns,
             },
         );
         true
+    }
+
+    /// A provider mapper resumed before its probes attached: counted, and
+    /// the named first-use row is filed (its first calls may be missed).
+    fn note_unattached_resume(&mut self, tgid: u32) {
+        self.member_stops.stats.timed_out = self.member_stops.stats.timed_out.saturating_add(1);
+        self.mark_partial(
+            crate::render::LEARNED_SKIP_SUBJECT,
+            crate::render::LEARNED_FIRST_RUN_REASON,
+        );
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "p11scope: run member {tgid} resumed before its provider attached (hold bound)"
+            );
+        }
     }
 
     /// Proves every uncleared executable row: non-providers come back as
@@ -626,17 +686,7 @@ impl Engine {
                 // The member runs before its provider's probes: its first
                 // calls may go unobserved, the same named first-use row a
                 // learned file without a stop files.
-                self.member_stops.stats.timed_out =
-                    self.member_stops.stats.timed_out.saturating_add(1);
-                self.mark_partial(
-                    crate::render::LEARNED_SKIP_SUBJECT,
-                    crate::render::LEARNED_FIRST_RUN_REASON,
-                );
-                if crate::run::capture_diagnostics_on() {
-                    eprintln!(
-                        "p11scope: run member {tgid} resumed before its provider attached (hold bound)"
-                    );
-                }
+                self.note_unattached_resume(tgid);
             }
         }
     }

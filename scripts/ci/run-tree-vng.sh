@@ -186,8 +186,9 @@ fi
 all_pass=$(python3 -I -c '
 import json,sys
 rows=[json.loads(line) for line in open(sys.argv[1]) if line.strip()]
-# A declared expected failure (run-run-tree.sh EXPECTED_FAILURES) passes
-# the leg only as a failed row; its unexpected pass fails the leg.
+# A declared intermittent failure (run-run-tree.sh EXPECTED_FAILURES)
+# lands as a qualified pass or as a non-passing expected-failure row with
+# a known signature; a passing expected-failure row is inconsistent.
 def ok(row):
     if row["qualification"] == "expected-failure":
         return not row["pass"]

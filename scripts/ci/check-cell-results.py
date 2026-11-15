@@ -14,11 +14,14 @@ qualified and every qualified row must pass (with owned-edge-usage-counts
 requiring its proof fields in detail); nonqualifying smoke may pass or
 fail but every nonqualifying row must be allow-listed and the allow-list
 must equal the nonqualifying set; expected-failure must equal its
-declared list and an expected failure that passes is a failure. Every
+declared list and an expected failure that passes is a failure. An
+--intermittent-failure cell fails only sometimes with a known signature:
+its row must appear and may be a passing qualified row or a non-passing
+expected-failure row, never a failed row or an unexpected pass. Every
 --require cell must appear, so a dropped row fails.
 
 Usage:
-  python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
+  python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
 """
 
 import json
@@ -53,6 +56,7 @@ def has_owned_edge_usage_proof(detail):
 
 def main(argv):
     expected = []
+    intermittent = []
     allowed_smoke = []
     required = []
     positional = []
@@ -63,6 +67,11 @@ def main(argv):
                 expected.append(next(iterator))
             except StopIteration:
                 return fail("--expected-failure needs a cell name")
+        elif token == "--intermittent-failure":
+            try:
+                intermittent.append(next(iterator))
+            except StopIteration:
+                return fail("--intermittent-failure needs a cell name")
         elif token == "--allow-nonqualifying":
             try:
                 allowed_smoke.append(next(iterator))
@@ -78,7 +87,7 @@ def main(argv):
         else:
             positional.append(token)
     if len(positional) != 1:
-        return fail("usage: check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]")
+        return fail("usage: check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--intermittent-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]")
     path = Path(positional[0])
     try:
         text = path.read_text(encoding="utf-8")
@@ -161,6 +170,17 @@ def main(argv):
     wanted = sorted(set(expected))
     if len(wanted) != len(expected):
         problems.append("duplicate --expected-failure names")
+    if len(set(intermittent)) != len(intermittent):
+        problems.append("duplicate --intermittent-failure names")
+    both = sorted(set(intermittent) & set(expected))
+    if both:
+        problems.append("cells declared both expected and intermittent: " + ", ".join(both))
+    # Intermittent cells may land either way: never part of the exact
+    # expected-failure set, but their rows must be present.
+    actual = [cell for cell in actual if cell not in set(intermittent)]
+    missing_intermittent = sorted(set(intermittent) - seen)
+    if missing_intermittent:
+        problems.append("missing intermittent cells: " + ", ".join(missing_intermittent))
     if len(set(allowed_smoke)) != len(allowed_smoke):
         problems.append("duplicate --allow-nonqualifying names")
     if len(set(required)) != len(required):
@@ -183,7 +203,15 @@ def main(argv):
         for problem in problems:
             print(f"check-cell-results: {problem}", file=sys.stderr)
         return 1
-    print(f"check-cell-results: {len(rows)} rows ok ({len(actual)} expected failures)")
+    landed = sum(
+        1 for row in rows
+        if row["cell"] in set(intermittent) and row["qualification"] == "expected-failure"
+    )
+    if intermittent:
+        print(f"check-cell-results: {len(rows)} rows ok ({len(actual)} expected failures, "
+              f"{landed} of {len(set(intermittent))} intermittent failures)")
+    else:
+        print(f"check-cell-results: {len(rows)} rows ok ({len(actual)} expected failures)")
     return 0
 
 

@@ -1149,7 +1149,7 @@ impl ProcPin<'_> {
     ) -> Result<Vec<u8>, String> {
         use std::io::Read as _;
         if max_bytes == 0 || max_bytes > 8 * 1024 * 1024 {
-            return Err("invalid maps byte bound".into());
+            return Err(format!("invalid {} byte bound", name.to_string_lossy()));
         }
         self.before_io(deadline)?;
         let fd = relative_proc_open(self.directory.as_fd(), name)?;
@@ -1161,14 +1161,17 @@ impl ProcPin<'_> {
             self.before_io(deadline)?;
             let count = file
                 .read(&mut buffer)
-                .map_err(|error| format!("reading retained maps: {error}"))?;
+                .map_err(|error| format!("reading retained {}: {error}", name.to_string_lossy()))?;
             after_read();
             self.before_io(deadline)?;
             if count == 0 {
                 return Ok(bytes);
             }
             if count > max_bytes.saturating_sub(bytes.len()) {
-                return Err("retained maps exceeds its byte bound".into());
+                return Err(format!(
+                    "retained {} exceeds its byte bound",
+                    name.to_string_lossy()
+                ));
             }
             bytes.extend_from_slice(&buffer[..count]);
         }

@@ -603,23 +603,28 @@ impl IngestedRaw {
 
     /// Classify an admission whose exact claim failed, so the claim step
     /// can retain it as plain S1 instead of stopping the lane. An
-    /// admission collected in a newer quantum than this ingest means the
-    /// caller supplied a stale quantum, which stays a refusal (`None`).
-    /// Classification then names only what the adapter can observe
-    /// exactly.
+    /// admission from another native domain, an admission with no
+    /// collected origin, or an admission collected in a newer quantum
+    /// than this ingest (a caller-supplied stale ingest) cannot name a
+    /// consistent original here, so each degrades under the
+    /// cause-neutral `Unclaimable` cause. Otherwise the adapter names
+    /// only what it can observe exactly.
     pub(crate) fn claim_refusal_cause(
         &self,
         admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
         adapter: &JournalAdapter,
-    ) -> Option<crate::discovery::caller_registry::instance_input::PlainS1Cause> {
+    ) -> crate::discovery::caller_registry::instance_input::PlainS1Cause {
+        use crate::discovery::caller_registry::instance_input::PlainS1Cause;
         if admitted.journal_binding().0 != self.raw.producers.native_domain() {
-            return None;
+            return PlainS1Cause::Unclaimable;
         }
-        let origin = admitted.collected_origin()?;
+        let Some(origin) = admitted.collected_origin() else {
+            return PlainS1Cause::Unclaimable;
+        };
         if origin.newer_than(self.raw.identity) {
-            return None;
+            return PlainS1Cause::Unclaimable;
         }
-        Some(adapter.claim_refusal_cause(admitted))
+        adapter.claim_refusal_cause(admitted)
     }
 
     pub(crate) fn disposition_s1only_original<'adapter, 'input>(

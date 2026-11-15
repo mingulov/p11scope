@@ -1083,17 +1083,15 @@ impl PreparedSemanticBatch {
                 {
                     // A stashed admission may no longer certify its
                     // retained original (a void wiped it, a taint
-                    // removed it, or a replay/duplicate/foreign row
-                    // owns the invocation). Observed history still
-                    // counts: retain the call as plain S1 under a named
-                    // cause and keep scanning instead of refusing the
-                    // whole semantic lane. The gap is counted once at
-                    // reduction, where the caller is known. Only a
-                    // caller-supplied stale ingest (an admission newer
-                    // than it) stays a refusal.
-                    let Some(cause) = ingested.claim_refusal_cause(input, adapter) else {
-                        return Err(RawQuantumRefusal::Admission);
-                    };
+                    // removed it, a replay/duplicate/foreign row owns
+                    // the invocation, or the caller supplied a stale
+                    // ingest with no consistent origin). Observed
+                    // history still counts: retain the call as plain S1
+                    // under a named cause and keep scanning instead of
+                    // refusing the whole semantic lane. The gap is
+                    // counted once at reduction, where the caller is
+                    // known; no claim classification stops the lane.
+                    let cause = ingested.claim_refusal_cause(input, adapter);
                     input.retain_as_plain_s1(cause);
                     next += 1;
                     continue;
@@ -1125,10 +1123,8 @@ impl PreparedSemanticBatch {
         Ok(self.claim_step(None))
     }
 
-    /// The batch's one-shot disclosure, released exactly when the claim
-    /// scan reaches its end: how many admissions a void forced to plain
-    /// S1. A mid-scan claim keeps the count for the final step, so one
-    /// batch stages one counted gap however its claims interleave.
+    /// The next claim-scan step. Admissions retained as plain S1 ride
+    /// the call to reduction and are counted there, never here.
     fn claim_step(&mut self, claim: Option<PreparedClaim>) -> ClaimStep {
         ClaimStep { claim }
     }

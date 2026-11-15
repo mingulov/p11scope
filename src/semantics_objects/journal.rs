@@ -5273,7 +5273,8 @@ impl JournalAdapter {
     ///   stop path), so the reason stays cause-neutral;
     /// - `Unclaimable`: the invocation is still retained, or
     ///   the admission cannot name a consistent original (a replay, a
-    ///   duplicate, a tainted present row or a foreign origin).
+    ///   duplicate, a tainted present row, a foreign origin or a
+    ///   resource origin whose producers do not match this adapter).
     ///
     /// The decision never depends on an unrelated earlier void: only
     /// the wipe record names a void, and that record is replaced at

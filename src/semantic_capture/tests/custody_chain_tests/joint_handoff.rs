@@ -849,7 +849,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
 }
 
 #[test]
-fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
+fn joint_prepared_foreign_or_old_raw_proof_never_claims() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
     fixture.bind(pid, image(7), &[0]);
@@ -915,6 +915,9 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
         ),
         Ok(())
     );
+    // The ingest is older than the prepared admission, so the sibling has
+    // no consistent original against it. It is retained as plain S1 once
+    // and the scan continues; it never yields a claim from the old proof.
     for _ in 0..2 {
         assert_eq!(
             fixture
@@ -922,11 +925,27 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
                 .scene
                 .coordinator
                 .claim_next_prepared_admission(&fixture.producers, &first),
-            Err(RawQuantumRefusal::Admission)
+            Ok(None)
         );
         fixture.assert_claims(&[(1, proof)]);
+        let prepared = fixture
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .unwrap();
+        assert_eq!(
+            prepared.next_admission().unwrap().h0_ordinal(),
+            2,
+            "the retained sibling stays prepared at its position"
+        );
+        assert_eq!(
+            prepared.next_admission().unwrap().plain_s1_cause(),
+            Some(crate::discovery::caller_registry::instance_input::PlainS1Cause::Unclaimable),
+            "one old-proof scan retains the newer sibling under one cause"
+        );
     }
-    let (next, next_proof) = fixture.ingest(next_raw);
+    let (next, _next_proof) = fixture.ingest(next_raw);
     for _ in 0..2 {
         assert_eq!(
             fixture
@@ -938,25 +957,8 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
         );
         fixture.assert_claims(&[(1, proof)]);
     }
-    assert_eq!(
-        fixture
-            .real
-            .scene
-            .coordinator
-            .prepared_semantic_batch()
-            .unwrap()
-            .next_admission()
-            .unwrap()
-            .h0_ordinal(),
-        2
-    );
-    assert!(
-        !fixture
-            .real
-            .scene
-            .coordinator
-            .stage_next_prepared_admission(false, true)
-    );
+    // The claim decision is one-shot: the correct ingest cannot reclaim
+    // the sibling already retained as plain S1, and records no claim.
     assert_eq!(
         fixture
             .real
@@ -964,21 +966,9 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .coordinator
             .claim_next_prepared_admission(&fixture.producers, &next)
             .unwrap(),
-        Some((2, Ok(next_proof)))
+        None
     );
-    fixture.assert_claims(&[(1, proof), (2, next_proof)]);
-    for _ in 0..2 {
-        assert!(
-            fixture
-                .real
-                .scene
-                .coordinator
-                .claim_next_prepared_admission(&fixture.producers, &next)
-                .unwrap()
-                .is_none()
-        );
-        fixture.assert_claims(&[(1, proof), (2, next_proof)]);
-    }
+    fixture.assert_claims(&[(1, proof)]);
     fixture.finish(1, 2);
     assert_eq!(
         operation_edge_rows(&fixture.real.scene),

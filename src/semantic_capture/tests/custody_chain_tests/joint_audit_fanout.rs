@@ -11746,6 +11746,240 @@ fn joint_claim_retains_an_older_admission_with_a_retained_invocation_after_a_voi
     );
 }
 
+/// Keyrows F1 failure twin: a prepared admission collected in a newer
+/// quantum than the caller-supplied ingest is a stale ingest. It cannot
+/// name a consistent original here, so the claim scan must retain it as
+/// plain S1 under the cause-neutral unclaimable cause and keep scanning:
+/// the one remaining claim-time lane stop is gone.
+#[test]
+fn joint_claim_retains_a_newer_admission_against_a_stale_ingest_as_s1() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    // Quantum 1 is claimed and settled normally.
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let (ingested1, _proof, _grant) = fixture.ingest_with_grant(raw1);
+    let claimed = claim_and_finish(&mut fixture, &ingested1);
+    assert_eq!(claimed.len(), 1, "the first call claims");
+    fixture
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.real.lane))
+        .unwrap();
+    // A newer quantum is prepared but not ingested, so the retained
+    // ingest is stale for its admissions while still passing the
+    // owner/frontier check.
+    fixture.push(pid, 0, "C_SignInit", 2);
+    let raw2 = fixture.prepare(1);
+    let newer = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    assert!(
+        !ingested1.matches_admission(&newer),
+        "the prepared admission belongs to a newer quantum"
+    );
+    assert_eq!(
+        ingested1.frontier(),
+        fixture
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .consumed_frontier(),
+        "the older ingest still passes the owner/frontier check"
+    );
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .claim_next_prepared_admission(&fixture.producers, &ingested1)
+            .expect("a stale ingest degrades its newer admissions instead of refusing"),
+        None,
+        "the claim scan reaches the batch end after retaining the call"
+    );
+    let prepared = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let retained = prepared
+        .admissions()
+        .next()
+        .expect("the retained admission stays prepared");
+    assert!(retained.plain_s1(), "the observed call is kept as plain S1");
+    assert_eq!(
+        retained.plain_s1_cause(),
+        Some(crate::discovery::caller_registry::instance_input::PlainS1Cause::Unclaimable),
+        "a stale ingest cannot name a consistent original"
+    );
+    assert_eq!(
+        retained.plain_s1_cause().map(|cause| cause.reason()),
+        Some("joint_unclaimable_claim_history_loss"),
+        "the retained call carries the named counted gap reason"
+    );
+    // M1: nothing is counted at the claim. The one gap is recorded only
+    // when the call actually reduces as S1.
+    let registry = fixture.real.scene.coordinator.registry();
+    assert!(
+        !registry
+            .gaps()
+            .iter()
+            .chain(registry.staged_gaps_for_test().iter())
+            .any(|gap| gap.reason.contains("claim_history_loss")),
+        "a claim decision alone records no retained-S1 gap"
+    );
+    // M2: a rescan retries the same marked admission without refusing,
+    // re-marking or counting it again.
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .claim_next_prepared_admission(&fixture.producers, &ingested1)
+            .expect("a rescan of a retained admission degrades, never refuses"),
+        None,
+        "the marked admission is scanned again without a new claim"
+    );
+    let prepared = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    assert_eq!(
+        prepared
+            .admissions()
+            .next()
+            .expect("the retained admission stays prepared")
+            .plain_s1_cause(),
+        Some(crate::discovery::caller_registry::instance_input::PlainS1Cause::Unclaimable),
+        "a rescan keeps the one retained cause"
+    );
+    drop(raw2);
+}
+
+/// Keyrows F1 healthy twin: the same newer admission claimed against its
+/// own ingest never takes the stale-ingest route. It claims normally and
+/// is not marked plain S1, so the degradation above is specific to a
+/// caller-supplied stale ingest.
+#[test]
+fn joint_claim_claims_a_newer_admission_against_its_own_ingest() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let (ingested1, _proof, _grant) = fixture.ingest_with_grant(raw1);
+    let claimed = claim_and_finish(&mut fixture, &ingested1);
+    assert_eq!(claimed.len(), 1, "the first call claims");
+    fixture
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.real.lane))
+        .unwrap();
+    fixture.push(pid, 0, "C_SignInit", 2);
+    let raw2 = fixture.prepare(1);
+    let newer = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    let (ingested2, _proof2, _grant2) = fixture.ingest_with_grant(raw2);
+    assert!(
+        ingested2.matches_admission(&newer),
+        "the current ingest owns the prepared admission"
+    );
+    let claim = fixture
+        .real
+        .scene
+        .coordinator
+        .claim_next_prepared_admission(&fixture.producers, &ingested2)
+        .expect("the current ingest claims its own admission")
+        .expect("a matching admission claims");
+    assert_eq!(
+        claim.0,
+        newer.h0_ordinal(),
+        "the claim names the prepared call"
+    );
+    let prepared = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    assert!(
+        !prepared
+            .admissions()
+            .next()
+            .expect("the claimed admission stays prepared")
+            .plain_s1(),
+        "a current-quantum admission is never degraded to plain S1"
+    );
+}
+
+/// Keyrows F1 no-origin twin: an admission that carries no collected
+/// origin cannot name any original at this ingest. It degrades under
+/// the same cause-neutral unclaimable cause rather than refusing, so
+/// both formerly refusing classification branches are pinned.
+#[test]
+fn joint_claim_retains_an_admission_without_a_collected_origin_as_s1() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    let caller = fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let admission = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    let (ingested1, _proof, _grant) = fixture.ingest_with_grant(raw1);
+    let originless =
+        crate::discovery::caller_registry::instance_input::AdmittedInstanceCall::scripted(
+            admission.instance_key_for_test(),
+            caller,
+            admission.h0_ordinal(),
+            admission.s1_facts().clone(),
+        );
+    assert!(
+        originless.collected_origin().is_none(),
+        "the scripted admission carries no collected origin"
+    );
+    assert!(
+        !ingested1.matches_admission(&originless),
+        "an originless admission never matches the current quantum"
+    );
+    let adapter = fixture.real.scene.coordinator.joint_capture().adapter();
+    assert_eq!(
+        ingested1.claim_refusal_cause(&originless, adapter),
+        crate::discovery::caller_registry::instance_input::PlainS1Cause::Unclaimable,
+        "an admission with no collected origin degrades instead of refusing"
+    );
+}
+
 /// Keyrows F4/I1b exactness control: a self-inconsistent admission whose
 /// collected-origin position disagrees with its own H0 ordinal is not an
 /// exactly voided claim, even after a real void and with its invocation

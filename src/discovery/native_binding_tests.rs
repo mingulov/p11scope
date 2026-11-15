@@ -348,6 +348,7 @@ fn departed_exec_instants_prune_within_the_grace_but_keep_live_tasks() {
     let live = 100u32;
     run.binder.prune_departed(
         |pid| pid != live,
+        |_| false,
         run.clock + 180_000_000_000,
         180_000_000_000,
     );
@@ -371,14 +372,14 @@ fn prune_keeps_live_tasks_and_gone_processes_within_the_grace() {
     run.binder.absorb_lifecycle(&drained(domain, &execs, at));
     assert_eq!(run.binder.exec_instants_for_test(), 32);
     run.binder
-        .prune_departed(|pid| pid != 100, at + GRACE - 1, GRACE);
+        .prune_departed(|pid| pid != 100, |_| false, at + GRACE - 1, GRACE);
     assert_eq!(
         run.binder.exec_instants_for_test(),
         32,
         "a live task and gone entries younger than the grace survive"
     );
     run.binder
-        .prune_departed(|pid| pid != 100, at + GRACE, GRACE);
+        .prune_departed(|pid| pid != 100, |_| false, at + GRACE, GRACE);
     assert_eq!(
         run.binder.exec_instants_for_test(),
         1,
@@ -399,7 +400,8 @@ fn prune_keeps_a_pending_rows_tgid_and_cookie_past_the_grace() {
     run.read(vec![row(domain, 7, 1, T, 900)]);
     assert_eq!(run.binder.exec_instants_for_test(), 1);
     assert_eq!(run.binder.cookie_sequences_for_test(), 1);
-    run.binder.prune_departed(|_| true, at + GRACE, GRACE);
+    run.binder
+        .prune_departed(|_| true, |_| false, at + GRACE, GRACE);
     assert_eq!(
         run.binder.exec_instants_for_test(),
         1,
@@ -425,7 +427,8 @@ fn prune_keeps_a_bound_callers_cookie_after_exit_past_the_grace() {
     run.settle();
     assert_eq!(run.verdicts(), vec![bound(caller)]);
     run.world.retire(T);
-    run.binder.prune_departed(|_| true, 2_000 + GRACE, GRACE);
+    run.binder
+        .prune_departed(|_| true, |_| false, 2_000 + GRACE, GRACE);
     assert_eq!(
         run.binder.cookie_sequences_for_test(),
         1,
@@ -446,7 +449,8 @@ fn prune_clears_unbound_departed_state_past_the_grace() {
     run.settle();
     assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
     assert_eq!(run.binder.cookie_sequences_for_test(), 1);
-    run.binder.prune_departed(|_| true, 1_000 + GRACE, GRACE);
+    run.binder
+        .prune_departed(|_| true, |_| false, 1_000 + GRACE, GRACE);
     assert_eq!(
         run.binder.exec_instants_for_test(),
         0,
@@ -469,7 +473,8 @@ fn prune_skips_a_finished_domain() {
     run.binder
         .absorb_lifecycle(&drained(domain, &[(T, 1_000)], 1_000));
     run.binder.finish(domain);
-    run.binder.prune_departed(|_| true, 1_000 + GRACE, GRACE);
+    run.binder
+        .prune_departed(|_| true, |_| false, 1_000 + GRACE, GRACE);
     assert_eq!(
         run.binder.exec_instants_for_test(),
         1,
@@ -500,7 +505,8 @@ fn prune_keeps_a_retained_callers_exec_veto() {
         CallerLifecycle::Exited,
     );
     assert_eq!(run.binder.exec_instants_for_test(), 1);
-    run.binder.prune_departed(|_| true, 1_600 + GRACE, GRACE);
+    run.binder
+        .prune_departed(|_| true, |pid| pid == T, 1_600 + GRACE, GRACE);
     assert_eq!(
         run.binder.exec_instants_for_test(),
         1,

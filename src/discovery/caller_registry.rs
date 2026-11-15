@@ -1934,6 +1934,26 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.live_by_pid.remove(&tracked.record.pid);
     }
 
+    /// Forget one already-retired caller record whose row was rendered
+    /// and whose facts are folded into the coordinator's counted
+    /// aggregate. Only a retired record with no held pin can leave; a
+    /// live or still-pinned incarnation refuses. Caller IDs are never
+    /// reused, so this cannot land on a newer incarnation.
+    pub(crate) fn forget_caller(&mut self, id: CallerId) -> bool {
+        let Some(tracked) = self.callers.get(&id) else {
+            return false;
+        };
+        if !tracked.record.retired || tracked.pin.is_some() {
+            return false;
+        }
+        let pid = tracked.record.pid;
+        self.callers.remove(&id);
+        if self.live_by_pid.get(&pid) == Some(&id) {
+            self.live_by_pid.remove(&pid);
+        }
+        true
+    }
+
     /// A natively proven exec transition (Task 6 C4): the live incarnation
     /// `id`'s image ended while its pin held. It retires exec-retired with
     /// its evidence and the pid is admitted again as its successor. A
@@ -4253,6 +4273,32 @@ impl CallerRegistry {
 
     pub(crate) fn edge(&self, caller: CallerId, module: ModuleId) -> Option<&EdgeRecord> {
         self.edges.get(&(caller, module))
+    }
+
+    /// Whether `caller` still backs a rendered registry fact: an edge,
+    /// a gap, an instance or an instance-semantic row. A retired caller
+    /// with none of these holds no per-caller registry state beyond its
+    /// retirement refusal entry.
+    pub(crate) fn caller_has_rendered_state(&self, caller: CallerId) -> bool {
+        self.edges
+            .range((caller, ModuleId(0))..=(caller, ModuleId(u32::MAX)))
+            .next()
+            .is_some()
+            || self.gaps.iter().any(|gap| gap.caller == Some(caller))
+            || self.instances().any(|row| row.caller == caller)
+            || self
+                .instance_semantic_edges()
+                .any(|row| row.caller == caller)
+    }
+
+    /// Drop a retired caller from the registry's caller set once it has
+    /// no rendered rows left. Its `retired` refusal entry stays: late
+    /// mapping evidence for the incarnation must still be refused, not
+    /// admitted under a dead caller ID.
+    pub(crate) fn compact_retired_caller(&mut self, caller: CallerId) {
+        if self.retired.contains_key(&caller) && !self.caller_has_rendered_state(caller) {
+            self.callers.remove(&caller);
+        }
     }
 
     /// One caller's edges: a range query over the `(caller, module)` key,

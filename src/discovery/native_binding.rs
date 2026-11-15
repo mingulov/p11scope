@@ -873,22 +873,23 @@ impl NativeBinder {
         self.decide_ready(index);
     }
 
-    /// One lifecycle quantum, in the domain the facade drained it from. A
-    /// drain that emptied the ring (no bound, deadline, failure, or busy
-    /// head) covers every read that finished before it started; a failed
-    /// record is dated at the quantum's end.
     /// Free per-process exec state for departed tasks (R-C51-5): a gone
     /// process can never start a new incarnation, so its remembered exec
     /// instant only orders rows that can no longer bind. Rows still
     /// pending are kept, as are live processes' entries and anything
-    /// younger than `grace_ns`. The hard limits are unchanged; this only
-    /// stops a churn of short-lived processes from filling them.
-    pub(crate) fn prune_departed<G: Fn(u32) -> bool>(
-        &mut self,
-        gone: G,
-        now_ns: u64,
-        grace_ns: u64,
-    ) {
+    /// younger than `grace_ns`. `protected` names tgids whose retained
+    /// incarnation still needs the entries as decision evidence: a
+    /// retained caller's late row is decided through the post-exit
+    /// fallback, and the exec instant and competing image sequences are
+    /// what keep it from binding the wrong image. Pruning those would
+    /// turn a `exec_after_admission` refusal into a false bind. The hard
+    /// limits are unchanged; this only stops a churn of short-lived
+    /// processes from filling them.
+    pub(crate) fn prune_departed<G, P>(&mut self, gone: G, protected: P, now_ns: u64, grace_ns: u64)
+    where
+        G: Fn(u32) -> bool,
+        P: Fn(u32) -> bool,
+    {
         for domain in &mut self.domains {
             if domain.finished {
                 continue;
@@ -900,13 +901,14 @@ impl NativeBinder {
                 .collect();
             domain.exec_ns.retain(|tgid, latest| {
                 !gone(*tgid)
+                    || protected(*tgid)
                     || pending_tgids.contains(tgid)
                     || now_ns.saturating_sub(*latest) < grace_ns
             });
             // An image cookie whose latest row is older than the grace and
             // whose process is gone cannot receive a new row; keeping its
-            // exec sequences only grows the per-image map. A bound caller
-            // or a pending row still needs it.
+            // exec sequences only grows the per-image map. A bound caller,
+            // a pending row or a retained caller's veto still needs it.
             let live_cookies: std::collections::HashSet<DomainCookie> =
                 domain.callers.values().map(|(cookie, _)| *cookie).collect();
             let pending_cookies: std::collections::HashSet<DomainCookie> = domain
@@ -918,10 +920,41 @@ impl NativeBinder {
                 live_cookies.contains(cookie)
                     || pending_cookies.contains(cookie)
                     || execs.values().any(|seen| {
-                        !gone(seen.last_tgid) || now_ns.saturating_sub(seen.last_t0_ns) < grace_ns
+                        !gone(seen.last_tgid)
+                            || protected(seen.last_tgid)
+                            || now_ns.saturating_sub(seen.last_t0_ns) < grace_ns
                     })
             });
         }
+    }
+
+    /// Release one retired caller's binder evidence after its row was
+    /// rendered: cached bindings, ended marks and pending-row references.
+    /// A row still pending keeps the caller (it still decides through
+    /// the incarnation snapshot) and this returns false. A cleared
+    /// cached binding makes any later row for that image read unknown,
+    /// never attribute to a caller record that no longer exists.
+    pub(crate) fn release_retired_caller(&mut self, id: CallerId) -> bool {
+        if self.domains.iter().any(|domain| {
+            domain.pending.iter().any(|pending| {
+                pending.sighting.as_ref().is_some_and(|s| s.caller == id)
+                    || pending.retained.is_some_and(|retained| retained.id == id)
+            })
+        }) {
+            return false;
+        }
+        for domain in &mut self.domains {
+            domain.callers.remove(&id);
+            domain.ended.remove(&id);
+            for execs in domain.cookies.values_mut() {
+                for seen in execs.values_mut() {
+                    if seen.bound == Some(id) {
+                        seen.bound = None;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Test-only: remembered exec instants across all open domains.

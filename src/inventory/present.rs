@@ -477,6 +477,9 @@ pub(crate) struct BudgetView {
     pub callers_limit: usize,
     pub callers_occupied: usize,
     pub callers_refused: u64,
+    /// Proven-exited caller rows retired after they were rendered into
+    /// the counted aggregate (their `callers[]` row no longer appears).
+    pub callers_retired: u64,
     pub modules_limit: usize,
     pub modules_occupied: usize,
     pub modules_refused: u64,
@@ -1036,6 +1039,7 @@ impl Presentation {
                     .adapter()
                     .admit_refused()
                     .saturating_add(registry.callers_refused()),
+                callers_retired: coordinator.retired_callers(),
                 modules_limit: limits.max_modules,
                 modules_occupied: registry.module_count(),
                 modules_refused: registry.modules_refused(),
@@ -4493,10 +4497,11 @@ fn render_snapshot_inner(
     );
     let _ = writeln!(
         out,
-        "budgets: callers {}/{} refused {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {} | {}",
+        "budgets: callers {}/{} refused {} retired {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {} | {}",
         budgets.callers_occupied,
         budgets.callers_limit,
         budgets.callers_refused,
+        budgets.callers_retired,
         budgets.modules_occupied,
         budgets.modules_limit,
         budgets.modules_refused,

@@ -86250,10 +86250,15 @@ struct ScriptedMemberStops {
     deactivated: bool,
     /// Tgids scripted as outside the run tree.
     non_members: BTreeSet<u32>,
+    /// A scripted pending-table read failure.
+    fail_pending: bool,
 }
 
 impl MemberStopIo for ScriptedMemberStops {
     fn pending(&mut self) -> Result<Vec<(u32, p11scope_ebpf_common::MemberStop)>, String> {
+        if self.fail_pending {
+            return Err("scripted MS_STOPS read failure".into());
+        }
         Ok(self
             .rows
             .iter()
@@ -86534,6 +86539,115 @@ fn member_stop_leaves_a_process_outside_the_run_tree_untouched() {
         states.values().all(|state| *state == b'T'),
         "the process is never signalled"
     );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A held member's bound is enforced even while the pending table cannot
+/// be read: the failed read never skips the hold resolution.
+#[test]
+fn member_stop_bound_resumes_a_held_member_while_the_table_is_unreadable() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.pause_owned_batch = true;
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held());
+    io.fail_pending = true;
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(10 + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(!engine.member_stops_held(), "the bound still ends the hold");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+}
+
+/// A pin without signal authority (no pidfd) never withdraws the row
+/// it cannot resume: a fresh pin of the same process resumes it, and a
+/// pin whose process cannot be re-proven keeps the row for a later pass.
+#[test]
+fn member_stop_resume_keeps_the_row_without_signal_authority() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    stop_member_for_test(pid);
+    let start = crate::process::process_start_time(pid).unwrap();
+    let mut io = ScriptedMemberStops::default();
+    let row = p11scope_ebpf_common::MemberStop {
+        file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+        hook_ts_ns: 1,
+        vm_start: 0x1000,
+        vm_end: 0x2000,
+    };
+    io.rows.insert(pid, row);
+    // Wrong start time: the fallback pin cannot be re-proven.
+    let stale = crate::process::PidPin::test_pidfd_fallback(pid, Some(start + 1));
+    assert!(!Engine::resume_member_for_test(&mut io, &stale));
+    assert!(io.rows.contains_key(&pid), "the row stays");
+    assert!(io.withdrawn.is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let states = crate::discovery::pause::read_task_states(pid).unwrap();
+    assert!(states.values().all(|state| *state == b'T'));
+    // The same process re-pinned with a pidfd resumes.
+    let fallback = crate::process::PidPin::test_pidfd_fallback(pid, Some(start));
+    assert!(Engine::resume_member_for_test(&mut io, &fallback));
+    assert_eq!(io.withdrawn, vec![pid]);
+    assert!(member_resumed_for_test(pid));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// An `original_exited` read error is not a departure: the held member
+/// is not abandoned. Its row stays, and the next pass re-pins and resumes
+/// it.
+#[test]
+fn member_stop_unreadable_exit_state_never_abandons_a_held_member() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    stop_member_for_test(pid);
+    let mut io = ScriptedMemberStops::default();
+    let row = p11scope_ebpf_common::MemberStop {
+        file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+        hook_ts_ns: 1,
+        vm_start: 0x1000,
+        vm_end: 0x2000,
+    };
+    io.rows.insert(pid, row);
+    let mut engine = member_stop_engine();
+    // No pidfd and no start time: `original_exited` cannot answer.
+    let blind = crate::process::PidPin::test_pidfd_fallback(pid, None);
+    assert!(blind.original_exited().is_err());
+    engine.hold_member_for_test(pid, blind, 1);
+    let mut session = ScriptedSession::default();
+    io.fail_pending = true;
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(1 + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(io.rows.contains_key(&pid), "the row is not withdrawn");
+    assert_eq!(engine.member_stop_stats_for_test().departed, 0);
+    io.fail_pending = false;
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(2 + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(member_resumed_for_test(pid), "the next pass resumes it");
     let _ = child.kill();
     let _ = child.wait();
 }

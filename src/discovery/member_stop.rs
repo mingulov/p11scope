@@ -328,6 +328,16 @@ impl Engine {
         Self::resume_member(io, pin)
     }
 
+    /// [`Self::resume_member`] with the signal send replaced.
+    #[cfg(test)]
+    pub(crate) fn resume_member_with_for_test(
+        io: &mut dyn MemberStopIo,
+        pin: &crate::process::PidPin,
+        send: &mut dyn FnMut(&crate::process::PidPin) -> Result<(), String>,
+    ) -> bool {
+        Self::resume_member_with(io, pin, send)
+    }
+
     /// Holds `pin` as if a provider staging were pending since `since_ns`.
     #[cfg(test)]
     pub(crate) fn hold_member_for_test(
@@ -632,14 +642,25 @@ impl Engine {
         }
     }
 
-    /// Resumes the member through its pidfd, withdrawing its row first
-    /// (so its next new file stops it again) only once the resume is
-    /// certain: the pin carries signal authority for that exact process.
-    /// A pin without a pidfd is re-pinned and accepted only for the same
-    /// start time. Returns false, with the row kept, when no resume can
-    /// be sent; the row then stays for a later pass, the final release,
-    /// and the watchdog.
+    /// Resumes the member through its pidfd, then withdraws its row (so
+    /// its next new file stops it again). The signal goes first: a send
+    /// that fails while the member lives keeps the row, so a later pass,
+    /// the bound, the final release and the watchdog still resume it. The
+    /// hook refuses a second row for a tgid, so a file the member maps in
+    /// the instant between the resume and the withdraw does not stop it;
+    /// the owned-tree watch still learns such a file, with its first-use
+    /// row. A pin without a pidfd is re-pinned and accepted only for the
+    /// same start time. Returns false, with the row kept, when no resume
+    /// was sent.
     fn resume_member(io: &mut dyn MemberStopIo, pin: &crate::process::PidPin) -> bool {
+        Self::resume_member_with(io, pin, &mut |pin| pin.send_signal(libc::SIGCONT))
+    }
+
+    fn resume_member_with(
+        io: &mut dyn MemberStopIo,
+        pin: &crate::process::PidPin,
+        send: &mut dyn FnMut(&crate::process::PidPin) -> Result<(), String>,
+    ) -> bool {
         let fresh;
         let pin = if pin.probe_signal_authority().is_ok() {
             pin
@@ -656,9 +677,11 @@ impl Engine {
                 _ => return false,
             }
         };
+        // A failed send of an exited member leaves nothing stopped.
+        if send(pin).is_err() && !matches!(pin.original_exited(), Ok(true)) {
+            return false;
+        }
         let _ = io.withdraw(pin.pid());
-        // A failure here is the process's exit: nothing left stopped.
-        let _ = pin.send_signal(libc::SIGCONT);
         true
     }
 

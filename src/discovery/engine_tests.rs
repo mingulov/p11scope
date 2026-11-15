@@ -86652,6 +86652,94 @@ fn member_stop_unreadable_exit_state_never_abandons_a_held_member() {
     let _ = child.wait();
 }
 
+/// The hold bound counts from the kernel's stop, not from the pass that
+/// first reads the row: a row read a whole bound after its stop resumes
+/// its provider mapper in that pass, with the first-use row.
+#[test]
+fn member_stop_hold_counts_from_the_kernel_stop() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    let mut row = member_stop_row(pid, &library, key);
+    row.hook_ts_ns = 5;
+    io.rows.insert(pid, row);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.pause_owned_batch = true;
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(5 + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(!engine.member_stops_held(), "no hold past the bound");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert_eq!(engine.member_stop_stats_for_test().timed_out, 1);
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.name == "learned provider file"
+                && skip.reason == render::LEARNED_FIRST_RUN_REASON),
+        "{public:?}"
+    );
+}
+
+/// One pass takes a bounded number of rows, oldest stop first; the rest
+/// stay stopped with their rows for the next pass.
+#[test]
+fn member_stop_intake_is_bounded_per_pass() {
+    let mut children = Vec::new();
+    let mut io = ScriptedMemberStops::default();
+    for stamp in [3u64, 1, 2] {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let exe = loop {
+            if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+                && exe.file_name().is_some_and(|name| name == "sleep")
+            {
+                break exe;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        stop_member_for_test(pid);
+        let key = member_exec_key_for_test(pid, &exe);
+        let mut row = member_stop_row(pid, &exe, key);
+        row.hook_ts_ns = stamp;
+        io.rows.insert(pid, row);
+        children.push((stamp, child));
+    }
+    let mut engine = member_stop_engine();
+    engine.member_stops.intake_cap = Some(2);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    let newest = children
+        .iter()
+        .find(|(stamp, _)| *stamp == 3)
+        .map(|(_, child)| child.id())
+        .unwrap();
+    assert_eq!(io.rows.keys().copied().collect::<Vec<_>>(), vec![newest]);
+    assert_eq!(io.withdrawn.len(), 2);
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(io.rows.is_empty(), "the next pass takes the rest");
+    for (_, child) in &mut children {
+        assert!(member_resumed_for_test(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// Twin: without a service pass the stopped member stays stopped (the
 /// resume above is the service's, not the fixture's).
 #[test]

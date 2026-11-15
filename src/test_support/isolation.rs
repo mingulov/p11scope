@@ -17,7 +17,18 @@ const DEFAULT_CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 /// Builds the re-executed child command for `test`, gated by `key`.
 pub(crate) fn command(test: &str, key: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().expect("test binary path is known"));
-    command.args(["--exact", test, "--nocapture", "--test-threads=1"]);
+    // Terse output never prints the `test NAME ... ` status line. With
+    // `--test-threads=1` libtest leaves that line unterminated until the
+    // test's first write, so a protocol child's first line would land on
+    // it and parsers that skip libtest framing would swallow it.
+    command.args([
+        "--exact",
+        test,
+        "--nocapture",
+        "--test-threads=1",
+        "--format",
+        "terse",
+    ]);
     command.env(CHILD_ENV, key).env(TEST_ENV, test);
     command
 }

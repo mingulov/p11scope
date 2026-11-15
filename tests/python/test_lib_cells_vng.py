@@ -39,6 +39,7 @@ EXPECTED_CELLS = [
     "metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes",
     "metrics::counter_reader::tests::counter_reader_requires_exact_maps_and_health",
     "events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict",
+    "attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_map",
 ]
 
 # A canned guest: parses --run/--rwdir from the script's vng invocation and
@@ -129,7 +130,7 @@ class LibCellsVngTests(unittest.TestCase):
                               timeout=120, env=env), out
 
     def test_cells_are_exact_and_curated(self):
-        self.assertEqual(len(EXPECTED_CELLS), 12)
+        self.assertEqual(len(EXPECTED_CELLS), 13)
         curated = default_tests(RUNNER.read_text(encoding="utf-8"))
         self.assertTrue(curated, "no DEFAULT_TESTS parsed from the runner")
         for cell in EXPECTED_CELLS:
@@ -165,7 +166,7 @@ class LibCellsVngTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         rows = [json.loads(line) for line in
                 (out / "results.jsonl").read_text().splitlines()]
-        self.assertEqual(len(rows), 12)
+        self.assertEqual(len(rows), 13)
         failed = [row for row in rows if not row["pass"]]
         self.assertEqual([row["cell"] for row in failed], [EXPECTED_CELLS[3]])
         self.assertEqual(failed[0]["qualification"], "failed")

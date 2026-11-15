@@ -337,6 +337,47 @@ mod tests {
     use super::*;
     use crate::fixture_guard::DieWithParent as _;
 
+    /// The built object carries exactly one fentry program and five maps
+    /// of exact shapes: (name, type, key, value, entries, flags). Pins the
+    /// C header against the ebpf-common mirror without a kernel.
+    #[test]
+    fn member_stop_object_carries_exact_program_and_maps() {
+        let parsed = aya_obj::Object::parse(MEMBER_STOP_OBJECT).expect("member-stop object parses");
+        let programs: Vec<&str> = parsed.programs.keys().map(String::as_str).collect();
+        assert_eq!(programs, vec![MEMBER_STOP_PROGRAM]);
+        assert!(
+            matches!(
+                parsed.programs[MEMBER_STOP_PROGRAM].section,
+                aya_obj::ProgramSection::FEntry { .. }
+            ),
+            "the hook is an fentry program"
+        );
+        let stop_value = core::mem::size_of::<MemberStop>() as u32;
+        let file_key = core::mem::size_of::<MemberFileKey>() as u32;
+        let config = core::mem::size_of::<MemberStopConfig>() as u32;
+        let expected: &[(&str, u32, u32, u32, u32, u32)] = &[
+            ("MS_CFG", 2, 4, config, 1, 1 << 7),
+            ("MS_CGROUP", 8, 4, 4, 1, 0),
+            ("MS_STOPS", 1, 4, stop_value, MEMBER_STOP_ENTRIES, 0),
+            ("MS_CLEARED", 9, file_key, 1, MEMBER_CLEARED_ENTRIES, 0),
+            ("MS_COUNTS", 6, 4, 8, MEMBER_STOP_COUNTERS, 0),
+        ];
+        let mut names: Vec<&str> = parsed.maps.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        let mut wanted: Vec<&str> = expected.iter().map(|(name, ..)| *name).collect();
+        wanted.sort_unstable();
+        assert_eq!(names, wanted, "exactly five maps");
+        for (name, map_type, key, value, entries, flags) in expected {
+            let map = &parsed.maps[*name];
+            assert_eq!(map.map_type(), *map_type, "{name} type");
+            assert_eq!(map.key_size(), *key, "{name} key");
+            assert_eq!(map.value_size(), *value, "{name} value");
+            assert_eq!(map.max_entries(), *entries, "{name} entries");
+            assert_eq!(map.map_flags(), *flags, "{name} flags");
+        }
+        assert_eq!(stop_value, 40);
+    }
+
     /// Waits for `child` to exit within 10 s; on timeout fails with the
     /// pending rows and the child's executable maps rows, never hangs.
     fn wait_bounded(

@@ -2046,7 +2046,6 @@ jobs:
           sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11TEST_PIN=1234 P11TEST_SO_PIN=5678 \
             P11CHECK_MODE=smoke P11CHECK_BIN="$RUNNER_TEMP/p11check/bin/pkcs11-check" \
             scripts/ci/run-cell-script.sh pkcs11-check-cell "$in/p11scope" "$out/cells" \
-            --expected-failure pkcs11-check-default-coverage \
             --require pkcs11-check-identical-results \
             --require pkcs11-check-observer-clean \
             --require pkcs11-check-manifest-exact \
@@ -2104,7 +2103,6 @@ jobs:
           sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11TEST_PIN=1234 P11TEST_SO_PIN=5678 \
             P11CHECK_MODE=full P11CHECK_BIN="$RUNNER_TEMP/p11check/bin/pkcs11-check" \
             scripts/ci/run-cell-script.sh pkcs11-check-cell "$in/p11scope" "$out/cells" \
-            --expected-failure pkcs11-check-default-coverage \
             --require pkcs11-check-identical-results \
             --require pkcs11-check-observer-clean \
             --require pkcs11-check-manifest-exact \

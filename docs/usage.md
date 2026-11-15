@@ -891,11 +891,13 @@ so every descendant — `fork`/`exec` children, `sh -c` and `env`
 wrappers, double forks — is born in the cgroup. Only the direct child
 is paused; descendants are never paused. A descendant that loads an
 already-attached provider file is observed from its first call via the
-shared links, but a short-lived descendant that cold-loads the provider
-can retire before admission: its calls are then missing and the run
-reports `PARTIAL` with `pid_descendant_gaps`. Pass `--prearm-module`
-for the provider so cold grandchildren are hooked from their first
-call. (`sudo`/`setuid` inside the command cannot elevate under the
+shared links. A short-lived descendant that cold-loads the provider
+teaches the run its file: the provider attaches by file identity for
+every later mapper, while the first mapper's own calls made before
+the attach stay missing and the run reports `PARTIAL` with
+`pid_descendant_gaps` plus the learned-file gap row. Pass
+`--prearm-module` for the provider when the very first mapper's calls
+must land too. (`sudo`/`setuid` inside the command cannot elevate under the
 child's `no_new_privs` hardening, so privilege hops are not a
 supported shape.) The run still ends with the direct child's exit:
 descendants still alive are handed back alive, never killed, and

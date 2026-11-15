@@ -898,8 +898,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
     def test_pkcs11_check_campaign_pins_match_the_cell_script(self):
         # The external suite pins live in privileged-campaign.json (not lib
         # tests) and the cell script plus both workflow jobs must match
-        # them: exact version, exact smoke marker, four cells, floor, and
-        # the named default-coverage expected failure.
+        # them: exact version, exact smoke marker, four cells and floor.
         campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
         check = campaign["pkcs11_check"]
         self.assertEqual(check["version"], "0.2.3")
@@ -910,9 +909,8 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
             "pkcs11-check-manifest-exact",
             "pkcs11-check-default-coverage",
         ])
-        self.assertEqual(check["default_coverage_floor"], 0.5)
-        self.assertEqual(check["default_coverage_expected_failure"],
-                         "pkcs11-check-default-coverage")
+        self.assertEqual(check["default_coverage_floor"], 0.8)
+        self.assertNotIn("default_coverage_expected_failure", check)
         script = (ROOT / "scripts" / "ci" / "pkcs11-check-cell.sh").read_text(encoding="utf-8")
         self.assertIn("pkcs11-check==0.2.3", self.yml)
         self.assertIn("--marker smoke", script)
@@ -923,7 +921,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertEqual(len(invocations), 2)
         for line in invocations:
             self.assertNotIn("--isolation", line)
-        self.assertIn("FLOOR=0.50", script)
+        self.assertIn("FLOOR=0.80", script)
         helper = (ROOT / "scripts" / "ci" / "pkcs11_check_cell_compare.py").read_text(encoding="utf-8")
         self.assertIn('PINNED_VERSION = "0.2.3"', helper)
 
@@ -943,7 +941,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                              "pkcs11-check-manifest-exact",
                              "pkcs11-check-default-coverage"):
                     self.assertIn(f"--require {cell}", job)
-                self.assertIn("--expected-failure pkcs11-check-default-coverage", job)
+                self.assertNotIn("--expected-failure pkcs11-check-default-coverage", job)
                 self.assertIn("P11TEST_PIN=1234", job)
                 self.assertIn("rm -rf", job)
                 self.assertIn("tokens", job)

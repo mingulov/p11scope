@@ -16,6 +16,10 @@ use p11scope::{
 };
 
 fn main() {
+    // `p11scope run`'s own member-stop watchdog, never a user command.
+    if let Some(code) = p11scope::member_stop_watchdog_entry() {
+        std::process::exit(code);
+    }
     match run() {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),

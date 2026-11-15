@@ -56,6 +56,16 @@ impl LoaderContextId {
     pub(crate) fn from_case_id(case_id: u8) -> Self {
         Self(u16::from(case_id) + 1)
     }
+
+    /// An attach-owner identity for export hooks a manifest located in a
+    /// process that has no armable loader (a statically linked program).
+    /// It lives above the registry's `1..=MAX_LOADER_CONTEXTS` ids, so it
+    /// never names a registry context, a loader cookie or a loader record.
+    pub(crate) fn view_owned(index: u16) -> Option<Self> {
+        (MAX_LOADER_CONTEXTS as u16 + 1)
+            .checked_add(index)
+            .map(Self)
+    }
 }
 
 pub(crate) fn encode_loader_cookie(

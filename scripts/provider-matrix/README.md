@@ -89,10 +89,15 @@ listed in the table), 1 a cell failed, 2 a harness/collect error.
   dir; deliver it as `--extra-deliver /path/to/stagedir` with the dir
   named `kryoptic-static-embed`. Needs a Rust toolchain, a C compiler,
   OpenSSL headers and crates.io access. The custom
-  `static-embed-cell.sh` (3 rows, judged by
+  `static-embed-cell.sh` (4 rows, judged by
   `static_embed_cell_compare.py`) drives it: the run/discover rows
   fail with the `static-executable-unobserved` gap while the static
-  file-scan is unlanded.
+  file-scan is unlanded; the `kryoptic-static-embed-getter-manifest`
+  row runs the program under `p11scope run --manifest` with a
+  getter-only manifest from `scripts/getter-manifest.py` and passes
+  when the table calls are counted, named and owned by the binary,
+  equal to the program's `CALLS=n` (fewer only with a named
+  observation gap, never more).
 
 ## Legs and rows per cell
 

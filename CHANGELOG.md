@@ -8,6 +8,21 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [Unreleased]
 
+### Added
+
+- Getter-only manifests: a `p11scope-manifest/5` manifest may name just
+  a provider's `C_GetFunctionList`, `C_GetInterface` and/or
+  `C_GetInterfaceList` by file offset (new optional `getters` field,
+  `surfaces: []`), for a program with a statically linked provider that
+  `p11scope-discover` cannot load and that exports no PKCS#11 symbol.
+  The observer hooks each getter's return, reads the table it hands out
+  at run time and counts its calls by name; both getters together count
+  a call reached through either table once. `scripts/getter-manifest.py`
+  writes such a manifest from the program's own symbol table. Manifest
+  trust checks are unchanged. Such captures name the window before the
+  table attaches (`unprotected_live_windows`) and withhold attribution
+  (layout not proved); see known limitations.
+
 ### Fixed
 
 - A call set aside just before a tracking interruption no longer stops
@@ -55,6 +70,11 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Known limitations
 
+- Getter-only manifests: a table attaches only after its getter
+  returned it, so the report always names that window and stays
+  `PARTIAL`; names are not layout-proved (no mechanism decoding);
+  `--module` together with a getter-only manifest for the same program
+  names a static probe gap at exit although no call is lost.
 - On a busy host, a long `inventory --system --key-operations`
   capture can stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Since

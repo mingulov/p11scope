@@ -7,23 +7,31 @@ The cell drives a program with kryoptic statically linked (no dlopenable
 module): the program self-tests through its embedded table (printing
 CALLS=n, the observation oracle), runs once more under `p11scope run`
 with default discovery, and faces `p11scope-discover`. This helper judges
-three rows:
+these rows:
 
 - kryoptic-static-embed-program-runs: the self-test exits 0 with CALLS>0;
 - kryoptic-static-embed-run-observed: calls attributed to the binary in
   the run leg are > 0, else FAIL as not observed (the rv-trace oracle
   does not exist here; the program's own CALLS count is the denominator);
 - kryoptic-static-embed-discover: a manifest with at least one surface
-  passes; the dlopen refusal fails with the named static gap.
+  passes; the dlopen refusal fails with the named static gap;
+- kryoptic-static-embed-getter-manifest (when the cell passes the
+  getter leg): `scripts/getter-manifest.py` writes a getter-only
+  manifest from the binary's own symbol table and `p11scope run
+  --manifest` with it must count the program's table calls, named and
+  owned by the binary. Table calls must equal the program's CALLS
+  oracle; fewer passes only when the report itself names an observation
+  gap (a missed call is never hidden), more always fails (a call counted
+  twice).
 
 The run/discover joins reuse provider_matrix_cell_compare (same sha256
 then dev/ino file-join semantics against the binary path). No manifest
 pin exists yet: when a file scan lands, the surfaced shape gets pinned
 like the other providers.
 
-It writes results.jsonl (three rows) and summary.txt, prints details, and
-exits 0 when every qualified row passes, 1 when a qualified check fails,
-2 on harness errors. PINs never appear in outputs.
+It writes results.jsonl (three rows, four with the getter leg) and
+summary.txt, prints details, and exits 0 when every qualified row
+passes, 1 when a qualified check fails, 2 on harness errors. PINs never appear in outputs.
 """
 
 import argparse
@@ -49,6 +57,49 @@ _BASE_SPEC.loader.exec_module(_BASE)
 STATIC_GAP = "static-executable-unobserved"
 GAP_POINTER = ("static file-scan unlanded: static-progs lane "
                "(ET_EXEC/PIE executable table witness)")
+
+
+# Getter rows are not table calls: CALLS counts table calls only.
+GETTERS = ("C_GetFunctionList", "C_GetInterface", "C_GetInterfaceList")
+UNKNOWN_NAME = "unknown"
+
+
+def judge_getter_manifest(rc, observed, binary_path, oracle_calls):
+    """(pass, detail) for the getter-only manifest run leg."""
+    if rc != 0:
+        return False, f"getter-manifest.py exit={rc} (wants 0)"
+    if observed is None:
+        return False, "no observed report from the getter-manifest run"
+    if oracle_calls is None:
+        return (False, "no CALLS oracle under the getter-manifest run "
+                       "(the program failed under observation?)")
+    sha256, dev, ino = _BASE.file_identity(binary_path)
+    table_calls = 0
+    unnamed = 0
+    for function in observed.get("functions", []):
+        if _BASE.function_owner_matches(function, sha256, dev, ino) is None:
+            continue
+        names = function.get("names") or []
+        calls = int(function.get("calls", 0))
+        if any(name in GETTERS for name in names):
+            continue
+        if not names or UNKNOWN_NAME in names:
+            unnamed += calls
+            continue
+        table_calls += calls
+    observation = (((observed.get("evidence") or {}).get("gap_classes") or {})
+                   .get("observation") or {}).get("status")
+    detail = (f"oracle CALLS={oracle_calls}; {table_calls} named table calls "
+              f"on the binary, {unnamed} unnamed; observation={observation}")
+    if unnamed:
+        return False, f"{detail}; table calls counted without names"
+    if table_calls == 0:
+        return False, f"not observed: {detail}"
+    if table_calls > oracle_calls:
+        return False, f"{detail}; more calls than the program made"
+    if table_calls < oracle_calls and observation == "exact":
+        return False, f"{detail}; calls missed with no observation gap named"
+    return True, detail
 
 
 def fail(message):
@@ -130,6 +181,9 @@ def main(argv):
     parser.add_argument("--discover-rc", required=True, type=int)
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--discover-stderr", required=True)
+    parser.add_argument("--getter-rc", type=int, default=None)
+    parser.add_argument("--getter-observed", default=None)
+    parser.add_argument("--getter-observer-out", default=None)
     parser.add_argument("--out-results", required=True)
     parser.add_argument("--out-summary", required=True)
     args = parser.parse_args(argv)
@@ -169,6 +223,27 @@ def main(argv):
             {"cell": "kryoptic-static-embed-discover", "pass": disc_ok,
              "qualification": "qualified", "detail": disc_detail[:500]},
         ]
+        getter_ok = True
+        if args.getter_rc is not None:
+            getter_observed = None
+            if args.getter_observed is not None:
+                try:
+                    getter_observed = load_json(args.getter_observed,
+                                                "getter observed")
+                except SystemExit:
+                    getter_observed = None
+            getter_oracle = None
+            if args.getter_observer_out is not None:
+                getter_oracle = parse_calls_log(
+                    Path(args.getter_observer_out).read_text(
+                        encoding="utf-8", errors="replace"))
+            getter_ok, getter_detail = judge_getter_manifest(
+                args.getter_rc, getter_observed, args.binary, getter_oracle)
+            print(f"getter-manifest: {'PASS' if getter_ok else 'FAIL'} "
+                  f"{getter_detail}")
+            rows.append({"cell": "kryoptic-static-embed-getter-manifest",
+                         "pass": getter_ok, "qualification": "qualified",
+                         "detail": getter_detail[:500]})
         Path(args.out_results).write_text(
             "\n".join(json.dumps(row) for row in rows) + "\n",
             encoding="utf-8")
@@ -178,9 +253,11 @@ def main(argv):
             f"run-observed: {'PASS' if run_ok else 'FAIL'}\n"
             f"discover: {'PASS' if disc_ok else 'FAIL'}\n"
         )
+        if args.getter_rc is not None:
+            summary += f"getter-manifest: {'PASS' if getter_ok else 'FAIL'}\n"
         Path(args.out_summary).write_text(summary, encoding="utf-8")
         print(summary, end="")
-        return 0 if (prog_ok and run_ok and disc_ok) else 1
+        return 0 if (prog_ok and run_ok and disc_ok and getter_ok) else 1
     except SystemExit as error:
         return fail(str(error))
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:

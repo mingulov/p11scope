@@ -101,6 +101,7 @@ impl ProviderFixture {
             vendor_interfaces: Vec::new(),
             alias_groups: Vec::new(),
             selection_evidence: Default::default(),
+            getters: Vec::new(),
         };
         assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
         let pinning = crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();

@@ -36,6 +36,24 @@ pub struct Manifest {
     /// Bounded, caller-dependent C_GetInterface selection evidence. This is
     /// deliberately separate from the caller-independent inventory above.
     pub selection_evidence: SelectionEvidence,
+    /// Table getters named by location only (additive in schema 5): the
+    /// observer hooks each getter's return and reads the table it hands
+    /// out at run time, instead of trusting a walked table here. A
+    /// manifest may carry getters alone (no surfaces) for a provider no
+    /// helper can load, such as one statically linked into a program
+    /// without dynamic exports. Absent in manifests that name none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub getters: Vec<GetterRecord>,
+}
+
+/// One table getter the manifest locates: a standard getter name
+/// (`C_GetFunctionList`, `C_GetInterfaceList` or `C_GetInterface`) and
+/// where its code lives, pinned to an object like every function record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetterRecord {
+    pub name: String,
+    pub resolution: Resolution,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -374,6 +392,7 @@ mod tests {
             }],
             alias_groups: vec![],
             selection_evidence: SelectionEvidence::default(),
+            getters: Vec::new(),
         };
         let json = serde_json::to_string_pretty(&m).unwrap();
         assert!(json.contains("\"schema\": \"p11scope-manifest/5\""));

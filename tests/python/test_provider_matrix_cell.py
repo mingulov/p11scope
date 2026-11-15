@@ -1057,6 +1057,85 @@ class StaticEmbedTests(unittest.TestCase):
         self.assertFalse(ok, "unexplained refusal passed")
         self.assertIn("exploded: boom", detail)
 
+    def getter_doc(self, binary, table_calls, observation="exact",
+                   names=("C_Initialize",)):
+        identity = module_identity(binary)
+        rows = [function_row(["C_GetFunctionList"], identity, 1),
+                function_row(list(names), identity, table_calls)]
+        doc = observed_doc(rows)
+        doc["evidence"] = {"gap_classes": {"observation": {"status": observation}}}
+        return doc
+
+    def test_getter_manifest_passes_on_exact_named_table_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = make_module(tmp, name="kryoptic-static-embed",
+                                 content=b"fake-embed")
+            ok, detail = _STATIC.judge_getter_manifest(
+                0, self.getter_doc(binary, 61), str(binary), 61)
+            self.assertTrue(ok, detail)
+            self.assertIn("61 named table calls", detail)
+
+    def test_getter_manifest_refuses_a_hidden_miss_and_a_double_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = make_module(tmp, name="kryoptic-static-embed",
+                                 content=b"fake-embed")
+            ok, detail = _STATIC.judge_getter_manifest(
+                0, self.getter_doc(binary, 60), str(binary), 61)
+            self.assertFalse(ok, "an undisclosed miss passed")
+            self.assertIn("no observation gap named", detail)
+            ok, detail = _STATIC.judge_getter_manifest(
+                0, self.getter_doc(binary, 60, observation="lossy"),
+                str(binary), 61)
+            self.assertTrue(ok, detail)
+            ok, detail = _STATIC.judge_getter_manifest(
+                0, self.getter_doc(binary, 62, observation="lossy"),
+                str(binary), 61)
+            self.assertFalse(ok, "a double count passed")
+            self.assertIn("more calls than the program made", detail)
+
+    def test_getter_manifest_fails_unnamed_unobserved_or_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = make_module(tmp, name="kryoptic-static-embed",
+                                 content=b"fake-embed")
+            ok, detail = _STATIC.judge_getter_manifest(
+                0, self.getter_doc(binary, 61, names=("unknown",)),
+                str(binary), 61)
+            self.assertFalse(ok, "unnamed table calls passed")
+            self.assertIn("without names", detail)
+            ok, detail = _STATIC.judge_getter_manifest(
+                0, self.getter_doc(binary, 0), str(binary), 61)
+            self.assertFalse(ok, "an unobserved leg passed")
+            self.assertIn("not observed", detail)
+            ok, detail = _STATIC.judge_getter_manifest(
+                1, None, str(binary), None)
+            self.assertFalse(ok, "a helper refusal passed")
+            self.assertIn("exit=1", detail)
+            ok, detail = _STATIC.judge_getter_manifest(
+                0, self.getter_doc(binary, 61), str(binary), None)
+            self.assertFalse(ok, "an oracle-less leg passed")
+
+    def test_getter_leg_adds_a_fourth_qualified_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, args = self.write_static_cell(tmp)
+            binary = Path(args[args.index("--binary") + 1])
+            (base / "getter.json").write_text(
+                json.dumps(self.getter_doc(binary, 61)), encoding="utf-8")
+            (base / "getter.out").write_text("CALLS=61\n", encoding="utf-8")
+            args += ["--getter-rc", "0",
+                     "--getter-observed", str(base / "getter.json"),
+                     "--getter-observer-out", str(base / "getter.out")]
+            self.assertEqual(1, _STATIC.main(args))
+            rows = [json.loads(line) for line in
+                    (base / "results.jsonl").read_text(
+                        encoding="utf-8").splitlines()]
+            self.assertEqual(4, len(rows))
+            row = rows[-1]
+            self.assertEqual("kryoptic-static-embed-getter-manifest", row["cell"])
+            self.assertTrue(row["pass"], row["detail"])
+            self.assertEqual("qualified", row["qualification"])
+            self.assertIn("getter-manifest: PASS",
+                          (base / "summary.txt").read_text(encoding="utf-8"))
+
     def write_static_cell(self, tmp, selftest_rc=0, selftest_log="CALLS=61\n",
                           run_log="CALLS=61\n", run_calls=0,
                           discover_rc=1,

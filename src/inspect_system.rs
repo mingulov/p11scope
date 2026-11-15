@@ -6064,6 +6064,7 @@ mod tests {
             vendor_interfaces: vec![],
             alias_groups: vec![],
             selection_evidence: Default::default(),
+            getters: Vec::new(),
         };
         assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
         let doc = dir.path().join("count.json");

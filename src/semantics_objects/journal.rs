@@ -9683,6 +9683,7 @@ pub(crate) mod tests {
                 vendor_interfaces: Vec::new(),
                 alias_groups: Vec::new(),
                 selection_evidence: Default::default(),
+                getters: Vec::new(),
             };
             let problems = crate::manifest_input::validate_structure(&manifest);
             assert!(problems.is_empty(), "fixture manifest: {problems:?}");

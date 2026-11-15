@@ -6360,17 +6360,147 @@ fn build(m: &Manifest) -> AttachPlan {
     plan
 }
 
-fn lower_manifest(
-    m: &Manifest,
+/// Upper-bound plan bytes one manifest code location (a surface function
+/// or a located getter) can leave: a count triple and a skip, both sized,
+/// since it leaves exactly one of the two.
+fn measure_manifest_function(
+    measured: &mut usize,
+    name: &str,
+    resolution: &Resolution,
+    module_path: &str,
+) -> Result<(), GraphRefusal> {
+    // Upper bound: every function leaves both a count triple
+    // and a skip (it leaves exactly one of the two).
+    plan_add(
+        measured,
+        plan_bytes_for::<(String, PinnedObjectId, u64)>(1)?,
+    )?;
+    for _ in 0..3 {
+        plan_add(measured, plan_text_bytes(name)?)?;
+    }
+    plan_add(measured, plan_bytes_for::<Target<'_>>(1)?)?;
+    plan_add(measured, plan_tree_bytes::<AttachKey, ()>(1)?)?;
+    plan_add(
+        measured,
+        plan_tree_bytes::<(String, PinnedObjectId, u64, usize), ()>(1)?,
+    )?;
+    plan_add(
+        measured,
+        plan_tree_bytes::<(String, PinnedObjectId, u64), usize>(1)?,
+    )?;
+    let mut reason = name
+        .len()
+        .checked_add(module_path.len())
+        .and_then(|bytes| bytes.checked_add(128))
+        .ok_or(GraphRefusal::Overflow)?;
+    if let Resolution::UnusableFile { reason: cause, .. } = resolution {
+        reason = reason
+            .checked_add(cause.len())
+            .ok_or(GraphRefusal::Overflow)?;
+    }
+    let reason = plan_byte_len(reason)?;
+    plan_add(measured, plan_bytes_for::<Skipped>(5)?)?;
+    for _ in 0..5 {
+        plan_add(measured, plan_text_bytes(name)?)?;
+        plan_add(measured, reason)?;
+    }
+    plan_add(measured, plan_tree_bytes::<(String, String), usize>(1)?)?;
+    plan_add(
+        measured,
+        plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+    )?;
+    plan_add(
+        measured,
+        plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+    )?;
+    Ok(())
+}
+
+fn lower_manifest<'m>(
+    m: &'m Manifest,
     mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
     mut compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
-) -> (Option<Discovered<'_>>, Vec<Skipped>) {
+) -> (Option<Discovered<'m>>, Vec<Skipped>) {
     let mut tables = Vec::new();
     let mut surfaces = Vec::new();
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
     let mut entries_seen = 0usize;
 
+    // One lowering for every resolved code location the manifest names:
+    // walked-surface functions and located getters alike.
+    let mut lower_one = |name: &'m String,
+                         resolution: &'m Resolution,
+                         fork_safe: bool,
+                         semantic_authorized: bool| {
+        entries_seen += 1;
+        let mut skip = |reason: String| {
+            skipped.push(Skipped {
+                subject: name.clone(),
+                reason,
+            })
+        };
+        match resolution {
+            Resolution::Resolved {
+                object,
+                file_offset,
+            } => {
+                let Some(record) = m.objects.iter().find(|o| o.id == *object) else {
+                    skip(format!("object id {object} missing from manifest"));
+                    return;
+                };
+                let Some(key) = object_key(m, record) else {
+                    skip(format!(
+                        "object id {object} has no provenance record naming {}",
+                        record.path
+                    ));
+                    return;
+                };
+                let Some(object) = pinned_id(key, &record.path) else {
+                    skip(format!(
+                        "object id {object} has no comparable pinned identity"
+                    ));
+                    return;
+                };
+                if let Some(provider) = m
+                    .objects
+                    .iter()
+                    .find(|candidate| candidate.path == m.module_path)
+                    .and_then(|candidate| {
+                        object_key(m, candidate).and_then(|key| pinned_id(key, &candidate.path))
+                    })
+                    && !compatible(provider, object)
+                {
+                    skip(format!(
+                        "object id {} has a different target ABI from the provider",
+                        record.id
+                    ));
+                    return;
+                }
+                targets.push(Target {
+                    name,
+                    table: None,
+                    ordinal: standard_ordinal(name).map(|ordinal| SlotOrdinal {
+                        table_file_offset: None,
+                        ordinal,
+                    }),
+                    aliases: Vec::new(),
+                    object,
+                    object_path: &record.path,
+                    file_offset: *file_offset,
+                    fork_safe,
+                    semantic_authorized,
+                    standard_layout_evidence: None,
+                    reproven_unfinished: false,
+                    name_authorized: true,
+                });
+            }
+            Resolution::NullPointer => skip("null pointer".into()),
+            Resolution::NonFileBacked => skip("non-file-backed".into()),
+            Resolution::Unmapped => skip("unmapped".into()),
+            Resolution::UnusableFile { reason, .. } => skip(reason.clone()),
+        }
+    };
     for surface in &m.surfaces {
         surfaces.push(SurfaceSummary {
             source: source_label(&surface.source),
@@ -6393,76 +6523,27 @@ fn lower_manifest(
             SurfaceSource::Interface { flags, .. } if flags & 1 != 0
         );
         for f in &surface.functions {
-            entries_seen += 1;
-            let mut skip = |reason: String| {
-                skipped.push(Skipped {
-                    subject: f.name.clone(),
-                    reason,
-                })
-            };
-            match &f.resolution {
-                Resolution::Resolved {
-                    object,
-                    file_offset,
-                } => {
-                    let Some(record) = m.objects.iter().find(|o| o.id == *object) else {
-                        skip(format!("object id {object} missing from manifest"));
-                        continue;
-                    };
-                    let Some(key) = object_key(m, record) else {
-                        skip(format!(
-                            "object id {object} has no provenance record naming {}",
-                            record.path
-                        ));
-                        continue;
-                    };
-                    let Some(object) = pinned_id(key, &record.path) else {
-                        skip(format!(
-                            "object id {object} has no comparable pinned identity"
-                        ));
-                        continue;
-                    };
-                    if let Some(provider) = m
-                        .objects
-                        .iter()
-                        .find(|candidate| candidate.path == m.module_path)
-                        .and_then(|candidate| {
-                            object_key(m, candidate).and_then(|key| pinned_id(key, &candidate.path))
-                        })
-                        && !compatible(provider, object)
-                    {
-                        skip(format!(
-                            "object id {} has a different target ABI from the provider",
-                            record.id
-                        ));
-                        continue;
-                    }
-                    targets.push(Target {
-                        name: &f.name,
-                        table: None,
-                        ordinal: standard_ordinal(&f.name).map(|ordinal| SlotOrdinal {
-                            table_file_offset: None,
-                            ordinal,
-                        }),
-                        aliases: Vec::new(),
-                        object,
-                        object_path: &record.path,
-                        file_offset: *file_offset,
-                        fork_safe,
-                        semantic_authorized: true,
-                        standard_layout_evidence: None,
-                        reproven_unfinished: false,
-                        name_authorized: true,
-                    });
-                }
-                Resolution::NullPointer => skip("null pointer".into()),
-                Resolution::NonFileBacked => skip("non-file-backed".into()),
-                Resolution::Unmapped => skip("unmapped".into()),
-                Resolution::UnusableFile { reason, .. } => skip(reason.clone()),
-            }
+            lower_one(&f.name, &f.resolution, fork_safe, true);
         }
     }
 
+    // Located getters lower like function records (each counts its own
+    // calls under its standard name); the observer reads the tables they
+    // return at run time. They lower count-only: no walked table proves
+    // their layout here, and the live table that later holds the same
+    // getter is count-only too, so the slot never changes descriptor (a
+    // change would detach and reattach the static probe). A getter a
+    // walked surface already records at the same place lowers once.
+    for getter in &m.getters {
+        let recorded = m
+            .surfaces
+            .iter()
+            .flat_map(|surface| &surface.functions)
+            .any(|function| function.name == getter.name);
+        if !recorded {
+            lower_one(&getter.name, &getter.resolution, false, false);
+        }
+    }
     let key = m
         .objects
         .iter()
@@ -7377,58 +7458,25 @@ impl ConservativePlanCursor {
                     plan_add(&mut self.measured, plan_text_bytes(&manifest.module_path)?)?;
                 }
                 let Some(surface) = manifest.surfaces.get(self.measure_surface) else {
+                    // Located getters lower like function records.
+                    for getter in &manifest.getters {
+                        measure_manifest_function(
+                            &mut self.measured,
+                            &getter.name,
+                            &getter.resolution,
+                            &manifest.module_path,
+                        )?;
+                    }
                     self.measure_manifest += 1;
                     self.measure_surface = 0;
                     return Ok(false);
                 };
                 for function in &surface.functions {
-                    // Upper bound: every function leaves both a count triple
-                    // and a skip (it leaves exactly one of the two).
-                    plan_add(
+                    measure_manifest_function(
                         &mut self.measured,
-                        plan_bytes_for::<(String, PinnedObjectId, u64)>(1)?,
-                    )?;
-                    for _ in 0..3 {
-                        plan_add(&mut self.measured, plan_text_bytes(&function.name)?)?;
-                    }
-                    plan_add(&mut self.measured, plan_bytes_for::<Target<'_>>(1)?)?;
-                    plan_add(&mut self.measured, plan_tree_bytes::<AttachKey, ()>(1)?)?;
-                    plan_add(
-                        &mut self.measured,
-                        plan_tree_bytes::<(String, PinnedObjectId, u64, usize), ()>(1)?,
-                    )?;
-                    plan_add(
-                        &mut self.measured,
-                        plan_tree_bytes::<(String, PinnedObjectId, u64), usize>(1)?,
-                    )?;
-                    let mut reason = function
-                        .name
-                        .len()
-                        .checked_add(manifest.module_path.len())
-                        .and_then(|bytes| bytes.checked_add(128))
-                        .ok_or(GraphRefusal::Overflow)?;
-                    if let Resolution::UnusableFile { reason: cause, .. } = &function.resolution {
-                        reason = reason
-                            .checked_add(cause.len())
-                            .ok_or(GraphRefusal::Overflow)?;
-                    }
-                    let reason = plan_byte_len(reason)?;
-                    plan_add(&mut self.measured, plan_bytes_for::<Skipped>(5)?)?;
-                    for _ in 0..5 {
-                        plan_add(&mut self.measured, plan_text_bytes(&function.name)?)?;
-                        plan_add(&mut self.measured, reason)?;
-                    }
-                    plan_add(
-                        &mut self.measured,
-                        plan_tree_bytes::<(String, String), usize>(1)?,
-                    )?;
-                    plan_add(
-                        &mut self.measured,
-                        plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
-                    )?;
-                    plan_add(
-                        &mut self.measured,
-                        plan_tree_bytes::<(&'static str, String, String, usize), ()>(1)?,
+                        &function.name,
+                        &function.resolution,
+                        &manifest.module_path,
                     )?;
                 }
                 // The surface summary, three lives; label bytes from the
@@ -8745,6 +8793,7 @@ mod tests {
             vendor_interfaces: vec![],
             alias_groups: vec![],
             selection_evidence: SelectionEvidence::default(),
+            getters: Vec::new(),
         }
     }
 
@@ -11934,6 +11983,157 @@ mod tests {
         assert_eq!(plan.surfaces[1].walk, "full");
         assert_eq!(plan.surfaces[1].acquisition, "ok");
         assert_eq!(plan.surfaces[1].functions, 1);
+    }
+
+    /// A manifest that locates only its table getters: no surface is
+    /// walked, and the getters name where the code lives.
+    fn getter_only_manifest(getters: &[(&str, u64)]) -> Manifest {
+        let mut m = manifest_with(vec![]);
+        m.surfaces.clear();
+        m.getters = getters
+            .iter()
+            .map(|(name, file_offset)| GetterRecord {
+                name: (*name).into(),
+                resolution: Resolution::Resolved {
+                    object: 0,
+                    file_offset: *file_offset,
+                },
+            })
+            .collect();
+        m
+    }
+
+    #[test]
+    fn getter_only_manifest_is_a_valid_trusted_input() {
+        // All three owner shapes: only the legacy getter, only the
+        // interface getter, and both.
+        for shape in [
+            &[("C_GetFunctionList", 0x1a70)][..],
+            &[("C_GetInterface", 0x1b00)][..],
+            &[("C_GetFunctionList", 0x1a70), ("C_GetInterface", 0x1b00)][..],
+        ] {
+            let m = getter_only_manifest(shape);
+            assert_eq!(
+                crate::manifest_input::validate_structure(&m),
+                Vec::<String>::new(),
+                "{shape:?}"
+            );
+            assert!(crate::manifest_input::is_getter_only(&m), "{shape:?}");
+            let p = build(&m);
+            assert_eq!(p.slots.len(), shape.len(), "{shape:?}: {:?}", p.slots);
+            assert!(p.surfaces.is_empty(), "{shape:?}: no walked surface");
+            // An honest unwalked legacy surface beside the getters is a
+            // getter-only manifest too.
+            let mut placeholder = m.clone();
+            placeholder.surfaces = manifest_with(vec![]).surfaces;
+            placeholder.surfaces[0].acquisition = Acquisition::Absent;
+            placeholder.surfaces[0].walk = WalkOutcome::NotWalked;
+            assert_eq!(
+                crate::manifest_input::validate_structure(&placeholder),
+                Vec::<String>::new(),
+                "{shape:?}"
+            );
+            assert!(crate::manifest_input::is_getter_only(&placeholder));
+        }
+        // Without getters, a manifest still records its legacy surface.
+        let mut bare = getter_only_manifest(&[]);
+        bare.getters.clear();
+        assert!(!crate::manifest_input::is_getter_only(&bare));
+        assert!(
+            crate::manifest_input::validate_structure(&bare)
+                .iter()
+                .any(|problem| problem.contains("exactly one legacy acquisition surface"))
+        );
+        let m = getter_only_manifest(&[("C_GetFunctionList", 0x1a70), ("C_GetInterface", 0x1b00)]);
+        // The schema stays additive: a manifest without getters serializes
+        // without the field, and a getter manifest round-trips.
+        let text = serde_json::to_string(&manifest_with(vec![])).unwrap();
+        assert!(!text.contains("getters"), "{text}");
+        let text = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<Manifest>(&text).unwrap(), m);
+    }
+
+    #[test]
+    fn getter_records_are_validated_like_function_records() {
+        let refused = |m: &Manifest, needle: &str| {
+            let problems = crate::manifest_input::validate_structure(m);
+            assert!(
+                problems.iter().any(|problem| problem.contains(needle)),
+                "{needle:?} not in {problems:?}"
+            );
+        };
+        refused(
+            &getter_only_manifest(&[("C_Initialize", 0x10)]),
+            "is not one of C_GetFunctionList, C_GetInterfaceList, C_GetInterface",
+        );
+        refused(
+            &getter_only_manifest(&[("C_GetFunctionList", 0x10), ("C_GetFunctionList", 0x20)]),
+            "duplicate getter",
+        );
+        let mut missing = getter_only_manifest(&[("C_GetFunctionList", 0x10)]);
+        missing.getters[0].resolution = Resolution::Resolved {
+            object: 7,
+            file_offset: 0x10,
+        };
+        refused(&missing, "refers to missing object id 7");
+        let mut unresolved = getter_only_manifest(&[("C_GetFunctionList", 0x10)]);
+        unresolved.getters[0].resolution = Resolution::NullPointer;
+        refused(&unresolved, "must be resolved");
+        // Beside a walked surface the getter must agree with the surface's
+        // own record of that function.
+        let mut walked = manifest_with(vec![
+            resolved("C_Initialize", 0x10),
+            resolved("C_Finalize", 0x20),
+            resolved("C_GetInfo", 0x30),
+            resolved("C_GetFunctionList", 0x40),
+        ]);
+        walked.getters = vec![GetterRecord {
+            name: "C_GetFunctionList".into(),
+            resolution: Resolution::Resolved {
+                object: 0,
+                file_offset: 0x44,
+            },
+        }];
+        refused(&walked, "disagrees with the surface record");
+        walked.getters[0].resolution = Resolution::Resolved {
+            object: 0,
+            file_offset: 0x40,
+        };
+        assert_eq!(
+            crate::manifest_input::validate_structure(&walked),
+            Vec::<String>::new()
+        );
+        // ...and lowers once.
+        let p = build(&walked);
+        assert_eq!(
+            p.slots
+                .iter()
+                .filter(|slot| slot.names == vec!["C_GetFunctionList"])
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn getter_only_manifest_lowers_each_getter_to_a_named_slot() {
+        let m = getter_only_manifest(&[("C_GetFunctionList", 0x1a70), ("C_GetInterface", 0x1b00)]);
+        let p = build(&m);
+        assert_eq!(p.modules.len(), 1, "the getters' provider is a module");
+        assert_eq!(p.slots.len(), 2, "{:?}", p.slots);
+        for (name, file_offset) in [("C_GetFunctionList", 0x1a70), ("C_GetInterface", 0x1b00)] {
+            let slot = p
+                .slots
+                .iter()
+                .find(|slot| slot.names == vec![name])
+                .unwrap_or_else(|| panic!("no {name} slot: {:?}", p.slots));
+            assert_eq!(slot.file_offset, file_offset);
+            assert!(!slot.aliased);
+            // Count-only: a live table holding the same getter never
+            // changes this slot's descriptor.
+            assert!(!slot.semantic_authorized, "{name}");
+            assert_eq!(slot.descriptor_index, 0, "{name}");
+        }
+        assert_eq!(p.entries_seen, 2);
     }
 
     #[test]

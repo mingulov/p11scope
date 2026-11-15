@@ -847,6 +847,81 @@ fn validate_selection_evidence(
     }
 }
 
+/// The table getters a manifest may locate without walking their table:
+/// the three standard factories the observer reads at run time.
+pub const GETTER_NAMES: [&str; 3] = ["C_GetFunctionList", "C_GetInterfaceList", "C_GetInterface"];
+
+/// A manifest that locates getters and claims no walked function: every
+/// table it can lead to is read live, from the getter's return.
+pub fn is_getter_only(m: &Manifest) -> bool {
+    !m.getters.is_empty()
+        && m.surfaces
+            .iter()
+            .all(|surface| surface.functions.is_empty())
+        && m.selection_evidence.tables.is_empty()
+}
+
+/// Getter records: each a distinct standard getter, resolved to a listed
+/// object. A getter named beside a walked surface must agree with that
+/// surface's own record of the same function, so two claims about one
+/// name can never disagree inside one manifest.
+fn validate_getters(m: &Manifest, object_ids: &BTreeSet<u32>, problems: &mut Vec<String>) {
+    if m.getters.len() > GETTER_NAMES.len() {
+        problems.push(format!(
+            "manifest has {} getters; limit is {}",
+            m.getters.len(),
+            GETTER_NAMES.len()
+        ));
+        return;
+    }
+    let mut names = BTreeSet::new();
+    for getter in &m.getters {
+        bounded("getter name", &getter.name, 128, problems);
+        if !GETTER_NAMES.contains(&getter.name.as_str()) {
+            problems.push(format!(
+                "getter {:?} is not one of {}",
+                getter.name,
+                GETTER_NAMES.join(", ")
+            ));
+        }
+        if !names.insert(getter.name.as_str()) {
+            problems.push(format!("duplicate getter {:?}", getter.name));
+        }
+        let Resolution::Resolved {
+            object,
+            file_offset,
+        } = getter.resolution
+        else {
+            problems.push(format!("getter {} must be resolved", getter.name));
+            continue;
+        };
+        if !object_ids.contains(&object) {
+            problems.push(format!(
+                "getter {} refers to missing object id {object}",
+                getter.name
+            ));
+        }
+        let disagreeing = m
+            .surfaces
+            .iter()
+            .flat_map(|surface| &surface.functions)
+            .filter(|function| function.name == getter.name)
+            .any(|function| {
+                !matches!(
+                    function.resolution,
+                    Resolution::Resolved { object: other_object, file_offset: other_offset }
+                        if other_object == object && other_offset == file_offset
+                )
+            });
+        if disagreeing {
+            problems.push(format!(
+                "getter {} disagrees with the surface record of the same function",
+                getter.name
+            ));
+        }
+    }
+}
+
 pub fn validate_structure(m: &Manifest) -> Vec<String> {
     let mut problems = Vec::new();
     if m.schema != SCHEMA {
@@ -1171,9 +1246,12 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
         }
     }
 
-    if !legacy_seen {
+    // A getter-only manifest walks no table, so it may carry no surface at
+    // all; any manifest that records surfaces records the legacy one.
+    if !legacy_seen && !(m.surfaces.is_empty() && !m.getters.is_empty()) {
         problems.push("manifest must contain exactly one legacy acquisition surface".into());
     }
+    validate_getters(m, &object_ids, &mut problems);
 
     for vendor in &m.vendor_interfaces {
         if vendor.index >= 256 || !interface_indices.insert(vendor.index) {

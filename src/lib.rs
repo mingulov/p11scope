@@ -229,6 +229,8 @@ pub(crate) mod history;
 #[cfg(test)]
 mod key_operation_tests;
 #[cfg(test)]
+mod manifest_getter_privileged_tests;
+#[cfg(test)]
 mod s1_tests;
 #[cfg(test)]
 mod s2s3_tests;

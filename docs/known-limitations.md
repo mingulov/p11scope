@@ -3073,6 +3073,46 @@ a silent drop.
 - Planned: automatic discovery of run-time-built tables is planned for
   a later version.
 
+### Getter-only manifests count tables read at run time
+
+- What the user sees: with a getter-only manifest
+  ([usage](usage.md#getter-only-manifests-providers-linked-into-a-program)),
+  a program that embeds its provider gets named per-function counts,
+  but the report stays `PARTIAL`:
+  - observation names `unprotected_live_windows` ("calls made while
+    probes were being attached may be missing"): a table attaches only
+    after its getter returned it, and no pause covers a getter return,
+    so calls in that moment can be missed. A program that fetches its
+    table once and calls it at once loses those first calls;
+  - attribution is withheld (`semantic_unverified_slots`): the names
+    follow the standard table layout, which a getter-only manifest does
+    not prove, so mechanisms are not decoded; a `C_GetInterface` table
+    adds `function list counted without names` for its interface
+    selection;
+  - the getters attach in the capture's initial and refresh passes; a
+    provider a `run` child loads later gets them at the next rescan;
+  - a getter that returns a table outside the program's file data
+    (heap or anonymous memory) is refused with a named gap;
+  - a process that already called the getter before the capture started
+    gives no new return to read: use `--module <program>` for its
+    file-backed tables;
+  - under `metrics`, a `C_GetInterface` getter is not hooked (a named
+    gap); calls reached only through its table are not counted;
+  - a getter record still queued when its process exits is a named loss.
+  - `--module <program>` together with a getter-only manifest for the
+    same program counts every call, but the report names a
+    `static probe coverage gap incomplete` at the program's exit even
+    though no call was lost (cause not yet found). Use one or the other.
+- Kernels/conditions: all kernels; programs `p11scope-discover` cannot
+  load, mainly ones with a statically linked provider.
+- Disclosure: the observation and attribution causes above, in text and
+  JSON.
+- Workaround: when the program's tables are complete in its file data,
+  `--module <program>` alone finds and attaches them at start, with no
+  window and with the layout proved. A getter-only manifest is for
+  tables the file scan cannot read, such as ones the program fills in
+  at run time inside its own data.
+
 ## Scopes (cgroup and pod)
 
 ### `inventory --cgroup` does not exist (DR-03)

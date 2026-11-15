@@ -653,6 +653,56 @@ used no parameters or templates. Candidate-provider testing and observed
 application coverage remain separate evidence; neither certifies migration
 compatibility for unobserved calls or undecoded parameters.
 
+### Getter-only manifests (providers linked into a program)
+
+`p11scope-discover` loads its target with `dlopen`, so it cannot describe a
+program that has a PKCS#11 provider statically linked in and exports no
+PKCS#11 symbol. Without help, `profile --pid` on such a program finds no
+provider (`no provider files found, no functions watched`). A getter-only
+manifest names just the provider's table getters by file offset;
+the observer hooks each getter's return and reads the function table it
+hands out at run time, so nothing about the table is trusted from the
+manifest:
+
+```bash
+# Reads the file's own symbol table (.symtab, else .dynsym); loads nothing.
+python3 scripts/getter-manifest.py /opt/app/bin/app -o app-getters.json
+sudo p11scope profile --pid <PID> --manifest app-getters.json \
+  --duration 60 -o observed-profile.json
+```
+
+`scripts/getter-manifest.py` (in the source tree) writes every standard
+getter the symbol table defines, or only those named with repeatable
+`--getter C_GetFunctionList|C_GetInterface|C_GetInterfaceList`. It exits 1
+when a named getter is missing (a stripped program has none) and 2 on a
+usage or ELF error. You can also write the manifest yourself: it is a
+`p11scope-manifest/5` document whose `getters` array holds
+`{"name": ..., "resolution": {"status": "resolved", "object": ID,
+"file_offset": N}}` records with `surfaces: []`; the field is optional and
+manifests without it are unchanged. Each name may appear once, must be one
+of the three standard getters, and must resolve to a listed object inside
+one of its executable segments. Manifest trust is unchanged: the file is
+pinned, its SHA-256 and identity must match the mapped program, and a
+getter named beside a walked surface must agree with that surface's
+record of the same function. `C_GetFunctionList` and `C_GetInterface` can
+be named together: a function both tables share is one probe, so each call
+is counted once whichever table it went through.
+
+What you get: named call counts for every table function, exact once the
+table's probes are attached. The table is attached only after its getter
+returns it, so calls the program makes through it in that moment can be
+missed; every getter-only capture therefore names that window
+(`calls made while probes were being attached may be missing`,
+`unprotected_live_windows`) and reads `PARTIAL`. A program that fetches
+its table once at start-up and calls it right away loses those first
+calls; a long-running one loses at most the calls of that first moment.
+The names come from the standard table layout, which a getter-only
+manifest does not prove, so attribution is withheld too
+(`semantic_unverified_slots`; mechanism decoding is not available). The
+text coverage line still suggests `--manifest`; for a program
+`p11scope-discover` cannot load, that hint does not apply. See
+[known limitations](known-limitations.md#getter-only-manifests-count-tables-read-at-run-time).
+
 ### Discovery timing and optional offline discovery
 
 The memory scan builds the initial attach plan. For an owned command,

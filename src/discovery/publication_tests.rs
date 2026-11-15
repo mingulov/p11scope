@@ -2903,6 +2903,7 @@ fn stale_ls_manifest(
         vendor_interfaces: vec![],
         alias_groups: vec![],
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     }
 }
 

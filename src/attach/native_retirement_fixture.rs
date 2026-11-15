@@ -1072,6 +1072,7 @@ pub(super) fn exported_owner_case() -> ExportedOwnerCase {
         vendor_interfaces: Vec::new(),
         alias_groups: Vec::new(),
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     };
     let pins = crate::discovery::identity::pin_manifest_objects(&manifest).unwrap();
     let object = pins.pinned().next().unwrap().id;

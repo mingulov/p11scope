@@ -39630,6 +39630,7 @@ fn valid_manifest_for(paths: &[PathBuf], targets: &[u32]) -> Manifest {
         vendor_interfaces: vec![],
         alias_groups: vec![],
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     }
 }
 
@@ -42934,6 +42935,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
         vendor_interfaces: vec![],
         alias_groups: vec![],
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     };
     let manifest_pins = pin_manifest_objects(&manifest).unwrap();
     let view = scan_view(
@@ -43088,7 +43090,42 @@ fn manifest_naming(path: &str, sha256: Option<String>) -> Manifest {
         vendor_interfaces: vec![],
         alias_groups: vec![],
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     }
+}
+
+/// A getter-only manifest claims only where its getters are. A decoded
+/// table that holds one there corroborates it; a scan that decoded other
+/// targets (a table published by the other getter, or none yet) leaves it
+/// uncorroborated, never a conflict. The identity check is unchanged, and
+/// `targets_agree` is asked in the getter-only sense.
+#[test]
+fn getter_only_manifest_corroboration_outcomes() {
+    assert_eq!(
+        corroborate_manifest(true, false, Some(true), |getter_only| getter_only, false),
+        Corroboration::Agreed
+    );
+    assert_eq!(
+        corroborate_manifest(true, false, Some(true), |_| false, false),
+        Corroboration::Uncorroborated
+    );
+    assert_eq!(
+        corroborate_manifest(true, false, Some(true), |_| false, true),
+        Corroboration::Uncorroborated
+    );
+    assert_eq!(
+        corroborate_manifest(true, false, Some(false), |_| true, false),
+        Corroboration::IdentityMismatch
+    );
+    assert_eq!(
+        corroborate_manifest(true, false, None, |_| false, false),
+        Corroboration::Uncorroborated
+    );
+    // A manifest that walks a table keeps the exact-set rule.
+    assert_eq!(
+        corroborate_manifest(false, false, Some(true), |getter_only| getter_only, false),
+        Corroboration::Conflict
+    );
 }
 
 /// The outcomes of spec §4.12, which decide whether `--manifest` is a safe
@@ -60718,6 +60755,45 @@ fn automatic_exec_named_pid_end_receipt_rechecks_original_pin_current_reused_or_
             .unwrap();
         assert_eq!(session.physical_gap_summary().episodes, 1, "{state:?}");
         assert!(session.physical_gap_summary().open, "{state:?}");
+    }
+}
+
+#[test]
+fn automatic_exec_named_pid_end_receipt_narrows_to_a_retired_subset() {
+    // A plan can keep some of an ended view's linked slots (a manifest
+    // getter hook outlives the view whose published table it attached).
+    // The proof minted for every linked slot does not cover the retired
+    // subset; a proof minted for exactly that subset retires it with no
+    // physical gap, the same as a whole-plan exit.
+    for narrowed in [false, true] {
+        let (mut fixture, engine, mut session) = continuity_route();
+        let slots = engine.plan.slots.clone();
+        assert!(
+            slots.len() >= 2,
+            "the route needs a kept and a retired slot"
+        );
+        let retired = &slots[1..];
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        let owner = &engine.views[0];
+        let whole = session.prepare_ended_pid_retirement(owner, &slots).unwrap();
+        assert!(whole.covers_exactly(&slots));
+        assert!(!whole.covers_exactly(retired));
+        let proof = if narrowed {
+            let subset = session
+                .prepare_ended_pid_retirement(owner, retired)
+                .unwrap();
+            assert!(subset.covers_exactly(retired));
+            subset
+        } else {
+            whole
+        };
+        session
+            .detach_ended_pid_slots(retired, owner, &proof)
+            .unwrap();
+        let gap = session.physical_gap_summary();
+        assert_eq!(gap.episodes, u64::from(!narrowed), "narrowed={narrowed}");
+        assert_eq!(gap.open, !narrowed, "narrowed={narrowed}");
     }
 }
 

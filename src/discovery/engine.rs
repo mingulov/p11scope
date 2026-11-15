@@ -1046,6 +1046,16 @@ pub struct Engine {
     task_uprobe_link_losses: u64,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
+    /// Attach owners for manifest-located getter hooks in views that have
+    /// no armable loader context (statically linked programs). Each view
+    /// gets one id, detached when the view retires.
+    view_getter_contexts: BTreeMap<ProcessViewId, LoaderContextId>,
+    next_view_getter_context: u16,
+    /// Live windows opened by getter-only manifests: a getter returned a
+    /// table whose probes were attached only afterwards, so calls the
+    /// program made through it before that attach completed were not
+    /// observed. No pause covers a getter return.
+    getter_publication_windows: u64,
     /// The deduplicated bound-context set behind `loader_discovery`'s
     /// strategy/timing/capture counts (design §9.2). Keyed by the exact
     /// internal `{process generation, bound identity state, load kind}` — so
@@ -3205,12 +3215,23 @@ impl CaptureFacts {
             let provider = pinned
                 .owned_timing_key(module.object)
                 .ok_or_else(|| anyhow!("scanned provider has no exact opened identity"))?;
-            history.standard_exports.entry(owner).or_default().insert(
-                if module
-                    .scanned
-                    .exports
+            // A trusted manifest that locates this object's C_GetInterface
+            // states the same fact as a `.dynsym` export of it (a record a
+            // getter hook published names only its own hook).
+            let located = manifests.iter().any(|manifest| {
+                manifest
+                    .getters
                     .iter()
-                    .any(|name| name == "C_GetInterface")
+                    .any(|getter| getter.name == "C_GetInterface")
+                    && manifest_module_object(manifest, pinned) == Some(module.object)
+            });
+            history.standard_exports.entry(owner).or_default().insert(
+                if located
+                    || module
+                        .scanned
+                        .exports
+                        .iter()
+                        .any(|name| name == "C_GetInterface")
                 {
                     StandardExportFact::Present
                 } else {
@@ -3461,7 +3482,14 @@ impl CaptureFacts {
             let provider = pinned
                 .owned_timing_key(object)
                 .ok_or_else(|| anyhow!("manifest provider has no exact opened identity"))?;
+            // A located C_GetInterface getter is the export fact itself: the
+            // manifest names where the getter is, so it is present.
+            let located = manifest
+                .getters
+                .iter()
+                .any(|getter| getter.name == "C_GetInterface");
             let export = match manifest.selection_evidence.acquisition {
+                _ if located => StandardExportFact::Present,
                 SelectionAcquisition::Queried => StandardExportFact::Present,
                 SelectionAcquisition::ExportAbsent => StandardExportFact::Absent,
                 SelectionAcquisition::ExportOutsideModule => StandardExportFact::Outside,
@@ -6771,6 +6799,27 @@ fn corroborate(
     }
 }
 
+/// [`corroborate`] for one manifest. A getter-only manifest claims no
+/// table, only where its getters are (`targets_agree` then asks whether a
+/// decoded table holds one of them there), so a scan that decoded other
+/// targets is not a contradiction: it stays uncorroborated until a table
+/// holds a getter. The identity comparison is unchanged.
+fn corroborate_manifest(
+    getter_only: bool,
+    scan_unavailable: bool,
+    identity: Option<bool>,
+    targets_agree: impl FnOnce(bool) -> bool,
+    scan_empty: bool,
+) -> Corroboration {
+    let agree = targets_agree(getter_only);
+    match corroborate(scan_unavailable, identity, agree, scan_empty) {
+        Corroboration::Conflict | Corroboration::ScanEmpty if getter_only => {
+            Corroboration::Uncorroborated
+        }
+        outcome => outcome,
+    }
+}
+
 struct ScanView<'a> {
     modules: Vec<&'a ScannedModule>,
     agrees: bool,
@@ -6858,10 +6907,14 @@ fn manifest_targets(
     m: &Manifest,
     pinned: &PinnedObjects,
 ) -> Option<BTreeSet<(PinnedObjectId, u64)>> {
+    // Located getters lower to targets like function records, so they
+    // belong to the manifest's own target set.
     m.surfaces
         .iter()
         .flat_map(|surface| &surface.functions)
-        .filter_map(|function| match function.resolution {
+        .map(|function| &function.resolution)
+        .chain(m.getters.iter().map(|getter| &getter.resolution))
+        .filter_map(|resolution| match *resolution {
             Resolution::Resolved {
                 object,
                 file_offset,
@@ -6996,9 +7049,12 @@ fn recorroborate_at_capture_end(
             // set to compare, so the recorded outcome stands.
             continue;
         };
-        let Some(own_targets) = manifests
+        let describing: Vec<&Manifest> = manifests
             .iter()
             .filter(|manifest| manifest_module_object(manifest, pinned) == Some(*object))
+            .collect();
+        let Some(own_targets) = describing
+            .iter()
             .map(|manifest| manifest_targets(manifest, pinned))
             .collect::<Option<Vec<_>>>()
             .filter(|sets| !sets.is_empty())
@@ -7006,18 +7062,30 @@ fn recorroborate_at_capture_end(
         else {
             continue;
         };
+        // Getter-only manifests claim only where their getters are: the
+        // scan corroborates them when its tables hold each getter there.
+        let getter_only = describing
+            .iter()
+            .all(|manifest| crate::manifest_input::is_getter_only(manifest));
         let scan_empty = scanned
             .iter()
             .flat_map(|module| &module.tables)
             .all(|table| table.entries.is_empty());
         derived.insert(
             *object,
-            corroborate(
+            corroborate_manifest(
+                getter_only,
                 false,
                 // Scan and manifest resolved to one opened object, so the
                 // identity comparison already succeeded.
                 Some(true),
-                pinned.exactly_same_targets(&scan_targets, pinned, &own_targets),
+                |getter_only| {
+                    if getter_only {
+                        pinned.shares_targets(&scan_targets, pinned, &own_targets)
+                    } else {
+                        pinned.exactly_same_targets(&scan_targets, pinned, &own_targets)
+                    }
+                },
                 scan_empty,
             ),
         );
@@ -10618,6 +10686,15 @@ fn bind_fallback_proof(
 const FALLBACK_UNUSABLE_REASON: &str = "superseded by exact scan fallback";
 
 fn filter_manifest_fallbacks(manifest: &mut Manifest, stale: &BTreeSet<u32>) -> Result<()> {
+    // A getter locates code in one exact file: a stale object's getter
+    // has no replacement location, so it leaves with its object (the
+    // stale object's own gap names the loss).
+    manifest.getters.retain(|getter| {
+        !matches!(
+            getter.resolution,
+            Resolution::Resolved { object, .. } if stale.contains(&object)
+        )
+    });
     for surface in &mut manifest.surfaces {
         for function in &mut surface.functions {
             if matches!(
@@ -10664,6 +10741,11 @@ fn filter_manifest_fallbacks(manifest: &mut Manifest, stale: &BTreeSet<u32>) -> 
             if let Resolution::Resolved { object, .. } = &mut function.resolution {
                 *object = ids[object];
             }
+        }
+    }
+    for getter in &mut manifest.getters {
+        if let Resolution::Resolved { object, .. } = &mut getter.resolution {
+            *object = ids[object];
         }
     }
     manifest.alias_groups.retain_mut(|group| {
@@ -10903,13 +10985,22 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 .flat_map(|module| &module.tables)
                 .all(|table| table.entries.is_empty())
         });
-        let outcome = corroborate(
+        let outcome = corroborate_manifest(
+            crate::manifest_input::is_getter_only(&manifest),
             counters.scan_unavailable.is_some(),
             view.as_ref().map(|view| view.agrees),
-            scan_targets
-                .as_ref()
-                .zip(own_targets.as_ref())
-                .is_some_and(|(scan, own)| pinned.exactly_same_targets(scan, manifest_pins, own)),
+            |getter_only| {
+                scan_targets
+                    .as_ref()
+                    .zip(own_targets.as_ref())
+                    .is_some_and(|(scan, own)| {
+                        if getter_only {
+                            pinned.shares_targets(scan, manifest_pins, own)
+                        } else {
+                            pinned.exactly_same_targets(scan, manifest_pins, own)
+                        }
+                    })
+            },
             scan_empty,
         );
         if outcome != Corroboration::IdentityMismatch {
@@ -13436,6 +13527,9 @@ impl Engine {
             task_uprobe_link_losses: 0,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
+            view_getter_contexts: BTreeMap::new(),
+            next_view_getter_context: 0,
+            getter_publication_windows: 0,
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
@@ -14722,6 +14816,22 @@ impl Engine {
     /// expedited-frame hint (scheduling only, never admission authority).
     pub(crate) fn take_learned_frame(&mut self) -> bool {
         std::mem::take(&mut self.learned_frame_owed)
+    }
+
+    /// Live windows getter-only manifests opened (see the field): each
+    /// is a table whose probes attached after its getter returned it.
+    pub(crate) fn getter_publication_windows(&self) -> u64 {
+        self.getter_publication_windows
+    }
+
+    /// The timing keys of the objects getter-only manifests describe.
+    fn getter_only_manifest_keys(&self, pinned: &PinnedObjects) -> BTreeSet<PinnedTimingKey> {
+        self.manifests
+            .iter()
+            .filter(|manifest| crate::manifest_input::is_getter_only(manifest))
+            .filter_map(|manifest| manifest_module_object(manifest, pinned))
+            .filter_map(|object| pinned.owned_timing_key(object))
+            .collect()
     }
 
     pub(crate) fn gap_exe_hints(&self) -> Option<&elf_needed::GapExeHints> {
@@ -17601,13 +17711,7 @@ impl Engine {
                 && binding.context.get() == key.context
                 && binding.view == key.view
                 && binding.object == key.hook_owner
-                && self
-                    .loader_registry
-                    .context(binding.context)
-                    .is_some_and(|context| {
-                        context.spec.view == key.view
-                            && !self.loader_registry.is_tombstoned(binding.context)
-                    })
+                && self.export_context_owns_view(binding.context, key.view)
                 && pinned
                     .owned_timing_key(binding.object)
                     .is_some_and(|provider| provider == key.provider)
@@ -18322,6 +18426,20 @@ impl Engine {
                 && candidate.delta.replace.is_empty()
                 && candidate.views.is_empty()
         }) {
+            // The proof was minted for every linked slot when the view ended.
+            // A plan that keeps some of those slots (a getter hook pinned by a
+            // manifest outlives the view whose published table it attached)
+            // retires a subset; mint the same proof for exactly that subset
+            // from the retained owner, so its exit does not open a phantom
+            // physical gap. Session revalidates the original group's end.
+            Some(ended) if !ended.proof.covers_exactly(&selected) => {
+                match session.prepare_ended_pid_retirement(&ended.owner, &selected) {
+                    Some(narrowed) => {
+                        session.detach_ended_pid_slots(&selected, &ended.owner, &narrowed)
+                    }
+                    None => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),
+                }
+            }
             Some(ended) => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),
             // Live/stop and publication checks already passed above. A
             // removal-only conservative candidate closes additions without
@@ -20534,7 +20652,19 @@ impl Engine {
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
         self.observe_causal_timing(&observed, hook_ts_ns);
+        let getter_keys = self.getter_only_manifest_keys(&candidate.pinned);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
+        // A getter-only manifest's table attaches only once its getter
+        // returned it: calls made through it before the attach completed
+        // were not observed. Name that window whenever this publication
+        // newly attached the manifest object's slots.
+        if outcome.static_completions.iter().any(|(modules, _)| {
+            modules
+                .iter()
+                .any(|module| observed.contains(module) && getter_keys.contains(module))
+        }) {
+            self.getter_publication_windows = self.getter_publication_windows.saturating_add(1);
+        }
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
         Ok(DiscoveryRecordOutcome::applied(
@@ -23268,11 +23398,7 @@ impl Engine {
         if !binding.attached
             || binding.retired
             || !hook_matches
-            || self.loader_registry.is_tombstoned(binding.context)
-            || self
-                .loader_registry
-                .context(binding.context)
-                .is_none_or(|context| context.spec.view != binding.view)
+            || !self.export_context_owns_view(binding.context, binding.view)
         {
             return None;
         }
@@ -24126,99 +24252,136 @@ impl Engine {
                     );
                     continue;
                 };
-                let selection_binding = if abi == HookAbi::Interface {
-                    let Some(view) = self
-                        .loader_registry
-                        .context(context)
-                        .map(|context| context.spec.view)
-                    else {
-                        collected.required_seed_complete = false;
-                        self.mark_partial(
-                            "live selection hook",
-                            "an interface hook had no retained loader context",
-                        );
-                        continue;
-                    };
-                    if terminal
-                        && !self.selection_bindings.values().any(|binding| {
-                            binding.context == context
-                                && binding.object == object
-                                && binding.file_offset == fact.file_offset
-                                && binding.abi == abi
-                        })
-                    {
-                        continue;
-                    }
-                    if collected.dynamic.iter().any(|work| {
-                        work.selection_binding.is_some_and(|binding| {
-                            binding.context == context
-                                && binding.object == object
-                                && binding.file_offset == fact.file_offset
-                                && binding.abi == abi
-                        })
-                    }) {
-                        continue;
-                    }
-                    let provider = match self.capture_facts.module_id_for_object(pinned, object) {
-                        Ok(provider) => provider,
-                        Err(error) => {
-                            collected.required_seed_complete = false;
-                            self.mark_partial("live selection hook", &error.to_string());
-                            continue;
-                        }
-                    };
-                    let Some(binding) = self.selection_binding_candidate(
-                        context,
-                        view,
-                        object,
-                        fact.file_offset,
-                        hook_id,
-                        provider,
-                    ) else {
-                        collected.required_seed_complete = false;
-                        continue;
-                    };
-                    Some(binding)
-                } else {
-                    None
-                };
-                let cookie = if let Some(binding) = selection_binding {
-                    binding.id
-                } else {
-                    let context_case_id = (context.get() - 1) as u8;
-                    let Some(cookie) = export_attach_cookie(object.0, context_case_id, hook_id)
-                    else {
-                        collected.required_seed_complete = false;
-                        self.mark_partial(
-                            "live export hook",
-                            "an export hook identity did not fit the checked attachment cookie",
-                        );
-                        continue;
-                    };
-                    cookie
-                };
-                collected.dynamic.push(DynamicExportWork {
+                self.push_export_site_work(
                     context,
-                    module: timing_key.clone(),
+                    None,
+                    pinned,
                     object,
-                    file_offset: fact.file_offset,
-                    cookie,
+                    &timing_key,
+                    fact.file_offset,
                     abi,
-                    already_attached: if terminal {
-                        terminal_exports.contains(&DynamicExportIdentity {
-                            object,
-                            file_offset: fact.file_offset,
-                            cookie,
-                            abi,
-                        })
-                    } else {
-                        session.has_dynamic_export(context, (object, fact.file_offset), cookie, abi)
-                    },
-                    selection_binding,
-                });
+                    hook_id,
+                    session,
+                    terminal,
+                    terminal_exports,
+                    &mut collected,
+                );
             }
         }
         collected
+    }
+
+    /// Queues one export site's attach work under `context`: its cookie
+    /// (or its selection binding for an interface getter), and whether
+    /// the session already holds it. Shared by `.dynsym` exports and by
+    /// manifest-located getters, so both reach one attach and one record
+    /// path. `view` names the owner when `context` is not a loader
+    /// context (a view-owned manifest-getter context).
+    #[allow(clippy::too_many_arguments)]
+    fn push_export_site_work(
+        &mut self,
+        context: LoaderContextId,
+        view: Option<ProcessViewId>,
+        pinned: &PinnedObjects,
+        object: PinnedObjectId,
+        timing_key: &Option<PinnedTimingKey>,
+        file_offset: u64,
+        abi: HookAbi,
+        hook_id: u32,
+        session: &dyn EngineSession,
+        terminal: bool,
+        terminal_exports: &[DynamicExportIdentity],
+        collected: &mut CollectedExportWork,
+    ) {
+        let selection_binding = if abi == HookAbi::Interface {
+            let Some(view) = view.or_else(|| {
+                self.loader_registry
+                    .context(context)
+                    .map(|context| context.spec.view)
+            }) else {
+                collected.required_seed_complete = false;
+                self.mark_partial(
+                    "live selection hook",
+                    "an interface hook had no retained loader context",
+                );
+                return;
+            };
+            if terminal
+                && !self.selection_bindings.values().any(|binding| {
+                    binding.context == context
+                        && binding.object == object
+                        && binding.file_offset == file_offset
+                        && binding.abi == abi
+                })
+            {
+                return;
+            }
+            if collected.dynamic.iter().any(|work| {
+                work.selection_binding.is_some_and(|binding| {
+                    binding.context == context
+                        && binding.object == object
+                        && binding.file_offset == file_offset
+                        && binding.abi == abi
+                })
+            }) {
+                return;
+            }
+            let provider = match self.capture_facts.module_id_for_object(pinned, object) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    collected.required_seed_complete = false;
+                    self.mark_partial("live selection hook", &error.to_string());
+                    return;
+                }
+            };
+            let Some(binding) = self.selection_binding_candidate(
+                context,
+                view,
+                object,
+                file_offset,
+                hook_id,
+                provider,
+            ) else {
+                collected.required_seed_complete = false;
+                return;
+            };
+            Some(binding)
+        } else {
+            None
+        };
+        let cookie = if let Some(binding) = selection_binding {
+            binding.id
+        } else {
+            let context_case_id = (context.get() - 1) as u8;
+            let Some(cookie) = export_attach_cookie(object.0, context_case_id, hook_id) else {
+                collected.required_seed_complete = false;
+                self.mark_partial(
+                    "live export hook",
+                    "an export hook identity did not fit the checked attachment cookie",
+                );
+                return;
+            };
+            cookie
+        };
+        collected.dynamic.push(DynamicExportWork {
+            context,
+            module: timing_key.clone(),
+            object,
+            file_offset,
+            cookie,
+            abi,
+            already_attached: if terminal {
+                terminal_exports.contains(&DynamicExportIdentity {
+                    object,
+                    file_offset,
+                    cookie,
+                    abi,
+                })
+            } else {
+                session.has_dynamic_export(context, (object, file_offset), cookie, abi)
+            },
+            selection_binding,
+        });
     }
 
     fn selection_binding_candidate(
@@ -24397,7 +24560,261 @@ impl Engine {
         );
     }
 
+    /// Attaches one view's export getter hooks: the `.dynsym` exports of
+    /// its scanned modules and the getters a trusted manifest located.
+    /// The outcome joins both: retire/skipped/attached when either says
+    /// so, complete only when both are.
     fn attach_refreshed_exports(
+        &mut self,
+        view: ProcessViewId,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+    ) -> (bool, bool, bool, bool) {
+        let modules = self.attach_refreshed_module_exports(view, session, additions_allowed);
+        let getters = self.attach_manifest_getters(view, session, additions_allowed);
+        (
+            modules.0 || getters.0,
+            modules.1 && getters.1,
+            modules.2 || getters.2,
+            modules.3 || getters.3,
+        )
+    }
+
+    /// The getters every accepted manifest located (`getters[]`) whose
+    /// exact pinned object `view` maps executable, as
+    /// `(object, file_offset, name)`. A manifest getter names code by file
+    /// offset in one pinned file, so it applies to any process mapping
+    /// that file: a statically linked program that exports nothing too.
+    fn manifest_getter_sites(
+        &mut self,
+        view: ProcessViewId,
+    ) -> Result<Vec<(PinnedObjectId, u64, String)>> {
+        let mut sites = Vec::new();
+        for manifest in &self.manifests {
+            for getter in &manifest.getters {
+                let Resolution::Resolved {
+                    object,
+                    file_offset,
+                } = &getter.resolution
+                else {
+                    continue;
+                };
+                let Some(id) = capture_manifest_object_key(manifest, *object)
+                    .and_then(|(key, path)| self.pinned.id_for_manifest(key, path))
+                else {
+                    continue;
+                };
+                sites.push((id, *file_offset, getter.name.clone()));
+            }
+        }
+        if sites.is_empty() {
+            return Ok(sites);
+        }
+        let Some(position) = self
+            .views
+            .iter()
+            .position(|candidate| candidate.id() == view)
+        else {
+            return Ok(Vec::new());
+        };
+        let maps = Self::read_maps(&self.views[position], &mut self.budget)?;
+        let mapped: BTreeSet<ObjectKey> = maps
+            .iter()
+            .filter(|mapping| mapping.permissions[2] == b'x')
+            .map(ObjectKey::of)
+            .collect();
+        // Both pin domains count: the held fd's key and the kernel's own
+        // maps rendering of it (they differ on Btrfs and old overlays).
+        sites.retain(|(id, _, _)| {
+            mapped.iter().any(|key| {
+                self.pinned
+                    .object_matches_key(*id, key.device.major, key.device.minor, key.inode)
+            })
+        });
+        // A finished scan of the same object in this view already found
+        // and attached its file-backed tables before any call, and a
+        // getter-only manifest admits no other kind: a getter hook there
+        // would only republish a table already watched, behind an attach
+        // window it does not need.
+        sites.retain(|(id, _, _)| {
+            !self.modules.iter().any(|module| {
+                module.scanned.view == view
+                    && module.object == *id
+                    && module.scanned.tables_scan_finished
+                    && module.scanned.tables.iter().any(|table| !table.live_return)
+            })
+        });
+        sites.sort();
+        sites.dedup();
+        Ok(sites)
+    }
+
+    /// The attach owner for `view`'s manifest getter hooks: its unique
+    /// attached loader context, or — only for a process with no loader
+    /// to arm (no `PT_INTERP`: a statically linked program) — a
+    /// view-owned id that retires with the view. `Err` carries the named
+    /// reason no owner exists; `Ok(None)` means the group is ending and
+    /// needs no hook.
+    fn manifest_getter_context(
+        &mut self,
+        view: ProcessViewId,
+    ) -> Result<Option<LoaderContextId>, &'static str> {
+        if let Some(context) = self.view_getter_contexts.get(&view) {
+            return Ok(Some(*context));
+        }
+        let contexts: Vec<_> = self
+            .loader_registry
+            .ids_for_view(view)
+            .into_iter()
+            .filter(|context| {
+                !self.loader_registry.is_tombstoned(*context)
+                    && self
+                        .loader_registry
+                        .context(*context)
+                        .is_some_and(|context| context.was_attached)
+            })
+            .collect();
+        match contexts.as_slice() {
+            [context] => return Ok(Some(*context)),
+            [] => {}
+            _ => return Err("a manifest getter's process had no unique attached loader context"),
+        }
+        if self.original_ending(view) {
+            return Ok(None);
+        }
+        let Some(position) = self
+            .views
+            .iter()
+            .position(|candidate| candidate.id() == view)
+        else {
+            return Ok(None);
+        };
+        if !self.loader_registry.ids_for_view(view).is_empty() {
+            return Err("a manifest getter's process had no unique attached loader context");
+        }
+        match Self::loader_locator(&self.views[position], &mut self.budget) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err("a manifest getter's process had no unique attached loader context");
+            }
+            Err(_) => {
+                return Err("a manifest getter's process loader could not be identified");
+            }
+        }
+        let Some(context) = LoaderContextId::view_owned(self.next_view_getter_context) else {
+            return Err("the manifest getter attach-owner ID space was exhausted");
+        };
+        let Some(next) = self.next_view_getter_context.checked_add(1) else {
+            return Err("the manifest getter attach-owner ID space was exhausted");
+        };
+        self.next_view_getter_context = next;
+        self.view_getter_contexts.insert(view, context);
+        Ok(Some(context))
+    }
+
+    /// Attaches the manifest-located getter hooks for `view`. The getter's
+    /// return then publishes its function table through the same record
+    /// path a `.dynsym` export uses, so the table's functions are read and
+    /// attached at run time; an unreadable table stays a named counted gap
+    /// there.
+    fn attach_manifest_getters(
+        &mut self,
+        view: ProcessViewId,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+    ) -> (bool, bool, bool, bool) {
+        if self
+            .manifests
+            .iter()
+            .all(|manifest| manifest.getters.is_empty())
+        {
+            return (false, true, false, false);
+        }
+        let sites = match self.manifest_getter_sites(view) {
+            Ok(sites) => sites,
+            Err(error) => {
+                self.mark_partial("live manifest getter hook", &error.to_string());
+                return (false, false, false, false);
+            }
+        };
+        if sites.is_empty() {
+            return (false, true, false, false);
+        }
+        let aggregate = session.capture_policy().is_aggregate();
+        let mut complete = true;
+        let sites: Vec<_> = sites
+            .into_iter()
+            .filter(|(_, _, name)| {
+                let interface = self.hooks.abi(name) == Some(HookAbi::Interface);
+                if interface && aggregate {
+                    complete = false;
+                }
+                !(interface && aggregate)
+            })
+            .collect();
+        if !complete {
+            self.mark_partial(
+                "live manifest getter hook",
+                "a manifest C_GetInterface getter is not hooked in an aggregate capture; \
+                 calls reached only through its table are not counted",
+            );
+        }
+        if sites.is_empty() {
+            return (false, complete, false, false);
+        }
+        let context = match self.manifest_getter_context(view) {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                self.invalidate_causal_timing();
+                return (false, complete, false, false);
+            }
+            Err(reason) => {
+                self.mark_partial("live manifest getter hook", reason);
+                return (false, false, false, false);
+            }
+        };
+        let pinned = self.pinned.clone();
+        let mut collected = CollectedExportWork {
+            dynamic: Vec::new(),
+            count_only_seeds: Vec::new(),
+            required_seed_complete: true,
+        };
+        for (object, file_offset, name) in sites {
+            let (Some(abi), Some(hook_id)) = (self.hooks.abi(&name), self.hooks.id(&name)) else {
+                complete = false;
+                self.mark_partial(
+                    "live manifest getter hook",
+                    "a manifest getter named no registered export hook",
+                );
+                continue;
+            };
+            let timing_key = pinned.owned_timing_key(object);
+            self.push_export_site_work(
+                context,
+                Some(view),
+                &pinned,
+                object,
+                &timing_key,
+                file_offset,
+                abi,
+                hook_id,
+                session,
+                false,
+                &[],
+                &mut collected,
+            );
+        }
+        let (retire, attached_complete, skipped, attached) =
+            self.attach_export_work(view, &collected.dynamic, session, additions_allowed);
+        (
+            retire,
+            complete && attached_complete && collected.required_seed_complete,
+            skipped,
+            attached,
+        )
+    }
+
+    fn attach_refreshed_module_exports(
         &mut self,
         view: ProcessViewId,
         session: &mut dyn EngineSession,
@@ -26119,6 +26536,46 @@ impl Engine {
         self.dispatch_terminal_batch(session, additions_allowed, pending_views, closure)
     }
 
+    /// Detaches the view-owned manifest getter hooks of a retiring view.
+    /// They have no loader ordering to drain: a getter record still queued
+    /// for the gone process is rejected with its own named loss.
+    fn retire_view_getter_context(
+        &mut self,
+        view: ProcessViewId,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        closure: &mut PauseClosure,
+    ) {
+        let Some(context) = self.view_getter_contexts.remove(&view) else {
+            return;
+        };
+        let (_, detach_failed) = session.detach_dynamic_context(context);
+        for binding in self.selection_bindings.values_mut() {
+            if binding.context == context {
+                binding.retired = true;
+                binding.coverage.retire();
+            }
+        }
+        if detach_failed {
+            closure.fail();
+            *additions_allowed = false;
+            self.mark_partial(
+                "live manifest getter detach",
+                "a manifest getter hook detach failed; replacement was blocked for this cycle",
+            );
+        }
+    }
+
+    /// Whether `context` is the live attach owner of `view`'s export
+    /// hooks: a retained untombstoned loader context of that view, or the
+    /// view's own manifest getter owner.
+    fn export_context_owns_view(&self, context: LoaderContextId, view: ProcessViewId) -> bool {
+        self.view_getter_contexts.get(&view) == Some(&context)
+            || self.loader_registry.context(context).is_some_and(|loader| {
+                loader.spec.view == view && !self.loader_registry.is_tombstoned(context)
+            })
+    }
+
     // The persistent view intent and original terminal journal retain the
     // decision across bounded Finish calls. Ordinary retirement still visits
     // the complete context set; Finish touches at most one context here.
@@ -26171,6 +26628,7 @@ impl Engine {
                 return Ok((changed, false));
             }
         }
+        self.retire_view_getter_context(view, session, additions_allowed, closure);
         let collected_finish = self.collected_finish_actions.is_some();
         for context_id in self
             .loader_registry
@@ -34740,13 +35198,7 @@ impl Engine {
                     && binding.context.get() == key.context
                     && binding.view == key.view
                     && binding.object == key.hook_owner
-                    && self
-                        .loader_registry
-                        .context(binding.context)
-                        .is_some_and(|context| {
-                            context.spec.view == key.view
-                                && !self.loader_registry.is_tombstoned(binding.context)
-                        })
+                    && self.export_context_owns_view(binding.context, key.view)
                     && loaned
                         .owned_timing_key(binding.object)
                         .is_some_and(|provider| provider == key.provider)

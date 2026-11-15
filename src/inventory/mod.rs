@@ -27392,6 +27392,7 @@ mod promotion_driver_tests {
             vendor_interfaces: Vec::new(),
             alias_groups: Vec::new(),
             selection_evidence: Default::default(),
+            getters: Vec::new(),
         };
         let pinning = crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();
         assert!(pinning.stale.is_empty());

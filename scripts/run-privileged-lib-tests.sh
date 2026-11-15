@@ -615,6 +615,17 @@ attach::prearm_witness::tests::privileged_start_activates_on_host
 attach::prearm_witness::tests::privileged_finalize_clears_clean_start
 attach::prearm_witness::tests::privileged_finalize_settles_under_churn
 attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_map
+# Getter-only manifests: a fully static program (no dynamic PKCS#11
+# export) embeds a provider; scripts/getter-manifest.py names only its
+# getters, and profile --pid --manifest counts every table call exactly,
+# named, including a call reached through both getters' tables (counted
+# once); calls made right after the getter returns must name the attach
+# window instead of reading exact. Builds the fixture with `cc -static`
+# (libc.a from libc6-dev); spawns the observer (P11SCOPE_E2E_OBSERVER,
+# else the test binary's p11scope sibling).
+manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly
+manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed
+manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_counts_static_program_exactly
 # sudo -o ownership: reports created in an invoker-owned directory are
 # handed to SUDO_UID:SUDO_GID (0600); elsewhere they stay root-owned.
 output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker

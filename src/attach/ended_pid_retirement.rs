@@ -70,6 +70,17 @@ fn retiring_pairs(
 }
 
 impl EndedPidRetirement {
+    /// Whether this proof names exactly these slots, by index.
+    pub(crate) fn covers_exactly(&self, slots: &[Slot]) -> bool {
+        slots.len() == self.pairs.len()
+            && slots
+                .iter()
+                .map(|slot| slot.index)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .eq(self.pairs.keys().copied())
+    }
+
     pub(super) fn prepare(
         domain: &DiscoveryDomain,
         scope: UProbeScope,

@@ -1376,6 +1376,9 @@ pub struct ReconciledModule {
     pub witness_fault: bool,
 }
 
+/// One target under its complete opened-file identity plus offset.
+type TargetKey = (MappingFileKey, u64, Pin, String, u64);
+
 /// Every object opened, identity-matched, hashed, and pinned by a capture-local ID.
 /// Raw mapping keys remain lookup inputs until reconciliation, never attach identity.
 /// No read leases are held:
@@ -2968,8 +2971,35 @@ impl PinnedObjects {
         other: &Self,
         other_targets: &BTreeSet<(PinnedObjectId, u64)>,
     ) -> bool {
+        self.compare_targets(targets, other, other_targets, |ours, theirs| ours == theirs)
+    }
+
+    /// Whether any of `other_targets` is among `targets`, under the same
+    /// complete opened-file identity as [`Self::exactly_same_targets`]. A
+    /// getter-only manifest claims no table, only where its getters are:
+    /// a decoded table that holds one of them at that exact place
+    /// corroborates it, and a table that lacks one says nothing against it
+    /// (a provider may publish its tables one getter at a time).
+    pub fn shares_targets(
+        &self,
+        targets: &BTreeSet<(PinnedObjectId, u64)>,
+        other: &Self,
+        other_targets: &BTreeSet<(PinnedObjectId, u64)>,
+    ) -> bool {
+        self.compare_targets(targets, other, other_targets, |ours, theirs| {
+            !ours.is_disjoint(&theirs)
+        })
+    }
+
+    fn compare_targets(
+        &self,
+        targets: &BTreeSet<(PinnedObjectId, u64)>,
+        other: &Self,
+        other_targets: &BTreeSet<(PinnedObjectId, u64)>,
+        compare: impl FnOnce(BTreeSet<TargetKey>, BTreeSet<TargetKey>) -> bool,
+    ) -> bool {
         let keys = |pinned: &Self, targets: &BTreeSet<(PinnedObjectId, u64)>| {
-            let keys: Option<BTreeSet<_>> = targets
+            let keys: Option<BTreeSet<TargetKey>> = targets
                 .iter()
                 .map(|(id, offset)| {
                     let entry = pinned.by_id.get(id)?;
@@ -2988,7 +3018,7 @@ impl PinnedObjects {
         };
         keys(self, targets)
             .zip(keys(other, other_targets))
-            .is_some_and(|(ours, theirs)| ours == theirs)
+            .is_some_and(|(ours, theirs)| compare(ours, theirs))
     }
 
     pub fn id_for_scanned(
@@ -8484,18 +8514,28 @@ fn pin_manifest_objects_with_read_policy(
             .tables
             .iter()
             .flat_map(|table| &table.functions);
-        for function in surface_functions.chain(selection_functions) {
+        // Getters are code locations exactly like function records: the
+        // same executable-segment proof pins them to the identified file.
+        let getter_records = m
+            .getters
+            .iter()
+            .map(|getter| (&getter.name, &getter.resolution));
+        for (name, resolution) in surface_functions
+            .chain(selection_functions)
+            .map(|function| (&function.name, &function.resolution))
+            .chain(getter_records)
+        {
             let Resolution::Resolved {
                 object: target,
                 file_offset,
-            } = function.resolution
+            } = *resolution
             else {
                 continue;
             };
             if target == object.id && !inspected.contains_executable_offset(file_offset) {
                 bad_offsets += 1;
                 if first_bad.is_none() {
-                    first_bad = Some((function.name.clone(), file_offset));
+                    first_bad = Some((name.clone(), file_offset));
                 }
             }
         }
@@ -13069,6 +13109,7 @@ mod tests {
             vendor_interfaces: vec![],
             alias_groups: vec![],
             selection_evidence: Default::default(),
+            getters: Vec::new(),
         }
     }
 
@@ -14037,6 +14078,20 @@ mod tests {
         let first_targets = BTreeSet::from([(first_id, 0u64)]);
         let second_targets = BTreeSet::from([(second_id, 0u64)]);
         assert!(first.exactly_same_targets(&first_targets, &second, &second_targets));
+        // A getter-only manifest is corroborated by a scan whose tables hold
+        // one of its getters at that place; an empty claim or a getter the
+        // tables lack shares nothing.
+        let scan_targets = BTreeSet::from([(first_id, 0u64), (first_id, 0x40)]);
+        assert!(!first.exactly_same_targets(&scan_targets, &second, &second_targets));
+        assert!(first.shares_targets(&scan_targets, &second, &second_targets));
+        let partly = BTreeSet::from([(second_id, 0u64), (second_id, 0x80)]);
+        assert!(first.shares_targets(&scan_targets, &second, &partly));
+        assert!(!first.shares_targets(&scan_targets, &second, &BTreeSet::new()));
+        assert!(!first.shares_targets(
+            &scan_targets,
+            &second,
+            &BTreeSet::from([(second_id, 0x80u64)])
+        ));
         let skipped = first.absorb(second);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert_eq!(first.pinned().count(), 1);
@@ -21931,6 +21986,7 @@ mod tests {
             vendor_interfaces: vec![],
             alias_groups: vec![],
             selection_evidence: Default::default(),
+            getters: Vec::new(),
         }
     }
 

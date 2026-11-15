@@ -78,6 +78,7 @@ fn minimal_manifest(path: &Path) -> Manifest {
         vendor_interfaces: vec![],
         alias_groups: vec![],
         selection_evidence: SelectionEvidence::default(),
+        getters: Vec::new(),
     }
 }
 

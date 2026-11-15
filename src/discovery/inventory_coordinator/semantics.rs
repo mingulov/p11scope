@@ -4850,6 +4850,7 @@ mod finalizer_history_tests {
                 vendor_interfaces: Vec::new(),
                 alias_groups: Vec::new(),
                 selection_evidence: Default::default(),
+                getters: Vec::new(),
             };
             assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
             let pinning =
@@ -4926,6 +4927,7 @@ mod finalizer_history_tests {
             vendor_interfaces: vec![],
             alias_groups: vec![],
             selection_evidence: Default::default(),
+            getters: Vec::new(),
         }
     }
 
@@ -8125,6 +8127,7 @@ mod promotion_lifecycle_tests {
                 vendor_interfaces: Vec::new(),
                 alias_groups: Vec::new(),
                 selection_evidence: Default::default(),
+                getters: Vec::new(),
             };
             assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
             let pinning =

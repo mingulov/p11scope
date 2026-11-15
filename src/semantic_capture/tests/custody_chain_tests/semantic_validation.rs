@@ -198,6 +198,7 @@ impl HeldProviders {
                 vendor_interfaces: Vec::new(),
                 alias_groups: Vec::new(),
                 selection_evidence: Default::default(),
+                getters: Vec::new(),
             };
             if standard_interface {
                 // The manifest records every legacy acquisition even when

@@ -4329,6 +4329,7 @@ fn softhsm_joint_manifest(workload: &Workload) -> Result<std::path::PathBuf> {
         vendor_interfaces: Vec::new(),
         alias_groups: Vec::new(),
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     };
     ensure!(
         crate::manifest_input::validate_structure(&manifest).is_empty(),
@@ -4846,6 +4847,7 @@ fn provider_joint_manifest(
         vendor_interfaces: Vec::new(),
         alias_groups: Vec::new(),
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     };
     ensure!(
         crate::manifest_input::validate_structure(&manifest).is_empty(),

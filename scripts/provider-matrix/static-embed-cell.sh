@@ -6,10 +6,12 @@
 # module): the program self-tests through its embedded table (printing
 # CALLS=n, the observation oracle), runs once more under `p11scope run`
 # with default discovery (no manifest can exist for a static binary),
-# and faces `p11scope-discover`. Judged by
-# static_embed_cell_compare.py: program-runs, run-observed and discover
-# (FAIL with the static-executable-unobserved gap while the static
-# file-scan is unlanded). Fresh token db per cell; PINs via
+# and faces `p11scope-discover`, then runs under `p11scope run
+# --manifest` with a getter-only manifest from scripts/getter-manifest.py.
+# Judged by static_embed_cell_compare.py: program-runs, run-observed and
+# discover (FAIL with the static-executable-unobserved gap while the
+# static file-scan is unlanded), and getter-manifest (the table calls
+# counted, named, against the program's CALLS oracle). Fresh token db per cell; PINs via
 # P11TEST_PIN/P11TEST_SO_PIN env (never echoed). The binary arrives via
 # run-matrix.sh --extra-deliver (kryoptic-static-embed/ dir holding the
 # binary plus BUILD.json); a missing binary is a harness error, never a
@@ -128,6 +130,29 @@ set -e
 echo "static-embed-cell: discover exit=$rc"
 MANIFEST_ARGS=()
 if [ -s "$OUT/manifest.json" ]; then MANIFEST_ARGS=(--manifest "$OUT/manifest.json"); fi
+# Getter-only manifest leg: the helper names the binary's getters from
+# its own symbol table (no loading), and `p11scope run --manifest`
+# hooks them and reads the tables they return. rc is judged by the
+# compare, never aborts here.
+GETTER_HELPER=$HERE/../getter-manifest.py
+[ -f "$GETTER_HELPER" ] || { echo "static-embed-cell: missing helper: $GETTER_HELPER" >&2; exit 2; }
+set +e
+python3 -I "$GETTER_HELPER" "$STATIC_BIN" -o "$OUT/getter-manifest.json" \
+  >"$OUT/getter-manifest.log" 2>&1
+grc=$?
+echo "$grc" >"$OUT/getter-manifest.exit"
+echo "static-embed-cell: getter-manifest exit=$grc"
+if [ "$grc" = 0 ]; then
+  obs "$P" run --manifest "$OUT/getter-manifest.json" -o "$OUT/getter-observed.json" \
+    -- "$STATIC_BIN" --iterations 5 --interval 1 \
+    </dev/null >"$OUT/getter-observer.out" 2>"$OUT/getter-observer.err"
+  echo "$?" >"$OUT/getter-run.exit"
+  echo "static-embed-cell: getter run exit=$(cat "$OUT/getter-run.exit")"
+fi
+set -e
+GETTER_ARGS=(--getter-rc "$grc")
+if [ -s "$OUT/getter-observed.json" ]; then GETTER_ARGS+=(--getter-observed "$OUT/getter-observed.json"); fi
+if [ -f "$OUT/getter-observer.out" ]; then GETTER_ARGS+=(--getter-observer-out "$OUT/getter-observer.out"); fi
 python3 -I "$COMPARE" --binary "$STATIC_BIN" \
   --selftest-rc "$(cat "$OUT/selftest.exit")" --selftest-log "$OUT/selftest.log" \
   --observer-out "$OUT/observer.out" \
@@ -135,6 +160,7 @@ python3 -I "$COMPARE" --binary "$STATIC_BIN" \
   --discover-rc "$(cat "$OUT/discover.exit")" \
   "${MANIFEST_ARGS[@]}" \
   --discover-stderr "$OUT/discover.stderr.log" \
+  "${GETTER_ARGS[@]}" \
   --out-results "$OUT/results.jsonl" --out-summary "$OUT/summary.txt"
 rc=$?
 echo "static-embed-cell: compare rc=$rc"

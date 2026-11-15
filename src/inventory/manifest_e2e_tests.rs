@@ -691,6 +691,7 @@ fn live_manifest(
         vendor_interfaces: Vec::new(),
         alias_groups: Vec::new(),
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     };
     ensure!(
         crate::manifest_input::validate_structure(&manifest).is_empty(),
@@ -1124,6 +1125,7 @@ fn full_surface_manifest(module: &str, out: &Path) -> Result<usize> {
         vendor_interfaces: Vec::new(),
         alias_groups: Vec::new(),
         selection_evidence: Default::default(),
+        getters: Vec::new(),
     };
     ensure!(
         crate::manifest_input::validate_structure(&manifest).is_empty(),

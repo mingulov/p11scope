@@ -328,6 +328,7 @@ pub fn discover_with_self_memory(
         vendor_interfaces,
         alias_groups,
         selection_evidence,
+        getters: Vec::new(),
     })
 }
 

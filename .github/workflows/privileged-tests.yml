@@ -1856,13 +1856,16 @@ jobs:
           # all exact-positive except three declared intermittent failures
           # (run-run-tree.sh EXPECTED_FAILURES): each may pass, or fail
           # only with one of its known signatures; any other failure or
-          # a timeout fails the gate. The cells judge exact accounting
-          # (every call after the disclosed pre-attach window observed).
-          # never_pause_still_learns carries PLAN-REPLACE-GAP (an
-          # undisclosed miss in a replace detach window) and SLOT-RECLAIM
-          # (the 2112-slot capacity abort); parallel_never_pause and
-          # arming_exhaustion carry PLAN-REPLACE-GAP (undisclosed misses). When those lanes land, delete their entries
-          # there and turn these back into --require.
+          # a timeout fails the gate. The cells judge exact per-call
+          # accounting (every call that entered after its own function's
+          # first attach observed). never_pause_still_learns carries
+          # PLAN-REPLACE-GAP (a miss the report ties to a replace: a
+          # second slot row or a failed replacement, within the calls
+          # before the last re-attach) and SLOT-RECLAIM (the 2112-slot
+          # capacity abort); parallel_never_pause and arming_exhaustion
+          # carry PLAN-REPLACE-GAP. Any other miss fails. When those
+          # lanes land, delete their entries there and turn these back
+          # into --require.
           python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
             --require privileged_run_tree_shell_wrapper_shows_grandchild_calls \
             --require privileged_run_tree_double_fork_shows_reparented_calls \

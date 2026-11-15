@@ -917,9 +917,9 @@ pub const MEMBER_STOP_COUNTER_IDENTITY_UNREAD: u32 = 3;
 /// number exactly as the kernel stores them. Userspace never derives a
 /// key from `stat`: it copies the kernel's pending rows or the
 /// kernel-written `maps` device and inode of the same file. The two can
-/// differ on overlayfs, where the hook reads the backing file's own
-/// superblock and `maps` prints the overlay's: the pending row's key is
-/// the one cleared for the stopping file.
+/// differ on overlayfs, where the hook reads the backing file's own inode
+/// and superblock and `maps` prints the overlay's: the pending row's key,
+/// found by its exact range, is the one cleared for the stopping file.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub struct MemberFileKey {
@@ -936,13 +936,17 @@ pub struct MemberStopConfig {
     pub exempt_tgid: u32,
 }
 
-/// One pending member stop: the file whose mapping requested it, and the
-/// kernel time of the request.
+/// One pending member stop: the file whose mapping requested it, the
+/// kernel time of the request (`CLOCK_MONOTONIC`) and the new mapping's
+/// exact range, which names its `maps` row whatever inode or device the
+/// row prints (overlayfs).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct MemberStop {
     pub file: MemberFileKey,
     pub hook_ts_ns: u64,
+    pub vm_start: u64,
+    pub vm_end: u64,
 }
 
 fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
@@ -3114,8 +3118,10 @@ mod tests {
     #[test]
     fn member_stop_shapes_are_fixed() {
         assert_eq!(core::mem::size_of::<MemberFileKey>(), 16);
-        assert_eq!(core::mem::size_of::<MemberStop>(), 24);
+        assert_eq!(core::mem::size_of::<MemberStop>(), 40);
         assert_eq!(core::mem::offset_of!(MemberStop, hook_ts_ns), 16);
+        assert_eq!(core::mem::offset_of!(MemberStop, vm_start), 24);
+        assert_eq!(core::mem::offset_of!(MemberStop, vm_end), 32);
         assert_eq!(core::mem::size_of::<MemberStopConfig>(), 8);
         assert_eq!(core::mem::offset_of!(MemberStopConfig, exempt_tgid), 4);
     }

@@ -6709,7 +6709,12 @@ fn run_owned_inner_with_host(
         && let Scope::Cgroup { dir, .. } = &scope
     {
         let tree = crate::attach::member_stop::RunTree::of(group);
-        match crate::attach::member_stop::MemberStopHooks::start(dir, tree, pid) {
+        match crate::attach::member_stop::MemberStopHooks::start(
+            dir,
+            tree,
+            pid,
+            &crate::attach::member_stop::WatchdogLauncher::SelfExe,
+        ) {
             Ok(hooks) => owned.member_stops = Some(hooks),
             Err(error) => {
                 if capture_diagnostics_on() {

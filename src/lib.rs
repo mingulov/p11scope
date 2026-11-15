@@ -120,6 +120,13 @@ pub(crate) mod uretprobe_hazard;
 pub mod userns;
 pub mod vendor_mechanisms;
 
+/// The run member-stop watchdog's entry: `Some(exit code)` when this
+/// process was started as the watchdog (a hidden first argument), else
+/// `None`. `main` calls it before anything else.
+pub fn member_stop_watchdog_entry() -> Option<i32> {
+    attach::member_stop::watchdog::entry(std::env::args_os())
+}
+
 /// Best-effort frontend diagnostic through the existing bounded stderr sink.
 /// A full or closed descriptor may drop some or all text; successful return
 /// does not guarantee delivery. Diagnostic delivery never determines exit status.

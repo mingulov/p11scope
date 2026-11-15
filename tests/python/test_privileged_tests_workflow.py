@@ -909,7 +909,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
             "pkcs11-check-manifest-exact",
             "pkcs11-check-default-coverage",
         ])
-        self.assertEqual(check["default_coverage_floor"], 0.95)
+        self.assertEqual(check["default_coverage_floor"], 1.0)
         self.assertNotIn("default_coverage_expected_failure", check)
         script = (ROOT / "scripts" / "ci" / "pkcs11-check-cell.sh").read_text(encoding="utf-8")
         self.assertIn("pkcs11-check==0.2.3", self.yml)
@@ -921,7 +921,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertEqual(len(invocations), 2)
         for line in invocations:
             self.assertNotIn("--isolation", line)
-        self.assertIn("FLOOR=0.95", script)
+        self.assertIn("FLOOR=1.0", script)
         helper = (ROOT / "scripts" / "ci" / "pkcs11_check_cell_compare.py").read_text(encoding="utf-8")
         self.assertIn('PINNED_VERSION = "0.2.3"', helper)
 

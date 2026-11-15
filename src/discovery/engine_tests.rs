@@ -87048,6 +87048,9 @@ fn member_stop_intake_is_bounded_per_pass() {
     }
     let mut engine = member_stop_engine();
     engine.member_stops.intake_cap = Some(2);
+    // The count cap alone: the wall-time pass budget can end a loaded
+    // host's pass after one proof.
+    engine.member_stops.pass_budget = Some(std::time::Duration::from_secs(30));
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     let newest = children

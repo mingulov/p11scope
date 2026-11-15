@@ -44,8 +44,9 @@ pub(crate) trait MemberStopIo {
     /// Waits, after [`Self::deactivate`], until every hook invocation that
     /// read `active` before it has finished (one RCU grace period: the
     /// hook runs inside an RCU read section), so a scan after it sees
-    /// every row there will be. False when no such wait is proven
-    /// (`nohz_full`, one online CPU, no `membarrier`).
+    /// every row there will be. False when no such wait is proven (the
+    /// map-in-map update is refused and `membarrier` gives none:
+    /// `nohz_full`, one online CPU).
     fn quiesce(&mut self) -> bool;
     /// Whether the pinned process is in the run cgroup tree now. A row
     /// names only a tgid: its member may have exited and the number been
@@ -66,6 +67,10 @@ pub(crate) trait MemberStopIo {
 /// (never-stop). A member read late (a busy pass) resumes in the pass
 /// that reads it.
 pub(crate) const MEMBER_STOP_HOLD_NS: u64 = 1_000_000_000;
+/// How long an unsettled release yields before its rescan, so a hook
+/// call preempted on the observer's CPU can run.
+pub(crate) const MEMBER_STOP_RESCAN_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(20);
 /// Bounded memory of provider identities staged by a stop (the learned
 /// settled set's own cap).
 pub(crate) const MEMBER_STOP_STAGED_CAP: usize = 8192;
@@ -1421,7 +1426,10 @@ impl Engine {
         self.resume_pending_at_release(io);
         if self.member_stops.unsettled {
             // A row inserted after that scan by an invocation the
-            // unproven wait did not cover.
+            // unproven wait did not cover: on one CPU it runs only once
+            // this thread blocks. The hooks' own release then ends the
+            // watchdog by its sweep, which bounds a stop landing later.
+            std::thread::sleep(MEMBER_STOP_RESCAN_DELAY);
             self.resume_pending_at_release(io);
         }
         if crate::run::capture_diagnostics_on() {

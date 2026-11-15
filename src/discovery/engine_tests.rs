@@ -11835,8 +11835,21 @@ fn sibling_closed_tick_still_defers_loader_arm_without_recording() {
 
 #[test]
 fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
+    const TEST: &str = "discovery::engine::tests::loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup";
+    if !crate::test_support::isolation::enter(TEST, "loader-budget-refusals") {
+        return;
+    }
     let (fixture, view, _module, _pins) = loaded_seed_provider();
     let pid = fixture.child.id();
+    // Pin /proc/<pid>/mountinfo on this thread to a snapshot of the target's
+    // live table so background host mount events cannot shift the 1-byte cuts
+    // (nor fire POLLPRI re-reads inside MountTableCache) between calibration and
+    // each arm(...) call.
+    let mountinfo_snapshot = std::fs::read(format!("/proc/{pid}/mountinfo")).unwrap();
+    assert!(!mountinfo_snapshot.is_empty());
+    let mut pinned_mountinfo = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut pinned_mountinfo, &mountinfo_snapshot).unwrap();
+    let _mountinfo_guard = crate::process::pin_mountinfo_for_test(pinned_mountinfo.path());
     let per_object_bytes = ScanLimits::default().per_object_bytes;
     let mut sizing_budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes,
@@ -11951,7 +11964,9 @@ fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
             .counters
             .object_skips
             .iter()
-            .any(|skip| { skip.subject == loader_subject && skip.reason == exact_pin_reason })
+            .any(|skip| { skip.subject == loader_subject && skip.reason == exact_pin_reason }),
+        "missing pin skip ({loader_subject:?}, {exact_pin_reason:?}) in {:?} (L={locator_bytes}, pin_cut={pin_cut})",
+        pin_engine.counters.object_skips
     );
     assert_named_io_cause(&pin_engine);
 

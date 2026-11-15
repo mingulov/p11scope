@@ -204,10 +204,10 @@ fn with_stopping_row(mut rows: Vec<ExecRow>, stop: &MemberStop) -> Vec<ExecRow> 
     rows
 }
 
-/// Opens the file a maps row names. The `map_files` link is exact (the
-/// kernel follows the VMA's own file) and needs `CAP_SYS_ADMIN`; without
-/// it the row's path is opened through the member's root and accepted
-/// only when its inode number matches the row. A refusal only means the
+/// Opens the file a maps row names. The `map_files` link follows the
+/// VMA's own file and needs `CAP_SYS_ADMIN`; without it the row's path is
+/// opened through the member's root. Either way the opened file must
+/// still be the row's (see [`opened_row_file`]). A refusal only means the
 /// row is not proven this pass.
 fn open_exec_row(
     proc: &crate::process::ProcPin<'_>,
@@ -216,22 +216,39 @@ fn open_exec_row(
     deadline: std::time::Instant,
 ) -> Result<std::fs::File, String> {
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
     if let Ok(file) = proc.open_mapped_file(row.start, row.end, deadline) {
-        return Ok(file);
+        return opened_row_file(file, row, true);
     }
     let path = row.path.strip_suffix(b" (deleted)").unwrap_or(&row.path);
     let mut rooted = std::ffi::OsString::from(format!("/proc/{pid}/root"));
     rooted.push(std::ffi::OsStr::from_bytes(path));
     let file =
         std::fs::File::open(&rooted).map_err(|error| format!("opening member file: {error}"))?;
-    let meta = file
+    opened_row_file(file, row, false)
+}
+
+/// Accepts an opened file only when its inode number is the one the
+/// maps snapshot printed. Another thread of the stopped member may remap
+/// the range between the snapshot and the open, and a path may name a
+/// newer file. Through `map_files` the kernel row's own inode number is
+/// accepted too: on overlayfs that link opens the backing file, which
+/// the hook keyed. Inode numbers only: the device encodings differ
+/// between `stat` and the kernel's superblock (btrfs subvolumes).
+fn opened_row_file(
+    file: std::fs::File,
+    row: &ExecRow,
+    through_map_files: bool,
+) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let ino = file
         .metadata()
-        .map_err(|error| format!("member file metadata: {error}"))?;
-    if meta.ino() != row.maps_ino {
-        return Err("member file path no longer names the mapped inode".into());
+        .map_err(|error| format!("member file metadata: {error}"))?
+        .ino();
+    if ino == row.maps_ino || (through_map_files && ino == row.key.ino) {
+        Ok(file)
+    } else {
+        Err("the opened member file is no longer the mapped inode".into())
     }
-    Ok(file)
 }
 
 impl Engine {
@@ -584,6 +601,33 @@ mod tests {
         let rows = with_stopping_row(vec![row(43, 7, 0x1000)], &stop(23, 7, 0x8000));
         assert_eq!(rows.len(), 1, "unmapped since: nothing to prove");
         assert_eq!(rows[0].key, MemberFileKey { dev: 43, ino: 7 });
+    }
+
+    /// A range remapped after the maps snapshot (or a path naming a newer
+    /// file) opens another inode: refused, so nothing is proven, staged
+    /// or cleared under the row's key.
+    #[test]
+    fn an_opened_file_must_be_the_mapped_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+        let open = || std::fs::File::open("/proc/self/exe").unwrap();
+        let ino = open().metadata().unwrap().ino();
+        let row = |maps_ino, key_ino| ExecRow {
+            start: 0x1000,
+            end: 0x2000,
+            key: MemberFileKey {
+                dev: 1,
+                ino: key_ino,
+            },
+            maps_ino,
+            path: b"/x".to_vec(),
+        };
+        assert!(opened_row_file(open(), &row(ino, ino), true).is_ok());
+        assert!(opened_row_file(open(), &row(ino, ino), false).is_ok());
+        assert!(opened_row_file(open(), &row(ino + 1, ino + 1), true).is_err());
+        assert!(opened_row_file(open(), &row(ino + 1, ino + 1), false).is_err());
+        // The kernel key's inode is the backing file's: map_files only.
+        assert!(opened_row_file(open(), &row(ino + 1, ino), true).is_ok());
+        assert!(opened_row_file(open(), &row(ino + 1, ino), false).is_err());
     }
 
     #[test]

@@ -640,9 +640,10 @@ Calls after it are observed unless another disclosed window says
 otherwise; it bounds the first-use gap, it is not a missed-call count. It may stand beside a
 null `attached_at_ns` when a replacement attach failed after the first
 complete attach. `first_attach_points` (additive) lists each endpoint that
-ever attached as `{file_offset, began_ns, attached_ns}`: the begin instant
-of its first attach call (`null` when the clock could not be read) and
-that call's completion stamp. Counts are completed calls, so no call that
+ever attached as `{file_offset, began_ns, attached_ns}`: the instant just
+before that endpoint's own first native attach call (its return side;
+the attach batch's start when that round has no usable clock; `null`
+when no clock could be read) and that attach's completion stamp. Counts are completed calls, so no call that
 entered before `began_ns` is counted and every call that entered after
 `attached_ns` is, unless another disclosed window says otherwise; only
 calls entering while that first attach ran are ambiguous. Absent when no

@@ -18442,6 +18442,10 @@ impl Engine {
         // Whether the attach mutation for `delta.new` ran. A precheck that
         // finds a candidate generation already gone skips it (U-07).
         let mut new_targets_attached = may_add;
+        // Whether the attach call itself ran (a counter growth refusal
+        // still ran it): that consumes the learned staging, even when its
+        // targets did not attach.
+        let mut attach_ran = false;
         if !may_add {
             block_unperformed_static(
                 &mut candidate.plan,
@@ -18514,6 +18518,7 @@ impl Engine {
             };
             generation_lost |= attach_stale;
             new_targets_attached = attach.is_some();
+            attach_ran = attach.is_some();
             if counter_growth {
                 // Counter growth stages the candidate plan append-only.
                 // Refusals deactivate the fresh tail for withdrawal and
@@ -18894,6 +18899,7 @@ impl Engine {
             extra_views,
             target_modules,
             new_targets_attached,
+            attach_ran,
             additions_allowed,
             &mut outcome,
         );
@@ -19468,6 +19474,7 @@ impl Engine {
         extra_views: &[&ProcessView],
         target_modules: BTreeSet<PinnedTimingKey>,
         new_targets_attached: bool,
+        attach_ran: bool,
         additions_allowed: &mut bool,
         outcome: &mut ApplyOutcome,
     ) {
@@ -19942,12 +19949,15 @@ impl Engine {
             self.merge_and_project_capture_facts()
         };
         outcome.disposition = candidate_publication_disposition(retired, &publication);
-        // Only an accepted candidate whose attach mutation ran consumed the
+        // Only an accepted candidate whose attach call ran consumed the
         // learned staging: it was built from the current pins (staging
         // never runs inside a tick or an apply), so the latch clears here
         // and nowhere else. Refused, deferred and early-returning
         // refreshes, and an accept with additions blocked, leave it set.
-        if outcome.disposition == ApplyDisposition::Accepted && new_targets_attached {
+        // A counter growth refusal ran the call: the latch clears, and the
+        // unattached provider stays covered per file by the hold's
+        // `provider_object_attached` and the watchdog-loss row.
+        if outcome.disposition == ApplyDisposition::Accepted && attach_ran {
             self.learned_unapplied = false;
         }
         if publication.is_err() {

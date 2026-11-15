@@ -2,7 +2,8 @@
 /* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
 /* Run-tree first-map stop. Standalone object loaded only by an owned,
  * pause-armed `run` on its cgroup scope. The hook reads kernel VMA/file
- * metadata only (VM_EXEC, the file's inode number and superblock device):
+ * metadata only (VM_EXEC, the mapping's range, the file's inode number
+ * and superblock device):
  * no syscall argument, user address, path, payload or memory content is
  * read or emitted. Shared by the BPF build and the userspace mirror in
  * `src/attach/member_stop.rs`, which pins every layout below. */
@@ -62,13 +63,16 @@ struct ms_file {
 };
 _Static_assert(sizeof(struct ms_file) == 16, "file key ABI");
 
-/* MS_STOPS value: the file whose mapping requested the stop and the
- * monotonic time of the request. */
+/* MS_STOPS value: the file whose mapping requested the stop, the
+ * monotonic time of the request and the new mapping's exact range. */
 struct ms_stop {
     struct ms_file file;
     u64 hook_ts_ns;
+    u64 vm_start;
+    u64 vm_end;
 };
-_Static_assert(sizeof(struct ms_stop) == 24, "stop ABI");
+_Static_assert(sizeof(struct ms_stop) == 40, "stop ABI");
 _Static_assert(__builtin_offsetof(struct ms_stop, hook_ts_ns) == 16, "stop time");
+_Static_assert(__builtin_offsetof(struct ms_stop, vm_start) == 24, "stop range");
 
 #endif

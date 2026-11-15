@@ -86137,10 +86137,36 @@ fn member_exec_key_for_test(
     panic!("{wanted} has no executable row in {pid}'s maps");
 }
 
-fn member_stop_row(key: p11scope_ebpf_common::MemberFileKey) -> p11scope_ebpf_common::MemberStop {
+/// The exact range of the first executable row naming `path` in `pid`'s
+/// maps: the mapping a kernel row names.
+fn member_exec_range_for_test(pid: u32, path: &std::path::Path) -> (u64, u64) {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    let wanted = path.to_string_lossy();
+    for line in maps.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 6 && fields[1].contains('x') && fields[5] == wanted {
+            let (start, end) = fields[0].split_once('-').unwrap();
+            return (
+                u64::from_str_radix(start, 16).unwrap(),
+                u64::from_str_radix(end, 16).unwrap(),
+            );
+        }
+    }
+    panic!("{wanted} has no executable row in {pid}'s maps");
+}
+
+/// A kernel row for `key`, stopped by `pid`'s mapping of `path`.
+fn member_stop_row(
+    pid: u32,
+    path: &std::path::Path,
+    key: p11scope_ebpf_common::MemberFileKey,
+) -> p11scope_ebpf_common::MemberStop {
+    let (vm_start, vm_end) = member_exec_range_for_test(pid, path);
     p11scope_ebpf_common::MemberStop {
         file: key,
         hook_ts_ns: 1,
+        vm_start,
+        vm_end,
     }
 }
 
@@ -86173,7 +86199,7 @@ fn member_stop_clears_non_provider_files_and_resumes_at_once() {
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &exe);
     let mut io = ScriptedMemberStops::default();
-    io.rows.insert(pid, member_stop_row(key));
+    io.rows.insert(pid, member_stop_row(pid, &exe, key));
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
@@ -86225,7 +86251,7 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
         ino: maps_key.ino,
     };
     let mut io = ScriptedMemberStops::default();
-    io.rows.insert(pid, member_stop_row(kernel));
+    io.rows.insert(pid, member_stop_row(pid, &exe, kernel));
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
@@ -86235,6 +86261,46 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
         io.cleared
     );
     assert!(io.cleared.contains(&maps_key), "its maps key clears too");
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Twin: the overlay's backing inode number differs from the one `maps`
+/// prints as well. The kernel row's range still names the stopping
+/// mapping, so its kernel key is cleared.
+#[test]
+fn member_stop_clears_the_kernel_key_when_maps_show_another_inode() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let exe = loop {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            && exe.file_name().is_some_and(|name| name == "sleep")
+        {
+            break exe;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    stop_member_for_test(pid);
+    let maps_key = member_exec_key_for_test(pid, &exe);
+    let kernel = p11scope_ebpf_common::MemberFileKey {
+        dev: maps_key.dev ^ 0x7f,
+        ino: maps_key.ino ^ 0x5a5a,
+    };
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &exe, kernel));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(
+        io.cleared.contains(&kernel),
+        "the kernel key of the stopping file is cleared: {:?}",
+        io.cleared
+    );
     assert!(member_resumed_for_test(pid), "the member runs again");
     let _ = child.kill();
     let _ = child.wait();
@@ -86270,7 +86336,7 @@ fn member_stop_holds_a_provider_mapper_until_its_staging_attaches() {
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &library);
     let mut io = ScriptedMemberStops::default();
-    io.rows.insert(pid, member_stop_row(key));
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
     let mut engine = member_stop_engine();
     // A pause-owned batch defers the event-driven apply: the staging
     // stays unattached until the batch ends.
@@ -86334,7 +86400,7 @@ fn member_stop_resumes_at_the_bound_and_files_the_first_use_row() {
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &library);
     let mut io = ScriptedMemberStops::default();
-    io.rows.insert(pid, member_stop_row(key));
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
     engine.pause_owned_batch = true;
@@ -86392,14 +86458,15 @@ fn member_stop_release_resumes_held_and_untaken_members() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     stop_member_for_test(other_pid);
     let mut io = ScriptedMemberStops::default();
-    io.rows.insert(pid, member_stop_row(key));
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
     let mut engine = member_stop_engine();
     engine.pause_owned_batch = true;
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert!(engine.member_stops_held());
     // A row the service never took (it arrived after the last pass).
-    io.rows.insert(other_pid, member_stop_row(key));
+    io.rows
+        .insert(other_pid, member_stop_row(pid, &library, key));
     engine.release_member_stops(&mut io);
     assert!(io.deactivated, "new stops switch off first");
     assert!(!engine.member_stops_held());
@@ -86420,7 +86487,7 @@ fn member_stop_attaches_and_resumes_a_provider_mapper_in_one_pass() {
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &library);
     let mut io = ScriptedMemberStops::default();
-    io.rows.insert(pid, member_stop_row(key));
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));

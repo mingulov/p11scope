@@ -492,8 +492,9 @@ pub struct Engine {
     learned_event_loss: u64,
     /// Learned candidates refused by the per-capture file cap.
     learned_cap_skipped: u64,
-    /// A learned staging owes an expedited discovery frame so attach
-    /// lands promptly instead of at the next cadence boundary.
+    /// A learned staging, or an owned member's bounded rescan after an
+    /// incomplete scan, owes an expedited discovery frame so attach lands
+    /// promptly instead of at the next cadence boundary.
     learned_frame_owed: bool,
     /// Unproven owned-tree members for the watch rescan rotation (E1).
     /// Members join at notice and leave once a scan proves a provider
@@ -6628,9 +6629,9 @@ pub(crate) const OWNED_WATCH_RUN_IO_CAP_BYTES: u64 = 2_097_152;
 
 /// How many prompt rescans an owned run member's view gets after an
 /// incomplete scan (a member mapping its provider while the scan read its
-/// maps). Each retry is the next tick's rescan, so a short-lived worker
-/// still attaches inside its life; past the bound the view keeps its
-/// partial result and the scan's own gaps, as before.
+/// maps). Each retry is the next expedited frame's rescan, so a
+/// short-lived worker still attaches inside its life; past the bound the
+/// view keeps its partial result and the scan's own gaps, as before.
 pub(crate) const OWNED_INCOMPLETE_SCAN_RETRIES: u32 = 3;
 
 /// How a marked newcomer generation's descendant gap was counted.
@@ -14697,8 +14698,8 @@ impl Engine {
         self.learned_cap_skipped
     }
 
-    /// Consume the learned-staging expedited-frame hint (scheduling
-    /// only, never admission authority).
+    /// Consume the learned-staging (or owned incomplete-rescan)
+    /// expedited-frame hint (scheduling only, never admission authority).
     pub(crate) fn take_learned_frame(&mut self) -> bool {
         std::mem::take(&mut self.learned_frame_owed)
     }
@@ -22047,8 +22048,10 @@ impl Engine {
     /// comes back incomplete with nothing proven, and nothing rescans a
     /// retained view without a request: its provider then attached only
     /// from the next worker, hundreds of milliseconds later. An incomplete
-    /// scan of an owned member keeps a refresh queued for the next tick,
-    /// at most `OWNED_INCOMPLETE_SCAN_RETRIES` times per view; then the
+    /// scan of an owned member keeps a refresh queued and owes an
+    /// expedited frame (the learned-staging hint), so the rescan runs on
+    /// the next loop tick instead of the next frame boundary, at most
+    /// `OWNED_INCOMPLETE_SCAN_RETRIES` times per view; then the
     /// partial result and the scan's own gaps stand, as before. Only a scan
     /// that found no module retries: a rescan replaces the view's modules,
     /// so retrying a partial result that already attached could detach it
@@ -22072,7 +22075,11 @@ impl Engine {
         }
         let count = self.owned_incomplete_scans.entry(view).or_insert(0);
         *count = count.saturating_add(1);
-        *count <= OWNED_INCOMPLETE_SCAN_RETRIES
+        let owed = *count <= OWNED_INCOMPLETE_SCAN_RETRIES;
+        // The inventory tick runs on the frame cadence; only an expedited
+        // frame lands the rescan inside a short-lived worker's life.
+        self.learned_frame_owed |= owed;
+        owed
     }
 
     /// Owned run-tree file learning (E1): stage scan-proven provider

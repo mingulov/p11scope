@@ -6,7 +6,8 @@
 scripts/ci/run-cell-script.sh runs one scripts/ci/<name>.sh cell script and
 validates its results.jsonl with scripts/ci/check-cell-results.py. The
 checker requires every row well formed, no qualified row failing, and the
-expected-failure set exactly equal to the declared list. Exit 77 from a
+expected-failure set exactly equal to the declared list (intermittent
+failures may land as either a pass or a known-signature failure). Exit 77 from a
 cell script (prerequisite missing) always fails the job.
 
 Run: python3 -I tests/python/test_cell_results.py -v
@@ -186,6 +187,38 @@ class CheckCellResultsTests(unittest.TestCase):
         result = run_checker(rows, "--expected-failure", "known")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected pass for expected failure known", result.stderr)
+
+    def test_intermittent_failure_accepts_either_outcome(self):
+        for outcome in (row("flaky", True),
+                        row("flaky", False, "expected-failure", "bug 1: signature")):
+            result = run_checker([row("a", True), outcome],
+                                 "--intermittent-failure", "flaky", "--require", "a")
+            self.assertEqual(result.returncode, 0, (outcome, result.stderr))
+
+    def test_intermittent_failure_never_masks_a_failure(self):
+        for outcome, message in (
+                (row("flaky", False, "failed", "rc=101 other"), "failed qualified cell flaky"),
+                (row("flaky", True, "expected-failure", "UNEXPECTED PASS"),
+                 "unexpected pass for expected failure flaky")):
+            result = run_checker([outcome], "--intermittent-failure", "flaky")
+            self.assertNotEqual(result.returncode, 0, outcome)
+            self.assertIn(message, result.stderr)
+
+    def test_intermittent_failure_row_must_appear(self):
+        result = run_checker([row("a", True)], "--intermittent-failure", "flaky")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing intermittent cells: flaky", result.stderr)
+
+    def test_intermittent_failure_names_are_exclusive(self):
+        rows = [row("flaky", False, "expected-failure", "bug")]
+        result = run_checker(rows, "--intermittent-failure", "flaky",
+                             "--expected-failure", "flaky")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cells declared both expected and intermittent: flaky", result.stderr)
+        result = run_checker(rows, "--intermittent-failure", "flaky",
+                             "--intermittent-failure", "flaky")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate --intermittent-failure names", result.stderr)
 
     def test_malformed_rows_fail(self):
         cases = [

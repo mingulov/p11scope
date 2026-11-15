@@ -12,8 +12,9 @@ Three legs run the same pkcs11-check selection against fresh SoftHSM tokens:
   report.jsonl);
 - observer clean (exits match the base leg, observed.json valid v3);
 - leg (c) oracle subset (teardown rv-trace calls ⊆ captured counts);
-- leg (b) default coverage ratio vs a pinned floor, or a named
-  expected-failure when slot exhaustion blinds the default capture.
+- leg (b) default coverage vs the cell's floor (1.0 since the owner's
+  2026-11-15 exact-accounting ruling: every oracle call observed), or a
+  named expected-failure when slot exhaustion blinds the default capture.
 
 It writes results.jsonl (four cells) and summary.txt, prints details, and
 exits 0 when every qualified row passes, 1 when a qualified check fails,

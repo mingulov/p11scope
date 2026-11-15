@@ -10,8 +10,9 @@
 # never echoed; --rv-trace -o json oracle. Hard checks (in
 # pkcs11_check_cell_compare.py): identical result sets across a/b/c,
 # observer exit matches base with valid v3 reports (no abort), leg (c)
-# oracle calls subset-of captured counts, leg (b) coverage vs a pinned
-# floor (or a named expected-failure when slot exhaustion blinds it).
+# oracle calls subset-of captured counts, leg (b) exact coverage (every
+# oracle call observed, or a named expected-failure when slot exhaustion
+# blinds it).
 # Overhead (wall) printed. Mode via P11CHECK_MODE=smoke (default,
 # --marker smoke, few minutes) or full (no marker, ~45 min).
 # Must run as root; the template wrapper calls this directly. Exit 0 means
@@ -63,14 +64,14 @@ mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd) || exit 2
 COMPARE=$HERE/pkcs11_check_cell_compare.py
 [ -f "$COMPARE" ] || { echo "pkcs11-check-cell: missing helper: $COMPARE" >&2; exit 2; }
-# Default-coverage floor, set from the smoke measurement: with run
-# members stopped at their first map of an unseen executable until the
-# provider attaches, default call_recall is 1.0000 (42 of 42 oracle
-# calls, two local smoke runs); before that fix it was 0.8095 (the first
-# mapper's calls were missed). 0.95 keeps two calls of margin under the
-# measurement: leg (b) without a manifest must reach it, else it records
-# the named slot-exhaustion expected-failure when the report proves it.
-FLOOR=0.95
+# Default coverage is exact (owner ruling 2026-11-15: no percentage
+# floors): with run members stopped at their first map of an unseen
+# executable until the provider attaches, every oracle call lands
+# (call_recall 1.0000, 42 of 42 in two local smoke runs; 0.8095 before
+# that fix). Leg (b) without a manifest must observe every oracle call,
+# else it records the named slot-exhaustion expected-failure when the
+# report proves it; any other miss fails.
+FLOOR=1.0
 echo "pkcs11-check-cell: mode=$MODE module=$MODULE floor=$FLOOR"
 echo "pkcs11-check-cell: suite=$HAVE_VER observer=$P discover=$DISCOVER run as $RUNUID:$RUNGID"
 make_token() {

@@ -2607,10 +2607,24 @@ impl AttachPlan {
             claims.unproven.extend(target.unproven);
         }
 
-        // Ticketed keys ride free at extend, so a pending reclaim must not be
-        // counted as an addition here: near capacity that would refuse a
-        // selection table whose reclaims already hold the needed room.
-        let ticketed = |key: &AttachKey| self.reclaimed.contains_key(key);
+        // A key this table names loses the merge reclaim ticket it holds:
+        // the selection name changes the slot's shape, so the shared
+        // reclaim predicate no longer proves it. Project that loss before
+        // charging additions, so the fresh slot the rename forces is
+        // counted and the table is refused here as a counted gap instead of
+        // leaving an uncharged addition for the extension to reject at
+        // capacity. The ticket itself drops only with the applied table, so
+        // a refused table leaves the candidate exactly as merge built it.
+        let renamed: BTreeSet<AttachKey> = grouped
+            .keys()
+            .filter(|key| self.reclaimed.contains_key(*key))
+            .copied()
+            .collect();
+        // Ticketed keys whose shape this table leaves alone ride free at
+        // extend, so a pending reclaim must not be counted as an addition
+        // here: near capacity that would refuse a selection table whose
+        // reclaims already hold the needed room.
+        let ticketed = |key: &AttachKey| self.reclaimed.contains_key(key) && !renamed.contains(key);
         let candidate_additions = self
             .slot_by_key
             .keys()
@@ -2640,6 +2654,9 @@ impl AttachPlan {
             ));
         }
 
+        for key in &renamed {
+            self.reclaimed.remove(key);
+        }
         for (key, claims) in grouped {
             // Selection tables carry no table location, only positions.
             self.slot_ordinals
@@ -2650,12 +2667,10 @@ impl AttachPlan {
                     ordinal,
                 }));
             if let Some(position) = self.slot_by_key.get(&key).copied() {
-                // A selection name changes the slot's shape after merge
-                // computed its reclaim ticket: drop the ticket so extend
-                // cannot apply a reclaim the shared predicate no longer
-                // proves. Capacity above was checked without any reclaim
-                // discount for this key, so the fresh slot still fits.
-                self.reclaimed.remove(&key);
+                // This table changes the slot's shape, so the reclaim
+                // ticket the key held (if any) was dropped and charged
+                // above: extend can no longer prove the shared predicate
+                // for it.
                 // A retired unknown sibling keeps rendering under this
                 // key, so the entry stays for it when one exists; named
                 // slots read nothing regardless (see
@@ -20858,6 +20873,97 @@ pub(crate) mod tests {
         );
     }
 
+    /// B1: a selection table that renames a ticketed reclaim key changes the
+    /// slot shape after merge charged it free, so the table must charge that
+    /// key fresh and be refused here as the counted gap when the budget is
+    /// full. The refusal is atomic: the ticket survives and the extension
+    /// still reoccupies the retired cells instead of failing at capacity.
+    #[test]
+    fn selection_table_rename_charges_a_reclaim_ticket_before_extend() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
+        let mut old = provider_with_tables(42, "/opt/ticketed.so", 1, 68, false);
+        let old_targets: Vec<(&'static str, u32, u64)> = (0..68u64)
+            .map(|index| ("C_Sign", 42, 0x1000 + index * 8))
+            .collect();
+        replace_table_targets(&mut old, 0, &old_targets);
+        let mut plan = scoped_plan(&[filler.clone(), old], AdmissionScope::Named);
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "the budget is full");
+        plan.object_identities.insert(
+            PinnedObjectId(42),
+            test_identity(42, "sha-ticketed-selection"),
+        );
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 68, "the generation retired");
+        plan.revivable.clone_from(&plan.retired_keys);
+        let mut returning = provider_with_tables(42, "/opt/ticketed.so", 1, 68, false);
+        returning.object = PinnedObjectId(90);
+        returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+        let returning_targets: Vec<(&'static str, u32, u64)> = (0..68u64)
+            .map(|index| ("C_Sign", 90, 0x1000 + index * 8))
+            .collect();
+        replace_table_targets(&mut returning, 0, &returning_targets);
+        let identities = BTreeMap::from([(
+            PinnedObjectId(90),
+            test_identity(42, "sha-ticketed-selection"),
+        )]);
+        let mut rebuilt =
+            plan.rebuild_from_sources_with_identities(&[filler, returning], &[], &identities);
+        let key = AttachKey {
+            object: PinnedObjectId(90),
+            file_offset: 0x1000,
+        };
+        assert_eq!(rebuilt.reclaimed.len(), 68, "the returning pin reclaims");
+        assert_eq!(
+            rebuilt.reclaimed.get(&key),
+            Some(&(MAX_SLOTS as usize - 68))
+        );
+        let module = rebuilt
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(90))
+            .map(|module| module.id)
+            .expect("the returning provider is admitted");
+        let error = rebuilt
+            .add_selection_table(
+                &plan,
+                module,
+                [selection_target(
+                    PinnedObjectId(90),
+                    0x1000,
+                    "C_VerifyUpdate",
+                )],
+            )
+            .expect_err("the renamed key is charged fresh and cannot fit the full budget");
+        assert!(
+            error.contains("2113 allocated slots") && error.contains("2112"),
+            "the refusal charges the rename: {error}"
+        );
+        assert_eq!(
+            rebuilt.reclaimed.get(&key),
+            Some(&(MAX_SLOTS as usize - 68)),
+            "a refused table leaves the reclaim ticket in place"
+        );
+        let delta = plan
+            .extend_exact_with_stable_module_ids(rebuilt)
+            .unwrap_or_else(|error| {
+                panic!("a counted selection refusal must not break extend: {error}")
+            });
+        assert_eq!(delta.retire.len(), 0);
+        assert_eq!(delta.new.len(), 68, "the retired indices are reoccupied");
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| slot.index as usize >= MAX_SLOTS as usize - 68),
+            "every returning target reuses a retired index"
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "capacity never grows");
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize);
+        assert!(plan.retired_slots.is_empty(), "nothing stays retired");
+    }
+
     /// I2: a reclaim that would newly make a semantic cell ambiguous prefers
     /// a fresh index that keeps the descriptor while the budget allows it.
     /// The retired cells stay retired; nothing is lowered silently.
@@ -21173,6 +21279,277 @@ pub(crate) mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Property-style audit of the merge/selection/extension seam over small
+    /// pseudo-random scenarios (fixed seed): retired count-only or semantic
+    /// cells, an identity-matching or failing returning pin, an optional
+    /// same-file co-claimant, an optional rival stable module id, a full or
+    /// partly free budget, and a random ordered subset of selection tables
+    /// renaming ticketed, returning, kept or fresh keys. Every admission and
+    /// every counted refusal must still leave an extension that allocates
+    /// exactly what validation charged: `extend_exact_with_stable_module_ids`
+    /// is Ok, capacity never grows, refused tables leave the reclaim tickets
+    /// intact, and no linked descriptor is lowered without a replace or a
+    /// new attach.
+    #[test]
+    fn selection_tables_and_reclaims_never_leave_uncharged_additions() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound
+        };
+        let names: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        for scenario in 0..32 {
+            let semantic = next(2) == 1;
+            let room = if next(2) == 1 { 68 } else { 0 };
+            let count = if semantic {
+                68
+            } else {
+                [1usize, 4, 68][next(3)]
+            };
+            let identity_ok = next(2) == 1;
+            let rival = next(2) == 1;
+            let co_claim = next(2) == 1;
+            let label = format!(
+                "scenario {scenario} (semantic {semantic}, room {room}, count {count}, \
+                 identity {identity_ok}, rival {rival}, co_claim {co_claim})"
+            );
+
+            let filler = provider_with_tables(
+                51,
+                "/opt/filler.so",
+                1,
+                MAX_SLOTS as usize - count - room,
+                true,
+            );
+            let old = if semantic {
+                sole_complete_module()
+            } else {
+                let mut old = provider_with_tables(42, "/opt/retired.so", 1, count, false);
+                let targets: Vec<(&'static str, u32, u64)> = (0..count as u64)
+                    .map(|index| ("C_Sign", 42, 0x1000 + index * 8))
+                    .collect();
+                replace_table_targets(&mut old, 0, &targets);
+                old
+            };
+            let mut plan = scoped_plan(&[filler.clone(), old], AdmissionScope::Named);
+            assert_eq!(
+                plan.slots.len(),
+                MAX_SLOTS as usize - room,
+                "{label}: the plan fills all but the chosen room"
+            );
+            plan.object_identities
+                .insert(PinnedObjectId(42), test_identity(42, "sha-audit"));
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&filler),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            plan.extend_exact(rebuilt).unwrap();
+            assert_eq!(plan.retired_slots.len(), count, "{label}: retired");
+            plan.revivable.clone_from(&plan.retired_keys);
+
+            let returning = if semantic {
+                let mut returning = sole_complete_module();
+                returning.object = PinnedObjectId(90);
+                returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+                returning
+            } else {
+                let mut returning = provider_with_tables(42, "/opt/retired.so", 1, count, false);
+                returning.object = PinnedObjectId(90);
+                returning.entry_objects = vec![vec![PinnedObjectId(90); count]];
+                let targets: Vec<(&'static str, u32, u64)> = (0..count as u64)
+                    .map(|index| ("C_Sign", 90, 0x1000 + index * 8))
+                    .collect();
+                replace_table_targets(&mut returning, 0, &targets);
+                returning
+            };
+            let mut modules = vec![filler, returning];
+            if co_claim {
+                let mut forward = provider_with_tables(91, "/opt/forward.so", 1, count, false);
+                let targets: Vec<(&'static str, u32, u64)> = if semantic {
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| (*name, 90, 0x1000 + index as u64 * 8))
+                        .collect()
+                } else {
+                    (0..count as u64)
+                        .map(|index| ("C_Sign", 90, 0x1000 + index * 8))
+                        .collect()
+                };
+                replace_table_targets(&mut forward, 0, &targets);
+                let path = if semantic {
+                    "/opt/p11.so"
+                } else {
+                    "/opt/retired.so"
+                };
+                for entry in &mut forward.scanned.tables[0].entries {
+                    entry.object_path = path.into();
+                }
+                modules.push(forward);
+            }
+            let identities = if identity_ok {
+                BTreeMap::from([(PinnedObjectId(90), test_identity(42, "sha-audit"))])
+            } else {
+                BTreeMap::new()
+            };
+            let mut rebuilt = plan.rebuild_from_sources_with_identities(&modules, &[], &identities);
+            if rival {
+                let returning_id = ModuleId(
+                    rebuilt
+                        .modules
+                        .iter()
+                        .chain(plan.modules.iter())
+                        .map(|module| module.id.0)
+                        .max()
+                        .unwrap_or(0)
+                        + 1,
+                );
+                for module in &mut rebuilt.modules {
+                    if module.object == PinnedObjectId(90) {
+                        module.id = returning_id;
+                    }
+                }
+                for slot in &mut rebuilt.slots {
+                    if slot.object == PinnedObjectId(90) {
+                        slot.module_ids = vec![returning_id];
+                    }
+                }
+            }
+
+            let module_for = |object: PinnedObjectId| {
+                rebuilt
+                    .modules
+                    .iter()
+                    .find(|module| module.object == object)
+                    .map(|module| module.id)
+            };
+            let returning_module = module_for(PinnedObjectId(90));
+            let filler_module = module_for(PinnedObjectId(51));
+            let ticketed: Vec<AttachKey> = rebuilt.reclaimed.keys().copied().collect();
+            let returning_keys: Vec<AttachKey> = rebuilt
+                .slots
+                .iter()
+                .filter(|slot| slot.object == PinnedObjectId(90) && rebuilt.is_active(slot.index))
+                .map(AttachKey::of)
+                .collect();
+            let mut candidates: Vec<(ModuleId, Vec<SelectionTableTarget>)> = Vec::new();
+            if let (Some(module), Some(key)) = (returning_module, ticketed.first()) {
+                candidates.push((
+                    module,
+                    vec![selection_target(
+                        key.object,
+                        key.file_offset,
+                        "C_VerifyUpdate",
+                    )],
+                ));
+            }
+            if let (Some(module), Some(key)) = (
+                returning_module,
+                ticketed.get(1).or_else(|| returning_keys.first()),
+            ) {
+                candidates.push((
+                    module,
+                    vec![selection_target(key.object, key.file_offset, "C_Encrypt")],
+                ));
+            }
+            if let Some(module) = returning_module {
+                let offset = 0x8000 + count as u64 * 8;
+                candidates.push((
+                    module,
+                    vec![selection_target(PinnedObjectId(90), offset, "C_Digest")],
+                ));
+            }
+            if let (Some(module), Some(slot)) = (
+                filler_module,
+                rebuilt
+                    .slots
+                    .iter()
+                    .find(|slot| slot.object == PinnedObjectId(51)),
+            ) {
+                let offset = slot.file_offset;
+                candidates.push((
+                    module,
+                    vec![selection_target(PinnedObjectId(51), offset, "C_DigestKey")],
+                ));
+            }
+            if let (Some(module), Some(key)) = (returning_module, returning_keys.first()) {
+                candidates.push((
+                    module,
+                    vec![
+                        selection_target(key.object, key.file_offset, "C_Decrypt"),
+                        selection_target(key.object, key.file_offset, "C_Digest"),
+                    ],
+                ));
+            }
+            let mut operations: Vec<(ModuleId, Vec<SelectionTableTarget>)> =
+                candidates.into_iter().filter(|_| next(2) == 0).collect();
+            for index in (1..operations.len()).rev() {
+                operations.swap(index, next(index + 1));
+            }
+            for (module, targets) in operations {
+                let tickets = rebuilt.reclaimed.clone();
+                let touched: Vec<AttachKey> = targets
+                    .iter()
+                    .map(|target| AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    })
+                    .collect();
+                match rebuilt.add_selection_table(&plan, module, targets) {
+                    Ok(()) => {
+                        for key in touched {
+                            if tickets.contains_key(&key) {
+                                assert!(
+                                    !rebuilt.reclaimed.contains_key(&key),
+                                    "{label}: an admitted rename drops its reclaim ticket"
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => assert_eq!(
+                        rebuilt.reclaimed, tickets,
+                        "{label}: a refused selection table leaves the tickets intact"
+                    ),
+                }
+            }
+
+            let before: Vec<u32> = plan
+                .slots
+                .iter()
+                .map(|slot| slot.descriptor_index)
+                .collect();
+            let delta = plan
+                .extend_exact_with_stable_module_ids(rebuilt)
+                .unwrap_or_else(|error| {
+                    panic!("{label}: a refusal must never leave an uncharged addition: {error}")
+                });
+            plan.validate_slot_index()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert!(
+                plan.slots.len() <= MAX_SLOTS as usize,
+                "{label}: capacity grew"
+            );
+            for (index, old) in before.iter().enumerate() {
+                if *old != 0 && plan.slots[index].descriptor_index == 0 {
+                    assert!(
+                        delta
+                            .replace
+                            .iter()
+                            .chain(&delta.new)
+                            .any(|slot| slot.index as usize == index),
+                        "{label}: slot {index} was lowered without a replace or fresh attach"
+                    );
                 }
             }
         }

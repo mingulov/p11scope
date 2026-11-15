@@ -922,6 +922,13 @@ impl Engine {
             };
             match crate::fanotify::prove_with_loader(&file, naming) {
                 Ok(None) => cleared.push(row.key),
+                // `--module` narrows discovery and `--exclude-module`
+                // removes a provider: outside the selection a provider
+                // is no provider for this capture, so it clears like a
+                // non-provider (no staging, no hold, no first-use row).
+                Ok(Some(_)) if self.outside_module_selection(&file, &row.path) => {
+                    cleared.push(row.key);
+                }
                 Ok(Some((loader_exe, loader_unknown_reason))) => {
                     let Ok((dev, ino)) = file.metadata().map(|meta| {
                         use std::os::unix::fs::MetadataExt as _;
@@ -950,6 +957,58 @@ impl Engine {
             }
         }
         (cleared, providers)
+    }
+
+    /// Whether a proven provider falls outside the capture's selection:
+    /// with `--module` it must be one of the named files (the mapped
+    /// path verbatim, or the same file identity as a hint, followed like
+    /// the scan's hints), and no `--exclude-module` input may match it
+    /// (identity, basename or soname, as in the scan).
+    fn outside_module_selection(&self, file: &std::fs::File, mapped_path: &[u8]) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let identity = file.metadata().ok().map(|meta| (meta.dev(), meta.ino()));
+        let same_file = |input: &std::path::Path| {
+            identity.is_some()
+                && std::fs::metadata(input)
+                    .ok()
+                    .map(|meta| (meta.dev(), meta.ino()))
+                    == identity
+        };
+        if !self.module_hints.is_empty()
+            && !self
+                .module_hints
+                .iter()
+                .any(|hint| hint.as_os_str().as_bytes() == mapped_path || same_file(hint))
+        {
+            return true;
+        }
+        let excludes = self.budget.excludes();
+        if excludes.is_empty() {
+            return false;
+        }
+        let is_path = |input: &std::path::PathBuf| input.as_os_str().as_bytes().contains(&b'/');
+        let exclude_paths: crate::discovery::scan::ExcludePaths = excludes
+            .iter()
+            .filter(|input| is_path(input))
+            .filter_map(|input| {
+                std::fs::metadata(input)
+                    .ok()
+                    .map(|meta| (input.clone(), meta.dev(), meta.ino()))
+            })
+            .collect();
+        let exclude_names: crate::discovery::scan::ExcludeNames = excludes
+            .iter()
+            .filter(|input| !is_path(input))
+            .map(|input| (input.clone(), input.as_os_str().as_bytes().to_vec()))
+            .collect();
+        crate::discovery::scan::exclude_match(
+            &String::from_utf8_lossy(mapped_path),
+            file,
+            &exclude_paths,
+            &exclude_names,
+        )
+        .is_some()
     }
 
     fn clear_member_file(&mut self, io: &mut dyn MemberStopIo, key: MemberFileKey) {

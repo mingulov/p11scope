@@ -1700,7 +1700,12 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
                 }
                 pid = Some(require_pid(&mut args)?);
             }
-            "--system" => system = true,
+            "--system" => {
+                if system {
+                    return Err(usage_err("--system given twice"));
+                }
+                system = true;
+            }
             "--module" => modules.push(require_path(&mut args, "--module")?),
             "--exclude-module" => {
                 exclude_modules.push(require_path(&mut args, "--exclude-module")?)
@@ -2054,7 +2059,12 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                 }
                 cgroup = Some(require_path(&mut args, "--cgroup")?);
             }
-            "--system" => system = true,
+            "--system" => {
+                if system {
+                    return Err(usage_err("--system given twice"));
+                }
+                system = true;
+            }
             "--module" => modules.push(require_path(&mut args, "--module")?),
             "--exclude-module" => {
                 exclude_modules.push(require_path(&mut args, "--exclude-module")?)
@@ -2422,7 +2432,12 @@ pub fn parse_capture(
                 }
                 cgroup = Some(require_path(&mut args, "--cgroup")?);
             }
-            "--system" => system = true,
+            "--system" => {
+                if system {
+                    return Err(usage_err("--system given twice"));
+                }
+                system = true;
+            }
             "--json" => {
                 let route = match kind {
                     Kind::Profile => "profile writes JSON with -o FILE",
@@ -3299,6 +3314,9 @@ mod tests {
                 "--max-scan-pids",
             ),
             (vec!["inspect", "--pid", "1", "--pid", "2"], "--pid"),
+            (vec!["profile", "--system", "--system"], "--system"),
+            (vec!["inventory", "--system", "--system"], "--system"),
+            (vec!["inspect", "--system", "--system"], "--system"),
             (vec!["doctor", "--pid", "1", "--pid", "2"], "--pid"),
             (
                 vec!["doctor", "--cgroup", "/x", "--cgroup", "/y"],

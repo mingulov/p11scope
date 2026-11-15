@@ -2002,7 +2002,7 @@ Limits that matter in pods:
 Every `P11SCOPE_*` switch that can change capture behavior, with its effect
 and default. Capture evidence records the active value of the capture-visible
 ones (`evidence.p11scope_env`), so a report always says which switches were
-live; absent means the narrow default in every row. `--help` lists the two
+live; absent means the narrow default in every row. `--help` lists the three
 capture-visible switches; the build/lane inputs below take documented
 arguments instead of environment wherever a script is invoked by hand.
 
@@ -2088,7 +2088,7 @@ changing capture behavior, it joins the table above and the `--help` list.
 
 ## Inventory diagnostics
 
-In v0.4 development builds, `inventory --diagnostics <f.jsonl>` requests a
+In release builds, `inventory --diagnostics <f.jsonl>` requests a
 separate JSONL file explaining native count reads, ownership changes, allocations
 and withheld growth. Use `--capture native` or `auto`; explicit `scan` is refused. If `auto`
 falls back to scanning, the file reports `native_unavailable` without inventing

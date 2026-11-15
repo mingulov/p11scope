@@ -262,6 +262,162 @@ fn snapshot_and_json_name_module_inputs_that_matched_nothing() {
     assert_eq!(out["unmatched_modules"][0], "/nonexistent/pkcs11.so");
 }
 
+fn presentation_with_recorded_paths(
+    paths: &[&str],
+    inode: u64,
+    module_inputs: Vec<std::path::PathBuf>,
+    forwarding_inputs: Vec<std::path::PathBuf>,
+) -> Presentation {
+    use crate::attach::Scope;
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::inventory_workload::ScriptedSource;
+    let source = ScriptedSource::default();
+    let observed: BTreeSet<u32> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, _)| 80_000 + index as u32)
+        .collect();
+    for pid in &observed {
+        source.spawn(*pid, 1_000 + u64::from(*pid));
+    }
+    let mut coordinator = InventoryCoordinator::new(
+        Scope::System,
+        HookRegistry::builtin(),
+        module_inputs,
+        Vec::new(),
+        source,
+        RegistryLimits::default_limits(),
+    )
+    .expect("scripted coordinator");
+    let events =
+        coordinator
+            .adapter_mut()
+            .reconcile(&observed, &mut |_| ImageAuthority::ScanPinned, 10);
+    coordinator.apply_reconcile_events(&events, 10);
+    let key = ModuleKey::physical(8, 1, inode, Some("sha-alias".into()), paths[0]);
+    for (index, path) in paths.iter().enumerate() {
+        let pid = 80_000 + index as u32;
+        let caller = coordinator.adapter().live_id(pid).expect("admitted caller");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: (*path).to_string(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("workload".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(4),
+                admission_reasons: Vec::new(),
+            },
+            20,
+        );
+    }
+    coordinator.set_forwarding(forwarding_inputs);
+    coordinator
+        .commit_batch(false)
+        .expect("scripted batch commits");
+    Presentation::capture(&coordinator, "workload", 0, 30, 1)
+}
+
+#[test]
+fn module_input_matching_a_non_first_recorded_path_is_not_unmatched() {
+    let presentation = presentation_with_recorded_paths(
+        &[
+            "/a-host/libprovider.so",
+            "/nonexistent/root/usr/lib/libprovider.so",
+        ],
+        100_000,
+        vec![std::path::PathBuf::from(
+            "/nonexistent/root/usr/lib/libprovider.so",
+        )],
+        Vec::new(),
+    );
+    assert!(
+        presentation.unmatched_modules.is_empty(),
+        "{:?}",
+        presentation.unmatched_modules
+    );
+}
+
+#[test]
+fn module_input_outside_every_recorded_path_stays_unmatched() {
+    let presentation = presentation_with_recorded_paths(
+        &[
+            "/a-host/libprovider.so",
+            "/nonexistent/root/usr/lib/libprovider.so",
+        ],
+        100_000,
+        vec![std::path::PathBuf::from("/a-host/libother.so")],
+        Vec::new(),
+    );
+    assert_eq!(
+        presentation.unmatched_modules,
+        vec!["/a-host/libother.so".to_string()]
+    );
+}
+
+#[test]
+fn forwarding_input_matching_a_non_first_recorded_path_is_applied() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("z-target.so");
+    std::fs::write(&target, b"forwarder").unwrap();
+    let alias = dir.path().join("a-alias.so");
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let inode = std::fs::metadata(&target).unwrap().ino();
+    let presentation = presentation_with_recorded_paths(
+        &[alias.to_str().unwrap(), target.to_str().unwrap()],
+        inode,
+        Vec::new(),
+        vec![target.clone(), std::path::PathBuf::from("z-target.so")],
+    );
+    assert!(
+        presentation.unmatched_forwarding.is_empty(),
+        "{:?}",
+        presentation.unmatched_forwarding
+    );
+    assert!(
+        presentation
+            .modules
+            .iter()
+            .any(|module| module.operator_forwarding),
+        "the declaration marks the module"
+    );
+}
+
+#[test]
+fn forwarding_input_outside_every_recorded_path_stays_unmatched() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("z-target.so");
+    std::fs::write(&target, b"forwarder").unwrap();
+    let alias = dir.path().join("a-alias.so");
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let other = dir.path().join("z-other.so");
+    std::fs::write(&other, b"other").unwrap();
+    let inode = std::fs::metadata(&target).unwrap().ino();
+    let presentation = presentation_with_recorded_paths(
+        &[alias.to_str().unwrap(), target.to_str().unwrap()],
+        inode,
+        Vec::new(),
+        vec![other.clone()],
+    );
+    assert_eq!(
+        presentation.unmatched_forwarding,
+        vec![other.display().to_string()]
+    );
+    assert!(
+        presentation
+            .modules
+            .iter()
+            .all(|module| !module.operator_forwarding),
+        "no declaration matched"
+    );
+}
+
 /// The snapshot names a refused module with its admission reason in plain
 /// words, on the module's own detail line.
 #[test]

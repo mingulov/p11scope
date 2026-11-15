@@ -970,13 +970,16 @@ impl Presentation {
         let (excluded_modules, unmatched_excludes) = coordinator.excluded_snapshot();
         let module_keys: Vec<(ModuleId, String, (u64, u64), u64)> = modules
             .iter()
-            .map(|module| {
-                (
-                    module.id,
-                    module.paths.first().cloned().unwrap_or_default(),
-                    (module.device_major, module.device_minor),
-                    module.inode,
-                )
+            .flat_map(|module| {
+                let device = (module.device_major, module.device_minor);
+                let paths: Vec<&str> = if module.paths.is_empty() {
+                    vec![""]
+                } else {
+                    module.paths.iter().map(String::as_str).collect()
+                };
+                paths
+                    .into_iter()
+                    .map(move |path| (module.id, path.to_string(), device, module.inode))
             })
             .collect();
         let (forwarding_declared, unmatched_forwarding) =

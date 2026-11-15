@@ -86081,6 +86081,8 @@ struct ScriptedMemberStops {
     /// Rows an in-flight hook invocation inserts only after the first
     /// table read that follows the deactivation.
     late_rows: BTreeMap<u32, p11scope_ebpf_common::MemberStop>,
+    /// A scripted deactivation failure (the hook may still be active).
+    fail_deactivate: bool,
 }
 
 impl MemberStopIo for ScriptedMemberStops {
@@ -86116,6 +86118,9 @@ impl MemberStopIo for ScriptedMemberStops {
     fn deactivate(&mut self) -> Result<(), String> {
         self.calls.push("deactivate");
         self.deactivated = true;
+        if self.fail_deactivate {
+            return Err("scripted MS_CFG write failure".into());
+        }
         Ok(())
     }
     fn quiesce(&mut self) -> bool {
@@ -87729,4 +87734,23 @@ fn member_stop_unproven_stopping_file_beside_a_provider_files_the_row() {
     assert_eq!(stats.unproven_resumes, 1, "{stats:?}");
     assert!(files_the_first_use_row(&engine));
     assert!(member_resumed_for_test(pid));
+}
+
+/// A failed deactivation leaves the hook's `active` flag unproven, and a
+/// call still before its RCU read section is not covered by the grace
+/// period: the release takes the unsettled path (each member's maps read
+/// before its resume) even with a proven wait.
+#[test]
+fn member_stop_failed_deactivate_settles_each_member() {
+    let mut io = ScriptedMemberStops {
+        fail_deactivate: true,
+        ..Default::default()
+    };
+    let (mut child, pid, _) = stopped_member_with_row(&mut io);
+    let mut engine = member_stop_engine();
+    engine.release_member_stops(&mut io);
+    assert!(member_resumed_for_test(pid));
+    assert_eq!(engine.member_stop_stats_for_test().unsettled_reads, 1);
+    let _ = child.kill();
+    let _ = child.wait();
 }

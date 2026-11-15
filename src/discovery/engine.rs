@@ -19942,11 +19942,12 @@ impl Engine {
             self.merge_and_project_capture_facts()
         };
         outcome.disposition = candidate_publication_disposition(retired, &publication);
-        // Only an accepted candidate consumed the learned staging: it was
-        // built from the current pins (staging never runs inside a tick or
-        // an apply), so the latch clears here and nowhere else. Refused,
-        // deferred and early-returning refreshes leave it set.
-        if outcome.disposition == ApplyDisposition::Accepted {
+        // Only an accepted candidate whose attach mutation ran consumed the
+        // learned staging: it was built from the current pins (staging
+        // never runs inside a tick or an apply), so the latch clears here
+        // and nowhere else. Refused, deferred and early-returning
+        // refreshes, and an accept with additions blocked, leave it set.
+        if outcome.disposition == ApplyDisposition::Accepted && new_targets_attached {
             self.learned_unapplied = false;
         }
         if publication.is_err() {

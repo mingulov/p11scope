@@ -1327,7 +1327,7 @@ impl Engine {
                 self.note_first_use_gap(tgid, "watchdog lost");
             }
         }
-        if self.stop_staged_unattached() {
+        if self.stop_staged_unattached(session) {
             // The hook is off from here on: no later mapper of a provider a
             // stop staged is stopped and held for its attach, and that
             // staging's own row is suppressed (`stop_staged`).
@@ -1343,16 +1343,19 @@ impl Engine {
     }
 
     /// Whether a provider identity a stop staged may still be unattached:
-    /// its staging is still queued, or a staging is still unapplied
-    /// (doubt counts as unattached).
-    fn stop_staged_unattached(&self) -> bool {
+    /// its staging is still queued, a staging is still unapplied, or the
+    /// session holds no real attach stamp and link for its slots (doubt
+    /// counts as unattached).
+    fn stop_staged_unattached(&self, session: &dyn EngineSession) -> bool {
         let staged = &self.member_stops.stop_staged;
         !staged.is_empty()
             && (self.learned_unapplied
-                || self
-                    .pending_learned
-                    .iter()
-                    .any(|queued| staged.contains(&(queued.dev, queued.ino))))
+                || staged.iter().any(|identity| {
+                    self.pending_learned
+                        .iter()
+                        .any(|queued| (queued.dev, queued.ino) == *identity)
+                        || !self.provider_object_attached(*identity, session)
+                }))
     }
 
     /// Resumes every pending row after the watchdog loss, on every pass:

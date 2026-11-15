@@ -1091,7 +1091,9 @@ fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
 /// starts each pass with a fresh budget. Byte accounting shares the one
 /// retained-cache ceiling the budget already enforces, and an insertion
 /// reclaims a carried entry this pass did not touch rather than pinning
-/// a full map on dead keys.
+/// a full map on dead keys. The producing pass's touched keys travel with
+/// the bundle, so the next pass reclaims an entry dead in both passes
+/// before one a later member may still reach.
 #[derive(Debug, Default)]
 pub(crate) struct RetainedFileFacts {
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
@@ -1099,6 +1101,11 @@ pub(crate) struct RetainedFileFacts {
     table_cap_refusals: BTreeMap<InspectedFileKey, String>,
     loader_elf_facts: BTreeMap<LoaderFactsKey, LoaderElfFacts>,
     retained_cache_bytes: u64,
+    /// Keys the producing pass looked up or inserted. A later pass that
+    /// has not reached one of these entries yet must not reclaim it ahead
+    /// of an entry dead in both passes.
+    touched_inspected_files: BTreeSet<InspectedFileKey>,
+    touched_loader_elf_facts: BTreeSet<LoaderFactsKey>,
 }
 
 /// The accounted bytes of the four file-fact maps, recomputed from the
@@ -1221,10 +1228,23 @@ pub struct CaptureWorkBudget {
     /// Keys of this pass's file-fact maps that a lookup hit or an insertion
     /// touched. Carried entries missing here are dead for this pass (a
     /// changed pin, a replaced library, a remounted overlay) and are the
-    /// only entries an insertion may reclaim. Never carried between
-    /// passes: each pass's budget starts with an empty set.
+    /// only entries an insertion may reclaim. Taken into the carried
+    /// `RetainedFileFacts` at the end of the pass so the next pass can
+    /// prefer entries dead since then.
     touched_inspected_files: BTreeSet<InspectedFileKey>,
     touched_loader_elf_facts: BTreeSet<LoaderFactsKey>,
+    /// The previous pass's touched keys, installed with a carried bundle.
+    /// An entry the previous pass used but this pass has not reached yet
+    /// is still live for a member walked later, so it is only a fallback
+    /// eviction candidate; an entry untouched in both passes is reclaimed
+    /// first.
+    previous_touched_inspected_files: BTreeSet<InspectedFileKey>,
+    previous_touched_loader_elf_facts: BTreeSet<LoaderFactsKey>,
+    /// Whether this budget installed a non-empty carried bundle. Only
+    /// such a budget can hold a carried entry this pass has not touched;
+    /// every other budget's entries were inserted here and are touched,
+    /// so it refuses a full map or byte ceiling without scanning.
+    carries_file_facts: bool,
     /// Test-only: insertion refusals that ran the untouched-entry
     /// eviction scan. Capture and engine budgets never carry file facts
     /// and must keep the O(1) refusal.
@@ -1311,22 +1331,37 @@ fn cache_admits(
         .is_some_and(|bytes| bytes <= byte_limit)
 }
 
-/// Drop the first carried entry this pass did not touch, returning its
-/// accounted bytes. Entries the current pass looked up or inserted are
-/// never candidates, so a pass that stops early keeps what it used and
-/// only dead keys from an earlier pass are reclaimed. Deterministic
-/// `BTreeMap` order with the key as the tie-breaker.
+/// Drop one carried entry this pass did not touch, preferring one the
+/// previous pass also did not touch, and return its accounted bytes.
+/// Entries the current pass looked up or inserted are never candidates,
+/// so a pass that stops early keeps what it used. A key only the previous
+/// pass used is still dead for this pass, but a member walked later may
+/// still reach it, so it is reclaimed only when no key is dead in both
+/// passes. Deterministic `BTreeMap` order with the key as the tie-breaker.
 fn evict_untouched<K, V>(
     map: &mut BTreeMap<K, V>,
     touched: &BTreeSet<K>,
+    touched_previous: &BTreeSet<K>,
     bytes_of: &impl Fn(&K, &V) -> u64,
 ) -> Option<u64>
 where
     K: Ord + Clone,
 {
-    let key = map.keys().find(|key| !touched.contains(*key)).cloned()?;
+    let key = map
+        .keys()
+        .find(|key| !touched.contains(*key) && !touched_previous.contains(*key))
+        .or_else(|| map.keys().find(|key| !touched.contains(*key)))
+        .cloned()?;
     let value = map.remove(&key)?;
     Some(bytes_of(&key, &value))
+}
+
+/// One file-fact map's touch bookkeeping: keys this pass used and keys
+/// the previous pass used. Reclamation never takes a current key, and it
+/// prefers a key the previous pass did not use either.
+struct TouchedKeys<'a, K> {
+    current: &'a mut BTreeSet<K>,
+    previous: &'a BTreeSet<K>,
 }
 
 /// One file-fact map's insertion accounting: the shared byte counter and
@@ -1338,13 +1373,57 @@ struct FileFactRetention<'a> {
     eviction_scans: &'a mut u64,
     byte_limit: u64,
     entry_limit: Option<usize>,
+    carries_file_facts: bool,
 }
 
 impl FileFactRetention<'_> {
+    /// Whether evicting every entry this pass did not touch could admit
+    /// the insertion: the entry dimension must have room afterwards, and
+    /// the reclaimed bytes must cover the byte shortfall. Checked before
+    /// the first eviction so a refusal never destroys a carried entry for
+    /// nothing.
+    fn eviction_can_admit<K, V>(
+        &self,
+        map: &BTreeMap<K, V>,
+        touched: &BTreeSet<K>,
+        key: &K,
+        old_bytes: Option<u64>,
+        new_bytes: u64,
+        bytes_of: &impl Fn(&K, &V) -> u64,
+    ) -> bool
+    where
+        K: Ord,
+    {
+        let mut untouched_entries = 0usize;
+        let mut untouched_bytes = 0u64;
+        for (candidate, value) in map {
+            if touched.contains(candidate) {
+                continue;
+            }
+            untouched_entries = untouched_entries.saturating_add(1);
+            untouched_bytes = untouched_bytes.saturating_add(bytes_of(candidate, value));
+        }
+        let old_bytes_kept = match old_bytes {
+            Some(old) if touched.contains(key) => old,
+            _ => 0,
+        };
+        let entries_after = map
+            .len()
+            .saturating_sub(untouched_entries)
+            .saturating_add(usize::from(old_bytes.is_none() || !touched.contains(key)));
+        let entries_fit = self.entry_limit.is_none_or(|limit| entries_after <= limit);
+        let bytes_after = self
+            .retained_cache_bytes
+            .saturating_sub(untouched_bytes)
+            .saturating_sub(old_bytes_kept)
+            .saturating_add(new_bytes);
+        entries_fit && bytes_after <= self.byte_limit
+    }
+
     fn retain<K, V>(
         &mut self,
         map: &mut BTreeMap<K, V>,
-        touched: &mut BTreeSet<K>,
+        touched: TouchedKeys<'_, K>,
         key: K,
         value: V,
         bytes: u64,
@@ -1362,24 +1441,37 @@ impl FileFactRetention<'_> {
             self.entry_limit,
             self.byte_limit,
         ) {
+            // Every entry in a budget that never carried facts was
+            // inserted by this pass and is therefore touched, so no
+            // eviction can help; keep the O(1) refusal.
+            if !self.carries_file_facts {
+                return false;
+            }
             #[cfg(test)]
             {
                 *self.eviction_scans = self.eviction_scans.saturating_add(1);
             }
-            let Some(freed) = evict_untouched(map, touched, &bytes_of) else {
+            if !self.eviction_can_admit(map, touched.current, &key, old_bytes, bytes, &bytes_of) {
                 return false;
-            };
-            *self.retained_cache_bytes = self.retained_cache_bytes.saturating_sub(freed);
-            old_bytes = map.get(&key).map(|old| bytes_of(&key, old));
-            if !cache_admits(
-                *self.retained_cache_bytes,
-                old_bytes,
-                bytes,
-                map.len(),
-                self.entry_limit,
-                self.byte_limit,
-            ) {
-                return false;
+            }
+            loop {
+                let Some(freed) =
+                    evict_untouched(map, touched.current, touched.previous, &bytes_of)
+                else {
+                    return false;
+                };
+                *self.retained_cache_bytes = self.retained_cache_bytes.saturating_sub(freed);
+                old_bytes = map.get(&key).map(|old| bytes_of(&key, old));
+                if cache_admits(
+                    *self.retained_cache_bytes,
+                    old_bytes,
+                    bytes,
+                    map.len(),
+                    self.entry_limit,
+                    self.byte_limit,
+                ) {
+                    break;
+                }
             }
         }
         let old = map
@@ -1389,7 +1481,7 @@ impl FileFactRetention<'_> {
             .retained_cache_bytes
             .saturating_sub(old)
             .saturating_add(bytes);
-        touched.insert(key);
+        touched.current.insert(key);
         true
     }
 }
@@ -1416,6 +1508,9 @@ impl CaptureWorkBudget {
             loader_elf_facts: BTreeMap::new(),
             touched_inspected_files: BTreeSet::new(),
             touched_loader_elf_facts: BTreeSet::new(),
+            previous_touched_inspected_files: BTreeSet::new(),
+            previous_touched_loader_elf_facts: BTreeSet::new(),
+            carries_file_facts: false,
             #[cfg(test)]
             eviction_scans: 0,
             interface_records: 0,
@@ -2115,10 +2210,14 @@ impl CaptureWorkBudget {
             eviction_scans: &mut self.eviction_scans,
             byte_limit,
             entry_limit,
+            carries_file_facts: self.carries_file_facts,
         }
         .retain(
             &mut self.inspected_files,
-            &mut self.touched_inspected_files,
+            TouchedKeys {
+                current: &mut self.touched_inspected_files,
+                previous: &self.previous_touched_inspected_files,
+            },
             key,
             value,
             bytes,
@@ -2161,10 +2260,14 @@ impl CaptureWorkBudget {
             eviction_scans: &mut self.eviction_scans,
             byte_limit,
             entry_limit,
+            carries_file_facts: self.carries_file_facts,
         }
         .retain(
             &mut self.loader_elf_facts,
-            &mut self.touched_loader_elf_facts,
+            TouchedKeys {
+                current: &mut self.touched_loader_elf_facts,
+                previous: &self.previous_touched_loader_elf_facts,
+            },
             key,
             value,
             bytes,
@@ -2212,10 +2315,14 @@ impl CaptureWorkBudget {
             eviction_scans: &mut self.eviction_scans,
             byte_limit,
             entry_limit,
+            carries_file_facts: self.carries_file_facts,
         }
         .retain(
             &mut self.table_cap_refusals,
-            &mut self.touched_inspected_files,
+            TouchedKeys {
+                current: &mut self.touched_inspected_files,
+                previous: &self.previous_touched_inspected_files,
+            },
             key,
             reason,
             bytes,
@@ -2243,10 +2350,14 @@ impl CaptureWorkBudget {
             eviction_scans: &mut self.eviction_scans,
             byte_limit,
             entry_limit,
+            carries_file_facts: self.carries_file_facts,
         }
         .retain(
             &mut self.elf_export_facts,
-            &mut self.touched_inspected_files,
+            TouchedKeys {
+                current: &mut self.touched_inspected_files,
+                previous: &self.previous_touched_inspected_files,
+            },
             key,
             value,
             bytes,
@@ -2258,16 +2369,19 @@ impl CaptureWorkBudget {
     /// none and its byte counter zeroed. The cgroup collector carries
     /// the bundle into the next pass's fresh budget: each entry keeps its
     /// file identity and pin, so unchanged files are reused with no
-    /// reads and changed files miss and are read again.
+    /// reads and changed files miss and are read again. This pass's
+    /// touched keys travel with the entries.
     pub(crate) fn take_retained_file_facts(&mut self) -> RetainedFileFacts {
-        self.touched_inspected_files.clear();
-        self.touched_loader_elf_facts.clear();
+        self.previous_touched_inspected_files.clear();
+        self.previous_touched_loader_elf_facts.clear();
         RetainedFileFacts {
             inspected_files: std::mem::take(&mut self.inspected_files),
             elf_export_facts: std::mem::take(&mut self.elf_export_facts),
             table_cap_refusals: std::mem::take(&mut self.table_cap_refusals),
             loader_elf_facts: std::mem::take(&mut self.loader_elf_facts),
             retained_cache_bytes: std::mem::replace(&mut self.retained_cache_bytes, 0),
+            touched_inspected_files: std::mem::take(&mut self.touched_inspected_files),
+            touched_loader_elf_facts: std::mem::take(&mut self.touched_loader_elf_facts),
         }
     }
 
@@ -2282,7 +2396,10 @@ impl CaptureWorkBudget {
                 && self.elf_export_facts.is_empty()
                 && self.table_cap_refusals.is_empty()
                 && self.loader_elf_facts.is_empty()
-                && self.retained_cache_bytes == 0,
+                && self.retained_cache_bytes == 0
+                && self.previous_touched_inspected_files.is_empty()
+                && self.previous_touched_loader_elf_facts.is_empty()
+                && !self.carries_file_facts,
             "retained file facts install into a fresh budget"
         );
         if let Some(limits) = self.inventory_limits() {
@@ -2319,6 +2436,12 @@ impl CaptureWorkBudget {
         );
         self.touched_inspected_files.clear();
         self.touched_loader_elf_facts.clear();
+        self.carries_file_facts = !(facts.inspected_files.is_empty()
+            && facts.elf_export_facts.is_empty()
+            && facts.table_cap_refusals.is_empty()
+            && facts.loader_elf_facts.is_empty());
+        self.previous_touched_inspected_files = facts.touched_inspected_files;
+        self.previous_touched_loader_elf_facts = facts.touched_loader_elf_facts;
         self.inspected_files = facts.inspected_files;
         self.elf_export_facts = facts.elf_export_facts;
         self.table_cap_refusals = facts.table_cap_refusals;

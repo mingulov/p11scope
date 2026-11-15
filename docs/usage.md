@@ -912,7 +912,8 @@ waits one RCU grace period for hook calls already running before it
 resumes anyone, so no member is stopped while the observer settles.
 If that wait cannot be proven, the run's watchdog sweeps for up to
 1.6 s after the end instead (see the
-[known limitations](known-limitations.md)). A job-control shell inside the command can
+[known limitations](known-limitations.md)); after a lost watchdog only
+the capture-end rescans remain, so send a member left stopped SIGCONT. A job-control shell inside the command can
 see such a child briefly stopped (`CLD_STOPPED`). With `--pause never`
 (or when the kernel refuses the stop object) descendants are never
 stopped: a short-lived descendant that cold-loads the provider teaches

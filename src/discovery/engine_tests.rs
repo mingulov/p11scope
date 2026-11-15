@@ -86633,3 +86633,32 @@ fn member_stop_watchdog_loss_after_an_attached_hold_files_no_row() {
     engine.service_member_stops(&mut io, &mut session, Some(20));
     assert!(!files_the_first_use_row(&engine));
 }
+
+/// A member whose stopping file is unproven (its mapping gone from maps)
+/// while a neighbor row proves a provider is held for that provider and
+/// resumed attached; its stopping file stays unproven, so the named
+/// first-use row is filed on the hold path too.
+#[test]
+fn member_stop_unproven_stopping_file_beside_a_provider_files_the_row() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    stop_member_for_test(pid);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+            hook_ts_ns: 1,
+            vm_start: 0x1000,
+            vm_end: 0x2000,
+        },
+    );
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 1, "{stats:?}");
+    assert_eq!(stats.unproven_resumes, 1, "{stats:?}");
+    assert!(files_the_first_use_row(&engine));
+    assert!(member_resumed_for_test(pid));
+}

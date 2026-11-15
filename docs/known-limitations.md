@@ -239,8 +239,11 @@ provider's probes, and resumes the member before it runs any of that
 file's code, so the first mapper's calls are observed too. Each
 distinct executable file costs one short stop for the first member
 that maps it (measured: 12 stops for ten python workers); a hold
-that cannot attach within 1 s resumes the member and files the
-learned first-use gap row. Measured on the local host under 8 extra
+that cannot attach resumes the member at most 1 s after its kernel
+stop (or in the first pass that reads it, when the observer is busier
+than that) and files the learned first-use gap row. A staging the
+learned-file cap or the pin budget refuses resumes the member at once,
+beside its refusal row. Measured on the local host under 8 extra
 CPU burners: ten sequential python workers loading SoftHSM observe
 60 of 60 calls in 5 of 5 runs (0 of 60 before), five workers with a
 2 s hold 30 of 30 in 5 of 5 (29 of 30 before), and the pkcs11-check
@@ -253,9 +256,16 @@ same fixed learned-file gap row plus descendant gaps for members
 that retired before admission. Members too short-lived to scan at all
 (a few milliseconds) stay counted in `pid_descendant_gaps` like the
 other never-admitted members. A job-control shell in the run tree
-can see its child briefly stopped (`CLD_STOPPED`), and an observer
-killed with SIGKILL can leave a stopped member stopped (send it
-SIGCONT). The 32-file per-capture cap is shared with system file
+can see its child briefly stopped (`CLD_STOPPED`). An observer
+killed with SIGKILL (or aborted) leaves its stopped members to the
+run's watchdog, a separate process outside the run cgroup that sends
+SIGCONT to every stopped member of the run tree in sweeps up to 1.6 s
+after the death (measured 0.2-0.5 s under load); that sweep also
+resumes a member stopped on purpose. Only a kill that takes the
+observer and the watchdog together (the whole session or the OOM
+killer) can leave a member stopped; send it SIGCONT. On an overlay
+filesystem a neighbor executable whose backing identity differs from
+the one `maps` prints costs one more short stop for its first mapper. The 32-file per-capture cap is shared with system file
 learning. Of the 256 loader contexts, 8 stay reserved for the direct
 child's exec chain: member arms past 248 refuse with the named reserve gap
 (their later calls still land via file-identity probes once the file
@@ -741,18 +751,20 @@ names the source SHA behind each check the release rounds re-measured.
 - `run` captures the command with its child processes: the child is
   placed in a dedicated cgroup under the observer's own cgroup before
   release, so fork/exec children, `sh -c` and `env` wrappers and
-  double forks are born in the cgroup. Only the direct child is
-  paused; descendants are never paused. Killing the observer with
-  SIGKILL while the child is held stopped writes no final report (no
-  handler can run); the child resumes when the observer dies, through
-  its SIGCONT parent-death signal. A pause stop a probe queued in the
-  instant the observer dies is not ruled out; check the child with
-  `ps` after such a kill.
+  double forks are born in the cgroup. The pause chain holds the
+  direct child; descendants stop only briefly at their first map of
+  each new executable file (see the run first-map stop above), and
+  never with `--pause never`. Killing the observer with SIGKILL while
+  the child is held stopped writes no final report (no handler can
+  run); the child resumes when the observer dies, through its SIGCONT
+  parent-death signal, and stopped descendants through the run's
+  watchdog. A pause stop a probe queued in the instant the observer
+  dies is not ruled out; check the child with `ps` after such a kill.
   A descendant that loads an
-  already-attached provider file is observed from its first call, but
-  a short-lived descendant that cold-loads the provider can retire
-  before admission: its calls are then missing and the run reports
-  `PARTIAL` with `pid_descendant_gaps`. Pass `--prearm-module` for
+  already-attached provider file is observed from its first call.
+  Without the first-map stop a short-lived descendant that cold-loads
+  the provider can retire before admission: its calls are then
+  missing and the run reports `PARTIAL` with `pid_descendant_gaps`. Pass `--prearm-module` for
   the provider so cold grandchildren are hooked from their first
   call. (`sudo`/`setuid` inside the command cannot elevate under the
   child's `no_new_privs` hardening, so privilege hops are not a

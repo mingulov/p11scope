@@ -615,14 +615,18 @@ impl Engine {
             if crate::run::capture_diagnostics_on() {
                 eprintln!("p11scope: member-stop watchdog gone; run member stops disabled");
             }
-            self.release_after_guard_loss(io, now_ns.or_else(crate::attach::monotonic_ns));
+            self.release_after_guard_loss(
+                io,
+                &*session,
+                now_ns.or_else(crate::attach::monotonic_ns),
+            );
             return;
         }
         let Some(now_ns) = now_ns.or_else(crate::attach::monotonic_ns) else {
             return;
         };
         // Bounds first: a held member never waits on this pass's intake.
-        self.resolve_member_holds(io, now_ns);
+        self.resolve_member_holds(io, &*session, now_ns);
         // A failed table read skips only the intake: held members' bounds
         // are still enforced.
         let pending = match io.pending() {
@@ -672,7 +676,7 @@ impl Engine {
         if !self.member_stops.held.is_empty() {
             self.apply_learned_staging(session);
         }
-        self.resolve_member_holds(io, now_ns);
+        self.resolve_member_holds(io, &*session, now_ns);
     }
 
     /// Takes one new stopped member. Returns whether it staged a
@@ -1208,7 +1212,7 @@ impl Engine {
 
     /// Where a hold stands: its member left, its providers are attached,
     /// or a staging was refused.
-    fn hold_state(&self, held: &HeldMember) -> HoldState {
+    fn hold_state(&self, held: &HeldMember, session: &dyn EngineSession) -> HoldState {
         // An unreadable exit state is not a departure: a departed member
         // is withdrawn without a resume, so doubt must resume.
         let departed = held.pin.original_exited().unwrap_or(false);
@@ -1217,20 +1221,58 @@ impl Engine {
             .providers
             .iter()
             .any(|identity| self.member_stops.refused.contains(identity));
+        // Attached means real session attach stamps, never scheduling
+        // flags: a deferred, refused or no-link apply can clear those
+        // without one probe live.
         let attached = !refused
-            && !self.learned_unapplied
             && held.providers.iter().all(|identity| {
-                self.learned_settled.contains(identity)
-                    && !self
-                        .pending_learned
-                        .iter()
-                        .any(|queued| (queued.dev, queued.ino) == *identity)
+                !self
+                    .pending_learned
+                    .iter()
+                    .any(|queued| (queued.dev, queued.ino) == *identity)
+                    && self.provider_object_attached(*identity, session)
             });
         HoldState {
             departed,
             attached,
             refused,
         }
+    }
+
+    /// Whether the provider file `identity` (its `(st_dev, st_ino)`) is
+    /// attached: the plan holds at least one active slot on a pinned object
+    /// of that file, and every such slot carries a real attach-complete
+    /// stamp from the session (current, or its attach key's first).
+    fn provider_object_attached(&self, identity: (u64, u64), session: &dyn EngineSession) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut objects: BTreeMap<crate::discovery::identity::PinnedObjectId, bool> =
+            BTreeMap::new();
+        let mut any = false;
+        for slot in self
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| self.plan.is_active(slot.index))
+        {
+            let of_file = *objects.entry(slot.object).or_insert_with(|| {
+                self.pinned
+                    .file_for(slot.object)
+                    .and_then(|file| file.metadata().ok())
+                    .is_some_and(|meta| (meta.dev(), meta.ino()) == identity)
+            });
+            if !of_file {
+                continue;
+            }
+            any = true;
+            if session.slot_attached_at(slot.index).is_none()
+                && session
+                    .key_first_attach(crate::plan::AttachKey::of(slot))
+                    .is_none()
+            {
+                return false;
+            }
+        }
+        any
     }
 
     /// The watchdog was lost: no new stops, and every held and pending
@@ -1240,7 +1282,12 @@ impl Engine {
     /// member whose resume cannot be sent, or that cannot be pinned or
     /// verified, gets the start-time guarded forced resume at once: with
     /// no watchdog and no further stops, nothing else would bound it.
-    fn release_after_guard_loss(&mut self, io: &mut dyn MemberStopIo, now_ns: Option<u64>) {
+    fn release_after_guard_loss(
+        &mut self,
+        io: &mut dyn MemberStopIo,
+        session: &dyn EngineSession,
+        now_ns: Option<u64>,
+    ) {
         self.end_kernel_stops(io);
         let held = std::mem::take(&mut self.member_stops.held);
         for (tgid, member) in held {
@@ -1248,7 +1295,7 @@ impl Engine {
                 departed,
                 attached,
                 refused,
-            } = self.hold_state(&member);
+            } = self.hold_state(&member, session);
             // As in `resolve_member_holds`: a departed hold clears its
             // providers only when attached; every other end files the row
             // (or is attached), so clearing is safe there.
@@ -1377,7 +1424,12 @@ impl Engine {
 
     /// Ends every hold whose providers are attached, whose member left,
     /// or whose bound passed.
-    fn resolve_member_holds(&mut self, io: &mut dyn MemberStopIo, now_ns: u64) {
+    fn resolve_member_holds(
+        &mut self,
+        io: &mut dyn MemberStopIo,
+        session: &dyn EngineSession,
+        now_ns: u64,
+    ) {
         let tgids: Vec<u32> = self.member_stops.held.keys().copied().collect();
         for tgid in tgids {
             let Some(held) = self.member_stops.held.get(&tgid) else {
@@ -1387,7 +1439,7 @@ impl Engine {
                 departed,
                 attached,
                 refused,
-            } = self.hold_state(held);
+            } = self.hold_state(held, session);
             let expired = now_ns.saturating_sub(held.since_ns) >= MEMBER_STOP_HOLD_NS;
             if !(departed || attached || refused || expired) {
                 continue;

@@ -259,8 +259,11 @@ that maps it (measured: 12 stops for ten python workers); a hold
 that cannot attach, and a stopped member the observer cannot pin or
 place in the run tree, resumes at most 1 s after its kernel stop (or
 in the first pass that reads it, when the observer is busier than
-that) and files the learned first-use gap row. A member moved out of
-the run cgroup while stopped resumes too. A staging the
+that) and files the learned first-use gap row. So does a member whose
+maps or stopping file could not be read, and a member moved out of
+the run cgroup while stopped (it resumes at once). If the watchdog is
+lost, every held and pending member resumes at once, with the same
+row when its provider was not attached yet. A staging the
 learned-file cap or the pin budget refuses resumes the member at once,
 beside its refusal row. Measured on the local host under 8 extra
 CPU burners: ten sequential python workers loading SoftHSM observe
@@ -279,8 +282,9 @@ can see its child briefly stopped (`CLD_STOPPED`). An observer
 killed with SIGKILL (or aborted) leaves its stopped members to the
 run's watchdog, a separate process in its own session outside the
 run cgroup that sends SIGCONT to every stopped member of the run tree
-except the direct child, in sweeps whose last one starts by 1.6 s
-after the death (measured 0.2-0.5 s under load); that sweep also
+except the direct child (a bounded walk: 256 cgroups, 8 levels, 4 MiB
+per process list), in sweeps scheduled up to 1.6 s after the death (a
+slow sweep delays the later ones; measured 0.2-0.5 s under load); that sweep also
 resumes a member stopped on purpose, and does not see a member moved
 out of the run cgroup. Only a kill that takes the observer and the
 watchdog together (`pkill -9 p11scope`, a kill of a cgroup holding

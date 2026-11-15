@@ -916,7 +916,10 @@ pub const MEMBER_STOP_COUNTER_IDENTITY_UNREAD: u32 = 3;
 /// Kernel identity of one mapped file: the superblock device and inode
 /// number exactly as the kernel stores them. Userspace never derives a
 /// key from `stat`: it copies the kernel's pending rows or the
-/// kernel-written `maps` device and inode of the same file.
+/// kernel-written `maps` device and inode of the same file. The two can
+/// differ on overlayfs, where the hook reads the backing file's own
+/// superblock and `maps` prints the overlay's: the pending row's key is
+/// the one cleared for the stopping file.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub struct MemberFileKey {

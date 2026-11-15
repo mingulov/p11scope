@@ -20,6 +20,9 @@ use p11scope_ebpf_common::{
 
 use crate::discovery::engine::MemberStopIo;
 
+pub(crate) mod watchdog;
+pub(crate) use watchdog::WatchdogLauncher;
+
 static MEMBER_STOP_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-member-stop"));
 
@@ -36,6 +39,9 @@ pub(crate) struct MemberStopHooks {
     tree: RunTree,
     /// The attached hook; detached before the final release scan.
     link: Option<aya::programs::fentry::FEntryLinkId>,
+    /// The process that resumes stopped members if this observer dies
+    /// without its cleanup. No stop is activated without it.
+    watchdog: Option<watchdog::Watchdog>,
 }
 
 /// The run cgroup tree the stops belong to: the cgroup v2 mount root
@@ -82,7 +88,12 @@ impl MemberStopHooks {
     /// Loads the object against the host BTF, publishes the run cgroup and
     /// the owned child's exemption, validates the map shapes, attaches the
     /// hook and only then activates it.
-    pub(crate) fn start(cgroup: &File, tree: RunTree, owned_tgid: u32) -> Result<Self> {
+    pub(crate) fn start(
+        cgroup: &File,
+        tree: RunTree,
+        owned_tgid: u32,
+        launcher: &WatchdogLauncher,
+    ) -> Result<Self> {
         let btf = aya::Btf::from_sys_fs().context("reading the host BTF")?;
         let mut loader = aya::EbpfLoader::new();
         loader.btf(Some(&btf));
@@ -98,6 +109,9 @@ impl MemberStopHooks {
                 .context("publishing the run cgroup")?;
         }
         write_config(&mut ebpf, false, owned_tgid)?;
+        // The watchdog runs before the hook can stop anyone.
+        let watchdog =
+            watchdog::Watchdog::start(launcher, &tree).map_err(|error| anyhow!(error))?;
         let link = {
             let program: &mut aya::programs::FEntry = ebpf
                 .program_mut(MEMBER_STOP_PROGRAM)
@@ -115,6 +129,7 @@ impl MemberStopHooks {
             ebpf,
             tree,
             link: Some(link),
+            watchdog: Some(watchdog),
         })
     }
 }
@@ -243,6 +258,10 @@ impl MemberStopIo for MemberStopHooks {
     fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {
         self.tree.contains_pinned(pin)
     }
+
+    fn guard_lost(&mut self) -> bool {
+        self.watchdog.as_mut().is_none_or(watchdog::Watchdog::lost)
+    }
 }
 
 impl MemberStopHooks {
@@ -275,14 +294,40 @@ impl Drop for MemberStopHooks {
             };
             match self.tree.contains_pinned(&pin) {
                 Ok(true) => {
-                    let _ = self.withdraw(tgid);
-                    let _ = pin.send_signal(libc::SIGCONT);
+                    if pin.probe_signal_authority().is_ok() {
+                        let _ = self.withdraw(tgid);
+                        let _ = pin.send_signal(libc::SIGCONT);
+                    }
                 }
                 Ok(false) => {
                     let _ = self.withdraw(tgid);
                 }
                 Err(_) => {}
             }
+        }
+        // An orderly end only when nothing is left: a row this release
+        // could not resume makes the watchdog sweep instead.
+        if let Some(watchdog) = self.watchdog.take() {
+            if self.pending().is_ok_and(|rows| rows.is_empty()) {
+                watchdog.finish();
+            } else {
+                watchdog.abandon();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl MemberStopHooks {
+    /// The observer's death, as far as a test can stage it: the hook is
+    /// deactivated and detached (a dead observer's link closes with its
+    /// descriptors) and the watchdog's pipe closes without an orderly
+    /// end. Nothing is resumed here.
+    pub(crate) fn simulate_observer_death(&mut self) {
+        let _ = self.deactivate();
+        self.detach();
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abandon_without_wait();
         }
     }
 }
@@ -343,8 +388,13 @@ mod tests {
             .spawn()
             .unwrap();
         group.place(exempt.id()).unwrap();
-        let mut hooks = MemberStopHooks::start(&dir, RunTree::of(&group), exempt.id())
-            .expect("member-stop starts");
+        let mut hooks = MemberStopHooks::start(
+            &dir,
+            RunTree::of(&group),
+            exempt.id(),
+            &WatchdogLauncher::TestHarness,
+        )
+        .expect("member-stop starts");
         let mut member = std::process::Command::new("sh")
             .args(["-c", "read line; exec /bin/true"])
             .stdin(std::process::Stdio::piped())
@@ -492,6 +542,85 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
         assert!(status.success(), "the second mapper runs through");
+
+        // The watchdog. An orderly end resumes nothing: a member stopped
+        // by someone else (job control) stays as it is.
+        let mut paused = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        group.place(paused.id()).unwrap();
+        // SAFETY: signals our own child.
+        unsafe {
+            libc::kill(paused.id() as i32, libc::SIGSTOP);
+        }
+        let stopped = |pid: u32| {
+            let states = task_states(pid);
+            !states.is_empty() && states.iter().all(|state| *state == b'T')
+        };
+        while !stopped(paused.id()) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let orderly =
+            watchdog::Watchdog::start(&WatchdogLauncher::TestHarness, &RunTree::of(&group))
+                .expect("a second watchdog starts");
+        orderly.finish();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(stopped(paused.id()), "an orderly end resumes nothing");
+        // The observer's death: a member stopped by the hook (and the
+        // paused one) resume within the watchdog's last sweep, with no
+        // help from this process.
+        // A fresh copy: every file of /bin/true is cleared by now.
+        let scratch = tempfile::tempdir().unwrap();
+        let fresh = scratch.path().join("true-copy");
+        std::fs::copy("/bin/true", &fresh).unwrap();
+        let mut third = std::process::Command::new("sh")
+            .args(["-c", "read line; exec \"$0\""])
+            .arg(&fresh)
+            .stdin(std::process::Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        group.place(third.id()).unwrap();
+        third.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(hooks
+            .pending()
+            .unwrap()
+            .iter()
+            .any(|(tgid, _)| *tgid == third.id())
+            && stopped(third.id()))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the third member never stopped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let died = std::time::Instant::now();
+        hooks.simulate_observer_death();
+        let bound = std::time::Duration::from_millis(
+            watchdog::SWEEP_DELAYS_MS[watchdog::SWEEP_DELAYS_MS.len() - 1] + 1000,
+        );
+        while stopped(third.id()) || stopped(paused.id()) {
+            assert!(
+                died.elapsed() < bound,
+                "members still stopped {:?} after the observer's death",
+                died.elapsed()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        eprintln!(
+            "member-stop watchdog: stopped members resumed {:?} after the observer's death",
+            died.elapsed()
+        );
+        assert!(
+            wait_bounded(&mut third, &mut hooks, "the third member").success(),
+            "the resumed member runs through"
+        );
+        let _ = paused.kill();
+        let _ = paused.wait();
         drop(hooks);
     }
 }

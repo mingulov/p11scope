@@ -581,6 +581,7 @@
                   "capture process-view capacity was exhausted; remaining generations were not scanned",
                   "discovery deep-scan selection was capped; unselected processes may contain undiscovered providers",
                   "loader context capacity 256 is exhausted",
+                  "loader contexts 249-256 are reserved for the run's own command; a descendant arm past 248 was refused",
                   "a deferred loader memory scan exceeded the bounded loader-context ledger",
                   "the bounded loader-arm catch-up ledger was full",
                   "manifest object unavailable",

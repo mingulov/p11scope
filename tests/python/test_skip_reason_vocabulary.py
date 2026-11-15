@@ -42,6 +42,8 @@ PRODUCER_CONSTANTS = (
     # View-collapse fix1: the deep-scan selection cap names its limit.
     "DEEP_SCAN_SELECTION_CAPPED",
     "LOADER_CONTEXT_CAPACITY_EXHAUSTED",
+    # The owned-command reserve refuses a descendant arm by its own name.
+    "LOADER_CONTEXT_CHILD_RESERVE",
     "LOADER_SCAN_LEDGER_EXCEEDED",
     "LOADER_ARM_LEDGER_FULL",
     # Never-stop discovery gaps: one bad manifest object, pre-arm path,
@@ -84,7 +86,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
-    fifteen discovery reasons; the run-tree scope renders one of its three
+    sixteen discovery reasons; the run-tree scope renders one of its three
     reasons under its own subject, and the learned-file scope renders one
     of its seven reasons under its own subject. The split mirrors
     `capture_skipped_out`'s branches; the strings themselves come from the
@@ -105,6 +107,7 @@ def producer_reasons():
         const["PROCESS_VIEW_CAPACITY_EXHAUSTED"],
         const["DEEP_SCAN_SELECTION_CAPPED"],
         const["LOADER_CONTEXT_CAPACITY_EXHAUSTED"],
+        const["LOADER_CONTEXT_CHILD_RESERVE"],
         const["LOADER_SCAN_LEDGER_EXCEEDED"],
         const["LOADER_ARM_LEDGER_FULL"],
         const["MANIFEST_OBJECT_UNAVAILABLE"],
@@ -127,7 +130,7 @@ def producer_reasons():
     }
     assert (
         len(entry) == 2
-        and len(discovery) == 15
+        and len(discovery) == 16
         and len(run_tree) == 3
         and len(learned) == 7
     ), const

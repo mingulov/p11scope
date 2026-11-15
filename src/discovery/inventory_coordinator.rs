@@ -938,6 +938,9 @@ struct StashedExec {
     ino: u64,
     hook_ts_ns: u64,
     pid_host: u32,
+    /// When the pid was first observed gone: the departed-stash grace
+    /// starts at the exit observation, not at this (possibly old) EXEC.
+    gone_since: Option<u64>,
 }
 
 /// Scan-learned exe identities per build: the primary
@@ -1630,6 +1633,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ino: record.pointers[1],
                 hook_ts_ns: record.hook_ts_ns,
                 pid_host: (record.pid_tgid >> 32) as u32,
+                gone_since: None,
             };
             if !self.exec_exe.contains_key(&cookie) && self.exec_exe.len() >= self.exec_exe_cap {
                 self.exec_exe_shed = self.exec_exe_shed.saturating_add(1);
@@ -4333,6 +4337,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .capture
             .as_ref()
             .map_or(0, |capture| capture.preadmission.len);
+        let binder = self.binder.retention_rows();
         crate::memory_counters::NativeRetentionLens {
             exec_exe: counter_row(
                 self.exec_exe.len(),
@@ -4414,6 +4419,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 size_of::<(String, Option<(u64, u64)>)>(),
                 crate::memory_counters::HEAP_MODULE_KEY,
             ),
+            binder_exec_ns: binder.exec_ns,
+            binder_cookies: binder.cookies,
+            binder_pending: binder.pending,
+            binder_callers: binder.callers,
         }
     }
 
@@ -4432,10 +4441,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 registry: self.registry.memory_lens(),
                 history: self.engine.memory_history_lens(),
                 model: self.joint_capture.memory_lens(),
+                ownership: {
+                    let [callers, associations, summaries, cleanup] =
+                        self.count_ownership.memory_rows();
+                    crate::memory_counters::OwnershipLens {
+                        callers,
+                        associations,
+                        summaries,
+                        cleanup,
+                    }
+                },
                 metadata_rows: self
                     .caller_metadata
                     .as_ref()
                     .map(|lane| lane.frame().memory_row()),
+                metadata_table: self.caller_metadata.as_ref().map(|lane| lane.table_row()),
                 baseline_rss_kb: self.memory_baseline_rss_kb,
             },
             p11scope_ebpf_common::RING_BYTES,
@@ -5345,17 +5365,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // reused by another process) can never matter again.
             capture.preadmission.prune(source);
         }
+        // One `/proc` liveness read per pid per pass, shared by the binder
+        // and the EXEC stash; cheap retained/pending checks run first.
+        let mut gone_memo: HashMap<u32, bool> = HashMap::new();
+        let mut gone = |pid: u32| *gone_memo.entry(pid).or_insert_with(|| source.gone(pid));
         self.binder.prune_departed(
-            |pid| source.gone(pid),
+            &mut gone,
             |pid| retained_pids.contains(&pid),
             now_ns,
             EXEC_STATE_GRACE_NS,
         );
         let mut pruned = Vec::new();
         self.exec_exe.retain(|cookie, exec| {
-            let keep = !source.gone(exec.pid_host)
-                || retained_pids.contains(&exec.pid_host)
-                || now_ns.saturating_sub(exec.hook_ts_ns) < EXEC_STATE_GRACE_NS;
+            if retained_pids.contains(&exec.pid_host) {
+                return true;
+            }
+            if !gone(exec.pid_host) {
+                exec.gone_since = None;
+                return true;
+            }
+            let since = *exec.gone_since.get_or_insert(now_ns);
+            let keep = now_ns.saturating_sub(since) < EXEC_STATE_GRACE_NS;
             if !keep {
                 pruned.push(*cookie);
             }
@@ -5502,6 +5532,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.exec_pruned_overflow
     }
 
+    /// Test-only: domains that latched EXEC loss.
+    #[cfg(test)]
+    pub(crate) fn exec_loss_domains_for_test(&self) -> usize {
+        self.exec_loss_domains.len()
+    }
+
     /// Test-only: shrink the pruned EXEC tombstone bound.
     #[cfg(test)]
     pub(crate) fn set_exec_pruned_cap_for_test(&mut self, cap: usize) {
@@ -5547,6 +5583,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// facts. Returns how many rows retired.
     pub(crate) fn retire_rendered_callers(&mut self, _now_ns: u64) -> u64 {
         let rendered = std::mem::take(&mut self.rendered_callers);
+        if rendered.is_empty() {
+            return 0;
+        }
+        // One referenced-caller set per call, not one scan per candidate:
+        // steady state can render the whole caller budget every pass.
+        let referenced = self.referenced_callers();
         let mut retired = 0;
         for id in rendered {
             let Some(record) = self.adapter.record(id) else {
@@ -5560,7 +5602,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 continue;
             }
-            if self.caller_row_referenced(id) {
+            if self.caller_row_referenced(id, &referenced) {
                 continue;
             }
             // A pending binder row still needs its incarnation snapshot;
@@ -5569,6 +5611,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 continue;
             }
             if self.adapter.forget_caller(id) {
+                self.count_ownership.forget_caller(id);
+                if let Some(metadata) = self.caller_metadata.as_mut() {
+                    metadata.forget(id);
+                }
                 self.registry.compact_retired_caller(id);
                 self.leader_link_loss_noted.remove(&id);
                 self.staged_retirements.remove(&id);
@@ -5583,31 +5629,43 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         retired
     }
 
+    /// Callers still referenced by pending work or a capture target, in
+    /// one pass over those tables. The registry's own rendered state is
+    /// checked per candidate (its edge range is cheap and its remaining
+    /// rows are bounded by retained evidence).
+    fn referenced_callers(&self) -> BTreeSet<CallerId> {
+        let mut referenced = BTreeSet::new();
+        if let Some(capture) = self.capture.as_ref()
+            && let Some(bound) = capture.bound
+        {
+            referenced.insert(bound);
+        }
+        referenced.extend(self.owners.keys().copied());
+        referenced.extend(self.pending_successors.keys().copied());
+        referenced.extend(self.pending_leader_exits.keys().copied());
+        referenced.extend(self.pending_adjudication.keys().copied());
+        referenced.extend(self.recoveries.values().map(|recovery| recovery.caller));
+        referenced.extend(
+            self.pair_targets
+                .values()
+                .filter_map(|target| match target {
+                    PairTarget::Bound { caller, .. }
+                    | PairTarget::Pending { caller, .. }
+                    | PairTarget::Suspended { caller, .. } => Some(*caller),
+                    PairTarget::Dropped { .. } => None,
+                }),
+        );
+        referenced.extend(self.pending_ids.values().map(|pending| pending.caller));
+        referenced
+    }
+
     /// Whether a caller row still backs a rendered fact or pending work.
     /// Such a row must keep its facts until that consumer releases it.
-    fn caller_row_referenced(&self, id: CallerId) -> bool {
-        self.capture
-            .as_ref()
-            .is_some_and(|capture| capture.bound == Some(id))
-            || self.owners.contains_key(&id)
-            || self.pending_successors.contains_key(&id)
-            || self.pending_leader_exits.contains_key(&id)
-            || self.pending_adjudication.contains_key(&id)
-            || self
-                .recoveries
-                .values()
-                .any(|recovery| recovery.caller == id)
-            || self.pair_targets.values().any(|target| match target {
-                PairTarget::Bound { caller, .. }
-                | PairTarget::Pending { caller, .. }
-                | PairTarget::Suspended { caller, .. } => *caller == id,
-                PairTarget::Dropped { .. } => false,
-            })
-            || self
-                .pending_ids
-                .values()
-                .any(|pending| pending.caller == id)
-            || self.registry.caller_has_rendered_state(id)
+    fn caller_row_referenced(&self, id: CallerId, referenced: &BTreeSet<CallerId>) -> bool {
+        if self.registry.edges_of(id).next().is_some() {
+            return true;
+        }
+        referenced.contains(&id) || self.registry.caller_has_rendered_state(id)
     }
 
     /// Caller rows retired into the counted aggregate.
@@ -7400,6 +7458,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // value.
         self.binder
             .set_exit_clocks_comparable(self.exit_clocks_comparable);
+        // A completed witness sweep proves no older row for its domain is
+        // still in flight; a Finish means no later evidence at all. Both
+        // release departed tombstones only after this batch's decisions
+        // are staged below.
+        let tombstone_cleanup = match &batch {
+            NativeBatch::Witness(batch) if batch.sweep_completed => Some((batch.domain, false)),
+            NativeBatch::Finish { domain } => Some((*domain, true)),
+            _ => None,
+        };
         let mut hook_events = Vec::new();
         match batch {
             NativeBatch::Witness(batch) => {
@@ -7459,7 +7526,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut receipt = self.stage_binder_output(identity, now_ns);
         receipt.events.extend(hook_events);
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
+        if let Some((domain, finished)) = tombstone_cleanup {
+            self.expire_exec_tombstones(domain);
+            if finished {
+                self.finish_native_domain(domain);
+            }
+        }
         receipt
+    }
+
+    /// No row older than a completed sweep can still arrive: EXEC stashes
+    /// pruned before it need no tombstone, unless a row for that cookie is
+    /// still pending and will resolve its unbound image later.
+    fn expire_exec_tombstones(&mut self, domain: NativeDomainId) {
+        if self.exec_pruned.is_empty() {
+            return;
+        }
+        let pending = self.binder.pending_cookies(domain);
+        self.exec_pruned
+            .retain(|cookie| cookie.domain() != domain || pending.contains(cookie));
+    }
+
+    /// The domain will produce no more evidence: drop its departed
+    /// tombstone maps (both would otherwise live for the whole capture)
+    /// and its EXEC-loss latch. Pair totals stay: they are the exact
+    /// counted aggregate, not per-pair revival state.
+    fn finish_native_domain(&mut self, domain: NativeDomainId) {
+        self.exec_pruned.retain(|cookie| cookie.domain() != domain);
+        self.exec_loss_domains.remove(&domain);
+        self.pair_dropped_tombstones
+            .retain(|key, _| key.image.domain() != domain);
     }
 
     /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
@@ -18083,6 +18179,10 @@ pub(crate) mod tests {
 
     impl CaptureScene {
         pub(super) fn new(endpoints: u64) -> Self {
+            Self::with_limits(endpoints, RegistryLimits::default_limits())
+        }
+
+        pub(super) fn with_limits(endpoints: u64, limits: RegistryLimits) -> Self {
             use crate::discovery::inventory_attach_set::tests as fx;
             let dir = tempfile::tempdir().unwrap();
             let path = fx::provider(&dir, "a.so", "provider-a");
@@ -18095,7 +18195,7 @@ pub(crate) mod tests {
                 Vec::new(),
                 vec![],
                 source.clone(),
-                RegistryLimits::default_limits(),
+                limits,
             )
             .unwrap();
             // Scripted scenes define their own clocks: the stale-exit
@@ -23343,7 +23443,29 @@ exit 0
                 start_time: record.start_time,
                 exe: record.exe.clone(),
             });
-        let now = last + super::EXEC_STATE_GRACE_NS + 1;
+        // The grace runs from the first pass that observes the exit, not
+        // from the old EXEC instant: one pass records it, a later pass
+        // past the grace prunes.
+        let first = last + 1;
+        let catalog = capture_catalog(
+            &native.scene.pins,
+            &[&native.scene.path],
+            7,
+            generation.clone(),
+        );
+        native.scene.coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            first,
+        );
+        assert_eq!(
+            native.scene.coordinator.exec_exe_len_for_test(),
+            CHURN as usize,
+            "the first exit observation starts the grace"
+        );
+        let now = first + super::EXEC_STATE_GRACE_NS + 1;
         let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
         native.scene.coordinator.apply_catalog(
             catalog,
@@ -23388,7 +23510,17 @@ exit 0
                 ino: 99,
                 hook_ts_ns: at,
                 pid_host: departed,
+                gone_since: None,
             },
+        );
+        assert_eq!(coordinator.binder.exec_instants_for_test(), 1);
+        assert_eq!(coordinator.exec_exe.len(), 1);
+        // The first pass observes the exit and starts the grace.
+        let _ = cgroup_pass(
+            &mut coordinator,
+            CgroupWalkState::default(),
+            CgroupWalkLimits::default(),
+            at + 1,
         );
         assert_eq!(coordinator.binder.exec_instants_for_test(), 1);
         assert_eq!(coordinator.exec_exe.len(), 1);
@@ -23396,7 +23528,7 @@ exit 0
             &mut coordinator,
             CgroupWalkState::default(),
             CgroupWalkLimits::default(),
-            at + EXEC_STATE_GRACE_NS,
+            at + 1 + EXEC_STATE_GRACE_NS,
         );
         assert_eq!(
             coordinator.binder.exec_instants_for_test(),
@@ -33791,10 +33923,14 @@ int main(void) {
         let at = native.stamps.tick();
         native.execs(vec![exec_record(41, 9, at, 8, 99)]);
         assert_eq!(native.scene.coordinator.exec_exe_len_for_test(), 1);
+        // Observe the exit first: the grace starts there, never at the
+        // (possibly old) EXEC instant.
+        native.scene.coordinator.prune_departed_native_state(at + 1);
+        assert_eq!(native.scene.coordinator.exec_exe_len_for_test(), 1);
         native
             .scene
             .coordinator
-            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+            .prune_departed_native_state(at + 1 + EXEC_STATE_GRACE_NS);
         assert_eq!(native.scene.coordinator.exec_exe_len_for_test(), 0);
         assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 1);
         native.witness(vec![native.row(41, 1, 9, 210, 0)]);
@@ -33820,16 +33956,88 @@ int main(void) {
             exec_record(41, 9, at, 8, 99),
             exec_record(42, 10, at, 8, 100),
         ]);
+        native.scene.coordinator.prune_departed_native_state(at + 1);
         native
             .scene
             .coordinator
-            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+            .prune_departed_native_state(at + 1 + EXEC_STATE_GRACE_NS);
         assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 1);
         assert_eq!(native.scene.coordinator.exec_pruned_overflow_for_test(), 1);
         native.witness(vec![native.row(42, 1, 10, 210, 0)]);
         let exes = scene_unbound_exe(&native);
         assert_eq!(exes.len(), 1);
         assert_eq!(exes[0].resolution, ExeResolution::ExecRecordLost);
+    }
+
+    /// A completed witness sweep proves no older row is still in flight:
+    /// EXEC tombstones then expire, so a steady churn cannot fill the
+    /// bound and latch EXEC loss. A row pending at the sweep keeps its
+    /// tombstone until it decides.
+    #[test]
+    fn completed_sweep_expires_pruned_exec_tombstones() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        let at = native.stamps.tick();
+        native.execs(vec![exec_record(41, 9, at, 8, 99)]);
+        native.scene.coordinator.prune_departed_native_state(at + 1);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + 1 + EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 1);
+        native.read(Vec::new());
+        assert_eq!(
+            native.scene.coordinator.exec_pruned_for_test(),
+            0,
+            "a completed sweep expires the tombstone"
+        );
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(
+            exes[0].resolution,
+            ExeResolution::NoExecRecord,
+            "after the sweep the image has no record at all, not a lost one"
+        );
+    }
+
+    /// A finished domain produces no more evidence: both departed
+    /// tombstone maps and the EXEC-loss latch are dropped.
+    #[test]
+    fn finishing_a_domain_drops_its_departed_tombstones() {
+        let (mut native, _caller) = NativeScene::new();
+        let cookie = DomainCookie::scripted(native.domain, 41);
+        native.scene.coordinator.exec_pruned.insert(cookie);
+        native
+            .scene
+            .coordinator
+            .exec_loss_domains
+            .insert(native.domain);
+        native.scene.coordinator.pair_dropped_tombstones.insert(
+            PairKey {
+                image: cookie,
+                exec: 1,
+                object: 0,
+            },
+            PrunedPairBase {
+                base: 5,
+                base_since: 100,
+            },
+        );
+        native.stage(NativeBatch::Finish {
+            domain: native.domain,
+        });
+        assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 0);
+        assert_eq!(
+            native.scene.coordinator.exec_loss_domains_for_test(),
+            0,
+            "the finished domain's latch is gone"
+        );
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            0,
+            "the finished domain's pair tombstones are gone"
+        );
     }
 
     /// Past the pruned-pair tombstone bound the row leaves the map into

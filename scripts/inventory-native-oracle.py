@@ -1275,9 +1275,24 @@ def check_streams(view, res):
         field_name = CALLER_EVENT_MINTS.get(e["event"].get("event"))
         if field_name:
             minted.add(e["event"].get(field_name))
-    res.ok(run, "*", "AGREE-CALLERS", minted == set(view.callers),
-           f"stream-minted only {sorted(minted - set(view.callers))[:5]} / snapshot-only "
-           f"{sorted(set(view.callers) - minted)[:5]}")
+    # A rendered, proven-exited caller row may be retired after it was
+    # shown: the mint stays in the stream while the final snapshot drops
+    # the row and budgets.callers.retired counts it. A retired ID must
+    # back no final edge or instance.
+    snapshot = set(view.callers)
+    retired = minted - snapshot
+    retired_budget = ((doc.get("budgets") or {}).get("callers") or {}).get("retired", 0)
+    referenced = {e.get("caller") for e in doc.get("edges", [])}
+    referenced |= {row.get("caller") for row in doc.get("instances", [])
+                   if isinstance(row, dict)}
+    caller_ok = (not (snapshot - minted)
+                 and type(retired_budget) is int and retired_budget >= 0
+                 and len(retired) == retired_budget
+                 and not (retired & referenced))
+    res.ok(run, "*", "AGREE-CALLERS", caller_ok,
+           f"snapshot-only {sorted(snapshot - minted)[:5]} / recovered {len(retired)} "
+           f"(budget {retired_budget!r}) / retired still referenced "
+           f"{sorted(retired & referenced)[:5]}")
     want = {"callers": len(view.callers), "modules": len(view.modules), "edges": len(view.edges)}
     totals = passes[-1].get("totals") if passes else None
     res.ok(run, "*", "AGREE-TOTALS", totals == want, f"last pass totals {totals} != snapshot {want}")
@@ -2873,7 +2888,7 @@ def demotion_public_health(inventory):
     obs, budgets = inventory.get("observation"), inventory.get("budgets")
     required_obs = {"lane", "settlement", "retirement", "lifecycle", "native_witnesses"}
     budget_tables = {"callers", "modules", "edges", "endpoints", "inventory_endpoints", "inventory_attach_modules",
-                     "counters", "semantic_state", "retained_history", "native_preadmission"}
+                     "counters", "semantic_state", "retained_history", "native_preadmission", "native_departed"}
     if type(obs) is not dict or not required_obs <= obs.keys() or type(budgets) is not dict or not budget_tables <= budgets.keys():
         return ["missing_public_health"]
     problems = []
@@ -2916,11 +2931,14 @@ def demotion_public_health(inventory):
     demotion_require(sum(census["placement"].values()) == census["bound"] + census["unbound"], "public_census_mismatch")
     if any(census[key] for key in ("unbound", "pending", "integrity")) or any(census["placement"][key] for key in ("module", "ambiguous", "unresolved")):
         problems.append("unhealthy_public_capture")
-    shapes = {key: {"limit", "occupied", "refused"} for key in budget_tables - {"counters", "semantic_state", "retained_history", "native_preadmission"}}
-    shapes.update(counters={"cap", "observed_edges", "saturated_edges"},
+    shapes = {key: {"limit", "occupied", "refused"} for key in budget_tables - {"callers", "counters", "semantic_state", "retained_history", "native_preadmission", "native_departed"}}
+    shapes.update(callers={"limit", "occupied", "refused", "retired", "late_refused"},
+                  counters={"cap", "observed_edges", "saturated_edges"},
                   semantic_state={"limit", "occupied", "status", "unknown_edges", "refused"},
                   retained_history={"limit", "retained", "suppressed"},
-                  native_preadmission={"limit", "occupied", "refused", "pruned"})
+                  native_preadmission={"limit", "occupied", "refused", "pruned"},
+                  native_departed={"pair_dropped_rows", "pair_dropped_base",
+                                   "pair_prune_overflow", "exec_prune_overflow"})
     for name, shape in shapes.items():
         table = budgets[name]
         if name == "native_preadmission" and table is None:
@@ -3703,11 +3721,21 @@ def demotion_self_test():
                 "identity_unavailable": 0, "identity_budget_exhausted": False})
         i["budgets"] = {key: {"limit": 64, "occupied": 1, "refused": 0} for key in (
             "callers", "modules", "edges", "endpoints", "inventory_endpoints", "inventory_attach_modules")}
+        i["budgets"]["callers"].update(retired=0, late_refused=0)
         i["budgets"].update(counters={"cap": U64_MAX, "observed_edges": 2, "saturated_edges": 0},
             semantic_state={"limit": 64, "occupied": 0, "status": "withheld", "unknown_edges": 2, "refused": 0},
             retained_history={"limit": 64, "retained": 2, "suppressed": 0},
-            native_preadmission={"limit": 64, "occupied": 0, "refused": 0, "pruned": 0})
+            native_preadmission={"limit": 64, "occupied": 0, "refused": 0, "pruned": 0},
+            native_departed={"pair_dropped_rows": 0, "pair_dropped_base": 0,
+                             "pair_prune_overflow": 0, "exec_prune_overflow": 0})
+    def public_health_counts(inventory, retired=0, late_refused=0, native_departed=None):
+        inventory["budgets"]["callers"].update(retired=retired, late_refused=late_refused)
+        inventory["budgets"]["native_departed"] = native_departed or {
+            "pair_dropped_rows": 0, "pair_dropped_base": 0,
+            "pair_prune_overflow": 0, "exec_prune_overflow": 0}
+
     public_health(receipt, inventory, ledger, manifest)
+    public_health_counts(inventory)
 
     def wider(r, inv, lines, m, pre=100, post=116, public=True):
         r["records"][5].update(count=3, pre_ns=pre, post_ns=post)
@@ -3776,6 +3804,17 @@ def demotion_self_test():
             if not ok:
                 failures.append("demotion-" + name)
             return root
+
+        case("public-callers-retired", "pass", "qualified",
+             lambda r, i, l, m: public_health_counts(i, retired=2, late_refused=3))
+        case("public-callers-retired-shape", "fail", "invalid_schema",
+             lambda r, i, l, m: i["budgets"]["callers"].pop("retired"))
+        case("public-native-departed", "pass", "qualified",
+             lambda r, i, l, m: public_health_counts(i, native_departed={
+                 "pair_dropped_rows": 4, "pair_dropped_base": 9,
+                 "pair_prune_overflow": 1, "exec_prune_overflow": 2}))
+        case("public-native-departed-shape", "fail", "invalid_schema",
+             lambda r, i, l, m: i["budgets"]["native_departed"].pop("exec_prune_overflow"))
 
         first = case("C1-strict-fence2", "pass", "qualified", values={"A": 1, "withheld": 1, "B": 2})
         second = case("C2-identical-public-wider-private", "fail", "public_allocation_mismatch",
@@ -5305,6 +5344,22 @@ def self_test():
             return {"events": [e for e in s.events(d, True)
                                if not (e["kind"] == "caller_event" and e["event"]["caller"] == "c0")]}
         case("jsonl-callers-mismatch", "AGREE-CALLERS", callers_mismatch)
+
+        def retired_caller(s, d, dash, budget=1):
+            # A lifetime caller minted, rendered and retired before the final
+            # snapshot; it backs no edge or instance and has no ledger calls.
+            gone = "c900"
+            d["budgets"]["callers"].update(retired=budget, late_refused=0)
+            extra = [("caller_event", {"event": "admitted", "caller": gone}),
+                     ("caller_event", {"event": "retired", "caller": gone,
+                                       "reason": "synthetic retirement"})]
+            return {"events": s.events(d, True, extra)}
+        # A rendered caller minted by the stream may be absent from the
+        # final snapshot when budgets.callers.retired counts it.
+        case("jsonl-callers-retired", None, retired_caller)
+        # The same absence without the counted retirement is a mismatch.
+        case("jsonl-callers-retired-unaccounted", "AGREE-CALLERS",
+             lambda s, d, dash: retired_caller(s, d, dash, budget=0))
 
         def totals(s, d, dash):
             ev = s.events(d, True)

@@ -3831,6 +3831,20 @@ fn concise_snapshot_keeps_head_limits_and_hint() {
     assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
 }
 
+/// v0.8.0: retired rows left the caller list after they were rendered;
+/// the default headline still accounts for them in plain words.
+#[test]
+fn concise_snapshot_names_callers_retired_without_calls() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.budgets.callers_retired = 7;
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.lines().any(|line| line == "7 exited without calls"),
+        "{out}"
+    );
+}
+
 /// F1: the concise snapshot groups gap reasons with counts, so a
 /// partial result names WHY (two distinct reasons both appear);
 /// per-gap `gap [` lines stay verbose-only.

@@ -10332,11 +10332,13 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
         // `pair_dropped_*` is the exact aggregate of pruned dropped-pair
         // rows (bases folded per key class, never forgotten silently);
         // `pair_prune_overflow` counts the rows folded past the exact
-        // per-pair tombstone bound (their revival rebases approximately,
-        // never re-absorbs a count), and `exec_prune_overflow` counts
-        // pruned EXEC stashes discarded past their bound (the domain
-        // latches `exec_record_lost`). Every overflow row is counted
-        // once, when it leaves the map.
+        // per-pair tombstone bound: a later revival starts from zero,
+        // so it stages its new absolute as growth instead of rebasing
+        // past the folded base, which the class aggregate still holds
+        // exactly once. `exec_prune_overflow` counts pruned EXEC stashes
+        // discarded past their bound (the domain latches
+        // `exec_record_lost`). Every overflow row is counted once, when
+        // it leaves the map.
         "native_departed": {
             "pair_dropped_rows": budgets.native_pair_dropped_rows,
             "pair_dropped_base": budgets.native_pair_dropped_base,

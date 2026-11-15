@@ -636,6 +636,23 @@ impl CountOwnership {
             }
         }
     }
+    /// A forgotten caller row can never be projected again: release its
+    /// ownership header and every `(caller, *)` summary, using the same
+    /// bounded discard accounting as an abandoned observation. Caller IDs
+    /// are lifetime-monotonic, so retaining the slot would exhaust this
+    /// map at the caller budget even while the adapter forgets rows.
+    pub(super) fn forget_caller(&mut self, caller: CallerId) {
+        self.forget_live(caller);
+        self.callers.remove(&caller);
+        let keys: Vec<(CallerId, u32)> = self
+            .summaries
+            .range((Included((caller, 0)), Included((caller, u32::MAX))))
+            .map(|(&key, _)| key)
+            .collect();
+        for key in keys {
+            self.summaries.remove(&key);
+        }
+    }
     pub(super) fn deferred(&self, caller: CallerId, object: u32) -> bool {
         self.callers.get(&caller).is_some_and(|slot| {
             slot.live
@@ -1397,6 +1414,32 @@ impl CountOwnership {
             std::mem::size_of::<CallerObservation>(),
             std::mem::size_of::<MembershipIndex>(),
         )
+    }
+    /// One `-v` memory row per retained ownership structure: headers,
+    /// charged associations, summaries and their pending cleanup. Read
+    /// only on the memory-emit path.
+    pub(super) fn memory_rows(&self) -> [crate::memory_counters::CounterRow; 4] {
+        use crate::memory_counters::{HEAP_MAP_ENTRY, counter_row};
+        use std::mem::size_of;
+        let cleanup = self.cleanup.iter().map(|entry| entry.cells).sum::<usize>();
+        [
+            counter_row(self.callers.len(), size_of::<CallerId>(), HEAP_MAP_ENTRY),
+            counter_row(self.associations, size_of::<ModuleKey>(), HEAP_MAP_ENTRY),
+            counter_row(
+                self.summaries.len(),
+                size_of::<(CallerId, u32)>() + size_of::<CandidateSummary>(),
+                HEAP_MAP_ENTRY,
+            ),
+            counter_row(cleanup, size_of::<ModuleKey>(), HEAP_MAP_ENTRY),
+        ]
+    }
+    #[cfg(test)]
+    pub(super) fn caller_headers(&self) -> usize {
+        self.callers.len()
+    }
+    #[cfg(test)]
+    pub(super) fn summary_rows(&self) -> usize {
+        self.summaries.len()
     }
     #[cfg(test)]
     pub(super) fn retained_cells(&self) -> (usize, usize, usize) {

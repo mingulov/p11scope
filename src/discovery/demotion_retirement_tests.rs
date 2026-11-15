@@ -3,6 +3,7 @@
 //! Behavioral retirement tests over retained real file identities.
 use super::tests::{CaptureScene, NativeScene, capture_catalog};
 use super::*;
+use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::inventory_attach_set::tests as fx;
 thread_local! { static QUERY_CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 thread_local! {
@@ -6895,4 +6896,145 @@ fn demotion_retirement_projected_observation_waits_for_admission_upgrade() {
         "after its publication the caller is judged with the Admitted admission"
     );
     assert_eq!(ownership.caller_authority_failure(caller), 0);
+}
+
+/// A forgotten caller releases its count-ownership header and summaries;
+/// lifetime caller IDs may exceed the caller budget without a storage
+/// refusal, and a later caller takes the freed slot.
+#[test]
+fn demotion_retirement_round4_forgotten_caller_releases_count_ownership() {
+    let mut limits = RegistryLimits::default_limits();
+    limits.max_callers = 2;
+    let mut ownership = CountOwnership::new(limits);
+    ownership.begin_catalog_pass();
+    assert!(ownership.queue_projected_observation(CallerId(1), Vec::new(), None, 0));
+    assert!(ownership.queue_projected_observation(CallerId(2), Vec::new(), None, 0));
+    assert!(ownership.register_pair(CallerId(2), 7));
+    assert_eq!(
+        (ownership.caller_headers(), ownership.summary_rows()),
+        (2, 1)
+    );
+    assert!(
+        !ownership.queue_projected_observation(CallerId(3), Vec::new(), None, 0),
+        "the live-retained budget still refuses a third caller"
+    );
+    ownership.forget_caller(CallerId(1));
+    assert_eq!(ownership.caller_headers(), 1);
+    assert!(
+        ownership.queue_projected_observation(CallerId(3), Vec::new(), None, 0),
+        "a forgotten caller's header is reusable"
+    );
+    ownership.forget_caller(CallerId(2));
+    assert_eq!(ownership.summary_rows(), 0, "its pair summaries are gone");
+    ownership.forget_caller(CallerId(3));
+    assert_eq!(ownership.caller_headers(), 0);
+}
+
+fn round4_empty_catalog(
+    native: &NativeScene,
+    caller: CallerId,
+    pid: u32,
+    at: u64,
+) -> crate::inspect_system::Catalog {
+    let record = native.scene.coordinator.adapter.record(caller).unwrap();
+    let generation = crate::inspect_system::MemberGeneration {
+        start_time: record.start_time,
+        exe: record.exe.clone(),
+    };
+    let mut catalog = capture_catalog(&native.scene.pins, &[], pid, Some(generation.clone()));
+    catalog.processes[0].complete_scan = Some(crate::inspect_system::CompleteMemberScan::scripted(
+        generation,
+        at,
+        at + 1,
+    ));
+    catalog
+}
+
+/// Lifecycle caller IDs can exceed `max_callers` once retired rows are
+/// forgotten: the third lifetime caller is projected, does not read the
+/// current-count-ownership refusal, and gets its metadata row.
+#[test]
+fn demotion_retirement_round4_lifetime_callers_exceed_the_retained_budget() {
+    let mut limits = RegistryLimits::default_limits();
+    limits.max_callers = 2;
+    let base = CaptureScene::with_limits(2, limits);
+    let mut native = NativeScene::over(base, 0);
+    native
+        .scene
+        .coordinator
+        .binder
+        .set_current_binding_clock(query_clock);
+    native.scene.coordinator.enable_caller_metadata(1).unwrap();
+    let mut ids = Vec::new();
+    for (index, pid) in [7u32, 8, 9, 10].into_iter().enumerate() {
+        let at = 100 + index as u64 * 100;
+        native.scene.source.spawn(pid, 500 + u64::from(pid));
+        let id = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, at)
+            .unwrap();
+        ids.push(id);
+        QUERY_CLOCK.with(|clock| clock.set(native.stamps.tick()));
+        let catalog = round4_empty_catalog(&native, id, pid, at);
+        native.scene.coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            at + 100,
+            at,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.synchronize_caller_metadata(at + 1);
+        let frame = native.scene.coordinator.metadata_frame();
+        assert!(
+            frame.contains(id),
+            "caller {id:?} (lifetime {index}) has a metadata row"
+        );
+        assert_eq!(
+            frame.summary.budget_refusals, 0,
+            "no lifetime caller is refused metadata storage"
+        );
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "current count ownership storage refused"),
+            "no current count ownership storage refusal for a lifetime caller"
+        );
+        let events = native
+            .scene
+            .coordinator
+            .adapter
+            .exec_transition_scoped(id, at + 2);
+        native
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, at + 2);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        assert_eq!(
+            native.scene.coordinator.retire_rendered_callers(at + 3),
+            1,
+            "the proven-exited rendered caller retires"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(id).is_none(),
+            "the retired caller row is forgotten"
+        );
+    }
+    assert_eq!(
+        ids.len(),
+        4,
+        "more lifetime callers than the retained budget"
+    );
+    assert_eq!(
+        native.scene.coordinator.count_ownership.caller_headers(),
+        0,
+        "each forgotten caller released its ownership header"
+    );
 }

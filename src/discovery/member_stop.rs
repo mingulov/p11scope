@@ -1607,8 +1607,15 @@ impl Engine {
         }
     }
 
-    /// Resumes every pending row at capture end (one table scan).
+    /// Resumes every pending row at capture end (one table scan). After a
+    /// lost watchdog nothing else bounds a stop, so every row goes through
+    /// the loss drain: an unpinnable, unverified or unsignalable member
+    /// gets the start-time guarded forced resume.
     fn resume_pending_at_release(&mut self, io: &mut dyn MemberStopIo) {
+        if self.member_stops.disabled {
+            self.drain_after_guard_loss(io, crate::attach::monotonic_ns());
+            return;
+        }
         for (tgid, stop) in io.pending().unwrap_or_default() {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {
                 // Gone: nothing is stopped, and a row left behind would
@@ -1631,17 +1638,8 @@ impl Engine {
                 Ok(false) => {
                     let _ = io.withdraw(tgid);
                 }
-                // Unreadable membership: with the watchdog still alive its
-                // sweep bounds the stop, but after a lost watchdog nothing
-                // else would, so the start-time guarded forced resume runs.
-                Err(_) if self.member_stops.disabled => {
-                    self.force_resume(
-                        io,
-                        tgid,
-                        stop.hook_ts_ns,
-                        "capture end without the watchdog, membership unreadable",
-                    );
-                }
+                // Unreadable membership: the live watchdog's sweep bounds
+                // the stop.
                 Err(_) => {}
             }
         }

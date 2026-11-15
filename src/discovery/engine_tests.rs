@@ -87220,6 +87220,34 @@ fn member_stop_release_after_watchdog_loss_resumes_an_unreadable_member() {
     let _ = child.wait();
 }
 
+/// Twin: capture end after a lost watchdog with a member that cannot be
+/// pinned (descriptor or `/proc` pressure): it still resumes, through
+/// the start-time guarded forced resume, and files the first-use row.
+#[test]
+fn member_stop_release_after_watchdog_loss_resumes_an_unpinnable_member() {
+    let mut io = ScriptedMemberStops {
+        guard_lost: true,
+        ..Default::default()
+    };
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(io.deactivated);
+    let (mut child, pid, _stop_ns) = stopped_member_with_row(&mut io);
+    engine.member_stops.pin_fail.insert(pid);
+    engine.release_member_stops(&mut io);
+    assert!(
+        member_resumed_for_test(pid),
+        "an unpinnable member is not left stopped"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.forced_resumes, 1, "{stats:?}");
+    assert!(files_the_first_use_row(&engine));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// A held provider mapper that exits before its provider attaches must
 /// not clear the provider: the next mapper is then stopped and held (or
 /// files the row), instead of running unprotected with no row.

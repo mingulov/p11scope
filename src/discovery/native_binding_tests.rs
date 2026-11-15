@@ -358,6 +358,163 @@ fn departed_exec_instants_prune_within_the_grace_but_keep_live_tasks() {
     );
 }
 
+/// The grace is a safety clause, not a performance hint: a gone
+/// process's entries younger than it stay, and a live process's entries
+/// never prune.
+#[test]
+fn prune_keeps_live_tasks_and_gone_processes_within_the_grace() {
+    const GRACE: u64 = 180_000_000_000;
+    let mut run = Run::new();
+    let domain = run.domain;
+    let at = run.tick();
+    let execs: Vec<(u32, u64)> = (100..132).map(|pid| (pid, at)).collect();
+    run.binder.absorb_lifecycle(&drained(domain, &execs, at));
+    assert_eq!(run.binder.exec_instants_for_test(), 32);
+    run.binder
+        .prune_departed(|pid| pid != 100, at + GRACE - 1, GRACE);
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        32,
+        "a live task and gone entries younger than the grace survive"
+    );
+    run.binder
+        .prune_departed(|pid| pid != 100, at + GRACE, GRACE);
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        1,
+        "at the grace the gone entries prune and the live task stays"
+    );
+}
+
+/// A pending row's tgid is still its decision input: its exec instant
+/// and its image sequence must survive the grace until it decides.
+#[test]
+fn prune_keeps_a_pending_rows_tgid_and_cookie_past_the_grace() {
+    const GRACE: u64 = 180_000_000_000;
+    let mut run = Run::new();
+    let domain = run.domain;
+    let at = run.tick();
+    run.binder
+        .absorb_lifecycle(&drained(domain, &[(T, at)], at));
+    run.read(vec![row(domain, 7, 1, T, 900)]);
+    assert_eq!(run.binder.exec_instants_for_test(), 1);
+    assert_eq!(run.binder.cookie_sequences_for_test(), 1);
+    run.binder.prune_departed(|_| true, at + GRACE, GRACE);
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        1,
+        "a pending row's tgid keeps its exec instant"
+    );
+    assert_eq!(
+        run.binder.cookie_sequences_for_test(),
+        1,
+        "a pending row keeps its image sequence"
+    );
+}
+
+/// A bound caller's cookie is retained evidence, not only a rebind
+/// cache: it keeps attributing late rows after the process is gone.
+#[test]
+fn prune_keeps_a_bound_callers_cookie_after_exit_past_the_grace() {
+    const GRACE: u64 = 180_000_000_000;
+    let mut run = Run::new();
+    let domain = run.domain;
+    let caller = run.world.admit(T, 1, 0, 1_000);
+    run.world.answer(T, 1, domain, cookie(domain, 7));
+    run.read(vec![row(domain, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(caller)]);
+    run.world.retire(T);
+    run.binder.prune_departed(|_| true, 2_000 + GRACE, GRACE);
+    assert_eq!(
+        run.binder.cookie_sequences_for_test(),
+        1,
+        "a bound caller's image sequence survives its exit"
+    );
+}
+
+/// Non-vacuity: without a pending row or a bound caller, the same
+/// departed entries do prune past the grace.
+#[test]
+fn prune_clears_unbound_departed_state_past_the_grace() {
+    const GRACE: u64 = 180_000_000_000;
+    let mut run = Run::new();
+    let domain = run.domain;
+    run.binder
+        .absorb_lifecycle(&drained(domain, &[(T, 1_000)], 1_000));
+    run.read(vec![row(domain, 7, 1, T, 900)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
+    assert_eq!(run.binder.cookie_sequences_for_test(), 1);
+    run.binder.prune_departed(|_| true, 1_000 + GRACE, GRACE);
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        0,
+        "an unbound departed exec instant prunes"
+    );
+    assert_eq!(
+        run.binder.cookie_sequences_for_test(),
+        0,
+        "an unbound departed image sequence prunes"
+    );
+}
+
+/// A finished domain no longer decides rows; its retained evidence is
+/// not the prune's to spend.
+#[test]
+fn prune_skips_a_finished_domain() {
+    const GRACE: u64 = 180_000_000_000;
+    let mut run = Run::new();
+    let domain = run.domain;
+    run.binder
+        .absorb_lifecycle(&drained(domain, &[(T, 1_000)], 1_000));
+    run.binder.finish(domain);
+    run.binder.prune_departed(|_| true, 1_000 + GRACE, GRACE);
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        1,
+        "a finished domain keeps its retained state"
+    );
+}
+
+/// Rule 4's exec veto is decision evidence for a retained caller too: a
+/// late row must stay `ExecAfterAdmission`, never re-bind through the
+/// post-exit fallback because the prune removed the veto.
+#[test]
+fn prune_keeps_a_retained_callers_exec_veto() {
+    const GRACE: u64 = 180_000_000_000;
+    let mut run = Run::new();
+    let domain = run.domain;
+    run.world.admit(T, 1, 0, 1_000);
+    run.drain(&[(T, 1_600)]);
+    run.world.retire(T);
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(1),
+        true,
+        true,
+        CallerLifecycle::Exited,
+    );
+    assert_eq!(run.binder.exec_instants_for_test(), 1);
+    run.binder.prune_departed(|_| true, 1_600 + GRACE, GRACE);
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        1,
+        "a retained caller's exec veto survives the prune"
+    );
+    run.read(vec![row(domain, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::ExecAfterAdmission)],
+        "the late row keeps the exec veto instead of binding the old image"
+    );
+}
+
 #[test]
 fn metadata_binding_requires_genuine_settled_postcoverage_image_not_record_authority() {
     use super::super::caller_registry::ImageAuthority;

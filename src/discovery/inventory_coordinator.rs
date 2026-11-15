@@ -5203,6 +5203,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.exec_exe.len()
     }
 
+    /// Test-only: summed bases in the departed dropped-pair aggregate.
+    #[cfg(test)]
+    pub(crate) fn dropped_pair_base_total_for_test(&self) -> u64 {
+        0
+    }
+
+    /// Record caller rows that a presentation has rendered. Retirement is
+    /// only allowed after this, so a row still shown keeps its facts.
+    #[cfg(test)]
+    pub(crate) fn note_rendered_callers(&mut self, _ids: &[CallerId]) {}
+
+    /// Retire rendered caller rows whose process is proven ended into the
+    /// counted aggregates. Returns how many rows retired.
+    #[cfg(test)]
+    pub(crate) fn retire_rendered_callers(&mut self, _now_ns: u64) -> u64 {
+        0
+    }
+
+    /// Test-only: caller rows retired into the counted aggregates.
+    #[cfg(test)]
+    pub(crate) fn retired_caller_rows_for_test(&self) -> u64 {
+        0
+    }
+
     /// One pass with no scan behind it: the collection failed after at
     /// least one successful pass (a `--pid` target that exited
     /// mid-observation, a transient enumeration loss). Lifecycle still
@@ -22874,6 +22898,174 @@ exit 0
             native.scene.coordinator.binder.exec_instants_for_test(),
             0,
             "departed exec instants must be pruned by the pass"
+        );
+    }
+
+    /// Cgroup-scope passes open the same native lane, so their commit
+    /// seam must prune departed native state too. Without it the
+    /// per-ever EXEC stash and ordering instants grow under churn for
+    /// the whole cgroup capture.
+    #[test]
+    fn cgroup_pass_prunes_departed_native_state() {
+        let (_fixture, _child, mut coordinator) = cgroup_os_scene();
+        let domain = NativeDomainId::mint();
+        coordinator
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+        let at = 1_000u64;
+        // A pid no scripted or real source holds: gone by construction.
+        let departed = 4_000_001u32;
+        let batch =
+            DiscoveryBatch::scripted(domain, vec![exec_record(41, departed, at, 8, 99)], at);
+        coordinator.binder.absorb_lifecycle(&batch);
+        coordinator.exec_exe.insert(
+            DomainCookie::new(domain, 41),
+            StashedExec {
+                dev: 8,
+                ino: 99,
+                hook_ts_ns: at,
+                pid_host: departed,
+            },
+        );
+        assert_eq!(coordinator.binder.exec_instants_for_test(), 1);
+        assert_eq!(coordinator.exec_exe.len(), 1);
+        let _ = cgroup_pass(
+            &mut coordinator,
+            CgroupWalkState::default(),
+            CgroupWalkLimits::default(),
+            at + EXEC_STATE_GRACE_NS,
+        );
+        assert_eq!(
+            coordinator.binder.exec_instants_for_test(),
+            0,
+            "a cgroup pass past the grace prunes a departed exec instant"
+        );
+        assert_eq!(
+            coordinator.exec_exe.len(),
+            0,
+            "a cgroup pass past the grace prunes a departed EXEC stash"
+        );
+    }
+
+    /// A generalised `Dropped` pair target is bounded by its absolute
+    /// base, and an exact per-class aggregate keeps the count: the sum
+    /// of every dropped base before the prune equals the sum after it.
+    #[test]
+    fn departed_dropped_pair_bases_prune_into_the_exact_class_aggregate() {
+        let (mut native, _caller) = NativeScene::new();
+        let first = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        let second = PairKey {
+            image: DomainCookie::scripted(native.domain, 42),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            first,
+            PairTarget::Dropped {
+                base: 20,
+                base_since: 1_000,
+            },
+        );
+        native.scene.coordinator.pair_targets.insert(
+            second,
+            PairTarget::Dropped {
+                base: 7,
+                base_since: 1_000,
+            },
+        );
+        let before = 27u64 + native.scene.coordinator.dropped_pair_base_total_for_test();
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(1_000 + EXEC_STATE_GRACE_NS);
+        assert!(
+            !native.scene.coordinator.pair_targets.contains_key(&first)
+                && !native.scene.coordinator.pair_targets.contains_key(&second),
+            "departed dropped pair targets leave the map"
+        );
+        let after = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .filter_map(|target| match target {
+                PairTarget::Dropped { base, .. } => Some(*base),
+                _ => None,
+            })
+            .sum::<u64>()
+            + native.scene.coordinator.dropped_pair_base_total_for_test();
+        assert_eq!(after, before, "sum before equals sum after the prune");
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_base_total_for_test(),
+            27,
+            "the aggregate holds exactly the pruned bases"
+        );
+    }
+
+    /// A rendered, proven-exited caller row retires into counted
+    /// aggregates; a row not yet rendered keeps its facts, and a live
+    /// row is never retired.
+    #[test]
+    fn rendered_exited_caller_rows_retire_into_counted_aggregates() {
+        let (mut native, live) = NativeScene::new();
+        native.scene.source.spawn(8, 800);
+        let exited = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(
+                8,
+                crate::discovery::caller_registry::ImageAuthority::ScanPinned,
+                100,
+            )
+            .unwrap();
+        native
+            .scene
+            .coordinator
+            .adapter
+            .exec_transition_scoped(exited, 200);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(exited)
+                .is_some_and(|record| record.retired)
+        );
+        assert_eq!(
+            native.scene.coordinator.retire_rendered_callers(300),
+            0,
+            "an unrendered row keeps its facts"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(exited).is_some(),
+            "an unrendered row keeps its facts"
+        );
+        native
+            .scene
+            .coordinator
+            .note_rendered_callers(&[exited, live]);
+        assert_eq!(
+            native.scene.coordinator.retire_rendered_callers(400),
+            1,
+            "only the proven-exited rendered row retires"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(exited).is_none(),
+            "the retired row leaves the adapter"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(live).is_some(),
+            "a live rendered row stays"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_caller_rows_for_test(),
+            1,
+            "the retirement is counted, never silent"
         );
     }
 

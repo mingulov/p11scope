@@ -86553,6 +86553,59 @@ fn member_stop_intake_is_bounded_per_pass() {
     }
 }
 
+/// A stopped member whose provider is refused (here the learned-file cap)
+/// resumes at once without probes: counted as a refused resume, never as
+/// an attached one, with the first-use row beside the cap row.
+#[test]
+fn member_stop_refused_provider_is_no_attached_resume() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    for index in 0..crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP as u64 {
+        engine
+            .pending_learned
+            .push(crate::fanotify::LearnedCandidate {
+                file: std::fs::File::open("/dev/null").unwrap(),
+                dev: u64::MAX,
+                ino: index,
+                display_path: format!("/filler-{index}"),
+                loader_exe: None,
+                loader_unknown_reason: None,
+                run_learned: true,
+                proving_retained: false,
+            });
+    }
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(
+        !engine.member_stops_held(),
+        "no hold for a refused provider"
+    );
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.attached_resumes, 0, "{stats:?}");
+    assert_eq!(stats.refused_resumes, 1, "{stats:?}");
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    for reason in [render::LEARNED_CAP_REASON, render::LEARNED_FIRST_RUN_REASON] {
+        assert!(
+            public
+                .iter()
+                .any(|skip| skip.name == "learned provider file" && skip.reason == reason),
+            "{reason}: {public:?}"
+        );
+    }
+}
+
 /// Twin: without a service pass the stopped member stays stopped (the
 /// resume above is the service's, not the fixture's).
 #[test]

@@ -137,6 +137,9 @@ static FD_LIMIT_SERIAL: Mutex<()> = Mutex::new(());
 pub(crate) struct FdLimitGuard {
     saved: libc::rlimit,
     restored: bool,
+    /// `false` for the deliberately irreversible [`Self::lower_both`],
+    /// whose saved hard limit cannot be raised back without privilege.
+    restore_on_drop: bool,
     _serial: MutexGuard<'static, ()>,
 }
 
@@ -156,6 +159,13 @@ impl FdLimitGuard {
     }
 
     fn guarded(limits: impl FnOnce(&libc::rlimit) -> (libc::rlim_t, libc::rlim_t)) -> Self {
+        Self::guarded_with(limits, true)
+    }
+
+    fn guarded_with(
+        limits: impl FnOnce(&libc::rlimit) -> (libc::rlim_t, libc::rlim_t),
+        restore_on_drop: bool,
+    ) -> Self {
         let serial = FD_LIMIT_SERIAL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -171,6 +181,7 @@ impl FdLimitGuard {
         Self {
             saved,
             restored: false,
+            restore_on_drop,
             _serial: serial,
         }
     }
@@ -220,13 +231,16 @@ impl FdLimitGuard {
 
     /// Lowers both limits irreversibly; only safe in an isolated child.
     pub(crate) fn lower_both(soft: libc::rlim_t) -> Self {
-        Self::guarded(|saved| {
-            assert!(
-                saved.rlim_max >= soft,
-                "the hard fd limit is below the lowered {soft}"
-            );
-            (soft, soft)
-        })
+        Self::guarded_with(
+            |saved| {
+                assert!(
+                    saved.rlim_max >= soft,
+                    "the hard fd limit is below the lowered {soft}"
+                );
+                (soft, soft)
+            },
+            false,
+        )
     }
 
     /// Restores the saved limits now, panicking on refusal.
@@ -244,12 +258,21 @@ impl FdLimitGuard {
 
 impl Drop for FdLimitGuard {
     fn drop(&mut self) {
-        if !self.restored {
-            // SAFETY: best-effort restore of the exact saved limits; an
-            // irreversible child lowering may refuse, and a panic here
-            // would abort the harness.
-            let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
-            self.restored = true;
+        if self.restored || !self.restore_on_drop {
+            return;
+        }
+        // SAFETY: best-effort restore of the exact saved limits.
+        let status = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+        self.restored = true;
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            // A panic while already unwinding would abort the harness, so
+            // report the failed restore instead; otherwise fail the test.
+            if std::thread::panicking() {
+                eprintln!("fd limit guard could not restore the sampled limits: {error}");
+            } else {
+                panic!("fd limit guard could not restore the sampled limits: {error}");
+            }
         }
     }
 }

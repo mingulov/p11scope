@@ -2162,9 +2162,7 @@ mod tests {
         assert_eq!(unsafe { libc::fstat(2, &raw mut stat) }, 0);
         assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
         let eacces = || io::Error::from_raw_os_error(libc::EACCES);
-        let exhaust = || {
-            let _limit = crate::test_support::isolation::FdLimitGuard::lower_both(4);
-        };
+        let exhaust = || crate::test_support::isolation::FdLimitGuard::lower_both(4);
         match mode.as_str() {
             "oneshot-healthy" => {
                 preserve_stdio_private_descriptions();
@@ -2174,7 +2172,7 @@ mod tests {
             }
             "oneshot-exhausted" => {
                 preserve_stdio_private_descriptions();
-                exhaust();
+                let _limit = exhaust();
                 // Production drops this result (`let _ =`); the parent
                 // requires the line itself. Pre-fix this is `EACCES`
                 // with zero bytes on the pipe.
@@ -2189,7 +2187,7 @@ mod tests {
             }
             "bounded-exhausted" => {
                 preserve_stdio_private_descriptions();
-                exhaust();
+                let _limit = exhaust();
                 // Pre-fix this writer is the sink: the write succeeds
                 // but no byte reaches the pipe, so the parent — not the
                 // result — decides.

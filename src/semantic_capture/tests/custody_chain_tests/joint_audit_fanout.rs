@@ -30489,11 +30489,11 @@ fn joint_machine_flood_buried_call_balances_only_at_drain_quiescence() {
         let pid = std::process::id();
         let mut held = fixture.scene.real.h0.0.borrow_mut();
         held.io.enqueue(pid, 0, "C_SignInit", 0, 0);
+        held.io.advance_queued_tail_return_epoch();
         let mut record = held.io.script.records.pop_back().unwrap();
         record.base.event.pid_tgid |= record.base.event.pid_tgid >> 32;
         record.base.event.duration_ns = 1;
         record.base.event.target_function = p11scope_ebpf_common::FUNCTION_NONE;
-        record.base.continuity.return_stamp.epoch += 1;
         let bytes = crate::events::record_bytes(&record.base);
         drop(held);
         fixture.scene.drain.source_mut().push_record(bytes);

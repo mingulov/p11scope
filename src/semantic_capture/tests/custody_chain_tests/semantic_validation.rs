@@ -383,6 +383,14 @@ impl HeldIo {
         }
     }
 
+    /// Straddling return-epoch stain for tests outside this allowlisted
+    /// fixture: advances the queued tail record's return epoch so it sheds
+    /// at route time while consuming no private record fields outside.
+    fn advance_queued_tail_return_epoch(&mut self) {
+        let record = self.script.records.back_mut().unwrap();
+        record.base.continuity.return_stamp.epoch += 1;
+    }
+
     fn scan_proof(
         &mut self,
         image: ImageIdentity,

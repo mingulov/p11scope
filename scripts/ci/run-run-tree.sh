@@ -79,10 +79,16 @@ privileged_run_tree_non_member_provider_is_never_staged
 # The cells judge exact accounting (owner ruling 2026-11-15): every call
 # that entered after its function's first attach must be observed, so any
 # miss fails, however small. The declared signature matches only a miss
-# the report itself ties to a replace: the cell names a "replace witness"
+# with the report's replace evidence: the cell names a "replace witness"
 # (a second counter-slot row for that endpoint, or a failed replacement's
 # null attached_at_ns) and the loss fits in the calls that entered before
-# the last re-attach. Any other partial loss is an "unexplained miss";
+# the last re-attach. The witness is necessary, not sufficient: until
+# PLAN-REPLACE-GAP times its interval, another loss inside that span
+# (ring or counter loss, a later worker's late first attach) is not told
+# apart, so the declaration can mask one there; the text also says
+# whether the physical static probe gap row is present. The signature also
+# needs the cell's first panic to be that assertion (EXPECTED_ANCHORS).
+# Any other partial loss is an "unexplained miss";
 # it, overcounts, invented functions and a function that lost every call
 # (probe loss) fail under their own text, never the declared signature.
 #
@@ -117,6 +123,17 @@ EXPECTED_SIGNATURES=(
 'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
 'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
 )
+# Each signature counts only as the cell's own failing assertion: the
+# message of the log's first panic must match the entry's anchor (the
+# exact-accounting miss assertion, or the run's exit-status assertion the
+# capacity abort trips), so a signature line beside a different failure
+# never qualifies it.
+EXPECTED_ANCHORS=(
+'^exact accounting failed: \['
+"^run exits with the shell's status$"
+'^exact accounting failed: \['
+'^exact accounting failed: \['
+)
 EXPECTED_REASONS=(
 'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
 'SLOT-RECLAIM: descriptor-replaced slots of the same pinned object are never reused'
@@ -138,11 +155,15 @@ expected_index() {
 }
 
 # expected_match NAME LOG prints "INDEX<TAB>MATCH" for the first declared
-# signature of NAME that LOG contains, or nothing (status 1).
+# signature of NAME that LOG contains while the log's first panic message
+# (the line after the first "panicked at") matches that entry's anchor,
+# or nothing (status 1).
 expected_match() {
-    local i match
+    local i match panic
+    panic=$(grep -m1 -A1 'panicked at ' "$2" 2>/dev/null | sed -n 2p)
     for i in "${!EXPECTED_FAILURES[@]}"; do
         [ "${EXPECTED_FAILURES[$i]}" = "$1" ] || continue
+        printf '%s\n' "$panic" | grep -qE "${EXPECTED_ANCHORS[$i]}" || continue
         match=$(grep -m1 -oE "${EXPECTED_SIGNATURES[$i]}" "$2" 2>/dev/null | head -1)
         if [ -n "$match" ]; then
             printf '%s\t%s' "$i" "$match"
@@ -302,6 +323,19 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     LOG_BODY="exact accounting failed: [\"undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 30 of 31 that started after 1)\"]
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$arming" 101 1 False failed 'rc=101'
+    # A declared line beside a different failing assertion is no expected
+    # failure: the capacity line with another panic, or a witnessed miss
+    # text printed by a cell that then failed on something else.
+    LOG_BODY="p11scope: attach plan requires 2176 allocated slots but only 2112 are available; refusing to attach a prefix
+thread 'x' panicked at tests/run_tree.rs:1503:5:
+the reserve row is disclosed
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$never" 101 1 False failed 'rc=101'
+    LOG_BODY="exact accounting failed: [\"undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 30 of 31 that entered after its first attach at 1; replace witness: 25 slot rows, 31 calls entered before the last re-attach)\"]
+thread 'x' panicked at tests/run_tree.rs:1700:5:
+the run staged the learned provider file
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$parallel" 101 1 False failed 'rc=101'
     # ...and so does a timeout, even with a signature in the log.
     LOG_BODY='undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 1 of 2)'
     check "$never" 124 1 False failed 'TIMEOUT after 300s'

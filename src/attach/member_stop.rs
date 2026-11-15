@@ -42,6 +42,8 @@ pub(crate) struct MemberStopHooks {
     /// The process that resumes stopped members if this observer dies
     /// without its cleanup. No stop is activated without it.
     watchdog: Option<watchdog::Watchdog>,
+    /// The outcome of the one grace-period wait after the deactivation.
+    quiesced: Option<bool>,
 }
 
 /// The run cgroup tree the stops belong to: the cgroup v2 mount root
@@ -130,6 +132,7 @@ impl MemberStopHooks {
             tree,
             link: Some(link),
             watchdog: None,
+            quiesced: None,
         };
         // The watchdog runs before the hook can stop anyone.
         hooks.watchdog = Some(
@@ -139,6 +142,25 @@ impl MemberStopHooks {
         write_config(&mut hooks.ebpf, true, owned_tgid)?;
         Ok(hooks)
     }
+}
+
+/// `MEMBARRIER_CMD_GLOBAL` (`linux/membarrier.h`).
+const MEMBARRIER_CMD_GLOBAL: libc::c_long = 1;
+
+/// Waits one RCU grace period: `membarrier(MEMBARRIER_CMD_GLOBAL)` runs
+/// `synchronize_rcu()` while more than one CPU is online. The hook's
+/// program runs inside an RCU read section, so when this returns every
+/// invocation that read `active` before the deactivation has inserted
+/// its row and sent its stop, and every later one reads it inactive.
+/// False when the wait is not proven: `EINVAL` under `nohz_full`, or one
+/// online CPU (the kernel then skips the grace period).
+fn rcu_grace_period() -> bool {
+    // SAFETY: `sysconf` takes an integer name only.
+    if unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } <= 1 {
+        return false;
+    }
+    // SAFETY: `membarrier` takes integer arguments only.
+    unsafe { libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0) == 0 }
 }
 
 fn write_config(ebpf: &mut aya::Ebpf, active: bool, exempt_tgid: u32) -> Result<()> {
@@ -261,12 +283,15 @@ impl MemberStopIo for MemberStopHooks {
         .unwrap_or(0);
         let written =
             write_config(&mut self.ebpf, false, exempt).map_err(|error| format!("{error:#}"));
-        // Detached too (idempotent with `Drop`): an invocation that read
+        // Detached too (idempotent with `Drop`). An invocation that read
         // `active` before the write may still insert a row and stop a
-        // member, and the detach waits for in-flight invocations, so a
-        // release scan after this call sees every row there will be.
+        // member, and the detach does not wait for it: `quiesce` does.
         self.detach();
         written
+    }
+
+    fn quiesce(&mut self) -> bool {
+        *self.quiesced.get_or_insert_with(rcu_grace_period)
     }
 
     fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {
@@ -283,10 +308,10 @@ impl MemberStopIo for MemberStopHooks {
 }
 
 impl MemberStopHooks {
-    /// Detaches the hook: an invocation that read `active` before the
-    /// deactivation may still insert a row and stop a member, so the
-    /// final scan runs only after the detach, which waits for in-flight
-    /// invocations. The maps stay readable while `ebpf` lives.
+    /// Detaches the hook (no new invocation starts). One already running
+    /// may still insert a row and stop a member: the final scan runs
+    /// only after [`MemberStopIo::quiesce`]. The maps stay readable while
+    /// `ebpf` lives.
     fn detach(&mut self) {
         let Some(link) = self.link.take() else {
             return;
@@ -305,6 +330,31 @@ impl Drop for MemberStopHooks {
     fn drop(&mut self) {
         let _ = self.deactivate();
         self.detach();
+        let settled = self.quiesce();
+        self.release_pending(settled);
+        if !settled {
+            // A row inserted after that scan by an invocation the
+            // unproven wait did not cover.
+            self.release_pending(settled);
+        }
+        // An orderly end only when nothing is left: a row this release
+        // could not resume makes the watchdog sweep instead.
+        if let Some(watchdog) = self.watchdog.take() {
+            if self.pending().is_ok_and(|rows| rows.is_empty()) {
+                watchdog.finish();
+            } else {
+                watchdog.abandon();
+            }
+        }
+    }
+}
+
+impl MemberStopHooks {
+    /// One release scan of the pending table. Without a proven grace
+    /// period each member's maps are read before its resume: the read
+    /// takes the `mmap_lock` a hook invocation inside that member's
+    /// mapping holds, so the resume comes after that invocation's stop.
+    fn release_pending(&mut self, settled: bool) {
         let pending = self.pending().unwrap_or_default();
         for (tgid, stop) in pending {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {
@@ -325,19 +375,17 @@ impl Drop for MemberStopHooks {
                 let _ = self.withdraw(tgid);
                 continue;
             }
+            if !settled {
+                // The engine's per-member read bounds.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+                let _ = pin
+                    .open_proc_dir()
+                    .and_then(|proc| proc.read_maps(deadline, 4 * 1024 * 1024));
+            }
             // Signal first: a failed send of a live member keeps the row,
             // and the watchdog sweeps instead of ending in order.
             if pin.send_signal(libc::SIGCONT).is_ok() || matches!(pin.original_exited(), Ok(true)) {
                 let _ = self.withdraw(tgid);
-            }
-        }
-        // An orderly end only when nothing is left: a row this release
-        // could not resume makes the watchdog sweep instead.
-        if let Some(watchdog) = self.watchdog.take() {
-            if self.pending().is_ok_and(|rows| rows.is_empty()) {
-                watchdog.finish();
-            } else {
-                watchdog.abandon();
             }
         }
     }

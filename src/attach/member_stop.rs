@@ -86,8 +86,12 @@ impl RunTree {
 
 impl MemberStopHooks {
     /// Loads the object against the host BTF, publishes the run cgroup and
-    /// the owned child's exemption, validates the map shapes, attaches the
-    /// hook and only then activates it.
+    /// the owned child's exemption, validates the map shapes and attaches
+    /// the hook while it is still inactive. Only then does the watchdog
+    /// start, and the hook activates last. A failure before the watchdog
+    /// stops nobody; a failure after it drops the hooks, whose release
+    /// resumes anything already stopped and ends the watchdog in order,
+    /// so a start failure never looks like an observer death.
     pub(crate) fn start(
         cgroup: &File,
         tree: RunTree,
@@ -109,9 +113,6 @@ impl MemberStopHooks {
                 .context("publishing the run cgroup")?;
         }
         write_config(&mut ebpf, false, owned_tgid)?;
-        // The watchdog runs before the hook can stop anyone.
-        let watchdog =
-            watchdog::Watchdog::start(launcher, &tree).map_err(|error| anyhow!(error))?;
         let link = {
             let program: &mut aya::programs::FEntry = ebpf
                 .program_mut(MEMBER_STOP_PROGRAM)
@@ -124,13 +125,19 @@ impl MemberStopHooks {
                 .attach()
                 .with_context(|| format!("attaching {MEMBER_STOP_PROGRAM}"))?
         };
-        write_config(&mut ebpf, true, owned_tgid)?;
-        Ok(Self {
+        let mut hooks = Self {
             ebpf,
             tree,
             link: Some(link),
-            watchdog: Some(watchdog),
-        })
+            watchdog: None,
+        };
+        // The watchdog runs before the hook can stop anyone.
+        hooks.watchdog = Some(
+            watchdog::Watchdog::start(launcher, &hooks.tree, owned_tgid)
+                .map_err(|error| anyhow!(error))?,
+        );
+        write_config(&mut hooks.ebpf, true, owned_tgid)?;
+        Ok(hooks)
     }
 }
 
@@ -612,7 +619,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let orderly =
-            watchdog::Watchdog::start(&WatchdogLauncher::TestHarness, &RunTree::of(&group))
+            watchdog::Watchdog::start(&WatchdogLauncher::TestHarness, &RunTree::of(&group), 0)
                 .expect("a second watchdog starts");
         orderly.finish();
         std::thread::sleep(std::time::Duration::from_millis(600));

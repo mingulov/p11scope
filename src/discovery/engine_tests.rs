@@ -87567,6 +87567,45 @@ fn member_stop_counts_a_provider_attached_only_from_real_attach_stamps() {
     assert!(member_resumed_for_test(pid));
 }
 
+/// Twin: attach stamps without a live link (a stamp outlives a detach)
+/// are no attach: the hold keeps waiting.
+#[test]
+fn member_stop_counts_a_provider_attached_only_with_a_live_link() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(
+        engine.member_stops_held(),
+        "no stamp, still held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
+    let active: Vec<u32> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| engine.plan.is_active(slot.index))
+        .map(|slot| slot.index)
+        .collect();
+    assert!(!active.is_empty(), "the staging attached slots");
+    for slot in active {
+        session.scripted_stamps.insert(slot, 5);
+    }
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(
+        engine.member_stops_held(),
+        "stamped but unlinked slots are not attached: {:?}",
+        engine.member_stop_stats_for_test()
+    );
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
+}
+
 /// Twin: a provider staging that never attaches resumes the member at
 /// the hold bound and files the named first-use row (never silent,
 /// never a wedged member).

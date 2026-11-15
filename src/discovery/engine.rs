@@ -39367,8 +39367,9 @@ pub(crate) mod session_fixture {
         pub(crate) scripted_links: BTreeSet<u32>,
         pub(crate) scripted_stamps: BTreeMap<u32, u64>,
         /// When set, every slot an `attach_targets` call attaches gets this
-        /// attach-complete stamp (first stamp wins), like the real session's
-        /// per-slot completion. Unset, attaches leave no stamp.
+        /// attach-complete stamp (first stamp wins) and a live link, like
+        /// the real session's per-slot completion. Unset, attaches leave
+        /// neither.
         pub(crate) stamp_attached_slots: Option<u64>,
         /// Scripted revival probe: retired slots reported physically
         /// detached, and detached slots reported counts-final. Empty
@@ -40094,6 +40095,7 @@ pub(crate) mod session_fixture {
                     .filter(|slot| !self.fail_target_slots.contains(&slot.index))
                 {
                     self.scripted_stamps.entry(slot.index).or_insert(stamp);
+                    self.scripted_links.insert(slot.index);
                 }
             }
             Ok((

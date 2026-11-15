@@ -1242,7 +1242,8 @@ impl Engine {
     /// Whether the provider file `identity` (its `(st_dev, st_ino)`) is
     /// attached: the plan holds at least one active slot on a pinned object
     /// of that file, and every such slot carries a real attach-complete
-    /// stamp from the session (current, or its attach key's first).
+    /// stamp from the session (current, or its attach key's first) and is
+    /// covered by a live session link (a stamp outlives a detach).
     fn provider_object_attached(&self, identity: (u64, u64), session: &dyn EngineSession) -> bool {
         use std::os::unix::fs::MetadataExt as _;
         let mut objects: BTreeMap<crate::discovery::identity::PinnedObjectId, bool> =
@@ -1264,11 +1265,11 @@ impl Engine {
                 continue;
             }
             any = true;
-            if session.slot_attached_at(slot.index).is_none()
-                && session
+            let stamped = session.slot_attached_at(slot.index).is_some()
+                || session
                     .key_first_attach(crate::plan::AttachKey::of(slot))
-                    .is_none()
-            {
+                    .is_some();
+            if !stamped || !session.has_slot_link(slot.index) {
                 return false;
             }
         }

@@ -33698,31 +33698,124 @@ fn an_interface_getter_credits_only_its_own_object() {
     ));
 }
 
-/// One getter-only and one walking manifest on one object: the getter is
-/// not part of the exact walked set, so an agreeing walk stays agreed
-/// (twin: `a_late_scan_that_agrees_is_recorded_as_agreed_not_as_a_conflict`).
+/// Each manifest describing one object is judged on its own and the
+/// object keeps the weakest reading: a getter-only manifest is agreed only
+/// where a decoded table holds its getter, never by a sibling's walk or a
+/// sibling's getter, and it never manufactures a conflict.
 #[test]
-fn a_getter_only_sibling_does_not_turn_an_agreeing_walk_into_a_conflict() {
-    let fixture = ScanManifestFixture::new();
-    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
-    let mut getter_only = with_getters(input.manifest.clone(), &[("C_GetFunctionList", 0, 0x80)]);
-    getter_only.surfaces.clear();
-    assert!(crate::manifest_input::is_getter_only(&getter_only));
-    let sibling = ManifestInput {
-        path: PathBuf::from("getter.json"),
-        manifest: getter_only,
-        pins: input.pins.clone(),
-        stale: Vec::new(),
+fn every_manifest_on_one_object_is_corroborated_on_its_own() {
+    let corroboration = |getters: &[u64], walking: bool| {
+        let fixture = ScanManifestFixture::new();
+        let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+        let getter_only = |offset: u64| {
+            let mut manifest =
+                with_getters(input.manifest.clone(), &[("C_GetFunctionList", 0, offset)]);
+            manifest.surfaces.clear();
+            assert!(crate::manifest_input::is_getter_only(&manifest));
+            ManifestInput {
+                path: PathBuf::from(format!("getter-{offset:#x}.json")),
+                manifest,
+                pins: input.pins.clone(),
+                stale: Vec::new(),
+            }
+        };
+        let mut inputs: Vec<ManifestInput> = getters.iter().map(|o| getter_only(*o)).collect();
+        if walking {
+            inputs.insert(0, input);
+        }
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, inputs);
+        blinded_attach_time_corroboration(&mut engine);
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.discovery.conflicts, 0, "getters={getters:?}");
+        engine.discovery.modules[0].corroboration.clone()
     };
-    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input, sibling]);
-    blinded_attach_time_corroboration(&mut engine);
+    // The walk agrees; a getter-only sibling whose getter the table holds.
+    assert_eq!(corroboration(&[0x40], true), ["agreed"]);
+    // The sibling's getter is not in the table: it is not corroborated,
+    // and the object does not read agreed on the walk's word.
+    assert_eq!(corroboration(&[0x80], true), ["uncorroborated"]);
+    // Two getter-only manifests: one getter in the table does not vouch
+    // for the other manifest.
+    assert_eq!(corroboration(&[0x40], false), ["agreed"]);
+    assert_eq!(corroboration(&[0x40, 0x80], false), ["uncorroborated"]);
+}
 
-    engine.publish_current_capture_facts().unwrap();
+/// A dynamically linked program in a multi-process scope that owns no
+/// provider module stays unarmed; one that maps a manifest getter's
+/// object needs its loader armed for the getter's owner, so it is ungated
+/// and rescanned instead of failing the getter.
+#[test]
+fn a_gated_dynamic_view_with_manifest_getters_is_armed_on_the_next_scan() {
+    let sleeps = e06_spawn_sleeps(1);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    assert!(engine.loader_arming_gated(view), "provider-free: gated");
+    assert!(engine.loader_registry.ids_for_view(view).is_empty());
+    engine.refresh_requested.remove(&pid);
+    let owner = engine.manifest_getter_context(view);
+    assert!(owner.is_ok(), "{:?}", owner.err());
+    assert!(engine.manifest_getter_context_cached(view).is_none());
+    assert!(!engine.loader_arming_gated(view), "the getter ungates it");
+    assert!(engine.refresh_requested.contains_key(&pid));
+    // The requested scan arms its loader, which then owns the getters.
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the next scan armed the getter view's loader"
+    );
+    // A released id does not carry the ungating to a later view.
+    engine.release_view_id(view);
+    assert!(!engine.getter_loader_views.contains(&view));
+}
 
-    assert_eq!(engine.discovery.conflicts, 0);
-    assert_eq!(engine.discovery.uncorroborated, 0);
-    let module = &engine.discovery.modules[0];
-    assert_eq!(module.corroboration, vec!["agreed"], "{module:?}");
+/// A view whose manifest getter work a closed or spent pass skipped is
+/// requested again even with no loader context (a static program's owner
+/// is view-owned); a settled view is not.
+#[test]
+fn skipped_manifest_getter_views_are_requested_without_a_loader_context() {
+    let sleeps = e06_spawn_sleeps(1);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    assert!(engine.loader_registry.ids_for_view(view).is_empty());
+    let incomplete = BTreeSet::from([view]);
+    engine.refresh_requested.remove(&pid);
+    // No getter manifest: nothing to redo for an unarmed view.
+    engine.request_skipped_export_views(&incomplete);
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    accept_a_manifest_getter(&mut engine);
+    engine.getter_sites_settled.insert(view);
+    engine.request_skipped_export_views(&incomplete);
+    assert!(!engine.refresh_requested.contains_key(&pid), "settled");
+    engine.getter_sites_settled.remove(&view);
+    engine.request_skipped_export_views(&incomplete);
+    assert!(engine.refresh_requested.contains_key(&pid));
+}
+
+/// A failed orphan detach fails the pass closed like a retirement's does,
+/// and the tick drains orphans even when no view runs a getter pass.
+#[test]
+fn a_failed_orphan_getter_detach_leaves_the_pass_incomplete() {
+    let mut engine = Engine::empty();
+    accept_a_manifest_getter(&mut engine);
+    let context = LoaderContextId::view_owned(0).unwrap();
+    engine.orphaned_getter_contexts.push(context);
+    let mut session = ScriptedSession::default();
+    session.detach_failed = true;
+    let mut additions_allowed = true;
+    let outcome =
+        engine.attach_manifest_getters(ProcessViewId(9), &mut session, &mut additions_allowed);
+    assert_eq!(session.detached, vec![context]);
+    assert!(!additions_allowed);
+    assert!(!outcome.1, "the pass is incomplete");
+    assert!(!engine.getter_sites_settled.contains(&ProcessViewId(9)));
 }
 
 /// The settled cache skips the per-tick maps read only until the view is

@@ -680,7 +680,7 @@ usage or ELF error. You can also write the manifest yourself: it is a
 `{"name": ..., "resolution": {"status": "resolved", "object": ID,
 "file_offset": N}}` records with `surfaces: []`; the field is optional and
 manifests without it are unchanged. Each name may appear once, must be one
-of the three standard getters, must resolve to a listed object inside one
+of the three standard getters, must resolve to the `module_path` object inside one
 of its executable segments, and no two getters may share one location. Manifest trust is unchanged: the file is
 pinned, its SHA-256 and identity must match the mapped program, and a
 getter named beside a walked surface must agree with that surface's

@@ -3092,6 +3092,9 @@ a silent drop.
     selection;
   - the getters attach in the capture's initial and refresh passes; a
     provider a `run` child loads later gets them at the next rescan;
+  - under `--system` or a cgroup scope, a dynamically linked program
+    that owns no other provider gets its getters at its next scan, once
+    its loader is armed; calls before then fall in the named window;
   - a getter that returns a table outside the program's file data
     (heap or anonymous memory) is refused with a named gap;
   - a process that already called the getter before the capture started

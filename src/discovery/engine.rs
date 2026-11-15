@@ -1060,6 +1060,10 @@ pub struct Engine {
     /// (all mapped getters hooked, or none mapped): skipped until a rescan,
     /// retirement or release, so a tick reads no maps for them.
     getter_sites_settled: BTreeSet<ProcessViewId>,
+    /// Dynamically linked views a manifest getter needs a loader context
+    /// in: exempt from ownership-gated arming (`loader_arming_gated`)
+    /// until released, so the next scan arms them.
+    getter_loader_views: BTreeSet<ProcessViewId>,
     /// The deduplicated bound-context set behind `loader_discovery`'s
     /// strategy/timing/capture counts (design §9.2). Keyed by the exact
     /// internal `{process generation, bound identity state, load kind}` — so
@@ -6044,6 +6048,17 @@ struct PauseClosure {
     required_complete: bool,
 }
 
+/// Who owns a view's manifest getter hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetterOwner {
+    /// The view's unique attached loader context, or its view-owned id.
+    Context(LoaderContextId),
+    /// The group is ending: no hook is needed.
+    Ending,
+    /// A gated dynamic view: its loader arms on the requested next scan.
+    AwaitLoader,
+}
+
 impl PauseClosure {
     fn new(additions_allowed: bool) -> Self {
         Self {
@@ -7047,10 +7062,10 @@ pub(crate) fn retarget_to_pins(
 /// derived with the scan already in hand, and an `identity_mismatch` or
 /// `object_fallback` is a decision, not a gap waiting to be filled.
 ///
-/// ponytail: one re-derived outcome per opened object, not per `--manifest` —
-/// the recorded outcome does not carry which manifest produced it, and every
-/// manifest naming one object shares that object's scan side. Split it per
-/// manifest if two manifests ever describe one object with different offsets.
+/// One re-derived outcome per opened object: the recorded outcome does not
+/// carry which manifest produced it. Walking manifests are compared as one
+/// union; each getter-only manifest is judged on its own, and the object
+/// keeps the weakest reading ([`weakest_corroboration`]).
 fn recorroborate_at_capture_end(
     pinned: &PinnedObjects,
     modules: &[ReconciledModule],
@@ -7088,48 +7103,84 @@ fn recorroborate_at_capture_end(
             .iter()
             .filter(|manifest| manifest_module_object(manifest, pinned) == Some(*object))
             .collect();
-        // Getter-only manifests claim only where their getters are: the
-        // scan corroborates them when its tables hold each getter there.
-        let getter_only = describing
-            .iter()
-            .all(|manifest| crate::manifest_input::is_getter_only(manifest));
-        // Beside a walked sibling, a getter-only manifest's getters are not
-        // part of the exact walked set: a table that lacks a getter says
-        // nothing against it, so they would only manufacture a Conflict.
-        let Some(own_targets) = describing
-            .iter()
-            .filter(|manifest| getter_only || !crate::manifest_input::is_getter_only(manifest))
-            .map(|manifest| manifest_targets(manifest, pinned))
-            .collect::<Option<Vec<_>>>()
-            .filter(|sets| !sets.is_empty())
-            .map(|sets| sets.into_iter().flatten().collect())
-        else {
-            continue;
-        };
         let scan_empty = scanned
             .iter()
             .flat_map(|module| &module.tables)
             .all(|table| table.entries.is_empty());
-        derived.insert(
-            *object,
-            corroborate_manifest(
-                getter_only,
-                false,
-                // Scan and manifest resolved to one opened object, so the
-                // identity comparison already succeeded.
-                Some(true),
-                |getter_only| {
-                    if getter_only {
-                        pinned.shares_targets(&scan_targets, pinned, &own_targets)
-                    } else {
-                        pinned.exactly_same_targets(&scan_targets, pinned, &own_targets)
-                    }
-                },
-                scan_empty,
-            ),
-        );
+        let (getter_only, walking): (Vec<&Manifest>, Vec<&Manifest>) = describing
+            .iter()
+            .partition(|manifest| crate::manifest_input::is_getter_only(manifest));
+        // Walking manifests keep the exact-set rule over their union. Each
+        // getter-only manifest claims only where its own getters are, so it
+        // is judged on its own: a table holding a sibling's getter, or a
+        // sibling's agreeing walk, never vouches for it, and a table that
+        // lacks its getter says nothing against it.
+        let mut outcomes = Vec::new();
+        if !walking.is_empty() {
+            let Some(own_targets) = walking
+                .iter()
+                .map(|manifest| manifest_targets(manifest, pinned))
+                .collect::<Option<Vec<_>>>()
+                .map(|sets| sets.into_iter().flatten().collect())
+            else {
+                continue;
+            };
+            outcomes.push((false, own_targets));
+        }
+        // A manifest with no comparable target set leaves the recorded
+        // outcome standing for the whole object, as a walk's does.
+        let Some(getter_targets) = getter_only
+            .iter()
+            .map(|manifest| manifest_targets(manifest, pinned))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        outcomes.extend(getter_targets.into_iter().map(|targets| (true, targets)));
+        let Some(outcome) = outcomes
+            .into_iter()
+            .map(|(getter_only, own_targets)| {
+                corroborate_manifest(
+                    getter_only,
+                    false,
+                    // Scan and manifest resolved to one opened object, so
+                    // the identity comparison already succeeded.
+                    Some(true),
+                    |getter_only| {
+                        if getter_only {
+                            pinned.shares_targets(&scan_targets, pinned, &own_targets)
+                        } else {
+                            pinned.exactly_same_targets(&scan_targets, pinned, &own_targets)
+                        }
+                    },
+                    scan_empty,
+                )
+            })
+            .reduce(weakest_corroboration)
+        else {
+            continue;
+        };
+        derived.insert(*object, outcome);
     }
     derived
+}
+
+/// The one outcome an object keeps when several manifests describe it: a
+/// conflict stands; otherwise the least corroborated reading, so no
+/// manifest reads agreed on another's evidence.
+fn weakest_corroboration(left: Corroboration, right: Corroboration) -> Corroboration {
+    let rank = |outcome| match outcome {
+        Corroboration::Conflict => 0,
+        Corroboration::IdentityMismatch => 1,
+        Corroboration::Uncorroborated => 2,
+        Corroboration::ScanEmpty => 3,
+        Corroboration::Agreed => 4,
+    };
+    if rank(left) <= rank(right) {
+        left
+    } else {
+        right
+    }
 }
 
 fn corroboration_corroborates(outcome: Corroboration) -> bool {
@@ -13570,6 +13621,7 @@ impl Engine {
             next_view_getter_context: 0,
             orphaned_getter_contexts: Vec::new(),
             getter_sites_settled: BTreeSet::new(),
+            getter_loader_views: BTreeSet::new(),
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
@@ -15581,6 +15633,7 @@ impl Engine {
         // owner hands it to the next Session pass for detach; the id never
         // carries it to a later view.
         self.getter_sites_settled.remove(&id);
+        self.getter_loader_views.remove(&id);
         // Its selection bindings fail closed now, as a retirement's do: a
         // C_GetInterface selection on the released view is never reported
         // as silently covered by a hook that is about to be detached.
@@ -24671,15 +24724,16 @@ impl Engine {
     /// The attach owner for `view`'s manifest getter hooks: its unique
     /// attached loader context, or — only for a process with no loader
     /// to arm (no `PT_INTERP`: a statically linked program) — a
-    /// view-owned id that retires with the view. `Err` carries the named
-    /// reason no owner exists; `Ok(None)` means the group is ending and
-    /// needs no hook.
+    /// view-owned id that retires with the view. A dynamically linked
+    /// process the scope left unarmed awaits its loader (see
+    /// [`GetterOwner::AwaitLoader`]). `Err` carries the named reason no
+    /// owner exists.
     fn manifest_getter_context(
         &mut self,
         view: ProcessViewId,
-    ) -> Result<Option<LoaderContextId>, &'static str> {
+    ) -> Result<GetterOwner, &'static str> {
         if let Some(context) = self.view_getter_contexts.get(&view) {
-            return Ok(Some(*context));
+            return Ok(GetterOwner::Context(*context));
         }
         let contexts: Vec<_> = self
             .loader_registry
@@ -24694,25 +24748,35 @@ impl Engine {
             })
             .collect();
         match contexts.as_slice() {
-            [context] => return Ok(Some(*context)),
+            [context] => return Ok(GetterOwner::Context(*context)),
             [] => {}
             _ => return Err("a manifest getter's process had no unique attached loader context"),
         }
         if self.original_ending(view) {
-            return Ok(None);
+            return Ok(GetterOwner::Ending);
         }
         let Some(position) = self
             .views
             .iter()
             .position(|candidate| candidate.id() == view)
         else {
-            return Ok(None);
+            return Ok(GetterOwner::Ending);
         };
         if !self.loader_registry.ids_for_view(view).is_empty() {
             return Err("a manifest getter's process had no unique attached loader context");
         }
         match Self::loader_locator(&self.views[position], &mut self.budget) {
             Ok(None) => {}
+            // A dynamically linked program the multi-process scope left
+            // unarmed (it owns no provider module): arm its loader on the
+            // next scan, which then owns the getter hooks. A refused
+            // request stays owed (`request_refresh`).
+            Ok(Some(_)) if self.loader_arming_gated(view) => {
+                self.getter_loader_views.insert(view);
+                let pid = self.views[position].pid();
+                self.request_refresh(pid, crate::attach::monotonic_ns());
+                return Ok(GetterOwner::AwaitLoader);
+            }
             Ok(Some(_)) => {
                 return Err("a manifest getter's process had no unique attached loader context");
             }
@@ -24728,7 +24792,7 @@ impl Engine {
         };
         self.next_view_getter_context = next;
         self.view_getter_contexts.insert(view, context);
-        Ok(Some(context))
+        Ok(GetterOwner::Context(context))
     }
 
     /// Attaches the manifest-located getter hooks for `view`. The getter's
@@ -24749,13 +24813,16 @@ impl Engine {
         {
             return (false, true, false, false);
         }
-        self.detach_orphaned_getter_contexts(session, additions_allowed);
+        // A failed orphan detach fails this pass closed, as a retirement's
+        // failed detach does.
+        let orphans_detached = self.detach_orphaned_getter_contexts(session, additions_allowed);
         // Settled since its last scan: every mapped getter is hooked (or
         // none is mapped). Only a rescan changes that, so no maps read.
         if self.getter_sites_settled.contains(&view) {
-            return (false, true, false, false);
+            return (false, orphans_detached, false, false);
         }
-        let outcome = self.attach_manifest_getters_unsettled(view, session, additions_allowed);
+        let mut outcome = self.attach_manifest_getters_unsettled(view, session, additions_allowed);
+        outcome.1 &= orphans_detached;
         if outcome.1 && !outcome.2 {
             self.getter_sites_settled.insert(view);
         }
@@ -24767,15 +24834,20 @@ impl Engine {
         self.view_getter_contexts.get(&view).copied()
     }
 
-    /// Detaches the getter owners of views released without retirement.
+    /// Detaches the getter owners of views released without retirement;
+    /// false when a detach failed (named, and additions closed). A failed
+    /// owner is not retried: its bindings retired at release, and a record
+    /// its hooks still publish names a view that no longer owns them.
     fn detach_orphaned_getter_contexts(
         &mut self,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
-    ) {
+    ) -> bool {
+        let mut detached = true;
         for context in std::mem::take(&mut self.orphaned_getter_contexts) {
             let (_, detach_failed) = session.detach_dynamic_context(context);
             if detach_failed {
+                detached = false;
                 *additions_allowed = false;
                 self.mark_partial(
                     "live manifest getter detach",
@@ -24783,6 +24855,7 @@ impl Engine {
                 );
             }
         }
+        detached
     }
 
     fn attach_manifest_getters_unsettled(
@@ -24824,11 +24897,14 @@ impl Engine {
             return (false, complete, false, false);
         }
         let context = match self.manifest_getter_context(view) {
-            Ok(Some(context)) => context,
-            Ok(None) => {
+            Ok(GetterOwner::Context(context)) => context,
+            Ok(GetterOwner::Ending) => {
                 self.invalidate_causal_timing();
                 return (false, complete, false, false);
             }
+            // Skipped, not settled: the requested scan arms the loader and
+            // a later pass attaches the getters under it.
+            Ok(GetterOwner::AwaitLoader) => return (false, false, true, false),
             Err(reason) => {
                 self.mark_partial("live manifest getter hook", reason);
                 return (false, false, false, false);
@@ -24956,15 +25032,20 @@ impl Engine {
     /// Requests every still-current armed view whose export work the attach
     /// skipped, shared by startup and tick attach. The next tick rescans
     /// and re-attaches its exports, retiring its loader context before
-    /// arming again — no double-arm, no lost generation (C2).
+    /// arming again — no double-arm, no lost generation (C2). A view whose
+    /// manifest getter sites are not settled is requested too, armed or
+    /// not: a static program's getter owner is view-owned, so it has no
+    /// loader context, and nothing else would revisit it.
     fn request_skipped_export_views(&mut self, incomplete: &BTreeSet<ProcessViewId>) {
+        let getters_pending = self.getter_manifest_active();
         let pids: Vec<_> = self
             .views
             .iter()
             .filter(|view| {
                 incomplete.contains(&view.id())
                     && view.still_the_same()
-                    && !self.loader_registry.ids_for_view(view.id()).is_empty()
+                    && (!self.loader_registry.ids_for_view(view.id()).is_empty()
+                        || (getters_pending && !self.getter_sites_settled.contains(&view.id())))
             })
             .map(ProcessView::pid)
             .collect();
@@ -25834,7 +25915,7 @@ impl Engine {
         // the pause follows its exec chain as it did when runs were
         // exact-PID captures. Every other provider-free member view
         // stays exploratory.
-        if self.owned_run_view(view_id) {
+        if self.owned_run_view(view_id) || self.getter_loader_views.contains(&view_id) {
             return false;
         }
         // Owned run-tree members all arm (E1): the run owns the whole
@@ -32907,6 +32988,11 @@ impl Engine {
                     .iter()
                     .map(|position| tick_view_ids[*position])
                     .collect();
+                // Released getter owners detach every tick, not only when a
+                // refreshed view runs a getter pass.
+                if !self.detach_orphaned_getter_contexts(session, additions_allowed) {
+                    closure.fail();
+                }
                 for view in export_order {
                     // H-1: export attach left for the next frame is requested
                     // the way skipped export work already is.

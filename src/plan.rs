@@ -12063,6 +12063,31 @@ mod tests {
         );
     }
 
+    /// A getter locates code in the manifest's own module: a getter in a
+    /// listed dependency would hook code the module record does not own
+    /// (twin: the same getter in the module is accepted).
+    #[test]
+    fn a_getter_outside_the_module_object_is_refused() {
+        let mut m = getter_only_manifest(&[("C_GetInterface", 0x1b00)]);
+        let mut dependency = m.objects[0].clone();
+        dependency.id = 1;
+        dependency.path = "/opt/libdependency.so".into();
+        m.objects.push(dependency);
+        let mut provenance = m.provenance_objects[0].clone();
+        provenance.path = "/opt/libdependency.so".into();
+        provenance.inode += 1;
+        m.provenance_objects.push(provenance);
+        let outside =
+            |problems: &[String]| problems.iter().any(|p| p.contains("outside the module"));
+        assert!(!outside(&crate::manifest_input::validate_structure(&m)));
+        m.getters[0].resolution = Resolution::Resolved {
+            object: 1,
+            file_offset: 0x1b00,
+        };
+        let problems = crate::manifest_input::validate_structure(&m);
+        assert!(outside(&problems), "{problems:?}");
+    }
+
     #[test]
     fn getter_only_manifest_is_a_valid_trusted_input() {
         // All three owner shapes: only the legacy getter, only the

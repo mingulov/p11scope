@@ -874,6 +874,11 @@ fn validate_getters(m: &Manifest, object_ids: &BTreeSet<u32>, problems: &mut Vec
         ));
         return;
     }
+    let module_object = m
+        .objects
+        .iter()
+        .find(|object| object.path == m.module_path)
+        .map(|object| object.id);
     let mut names = BTreeSet::new();
     let mut locations = BTreeSet::new();
     for getter in &m.getters {
@@ -899,6 +904,14 @@ fn validate_getters(m: &Manifest, object_ids: &BTreeSet<u32>, problems: &mut Vec
         if !object_ids.contains(&object) {
             problems.push(format!(
                 "getter {} refers to missing object id {object}",
+                getter.name
+            ));
+        } else if module_object != Some(object) {
+            // The module is the provider the getter's table belongs to:
+            // its owner, its module ID and its interface fact.
+            problems.push(format!(
+                "getter {} resolves outside the module (object {object}); \
+                 a getter must locate code in the module's own object",
                 getter.name
             ));
         }

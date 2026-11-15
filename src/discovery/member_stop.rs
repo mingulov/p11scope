@@ -208,6 +208,16 @@ fn process_gone(tgid: u32) -> bool {
     )
 }
 
+/// Sends `SIGCONT` to a process number (no pidfd could be opened).
+fn signal_by_number(tgid: u32) -> std::io::Result<()> {
+    let pid = i32::try_from(tgid).map_err(|_| std::io::Error::from_raw_os_error(libc::ESRCH))?;
+    // SAFETY: `kill` takes a process number and a signal only.
+    if unsafe { libc::kill(pid, libc::SIGCONT) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Whether a process that started at `start_ticks` (`/proc` starttime,
 /// on the boot clock) already existed at the kernel stop stamped
 /// `stop_ns` (on the monotonic clock): its age on the boot clock is at
@@ -896,14 +906,26 @@ impl Engine {
     /// unreadable too) the run-tree read does not place it outside;
     /// doubt resumes. A process proven born after the stop (a reused
     /// number) is never signalled. The member's files stay unproven and
-    /// uncleared, so the named first-use gap row is filed.
+    /// uncleared, so the named first-use gap row is filed. When a pin
+    /// with signal authority can be opened now, the checks read the
+    /// pinned process and the signal goes through its pidfd, so the
+    /// number cannot be reused between the check and the signal; only
+    /// without one is the number signalled.
     fn force_resume(&mut self, io: &mut dyn MemberStopIo, tgid: u32, stop_ns: u64, why: &str) {
         if process_gone(tgid) {
             let _ = io.withdraw(tgid);
             self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
             return;
         }
-        let original = match crate::process::process_start_time(tgid) {
+        let pin = self
+            .open_member_pin(tgid)
+            .ok()
+            .filter(|pin| pin.probe_signal_authority().is_ok());
+        let start = match pin.as_ref().and_then(crate::process::PidPin::start_time) {
+            Some(start) => Ok(start),
+            None => crate::process::process_start_time(tgid),
+        };
+        let original = match start {
             Ok(start) => born_before_stop(start, stop_ns),
             Err(_) => io.tgid_in_run_tree(tgid) != Ok(false),
         };
@@ -913,12 +935,18 @@ impl Engine {
                 self.member_stops.stats.not_members.saturating_add(1);
             return;
         }
-        let Ok(pid) = i32::try_from(tgid) else {
-            return;
-        };
-        // SAFETY: `kill` takes a process number and a signal only.
-        if unsafe { libc::kill(pid, libc::SIGCONT) } != 0 {
-            let error = std::io::Error::last_os_error();
+        if let Some(pin) = &pin {
+            if let Err(error) = pin.send_signal(libc::SIGCONT) {
+                if matches!(pin.original_exited(), Ok(true)) {
+                    let _ = io.withdraw(tgid);
+                    self.member_stops.stats.departed =
+                        self.member_stops.stats.departed.saturating_add(1);
+                } else {
+                    self.keep_for_retry(tgid, stop_ns, &format!("forced resume refused: {error}"));
+                }
+                return;
+            }
+        } else if let Err(error) = signal_by_number(tgid) {
             if error.raw_os_error() == Some(libc::ESRCH) {
                 let _ = io.withdraw(tgid);
                 self.member_stops.stats.departed =

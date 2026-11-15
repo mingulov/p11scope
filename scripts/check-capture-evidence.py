@@ -2780,6 +2780,14 @@ def exact_prearm_keys(module):
             attached is None or u64(attached),
             f"invalid attached_at_ns: {module}",
         )
+    if "first_attached_at_ns" in module:
+        first = module["first_attached_at_ns"]
+        require(u64(first), f"invalid first_attached_at_ns: {module}")
+        attached = module.get("attached_at_ns")
+        require(
+            attached is not None and first <= attached,
+            f"first_attached_at_ns after attached_at_ns: {module}",
+        )
     if "unobserved_windows" in module:
         windows = module["unobserved_windows"]
         require(isinstance(windows, list), f"invalid unobserved_windows: {module}")

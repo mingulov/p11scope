@@ -598,6 +598,7 @@ impl PrearmState {
         records: &mut [crate::render::DiscoveredModule],
         plan: &crate::plan::AttachPlan,
         attached: &BTreeMap<u32, u64>,
+        first_attached: &BTreeMap<AttachKey, u64>,
         proofs: &BTreeMap<PinnedObjectId, ExactnessProof>,
     ) {
         let objects: BTreeMap<crate::plan::ModuleId, PinnedObjectId> = plan
@@ -633,6 +634,7 @@ impl PrearmState {
                     .max(),
             };
             record.attached_at_ns = Some(attached_at);
+            record.first_attached_at_ns = first_attached_at(plan, first_attached, record.id, watch);
             let Some(attached_at) = attached_at else {
                 continue;
             };
@@ -692,6 +694,38 @@ impl PrearmState {
             }
         }
     }
+}
+
+/// The module's first complete attach instant: per endpoint, the first
+/// attach-complete stamp over every slot that ever held that attach point
+/// (`first_attached`, kept by the session: a replaced probe keeps its first
+/// instant); then the maximum over the endpoints. The endpoints are the
+/// watch's declared set, else every attach point of the module's current
+/// slots. `None` when any endpoint never carried a stamp.
+fn first_attached_at(
+    plan: &crate::plan::AttachPlan,
+    first_attached: &BTreeMap<AttachKey, u64>,
+    module: crate::plan::ModuleId,
+    watch: Option<&PrearmWatch>,
+) -> Option<u64> {
+    let endpoints: BTreeSet<AttachKey> = match watch {
+        Some(watch) => watch.declared.iter().copied().collect(),
+        None => plan
+            .slots
+            .iter()
+            .filter(|slot| slot.module_ids.contains(&module))
+            .map(AttachKey::of)
+            .collect(),
+    };
+    if endpoints.is_empty() {
+        return None;
+    }
+    let mut latest: Option<u64> = None;
+    for key in &endpoints {
+        let first = first_attached.get(key).copied()?;
+        latest = Some(latest.map_or(first, |known| known.max(first)));
+    }
+    latest
 }
 
 #[cfg(test)]
@@ -989,6 +1023,7 @@ mod tests {
             watch: None,
             attached_at_ns: None,
             unobserved_windows: None,
+            first_attached_at_ns: None,
             first_loaded_by: None,
         }
     }
@@ -1006,6 +1041,7 @@ mod tests {
             &plan,
             &BTreeMap::from([(0, 900)]),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         assert_eq!(records[0].attached_at_ns, Some(Some(900)));
         assert_eq!(
@@ -1016,6 +1052,33 @@ mod tests {
                 reason: UnobservedReason::PreAttach,
             }]),
         );
+    }
+
+    /// A probe replaced mid-capture (a new slot at the same attach point)
+    /// moves `attached_at_ns` to the replacement while the first complete
+    /// attach instant stays at the first stamps: per endpoint the
+    /// earliest, then the latest endpoint. An endpoint that never attached
+    /// leaves the first attach unknown.
+    #[test]
+    fn assembly_keeps_the_first_attach_across_a_replaced_probe() {
+        let mut plan =
+            crate::plan::AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 7, 0x2000, 3)]);
+        plan.modules = vec![module(3, 7)];
+        let mut state = PrearmState::empty();
+        state.set_scope_start_ns(Some(50));
+        // Both current slots were (re)attached late (900, 950); the
+        // session's first stamps per attach point stayed at 100 and 120.
+        let current = BTreeMap::from([(0, 900), (1, 950)]);
+        let first = BTreeMap::from([(key(7, 0x1000), 100), (key(7, 0x2000), 120)]);
+        let mut records = vec![record(3, vec!["scan"])];
+        state.assemble(&mut records, &plan, &current, &first, &BTreeMap::new());
+        assert_eq!(records[0].attached_at_ns, Some(Some(950)));
+        assert_eq!(records[0].first_attached_at_ns, Some(120));
+        // An endpoint without a first stamp leaves the first attach unknown.
+        let partial = BTreeMap::from([(key(7, 0x1000), 100)]);
+        let mut records = vec![record(3, vec!["scan"])];
+        state.assemble(&mut records, &plan, &current, &partial, &BTreeMap::new());
+        assert_eq!(records[0].first_attached_at_ns, None);
     }
 
     #[test]
@@ -1030,6 +1093,7 @@ mod tests {
             &mut records,
             &plan,
             &BTreeMap::from([(0, 900)]),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
         assert_eq!(
@@ -1058,7 +1122,13 @@ mod tests {
             },
         )]);
         let mut records = vec![record(3, vec!["scan"])];
-        state.assemble(&mut records, &plan, &BTreeMap::from([(0, 900)]), &proofs);
+        state.assemble(
+            &mut records,
+            &plan,
+            &BTreeMap::from([(0, 900)]),
+            &BTreeMap::new(),
+            &proofs,
+        );
         assert_eq!(records[0].attached_at_ns, Some(Some(900)));
         assert_eq!(records[0].unobserved_windows, Some(Vec::new()));
     }
@@ -1080,7 +1150,13 @@ mod tests {
             },
         )]);
         let mut records = vec![record(3, vec!["scan"])];
-        state.assemble(&mut records, &plan, &BTreeMap::from([(0, 900)]), &proofs);
+        state.assemble(
+            &mut records,
+            &plan,
+            &BTreeMap::from([(0, 900)]),
+            &BTreeMap::new(),
+            &proofs,
+        );
         assert!(records[0].unobserved_windows.as_ref().is_some_and(
             |windows| windows.len() == 1 && windows[0].reason == UnobservedReason::PreAttach
         ),);
@@ -1105,6 +1181,7 @@ mod tests {
             &mut records,
             &plan,
             &BTreeMap::from([(0, 900), (1, 1200)]),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
         // Declared-set max only: the undeclared attach is disclosed, never
@@ -1146,7 +1223,13 @@ mod tests {
                 .watches
                 .insert(PinnedObjectId(7), watched(BTreeSet::from([a, b])));
             let mut records = vec![record(3, vec!["scan", "prearm"])];
-            state.assemble(&mut records, &plan, &attached, &BTreeMap::new());
+            state.assemble(
+                &mut records,
+                &plan,
+                &attached,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
             assert_eq!(records[0].attached_at_ns, Some(None));
             assert_eq!(records[0].unobserved_windows, None);
         }
@@ -1170,6 +1253,7 @@ mod tests {
             &mut records,
             &plan,
             &BTreeMap::from([(0, 900)]),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
         assert_eq!(records[0].attached_at_ns, Some(Some(900)));
@@ -1200,6 +1284,7 @@ mod tests {
             &mut records,
             &plan,
             &BTreeMap::from([(0, 900)]),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
         assert_eq!(records[0].attached_at_ns, Some(Some(900)));

@@ -1206,6 +1206,16 @@ pub struct DiscoveredModule {
     /// explicitly empty list reads as exact only with an R2-D1-6 proof.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unobserved_windows: Option<Vec<UnobservedWindow>>,
+    /// First complete attach instant, `CLOCK_MONOTONIC`, merged at evidence
+    /// assembly: for each endpoint (the declared set under a watch, else
+    /// every attach point of the module) the earliest real stamp over
+    /// every slot the plan ever held for it, then the maximum over the
+    /// endpoints. `attached_at_ns` reads the current slots, so a probe
+    /// replaced mid-capture moves it later; this instant stays at the
+    /// first attach. Calls after it are observed unless another disclosed
+    /// window says otherwise. Absent when any endpoint never attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_attached_at_ns: Option<u64>,
     /// Who first loaded this file, learned modules only. `None` — and
     /// absent on the wire — for every module no learn event staged.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8214,6 +8224,7 @@ pub(crate) mod tests {
             watch: None,
             attached_at_ns: None,
             unobserved_windows: None,
+            first_attached_at_ns: None,
             first_loaded_by: None,
             tables: vec![crate::plan::TableSummary {
                 version: (2, 40),

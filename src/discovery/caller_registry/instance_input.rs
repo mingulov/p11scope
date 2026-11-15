@@ -3434,7 +3434,7 @@ impl CallerRegistry {
                 caller: Some(input.caller),
                 module: None,
                 pid: None,
-                subject: "Joint key operations unavailable; retained S1".into(),
+                subject: crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.into(),
                 reason: cause.reason().into(),
                 budget: None,
             });
@@ -3523,7 +3523,7 @@ impl CallerRegistry {
                         caller: Some(caller),
                         module: None,
                         pid: None,
-                        subject: "Joint key operations unavailable; retained S1".into(),
+                        subject: crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.into(),
                         reason: "joint_resume_deferred_below_fence".into(),
                         budget: None,
                     });
@@ -4262,7 +4262,7 @@ fn joint_ended_gap(caller: CallerId, reason: String) -> RegistryGap {
         caller: Some(caller),
         module: None,
         pid: None,
-        subject: "Joint key operations unavailable; retained S1".into(),
+        subject: crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.into(),
         reason,
         budget: None,
     }

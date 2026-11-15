@@ -2039,6 +2039,10 @@ fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -
 /// (`disclose_s1_birth_refusal`).
 pub(crate) const JOINT_BIRTH_UNAVAILABLE_SUBJECT: &str = "Joint birth unavailable; retained S1";
 
+/// The subject every Joint ending and retained-S1 claim gap discloses
+/// under: per-call losses name their caller, capture-wide voids do not.
+pub(crate) const JOINT_RETAINED_S1_SUBJECT: &str = "Joint key operations unavailable; retained S1";
+
 /// The reason only the presentation-synthesized bootstrap row carries
 /// ([`silent_bootstrap_gap`]): no retained registry recording uses it.
 /// Shared with [`is_synthetic_bootstrap_gap`] so the producer and the
@@ -3215,19 +3219,19 @@ fn key_observation_plain_reason(reason: &str) -> &str {
 /// never claim a per-process non-start, and deferral rows read
 /// paused, never unstarted.
 fn gap_plain_subject<'a>(subject: &'a str, reason: &'a str) -> &'a str {
-    if subject == "Joint key operations unavailable; retained S1" {
-        if reason.strip_prefix("joint_void_").is_some()
-            || reason.strip_prefix("joint_unretained_").is_some()
-            || reason.strip_prefix("joint_unclaimable_").is_some()
-        {
+    if subject == JOINT_RETAINED_S1_SUBJECT {
+        if reason.ends_with("_claim_history_loss") {
             return "Per-key tracking lost history for this process; function counts above are unaffected";
+        }
+        if reason.strip_prefix("joint_void_").is_some() {
+            return "Per-key tracking lost history for tracked processes; function counts above are unaffected";
         }
         if reason == "joint_resume_deferred_below_fence" {
             return "Per-key tracking paused for this process; function counts above are unaffected";
         }
     }
     match subject {
-        "Joint key operations unavailable; retained S1" | JOINT_BIRTH_UNAVAILABLE_SUBJECT => {
+        JOINT_RETAINED_S1_SUBJECT | JOINT_BIRTH_UNAVAILABLE_SUBJECT => {
             "Per-key tracking did not start for this process; function counts above are unaffected"
         }
         JOINT_BIRTH_DEFERRED_SUBJECT => {
@@ -4708,12 +4712,13 @@ fn render_snapshot_inner(
         }
         // The re-arm gap merges every continuation into one row: show
         // its count in text, so a long run cannot hide hundreds of
-        // interruptions behind one line. The retained-S1 gaps merge per
-        // caller and cause, so their repeats stand for lost calls and
-        // read in text too. (JSON carries `repeats` for every row.)
+        // interruptions behind one line. The retained-S1 claim gaps
+        // merge per caller and cause, so their repeats stand for lost
+        // calls; capture-wide void rows repeat for that many voids. (JSON
+        // carries `repeats` for every row.)
         let merged_rearms =
             gap.subject == crate::inventory_semantics::RUNNING_REARM_SUBJECT && gap.repeats > 1;
-        let merged_retained_s1 = gap.subject == "Joint key operations unavailable; retained S1"
+        let merged_retained_s1 = gap.subject == JOINT_RETAINED_S1_SUBJECT
             && (gap.reason.strip_prefix("joint_void_").is_some()
                 || gap.reason.strip_prefix("joint_unretained_").is_some()
                 || gap.reason.strip_prefix("joint_unclaimable_").is_some())

@@ -45,8 +45,18 @@ versioned separately and are opaque, exact dispatch keys.
   the same way instead of stopping per-key tracking for the rest of
   the run: the call stays a plain row with one counted gap that names
   its caller, and the gap names a void only when that exact original
-  was recorded wiped by one. Its still-unclaimed original is disposed
-  with the call, so the following calls keep per-key tracking.
+  was recorded wiped by one. When the call is effect-neutral, a key
+  use or GetAttributes and its exact original is still unclaimed, the
+  original is disposed with the call so the following calls keep
+  per-key tracking; if the caller already had calls waiting for a
+  seal, its feed falls back and names a second
+  `joint_fallback_stashed_admission` gap. Other functions (create,
+  copy, generate, generate-pair, derive, unwrap, destroy, find,
+  set-attributes and the session/login/finalize lifecycle) keep the
+  named end of per-key tracking instead, because a disposed original
+  could make a later call name the wrong key. A claimed, converted,
+  abandon-staged, S1Only-marked or ledger-mismatched original also
+  refuses disposal and keeps that fail-closed path.
 - System and cgroup captures no longer file a `pid_descendant_gaps`
   gap for a tracked process that exits but lingers unreaped: a
   still-listed whole-group zombie (`Z` with no live threads) is the

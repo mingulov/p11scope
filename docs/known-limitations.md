@@ -645,14 +645,27 @@ an original removed by an image taint, or a tainted original still
 present), the call is kept the same way as a plain row with a
 counted gap naming the caller. The gap names a void only when that
 exact original was recorded wiped by one; otherwise its reason is
-cause-neutral. Tracking continues for this process: when the exact
-original is still unclaimed, it is disposed with the call and the
-counted gap is its only loss, so the key's next seal keeps the
-following calls. A gap that repeats for the same caller and cause
-stands for that many calls: verbose text shows the count and JSON
-carries `repeats`, while the concise summary counts rows, not calls.
-With `--max-gaps` spent, a suppressed row is counted once in the
-suppressed total, not once per call.
+cause-neutral. Tracking continues for this process only when the
+call is effect-neutral, a key use (Access or OperationImport) or
+GetAttributes and its exact original is still unclaimed: that
+original is then disposed with the call, so the key's next seal
+keeps the following calls. Every other function (create, copy,
+generate, generate-pair, derive, unwrap, destroy, find,
+set-attributes and the session/login/finalize lifecycle) keeps the
+older fail-closed path: its original stays and the next seal ends
+per-key tracking for the image with a named `claim_unmatched` gap.
+A disposal also refuses a claimed, converted, abandon-staged,
+S1Only-marked or ledger-mismatched original and keeps that same
+path. If the caller already had calls waiting for a seal, the plain
+row cannot reduce in order without overtaking them: the feed falls
+back first, so the capture also names a
+`joint_fallback_stashed_admission` gap and the counted gap is not
+its only loss. A per-caller gap that repeats for the same caller and
+cause stands for that many calls: verbose text shows the count and
+JSON carries `repeats`, while the concise summary counts rows, not
+calls. A capture-wide void row's count stands for that many voids,
+not calls. With `--max-gaps` spent, a suppressed row is counted once
+in the suppressed total, not once per call.
 This is rare — it requires a tracking interruption or a journal
 inconsistency at the same moment a call is set aside.
 

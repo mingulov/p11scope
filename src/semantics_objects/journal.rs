@@ -101,6 +101,33 @@ pub(crate) fn is_neutral_function(function: u32) -> bool {
     NEUTRAL_S1_FUNCTIONS.contains(&name)
 }
 
+/// Whether one unclaimable original may be disposed with its observed
+/// call instead of holding the key's next seal. Disposal is safe only
+/// when the call cannot change a later call's resolution: effect-neutral
+/// S1 operations, key uses (`Access`, `OperationImport`) and
+/// `GetAttributes` read a binding without creating, destroying,
+/// converting or rebinding it. Every other modeled function — creation,
+/// destruction, lookup, attribute writes and session/login lifecycle —
+/// keeps the named `ClaimUnmatched` fallback, because the retained
+/// original still owns the identity its later calls may resolve through.
+fn disposes_unclaimable_original(function: u32) -> bool {
+    if is_neutral_function(function) {
+        return true;
+    }
+    let Some(name) = pkcs11_module::function_name(usize::try_from(function).unwrap_or(usize::MAX))
+    else {
+        return false;
+    };
+    matches!(
+        crate::kinds::object_descriptor(name).map(|descriptor| descriptor.action),
+        Some(
+            p11scope_ebpf_common::object_policy::ObjectAction::Access
+                | p11scope_ebpf_common::object_policy::ObjectAction::OperationImport
+                | p11scope_ebpf_common::object_policy::ObjectAction::GetAttributes
+        )
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Frozen endpoint classification: the closure's per-function table
 // ---------------------------------------------------------------------------
@@ -1729,6 +1756,33 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn image_sighted_for_test(&self, image: (u64, u64)) -> bool {
         self.sightings.contains_key(&image)
+    }
+
+    /// Tests-only disagreement: replace one open original's collected
+    /// origin so predicates that require it to equal the admission's
+    /// origin can be exercised.
+    #[cfg(test)]
+    pub(crate) fn replace_collected_origin_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        origin: Option<joint_driver::CollectedCallOrigin>,
+    ) -> bool {
+        let Some(entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.collected_origin = origin;
+        true
+    }
+
+    /// Tests-only missing terminal: drop one open original's staged END
+    /// so the disposal path's expected-absent branch can be exercised.
+    #[cfg(test)]
+    pub(crate) fn clear_open_end_for_test(&mut self, native: JournalNativeKey) -> bool {
+        let Some(entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.end = None;
+        true
     }
 
     /// Images with unconverted staging (open or refused) that no bound
@@ -5311,19 +5365,26 @@ impl JournalAdapter {
     /// per-key detail is counted by the caller-registry gap at its S1
     /// reduction; dropping the staged original here keeps the key's next
     /// seal from finding an unmatched entry and ending per-key tracking
-    /// for the whole image. Only the exact unclaimed H8 original is
-    /// removed: a claim, conversion, refusal marker or S1Only subject
-    /// refuses disposal and keeps the older fail-closed path. A terminal
-    /// that arrives after the BEGIN was disposed is recorded as an
-    /// expected-absent one, so it cannot taint a stream whose original
-    /// this path deliberately released.
+    /// for the whole image. Only the exact unclaimed H8 original of an
+    /// effect-neutral call, a key use or `GetAttributes` is removed:
+    /// other functions could later name the disposed identity (a reused
+    /// handle, an unknown created key or a stale session), so they keep
+    /// the named fail-closed path. A claim, conversion, refusal marker,
+    /// S1Only subject, mismatched collected origin or ledger mismatch
+    /// also refuses disposal. A terminal that arrives after the BEGIN was
+    /// disposed is recorded as an expected-absent one, so it cannot taint
+    /// a stream whose original this path deliberately released.
     pub(crate) fn dispose_unclaimable_original(&mut self, admitted: &AdmittedInstanceCall) -> bool {
-        let (Some(_origin), Some(resource)) = (
+        let (Some(origin), Some(resource), Some(fingerprint)) = (
             admitted.collected_origin(),
             admitted.joint_resource_origin(),
+            admitted.journal_call_fingerprint(),
         ) else {
             return false;
         };
+        if !disposes_unclaimable_original(fingerprint.function) {
+            return false;
+        }
         if !self
             .resource_producers
             .as_ref()
@@ -5336,7 +5397,9 @@ impl JournalAdapter {
             return false;
         };
         let (_, image, _, _) = admitted.journal_binding();
-        if entry.image != (image.task_cookie, image.exec_id) {
+        if entry.image != (image.task_cookie, image.exec_id)
+            || entry.collected_origin != Some(origin)
+        {
             return false;
         }
         if entry.converted_ticket.is_some()

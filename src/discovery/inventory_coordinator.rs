@@ -3263,7 +3263,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             for _ in 0..new {
                 self.note_scope_gap(
-                    "Joint key operations unavailable; retained S1".to_string(),
+                    crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string(),
                     format!("joint_void_{}_history_loss", gap.label()),
                 );
             }

@@ -5492,16 +5492,16 @@ fn merge(
             .checked_required(allocated_slots, fresh.len())
             .expect("admitted target union was checked before allocation");
         revived_total += revived.len();
-        // Commit this group's reclaim tickets: their positions are now
-        // spoken for, one key per position, so a later group cannot claim
-        // the same retired cell.
-        for (key, position) in &tickets {
+        // Commit only the tickets this admission revived: a spilled or
+        // otherwise unbuilt table's ticket stays an unused claim, so it
+        // cannot consume the retired position or mark its key claimed for
+        // a later group of this merge.
+        for (key, position) in tickets.iter().filter(|(key, _)| revived.contains(*key)) {
             claimed_positions.insert(*position);
             reclaimed.insert(*key, *position);
         }
         claimed.extend(fresh.iter().copied());
         claimed.extend(revived.iter().copied());
-        claimed.extend(tickets.keys().copied());
         holding.insert(object, kept.len() + fresh.len() + revived.len());
         decisions[position] = Some(AdmissionDecision::Admitted {
             admitted,
@@ -20051,6 +20051,79 @@ pub(crate) mod tests {
         assert_eq!(plan.slots.len(), 136, "68 reclaimed + 68 fresh");
         assert_eq!(plan.slot_by_key.len(), 136, "every key has one slot");
         plan.validate_slot_index().expect("a consistent slot index");
+    }
+
+    /// A ticket issued for a table that spilled is not a claim: it must not
+    /// consume the retired position or mark its key claimed, so a later group
+    /// in the same merge can still reoccupy that position. Group A's second
+    /// heuristic table spills against the reserve and targets object 92; group
+    /// B is another pin of the same file whose own key is reclaimable to that
+    /// retired cell.
+    #[test]
+    fn slot_reclaim_spilled_ticket_does_not_block_a_later_group() {
+        let capacity = MAX_SLOTS as usize;
+        let ceiling = capacity - shared_scope_reserve(MAX_SLOTS as usize);
+        let old = provider_with_tables(82, "/opt/obj92.so", 1, 1, false);
+        let mut plan = scoped_plan(std::slice::from_ref(&old), AdmissionScope::Named);
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-spill"));
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        assert_eq!(plan.retired_slots.len(), 1, "the old generation retired");
+
+        // The retired cell counts in the in-use total, so the filler leaves
+        // room for one fresh table below the ceiling, not two.
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, ceiling - 3, true);
+        let mut spanning = provider_with_tables(90, "/opt/a.so", 2, 1, false);
+        replace_table_targets(
+            &mut spanning,
+            1,
+            &[("C_Sign", 92, 0), ("C_Sign", 92, 8), ("C_Sign", 92, 16)],
+        );
+        let later = provider_with_tables(91, "/opt/obj92.so", 1, 1, false);
+        let identities = BTreeMap::from([
+            (PinnedObjectId(91), test_identity(82, "sha-spill")),
+            (PinnedObjectId(92), test_identity(82, "sha-spill")),
+        ]);
+        let rebuilt =
+            plan.rebuild_from_sources_with_identities(&[filler, spanning, later], &[], &identities);
+        let phantom = AttachKey {
+            object: PinnedObjectId(92),
+            file_offset: 0,
+        };
+        let later_key = AttachKey {
+            object: PinnedObjectId(91),
+            file_offset: 0,
+        };
+        assert!(
+            !rebuilt.reclaimed.contains_key(&phantom),
+            "the spilled table's ticket is not committed: {:?}",
+            rebuilt.reclaimed
+        );
+        assert_eq!(
+            rebuilt.reclaimed.get(&later_key),
+            Some(&0),
+            "the later pin claims the retired position: {:?}",
+            rebuilt.reclaimed
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(
+            delta.new.iter().any(|slot| slot.index == 0),
+            "the retired index is reoccupied, not a fresh slot: {:?}",
+            delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.slots.len(),
+            ceiling - 1,
+            "no fresh slot is minted beside the reclaimed cell"
+        );
+        assert_eq!(
+            plan.active_slot_count(),
+            ceiling - 1,
+            "every admitted endpoint stays active"
+        );
+        assert!(plan.retired_slots.is_empty(), "nothing stays retired");
     }
 
     /// Cross-ID reclaim fails closed without a positive file identity match

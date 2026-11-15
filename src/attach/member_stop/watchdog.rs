@@ -41,6 +41,8 @@ pub(crate) const DONE: u8 = b'D';
 /// resumed (measured: every member ran again 0.2-0.5 s after a `SIGKILL`
 /// under load).
 pub(crate) const SWEEP_DELAYS_MS: [u64; 8] = [0, 20, 50, 100, 200, 400, 800, 1600];
+/// The one capability the watchdog keeps (`linux/capability.h`).
+const CAP_KILL: u32 = 5;
 /// Bounded walk of the run cgroup tree: members may create subgroups.
 const MAX_GROUPS: usize = 256;
 const MAX_DEPTH: usize = 8;
@@ -298,6 +300,15 @@ pub(crate) fn entry(mut args: impl Iterator<Item = std::ffi::OsString>) -> Optio
 /// (it must outlive the observer's own end), prints its ready line, then
 /// blocks on the pipe. `exempt_tgid` is never signalled.
 pub(crate) fn watchdog_main(tree: RunTree, exempt_tgid: u32) -> i32 {
+    // It only reads `/proc` and the cgroup tree and sends SIGCONT: it
+    // keeps `CAP_KILL` alone (a `--user` member runs under another uid),
+    // and never gains privilege again (a setcap observer re-executed
+    // here would otherwise hold its whole file grant for the run).
+    let _ = crate::caps::drop_to_keep(1u64 << CAP_KILL);
+    // SAFETY: `PR_SET_NO_NEW_PRIVS` takes integer arguments only.
+    unsafe {
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    }
     for signal in [
         libc::SIGINT,
         libc::SIGTERM,
@@ -591,6 +602,47 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(stopped, "a stopped thread group reads stopped");
+    }
+
+    /// The watchdog needs only `CAP_KILL` (a `--user` member runs under
+    /// another uid) and never gains privilege: no new privileges.
+    #[test]
+    fn the_watchdog_runs_without_new_privileges() {
+        let (_root, tree) = listed_tree(&[]);
+        let watchdog = Watchdog::start(&WatchdogLauncher::TestHarness, &tree, 0).unwrap();
+        // The harness runs `watchdog_main` on a test thread (capabilities
+        // and no-new-privileges are per thread); the observer's own
+        // watchdog runs it on its only thread. Read the thread that ran it.
+        let tasks: Vec<String> = std::fs::read_dir(format!("/proc/{}/task", watchdog.pid()))
+            .unwrap()
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("status")).ok())
+            .collect();
+        watchdog.finish();
+        let field = |status: &str, name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let guarded: Vec<&String> = tasks
+            .iter()
+            .filter(|status| field(status, "NoNewPrivs:") == "1")
+            .collect();
+        assert!(
+            !guarded.is_empty(),
+            "no task without new privileges: {tasks:?}"
+        );
+        for status in guarded {
+            let effective = u64::from_str_radix(&field(status, "CapEff:"), 16).unwrap();
+            assert_eq!(
+                effective & !(1u64 << CAP_KILL),
+                0,
+                "CapEff {effective:x} beyond CAP_KILL"
+            );
+        }
     }
 
     /// An abandoned watchdog sweeps past the observer's bounded wait; it

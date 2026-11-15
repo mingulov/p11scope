@@ -86933,6 +86933,58 @@ fn member_stop_watchdog_loss_releases_every_member() {
     );
 }
 
+/// A held provider mapper that exits before its provider attaches must
+/// not clear the provider: the next mapper is then stopped and held (or
+/// files the row), instead of running unprotected with no row.
+#[test]
+fn member_stop_departed_unattached_hold_keeps_the_provider_uncleared() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.pause_owned_batch = true;
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held());
+    let _ = fixture.child.kill();
+    let _ = fixture.child.wait();
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(!engine.member_stops_held());
+    assert_eq!(engine.member_stop_stats_for_test().departed, 1);
+    assert!(
+        !io.cleared.contains(&key),
+        "the unattached provider still stops its next mapper"
+    );
+}
+
+/// The same at a watchdog loss: a departed hold leaves its unattached
+/// provider uncleared.
+#[test]
+fn member_stop_watchdog_loss_keeps_a_departed_holds_provider_uncleared() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.pause_owned_batch = true;
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held());
+    let _ = fixture.child.kill();
+    let _ = fixture.child.wait();
+    io.guard_lost = true;
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert_eq!(engine.member_stop_stats_for_test().departed, 1);
+    assert!(!io.cleared.contains(&key));
+}
+
 /// Twin: without a service pass the stopped member stays stopped (the
 /// resume above is the service's, not the fixture's).
 #[test]

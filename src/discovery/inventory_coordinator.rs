@@ -18196,12 +18196,58 @@ pub(crate) mod tests {
         file.set_len(dynstr_off + dynstr_bytes).unwrap();
     }
 
+    /// Spawn one owned large-table driver over `mapped` (and optionally a
+    /// real provider), stopped after its readiness handshake.
+    fn spawn_table_driver(
+        dir: &std::path::Path,
+        driver: &std::path::Path,
+        ready_name: &str,
+        mapped: &[std::path::PathBuf],
+        provider: Option<&std::path::Path>,
+    ) -> crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let ready = dir.join(ready_name);
+        let mut command = std::process::Command::new(driver);
+        command.arg(&ready);
+        for path in mapped {
+            command.arg("--map").arg(path);
+        }
+        if let Some(provider) = provider {
+            command.arg("--provider").arg(provider);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        OwnedStoppedChild::spawn_stopped(&mut command, |pid| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned large-table child did not finish startup"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // SAFETY: pid names the child retained by spawn_stopped.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+        })
+    }
+
+    /// One scene pass before the fold: deep-scan gaps, module paths and
+    /// attempted file I/O.
+    struct CgroupTablePass {
+        gaps: Vec<(u32, String, String)>,
+        modules: Vec<String>,
+        attempted_io: Option<u64>,
+    }
+
     /// One cgroup transaction over an owned child that maps large-table
     /// fixtures (and optionally loads a real provider), with the
     /// production inventory budget.
     struct CgroupTableScene {
         _dir: tempfile::TempDir,
-        _child: crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        driver: std::path::PathBuf,
+        children: Vec<crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild>,
         coordinator: Box<InventoryCoordinator<OsProcessSource>>,
     }
 
@@ -18219,36 +18265,8 @@ pub(crate) mod tests {
                 &["-O2", "-Wall", "-Wextra", "-Werror"],
                 &["-ldl"],
             );
-            let ready = dir.path().join("large-table-ready");
-            let mut command = std::process::Command::new(driver);
-            command.arg(&ready);
-            for path in mapped {
-                command.arg("--map").arg(path);
-            }
-            if let Some(provider) = provider {
-                command.arg("--provider").arg(provider);
-            }
-            command
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
             let child =
-                crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::spawn_stopped(
-                    &mut command,
-                    |pid| {
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
-                        while !ready.exists() {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "owned large-table child did not finish startup"
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
-                        // SAFETY: pid names the child retained by spawn_stopped.
-                        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
-                    },
-                );
+                spawn_table_driver(dir.path(), &driver, "large-table-ready", mapped, provider);
             std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
             let mut coordinator = Box::new(
                 InventoryCoordinator::new(
@@ -18264,14 +18282,36 @@ pub(crate) mod tests {
             coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
             Self {
                 _dir: dir,
-                _child: child,
+                driver,
+                children: vec![child],
                 coordinator,
             }
         }
 
+        /// Replace the cgroup membership with `count` fresh owned children
+        /// that map only `mapped`. The earlier children stay owned and
+        /// paused, so the next pass sees another file population while the
+        /// carried facts still name the earlier one.
+        fn remap_members(&mut self, mapped: &[std::path::PathBuf], count: usize) {
+            let mut members = String::new();
+            for index in 0..count {
+                let child = spawn_table_driver(
+                    self._dir.path(),
+                    &self.driver,
+                    &format!("remapped-ready-{index}"),
+                    mapped,
+                    None,
+                );
+                members.push_str(&format!("{}\n", child.id()));
+                self.children.push(child);
+            }
+            std::fs::write(self._dir.path().join("cgroup.procs"), members).unwrap();
+        }
+
         /// One full collect/apply/commit transaction; returns the
-        /// collection's deep-scan gaps and module paths before the fold.
-        fn pass(&mut self) -> (Vec<(u32, String, String)>, Vec<String>) {
+        /// collection's deep-scan gaps, module paths and attempted file
+        /// I/O before the fold.
+        fn pass(&mut self) -> CgroupTablePass {
             let collection = self
                 .coordinator
                 .cgroup_collector(
@@ -18281,35 +18321,57 @@ pub(crate) mod tests {
                     None,
                 )
                 .unwrap()();
-            let gaps = collection.member_gaps_for_test();
-            let paths = collection.module_paths_for_test();
+            let pass = CgroupTablePass {
+                gaps: collection.member_gaps_for_test(),
+                modules: collection.module_paths_for_test(),
+                attempted_io: collection.attempted_io_bytes_for_test(),
+            };
             self.coordinator
                 .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
                 .unwrap();
             self.coordinator.commit_batch(false).unwrap();
             let _completion = self.coordinator.take_cgroup_completion().unwrap();
-            (gaps, paths)
+            pass
         }
     }
 
-    fn same_device_and_inode_order(paths: &[&std::path::Path]) {
+    /// Create empty placeholders for the fixture roles, order them by
+    /// inode, rename them to the role names in that order, then let `fill`
+    /// write each role's contents in place. ext4 hands out the lowest free
+    /// inode and reuses freed ones, so creation order cannot establish the
+    /// scan's object-key order; sorting the placeholders can. Renames,
+    /// truncating writes and `std::fs::copy` all keep the placeholder
+    /// inode, so the returned paths stay in scan order.
+    fn inode_ordered_role_paths(
+        dir: &std::path::Path,
+        names: &[&str],
+        fill: impl FnOnce(&[std::path::PathBuf]),
+    ) -> Vec<std::path::PathBuf> {
         use std::os::unix::fs::MetadataExt as _;
-        let metadata: Vec<_> = paths
-            .iter()
-            .map(|path| std::fs::metadata(path).unwrap())
+        let mut slots: Vec<_> = (0..names.len())
+            .map(|index| {
+                let path = dir.join(format!("fixture-slot-{index:03}"));
+                std::fs::write(&path, b"").unwrap();
+                path
+            })
             .collect();
+        slots.sort_by_key(|path| std::fs::metadata(path).unwrap().ino());
+        let mut paths = Vec::with_capacity(names.len());
+        for (slot, name) in slots.into_iter().zip(names) {
+            let path = dir.join(name);
+            std::fs::rename(&slot, &path).unwrap();
+            paths.push(path);
+        }
+        fill(&paths);
         assert!(
-            metadata
-                .windows(2)
-                .all(|pair| pair[0].dev() == pair[1].dev()),
-            "the fixture files must share one device for object-key order"
+            paths.windows(2).all(|pair| {
+                let before = std::fs::metadata(&pair[0]).unwrap();
+                let after = std::fs::metadata(&pair[1]).unwrap();
+                before.dev() == after.dev() && before.ino() < after.ino()
+            }),
+            "the fixture roles keep the inode order the scan's object-key order uses"
         );
-        assert!(
-            metadata
-                .windows(2)
-                .all(|pair| pair[0].ino() < pair[1].ino()),
-            "inode order places earlier fixture files before later ones"
-        );
+        paths
     }
 
     /// The reported gap twin: a pandoc-sized table object plus a
@@ -18320,45 +18382,55 @@ pub(crate) mod tests {
     #[test]
     fn cgroup_passes_carry_large_table_facts_and_reach_a_later_provider() {
         let dir = tempfile::tempdir().unwrap();
-        let pandoc = dir.path().join("pandoc-sized.so");
-        write_dynsym_dynstr_elf(&pandoc, 11_497_776, 43_660_724);
-        let ghci = dir.path().join("ghci-like.so");
-        write_dynsym_dynstr_elf(&ghci, 10_497_792, 20_000_000);
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let provider = gcc(
+        let roles = inode_ordered_role_paths(
             dir.path(),
-            "scoped-provider.so",
-            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
-            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
-            &[],
+            &["pandoc-sized.so", "ghci-like.so", "scoped-provider.so"],
+            |roles| {
+                write_dynsym_dynstr_elf(&roles[0], 11_497_776, 43_660_724);
+                write_dynsym_dynstr_elf(&roles[1], 10_497_792, 20_000_000);
+                let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let compiled = gcc(
+                    dir.path(),
+                    "scoped-provider-build.so",
+                    &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+                    &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+                    &[],
+                );
+                std::fs::copy(&compiled, &roles[2]).unwrap();
+            },
         );
-        same_device_and_inode_order(&[&pandoc, &ghci, &provider]);
-        let mut scene = CgroupTableScene::new(dir, &[pandoc, ghci], Some(&provider));
+        let provider = &roles[2];
+        let mut scene = CgroupTableScene::new(dir, &roles[..2], Some(provider));
 
-        let (first_gaps, first_modules) = scene.pass();
+        let first = scene.pass();
         assert!(
-            first_gaps.iter().any(|(_, subject, reason)| {
+            first.gaps.iter().any(|(_, subject, reason)| {
                 subject.contains("ghci-like")
                     && reason.contains(crate::discovery::scan::IO_CEILING_REASON)
             }),
-            "the first pass must exhaust its window on the large tables: {first_gaps:?}"
+            "the first pass must exhaust its window on the large tables: {:?}",
+            first.gaps
         );
         assert!(
-            first_gaps.iter().any(|(_, subject, reason)| {
+            first.gaps.iter().any(|(_, subject, reason)| {
                 subject.contains("scoped-provider")
                     && reason.contains(crate::discovery::scan::IO_CEILING_REASON)
             }),
-            "a provider after the large tables is refused in the first pass: {first_gaps:?}"
+            "a provider after the large tables is refused in the first pass: {:?}",
+            first.gaps
         );
         assert!(
-            !first_modules
+            !first
+                .modules
                 .iter()
                 .any(|path| path.contains("scoped-provider")),
-            "the first pass cannot reach the provider: {first_modules:?}"
+            "the first pass cannot reach the provider: {:?}",
+            first.modules
         );
 
-        let (second_gaps, second_modules) = scene.pass();
-        let ceiling: Vec<_> = second_gaps
+        let second = scene.pass();
+        let ceiling: Vec<_> = second
+            .gaps
             .iter()
             .filter(|(_, _, reason)| reason.contains(crate::discovery::scan::IO_CEILING_REASON))
             .collect();
@@ -18367,10 +18439,12 @@ pub(crate) mod tests {
             "pass 2 must reuse the unchanged large-table facts, not re-read them: {ceiling:?}"
         );
         assert!(
-            second_modules
+            second
+                .modules
                 .iter()
                 .any(|path| path.contains("scoped-provider")),
-            "pass 2 must find the provider placed after the large objects: {second_modules:?}"
+            "pass 2 must find the provider placed after the large objects: {:?}",
+            second.modules
         );
     }
 
@@ -18383,12 +18457,16 @@ pub(crate) mod tests {
     fn cgroup_passes_re_read_a_changed_file() {
         use std::os::unix::fs::MetadataExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let changed = dir.path().join("changed-table.so");
-        write_dynsym_dynstr_elf(&changed, 24, 64);
-        let pandoc = dir.path().join("pandoc-sized.so");
-        write_dynsym_dynstr_elf(&pandoc, 11_497_776, 43_660_724);
-        let ghci = dir.path().join("ghci-like.so");
-        write_dynsym_dynstr_elf(&ghci, 10_497_792, 20_000_000);
+        let roles = inode_ordered_role_paths(
+            dir.path(),
+            &["changed-table.so", "pandoc-sized.so", "ghci-like.so"],
+            |roles| {
+                write_dynsym_dynstr_elf(&roles[0], 24, 64);
+                write_dynsym_dynstr_elf(&roles[1], 11_497_776, 43_660_724);
+                write_dynsym_dynstr_elf(&roles[2], 10_497_792, 20_000_000);
+            },
+        );
+        let changed = roles[0].clone();
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let provider = gcc(
             dir.path(),
@@ -18397,15 +18475,16 @@ pub(crate) mod tests {
             &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
             &[],
         );
-        same_device_and_inode_order(&[&changed, &pandoc, &ghci]);
-        let mut scene = CgroupTableScene::new(dir, &[changed.clone(), pandoc, ghci], None);
+        let mut scene = CgroupTableScene::new(dir, &roles, None);
 
-        let (_, first_modules) = scene.pass();
+        let first = scene.pass();
         assert!(
-            !first_modules
+            !first
+                .modules
                 .iter()
                 .any(|path| path.contains("changed-table")),
-            "the initial changed-table file exports no hook: {first_modules:?}"
+            "the initial changed-table file exports no hook: {:?}",
+            first.modules
         );
 
         // Rewrite in place: the same inode keeps the maps identity, a new
@@ -18418,8 +18497,9 @@ pub(crate) mod tests {
             "the rewritten fixture must keep its inode"
         );
 
-        let (second_gaps, second_modules) = scene.pass();
-        let ceiling: Vec<_> = second_gaps
+        let second = scene.pass();
+        let ceiling: Vec<_> = second
+            .gaps
             .iter()
             .filter(|(_, _, reason)| reason.contains(crate::discovery::scan::IO_CEILING_REASON))
             .collect();
@@ -18428,10 +18508,77 @@ pub(crate) mod tests {
             "pass 2 re-reads only the changed file, not the cached large tables: {ceiling:?}"
         );
         assert!(
-            second_modules
+            second
+                .modules
                 .iter()
                 .any(|path| path.contains("changed-table")),
-            "the changed pin must invalidate the cache and re-read the new provider bytes: {second_modules:?}"
+            "the changed pin must invalidate the cache and re-read the new provider bytes: {:?}",
+            second.modules
+        );
+    }
+
+    /// Past the 128-entry carried ceiling: the first pass fills the export
+    /// map with a 130-file population whose large table object sorts last.
+    /// A restart-shaped second pass maps that one 40 MiB object from two
+    /// fresh members, so the first member's insertion must reclaim a dead
+    /// carried entry for the second member's lookup to be a zero-read hit.
+    /// Without reclamation the second member re-reads 40 MiB, exhausts the
+    /// 64 MiB pass window and names an I/O-ceiling gap.
+    #[test]
+    fn cgroup_passes_reclaim_a_full_carry_after_more_than_128_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..129)
+            .map(|index| format!("small-{index:03}.so"))
+            .chain(std::iter::once("large-table.so".to_string()))
+            .collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let roles = inode_ordered_role_paths(dir.path(), &name_refs, |roles| {
+            for small in &roles[..129] {
+                std::fs::copy("/bin/sh", small).unwrap();
+            }
+            write_dynsym_dynstr_elf(&roles[129], 20_000_016, 20_000_000);
+        });
+        let large = roles[129].clone();
+        let mut scene = CgroupTableScene::new(dir, &roles, None);
+
+        let first = scene.pass();
+        let first_ceiling: Vec<_> = first
+            .gaps
+            .iter()
+            .filter(|(_, _, reason)| reason.contains(crate::discovery::scan::IO_CEILING_REASON))
+            .collect();
+        assert!(
+            first_ceiling.is_empty(),
+            "the first pass fits its window while filling the carried cache: {first_ceiling:?}"
+        );
+        let carried = scene.coordinator.cgroup_file_facts.counts();
+        assert_eq!(
+            carried.1, 128,
+            "the first pass fills the carried export map to its 128-entry ceiling: {carried:?}"
+        );
+        assert!(
+            carried.4 <= 16 << 20,
+            "carried bytes stay within their 16 MiB ceiling: {carried:?}"
+        );
+
+        scene.remap_members(std::slice::from_ref(&large), 2);
+        let second = scene.pass();
+        let second_io = second
+            .attempted_io
+            .expect("the second pass ran a collection budget");
+        let second_ceiling: Vec<_> = second
+            .gaps
+            .iter()
+            .filter(|(_, _, reason)| reason.contains(crate::discovery::scan::IO_CEILING_REASON))
+            .collect();
+        assert!(
+            second_ceiling.is_empty(),
+            "the second pass must reclaim dead carried entries instead of re-reading: {second_ceiling:?}"
+        );
+        assert!(
+            second_io < crate::discovery::scan::INVENTORY_WINDOW_IO_BYTES,
+            "the second member reused the first member's facts instead of \
+             re-reading the table: {second_io} attempted bytes"
         );
     }
 

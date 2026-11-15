@@ -781,6 +781,14 @@ impl CgroupCollection {
             })
             .collect()
     }
+    /// Test-only: this pass's attempted file I/O, so a twin can prove a
+    /// carried hit avoided a second read of the same object.
+    #[cfg(test)]
+    pub(crate) fn attempted_io_bytes_for_test(&self) -> Option<u64> {
+        self.collection
+            .as_ref()
+            .map(|collection| collection.budget.attempted_io_bytes())
+    }
     /// Test-only: the paths of the modules this collection deep-scanned.
     #[cfg(test)]
     pub(crate) fn module_paths_for_test(&self) -> Vec<String> {

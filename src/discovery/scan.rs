@@ -1097,6 +1097,21 @@ pub(crate) struct RetainedFileFacts {
     retained_cache_bytes: u64,
 }
 
+impl RetainedFileFacts {
+    /// `(inspection, export, refusal, loader, accounted bytes)` entry
+    /// counts, for twins that assert the carried map is genuinely full.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (usize, usize, usize, usize, u64) {
+        (
+            self.inspected_files.len(),
+            self.elf_export_facts.len(),
+            self.table_cap_refusals.len(),
+            self.loader_elf_facts.len(),
+            self.retained_cache_bytes,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveInventoryWindow {
     token: WindowToken,
@@ -2153,6 +2168,40 @@ impl CaptureWorkBudget {
     #[cfg(test)]
     pub(crate) fn loader_cache_len(&self) -> usize {
         self.loader_elf_facts.len()
+    }
+
+    /// The byte counter recomputed from the retained entries themselves,
+    /// for tests that pin the eviction accounting.
+    #[cfg(test)]
+    pub(crate) fn retained_file_bytes_recount(&self) -> u64 {
+        let inspected = self
+            .inspected_files
+            .iter()
+            .fold(0u64, |bytes, (key, value)| {
+                bytes.saturating_add(inspected_cache_bytes(key, value))
+            });
+        let exports = self
+            .elf_export_facts
+            .iter()
+            .fold(0u64, |bytes, (key, value)| {
+                bytes.saturating_add(export_cache_bytes(key, value))
+            });
+        let refusals = self
+            .table_cap_refusals
+            .iter()
+            .fold(0u64, |bytes, (key, value)| {
+                bytes.saturating_add(table_refusal_cache_bytes(key, value))
+            });
+        let loaders = self
+            .loader_elf_facts
+            .iter()
+            .fold(0u64, |bytes, (key, value)| {
+                bytes.saturating_add(loader_cache_bytes(key, value))
+            });
+        inspected
+            .saturating_add(exports)
+            .saturating_add(refusals)
+            .saturating_add(loaders)
     }
 
     fn table_exhaustion_reason(&mut self) -> Option<String> {
@@ -18289,6 +18338,197 @@ mod tests {
         second.finish_window(window).unwrap();
     }
 
+    /// A full carried cache still admits a new file: the insertion
+    /// reclaims a carried entry this pass did not touch, so the new
+    /// file's second lookup is a zero-read hit. Without recency
+    /// reclamation the full bundle refuses every new key and in-pass
+    /// deduplication degrades to the old per-pass-cache failure.
+    #[test]
+    fn inventory_full_carried_cache_reclaims_untouched_entries_for_a_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = || inventory_limits(8 << 20, 1 << 20, 4096, 32768, 4096, 512);
+
+        let mut first = CaptureWorkBudget::for_inventory(limits());
+        let window = first.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = first.checkpoint(window.clone()).unwrap();
+        let mut filled = Vec::new();
+        for index in 0..4 {
+            let path = dir.path().join(format!("filled-{index}.so"));
+            std::fs::copy("/bin/sh", &path).unwrap();
+            let file = File::open(&path).unwrap();
+            assert!(
+                crate::discovery::identity::file_inodes_are_unique(&file),
+                "the lane TMPDIR must name one file per (device, inode)"
+            );
+            let key = object_key_of(&file);
+            provider_facts_for(&file, key, &[], &mut first).unwrap();
+            filled.push((file, key));
+        }
+        let (_, _, _, _, exports, _) = first.retained_counts();
+        assert_eq!(exports, 4, "the first pass fills the 4-entry export map");
+        first.finish_scan(scan).unwrap();
+        first.finish_window(window).unwrap();
+        let carried = first.take_retained_file_facts();
+        assert_eq!(carried.counts().1, 4, "the carried export map is full");
+
+        let newcomer_path = dir.path().join("newcomer.so");
+        std::fs::copy("/bin/sh", &newcomer_path).unwrap();
+        let newcomer = File::open(&newcomer_path).unwrap();
+        let newcomer_key = object_key_of(&newcomer);
+        let mut second =
+            CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
+        let window = second.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = second.checkpoint(window.clone()).unwrap();
+        // Touch one carried file: this pass used it, so reclamation must
+        // never evict it for the newcomer.
+        let (used_file, used_object_key) = &filled[0];
+        let used_cache_key = InspectedFileKey::for_open_file(
+            used_file,
+            used_object_key.device,
+            used_object_key.inode,
+            pin_of(used_file).unwrap(),
+        )
+        .unwrap();
+        let used = provider_facts_for(used_file, *used_object_key, &[], &mut second).unwrap();
+        assert_eq!(second.attempted_io_bytes(), 0, "the carried file is a hit");
+        let newcomer_facts =
+            provider_facts_for(&newcomer, newcomer_key, &[], &mut second).unwrap();
+        let first_cost = second.attempted_io_bytes();
+        assert!(first_cost > 0, "the newcomer's first lookup reads it");
+        assert_eq!(
+            provider_facts_for(&newcomer, newcomer_key, &[], &mut second).unwrap(),
+            newcomer_facts
+        );
+        assert_eq!(
+            second.attempted_io_bytes(),
+            first_cost,
+            "a full carried cache must reclaim a dead entry and dedupe the newcomer"
+        );
+        assert_eq!(
+            second.retained_counts().4,
+            4,
+            "the newcomer replaced one carried entry, not grew the map"
+        );
+        assert_eq!(
+            second.elf_export_facts_for(&used_cache_key),
+            Some(used),
+            "an entry this pass used is never reclaimed"
+        );
+        assert_eq!(
+            second.retained_counts().5,
+            second.retained_file_bytes_recount(),
+            "reclamation keeps the retained byte counter exact"
+        );
+        second.finish_scan(scan).unwrap();
+        second.finish_window(window).unwrap();
+    }
+
+    /// Stale carried entries from another descriptor device or pin are
+    /// reclaimed for the current pass's files in every carried map, so a
+    /// restarted container or remounted overlay cannot leave the whole
+    /// bundle pinned on dead keys.
+    #[test]
+    fn inventory_stale_carried_entries_are_reclaimed_for_new_files() {
+        let file = File::open("/bin/sh").unwrap();
+        let pin = pin_of(&file).unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        let export_facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        let loader_facts = LoaderElfFacts {
+            abi: ElfAbi::Lp64,
+            hook: Ok(None),
+            state_address: Ok(None),
+        };
+        let limits = || inventory_limits(8 << 20, 1 << 20, 4096, 32768, 4096, 512);
+
+        let mut first = CaptureWorkBudget::for_inventory(limits());
+        let window = first.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = first.checkpoint(window.clone()).unwrap();
+        let stale_key = |inode| InspectedFileKey {
+            device: Device {
+                major: 8,
+                minor: 1,
+            },
+            inode,
+            pin,
+            fd_dev: 7,
+        };
+        for inode in 0..4u64 {
+            let key = stale_key(inode);
+            assert!(first.note_inspected_file(key, inspected.clone()));
+            assert!(first.note_elf_export_facts(key, export_facts.clone()));
+            assert!(first.note_table_cap_refusal(key, "stale table-cap refusal".into()));
+            assert!(first.note_loader_elf_facts(
+                LoaderFactsKey {
+                    device: 100 + inode,
+                    pin,
+                },
+                loader_facts.clone(),
+            ));
+        }
+        let (_, _, _, inspected_len, exports_len, _) = first.retained_counts();
+        assert_eq!((inspected_len, exports_len), (4, 4));
+        assert_eq!(first.loader_cache_len(), 4);
+        first.finish_scan(scan).unwrap();
+        first.finish_window(window).unwrap();
+        let carried = first.take_retained_file_facts();
+        let counts = carried.counts();
+        assert_eq!(
+            (counts.0, counts.1, counts.2, counts.3),
+            (4, 4, 4, 4),
+            "every carried map is full before the stale-entry pass"
+        );
+
+        let mut second =
+            CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
+        let window = second.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = second.checkpoint(window.clone()).unwrap();
+        // A different descriptor device and inode: every carried entry is
+        // dead for this pass.
+        let fresh = InspectedFileKey {
+            device: Device {
+                major: 8,
+                minor: 1,
+            },
+            inode: 99,
+            pin,
+            fd_dev: 8,
+        };
+        let fresh_loader = LoaderFactsKey { device: 999, pin };
+        assert!(second.inspected_file(&fresh).is_none());
+        assert!(second.elf_export_facts_for(&fresh).is_none());
+        assert!(second.table_cap_refusal_for(&fresh).is_none());
+        assert!(second.loader_elf_facts_for(&fresh_loader).is_none());
+        assert!(second.note_inspected_file(fresh, inspected.clone()));
+        assert!(second.note_elf_export_facts(fresh, export_facts.clone()));
+        assert!(second.note_table_cap_refusal(fresh, "fresh table-cap refusal".into()));
+        assert!(second.note_loader_elf_facts(fresh_loader, loader_facts.clone()));
+        assert_eq!(
+            second.inspected_file(&fresh),
+            Some(inspected),
+            "the new file's inspection is cached after reclaiming a stale entry"
+        );
+        assert_eq!(second.elf_export_facts_for(&fresh), Some(export_facts));
+        assert_eq!(
+            second.table_cap_refusal_for(&fresh),
+            Some("fresh table-cap refusal".into())
+        );
+        assert_eq!(second.loader_elf_facts_for(&fresh_loader), Some(loader_facts));
+        assert_eq!(second.loader_cache_len(), 4);
+        assert_eq!(
+            second.retained_counts().5,
+            second.retained_file_bytes_recount(),
+            "reclamation keeps the retained byte counter exact"
+        );
+        second.finish_scan(scan).unwrap();
+        second.finish_window(window).unwrap();
+    }
+
     /// One charging rule: a snapshot read debits the inventory window
     /// for every byte and charges no collection work; the parsed table
     /// entries alone charge work through `spend`.
@@ -18308,6 +18548,12 @@ mod tests {
             4096,
             512,
         ));
+        let charged = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+        let counted = std::sync::Arc::clone(&charged);
+        budget.set_collection_work(CollectionWork::new(move |units| {
+            *counted.lock().unwrap() += units;
+            true
+        }));
         let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
         let scan = budget.checkpoint(window.clone()).unwrap();
         let snapshot = read_elf_snapshot(&file, &mut budget).unwrap();
@@ -18315,6 +18561,12 @@ mod tests {
             budget.attempted_io_bytes(),
             size,
             "the whole snapshot was read"
+        );
+        let hook_units = *charged.lock().unwrap();
+        assert!(
+            hook_units < size.div_ceil(32),
+            "snapshot bytes must debit the window, never convert to collection work: \
+             {hook_units} hook units for {size} bytes"
         );
         assert_eq!(
             budget.work_units_count(),

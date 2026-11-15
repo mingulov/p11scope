@@ -86558,3 +86558,78 @@ fn member_stop_loss_release_without_a_grace_period_settles_each_member() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Scenario A: a provider mapper departs while held and the watchdog is
+/// lost before the staging attaches. The hook is off from the loss on,
+/// so no later mapper is stopped and held, and `stop_staged` suppresses
+/// the staging's own row: the loss files the first-use row.
+#[test]
+fn member_stop_watchdog_loss_files_the_row_for_a_departed_unattached_hold() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.pause_owned_batch = true;
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held());
+    let _ = fixture.child.kill();
+    let _ = fixture.child.wait();
+    io.guard_lost = true;
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert_eq!(engine.member_stop_stats_for_test().departed, 1);
+    assert!(files_the_first_use_row(&engine));
+}
+
+/// Scenario B: the departed hold ends in a normal pass (no row: a later
+/// mapper would be stopped and held), then the watchdog is lost before
+/// the staging attaches: the loss files the row.
+#[test]
+fn member_stop_watchdog_loss_after_a_departed_hold_files_the_row() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.pause_owned_batch = true;
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(engine.member_stops_held());
+    let _ = fixture.child.kill();
+    let _ = fixture.child.wait();
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert_eq!(engine.member_stop_stats_for_test().departed, 1);
+    assert!(
+        !files_the_first_use_row(&engine),
+        "the hook still protects it"
+    );
+    io.guard_lost = true;
+    engine.service_member_stops(&mut io, &mut session, Some(30));
+    assert!(files_the_first_use_row(&engine));
+}
+
+/// Twin: a staging that attached before the watchdog loss owes no row.
+#[test]
+fn member_stop_watchdog_loss_after_an_attached_hold_files_no_row() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 1);
+    io.guard_lost = true;
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(!files_the_first_use_row(&engine));
+}

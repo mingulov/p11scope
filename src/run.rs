@@ -4198,6 +4198,17 @@ impl Owned {
     /// evidence is built: `child_still_running` is a fact the final document
     /// reports, never a guess made after it was written. Resume comes first,
     /// so a child still held by an accepted stop is never waited on.
+    /// Ends the run-member stops: the hook switches off and detaches,
+    /// every held or pending member resumes, and the watchdog ends in
+    /// order. Runs at the capture loop's end, before the terminal
+    /// quiesce, so no member is stopped while no stop service runs.
+    /// Idempotent.
+    fn end_member_stops(&mut self, engine: &mut Engine) {
+        if let Some(mut hooks) = self.member_stops.take() {
+            engine.release_member_stops(&mut hooks);
+        }
+    }
+
     fn finish(
         &mut self,
         engine: &mut Engine,
@@ -4211,10 +4222,9 @@ impl Owned {
         // the gap reason; `None` (degraded exact-PID path) discloses
         // nothing on top of the degradation gap.
         // No member stays stopped past the capture: new stops switch
-        // off and every held member resumes before settlement.
-        if let Some(mut hooks) = self.member_stops.take() {
-            engine.release_member_stops(&mut hooks);
-        }
+        // off and every held member resumes before settlement (already
+        // done at the loop's end; this covers the paths that skip it).
+        self.end_member_stops(engine);
         if let Some(group) = self.run_cgroup.as_ref() {
             let (count, gap) = run_tree_survivors_gap(group.survivors_excluding(self.pid));
             if let Some(reason) = gap {
@@ -9937,6 +9947,11 @@ fn capture_profile(
             CancellationPhase::Finalization,
         );
     };
+    // The loop ended: no run member is stopped past it (the terminal
+    // quiesce below runs no stop service).
+    if let Some(owned) = owned.as_deref_mut() {
+        owned.end_member_stops(engine);
+    }
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
         // Owned runs name the child's status instead of this marker.
         if owned.is_none() {
@@ -11657,6 +11672,11 @@ fn capture_trace(
             CancellationPhase::Finalization,
         );
     };
+    // The loop ended: no run member is stopped past it (the identity
+    // stop and quiesce below run no stop service).
+    if let Some(owned) = owned.as_deref_mut() {
+        owned.end_member_stops(engine);
+    }
     let mut terminal = None;
     begin_trace_identity_stop(
         engine,

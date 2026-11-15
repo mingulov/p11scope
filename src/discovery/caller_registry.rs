@@ -33,7 +33,7 @@ use crate::discovery::scan::CaptureWorkBudget;
 use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
 use crate::process::CustodyCharge;
 use crate::process::{
-    PidPin, generation_gone, process_is_kthread, process_is_zombie, process_proven_exited,
+    PidPin, generation_dead, process_is_kthread, process_is_zombie, process_proven_exited,
     process_start_time, process_stat_pair,
 };
 pub(crate) mod metadata;
@@ -755,7 +755,8 @@ impl ProcessSource for OsProcessSource {
     }
 
     fn gone(&self, pid: u32) -> bool {
-        generation_gone(pid) || process_is_zombie(pid)
+        // One stat read classifies both a reaped and an unreaped exit.
+        generation_dead(pid)
     }
 
     fn proven_exited(&self, pid: u32) -> bool {
@@ -3787,9 +3788,6 @@ fn aggregated_unrouted_reason(
 struct RetiredCallers {
     /// Inclusive `start -> end` retired ID runs.
     ranges: BTreeMap<u32, u32>,
-    /// Total retired IDs ever recorded (published as the counted
-    /// aggregate, not retained per row).
-    ids: u64,
 }
 
 impl RetiredCallers {
@@ -3822,7 +3820,6 @@ impl RetiredCallers {
             self.ranges.remove(&after);
         }
         self.ranges.insert(start, end);
-        self.ids = self.ids.saturating_add(1);
     }
 
     /// Structural rows (one per retired ID run), the memory lens value.
@@ -9321,7 +9318,7 @@ pub(crate) mod tests {
         // The generation is dead but `/proc` still parses — exactly the
         // case that used to re-admit every pass as "PID reuse".
         assert!(process_start_time(pid).is_ok());
-        assert!(!generation_gone(pid));
+        assert!(!crate::process::generation_gone(pid));
         let source = OsProcessSource;
         assert!(source.gone(pid));
         let mut adapter = CallerAdapter::new(

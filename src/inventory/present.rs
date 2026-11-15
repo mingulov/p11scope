@@ -3975,6 +3975,12 @@ fn render_snapshot_inner(
             "s"
         },
     );
+    // Proven-exited rows retired after they were rendered no longer
+    // appear in callers[]; name them so the headline is not read as the
+    // capture's lifetime caller count.
+    if budgets.callers_retired > 0 {
+        let _ = writeln!(out, "{} exited without calls", budgets.callers_retired);
+    }
     // One coverage format everywhere (profile, inspect, inventory):
     // `coverage: complete`, or `coverage: partial` with the nonzero
     // segments — loss gaps, refusals, suppressed-but-unretained.

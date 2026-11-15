@@ -18,6 +18,7 @@ pub(crate) mod job;
 #[path = "runtime/work_lane.rs"]
 pub(crate) mod work_lane;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -264,6 +265,10 @@ impl MetadataSummary {
 
 pub(crate) struct MetadataRuntime {
     slots: Box<[Option<Slot>]>,
+    /// Caller IDs are lifetime-monotonic and may far exceed the table
+    /// capacity: slots are allocated from `free`, never indexed by ID.
+    index: BTreeMap<CallerId, usize>,
+    free: Vec<usize>,
     _table_storage: MemoryCharge,
     budget: Arc<MemoryBudget>,
     epoch: u64,
@@ -301,14 +306,22 @@ impl MetadataRuntime {
         // Reservation precedes Vec's one exact-capacity allocation, including
         // this owner and its fixed table/worker-slot bookkeeping.
         let bytes = MAX_CALLER_METADATA_RECORDS * size_of::<Option<Slot>>()
+            + MAX_CALLER_METADATA_RECORDS
+                * (size_of::<(CallerId, usize)>()
+                    + size_of::<usize>()
+                    + crate::memory_counters::HEAP_MAP_ENTRY)
             + ALLOCATION_PADDING
             + job::owner_storage_bytes();
         let storage = MemoryCharge::reserve(&budget, bytes)?;
         let mut slots = Vec::with_capacity(MAX_CALLER_METADATA_RECORDS);
         slots.resize(MAX_CALLER_METADATA_RECORDS, None);
         assert_eq!(slots.capacity(), MAX_CALLER_METADATA_RECORDS);
+        let mut free = Vec::with_capacity(MAX_CALLER_METADATA_RECORDS);
+        free.extend((0..MAX_CALLER_METADATA_RECORDS).rev());
         Some(Self {
             slots: slots.into_boxed_slice(),
+            index: BTreeMap::new(),
+            free,
             _table_storage: storage,
             budget,
             epoch,
@@ -333,10 +346,19 @@ impl MetadataRuntime {
         now: u64,
     ) {
         for caller in callers {
-            let Some(slot) = self.slots.get_mut(caller.id.0 as usize) else {
-                self.summary.budget_refusals = self.summary.budget_refusals.saturating_add(1);
-                continue;
+            let index = match self.index.get(&caller.id) {
+                Some(&index) => index,
+                None => {
+                    let Some(index) = self.free.pop() else {
+                        self.summary.budget_refusals =
+                            self.summary.budget_refusals.saturating_add(1);
+                        continue;
+                    };
+                    self.index.insert(caller.id, index);
+                    index
+                }
             };
+            let slot = &mut self.slots[index];
             match slot {
                 None => {
                     let metadata = if caller.retired {
@@ -389,6 +411,30 @@ impl MetadataRuntime {
                     }
                 }
             }
+        }
+    }
+
+    /// Release a forgotten caller's slot for a later caller. An already
+    /// running job for the ID is discarded by its caller/sequence guard.
+    pub(crate) fn forget(&mut self, id: CallerId) {
+        let Some(index) = self.index.remove(&id) else {
+            return;
+        };
+        self.slots[index] = None;
+        self.free.push(index);
+    }
+
+    /// The retained table's fixed slots plus the live ID index, for the
+    /// `-v` memory line.
+    pub(crate) fn table_row(&self) -> crate::memory_counters::CounterRow {
+        let fixed = MAX_CALLER_METADATA_RECORDS * size_of::<Option<Slot>>();
+        let per_entry = size_of::<(CallerId, usize)>()
+            + size_of::<usize>()
+            + crate::memory_counters::HEAP_MAP_ENTRY;
+        crate::memory_counters::CounterRow {
+            len: self.index.len() as u64,
+            bytes: (fixed as u64)
+                .saturating_add((self.index.len() as u64).saturating_mul(per_entry as u64)),
         }
     }
 
@@ -466,9 +512,9 @@ impl MetadataRuntime {
             && current == ticket.caller
             && !current.retired
             && self
-                .slots
-                .get(ticket.caller.id.0 as usize)
-                .and_then(Option::as_ref)
+                .index
+                .get(&ticket.caller.id)
+                .and_then(|&index| self.slots[index].as_ref())
                 .is_some_and(|slot| slot.caller == current && slot.sequence == ticket.sequence)
     }
 
@@ -497,9 +543,10 @@ impl MetadataRuntime {
             self.running = None;
         }
         let slot = self
-            .slots
-            .get_mut(ticket.caller.id.0 as usize)
-            .and_then(Option::as_mut);
+            .index
+            .get(&ticket.caller.id)
+            .copied()
+            .and_then(|index| self.slots[index].as_mut());
         let accepted = owned
             && !self.stopped
             && ticket.epoch == self.epoch
@@ -573,6 +620,10 @@ impl MetadataRuntime {
                 slot.metadata
             },
         }));
+        // Slot allocation no longer matches ID order (a forgotten caller's
+        // slot is reused by a higher ID); the frame's binary search needs
+        // caller order.
+        rows.sort_by_key(|row| row.caller);
         assert_eq!(rows.capacity(), count);
         let rows = Arc::new(FrameRows {
             rows: rows.into_boxed_slice(),

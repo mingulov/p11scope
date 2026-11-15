@@ -512,3 +512,30 @@ fn stop_keeps_last_sample_when_native_binding_is_retired_and_rejects_late_work()
         MetadataStatus::Historical
     );
 }
+
+/// Caller IDs are lifetime-monotonic: the table is keyed by ID, never a
+/// raw-ID slot index, and a forgotten caller's slot is reusable by a much
+/// higher ID without a budget refusal.
+#[test]
+fn high_lifetime_caller_ids_are_keyed_and_freed_slots_reused() {
+    let mut runtime = MetadataRuntime::new(7);
+    let base = 10_000u32;
+    let first: Vec<_> = (0..MAX_CALLER_METADATA_RECORDS as u32)
+        .map(|offset| caller(base + offset))
+        .collect();
+    runtime.synchronize(first, 0);
+    assert_eq!(runtime.frame().summary.pending, MAX_CALLER_METADATA_RECORDS);
+    // A full table refuses a new caller honestly.
+    runtime.synchronize([caller(20_000)], 0);
+    assert_eq!(runtime.frame().summary.budget_refusals, 1);
+    assert!(!runtime.frame().contains(CallerId(20_000)));
+    // Freeing one forgotten caller lets the higher ID in with no new
+    // refusal, and the scheduler can select it.
+    runtime.forget(CallerId(base));
+    runtime.synchronize([caller(20_000)], 0);
+    let frame = runtime.frame();
+    assert_eq!(frame.summary.budget_refusals, 1);
+    assert!(frame.contains(CallerId(20_000)), "high ID has a table row");
+    assert!(!frame.contains(CallerId(base)), "the forgotten row is gone");
+    assert_eq!(runtime.next(0).unwrap().caller.id, CallerId(20_000));
+}

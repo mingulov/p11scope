@@ -2321,7 +2321,7 @@ impl ConfirmIo for OsConfirmIo<'_> {
         {
             return false;
         }
-        crate::process::generation_gone(pid) || crate::process::process_is_zombie(pid)
+        crate::process::generation_dead(pid)
     }
 
     fn mint_member(

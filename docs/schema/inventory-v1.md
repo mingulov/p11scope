@@ -1075,10 +1075,15 @@ Additive budgets are:
   domain and object class). `pair_prune_overflow` counts the rows folded
   into that aggregate past the exact per-pair revival-tombstone bound; each
   row is counted once, its base is still in the aggregate, and only exact
-  per-pair revival is lost (a revival then rebases approximately, never
-  silently re-absorbing a pre-fold count). `exec_prune_overflow` counts
+  per-pair revival is lost: a later revival starts from zero, so its new
+  absolute is staged as growth rather than rebased past the folded base
+  (the class aggregate keeps that base counted exactly once).
+  `exec_prune_overflow` counts
   pruned EXEC stashes discarded past their tombstone bound; the domain
-  latches EXEC loss and late rows there read `exec_record_lost`.
+  latches EXEC loss and late rows there read `exec_record_lost`. EXEC
+  tombstones expire by domain after its next completed witness sweep (a
+  row that still needs one keeps it until it decides), and both departed
+  tombstone maps are dropped when their capture domain finishes.
 - `instances`: `{limit, occupied, refused}` for lifetime retained records,
   including retired records (default limit 4096).
 - `instance_semantic_state`: `{limit, occupied, unknown_edges, refused,

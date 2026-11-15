@@ -116,6 +116,20 @@ pub(crate) struct NativeRetentionLens {
     pub scan_freshness: CounterRow,
     pub proven_images: CounterRow,
     pub exe_probe_cache: CounterRow,
+    pub binder_exec_ns: CounterRow,
+    pub binder_cookies: CounterRow,
+    pub binder_pending: CounterRow,
+    pub binder_callers: CounterRow,
+}
+
+/// Current count-ownership headers, charged associations, summaries and
+/// their pending bounded cleanup (`CountOwnership`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnershipLens {
+    pub callers: CounterRow,
+    pub associations: CounterRow,
+    pub summaries: CounterRow,
+    pub cleanup: CounterRow,
 }
 
 /// R3 lens: per-edge session/operation/mechanism maps, summed over
@@ -337,7 +351,9 @@ pub(crate) struct InventoryLens {
     pub registry: RegistryLens,
     pub history: HistoryLens,
     pub model: ModelLens,
+    pub ownership: OwnershipLens,
     pub metadata_rows: Option<CounterRow>,
+    pub metadata_table: Option<CounterRow>,
     pub baseline_rss_kb: Option<u64>,
 }
 
@@ -366,6 +382,14 @@ pub(crate) struct MemorySnapshot {
     r1_native_scan_freshness: Option<CounterRow>,
     r1_native_proven_images: Option<CounterRow>,
     r1_native_exe_probe_cache: Option<CounterRow>,
+    r1_native_binder_exec_ns: Option<CounterRow>,
+    r1_native_binder_cookies: Option<CounterRow>,
+    r1_native_binder_pending: Option<CounterRow>,
+    r1_native_binder_callers: Option<CounterRow>,
+    r1_ownership_callers: Option<CounterRow>,
+    r1_ownership_associations: Option<CounterRow>,
+    r1_ownership_summaries: Option<CounterRow>,
+    r1_ownership_cleanup: Option<CounterRow>,
     r2_registry_callers: Option<CounterRow>,
     r2_registry_retired: Option<CounterRow>,
     r2_registry_modules: Option<CounterRow>,
@@ -434,6 +458,7 @@ pub(crate) struct MemorySnapshot {
     r12_retired_sessions_dead: Option<CounterRow>,
     sample_us: Option<u64>,
     caller_metadata_rows: Option<CounterRow>,
+    caller_metadata_table: Option<CounterRow>,
     floor_discovery_baseline_kb: Option<u64>,
     floor_staging_bytes: u64,
     floor_ring_bytes: u64,
@@ -540,6 +565,14 @@ impl MemorySnapshot {
             r1_native_scan_freshness: None,
             r1_native_proven_images: None,
             r1_native_exe_probe_cache: None,
+            r1_native_binder_exec_ns: None,
+            r1_native_binder_cookies: None,
+            r1_native_binder_pending: None,
+            r1_native_binder_callers: None,
+            r1_ownership_callers: None,
+            r1_ownership_associations: None,
+            r1_ownership_summaries: None,
+            r1_ownership_cleanup: None,
             r2_registry_callers: None,
             r2_registry_retired: None,
             r2_registry_modules: None,
@@ -608,6 +641,7 @@ impl MemorySnapshot {
             r12_retired_sessions_dead: Some(dead.retired_sessions_dead),
             sample_us: Some(lens.sample_us),
             caller_metadata_rows: None,
+            caller_metadata_table: None,
             floor_discovery_baseline_kb: lens.baseline_rss_kb,
             floor_staging_bytes: staging,
             floor_ring_bytes: ring,
@@ -643,6 +677,14 @@ impl MemorySnapshot {
             r1_native_scan_freshness: Some(lens.native.scan_freshness),
             r1_native_proven_images: Some(lens.native.proven_images),
             r1_native_exe_probe_cache: Some(lens.native.exe_probe_cache),
+            r1_native_binder_exec_ns: Some(lens.native.binder_exec_ns),
+            r1_native_binder_cookies: Some(lens.native.binder_cookies),
+            r1_native_binder_pending: Some(lens.native.binder_pending),
+            r1_native_binder_callers: Some(lens.native.binder_callers),
+            r1_ownership_callers: Some(lens.ownership.callers),
+            r1_ownership_associations: Some(lens.ownership.associations),
+            r1_ownership_summaries: Some(lens.ownership.summaries),
+            r1_ownership_cleanup: Some(lens.ownership.cleanup),
             r2_registry_callers: Some(lens.registry.callers),
             r2_registry_retired: Some(lens.registry.retired),
             r2_registry_modules: Some(lens.registry.modules),
@@ -713,6 +755,7 @@ impl MemorySnapshot {
             r12_retired_sessions_dead: None,
             sample_us: None,
             caller_metadata_rows: lens.metadata_rows,
+            caller_metadata_table: lens.metadata_table,
             floor_discovery_baseline_kb: lens.baseline_rss_kb,
             floor_staging_bytes: staging,
             floor_ring_bytes: ring,
@@ -991,6 +1034,10 @@ mod tests {
                 scan_freshness: row(34),
                 proven_images: row(35),
                 exe_probe_cache: row(36),
+                binder_exec_ns: row(39),
+                binder_cookies: row(40),
+                binder_pending: row(41),
+                binder_callers: row(42),
             },
             registry: RegistryLens {
                 callers: row(3),
@@ -1025,7 +1072,14 @@ mod tests {
                 recently_pruned: row(22),
                 gaps: row(23),
             },
+            ownership: OwnershipLens {
+                callers: row(43),
+                associations: row(44),
+                summaries: row(45),
+                cleanup: row(46),
+            },
             metadata_rows: Some(row(16)),
+            metadata_table: Some(row(47)),
             baseline_rss_kb: Some(4321),
         }
     }
@@ -1168,6 +1222,11 @@ mod tests {
         );
         assert!(profile.r1_native_exec_exe.is_none());
         assert!(trace.r1_native_pair_targets.is_none());
+        assert_eq!(inventory.r1_native_binder_exec_ns.expect("binder").len, 39);
+        assert_eq!(inventory.r1_native_binder_cookies.expect("binder").len, 40);
+        assert_eq!(inventory.r1_ownership_callers.expect("ownership").len, 43);
+        assert_eq!(inventory.r1_ownership_summaries.expect("ownership").len, 45);
+        assert_eq!(inventory.caller_metadata_table.expect("metadata").len, 47);
         assert_eq!(inventory.r2_modules_by_key.expect("R2").len, 7);
         assert_eq!(inventory.r2_gap_index.expect("R2").len, 8);
         assert_eq!(inventory.r3_edge_detached.expect("R3").len, 11);

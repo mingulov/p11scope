@@ -114,6 +114,12 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   admitted/exited/retired, or `old` and `new` for exec-retired/reused. Each subject
   uses the compact caller projection below from the same publication revision.
   `admit_failed` has no identity context or invented incarnation.
+  A caller minted by `admitted`, `exec_retired` or `reused` may be absent
+  from the final snapshot `callers[]`: a proven-exited row retired after a
+  presentation rendered it no longer appears there, while
+  `budgets.callers.retired` counts it. Such a retired ID backs no final
+  edge or instance. Consumers must therefore compare minted IDs as a
+  superset of the snapshot, not an equality.
 - `gap_recorded`: `{index, caller, module, pid, subject, reason,
   budget}` — a snapshot `gaps[]` entry minus `repeats`, plus its
   ordinal `index` (equal to its snapshot `gaps[]` index): gap identity

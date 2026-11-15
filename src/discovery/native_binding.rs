@@ -515,6 +515,14 @@ impl BindingCensus {
     }
 }
 
+/// The binder's retained per-ever tables, for the `-v` memory line.
+pub(crate) struct BinderRetentionRows {
+    pub exec_ns: crate::memory_counters::CounterRow,
+    pub cookies: crate::memory_counters::CounterRow,
+    pub pending: crate::memory_counters::CounterRow,
+    pub callers: crate::memory_counters::CounterRow,
+}
+
 /// Table bounds. Every bound reached is a counted `Capacity` verdict (or a
 /// lifecycle loss for the exec table), never silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -697,6 +705,10 @@ pub(crate) struct NativeBinder {
     /// tracked generation while the pid named a live process. A host
     /// fact, shared by every domain like the census.
     reuse_ns: HashMap<u32, u64>,
+    /// When a tgid was first observed gone, so the departed-record grace
+    /// runs from the exit observation rather than from old evidence
+    /// timestamps (a process older than the grace still gets its grace).
+    gone_since: HashMap<u32, u64>,
     /// Whether BPF hook stamps and admission stamps share a clock. The
     /// coordinator syncs this on every staged batch and immediately
     /// when the clocks go incomparable; fail-closed false until
@@ -719,6 +731,7 @@ impl NativeBinder {
             transitions: Vec::new(),
             census: BindingCensus::default(),
             reuse_ns: HashMap::new(),
+            gone_since: HashMap::new(),
             exit_clocks_comparable: false,
             metadata_clock_qualified: false,
             #[cfg(test)]
@@ -885,12 +898,23 @@ impl NativeBinder {
     /// turn a `exec_after_admission` refusal into a false bind. The hard
     /// limits are unchanged; this only stops a churn of short-lived
     /// processes from filling them.
-    pub(crate) fn prune_departed<G, P>(&mut self, gone: G, protected: P, now_ns: u64, grace_ns: u64)
-    where
-        G: Fn(u32) -> bool,
+    pub(crate) fn prune_departed<G, P>(
+        &mut self,
+        mut gone: G,
+        protected: P,
+        now_ns: u64,
+        grace_ns: u64,
+    ) where
+        G: FnMut(u32) -> bool,
         P: Fn(u32) -> bool,
     {
-        for domain in &mut self.domains {
+        let Self {
+            domains,
+            gone_since,
+            ..
+        } = self;
+        let mut referenced = std::collections::HashSet::new();
+        for domain in domains.iter_mut() {
             if domain.finished {
                 continue;
             }
@@ -899,16 +923,28 @@ impl NativeBinder {
                 .iter()
                 .map(|pending| pending.row.host_tgid)
                 .collect();
-            domain.exec_ns.retain(|tgid, latest| {
-                !gone(*tgid)
-                    || protected(*tgid)
-                    || pending_tgids.contains(tgid)
-                    || now_ns.saturating_sub(*latest) < grace_ns
+            // Cheap evidence/protection checks precede the `/proc` read.
+            domain.exec_ns.retain(|tgid, _latest| {
+                if protected(*tgid) || pending_tgids.contains(tgid) {
+                    referenced.insert(*tgid);
+                    return true;
+                }
+                if !gone(*tgid) {
+                    gone_since.remove(tgid);
+                    referenced.insert(*tgid);
+                    return true;
+                }
+                let since = *gone_since.entry(*tgid).or_insert(now_ns);
+                if now_ns.saturating_sub(since) < grace_ns {
+                    referenced.insert(*tgid);
+                    return true;
+                }
+                false
             });
-            // An image cookie whose latest row is older than the grace and
-            // whose process is gone cannot receive a new row; keeping its
-            // exec sequences only grows the per-image map. A bound caller,
-            // a pending row or a retained caller's veto still needs it.
+            // An image cookie whose process was gone longer than the grace
+            // cannot receive a new row; keeping its exec sequences only
+            // grows the per-image map. A bound caller, a pending row or a
+            // retained caller's veto still needs it.
             let live_cookies: std::collections::HashSet<DomainCookie> =
                 domain.callers.values().map(|(cookie, _)| *cookie).collect();
             let pending_cookies: std::collections::HashSet<DomainCookie> = domain
@@ -917,14 +953,71 @@ impl NativeBinder {
                 .map(|pending| pending.row.cookie())
                 .collect();
             domain.cookies.retain(|cookie, execs| {
-                live_cookies.contains(cookie)
-                    || pending_cookies.contains(cookie)
-                    || execs.values().any(|seen| {
-                        !gone(seen.last_tgid)
-                            || protected(seen.last_tgid)
-                            || now_ns.saturating_sub(seen.last_t0_ns) < grace_ns
-                    })
+                if live_cookies.contains(cookie) || pending_cookies.contains(cookie) {
+                    return true;
+                }
+                execs.values().any(|seen| {
+                    if protected(seen.last_tgid) {
+                        referenced.insert(seen.last_tgid);
+                        return true;
+                    }
+                    if !gone(seen.last_tgid) {
+                        gone_since.remove(&seen.last_tgid);
+                        referenced.insert(seen.last_tgid);
+                        return true;
+                    }
+                    let since = *gone_since.entry(seen.last_tgid).or_insert(now_ns);
+                    if now_ns.saturating_sub(since) < grace_ns {
+                        referenced.insert(seen.last_tgid);
+                        true
+                    } else {
+                        false
+                    }
+                })
             });
+        }
+        gone_since.retain(|tgid, _| referenced.contains(tgid));
+    }
+
+    /// Cookies with a row still pending in `domain`: their EXEC tombstone
+    /// is needed until that row decides.
+    pub(crate) fn pending_cookies(
+        &self,
+        domain: NativeDomainId,
+    ) -> std::collections::HashSet<DomainCookie> {
+        self.domain_indices
+            .get(&domain)
+            .map(|&index| {
+                self.domains[index]
+                    .pending
+                    .iter()
+                    .map(|pending| pending.row.cookie())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The binder's retained per-ever tables for the `-v` memory line.
+    pub(crate) fn retention_rows(&self) -> BinderRetentionRows {
+        use crate::memory_counters::{HEAP_MAP_ENTRY, counter_row};
+        use std::mem::size_of;
+        let exec_ns = self.domains.iter().map(|domain| domain.exec_ns.len()).sum();
+        let cookies = self
+            .domains
+            .iter()
+            .map(|domain| domain.cookies.values().map(BTreeMap::len).sum::<usize>())
+            .sum();
+        let pending = self.domains.iter().map(|domain| domain.pending.len()).sum();
+        let callers = self.domains.iter().map(|domain| domain.callers.len()).sum();
+        BinderRetentionRows {
+            exec_ns: counter_row(exec_ns, size_of::<(u32, u64)>(), HEAP_MAP_ENTRY),
+            cookies: counter_row(cookies, size_of::<(u64, ExecSeen)>(), HEAP_MAP_ENTRY),
+            pending: counter_row(pending, size_of::<Pending>(), HEAP_MAP_ENTRY),
+            callers: counter_row(
+                callers,
+                size_of::<(CallerId, (DomainCookie, u64))>(),
+                HEAP_MAP_ENTRY,
+            ),
         }
     }
 

@@ -87,6 +87,20 @@ impl MetadataLane {
             self.unavailable.summary.unknown = adapter.len();
         }
     }
+    /// Release a forgotten caller's table slot so lifetime caller IDs do
+    /// not exhaust the fixed table.
+    pub(crate) fn forget(&mut self, id: crate::discovery::caller_registry::CallerId) {
+        if let Some(active) = self.active.as_mut() {
+            active.runtime.forget(id);
+        }
+    }
+    /// The retained table itself (occupied slots and fixed storage).
+    pub(crate) fn table_row(&self) -> crate::memory_counters::CounterRow {
+        self.active.as_ref().map_or(
+            crate::memory_counters::CounterRow { len: 0, bytes: 0 },
+            |active| active.runtime.table_row(),
+        )
+    }
     pub(crate) fn stop(&mut self) {
         if let Some(active) = self.active.as_mut() {
             active.stop();

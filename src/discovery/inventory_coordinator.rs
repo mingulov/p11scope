@@ -4885,8 +4885,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // Keep this pass's file-derived facts for the next pass. They are
         // keyed and pin-validated per opened file, so reuse never outlives
-        // a file change, and a refused or discarded collection (rejected
-        // above) never replaces the facts a future pass can use.
+        // a file change. The bundle left the coordinator when the
+        // collector took it; a collection discarded between that take and
+        // this point (worker failure, stop, or a refusal above) leaves the
+        // coordinator without facts, so the next pass re-reads instead of
+        // reusing anything stale.
         self.cgroup_file_facts = collection.take_retained_file_facts();
         let work = collection.work();
         let events = self

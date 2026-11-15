@@ -1097,6 +1097,33 @@ pub(crate) struct RetainedFileFacts {
     retained_cache_bytes: u64,
 }
 
+/// The accounted bytes of the four file-fact maps, recomputed from the
+/// entries themselves. Install re-derives the carried counter with it, and
+/// twins pin eviction accounting against it.
+fn file_fact_bytes(
+    inspected_files: &BTreeMap<InspectedFileKey, InspectedFile>,
+    elf_export_facts: &BTreeMap<InspectedFileKey, ElfExportFacts>,
+    table_cap_refusals: &BTreeMap<InspectedFileKey, String>,
+    loader_elf_facts: &BTreeMap<LoaderFactsKey, LoaderElfFacts>,
+) -> u64 {
+    let inspected = inspected_files.iter().fold(0u64, |bytes, (key, value)| {
+        bytes.saturating_add(inspected_cache_bytes(key, value))
+    });
+    let exports = elf_export_facts.iter().fold(0u64, |bytes, (key, value)| {
+        bytes.saturating_add(export_cache_bytes(key, value))
+    });
+    let refusals = table_cap_refusals.iter().fold(0u64, |bytes, (key, value)| {
+        bytes.saturating_add(table_refusal_cache_bytes(key, value))
+    });
+    let loaders = loader_elf_facts.iter().fold(0u64, |bytes, (key, value)| {
+        bytes.saturating_add(loader_cache_bytes(key, value))
+    });
+    inspected
+        .saturating_add(exports)
+        .saturating_add(refusals)
+        .saturating_add(loaders)
+}
+
 impl RetainedFileFacts {
     /// `(inspection, export, refusal, loader, accounted bytes)` entry
     /// counts, for twins that assert the carried map is genuinely full.
@@ -1187,6 +1214,13 @@ pub struct CaptureWorkBudget {
     /// re-reading the whole loader for its locator, snapshot and both
     /// revalidation brackets.
     loader_elf_facts: BTreeMap<LoaderFactsKey, LoaderElfFacts>,
+    /// Keys of this pass's file-fact maps that a lookup hit or an insertion
+    /// touched. Carried entries missing here are dead for this pass (a
+    /// changed pin, a replaced library, a remounted overlay) and are the
+    /// only entries an insertion may reclaim. Never carried between
+    /// passes: each pass's budget starts with an empty set.
+    touched_inspected_files: BTreeSet<InspectedFileKey>,
+    touched_loader_elf_facts: BTreeSet<LoaderFactsKey>,
     interface_records: usize,
     admitted_interfaces: BTreeSet<InterfaceIdentity>,
     /// New distinct candidates refused by the cardinality ceilings. Sticky
@@ -1249,6 +1283,102 @@ pub(crate) struct ExcludedRecord {
     pub via: PathBuf,
 }
 
+/// Whether one file-fact insertion fits: the entry ceiling applies only to
+/// a new key, the byte ceiling to the resulting accounted total.
+fn cache_admits(
+    retained_cache_bytes: u64,
+    old_bytes: Option<u64>,
+    new_bytes: u64,
+    entries: usize,
+    entry_limit: Option<usize>,
+    byte_limit: u64,
+) -> bool {
+    if old_bytes.is_none() && entry_limit.is_some_and(|limit| entries >= limit) {
+        return false;
+    }
+    retained_cache_bytes
+        .checked_sub(old_bytes.unwrap_or(0))
+        .and_then(|bytes| bytes.checked_add(new_bytes))
+        .is_some_and(|bytes| bytes <= byte_limit)
+}
+
+/// Drop the first carried entry this pass did not touch, returning its
+/// accounted bytes. Entries the current pass looked up or inserted are
+/// never candidates, so a pass that stops early keeps what it used and
+/// only dead keys from an earlier pass are reclaimed. Deterministic
+/// `BTreeMap` order with the key as the tie-breaker.
+fn evict_untouched<K, V>(
+    map: &mut BTreeMap<K, V>,
+    touched: &BTreeSet<K>,
+    bytes_of: &impl Fn(&K, &V) -> u64,
+) -> Option<u64>
+where
+    K: Ord + Clone,
+{
+    let key = map.keys().find(|key| !touched.contains(*key)).cloned()?;
+    let value = map.remove(&key)?;
+    Some(bytes_of(&key, &value))
+}
+
+/// One file-fact map's insertion accounting: the shared byte counter and
+/// this map's ceilings. `retain` keeps the counter exact across an
+/// eviction by subtracting the reclaimed entry's accounted bytes.
+struct FileFactRetention<'a> {
+    retained_cache_bytes: &'a mut u64,
+    byte_limit: u64,
+    entry_limit: Option<usize>,
+}
+
+impl FileFactRetention<'_> {
+    fn retain<K, V>(
+        &mut self,
+        map: &mut BTreeMap<K, V>,
+        touched: &mut BTreeSet<K>,
+        key: K,
+        value: V,
+        bytes: u64,
+        bytes_of: impl Fn(&K, &V) -> u64,
+    ) -> bool
+    where
+        K: Ord + Clone,
+    {
+        let mut old_bytes = map.get(&key).map(|old| bytes_of(&key, old));
+        if !cache_admits(
+            *self.retained_cache_bytes,
+            old_bytes,
+            bytes,
+            map.len(),
+            self.entry_limit,
+            self.byte_limit,
+        ) {
+            let Some(freed) = evict_untouched(map, touched, &bytes_of) else {
+                return false;
+            };
+            *self.retained_cache_bytes = self.retained_cache_bytes.saturating_sub(freed);
+            old_bytes = map.get(&key).map(|old| bytes_of(&key, old));
+            if !cache_admits(
+                *self.retained_cache_bytes,
+                old_bytes,
+                bytes,
+                map.len(),
+                self.entry_limit,
+                self.byte_limit,
+            ) {
+                return false;
+            }
+        }
+        let old = map
+            .insert(key.clone(), value)
+            .map_or(0, |old| bytes_of(&key, &old));
+        *self.retained_cache_bytes = self
+            .retained_cache_bytes
+            .saturating_sub(old)
+            .saturating_add(bytes);
+        touched.insert(key);
+        true
+    }
+}
+
 impl CaptureWorkBudget {
     pub fn new(limits: ScanLimits) -> Self {
         Self {
@@ -1269,6 +1399,8 @@ impl CaptureWorkBudget {
             elf_export_facts: BTreeMap::new(),
             table_cap_refusals: BTreeMap::new(),
             loader_elf_facts: BTreeMap::new(),
+            touched_inspected_files: BTreeSet::new(),
+            touched_loader_elf_facts: BTreeSet::new(),
             interface_records: 0,
             admitted_interfaces: BTreeSet::new(),
             table_refusals: 0,
@@ -1537,29 +1669,14 @@ impl CaptureWorkBudget {
         matches!(self.policy, DiscoveryPolicy::DetailedLegacy) || self.active_scan.is_some()
     }
 
-    fn cache_can_replace(
-        &self,
-        old_bytes: Option<u64>,
-        new_bytes: u64,
-        entries: usize,
-        entry_limit: Option<usize>,
-    ) -> bool {
-        // Capture scans (DetailedLegacy) enforce the capture ceilings; without
-        // them every distinct scanned file stayed cached forever (v070-musl-rss).
-        // Callers pass the capture entry ceiling as the fallback, so by the time
-        // this runs `entry_limit` is always `Some`.
-        let byte_limit = self
-            .inventory_limits()
+    /// The byte ceiling the file-fact maps share. Capture scans
+    /// (DetailedLegacy) enforce the capture ceiling; without it every
+    /// distinct scanned file stayed cached forever (v070-musl-rss).
+    fn retained_byte_limit(&self) -> u64 {
+        self.inventory_limits()
             .map_or(CAPTURE_RETAINED_CACHE_BYTES, |limits| {
                 limits.retained.cache_bytes
-            });
-        if old_bytes.is_none() && entry_limit.is_some_and(|limit| entries >= limit) {
-            return false;
-        }
-        self.retained_cache_bytes
-            .checked_sub(old_bytes.unwrap_or(0))
-            .and_then(|bytes| bytes.checked_add(new_bytes))
-            .is_some_and(|bytes| bytes <= byte_limit)
+            })
     }
 
     fn set_scan_stop(&mut self, reason: &'static str) {
@@ -1953,8 +2070,12 @@ impl CaptureWorkBudget {
         self.admitted_runtime_tables.insert(id)
     }
 
-    pub(crate) fn inspected_file(&self, key: &InspectedFileKey) -> Option<InspectedFile> {
-        self.inspected_files.get(key).cloned()
+    pub(crate) fn inspected_file(&mut self, key: &InspectedFileKey) -> Option<InspectedFile> {
+        let value = self.inspected_files.get(key).cloned();
+        if value.is_some() {
+            self.touched_inspected_files.insert(*key);
+        }
+        value
     }
 
     pub(crate) fn note_inspected_file(
@@ -1966,31 +2087,32 @@ impl CaptureWorkBudget {
             return false;
         }
         let bytes = inspected_cache_bytes(&key, &value);
-        if !self.cache_can_replace(
-            self.inspected_files
-                .get(&key)
-                .map(|old| inspected_cache_bytes(&key, old)),
-            bytes,
-            self.inspected_files.len(),
-            self.inventory_limits()
-                .map(|limits| limits.retained.inspection_cache_entries)
-                .or(Some(CAPTURE_INSPECTION_CACHE_ENTRIES)),
-        ) {
-            return false;
+        let entry_limit = self
+            .inventory_limits()
+            .map(|limits| limits.retained.inspection_cache_entries)
+            .or(Some(CAPTURE_INSPECTION_CACHE_ENTRIES));
+        let byte_limit = self.retained_byte_limit();
+        FileFactRetention {
+            retained_cache_bytes: &mut self.retained_cache_bytes,
+            byte_limit,
+            entry_limit,
         }
-        let old = self
-            .inspected_files
-            .insert(key, value)
-            .map_or(0, |old| inspected_cache_bytes(&key, &old));
-        self.retained_cache_bytes = self
-            .retained_cache_bytes
-            .saturating_sub(old)
-            .saturating_add(bytes);
-        true
+        .retain(
+            &mut self.inspected_files,
+            &mut self.touched_inspected_files,
+            key,
+            value,
+            bytes,
+            inspected_cache_bytes,
+        )
     }
 
-    pub(crate) fn loader_elf_facts_for(&self, key: &LoaderFactsKey) -> Option<LoaderElfFacts> {
-        self.loader_elf_facts.get(key).cloned()
+    pub(crate) fn loader_elf_facts_for(&mut self, key: &LoaderFactsKey) -> Option<LoaderElfFacts> {
+        let value = self.loader_elf_facts.get(key).cloned();
+        if value.is_some() {
+            self.touched_loader_elf_facts.insert(*key);
+        }
+        value
     }
 
     /// Retains one loader's facts under its own entry allowance: the loader
@@ -2009,35 +2131,43 @@ impl CaptureWorkBudget {
             return false;
         }
         let bytes = loader_cache_bytes(&key, &value);
-        if !self.cache_can_replace(
-            self.loader_elf_facts
-                .get(&key)
-                .map(|old| loader_cache_bytes(&key, old)),
-            bytes,
-            self.loader_elf_facts.len(),
-            self.inventory_limits()
-                .map(|limits| limits.retained.export_cache_entries)
-                .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES)),
-        ) {
-            return false;
+        let entry_limit = self
+            .inventory_limits()
+            .map(|limits| limits.retained.export_cache_entries)
+            .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES));
+        let byte_limit = self.retained_byte_limit();
+        FileFactRetention {
+            retained_cache_bytes: &mut self.retained_cache_bytes,
+            byte_limit,
+            entry_limit,
         }
-        let old = self
-            .loader_elf_facts
-            .insert(key, value)
-            .map_or(0, |old| loader_cache_bytes(&key, &old));
-        self.retained_cache_bytes = self
-            .retained_cache_bytes
-            .saturating_sub(old)
-            .saturating_add(bytes);
-        true
+        .retain(
+            &mut self.loader_elf_facts,
+            &mut self.touched_loader_elf_facts,
+            key,
+            value,
+            bytes,
+            loader_cache_bytes,
+        )
     }
 
-    pub(crate) fn elf_export_facts_for(&self, key: &InspectedFileKey) -> Option<ElfExportFacts> {
-        self.elf_export_facts.get(key).cloned()
+    pub(crate) fn elf_export_facts_for(
+        &mut self,
+        key: &InspectedFileKey,
+    ) -> Option<ElfExportFacts> {
+        let value = self.elf_export_facts.get(key).cloned();
+        if value.is_some() {
+            self.touched_inspected_files.insert(*key);
+        }
+        value
     }
 
-    pub(crate) fn table_cap_refusal_for(&self, key: &InspectedFileKey) -> Option<String> {
-        self.table_cap_refusals.get(key).cloned()
+    pub(crate) fn table_cap_refusal_for(&mut self, key: &InspectedFileKey) -> Option<String> {
+        let value = self.table_cap_refusals.get(key).cloned();
+        if value.is_some() {
+            self.touched_inspected_files.insert(*key);
+        }
+        value
     }
 
     /// Retains one gate refusal (table-cap or pre-parse format)
@@ -2050,27 +2180,24 @@ impl CaptureWorkBudget {
             return false;
         }
         let bytes = table_refusal_cache_bytes(&key, &reason);
-        if !self.cache_can_replace(
-            self.table_cap_refusals
-                .get(&key)
-                .map(|old| table_refusal_cache_bytes(&key, old)),
-            bytes,
-            self.table_cap_refusals.len(),
-            self.inventory_limits()
-                .map(|limits| limits.retained.export_cache_entries)
-                .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES)),
-        ) {
-            return false;
+        let entry_limit = self
+            .inventory_limits()
+            .map(|limits| limits.retained.export_cache_entries)
+            .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES));
+        let byte_limit = self.retained_byte_limit();
+        FileFactRetention {
+            retained_cache_bytes: &mut self.retained_cache_bytes,
+            byte_limit,
+            entry_limit,
         }
-        let old = self
-            .table_cap_refusals
-            .insert(key, reason)
-            .map_or(0, |old| table_refusal_cache_bytes(&key, &old));
-        self.retained_cache_bytes = self
-            .retained_cache_bytes
-            .saturating_sub(old)
-            .saturating_add(bytes);
-        true
+        .retain(
+            &mut self.table_cap_refusals,
+            &mut self.touched_inspected_files,
+            key,
+            reason,
+            bytes,
+            |key, value: &String| table_refusal_cache_bytes(key, value),
+        )
     }
 
     pub(crate) fn note_elf_export_facts(
@@ -2082,27 +2209,24 @@ impl CaptureWorkBudget {
             return false;
         }
         let bytes = export_cache_bytes(&key, &value);
-        if !self.cache_can_replace(
-            self.elf_export_facts
-                .get(&key)
-                .map(|old| export_cache_bytes(&key, old)),
-            bytes,
-            self.elf_export_facts.len(),
-            self.inventory_limits()
-                .map(|limits| limits.retained.export_cache_entries)
-                .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES)),
-        ) {
-            return false;
+        let entry_limit = self
+            .inventory_limits()
+            .map(|limits| limits.retained.export_cache_entries)
+            .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES));
+        let byte_limit = self.retained_byte_limit();
+        FileFactRetention {
+            retained_cache_bytes: &mut self.retained_cache_bytes,
+            byte_limit,
+            entry_limit,
         }
-        let old = self
-            .elf_export_facts
-            .insert(key, value)
-            .map_or(0, |old| export_cache_bytes(&key, &old));
-        self.retained_cache_bytes = self
-            .retained_cache_bytes
-            .saturating_sub(old)
-            .saturating_add(bytes);
-        true
+        .retain(
+            &mut self.elf_export_facts,
+            &mut self.touched_inspected_files,
+            key,
+            value,
+            bytes,
+            export_cache_bytes,
+        )
     }
 
     /// Take every retained file-derived cache, leaving this budget with
@@ -2111,6 +2235,8 @@ impl CaptureWorkBudget {
     /// file identity and pin, so unchanged files are reused with no
     /// reads and changed files miss and are read again.
     pub(crate) fn take_retained_file_facts(&mut self) -> RetainedFileFacts {
+        self.touched_inspected_files.clear();
+        self.touched_loader_elf_facts.clear();
         RetainedFileFacts {
             inspected_files: std::mem::take(&mut self.inspected_files),
             elf_export_facts: std::mem::take(&mut self.elf_export_facts),
@@ -2121,10 +2247,53 @@ impl CaptureWorkBudget {
     }
 
     /// Install file facts carried from an earlier pass, before this
-    /// budget begins its window and scan. Installed entries keep the
-    /// entry and byte ceilings the budget already enforces for new
-    /// insertions; a later changed pin simply misses.
+    /// budget begins its window and scan. The destination must be a fresh
+    /// budget, and every installed count and byte total must already fit
+    /// its ceilings: reclamation assumes the carried maps were built
+    /// under the same limits. A later changed pin simply misses.
     pub(crate) fn with_retained_file_facts(mut self, facts: RetainedFileFacts) -> Self {
+        debug_assert!(
+            self.inspected_files.is_empty()
+                && self.elf_export_facts.is_empty()
+                && self.table_cap_refusals.is_empty()
+                && self.loader_elf_facts.is_empty()
+                && self.retained_cache_bytes == 0,
+            "retained file facts install into a fresh budget"
+        );
+        if let Some(limits) = self.inventory_limits() {
+            debug_assert!(
+                facts.inspected_files.len() <= limits.retained.inspection_cache_entries,
+                "carried inspection entries exceed the destination ceiling"
+            );
+            debug_assert!(
+                facts.elf_export_facts.len() <= limits.retained.export_cache_entries,
+                "carried export entries exceed the destination ceiling"
+            );
+            debug_assert!(
+                facts.table_cap_refusals.len() <= limits.retained.export_cache_entries,
+                "carried refusals exceed the destination ceiling"
+            );
+            debug_assert!(
+                facts.loader_elf_facts.len() <= limits.retained.export_cache_entries,
+                "carried loader entries exceed the destination ceiling"
+            );
+            debug_assert!(
+                facts.retained_cache_bytes <= limits.retained.cache_bytes,
+                "carried bytes exceed the destination ceiling"
+            );
+        }
+        debug_assert_eq!(
+            facts.retained_cache_bytes,
+            file_fact_bytes(
+                &facts.inspected_files,
+                &facts.elf_export_facts,
+                &facts.table_cap_refusals,
+                &facts.loader_elf_facts,
+            ),
+            "the carried byte counter matches its entries"
+        );
+        self.touched_inspected_files.clear();
+        self.touched_loader_elf_facts.clear();
         self.inspected_files = facts.inspected_files;
         self.elf_export_facts = facts.elf_export_facts;
         self.table_cap_refusals = facts.table_cap_refusals;
@@ -2174,34 +2343,12 @@ impl CaptureWorkBudget {
     /// for tests that pin the eviction accounting.
     #[cfg(test)]
     pub(crate) fn retained_file_bytes_recount(&self) -> u64 {
-        let inspected = self
-            .inspected_files
-            .iter()
-            .fold(0u64, |bytes, (key, value)| {
-                bytes.saturating_add(inspected_cache_bytes(key, value))
-            });
-        let exports = self
-            .elf_export_facts
-            .iter()
-            .fold(0u64, |bytes, (key, value)| {
-                bytes.saturating_add(export_cache_bytes(key, value))
-            });
-        let refusals = self
-            .table_cap_refusals
-            .iter()
-            .fold(0u64, |bytes, (key, value)| {
-                bytes.saturating_add(table_refusal_cache_bytes(key, value))
-            });
-        let loaders = self
-            .loader_elf_facts
-            .iter()
-            .fold(0u64, |bytes, (key, value)| {
-                bytes.saturating_add(loader_cache_bytes(key, value))
-            });
-        inspected
-            .saturating_add(exports)
-            .saturating_add(refusals)
-            .saturating_add(loaders)
+        file_fact_bytes(
+            &self.inspected_files,
+            &self.elf_export_facts,
+            &self.table_cap_refusals,
+            &self.loader_elf_facts,
+        )
     }
 
     fn table_exhaustion_reason(&mut self) -> Option<String> {
@@ -18391,8 +18538,7 @@ mod tests {
         .unwrap();
         let used = provider_facts_for(used_file, *used_object_key, &[], &mut second).unwrap();
         assert_eq!(second.attempted_io_bytes(), 0, "the carried file is a hit");
-        let newcomer_facts =
-            provider_facts_for(&newcomer, newcomer_key, &[], &mut second).unwrap();
+        let newcomer_facts = provider_facts_for(&newcomer, newcomer_key, &[], &mut second).unwrap();
         let first_cost = second.attempted_io_bytes();
         assert!(first_cost > 0, "the newcomer's first lookup reads it");
         assert_eq!(
@@ -18450,10 +18596,7 @@ mod tests {
         let window = first.begin_window(WindowId::new(1), u64::MAX).unwrap();
         let scan = first.checkpoint(window.clone()).unwrap();
         let stale_key = |inode| InspectedFileKey {
-            device: Device {
-                major: 8,
-                minor: 1,
-            },
+            device: Device { major: 8, minor: 1 },
             inode,
             pin,
             fd_dev: 7,
@@ -18491,10 +18634,7 @@ mod tests {
         // A different descriptor device and inode: every carried entry is
         // dead for this pass.
         let fresh = InspectedFileKey {
-            device: Device {
-                major: 8,
-                minor: 1,
-            },
+            device: Device { major: 8, minor: 1 },
             inode: 99,
             pin,
             fd_dev: 8,
@@ -18518,7 +18658,10 @@ mod tests {
             second.table_cap_refusal_for(&fresh),
             Some("fresh table-cap refusal".into())
         );
-        assert_eq!(second.loader_elf_facts_for(&fresh_loader), Some(loader_facts));
+        assert_eq!(
+            second.loader_elf_facts_for(&fresh_loader),
+            Some(loader_facts)
+        );
         assert_eq!(second.loader_cache_len(), 4);
         assert_eq!(
             second.retained_counts().5,

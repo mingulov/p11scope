@@ -35,7 +35,9 @@ pub(crate) trait MemberStopIo {
     fn withdraw(&mut self, tgid: u32) -> Result<(), String>;
     /// Requested, table-full, signal-refused, identity-unread totals.
     fn counters(&mut self) -> Result<[u64; 4], String>;
-    /// Stops every new stop; pending rows stay for the final release.
+    /// Stops every new stop and waits out in-flight hook invocations
+    /// (the hook is detached), so a scan after it sees every row there
+    /// will be; pending rows stay for the release.
     fn deactivate(&mut self) -> Result<(), String>;
     /// Whether the pinned process is in the run cgroup tree now. A row
     /// names only a tgid: its member may have exited and the number been
@@ -107,13 +109,9 @@ pub(crate) struct MemberStopState {
     /// Rows left in place for a retry (counted once as stopped), with
     /// the stop instant their bound runs from.
     retrying: BTreeMap<u32, u64>,
-    /// The watchdog was lost: no further stops are serviced or made.
+    /// The watchdog was lost: no further stops are made, and every pass
+    /// only resumes whatever rows remain.
     disabled: bool,
-    /// After the loss, rows still owed a resume: the table was unreadable
-    /// at the loss, or a forced resume was refused (retried each pass).
-    loss_drain: bool,
-    /// The loss drain has not yet read the table once.
-    loss_drain_all: bool,
     /// Pinned identities whose staging was refused (cap, replaced file,
     /// pin budget, nothing pinnable): settled, but never attached.
     refused: BTreeSet<(u64, u64)>,
@@ -482,9 +480,7 @@ impl Engine {
         now_ns: Option<u64>,
     ) {
         if self.member_stops.disabled {
-            if self.member_stops.loss_drain {
-                self.drain_after_guard_loss(io, now_ns.or_else(crate::attach::monotonic_ns));
-            }
+            self.drain_after_guard_loss(io, now_ns.or_else(crate::attach::monotonic_ns));
             return;
         }
         if io.guard_lost() {
@@ -1058,31 +1054,25 @@ impl Engine {
                 self.note_first_use_gap(tgid, "watchdog lost");
             }
         }
-        self.member_stops.loss_drain = true;
-        self.member_stops.loss_drain_all = true;
         self.drain_after_guard_loss(io, now_ns);
     }
 
-    /// Resumes the pending rows owed a resume after the watchdog loss:
-    /// every row on the first readable pass, then only those a refused
-    /// forced resume kept. Ends once nothing is owed.
+    /// Resumes every pending row after the watchdog loss, on every pass:
+    /// the hook is detached, so any row still present (an invocation that
+    /// passed its active check before the detach, a refused forced
+    /// resume, an unreadable table) is owed a resume, and no watchdog is
+    /// left to give it.
     fn drain_after_guard_loss(&mut self, io: &mut dyn MemberStopIo, now_ns: Option<u64>) {
         let Ok(pending) = io.pending() else {
             // Unreadable: retried on the next pass.
             return;
         };
         let owed: BTreeMap<u32, u64> = std::mem::take(&mut self.member_stops.retrying);
-        let all = std::mem::replace(&mut self.member_stops.loss_drain_all, false);
         let now_ns = now_ns.unwrap_or(0);
         for (tgid, stop) in pending {
-            let first_seen = owed.get(&tgid).copied();
-            if !all && first_seen.is_none() {
-                continue;
-            }
-            let since_ns = stop_since(&stop, first_seen, now_ns);
+            let since_ns = stop_since(&stop, owed.get(&tgid).copied(), now_ns);
             self.resume_pending_after_guard_loss(io, tgid, since_ns);
         }
-        self.member_stops.loss_drain = !self.member_stops.retrying.is_empty();
     }
 
     fn resume_pending_after_guard_loss(

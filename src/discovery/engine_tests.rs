@@ -29954,6 +29954,118 @@ fn conservative_replays_under_churn_never_burn_capacity() {
     );
 }
 
+/// I3 engine twin: the named reserve arms on endpoints that departed, not on
+/// failed attaches. A named plan filled to `capacity - 100` has 30 unlinked
+/// cells whose endpoints are still listed; the next candidate re-lists them
+/// beside a 50-endpoint newcomer. The newcomer fits the raw budget
+/// (`capacity - 100 + 30 + 50 < capacity`), but the old `retired > 0`
+/// trigger armed the reserve at `capacity - reserve` and refused both the
+/// retries and the newcomer. Under the departed-churn trigger the still
+/// listed retries are not churn and the capture admits them.
+#[test]
+fn named_reserve_ignores_failed_attaches_across_conservative_replays() {
+    let capacity = p11scope_ebpf_common::MAX_SLOTS;
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let _reap = ChildReaper(child);
+    let view = ProcessView::open(ProcessViewId(3), _reap.0.id()).unwrap();
+    let modules = child_provider_modules(&view);
+    let busy = with_endpoints(modules[0].clone(), capacity - 100);
+    let late = with_endpoints(modules[1].clone(), 50);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(view.pid());
+    engine.next_view_id = 4;
+    engine.views.push(view);
+    assert_eq!(
+        engine.admission_scope(),
+        plan::AdmissionScope::Named,
+        "a pid capture admits first-come"
+    );
+    let pins = pin_test_modules(&engine.views[0], std::slice::from_ref(&busy));
+    let candidate = engine
+        .live_candidate(pins, vec![busy.clone()], Vec::new())
+        .unwrap();
+    let mut session = ScriptedSession::default();
+    // Thirty of the busy provider's attaches fail: listed, not active.
+    session.fail_target_slots(0..30);
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    session.fail_target_slots([]);
+    let allocated = engine.plan.slots.len();
+    assert_eq!(allocated, capacity as usize - 100);
+    assert_eq!(engine.plan.active_slot_count(), allocated - 30);
+
+    // Churn: an ambient process with no modules exits, again and again. The
+    // failed attaches are still listed, so a replay with additions closed
+    // allocates nothing.
+    for exit in 0..8 {
+        engine.pending_retirements.insert(ProcessViewId(100 + exit));
+        engine.replay_pending_conservative(
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        assert_eq!(
+            engine.plan.slots.len(),
+            allocated,
+            "exit {exit}: a replay with additions closed allocates nothing"
+        );
+    }
+
+    // The retried endpoints and the newcomer fit the raw budget with no
+    // departed endpoint: the named reserve must stay unarmed.
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(
+        &engine.views[0],
+        std::slice::from_ref(&late),
+    ));
+    let candidate = engine
+        .live_candidate(pins, vec![busy, late], skipped)
+        .unwrap();
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .any(|module| module.path.contains("libc.so.6")),
+        "the newcomer that fits the raw budget is admitted: {:?}",
+        engine
+            .plan
+            .modules
+            .iter()
+            .map(|module| &module.path)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !engine
+            .plan
+            .modules_skipped
+            .iter()
+            .any(|skip| skip.reason.contains("are reserved")),
+        "still-listed retries do not arm the named reserve: {:?}",
+        engine.plan.modules_skipped
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        allocated + 80,
+        "the 30 retried endpoints and the 50-endpoint newcomer are allocated"
+    );
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        allocated - 30 + 80,
+        "every admitted endpoint is active"
+    );
+}
+
 /// Kills and reaps its child when dropped.
 struct ChildReaper(std::process::Child);
 

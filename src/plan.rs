@@ -21087,6 +21087,251 @@ pub(crate) mod tests {
         assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize);
     }
 
+    /// B1: an ambiguous ticketed reclaim must reserve the room later
+    /// mandatory fresh additions need. The plan holds 2,044 of the 2,112
+    /// slots with 68 retired semantic cells; the same file returns with a
+    /// positive identity match under a rival stable module id (so every
+    /// reclaim would newly merge its cell to ambiguous), and a corroborated
+    /// 68-endpoint provider is admitted in the same discovery. The 68 fresh
+    /// indices those reclaims used to take are exactly the room the
+    /// mandatory provider needs, so the old seen-so-far preference aborts
+    /// the capture at 2,180 of 2,112. The reclaims reoccupy their retired
+    /// indices as counted count-only ambiguity instead.
+    #[test]
+    fn slot_reclaim_fresh_preference_reserves_mandatory_additions() {
+        for (scope, label) in [
+            (AdmissionScope::Shared, "shared"),
+            (AdmissionScope::Named, "named"),
+        ] {
+            let filler =
+                provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68 - 68, true);
+            let mut plan = scoped_plan(&[filler.clone(), sole_complete_module()], scope);
+            assert_eq!(
+                plan.slots.len(),
+                MAX_SLOTS as usize - 68,
+                "{label}: 1,976 live + 68 retired"
+            );
+            plan.object_identities
+                .insert(PinnedObjectId(42), test_identity(42, "sha-b1-order"));
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&filler),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            plan.extend_exact(rebuilt).unwrap();
+            assert_eq!(
+                plan.retired_slots.len(),
+                68,
+                "{label}: the generation retires"
+            );
+            plan.revivable.clone_from(&plan.retired_keys);
+
+            let mut returning = sole_complete_module();
+            returning.object = PinnedObjectId(90);
+            returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+            let corroborated = provider_with_tables(91, "/opt/corroborated.so", 1, 68, true);
+            let identities =
+                BTreeMap::from([(PinnedObjectId(90), test_identity(42, "sha-b1-order"))]);
+            let mut rebuilt = plan.rebuild_from_sources_with_identities(
+                &[filler, returning, corroborated],
+                &[],
+                &identities,
+            );
+            assert_eq!(
+                rebuilt.reclaimed.len(),
+                68,
+                "{label}: merge tickets the semantic cells"
+            );
+            // The returning pin resolves to a different stable module id, so
+            // every reclaim would newly merge its retired cell to ambiguous.
+            let returning_id = ModuleId(
+                rebuilt
+                    .modules
+                    .iter()
+                    .chain(plan.modules.iter())
+                    .map(|module| module.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    + 1,
+            );
+            for module in &mut rebuilt.modules {
+                if module.object == PinnedObjectId(90) {
+                    module.id = returning_id;
+                }
+            }
+            for slot in &mut rebuilt.slots {
+                if slot.object == PinnedObjectId(90) {
+                    slot.module_ids = vec![returning_id];
+                }
+            }
+            let retired: Vec<usize> = plan.retired_slots.iter().copied().collect();
+            let delta = plan
+                .extend_exact_with_stable_module_ids(rebuilt)
+                .unwrap_or_else(|error| {
+                    panic!("{label}: a counted ambiguity must not abort the capture: {error}")
+                });
+            assert_eq!(delta.retire.len(), 0, "{label}: nothing retires");
+            assert_eq!(
+                delta.new.len(),
+                136,
+                "{label}: 68 reclaimed + 68 mandatory fresh"
+            );
+            assert_eq!(
+                plan.slots.len(),
+                MAX_SLOTS as usize,
+                "{label}: the full budget, never more"
+            );
+            assert_eq!(
+                plan.active_slot_count(),
+                MAX_SLOTS as usize,
+                "{label}: every cell is active"
+            );
+            assert!(
+                plan.retired_slots.is_empty(),
+                "{label}: no cell stays retired"
+            );
+            assert_eq!(
+                plan.module_ambiguous, 68,
+                "{label}: the rival ownership is counted"
+            );
+            for position in &retired {
+                assert_eq!(
+                    plan.slots[*position].descriptor_index, 0,
+                    "{label}: the reclaimed cell is count-only"
+                );
+                assert!(
+                    plan.slots[*position].semantic_ambiguous,
+                    "{label}: the reclaimed cell reports its ambiguity"
+                );
+                assert_eq!(
+                    plan.effective_semantics(&plan.slots[*position]),
+                    SlotSemantics::COUNT_ONLY,
+                    "{label}: the reclaimed cell is never probed semantically"
+                );
+            }
+            assert_eq!(
+                plan.slots
+                    .iter()
+                    .filter(|slot| slot.object == PinnedObjectId(91))
+                    .count(),
+                68,
+                "{label}: the mandatory provider keeps its 68 fresh cells"
+            );
+        }
+    }
+
+    /// B1 selection-table variant: a fresh key appended after rival ticketed
+    /// reclaim keys must keep the only free index. The plan holds 2,111 of
+    /// 2,112 slots with 68 retired semantic cells, so the selection table's
+    /// new key is the single mandatory addition and every ambiguous reclaim
+    /// falls back to its retired index instead of taking that index first.
+    #[test]
+    fn selection_table_fresh_key_keeps_room_for_mandatory_addition() {
+        let filler =
+            provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68 - 1, true);
+        let mut plan = scoped_plan(
+            &[filler.clone(), sole_complete_module()],
+            AdmissionScope::Shared,
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize - 1);
+        plan.object_identities.insert(
+            PinnedObjectId(42),
+            test_identity(42, "sha-b1-selection-order"),
+        );
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 68, "the generation retires");
+        plan.revivable.clone_from(&plan.retired_keys);
+
+        let mut returning = sole_complete_module();
+        returning.object = PinnedObjectId(90);
+        returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+        let identities = BTreeMap::from([(
+            PinnedObjectId(90),
+            test_identity(42, "sha-b1-selection-order"),
+        )]);
+        let mut rebuilt =
+            plan.rebuild_from_sources_with_identities(&[filler, returning], &[], &identities);
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "merge tickets the semantic cells"
+        );
+        let returning_id = ModuleId(
+            rebuilt
+                .modules
+                .iter()
+                .chain(plan.modules.iter())
+                .map(|module| module.id.0)
+                .max()
+                .unwrap_or(0)
+                + 1,
+        );
+        for module in &mut rebuilt.modules {
+            if module.object == PinnedObjectId(90) {
+                module.id = returning_id;
+            }
+        }
+        for slot in &mut rebuilt.slots {
+            if slot.object == PinnedObjectId(90) {
+                slot.module_ids = vec![returning_id];
+            }
+        }
+        rebuilt
+            .add_selection_table(
+                &plan,
+                returning_id,
+                [selection_target(PinnedObjectId(90), 0x8000, "C_Digest")],
+            )
+            .expect("the fresh selection key fits the last free index");
+        let retired: Vec<usize> = plan.retired_slots.iter().copied().collect();
+        let delta = plan
+            .extend_exact_with_stable_module_ids(rebuilt)
+            .unwrap_or_else(|error| {
+                panic!("a counted ambiguity must not abort the capture: {error}")
+            });
+        assert_eq!(delta.retire.len(), 0, "nothing retires");
+        assert_eq!(delta.new.len(), 69, "68 reclaimed + 1 fresh selection key");
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "the full budget");
+        assert_eq!(
+            plan.active_slot_count(),
+            MAX_SLOTS as usize,
+            "every cell is active"
+        );
+        assert!(plan.retired_slots.is_empty(), "no cell stays retired");
+        assert_eq!(plan.module_ambiguous, 68, "the rival ownership is counted");
+        for position in &retired {
+            assert_eq!(
+                plan.slots[*position].descriptor_index, 0,
+                "the reclaimed cell is count-only"
+            );
+            assert!(
+                plan.slots[*position].semantic_ambiguous,
+                "the reclaimed cell reports its ambiguity"
+            );
+        }
+        assert_eq!(
+            plan.slot_by_key.get(&AttachKey {
+                object: PinnedObjectId(90),
+                file_offset: 0x8000,
+            }),
+            Some(&(MAX_SLOTS as usize - 1)),
+            "the mandatory selection key keeps the only free index"
+        );
+        let fresh: Vec<&Slot> = plan
+            .slots
+            .iter()
+            .filter(|slot| slot.file_offset == 0x8000)
+            .collect();
+        assert_eq!(fresh.len(), 1, "one fresh selection cell");
+        assert_eq!(
+            fresh[0].names,
+            vec!["C_Digest".to_string()],
+            "the selection table's own name"
+        );
+    }
+
     /// Two active pins of one file and a third arrival: only one old index
     /// may migrate onto the returning key; the other retires honestly.
     /// The old search could point two source keys at the same returning
@@ -21136,11 +21381,12 @@ pub(crate) mod tests {
     /// Property-style matrix over the reclaim disagreements that used to
     /// surface at capacity: retired shape (heuristic count-only or semantic),
     /// returning shape (heuristic same-key or semantic cross-ID), a second
-    /// claimant (none, the same targets, or its own fresh demand), a rival
-    /// stable module id, and room (none or one standard table). For every
-    /// case, merge's charge and the extension's allocation must agree:
-    /// `extend_exact_with_stable_module_ids` is Ok, no slot is lost, and no
-    /// linked descriptor is lowered without a replace or a new attach.
+    /// claimant (none, the same targets, or a corroborated provider with its
+    /// own fresh demand), a rival stable module id, and room (none or one
+    /// standard table). For every case, merge's charge and the extension's
+    /// allocation must agree: `extend_exact_with_stable_module_ids` is Ok, no
+    /// slot is lost, and no linked descriptor is lowered without a replace or
+    /// a new attach.
     #[test]
     fn merge_charge_and_extension_agree_across_reclaim_scenarios() {
         let heuristic = |object: u32, path: &'static str| {
@@ -21206,12 +21452,16 @@ pub(crate) mod tests {
                                 replace_table_targets(&mut forward, 0, &targets);
                                 modules.push(forward);
                             }
+                            // Corroborated: a heuristic co-claimant is
+                            // refused by the Shared reserve at this budget,
+                            // so its fresh demand could never race a rival
+                            // reclaim for the free room.
                             "own" => modules.push(provider_with_tables(
                                 91,
                                 "/opt/forward.so",
                                 1,
                                 68,
-                                false,
+                                true,
                             )),
                             _ => {}
                         }

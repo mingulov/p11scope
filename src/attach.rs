@@ -1882,6 +1882,11 @@ pub struct Session {
     /// instant coverage began. Detach never removes these: they are
     /// historical facts, and capture-held ordering evidence reads them.
     slot_attached_at: BTreeMap<u32, u64>,
+    /// The first real attach-complete instant per attach point (object,
+    /// file offset), across every slot that ever held it: a probe replaced
+    /// mid-capture gets a new slot (and a new `slot_attached_at` entry)
+    /// but keeps this first instant. First wins; detach never removes it.
+    key_first_attached_at: BTreeMap<crate::plan::AttachKey, u64>,
     /// Reserved once before BPF preparation, in process-local allocation order.
     /// Collection identity only; this grants no capture or lifetime authority.
     counter_collection_generation: NonZeroU64,
@@ -8211,6 +8216,7 @@ impl Session {
                 detach_wall_ms: 0,
                 attach_mono_ns: None,
                 slot_attached_at: BTreeMap::new(),
+                key_first_attached_at: BTreeMap::new(),
                 counter_collection_generation,
                 successful_static: BTreeSet::new(),
                 dynamic_attach_evidence: DynamicAttachEvidence::default(),
@@ -9454,6 +9460,11 @@ impl Session {
         for (slot, stamp) in &completed {
             if let Some(stamp) = stamp {
                 self.slot_attached_at.entry(*slot).or_insert(*stamp);
+                if let Some(target) = targets.iter().find(|target| target.index == *slot) {
+                    self.key_first_attached_at
+                        .entry(crate::plan::AttachKey::of(target))
+                        .or_insert(*stamp);
+                }
             }
         }
         Ok((failed, completed))
@@ -10530,6 +10541,12 @@ impl Session {
     /// these, never the once-only session stamp).
     pub(crate) fn slot_attached_at(&self, slot: u32) -> Option<u64> {
         self.slot_attached_at.get(&slot).copied()
+    }
+
+    /// The first attach-complete instant for one attach point over every
+    /// slot that ever held it (a replaced probe keeps its first instant).
+    pub(crate) fn key_first_attached_at(&self, key: crate::plan::AttachKey) -> Option<u64> {
+        self.key_first_attached_at.get(&key).copied()
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {

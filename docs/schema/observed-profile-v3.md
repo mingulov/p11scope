@@ -629,7 +629,15 @@ changed?}`: `state` is exactly `pinned_unarmed`, `armed`, `armed_idle`,
 `health_loss`, or `scope_uncertain`); `changed` is the
 `{last_ok_ns, detected_ns, previous_ino}` uncertainty bracket.
 `attached_at_ns` is null or a `CLOCK_MONOTONIC` instant, merged at evidence
-assembly from real attach-complete stamps. `unobserved_windows` is a list of
+assembly from real attach-complete stamps. `first_attached_at_ns` (additive) is the
+module's first complete attach instant in the same clock: for each
+endpoint (the declared set under a watch, else every attach point of the
+module) the earliest real stamp over every slot the plan ever held for it,
+then the maximum over the endpoints. `attached_at_ns` follows the current
+slots, so a probe replaced mid-capture moves it later; `first_attached_at_ns`
+stays at the first attach. It is absent when any endpoint never attached.
+Calls after it are observed unless another disclosed window says
+otherwise; it bounds the first-use gap, it is not a missed-call count. `unobserved_windows` is a list of
 `{start_ns, end_ns, reason}` with `reason` exactly `pre_attach`,
 `late_discovery`, `mapped_unattached`, `health_loss`, or `scope_uncertain`;
 absent means undisclosed, and an explicitly empty list reads as exact only

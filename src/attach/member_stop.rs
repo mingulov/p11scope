@@ -144,17 +144,82 @@ impl MemberStopHooks {
     }
 }
 
+/// `bpf(2)` commands and map types (`linux/bpf.h`).
+const BPF_MAP_CREATE: libc::c_long = 0;
+const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
+const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_ARRAY_OF_MAPS: u32 = 12;
 /// `MEMBARRIER_CMD_GLOBAL` (`linux/membarrier.h`).
 const MEMBARRIER_CMD_GLOBAL: libc::c_long = 1;
 
-/// Waits one RCU grace period: `membarrier(MEMBARRIER_CMD_GLOBAL)` runs
-/// `synchronize_rcu()` while more than one CPU is online. The hook's
-/// program runs inside an RCU read section, so when this returns every
-/// invocation that read `active` before the deactivation has inserted
-/// its row and sent its stop, and every later one reads it inactive.
-/// False when the wait is not proven: `EINVAL` under `nohz_full`, or one
-/// online CPU (the kernel then skips the grace period).
+/// One raw `bpf(2)` call over a zeroed attribute block (the kernel
+/// accepts a larger block whose tail is zero).
+fn bpf_call(command: libc::c_long, attr: &mut [u64; 16]) -> libc::c_long {
+    // SAFETY: `attr` is a caller-owned, zero-tailed block of the size
+    // passed; the kernel reads (and for these commands never keeps) it.
+    unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            command,
+            attr.as_mut_ptr(),
+            std::mem::size_of_val(attr),
+        )
+    }
+}
+
+/// Creates a one-entry map (`inner` names the inner map of a map-in-map).
+fn create_map(map_type: u32, inner: Option<i32>) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    let mut attr = [0u64; 16];
+    // map_type, key_size, value_size, max_entries | map_flags, inner_map_fd
+    attr[0] = u64::from(map_type) | (4u64 << 32);
+    attr[1] = 4 | (1u64 << 32);
+    attr[2] = u64::from(inner.map_or(0, |fd| fd as u32)) << 32;
+    let fd = bpf_call(BPF_MAP_CREATE, &mut attr);
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: a successful BPF_MAP_CREATE returns a new descriptor this
+    // process owns.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// Waits one RCU grace period on every kernel: an update of a
+/// map-in-map from userspace returns only after `maybe_wait_bpf_programs`
+/// (`synchronize_rcu` or its expedited form), which exists to wait out
+/// running non-sleepable BPF programs, with no CPU-count or `nohz_full`
+/// exception. Two private one-entry maps, created and dropped here; no
+/// BPF object or loaded program is involved. False when a map cannot be
+/// created or updated (no `CAP_BPF`).
+fn map_update_grace_period() -> bool {
+    use std::os::fd::AsRawFd as _;
+    let Some(inner) = create_map(BPF_MAP_TYPE_ARRAY, None) else {
+        return false;
+    };
+    let Some(outer) = create_map(BPF_MAP_TYPE_ARRAY_OF_MAPS, Some(inner.as_raw_fd())) else {
+        return false;
+    };
+    let key: u32 = 0;
+    let value: u32 = inner.as_raw_fd() as u32;
+    let mut attr = [0u64; 16];
+    // map_fd, key pointer, value pointer, flags (BPF_ANY).
+    attr[0] = u64::from(outer.as_raw_fd() as u32);
+    attr[1] = std::ptr::from_ref(&key) as u64;
+    attr[2] = std::ptr::from_ref(&value) as u64;
+    bpf_call(BPF_MAP_UPDATE_ELEM, &mut attr) == 0
+}
+
+/// Waits one RCU grace period. The hook's program runs inside an RCU
+/// read section, so when this returns every invocation that read
+/// `active` before the deactivation has inserted its row and sent its
+/// stop, and every later one reads it inactive. The map-in-map update
+/// first; `membarrier(MEMBARRIER_CMD_GLOBAL)` (`synchronize_rcu()` while
+/// more than one CPU is online, `EINVAL` under `nohz_full`) only when
+/// that fails. False when neither wait is proven.
 fn rcu_grace_period() -> bool {
+    if map_update_grace_period() {
+        return true;
+    }
     // SAFETY: `sysconf` takes an integer name only.
     if unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } <= 1 {
         return false;
@@ -328,19 +393,26 @@ impl MemberStopHooks {
 
 impl Drop for MemberStopHooks {
     fn drop(&mut self) {
-        let _ = self.deactivate();
+        // A failed deactivation leaves `active` unproven: a call still
+        // before its RCU read section is covered only by that write.
+        let deactivated = self.deactivate().is_ok();
         self.detach();
-        let settled = self.quiesce();
+        let settled = self.quiesce() && deactivated;
         self.release_pending(settled);
         if !settled {
             // A row inserted after that scan by an invocation the
-            // unproven wait did not cover.
+            // unproven wait did not cover: on one CPU it runs only once
+            // this thread blocks.
+            std::thread::sleep(crate::discovery::engine::MEMBER_STOP_RESCAN_DELAY);
             self.release_pending(settled);
         }
-        // An orderly end only when nothing is left: a row this release
-        // could not resume makes the watchdog sweep instead.
+        // An orderly end only when nothing is left and the wait was
+        // proven: a row this release could not resume, or a stop that
+        // may still land, makes the watchdog sweep instead (its sweeps
+        // up to 1.6 s bound a late stop; they also resume a member
+        // stopped on purpose).
         if let Some(watchdog) = self.watchdog.take() {
-            if self.pending().is_ok_and(|rows| rows.is_empty()) {
+            if settled && self.pending().is_ok_and(|rows| rows.is_empty()) {
                 watchdog.finish();
             } else {
                 watchdog.abandon();
@@ -510,6 +582,10 @@ mod tests {
             &WatchdogLauncher::TestHarness,
         )
         .expect("member-stop starts");
+        assert!(
+            map_update_grace_period(),
+            "the map-in-map update waits a grace period (CAP_BPF held)"
+        );
         let mut member = std::process::Command::new("sh")
             .args(["-c", "read line; exec /bin/true"])
             .stdin(std::process::Stdio::piped())

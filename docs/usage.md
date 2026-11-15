@@ -908,10 +908,11 @@ filed when the kernel refused any stop (table full, signal or file
 identity refused). A member moved out of the run cgroup while
 stopped is resumed too. Stopping ends with the capture loop: the hook
 is switched off and detached before the final drain, and the observer
-waits for hook calls already running (one RCU grace period, or where
-the kernel gives none, a maps read of each member and a second scan)
-before it resumes anyone, so no member is stopped while the observer
-settles. A job-control shell inside the command can
+waits one RCU grace period for hook calls already running before it
+resumes anyone, so no member is stopped while the observer settles.
+If that wait cannot be proven, the run's watchdog sweeps for up to
+1.6 s after the end instead (see the
+[known limitations](known-limitations.md)). A job-control shell inside the command can
 see such a child briefly stopped (`CLD_STOPPED`). With `--pause never`
 (or when the kernel refuses the stop object) descendants are never
 stopped: a short-lived descendant that cold-loads the provider teaches

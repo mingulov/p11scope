@@ -1023,8 +1023,13 @@ impl Engine {
                 attached,
                 refused,
             } = self.hold_state(&member);
-            for key in &member.files {
-                self.clear_member_file(io, *key);
+            // As in `resolve_member_holds`: a departed hold clears its
+            // providers only when attached; every other end files the row
+            // (or is attached), so clearing is safe there.
+            if !departed || attached {
+                for key in &member.files {
+                    self.clear_member_file(io, *key);
+                }
             }
             if departed {
                 let _ = io.withdraw(tgid);
@@ -1142,14 +1147,25 @@ impl Engine {
                 continue;
             }
             let held = self.member_stops.held.remove(&tgid).expect("held member");
-            for key in &held.files {
-                self.clear_member_file(io, *key);
-            }
             if departed {
+                // Its providers stay uncleared unless attached: the next
+                // mapper of an unattached one is then stopped and held
+                // (or files the row) instead of running it unprotected,
+                // with the staging's row suppressed by `stop_staged`.
+                if attached {
+                    for key in &held.files {
+                        self.clear_member_file(io, *key);
+                    }
+                }
                 let _ = io.withdraw(tgid);
                 self.member_stops.stats.departed =
                     self.member_stops.stats.departed.saturating_add(1);
                 continue;
+            }
+            // Attached, refused or expired: a refused or expired end files
+            // the row below, so the provider may be cleared.
+            for key in &held.files {
+                self.clear_member_file(io, *key);
             }
             self.resume_or_retry(io, &held.pin, held.since_ns);
             if attached {

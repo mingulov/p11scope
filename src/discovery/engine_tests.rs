@@ -87491,6 +87491,47 @@ fn member_stop_keeps_holding_when_the_staging_apply_preflight_refuses() {
     assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
 }
 
+/// Twin: a candidate accepted with additions blocked (its attach
+/// mutation never ran) did not consume the learned staging: the latch
+/// stays set, so a lost watchdog still marks the stop-staged provider
+/// unattached.
+#[test]
+fn member_stop_staging_stays_unapplied_after_an_accept_without_additions() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    engine.pause_owned_batch = true;
+    let mut session = attaching_session();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
+    engine.pause_owned_batch = false;
+    let candidate = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine.modules.iter().map(|m| m.scanned.clone()).collect(),
+            vec![],
+        )
+        .unwrap();
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut false, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert!(
+        engine.learned_unapplied,
+        "an accept that attached nothing leaves the staging unapplied"
+    );
+}
+
 /// Twin: an accepted apply whose session reports no attach-complete
 /// stamp for the provider's slots is no attach: the hold keeps waiting
 /// for real stamps, and at the bound it files the first-use row.
@@ -87950,6 +87991,38 @@ fn member_stop_watchdog_loss_files_the_row_for_a_departed_unattached_hold() {
     engine.service_member_stops(&mut io, &mut session, Some(20));
     assert_eq!(engine.member_stop_stats_for_test().departed, 1);
     assert!(files_the_first_use_row(&engine));
+}
+
+/// Scenario C: the staging applied (the latch is clear) but the session
+/// never stamped its slots attached. The provider is still unattached,
+/// so a watchdog loss after its mapper departed files the first-use row.
+#[test]
+fn member_stop_watchdog_loss_files_the_row_for_an_applied_unstamped_staging() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(!engine.learned_unapplied, "the staging applied");
+    assert!(
+        engine.member_stops_held(),
+        "no stamp, still held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
+    let _ = fixture.child.kill();
+    let _ = fixture.child.wait();
+    io.guard_lost = true;
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert_eq!(engine.member_stop_stats_for_test().departed, 1);
+    assert!(
+        files_the_first_use_row(&engine),
+        "an applied staging without attach stamps is unattached"
+    );
 }
 
 /// Scenario B: the departed hold ends in a normal pass (no row: a later

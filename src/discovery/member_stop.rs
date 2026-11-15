@@ -136,6 +136,9 @@ pub(crate) struct MemberStopState {
     /// Test override of [`MEMBER_STOP_INTAKE_PER_PASS`].
     #[cfg(test)]
     pub(crate) intake_cap: Option<usize>,
+    /// Test override of [`MEMBER_STOP_PASS_BUDGET`].
+    #[cfg(test)]
+    pub(crate) pass_budget: Option<std::time::Duration>,
     /// Tgids whose pin open fails (descriptor or `/proc` pressure), for
     /// the tests.
     #[cfg(test)]
@@ -646,7 +649,14 @@ impl Engine {
             .unwrap_or(MEMBER_STOP_INTAKE_PER_PASS);
         #[cfg(not(test))]
         let cap = MEMBER_STOP_INTAKE_PER_PASS;
-        let pass_deadline = std::time::Instant::now() + MEMBER_STOP_PASS_BUDGET;
+        #[cfg(test)]
+        let budget = self
+            .member_stops
+            .pass_budget
+            .unwrap_or(MEMBER_STOP_PASS_BUDGET);
+        #[cfg(not(test))]
+        let budget = MEMBER_STOP_PASS_BUDGET;
+        let pass_deadline = std::time::Instant::now() + budget;
         let mut staged = false;
         for (tgid, stop) in pending.into_iter().take(cap) {
             if std::time::Instant::now() >= pass_deadline {

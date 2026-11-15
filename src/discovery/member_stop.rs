@@ -1165,7 +1165,32 @@ impl Engine {
                 self.note_first_use_gap(tgid, "watchdog lost");
             }
         }
+        if self.stop_staged_unattached() {
+            // The hook is off from here on: no later mapper of a provider a
+            // stop staged is stopped and held for its attach, and that
+            // staging's own row is suppressed (`stop_staged`).
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_FIRST_RUN_REASON,
+            );
+            if crate::run::capture_diagnostics_on() {
+                eprintln!("p11scope: member-stop watchdog lost before a staged provider attached");
+            }
+        }
         self.drain_after_guard_loss(io, now_ns);
+    }
+
+    /// Whether a provider identity a stop staged may still be unattached:
+    /// its staging is still queued, or a staging is still unapplied
+    /// (doubt counts as unattached).
+    fn stop_staged_unattached(&self) -> bool {
+        let staged = &self.member_stops.stop_staged;
+        !staged.is_empty()
+            && (self.learned_unapplied
+                || self
+                    .pending_learned
+                    .iter()
+                    .any(|queued| staged.contains(&(queued.dev, queued.ino))))
     }
 
     /// Resumes every pending row after the watchdog loss, on every pass:

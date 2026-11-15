@@ -248,5 +248,16 @@ class StaleOutputTests(unittest.TestCase):
                             self.assertNotIn("--marker", echo)
 
 
+
+class ExactCoverageTests(unittest.TestCase):
+    """Owner ruling 2026-11-15: no percentage floors; leg (b) is exact."""
+
+    def test_the_cell_pins_exact_default_coverage(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        floors = re.findall(r"^FLOOR=(\S+)$", text, flags=re.MULTILINE)
+        self.assertEqual(floors, ["1.0"], "leg (b) must observe every oracle call")
+        self.assertNotIn("FLOOR=0.", text)
+
+
 if __name__ == "__main__":
     unittest.main()

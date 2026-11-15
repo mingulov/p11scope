@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -110,6 +110,17 @@ pub(crate) struct LearnedCandidate {
     /// `/proc/<loader>/exe` at first sight, or the finite reason below.
     pub(crate) loader_exe: Option<String>,
     pub(crate) loader_unknown_reason: Option<&'static str>,
+    /// Synthesized by owned-run scan learning (E1) rather than the
+    /// fanotify drain: the proving mapper is a transient descendant,
+    /// so transient scan coverage does not exempt the file from
+    /// staging (the drain's exemption assumes a stable mapper).
+    pub(crate) run_learned: bool,
+    /// The proving view was still retained when the proof was taken:
+    /// a run-learned file from a retained prover over a scan-covered
+    /// key stages silently (ordinary discovery already observes its
+    /// calls), while a transient prover's staging still owes the
+    /// first-use row. Always false for drain candidates.
+    pub(crate) proving_retained: bool,
 }
 
 /// Drain-to-engine messages. `Load` tallies post-send opens so the staged
@@ -807,7 +818,7 @@ fn set_cloexec(fd: std::os::unix::io::RawFd) {
 
 /// Whether the task a pidfd pins has exited: a pidfd becomes readable
 /// exactly when its task terminates.
-fn pidfd_exited(pidfd: &OwnedFd) -> bool {
+fn pidfd_exited(pidfd: BorrowedFd<'_>) -> bool {
     let mut polled = libc::pollfd {
         fd: pidfd.as_raw_fd(),
         events: libc::POLLIN,
@@ -827,8 +838,11 @@ fn pidfd_exited(pidfd: &OwnedFd) -> bool {
 /// that already exited — or exec'd a different program between the
 /// open and this read, which no pidfd can exclude — resolves to the
 /// finite unknown or the current image; callers and docs state the
-/// field as the still-live loader's program at learn time.
-pub(crate) fn loader_exe_for_pidfd(pidfd: &OwnedFd) -> (Option<String>, Option<&'static str>) {
+/// field as the still-live loader's program at learn time. The borrowed
+/// form serves both drain-owned pidfds and proving view pins.
+pub(crate) fn loader_exe_for_pidfd(
+    pidfd: BorrowedFd<'_>,
+) -> (Option<String>, Option<&'static str>) {
     let unknown = (None, Some(LOADER_EXE_UNREADABLE_REASON));
     if pidfd_exited(pidfd) {
         return unknown;
@@ -1604,7 +1618,7 @@ fn mark_visible_filesystems_shared(
 /// pinned task, so it cannot name a reused process. A dead task reads
 /// `Pid: -1`, which fails the `u32` parse and yields `None`: callers
 /// must treat that as "loader already gone", never as a skip.
-fn pid_of_pidfd(pidfd: &OwnedFd) -> Option<u32> {
+fn pid_of_pidfd(pidfd: BorrowedFd<'_>) -> Option<u32> {
     let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).ok()?;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("Pid:") {
@@ -1620,7 +1634,7 @@ fn pid_of_pidfd(pidfd: &OwnedFd) -> Option<u32> {
 /// (a dead pid is still a real missed run; reuse can only merge two
 /// runs into one tally entry) but must never name an executable.
 fn tally_pid(event: &ParsedFanotifyEvent, pidfd: Option<&OwnedFd>) -> Option<u32> {
-    if let Some(pid) = pidfd.and_then(pid_of_pidfd) {
+    if let Some(pid) = pidfd.map(|fd| fd.as_fd()).and_then(pid_of_pidfd) {
         return Some(pid);
     }
     u32::try_from(event.pid).ok().filter(|pid| *pid > 0)
@@ -2058,7 +2072,7 @@ impl DrainCtx<'_> {
         // tests admitted the file and before the full parse, bracketed
         // by pidfd liveness.
         let proved = prove_with_loader(&file, || match pidfd.as_ref() {
-            Some(pidfd) => loader_exe_for_pidfd(pidfd),
+            Some(pidfd) => loader_exe_for_pidfd(pidfd.as_fd()),
             None => (None, Some(LOADER_EXE_UNREADABLE_REASON)),
         });
         let (loader_exe, loader_unknown_reason) = match proved {
@@ -2097,6 +2111,8 @@ impl DrainCtx<'_> {
             display_path,
             loader_exe,
             loader_unknown_reason,
+            run_learned: false,
+            proving_retained: false,
         };
         if !self.send(LearnMsg::Candidate(candidate), window) {
             return false;
@@ -2819,7 +2835,7 @@ fn drain_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::{AsFd, AsRawFd};
 
     /// One synthetic 32-byte open record with no fds (fd negative, no
     /// pidfd info): the parser accepts it, the drain counts it, and
@@ -3060,7 +3076,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pidfd = test_pidfd(child.id());
-        let (exe, reason) = super::loader_exe_for_pidfd(&pidfd);
+        let (exe, reason) = super::loader_exe_for_pidfd(pidfd.as_fd());
         assert_eq!(reason, None, "live loader names without a reason");
         assert!(
             exe.as_deref().is_some_and(|exe| exe.ends_with("sleep")),
@@ -3071,13 +3087,16 @@ mod tests {
         // The pidfd turns readable at exit; give the bracket a moment
         // only if the scheduler has not delivered it yet.
         for _ in 0..200 {
-            if super::pidfd_exited(&pidfd) {
+            if super::pidfd_exited(pidfd.as_fd()) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(super::pidfd_exited(&pidfd), "exit makes the pidfd readable");
-        let (exe, reason) = super::loader_exe_for_pidfd(&pidfd);
+        assert!(
+            super::pidfd_exited(pidfd.as_fd()),
+            "exit makes the pidfd readable"
+        );
+        let (exe, reason) = super::loader_exe_for_pidfd(pidfd.as_fd());
         assert_eq!(exe, None, "an exited loader is never named");
         assert_eq!(reason, Some(super::LOADER_EXE_UNREADABLE_REASON));
     }
@@ -4185,6 +4204,8 @@ mod tests {
                 display_path: "/bin/sh".to_string(),
                 loader_exe: None,
                 loader_unknown_reason: Some(super::LOADER_EXE_UNREADABLE_REASON),
+                run_learned: false,
+                proving_retained: false,
             }),
         );
         assert!(!ok);

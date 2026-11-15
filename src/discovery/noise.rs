@@ -51,6 +51,7 @@ impl DiscoveryNoiseClass {
 /// contain overlapping substrings (`generation changed`).
 pub fn classify_discovery_noise(subject: &str, reason: &str) -> DiscoveryNoiseClass {
     if reason.contains("mapping validation unavailable")
+        || reason.contains("mapping changed during acquisition")
         || reason.contains("empty or truncated")
         || reason.contains("empty /proc maps")
         || reason.contains("reversed or overlapping")
@@ -591,5 +592,16 @@ mod tests {
                 "labels are categorical, never data: {label:?}"
             );
         }
+    }
+
+    #[test]
+    fn classification_maps_mapping_changed_acquisition_races() {
+        assert_eq!(
+            classify_discovery_noise(
+                "capture discovery",
+                "memory scan refused: mapping changed during acquisition"
+            ),
+            DiscoveryNoiseClass::MapsSnapshot
+        );
     }
 }

@@ -9764,6 +9764,13 @@ fn capture_profile(
                     // staging owed this tick can expedite this tick's frame.
                     context.0.service_learned_files();
                     context.0.apply_learned_staging(context.1);
+                    // Owned-tree watch likewise: unseen members are
+                    // noticed and their provider files proven by direct
+                    // scan every few ticks (E1). No-op except on the
+                    // owned run-tree scope.
+                    context
+                        .0
+                        .owned_tree_watch(crate::attach::monotonic_ns());
                     // Fresh every tick: only this tick's backlog pass may
                     // schedule a zero sleep below.
                     consumers.scheduling.note_discovery_backlog(false);
@@ -11539,6 +11546,10 @@ fn capture_trace(
         // owed this tick can expedite this tick's frame.
         engine.service_learned_files();
         engine.apply_learned_staging(session);
+        // Owned-tree watch likewise: unseen members are noticed and
+        // their provider files proven by direct scan every few ticks
+        // (E1). No-op except on the owned run-tree scope.
+        engine.owned_tree_watch(crate::attach::monotonic_ns());
         // Fresh every tick: only this tick's backlog pass may
         // schedule a zero sleep below.
         scheduling.note_discovery_backlog(false);

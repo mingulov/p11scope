@@ -368,7 +368,6 @@
       "pkcs11-check-manifest-exact",
       "pkcs11-check-default-coverage"
     ],
-    "default_coverage_floor": 0.5,
-    "default_coverage_expected_failure": "pkcs11-check-default-coverage"
+    "default_coverage_floor": 0.8
   }
 }

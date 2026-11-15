@@ -9623,21 +9623,25 @@ fn capture_profile(
         }
         Scope::Cgroup { .. } | Scope::System => None,
     };
-    // Per-scope arming order: a `--pid` capture finishes the deferred
-    // initial arming (and the endpoint selection below) before the
-    // `capturing:` line, so a workload gated on that line is counted
-    // from its first call and no post-ready window exists. Wide scopes
-    // keep the completion after the ready line (the desktop startup
-    // win); their completion names a window gap only when it added
-    // counting coverage (a new plan slot). Failures degrade to named
-    // PARTIAL gaps; a stop between views — Ctrl-C or the `--duration`
-    // deadline — ends arming early the same way, and the loop's own
-    // stop path below still writes the report. Owned runs never pend,
-    // so this is a no-op there. The cleanup pass can change the plan
+    // Per-scope arming order: a `--pid` capture and an owned `run`
+    // finish the deferred initial arming (and the endpoint selection
+    // below) before the `capturing:` line, so a workload gated on that
+    // line is counted from its first call and no post-ready window
+    // exists — including the K0 detail window, whose selection-time
+    // read must precede a gated child's first call. (An owned child
+    // that ignores the line still starts before selection; its early
+    // calls can fall outside the detail.) Wide scopes keep the
+    // completion after the ready line (the desktop startup win); their
+    // completion names a window gap only when it added counting
+    // coverage (a new plan slot). Failures degrade to named PARTIAL
+    // gaps; a stop between views — Ctrl-C or the `--duration` deadline
+    // — ends arming early the same way, and the loop's own stop path
+    // below still writes the report. Owned runs never pend, so the
+    // completion is a no-op there. The cleanup pass can change the plan
     // silently, so the semantic state re-syncs exactly as on a
     // plan-changed tick; nothing has been observed yet, so the purge is
     // empty.
-    let arm_before_ready = matches!(scope, Scope::Pid(_));
+    let arm_before_ready = matches!(scope, Scope::Pid(_)) || owned.is_some();
     if !arm_before_ready {
         emit_capture_diagnostic(&capture_ready_line(
             session.attached_probes(),
@@ -28403,10 +28407,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    /// Per-scope initial-arming order: a `--pid` capture completes the
-    /// deferred initial arming (and, in profile, the endpoint selection)
-    /// before the `capturing:` line, so it has no post-ready window;
-    /// `--system`/`--cgroup` keep the completion after the ready line.
+    /// Per-scope initial-arming order: a `--pid` capture and an owned
+    /// `run` complete the deferred initial arming (and, in profile, the
+    /// endpoint selection) before the `capturing:` line, so they have
+    /// no post-ready window; wide `--system`/`--cgroup` captures keep
+    /// the completion after the ready line.
     /// Both loops re-sync their plan consumers after the completion —
     /// its cleanup pass can change the plan silently (no plan-changed
     /// tick fires for it), so the semantic state, the tracer, the trace
@@ -28451,7 +28456,15 @@ int main(int argc, char **argv) {
             ),
         ] {
             let mut markers = vec![
-                "let arm_before_ready = matches!(scope, Scope::Pid(_));",
+                if name == "profile" {
+                    // The owned `run` child is a direct-child capture:
+                    // its K0 window opens before `capturing:` too, so
+                    // a child gated on the line cannot call into the
+                    // selection-time read.
+                    "let arm_before_ready = matches!(scope, Scope::Pid(_)) || owned.is_some();"
+                } else {
+                    "let arm_before_ready = matches!(scope, Scope::Pid(_));"
+                },
                 "if !arm_before_ready {",
                 "capture_ready_line(",
                 "complete_initial_arming(",
@@ -28459,8 +28472,8 @@ int main(int argc, char **argv) {
             markers.extend_from_slice(syncs);
             if name == "profile" {
                 // The selection sits between the completion and the
-                // pid-scope ready line: its detail window is open
-                // before `capturing:` on that path.
+                // pre-ready emission: its detail window is open before
+                // `capturing:` on the pid and owned-run paths.
                 markers.push("run_metrics_selection_stage(");
             }
             markers.extend_from_slice(&[

@@ -753,6 +753,15 @@ fn spawn_run_observer(
         "--gate",
         gate.to_str().context("gate path")?,
     ]);
+    // A gated owned child waits for the same gate before its own setup:
+    // its provider is already mapped and bound (so attach and discovery
+    // see the image and --prearm-module resolves the name), but no
+    // PKCS#11 call can race the selection-time broad read. A call that
+    // completes inside that read pairs one component's stats with the
+    // other's return-value counts and voids the whole window as torn.
+    if gate != Path::new("-") {
+        command.arg("--gate-before-setup");
+    }
     command
         .args(child_tail)
         .env("SOFTHSM2_CONF", conf)
@@ -1011,13 +1020,15 @@ fn k0_live_run_exit_in_window_counts_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build_owned(&module)?;
-    // The delayed-exit shape: the child waits three seconds after the
-    // gate so the observer's ~1 s discovery frames process its
-    // provider-load records while it still runs; then it signs four
-    // times and exits inside the window. An immediate exit would
-    // race loader-hit processing against view retirement and void
-    // intermittently (see the `ExitsAfter` docs), so the delay pins
-    // the exit-cleanly contract deterministically.
+    // The delayed-exit shape: the child waits for the gate before its
+    // own setup (so no provider call races the selection-time read),
+    // then waits three seconds after setup so the observer's ~1 s
+    // discovery frames process its provider-load records while it
+    // still runs; then it signs four times and exits inside the
+    // window. An immediate exit would race loader-hit processing
+    // against view retirement and void intermittently (see the
+    // `ExitsAfter` docs), so the delay pins the exit-cleanly contract
+    // deterministically.
     let outcome = k0_owned_run(
         &workload,
         &module,

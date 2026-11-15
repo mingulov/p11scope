@@ -967,7 +967,11 @@ few seconds after its provider loads is unaffected (measured with a
 before the slot counters, so a call that completes between the two
 passes leaves a torn window and the detail is withheld as
 `broad_plan_topology`; against a busy `--pid` target this can withhold
-most windows.
+most windows. A call that completes inside the selection-time read
+itself tears the same way: an owned `run` child that calls as soon as
+it starts can leave its own startup calls there. A `run` child that
+waits for the `p11scope: capturing: ` line before calling keeps its
+workload inside the window.
 With `run`, a host whose kernel and userspace monotonic clocks cannot
 be compared (a time namespace offset, or a kernel without the time
 namespace files) refuses the selection as `promotion_scope_unsupported`.

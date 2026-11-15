@@ -17,6 +17,10 @@
  * options:
  *   --iters N        main-phase iterations (default 4)
  *   --gate FILE|-    wait for FILE to exist before the main phase (default -: no gate)
+ *   --gate-before-setup
+ *                    (mech) also wait for --gate before any API call: providers
+ *                    are mapped (and bound) first, so attach/discovery see the
+ *                    image, but no PKCS#11 call races the observer's startup
  *   --hold           after teardown, wait for SIGTERM/SIGINT before exiting
  *   --late           (mech) dlopen only after the gate opens: a late provider     [P7]
  *   --late-from N    (mech) modules N.. load only after the gate; modules below N
@@ -459,7 +463,7 @@ static void iteration(int m, CK_SESSION_HANDLE s, int phase) {
 struct options {
     const char *mode, *gate, *gate2, *pre_init_gate, *chain;
     long iters, delay_ms, sleep_us;
-    int hold, late_from, single_call, h6_control, c8_warm_initial;
+    int hold, gate_before_setup, late_from, single_call, h6_control, c8_warm_initial;
     unsigned long h6_deadline, h6_leg_deadline;
 };
 static struct options opt = {.gate = "-", .pre_init_gate = "-", .iters = 4, .late_from = -1,
@@ -524,6 +528,10 @@ static void mech_generation(long iters, int gated) {
             }
             s[m] = setup(m, PH_SETUP);
         }
+    } else if (opt.gate_before_setup) {
+        for (int m = 0; m < split; m++) { load_module(m); bind_module(m, PH_SETUP); }
+        wait_gate(opt.gate);
+        for (int m = 0; m < split; m++) s[m] = setup(m, PH_SETUP);
     } else {
         for (int m = 0; m < split; m++) { load_module(m); bind_module(m, PH_SETUP); s[m] = setup(m, PH_SETUP); }
     }
@@ -793,7 +801,7 @@ int main(int argc, char **argv) {
     saved_argv = argv;
     if (argc < 2) {
         fprintf(stderr, "usage: inventory-ledger mech|map|exec-chain|held|leader-exit --cell LABEL "
-                        "[--module P]... [--iters N] [--gate F|-] [--hold] [--late] [--delay-ms N] "
+                        "[--module P]... [--iters N] [--gate F|-] [--gate-before-setup] [--hold] [--late] [--delay-ms N] "
                         "[--sleep-us N] [--chain HOW:EXE,...] [--late-from N] [--gate2 F] "
                         "[--single-call M] [--pre-init-gate F]\n");
         return 2;
@@ -806,6 +814,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--ledger-singletons")) { ledger_singletons = 1; continue; }
         if (!strcmp(a, "--c8-warm-initial")) { opt.c8_warm_initial = 1; continue; }
         if (!strcmp(a, "--hold")) { opt.hold = 1; continue; }
+        if (!strcmp(a, "--gate-before-setup")) { opt.gate_before_setup = 1; continue; }
         if (!strcmp(a, "--late")) { opt.late_from = 0; continue; }
         if (!v) { fprintf(stderr, "missing value for %s\n", a); return 2; }
         i++;

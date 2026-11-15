@@ -1679,6 +1679,14 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
         early == 0 || has_learned_first_use_row(&profile),
         "{early} calls entered before their first attach without the learned-provider-file first-use row: {profile}"
     );
+    // The member-stop hook loads on every supported kernel (its own lib
+    // cell runs on the host and in the vng guests), so here every first
+    // mapper is held until its provider attaches: no call precedes a
+    // first attach. A hook load refusal fails this cell, never passes it.
+    assert_eq!(
+        early, 0,
+        "calls entered before their first attach with the member-stop hook armed: {profile}"
+    );
     // Honesty half: the first mapper's miss stays disclosed, never silent.
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
     let learned = evidence

@@ -7120,6 +7120,14 @@ fn scan_and_pin_with(
     .map(|(modules, pins, complete, _, _)| (modules, pins, complete))
 }
 
+// Test-only: make the next scans on this thread see their view as
+// already in its final exit at scan start.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_ENDING_AT_SCAN_START: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// One scan plus its pins plus its shape proof: the modules, the pins,
 /// the completeness verdict, the negative examined-file evidence, and
 /// the provider `.so`-set of the scan's own initial maps.
@@ -7162,6 +7170,8 @@ fn scan_and_pin_with_proof(
     // process ending, not a provider gone unobserved. A group that was
     // live at scan start keeps every refusal, even if it exits mid-scan.
     let ending_at_start = view.final_exit_in_progress();
+    #[cfg(test)]
+    let ending_at_start = ending_at_start || FORCE_ENDING_AT_SCAN_START.with(std::cell::Cell::get);
     let scan_start = crate::attach::monotonic_ns();
     let scanned = scan(
         &ScanRequest {
@@ -25350,8 +25360,29 @@ impl Engine {
         stale: &BTreeSet<ProcessViewId>,
         pending_views: &mut PendingViewRetirements,
     ) {
+        self.queue_stale_views_within(
+            stale,
+            pending_views,
+            &mut crate::process::leader_exit::LeaderExitReadBudget::for_final_exit_proof(),
+        );
+    }
+
+    /// [`Self::queue_stale_views`] with one final-exit read budget shared by
+    /// the whole batch: a spent budget answers "not ending" and the loss
+    /// stays counted.
+    fn queue_stale_views_within(
+        &mut self,
+        stale: &BTreeSet<ProcessViewId>,
+        pending_views: &mut PendingViewRetirements,
+        work: &mut crate::process::leader_exit::LeaderExitReadBudget,
+    ) {
         for view in stale {
-            self.queue_retirement(*view, RetirementCause::GenerationLost, pending_views);
+            self.queue_retirement_within(
+                *view,
+                RetirementCause::GenerationLost,
+                pending_views,
+                work,
+            );
         }
     }
 
@@ -25362,6 +25393,8 @@ impl Engine {
         departed: &BTreeSet<ProcessViewId>,
         pending_views: &mut PendingViewRetirements,
     ) {
+        // One final-exit read budget for the whole batch.
+        let mut work = crate::process::leader_exit::LeaderExitReadBudget::for_final_exit_proof();
         for view in retirement_views {
             let cause = if stale.contains(view) {
                 RetirementCause::GenerationLost
@@ -25371,7 +25404,7 @@ impl Engine {
             } else {
                 RetirementCause::ExecRefresh
             };
-            self.queue_retirement(*view, cause, pending_views);
+            self.queue_retirement_within(*view, cause, pending_views, &mut work);
         }
     }
 
@@ -25400,8 +25433,25 @@ impl Engine {
     fn queue_retirement(
         &mut self,
         view: ProcessViewId,
+        cause: RetirementCause,
+        pending_views: &mut PendingViewRetirements,
+    ) {
+        self.queue_retirement_within(
+            view,
+            cause,
+            pending_views,
+            &mut crate::process::leader_exit::LeaderExitReadBudget::for_final_exit_proof(),
+        );
+    }
+
+    /// [`Self::queue_retirement`] charging its final-exit proof to a
+    /// caller-owned budget, so batch callers share one bound.
+    fn queue_retirement_within(
+        &mut self,
+        view: ProcessViewId,
         mut cause: RetirementCause,
         pending_views: &mut PendingViewRetirements,
+        work: &mut crate::process::leader_exit::LeaderExitReadBudget,
     ) {
         // One exit observation per call: a positive proof below must
         // survive a later observation failure instead of becoming fatal
@@ -25414,7 +25464,9 @@ impl Engine {
                 // A group in its final exit has ended even while its pidfd
                 // is not ready yet: retire it as an expected end, like a
                 // proven exit, instead of deferring with a gap.
-                Some(Ok(OriginalGenerationState::Current)) if self.original_ending(view) => {
+                Some(Ok(OriginalGenerationState::Current))
+                    if self.original_ending_within(view, work) =>
+                {
                     cause = RetirementCause::ExpectedRemoval;
                 }
                 Some(Ok(OriginalGenerationState::Current)) | Some(Err(_)) | None => {
@@ -25599,9 +25651,11 @@ impl Engine {
         view: ProcessViewId,
         work: &mut crate::process::leader_exit::LeaderExitReadBudget,
     ) -> bool {
+        // The test override still charges the shared budget, so a test can
+        // show a batch running out of it.
         #[cfg(test)]
         if self.final_exit_views_for_test.contains(&view) {
-            return true;
+            return work.spend(1);
         }
         self.views
             .iter()

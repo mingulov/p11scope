@@ -83873,3 +83873,101 @@ fn folded_deferral_of_a_departed_view_keeps_the_records_standing() {
         "the departed view's deferral still stands"
     );
 }
+
+/// The pin half of the scan-start excuse: a module the view cannot pin
+/// files a pin skip. For a group already ending when its scan started it
+/// is dropped; for a live group it stays a counted gap.
+#[test]
+fn pin_skips_are_dropped_only_for_a_group_ending_at_scan_start() {
+    for ending in [true, false] {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(713), child.id()).unwrap();
+        let mut module = child_provider_modules(&view)[0].clone();
+        module.path = "relative/provider.so".into();
+        module.tables.clear();
+        let mut counters = DiscoveryCounters::default();
+        FORCE_ENDING_AT_SCAN_START.with(|force| force.set(ending));
+        let result = scan_and_pin_with(
+            &view,
+            &[],
+            &HookRegistry::builtin(),
+            &mut CaptureWorkBudget::default(),
+            &mut counters,
+            false,
+            &mut crate::timing::StageTimings::default(),
+            |_, _, _| {
+                Ok::<_, String>(ScanOutcome::Scanned {
+                    modules: vec![module.clone()],
+                    skipped: Vec::new(),
+                    scan_ms: 0,
+                })
+            },
+            None,
+            None,
+        );
+        FORCE_ENDING_AT_SCAN_START.with(|force| force.set(false));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        result.expect("a live view pins its unnormalizable module as a skip");
+        let filed = counters.object_skips.iter().any(|skip| {
+            skip.subject == "relative/provider.so"
+                && skip.reason == "target path cannot be normalized; object was not pinned"
+        });
+        assert_eq!(
+            filed, !ending,
+            "ending {ending}: {:?}",
+            counters.object_skips
+        );
+    }
+}
+
+/// A stale batch shares one final-exit read budget: with room for one
+/// proof, the first ending group retires as an expected end and the
+/// second, out of budget, keeps its counted generation loss.
+#[test]
+fn stale_batch_shares_one_final_exit_budget() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let first = engine.views[0].id();
+    let other = ProcessViewId(4);
+    engine
+        .views
+        .push(ProcessView::open(other, second.id()).unwrap());
+    engine.next_view_id = 5;
+    engine.set_final_exit_for_test(first);
+    engine.set_final_exit_for_test(other);
+    let mut pending = PendingViewRetirements::new();
+    engine.queue_stale_views_within(
+        &BTreeSet::from([first, other]),
+        &mut pending,
+        &mut crate::process::leader_exit::LeaderExitReadBudget::for_test(1),
+    );
+    for c in [&mut child, &mut second] {
+        c.kill().unwrap();
+        c.wait().unwrap();
+    }
+    assert_eq!(
+        pending.get(&first).copied(),
+        Some(RetirementCause::ExpectedRemoval)
+    );
+    assert_ne!(
+        pending.get(&other).copied(),
+        Some(RetirementCause::ExpectedRemoval),
+        "the spent budget proves nothing for the second view"
+    );
+    let losses = engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| skip.subject == "live discovery generation")
+        .count();
+    assert_eq!(losses, 1, "{:?}", engine.counters.object_skips);
+}

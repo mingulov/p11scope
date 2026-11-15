@@ -1225,6 +1225,11 @@ pub struct CaptureWorkBudget {
     /// passes: each pass's budget starts with an empty set.
     touched_inspected_files: BTreeSet<InspectedFileKey>,
     touched_loader_elf_facts: BTreeSet<LoaderFactsKey>,
+    /// Test-only: insertion refusals that ran the untouched-entry
+    /// eviction scan. Capture and engine budgets never carry file facts
+    /// and must keep the O(1) refusal.
+    #[cfg(test)]
+    eviction_scans: u64,
     interface_records: usize,
     admitted_interfaces: BTreeSet<InterfaceIdentity>,
     /// New distinct candidates refused by the cardinality ceilings. Sticky
@@ -1329,6 +1334,8 @@ where
 /// eviction by subtracting the reclaimed entry's accounted bytes.
 struct FileFactRetention<'a> {
     retained_cache_bytes: &'a mut u64,
+    #[cfg(test)]
+    eviction_scans: &'a mut u64,
     byte_limit: u64,
     entry_limit: Option<usize>,
 }
@@ -1355,6 +1362,10 @@ impl FileFactRetention<'_> {
             self.entry_limit,
             self.byte_limit,
         ) {
+            #[cfg(test)]
+            {
+                *self.eviction_scans = self.eviction_scans.saturating_add(1);
+            }
             let Some(freed) = evict_untouched(map, touched, &bytes_of) else {
                 return false;
             };
@@ -1405,6 +1416,8 @@ impl CaptureWorkBudget {
             loader_elf_facts: BTreeMap::new(),
             touched_inspected_files: BTreeSet::new(),
             touched_loader_elf_facts: BTreeSet::new(),
+            #[cfg(test)]
+            eviction_scans: 0,
             interface_records: 0,
             admitted_interfaces: BTreeSet::new(),
             table_refusals: 0,
@@ -2098,6 +2111,8 @@ impl CaptureWorkBudget {
         let byte_limit = self.retained_byte_limit();
         FileFactRetention {
             retained_cache_bytes: &mut self.retained_cache_bytes,
+            #[cfg(test)]
+            eviction_scans: &mut self.eviction_scans,
             byte_limit,
             entry_limit,
         }
@@ -2142,6 +2157,8 @@ impl CaptureWorkBudget {
         let byte_limit = self.retained_byte_limit();
         FileFactRetention {
             retained_cache_bytes: &mut self.retained_cache_bytes,
+            #[cfg(test)]
+            eviction_scans: &mut self.eviction_scans,
             byte_limit,
             entry_limit,
         }
@@ -2191,6 +2208,8 @@ impl CaptureWorkBudget {
         let byte_limit = self.retained_byte_limit();
         FileFactRetention {
             retained_cache_bytes: &mut self.retained_cache_bytes,
+            #[cfg(test)]
+            eviction_scans: &mut self.eviction_scans,
             byte_limit,
             entry_limit,
         }
@@ -2220,6 +2239,8 @@ impl CaptureWorkBudget {
         let byte_limit = self.retained_byte_limit();
         FileFactRetention {
             retained_cache_bytes: &mut self.retained_cache_bytes,
+            #[cfg(test)]
+            eviction_scans: &mut self.eviction_scans,
             byte_limit,
             entry_limit,
         }
@@ -2353,6 +2374,13 @@ impl CaptureWorkBudget {
             &self.table_cap_refusals,
             &self.loader_elf_facts,
         )
+    }
+
+    /// Test-only: how many insertion refusals ran the untouched-entry
+    /// eviction scan.
+    #[cfg(test)]
+    pub(crate) fn eviction_scans_count(&self) -> u64 {
+        self.eviction_scans
     }
 
     fn table_exhaustion_reason(&mut self) -> Option<String> {
@@ -17148,6 +17176,17 @@ mod tests {
         .unwrap()
     }
 
+    /// Inventory limits with the usual four-entry file caches but a chosen
+    /// accounted-byte ceiling, for carried-cache byte-edge tests.
+    fn tight_export_limits(cache_bytes: u64) -> InventoryDiscoveryLimits {
+        InventoryDiscoveryLimits::new(
+            8 << 20,
+            InventoryWindowLimits::new(8 << 20, 1 << 20, 4096, 32768, 4096).unwrap(),
+            InventoryRetainedLimits::new(512, 512, 512, 4, 4, cache_bytes).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn table_identity(index: u64) -> TableIdentity {
         TableIdentity {
             device: Device { major: 8, minor: 1 },
@@ -18530,16 +18569,23 @@ mod tests {
             CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
         let window = second.begin_window(WindowId::new(1), u64::MAX).unwrap();
         let scan = second.checkpoint(window.clone()).unwrap();
-        // Touch one carried file: this pass used it, so reclamation must
-        // never evict it for the newcomer.
-        let (used_file, used_object_key) = &filled[0];
-        let used_cache_key = InspectedFileKey::for_open_file(
-            used_file,
-            used_object_key.device,
-            used_object_key.inode,
-            pin_of(used_file).unwrap(),
-        )
-        .unwrap();
+        // Touch the carried file with the smallest cache key: plain
+        // key-order eviction would pick exactly that entry first, so the
+        // protection assertion cannot depend on inode allocation order.
+        let (used_file, used_object_key, used_cache_key) = filled
+            .iter()
+            .map(|(file, object_key)| {
+                let cache_key = InspectedFileKey::for_open_file(
+                    file,
+                    object_key.device,
+                    object_key.inode,
+                    pin_of(file).unwrap(),
+                )
+                .unwrap();
+                (file, object_key, cache_key)
+            })
+            .min_by_key(|(_, _, cache_key)| *cache_key)
+            .unwrap();
         let used = provider_facts_for(used_file, *used_object_key, &[], &mut second).unwrap();
         assert_eq!(second.attempted_io_bytes(), 0, "the carried file is a hit");
         let newcomer_facts = provider_facts_for(&newcomer, newcomer_key, &[], &mut second).unwrap();
@@ -18648,6 +18694,15 @@ mod tests {
         assert!(second.elf_export_facts_for(&fresh).is_none());
         assert!(second.table_cap_refusal_for(&fresh).is_none());
         assert!(second.loader_elf_facts_for(&fresh_loader).is_none());
+        // Use the smallest carried key in every map: key-order reclamation
+        // would otherwise pick it first, so surviving the insertion proves
+        // touched carried entries are protected.
+        let used_stale = stale_key(0);
+        let used_loader = LoaderFactsKey { device: 100, pin };
+        assert!(second.inspected_file(&used_stale).is_some());
+        assert!(second.elf_export_facts_for(&used_stale).is_some());
+        assert!(second.table_cap_refusal_for(&used_stale).is_some());
+        assert!(second.loader_elf_facts_for(&used_loader).is_some());
         assert!(second.note_inspected_file(fresh, inspected.clone()));
         assert!(second.note_elf_export_facts(fresh, export_facts.clone()));
         assert!(second.note_table_cap_refusal(fresh, "fresh table-cap refusal".into()));
@@ -18667,6 +18722,22 @@ mod tests {
             Some(loader_facts)
         );
         assert_eq!(second.loader_cache_len(), 4);
+        assert!(
+            second.inspected_file(&used_stale).is_some(),
+            "an inspected entry this pass used is never reclaimed"
+        );
+        assert!(
+            second.elf_export_facts_for(&used_stale).is_some(),
+            "an export entry this pass used is never reclaimed"
+        );
+        assert!(
+            second.table_cap_refusal_for(&used_stale).is_some(),
+            "a refusal entry this pass used is never reclaimed"
+        );
+        assert!(
+            second.loader_elf_facts_for(&used_loader).is_some(),
+            "a loader entry this pass used is never reclaimed"
+        );
         assert_eq!(
             second.retained_counts().5,
             second.retained_file_bytes_recount(),
@@ -18676,9 +18747,245 @@ mod tests {
         second.finish_window(window).unwrap();
     }
 
-    /// One charging rule: a snapshot read debits the inventory window
-    /// for every byte and charges no collection work; the parsed table
-    /// entries alone charge work through `spend`.
+    /// A live entry that a later member has not reached yet must survive
+    /// the earlier member's insertions. Reclamation that only looks at the
+    /// current pass evicts the low-sorting live entry on every pass once
+    /// churn entries fill the carried map.
+    #[test]
+    fn inventory_carried_cold_entries_are_reclaimed_before_a_live_entry() {
+        let file = File::open("/bin/sh").unwrap();
+        let pin = pin_of(&file).unwrap();
+        let key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+            fd_dev: 7,
+        };
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        let limits = || inventory_limits(8 << 20, 1 << 20, 4096, 32768, 4096, 512);
+        // The live entry sorts below every other key, so reclamation that
+        // ignores the previous pass's use picks it first.
+        let live = key(1);
+        let fixed = key(2);
+
+        let mut carried = RetainedFileFacts::default();
+        for pass in 0..8u64 {
+            let mut budget =
+                CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
+            let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+            let scan = budget.checkpoint(window.clone()).unwrap();
+            // Member A walks its stable file and then a fresh churn file;
+            // member B's live entry sorts lower and is still untouched.
+            assert!(budget.note_elf_export_facts(fixed, facts.clone()));
+            assert!(budget.note_elf_export_facts(key(10 + pass), facts.clone()));
+            if pass == 0 {
+                assert!(budget.note_elf_export_facts(live, facts.clone()));
+            } else {
+                assert_eq!(
+                    budget.elf_export_facts_for(&live),
+                    Some(facts.clone()),
+                    "a live carried entry must survive earlier insertions on pass {pass}"
+                );
+            }
+            budget.finish_scan(scan).unwrap();
+            budget.finish_window(window).unwrap();
+            carried = budget.take_retained_file_facts();
+        }
+    }
+
+    /// A refused byte-ceiling insertion never evicts a carried entry: the
+    /// untouched entries in the map cannot free enough to fit, so the pass
+    /// keeps what it already has instead of losing one for nothing.
+    #[test]
+    fn inventory_refused_byte_ceiling_insertion_keeps_carried_entries() {
+        let file = File::open("/bin/sh").unwrap();
+        let pin = pin_of(&file).unwrap();
+        let key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+            fd_dev: 7,
+        };
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        let small_bytes = export_cache_bytes(&key(0), &facts);
+        let limits = || tight_export_limits(small_bytes * 3);
+
+        let mut first = CaptureWorkBudget::for_inventory(limits());
+        let window = first.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = first.checkpoint(window.clone()).unwrap();
+        assert!(first.note_elf_export_facts(key(0), facts.clone()));
+        assert!(first.note_elf_export_facts(key(1), facts.clone()));
+        first.finish_scan(scan).unwrap();
+        first.finish_window(window).unwrap();
+        let carried = first.take_retained_file_facts();
+        assert_eq!(carried.counts().1, 2);
+
+        let mut second =
+            CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
+        let window = second.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = second.checkpoint(window.clone()).unwrap();
+        // Touch the first carried entry; the other stays untouched.
+        assert_eq!(second.elf_export_facts_for(&key(0)), Some(facts.clone()));
+        let huge = ElfExportFacts {
+            exports: (0..20_000u64)
+                .map(|index| (format!("bulk_symbol_{index:06}"), index))
+                .collect(),
+            ..facts.clone()
+        };
+        assert!(
+            !second.note_elf_export_facts(key(9), huge),
+            "a value that cannot fit even after evicting every untouched entry is refused"
+        );
+        assert_eq!(
+            second.retained_counts().4,
+            2,
+            "a refused insertion leaves the carried entries intact"
+        );
+        assert_eq!(second.elf_export_facts_for(&key(1)), Some(facts.clone()));
+        assert_eq!(second.elf_export_facts_for(&key(0)), Some(facts));
+        assert_eq!(
+            second.retained_counts().5,
+            second.retained_file_bytes_recount(),
+            "a refusal changes no retained bytes"
+        );
+        second.finish_scan(scan).unwrap();
+        second.finish_window(window).unwrap();
+    }
+
+    /// A byte-ceiling insertion evicts in a loop until it fits: one
+    /// untouched entry may free less than the shortfall, and the retained
+    /// map must not keep refusing while more reclaimable entries remain.
+    #[test]
+    fn inventory_byte_ceiling_evicts_until_the_insertion_fits() {
+        let file = File::open("/bin/sh").unwrap();
+        let pin = pin_of(&file).unwrap();
+        let key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+            fd_dev: 7,
+        };
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        let small_bytes = export_cache_bytes(&key(0), &facts);
+        let medium = ElfExportFacts {
+            exports: (0..40u64)
+                .map(|index| (format!("medium_symbol_{index:02}"), index))
+                .collect(),
+            ..facts.clone()
+        };
+        let medium_bytes = export_cache_bytes(&key(0), &medium);
+        assert!(
+            medium_bytes >= 2 * small_bytes,
+            "the medium value must need two small entries' worth of room"
+        );
+        let byte_limit = small_bytes + medium_bytes;
+        let limits = || tight_export_limits(byte_limit);
+
+        let mut first = CaptureWorkBudget::for_inventory(limits());
+        let window = first.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = first.checkpoint(window.clone()).unwrap();
+        for inode in 1..=3u64 {
+            assert!(first.note_elf_export_facts(key(inode), facts.clone()));
+        }
+        assert_eq!(first.retained_counts().5, 3 * small_bytes);
+        first.finish_scan(scan).unwrap();
+        first.finish_window(window).unwrap();
+        let carried = first.take_retained_file_facts();
+        assert_eq!(carried.counts().1, 3);
+
+        let mut second =
+            CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
+        let window = second.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = second.checkpoint(window.clone()).unwrap();
+        assert!(
+            second.note_elf_export_facts(key(9), medium.clone()),
+            "reclamation keeps evicting until the insertion fits"
+        );
+        let (_, _, _, _, exports, bytes) = second.retained_counts();
+        assert_eq!(exports, 2, "two small entries made room for the medium one");
+        assert!(bytes <= byte_limit);
+        assert_eq!(bytes, second.retained_file_bytes_recount());
+        assert_eq!(second.elf_export_facts_for(&key(3)), Some(facts));
+        assert_eq!(second.elf_export_facts_for(&key(9)), Some(medium));
+        second.finish_scan(scan).unwrap();
+        second.finish_window(window).unwrap();
+    }
+
+    /// Budgets that never carried file facts refuse a full map without
+    /// scanning for evictable entries; a carried budget still reclaims.
+    #[test]
+    fn budgets_without_carried_facts_refuse_without_an_eviction_scan() {
+        let file = File::open("/bin/sh").unwrap();
+        let pin = pin_of(&file).unwrap();
+        let key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+            fd_dev: 7,
+        };
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+
+        let mut capture = CaptureWorkBudget::default();
+        for inode in 0..CAPTURE_EXPORT_CACHE_ENTRIES as u64 {
+            assert!(capture.note_elf_export_facts(key(inode), facts.clone()));
+        }
+        assert!(!capture.note_elf_export_facts(key(u64::MAX), facts.clone()));
+        assert_eq!(
+            capture.eviction_scans_count(),
+            0,
+            "a budget that never carried file facts keeps the O(1) refusal"
+        );
+        assert_eq!(capture.retained_counts().4, CAPTURE_EXPORT_CACHE_ENTRIES);
+
+        // The same refusal shape in a carried budget scans and reclaims,
+        // so the guard cannot hide a missing eviction.
+        let limits = || inventory_limits(8 << 20, 1 << 20, 4096, 32768, 4096, 512);
+        let mut first = CaptureWorkBudget::for_inventory(limits());
+        let window = first.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = first.checkpoint(window.clone()).unwrap();
+        for inode in 0..4u64 {
+            assert!(first.note_elf_export_facts(key(inode), facts.clone()));
+        }
+        first.finish_scan(scan).unwrap();
+        first.finish_window(window).unwrap();
+        let carried = first.take_retained_file_facts();
+        let mut second =
+            CaptureWorkBudget::for_inventory(limits()).with_retained_file_facts(carried);
+        let window = second.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = second.checkpoint(window.clone()).unwrap();
+        assert!(second.note_elf_export_facts(key(9), facts));
+        assert_eq!(
+            second.eviction_scans_count(),
+            1,
+            "a carried budget does scan for an evictable entry"
+        );
+        second.finish_scan(scan).unwrap();
+        second.finish_window(window).unwrap();
+    }
     #[test]
     fn inventory_snapshot_read_charges_the_window_not_collection_work() {
         let dir = tempfile::tempdir().unwrap();

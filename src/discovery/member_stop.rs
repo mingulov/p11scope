@@ -380,12 +380,17 @@ fn exec_rows(maps: &[u8]) -> Vec<ExecRow> {
 /// the two agree; a mismatched one costs one more stop for the first
 /// mapper of that file, which then clears it under its own kernel key).
 /// No row holds the range when it was unmapped since: nothing is added,
-/// and the file stays uncleared.
+/// and the file stays uncleared. Only the exact mapping counts (the same
+/// start and end), and in the kernel's own device domain the same inode
+/// too: another thread of the member may replace the range before the
+/// group stop completes, and the replacement proves nothing about the
+/// stopped file, which then stays unproven (the named gap).
 fn with_stopping_row(mut rows: Vec<ExecRow>, stop: &MemberStop) -> Vec<ExecRow> {
-    let Some(at) = rows
-        .iter()
-        .position(|row| row.start <= stop.vm_start && stop.vm_start < row.end)
-    else {
+    let Some(at) = rows.iter().position(|row| {
+        row.start == stop.vm_start
+            && row.end == stop.vm_end
+            && (row.maps_dev != stop.file.dev || row.maps_ino == stop.file.ino)
+    }) else {
         return rows;
     };
     if rows[at].key == stop.file {
@@ -431,8 +436,10 @@ fn open_exec_row(
 /// the range between the snapshot and the open, and a path may name a
 /// newer file. Through `map_files` the kernel row's own inode number is
 /// accepted too: on overlayfs that link opens the backing file, which
-/// the hook keyed. Inode numbers only: the device encodings differ
-/// between `stat` and the kernel's superblock (btrfs subvolumes).
+/// the hook keyed. The stopping row through `map_files` must open the
+/// kernel row's inode itself (the VMA's own file is the stopped one).
+/// Inode numbers only: the device encodings differ between `stat` and
+/// the kernel's superblock (btrfs subvolumes).
 fn opened_row_file(
     file: std::fs::File,
     row: &ExecRow,
@@ -443,7 +450,12 @@ fn opened_row_file(
         .metadata()
         .map_err(|error| format!("member file metadata: {error}"))?
         .ino();
-    if ino == row.maps_ino || (through_map_files && ino == row.key.ino) {
+    let accepted = if through_map_files && row.stopping {
+        ino == row.key.ino
+    } else {
+        ino == row.maps_ino || (through_map_files && ino == row.key.ino)
+    };
+    if accepted {
         Ok(file)
     } else {
         Err("the opened member file is no longer the mapped inode".into())
@@ -1361,6 +1373,64 @@ mod tests {
             BTreeSet::from([kernel_dev(0, 45), kernel_dev(0, 46), kernel_dev(7, 3)]),
             "fuse, fuse.* and fuseblk only"
         );
+    }
+
+    /// The stopping row is the kernel's exact mapping: another range at
+    /// the same start, or (same device domain) another inode there, is a
+    /// replaced mapping and proves nothing about the stopped file.
+    #[test]
+    fn the_stopping_row_needs_the_exact_mapping_and_inode() {
+        let row = |dev, ino, start, end| ExecRow {
+            start,
+            end,
+            key: MemberFileKey { dev, ino },
+            maps_ino: ino,
+            maps_dev: dev,
+            stopping: false,
+            path: b"/usr/lib/libx.so".to_vec(),
+        };
+        let stop = |dev, ino, vm_start, vm_end| MemberStop {
+            file: MemberFileKey { dev, ino },
+            hook_ts_ns: 1,
+            vm_start,
+            vm_end,
+        };
+        let rows = with_stopping_row(vec![row(1, 7, 0x3000, 0x4000)], &stop(1, 7, 0x3000, 0x5000));
+        assert!(!rows.iter().any(|row| row.stopping), "another range end");
+        let rows = with_stopping_row(vec![row(1, 9, 0x3000, 0x4000)], &stop(1, 7, 0x3000, 0x4000));
+        assert!(
+            !rows.iter().any(|row| row.stopping),
+            "another inode, same domain"
+        );
+        let rows = with_stopping_row(vec![row(1, 7, 0x3000, 0x4000)], &stop(1, 7, 0x3000, 0x4000));
+        assert!(rows[0].stopping, "the exact mapping");
+    }
+
+    /// Through `map_files` the stopping row's file must be the kernel
+    /// row's inode itself.
+    #[test]
+    fn a_stopping_row_opened_through_map_files_must_be_the_stopped_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+        let open = || std::fs::File::open("/proc/self/exe").unwrap();
+        let ino = open().metadata().unwrap().ino();
+        let row = ExecRow {
+            start: 0x1000,
+            end: 0x2000,
+            key: MemberFileKey {
+                dev: 1,
+                ino: ino + 1,
+            },
+            maps_ino: ino,
+            maps_dev: 2,
+            stopping: true,
+            path: b"/x".to_vec(),
+        };
+        assert!(opened_row_file(open(), &row, true).is_err());
+        let exact = ExecRow {
+            key: MemberFileKey { dev: 1, ino },
+            ..row
+        };
+        assert!(opened_row_file(open(), &exact, true).is_ok());
     }
 
     #[test]

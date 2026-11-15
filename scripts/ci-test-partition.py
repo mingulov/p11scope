@@ -510,12 +510,10 @@ _SELF_PIN_FN = re.compile(
 )
 _SELF_PIN_LET = re.compile(r"\blet\s+(mut\s+)?(.+?)\s*=\s*", re.S)
 
-# The two self-pin flows the guard reports but excuses, as
-# (file, test function). Each is benign by a mechanism its own test
-# pins; `check_self_pin_allowlist` fails a stale entry loudly.
+# Self-pin flows the guard reports but excuses, as (file, test
+# function). Each is benign by a mechanism its own test pins;
+# `check_self_pin_allowlist` fails a stale entry loudly.
 SELF_PIN_ALLOWLIST = frozenset({
-    ("src/discovery/engine_tests.rs",
-     "exact_loader_pin_is_view_owned_but_not_a_provider_module"),
     ("tests/manifest_pinning.rs",
      "a_retargeted_path_is_skipped_as_an_identity_mismatch"),
 })

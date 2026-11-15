@@ -25,14 +25,10 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 PART = runpy.run_path(str(ROOT / "scripts/ci-test-partition.py"))
 
-# The two self-pin flows the guard reports but excuses, as
-# (file, test function). Each is benign by a mechanism its own test
-# pins, and each must keep violating: a stale entry fails loudly.
+# Self-pin flows the guard reports but excuses, as (file, test
+# function). Each is benign by a mechanism its own test pins, and each
+# must keep violating: a stale entry fails loudly.
 EXPECTED_ALLOWLIST = frozenset({
-    # Selects a mapped executable that is != the test binary (a small
-    # loader .so), pinned by its `path != executable` filter.
-    ("src/discovery/engine_tests.rs",
-     "exact_loader_pin_is_view_owned_but_not_a_provider_module"),
     # The identity-mismatch skip precedes the size gate, pinned by its
     # identity_mismatch assertion: a mismatch must never be pinned.
     ("tests/manifest_pinning.rs",

@@ -230,13 +230,20 @@ struct ExecRow {
 }
 
 /// Each mount of a `mountinfo` listing: its filesystem type and its
-/// device (kernel encoding). Unparsable lines are skipped.
-fn mount_types(mountinfo: &[u8]) -> impl Iterator<Item = (&str, u64)> {
+/// device (kernel encoding). Parsed as bytes: a mount point is printed
+/// raw apart from four escaped characters, so it need not be UTF-8.
+/// Unparsable lines are skipped.
+fn mount_types(mountinfo: &[u8]) -> impl Iterator<Item = (&[u8], u64)> {
     mountinfo.split(|byte| *byte == b'\n').filter_map(|line| {
-        let line = std::str::from_utf8(line).ok()?;
-        let (mount, source) = line.split_once(" - ")?;
-        let fstype = source.split(' ').next().unwrap_or_default();
-        let (major, minor) = mount.split(' ').nth(2)?.split_once(':')?;
+        let separator = line.windows(3).position(|window| window == b" - ")?;
+        let (mount, source) = (&line[..separator], &line[separator + 3..]);
+        let fstype = source
+            .split(|byte| *byte == b' ')
+            .next()
+            .unwrap_or_default();
+        let device = mount.split(|byte| *byte == b' ').nth(2)?;
+        let device = std::str::from_utf8(device).ok()?;
+        let (major, minor) = device.split_once(':')?;
         Some((
             fstype,
             kernel_dev(major.parse::<u64>().ok()?, minor.parse::<u64>().ok()?),
@@ -249,10 +256,10 @@ fn mount_types(mountinfo: &[u8]) -> impl Iterator<Item = (&str, u64)> {
 fn fuse_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
     mount_types(mountinfo)
         .filter(|(fstype, _)| {
-            *fstype == "fuse"
-                || *fstype == "fuseblk"
-                || fstype.starts_with("fuse.")
-                || fstype.starts_with("fuseblk.")
+            *fstype == b"fuse"
+                || *fstype == b"fuseblk"
+                || fstype.starts_with(b"fuse.")
+                || fstype.starts_with(b"fuseblk.")
         })
         .map(|(_, device)| device)
         .collect()
@@ -262,7 +269,7 @@ fn fuse_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
 /// listing.
 fn overlay_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
     mount_types(mountinfo)
-        .filter(|(fstype, _)| *fstype == "overlay")
+        .filter(|(fstype, _)| *fstype == b"overlay")
         .map(|(_, device)| device)
         .collect()
 }
@@ -1528,6 +1535,20 @@ mod tests {
             fuse_devices(mountinfo),
             BTreeSet::from([kernel_dev(7, 4)]),
             "fuseblk.* only"
+        );
+    }
+
+    /// `mountinfo` escapes only space, tab, newline and backslash: a
+    /// mount point that is not UTF-8 is printed raw, and its FUSE mount
+    /// must still be found.
+    #[test]
+    fn fuse_devices_parse_non_utf8_mount_paths() {
+        let mut mountinfo = b"46 22 0:48 / /mnt/".to_vec();
+        mountinfo.extend_from_slice(&[0xff, 0xfe]);
+        mountinfo.extend_from_slice(b" rw shared:26 - fuse.sshfs host:/ rw\n");
+        assert_eq!(
+            fuse_devices(&mountinfo),
+            BTreeSet::from([kernel_dev(0, 48)])
         );
     }
 

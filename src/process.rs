@@ -1137,8 +1137,28 @@ impl ProcPin<'_> {
         self.read_maps_with(deadline, max_bytes, || {})
     }
 
+    /// The retained process's `mountinfo`, read like [`Self::read_maps`]
+    /// (bounded, against the deadline, to real EOF).
+    pub(crate) fn read_mountinfo(
+        &self,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        self.read_retained(c"mountinfo", deadline, max_bytes, || {})
+    }
+
     fn read_maps_with(
         &self,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+        after_read: impl FnMut(),
+    ) -> Result<Vec<u8>, String> {
+        self.read_retained(c"maps", deadline, max_bytes, after_read)
+    }
+
+    fn read_retained(
+        &self,
+        name: &std::ffi::CStr,
         deadline: std::time::Instant,
         max_bytes: usize,
         mut after_read: impl FnMut(),
@@ -1148,7 +1168,7 @@ impl ProcPin<'_> {
             return Err("invalid maps byte bound".into());
         }
         self.before_io(deadline)?;
-        let fd = relative_proc_open(self.directory.as_fd(), c"maps")?;
+        let fd = relative_proc_open(self.directory.as_fd(), name)?;
         self.before_io(deadline)?;
         let mut file = std::fs::File::from(fd);
         let mut bytes = Vec::new();

@@ -294,7 +294,16 @@ dead: a member held at that moment stays stopped until the observer
 runs again (`fg`). No heartbeat covers that case: a missed-heartbeat
 timeout would also fire on a live observer that is only slow on a busy
 host, and the watchdog would then resume a held member before its
-probes attach, without the first-use gap row. On an overlay
+probes attach, without the first-use gap row. A stopped member's
+file on a FUSE mount (`fuse`, `fuse.*`, `fuseblk`) is never opened,
+because its server may itself be a stopped member: that member resumes
+at once and the learned first-use row is filed. One blocking open
+remains: the owned-tree watch opens a FUSE-backed provider on the
+capture thread, so if that file's FUSE server is a run member stopped
+at the same moment (at its own first map of a new file), the open, and
+with it the capture loop and every hold bound, waits for a server that
+only that loop would resume. Recover with `kill -9` of the observer; the watchdog
+then resumes every member. On an overlay
 filesystem a neighbor executable whose backing identity differs from
 the one `maps` prints costs one more short stop for its first mapper. The 32-file per-capture cap is shared with system file
 learning. Of the 256 loader contexts, 8 stay reserved for the direct

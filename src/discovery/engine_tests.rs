@@ -87226,6 +87226,41 @@ fn member_stop_kernel_refusals_file_the_first_use_row_at_release() {
     assert!(files_the_first_use_row(&engine), "the loss release too");
 }
 
+/// A stopped member's file on a FUSE mount is never opened (its server
+/// may be another stopped member): the member resumes at once and the
+/// named first-use gap is filed.
+#[test]
+fn member_stop_never_proves_a_fuse_backed_file() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let exe = loop {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            && exe.file_name().is_some_and(|name| name == "sleep")
+        {
+            break exe;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &exe);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &exe, key));
+    let mut engine = member_stop_engine();
+    engine.member_stops.fuse_devs = Some(BTreeSet::from([key.dev]));
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert!(!io.rows.contains_key(&pid));
+    assert_eq!(engine.member_stop_stats_for_test().fuse_resumes, 1);
+    assert!(files_the_first_use_row(&engine), "the gap is named");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Twin: without a service pass the stopped member stays stopped (the
 /// resume above is the service's, not the fixture's).
 #[test]

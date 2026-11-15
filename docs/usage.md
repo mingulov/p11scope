@@ -2807,10 +2807,13 @@ totals larger than the whole production read window
 guards against crafted files — 64 MiB for an inventory pass, 512 MiB
 for a `profile`/`trace` capture. Under `--cgroup`, one inventory pass
 shares that single 64 MiB attempted-read window across every member and
-every file it examines. The pass carries its file-derived inspection,
+every file it examines. Each pass carries its file-derived inspection,
 export, loader and table-refusal facts into the next pass, keyed and
-pinned by file identity and change time, so an unchanged large object is read once
-rather than on every pass while a changed file is read again. Identity
+pinned by file identity, size and change time. An unchanged object is read
+once rather than on every pass while its facts fit the retained-fact
+ceilings (128 entries per map and 16 MiB of accounted bytes); beyond
+them the pass re-reads the file rather than dropping coverage, and a
+changed file is always read again. Identity
 hashing reads the whole file once
 against the window allowance, and memory snapshots read in bounded
 chunks — a large object degrades through a named gap when an

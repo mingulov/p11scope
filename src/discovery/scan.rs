@@ -1085,9 +1085,13 @@ fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
 /// `(ino, size, ctime)` pin (the loader map by its own descriptor pin), so
 /// an unchanged file costs no reads on the next pass while a changed file
 /// misses and is read again. Nothing here comes from a target process or
-/// from a generation-scoped view, so the facts stay valid across passes
-/// the way the main inventory budget's caches do. Byte accounting shares
-/// the one retained-cache ceiling the budget already enforces.
+/// from a generation-scoped view, so the facts stay valid in a later pass
+/// of the same run; the engine budget used for native-owner scans keeps
+/// its caches across passes, while the `--system` deep-scan collector
+/// starts each pass with a fresh budget. Byte accounting shares the one
+/// retained-cache ceiling the budget already enforces, and an insertion
+/// reclaims a carried entry this pass did not touch rather than pinning
+/// a full map on dead keys.
 #[derive(Debug, Default)]
 pub(crate) struct RetainedFileFacts {
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,

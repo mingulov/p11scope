@@ -291,7 +291,9 @@ by its deadline while the mapping is blocked), yields 20 ms and scans
 the table once more, and then ends the watchdog by its sweeps instead
 of in order, so a stop that still lands is resumed within 1.6 s; on
 such a host those sweeps also resume a member stopped on purpose (job
-control). In the microseconds
+control). That bound needs a live watchdog: after a lost watchdog
+no sweep remains, so a stop that lands after those capture-end
+rescans is not resumed; send it SIGCONT, as after a kill of both. In the microseconds
 between a member's resume and the withdrawal of its row, a file it
 maps first is not stopped (the kernel keeps one row per process) and
 that refusal is not counted; the owned-tree watch still learns the

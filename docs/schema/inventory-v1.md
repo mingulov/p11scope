@@ -227,11 +227,16 @@ and never proves an app identity. See the app identity rows of
 
 ## Model
 
-- `callers[]`: one record per caller *incarnation* — one (pid,
-  start-time) generation running one executable image. `id` (`c0`,
-  `c1`, …) is stable for the capture, minted monotonically, never
-  reused: PID reuse and exec retire the old incarnation (evidence
-  retained) and mint a new one. `image.authority` is `native_exact`
+- `callers[]`: one record per *retained* caller incarnation — one
+  (pid, start-time) generation running one executable image. `id`
+  (`c0`, `c1`, …) is stable for the capture, minted monotonically,
+  never reused: PID reuse and exec retire the old incarnation and mint
+  a new one. A caller whose process is proven exited or exec-retired
+  keeps its row until a published presentation has rendered it; the
+  coordinator then folds the row into the exact
+  `budgets.callers.retired` aggregate (additive within v1) and removes
+  it. A row that still backs an edge, a gap, an instance or pending
+  native work keeps its facts until that consumer releases it. `image.authority` is `native_exact`
   (BPF task-cookie/exec-ID identity) or `scan_pinned` (pidfd/start-time
   pin with exe-identity exec detection); `exec_observed` is false when
   the exe identity was unreadable and exec changes were undetectable.
@@ -939,7 +944,10 @@ and never proves an app identity. See the app identity rows of
   gap carries `budget: null`. Run-lifetime admission refusals name the
   `inventory_endpoints` or `inventory_attach_modules` resource.
 - `budgets`: every budgeted resource with its own limit, occupancy
-  source, and loss counter — `callers`, `modules` (physical module
+  source, and loss counter — `callers` (additive within v1:
+  `retired` counts proven-ended caller rows removed after rendering;
+  `occupied` is the retained census, so `occupied + retired` is every
+  caller incarnation the capture ever admitted), `modules` (physical module
   instances), `edges` (caller relationships), `endpoints` (the
   retained attach-endpoint census: the sum of admitted per-module
   endpoint counts), `inventory_endpoints` (additive within v1:
@@ -1050,6 +1058,8 @@ Finite reasons are `no_calls`, `instance_unproven`,
 
 Additive budgets are:
 
+- `callers.retired`: proven-ended caller-incarnation rows retired into the
+  counted aggregate after a presentation rendered them (see `callers[]`).
 - `instances`: `{limit, occupied, refused}` for lifetime retained records,
   including retired records (default limit 4096).
 - `instance_semantic_state`: `{limit, occupied, unknown_edges, refused,
@@ -1459,7 +1469,7 @@ counts at each.
                                        "unbound_images": 0, "unbound_images_saturated": false,
                                        "identity_unavailable": 0, "identity_budget_exhausted": false}},
   "budgets": {
-    "callers": {"limit": 4096, "occupied": 1, "refused": 0},
+    "callers": {"limit": 4096, "occupied": 1, "refused": 0, "retired": 0},
     "modules": {"limit": 4096, "occupied": 1, "refused": 0},
     "edges": {"limit": 32768, "occupied": 1, "refused": 0},
     "endpoints": {"limit": 1048576, "occupied": 68, "refused": 0},

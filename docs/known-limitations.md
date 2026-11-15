@@ -2746,6 +2746,39 @@ The old bounds are measurements, not a product startup SLA.
   iterator or a documented boundary; D6 rule-3 relaxation only if
   `before_admission` ≥20% with zero false joins on P5).
 
+### Departed native EXEC evidence is pruned after three minutes (0.8.0)
+
+- What the user sees: once a process is proven gone (reaped, or a zombie;
+  only `kill(pid, 0) == ESRCH` or a reaped generation counts, never an
+  unreadable `/proc`), the capture releases its remembered EXEC instant,
+  image-cookie sequences and stashed EXEC identity after 180 s. Rows
+  still pending keep their tgid and image sequence, live processes keep
+  theirs, and hard caps are unchanged. Retained (retired) caller
+  incarnations are protected: their exec instants and competing image
+  sequences stay as decision vetoes for as long as the caller row is
+  retained, so a late row still reads `exec_after_admission` instead of
+  re-binding through the post-exit fallback. The prune runs at classic
+  catalog passes and at cgroup transaction completions.
+- Degraded attribution is named: an image whose stashed EXEC was pruned
+  reads `exec_record_lost` for a late row (the observer had the record
+  and discarded it), never `no_exec_record`. Past 65,536 pruned-EXEC
+  tombstones the domain latches EXEC loss (any still-unjoined image
+  there reads lost) and the overflow is counted; the tombstone bound is
+  never lowered.
+- Kernel binder worst case (disclosed, not lowered): per domain, at most
+  one exec instant per live tgid (16,384), and at most 65,536 remembered
+  image cookies. With the 180 s grace a sustained, very high exec rate
+  can fill the 65,536-cookie bound (~20 MiB worst case per domain) for
+  as long as the domain lives; the cap and grace are unchanged.
+- Caller and pair state: a proven-exited caller row is retired only
+  after a published presentation rendered it, into the exact
+  `budgets.callers.retired` aggregate; a row still backing an edge, a
+  gap, an instance or pending work keeps its facts. Dropped witness-pair
+  targets older than the grace move their exact base into a bounded
+  revival tombstone and the per-class aggregate, so `pair_targets` stays
+  bounded without double-counting a late revival; past 65,536
+  tombstones the row stays in the map and the overflow is counted.
+
 ### Leader-exit and exec-chain callers under `--system` stay unattributed (DR-05)
 
 - 2026-10-26 cold admission (qualified at the discovery seams, with a

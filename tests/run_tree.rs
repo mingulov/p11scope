@@ -405,14 +405,21 @@ fn function_rows_by_target(profile: &serde_json::Value, sha256: &str) -> Vec<(St
 /// harness declares (PLAN-REPLACE-GAP) only with the report's replace
 /// evidence for that endpoint (a second counter-slot row or a failed
 /// replacement) and only within the calls that entered before the last
-/// re-attach; any other partial loss is an unexplained miss. A function
+/// re-attach; any other partial loss is an unexplained miss. That witness
+/// is necessary, not sufficient: the report does not yet time a replace
+/// interval, so a different loss inside the same span (ring or counter
+/// loss, a later worker's late first attach) is not told apart; the text
+/// also says whether the physical static probe gap row is present. A function
 /// that lost every counted call is named as probe loss, and overcounts or
 /// invented functions fail on their own, never under the declared text.
+/// Returns the calls that entered before or during their function's first
+/// attach (`total - must` summed), the ones only a disclosed first-use gap
+/// may account for.
 fn assert_exact_first_use_accounting(
     profile: &serde_json::Value,
     module: &Path,
     ledgers: &[PathBuf],
-) {
+) -> u64 {
     let sha = record_sha256(profile, module);
     let records = module_records(profile, module);
     let window_end = first_use_window_end(&records);
@@ -437,6 +444,7 @@ fn assert_exact_first_use_accounting(
     let mut misses = Vec::new();
     let mut others = Vec::new();
     let mut summary = Vec::new();
+    let mut early = 0u64;
     for (name, total) in &oracle {
         // Rows are per counter slot: a replaced or reclaimed probe adds a
         // row at the same offset, and the endpoint's count is their sum.
@@ -464,6 +472,7 @@ fn assert_exact_first_use_accounting(
                 ambiguous += 1;
             }
         }
+        early += total.saturating_sub(must);
         summary.push(format!(
             "{name}: observed {seen}, must {must}, ambiguous {ambiguous}, total {total}"
         ));
@@ -489,6 +498,11 @@ fn assert_exact_first_use_accounting(
             } else {
                 None
             };
+            let gap_row = if has_physical_gap_row(profile) {
+                "physical gap row present"
+            } else {
+                "no physical gap row"
+            };
             let replaceable = calls
                 .iter()
                 .filter(|call| {
@@ -497,7 +511,7 @@ fn assert_exact_first_use_accounting(
                 .count() as u64;
             match witness {
                 Some(witness) if missed <= replaceable => misses.push(format!(
-                    "undisclosed miss: {missed} calls after the pre-attach window ({name}: observed {seen} of {must} that entered after its first attach at {attached}; replace witness: {witness}, {replaceable} calls entered before the last re-attach)"
+                    "undisclosed miss: {missed} calls after the pre-attach window ({name}: observed {seen} of {must} that entered after its first attach at {attached}; replace witness: {witness}, {replaceable} calls entered before the last re-attach, {gap_row})"
                 )),
                 Some(witness) => others.push(format!(
                     "unexplained miss: {name} lost {missed} calls after its first attach at {attached}, more than the {replaceable} that entered before the last re-attach at {replace_end} ({witness})"
@@ -527,6 +541,40 @@ fn assert_exact_first_use_accounting(
         "exact accounting failed: {misses:?}; window end {window_end}; {summary:?}"
     );
     eprintln!("exact accounting ok: window end {window_end}; {summary:?}");
+    early
+}
+
+/// Whether the report files the `physical static probe gap` row (static
+/// probes detached and reattached during the capture).
+fn has_physical_gap_row(profile: &serde_json::Value) -> bool {
+    profile
+        .get("evidence")
+        .and_then(|evidence| evidence.get("skipped"))
+        .and_then(|skipped| skipped.as_array())
+        .is_some_and(|skipped| {
+            skipped.iter().any(|entry| {
+                entry.get("name").and_then(|name| name.as_str())
+                    == Some("physical static probe gap")
+            })
+        })
+}
+
+/// Whether the report files the learned-provider-file first-use row (a
+/// provider learned after its first use; its earlier calls unobserved).
+fn has_learned_first_use_row(profile: &serde_json::Value) -> bool {
+    profile
+        .get("evidence")
+        .and_then(|evidence| evidence.get("skipped"))
+        .and_then(|skipped| skipped.as_array())
+        .expect("evidence.skipped")
+        .iter()
+        .any(|entry| {
+            entry.get("name").and_then(|name| name.as_str()) == Some("learned provider file")
+                && entry.get("reason").and_then(|reason| reason.as_str())
+                    == Some(
+                        "a provider file was learned after its first use; its earlier calls were not observed",
+                    )
+        })
 }
 
 /// The `evidence.discovery[]` record's `sha256` for `module`.
@@ -1561,10 +1609,13 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
 /// NO `--module`/`--prearm-module` hint. The run owns the whole tree,
 /// so the first live mapper must teach it the provider file: probes
 /// attach by file identity and every later grandchild's calls land.
-/// The first worker's calls may be missed honestly (PARTIAL with the
-/// learned-file gap row plus descendant gaps); judged by exact accounting
-/// (owner ruling 2026-11-15): every call after its function's first
-/// attach must land (`assert_exact_first_use_accounting`). The
+/// The run stops the first mapper at its first map of the provider and
+/// holds it until the probes attach; if the hold ends unattached, its
+/// earlier calls go unobserved only with the learned-provider-file
+/// first-use row. Judged by exact accounting (owner ruling 2026-11-15):
+/// every call after its function's first attach must land
+/// (`assert_exact_first_use_accounting`), and calls before a first attach
+/// require that row (PARTIAL also carries the descendant gaps). The
 /// linger is load-bearing, not padding: at ~15 ms without it the debug
 /// observer under test cannot complete a proof scan inside one lifetime,
 /// so the cell would test build-profile speed instead of the fix; the
@@ -1619,7 +1670,15 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
     // Exact accounting: every call after its function's first attach
     // lands; the first mapper's earlier calls fall in the disclosed
     // first-use window.
-    assert_exact_first_use_accounting(&profile, &module, &ledgers);
+    let early = assert_exact_first_use_accounting(&profile, &module, &ledgers);
+    // The stop works or says it did not: calls before a first attach are
+    // unobserved only with the learned-provider-file first-use row, and
+    // without that row every call landed (a held first mapper resumed
+    // attached).
+    assert!(
+        early == 0 || has_learned_first_use_row(&profile),
+        "{early} calls entered before their first attach without the learned-provider-file first-use row: {profile}"
+    );
     // Honesty half: the first mapper's miss stays disclosed, never silent.
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
     let learned = evidence

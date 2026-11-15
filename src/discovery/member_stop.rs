@@ -207,7 +207,7 @@ struct ExecRow {
 }
 
 /// The devices (kernel encoding) of FUSE-backed mounts (`fuse`,
-/// `fuse.*`, `fuseblk`) in a `mountinfo` listing.
+/// `fuse.*`, `fuseblk`, `fuseblk.*`) in a `mountinfo` listing.
 fn fuse_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
     let mut devices = BTreeSet::new();
     for line in mountinfo.split(|byte| *byte == b'\n') {
@@ -218,7 +218,11 @@ fn fuse_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
             continue;
         };
         let fstype = source.split(' ').next().unwrap_or_default();
-        if !(fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse.")) {
+        if !(fstype == "fuse"
+            || fstype == "fuseblk"
+            || fstype.starts_with("fuse.")
+            || fstype.starts_with("fuseblk."))
+        {
             continue;
         }
         let Some((major, minor)) = mount.split(' ').nth(2).and_then(|dev| dev.split_once(':'))
@@ -1382,6 +1386,19 @@ mod tests {
             devices,
             BTreeSet::from([kernel_dev(0, 45), kernel_dev(0, 46), kernel_dev(7, 3)]),
             "fuse, fuse.* and fuseblk only"
+        );
+    }
+
+    /// The kernel prints a FUSE block mount with its subtype too
+    /// (`fuseblk.<subtype>`).
+    #[test]
+    fn fuseblk_subtypes_are_fuse_backed() {
+        let mountinfo = b"44 22 7:4 / /mnt/exfat rw shared:24 - fuseblk.exfat /dev/loop4 rw\n\
+45 22 7:5 / /mnt/fuseblkish rw shared:25 - fuseblkx /dev/loop5 rw\n";
+        assert_eq!(
+            fuse_devices(mountinfo),
+            BTreeSet::from([kernel_dev(7, 4)]),
+            "fuseblk.* only"
         );
     }
 

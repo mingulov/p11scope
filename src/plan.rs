@@ -20835,15 +20835,15 @@ pub(crate) mod tests {
             &[],
             &identities,
         );
-        assert!(
-            rebuilt.reclaimed.is_empty(),
-            "a shared shape whose co-claimant can be refused never rides free: {:?}",
-            rebuilt.reclaimed
-        );
+        let tickets = rebuilt.reclaimed.clone();
         let result = plan.extend_exact(rebuilt);
         assert!(
             result.is_ok(),
             "merge charge and build must agree at capacity: {result:?}"
+        );
+        assert!(
+            tickets.is_empty(),
+            "a shared shape whose co-claimant can be refused never rides free: {tickets:?}"
         );
         assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "capacity never grows");
         assert_eq!(

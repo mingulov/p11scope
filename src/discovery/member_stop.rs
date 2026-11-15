@@ -52,6 +52,8 @@ pub(crate) const MEMBER_STOP_HOLD_NS: u64 = 1_000_000_000;
 const MEMBER_STOP_MAPS_BYTES: usize = 4 * 1024 * 1024;
 /// Bounded files inspected per stopped member and service pass.
 const MEMBER_STOP_FILES_PER_MEMBER: usize = 512;
+/// Bounded retry bookkeeping (the kernel table holds at most 1024 rows).
+const MEMBER_STOP_RETRY_CAP: usize = 1024;
 /// Bounded local clearance memory (the kernel LRU is the authority; this
 /// only saves repeated proofs of files already cleared this capture).
 const MEMBER_STOP_LOCAL_CLEARED_CAP: usize = 16_384;
@@ -76,6 +78,8 @@ pub(crate) struct MemberStopState {
     /// Pinned identities staged by a stop: their staging owes no
     /// first-use row while the stopped mapper still waits.
     pub(crate) stop_staged: BTreeSet<(u64, u64)>,
+    /// Rows left in place for a retry (counted once as stopped).
+    retrying: BTreeMap<u32, ()>,
     pub(crate) stats: MemberStopStats,
 }
 
@@ -89,6 +93,9 @@ pub(crate) struct MemberStopStats {
     pub(crate) timed_out: u64,
     pub(crate) unreadable: u64,
     pub(crate) departed: u64,
+    /// Stopped members kept for a retry: not pinnable, membership
+    /// unverified, or no signal authority for the resume.
+    pub(crate) resume_unavailable: u64,
     /// Rows whose tgid now names a process outside the run tree.
     pub(crate) not_members: u64,
 }
@@ -104,6 +111,15 @@ struct ExecRow {
     /// The inode number `maps` printed: what an opened file must match.
     maps_ino: u64,
     path: Vec<u8>,
+}
+
+/// Whether `tgid` is proven gone: its `/proc` directory does not exist.
+/// Any other doubt keeps a stopped member's row.
+fn process_gone(tgid: u32) -> bool {
+    matches!(
+        std::fs::symlink_metadata(format!("/proc/{tgid}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// Kernel `dev_t` encoding (`MKDEV`: major in the high 12 bits of 32).
@@ -270,6 +286,33 @@ impl Engine {
         self.member_stops.stats
     }
 
+    #[cfg(test)]
+    pub(crate) fn resume_member_for_test(
+        io: &mut dyn MemberStopIo,
+        pin: &crate::process::PidPin,
+    ) -> bool {
+        Self::resume_member(io, pin)
+    }
+
+    /// Holds `pin` as if a provider staging were pending since `since_ns`.
+    #[cfg(test)]
+    pub(crate) fn hold_member_for_test(
+        &mut self,
+        tgid: u32,
+        pin: crate::process::PidPin,
+        since_ns: u64,
+    ) {
+        self.member_stops.held.insert(
+            tgid,
+            HeldMember {
+                pin,
+                files: Vec::new(),
+                providers: vec![(u64::MAX, u64::MAX)],
+                since_ns,
+            },
+        );
+    }
+
     /// One service pass: takes new pending rows, proves their files,
     /// stages providers (and attaches them at once when the engine can),
     /// and resumes every member whose hold is done. Never fails the
@@ -283,13 +326,15 @@ impl Engine {
         let Some(now_ns) = now_ns.or_else(crate::attach::monotonic_ns) else {
             return;
         };
+        // A failed table read skips only the intake: held members' bounds
+        // are still enforced below.
         let pending = match io.pending() {
             Ok(pending) => pending,
             Err(error) => {
                 if crate::run::capture_diagnostics_on() {
                     eprintln!("p11scope: member stop table unreadable: {error}");
                 }
-                return;
+                Vec::new()
             }
         };
         let mut staged = false;
@@ -319,12 +364,25 @@ impl Engine {
         stop: MemberStop,
         now_ns: u64,
     ) -> bool {
-        self.member_stops.stats.stopped = self.member_stops.stats.stopped.saturating_add(1);
-        let Ok(pin) = crate::process::PidPin::open(tgid) else {
-            // Gone before its row was read: nothing is stopped.
-            let _ = io.withdraw(tgid);
-            self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
-            return false;
+        // A row kept for a retry counts once.
+        if self.member_stops.retrying.remove(&tgid).is_none() {
+            self.member_stops.stats.stopped = self.member_stops.stats.stopped.saturating_add(1);
+        }
+        let pin = match crate::process::PidPin::open(tgid) {
+            Ok(pin) => pin,
+            Err(_) if process_gone(tgid) => {
+                // Gone before its row was read: nothing is stopped.
+                let _ = io.withdraw(tgid);
+                self.member_stops.stats.departed =
+                    self.member_stops.stats.departed.saturating_add(1);
+                return false;
+            }
+            Err(error) => {
+                // Alive but not pinnable now (descriptor or /proc
+                // pressure): the row stays, so a later pass retries.
+                self.keep_for_retry(tgid, &error);
+                return false;
+            }
         };
         match io.is_run_member(&pin) {
             Ok(true) => {}
@@ -338,11 +396,7 @@ impl Engine {
                 return false;
             }
             Err(error) => {
-                self.member_stops.stats.unreadable =
-                    self.member_stops.stats.unreadable.saturating_add(1);
-                if crate::run::capture_diagnostics_on() {
-                    eprintln!("p11scope: stopped run member {tgid} unverified: {error}; kept");
-                }
+                self.keep_for_retry(tgid, &format!("membership unverified: {error}"));
                 return false;
             }
         }
@@ -362,7 +416,7 @@ impl Engine {
                 if crate::run::capture_diagnostics_on() {
                     eprintln!("p11scope: stopped run member {tgid} unreadable: {error}; resumed");
                 }
-                Self::resume_member(io, &pin);
+                self.resume_or_retry(io, &pin);
                 return false;
             }
         };
@@ -373,7 +427,7 @@ impl Engine {
             // A stopping file that was not proven (unmapped since, or
             // unreadable) stays uncleared, so a later mapper stops and
             // tries again.
-            Self::resume_member(io, &pin);
+            self.resume_or_retry(io, &pin);
             return false;
         }
         let mut files = Vec::new();
@@ -482,10 +536,53 @@ impl Engine {
         }
     }
 
-    /// Withdraws the member's row, then resumes it through its pidfd.
-    fn resume_member(io: &mut dyn MemberStopIo, pin: &crate::process::PidPin) {
+    /// Resumes the member through its pidfd, withdrawing its row first
+    /// (so its next new file stops it again) only once the resume is
+    /// certain: the pin carries signal authority for that exact process.
+    /// A pin without a pidfd is re-pinned and accepted only for the same
+    /// start time. Returns false, with the row kept, when no resume can
+    /// be sent; the row then stays for a later pass, the final release,
+    /// and the watchdog.
+    fn resume_member(io: &mut dyn MemberStopIo, pin: &crate::process::PidPin) -> bool {
+        let fresh;
+        let pin = if pin.probe_signal_authority().is_ok() {
+            pin
+        } else {
+            match crate::process::PidPin::open(pin.pid()) {
+                Ok(again)
+                    if pin.start_time().is_some()
+                        && again.start_time() == pin.start_time()
+                        && again.probe_signal_authority().is_ok() =>
+                {
+                    fresh = again;
+                    &fresh
+                }
+                _ => return false,
+            }
+        };
         let _ = io.withdraw(pin.pid());
+        // A failure here is the process's exit: nothing left stopped.
         let _ = pin.send_signal(libc::SIGCONT);
+        true
+    }
+
+    /// [`Self::resume_member`], keeping the row for a retry on failure.
+    fn resume_or_retry(&mut self, io: &mut dyn MemberStopIo, pin: &crate::process::PidPin) {
+        if !Self::resume_member(io, pin) {
+            self.keep_for_retry(pin.pid(), "no signal authority for the resume");
+        }
+    }
+
+    /// Leaves a stopped member's row in place for the next pass, counted.
+    fn keep_for_retry(&mut self, tgid: u32, why: &str) {
+        self.member_stops.stats.resume_unavailable =
+            self.member_stops.stats.resume_unavailable.saturating_add(1);
+        if self.member_stops.retrying.len() < MEMBER_STOP_RETRY_CAP {
+            self.member_stops.retrying.insert(tgid, ());
+        }
+        if crate::run::capture_diagnostics_on() {
+            eprintln!("p11scope: stopped run member {tgid} kept for a retry: {why}");
+        }
     }
 
     /// Ends every hold whose providers are attached, whose member left,
@@ -496,7 +593,9 @@ impl Engine {
             let Some(held) = self.member_stops.held.get(&tgid) else {
                 continue;
             };
-            let departed = held.pin.original_exited().unwrap_or(true);
+            // An unreadable exit state is not a departure: a departed
+            // member is withdrawn without a resume, so doubt must resume.
+            let departed = held.pin.original_exited().unwrap_or(false);
             let attached = !self.learned_unapplied
                 && held.providers.iter().all(|identity| {
                     self.learned_settled.contains(identity)
@@ -519,7 +618,7 @@ impl Engine {
                     self.member_stops.stats.departed.saturating_add(1);
                 continue;
             }
-            Self::resume_member(io, &held.pin);
+            self.resume_or_retry(io, &held.pin);
             if attached {
                 self.member_stops.stats.attached_resumes =
                     self.member_stops.stats.attached_resumes.saturating_add(1);
@@ -546,6 +645,8 @@ impl Engine {
     /// Pending rows the service never took resume too.
     pub(crate) fn release_member_stops(&mut self, io: &mut dyn MemberStopIo) {
         let _ = io.deactivate();
+        // A resume that cannot be sent keeps its row: the hooks' own
+        // release and the watchdog still resume that member.
         let held = std::mem::take(&mut self.member_stops.held);
         for (_, member) in held {
             Self::resume_member(io, &member.pin);
@@ -555,7 +656,9 @@ impl Engine {
                 continue;
             };
             match io.is_run_member(&pin) {
-                Ok(true) => Self::resume_member(io, &pin),
+                Ok(true) => {
+                    Self::resume_member(io, &pin);
+                }
                 Ok(false) => {
                     let _ = io.withdraw(tgid);
                 }
@@ -568,7 +671,7 @@ impl Engine {
             eprintln!(
                 "p11scope: run member stops: {} stopped, {} files cleared, {} provider holds, \
                  {} resumed attached, {} resumed at bound, {} unreadable, {} departed, \
-                 {} not members; \
+                 {} not members, {} kept for a retry; \
                  kernel requested {}, table full {}, signal refused {}, identity unread {}",
                 stats.stopped,
                 stats.cleared_files,
@@ -578,6 +681,7 @@ impl Engine {
                 stats.unreadable,
                 stats.departed,
                 stats.not_members,
+                stats.resume_unavailable,
                 kernel[0],
                 kernel[1],
                 kernel[2],

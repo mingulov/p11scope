@@ -494,12 +494,15 @@ with a count as a gap), so the stop is narrower. Processes already
 running when that happens keep exact
 call counts but lose per-key rows for the rest of the run, while
 processes started later are tracked. A refusal at any other step,
-or past the continuation limit, still stops the lane, and the stop
-gap names the step where the lane stopped and why it could not
-continue. Whether it stops depends on host activity. The broad
-inventory keeps running to the end of the window with exact counts
-and no lost calls. Workaround: rerun the capture, or narrow the
-scope (`--pid`).
+or past the continuation limit, still stops the lane. One exception
+is a single call whose retained journal original can no longer be
+certified at its claim step: that call is kept as a plain row
+without key identity under its own counted gap (see below) and the
+lane continues. The stop gap names the step where the lane stopped
+and why it could not continue. Whether it stops depends on host
+activity. The broad inventory keeps running to the end of the
+window with exact counts and no lost calls. Workaround: rerun the
+capture, or narrow the scope (`--pid`).
 
 ### A call caught mid-flight by a tracking interruption can lose its per-key detail
 
@@ -515,8 +518,17 @@ preserved as a plain row without key identity, a counted gap names
 the lost per-key detail, and detailed tracking continues for other
 calls. If that call's caller still had calls waiting for a seal, the
 caller's feed falls back to plain rows until its next clean point.
-This is rare — it requires a tracking interruption at the same
-moment a call is set aside.
+
+One observed call can also lose its per-key detail without a
+tracking interruption: when its retained journal original can no
+longer be certified at the claim step (a replayed or duplicate row,
+an original removed by an image taint, or a tainted original still
+present), the call is kept the same way as a plain row with a
+counted gap naming the caller. The gap names a void only when that
+exact original was recorded wiped by one; otherwise its reason is
+cause-neutral. Tracking continues for the following calls.
+This is rare — it requires a tracking interruption or a journal
+inconsistency at the same moment a call is set aside.
 
 Automatic continuation covers up to 32 interruptions per rolling
 2 minutes; once all 32 continuations are spent the next interruption

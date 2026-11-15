@@ -14,6 +14,13 @@ versioned separately and are opaque, exact dispatch keys.
   per-key tracking: its observed call and return stay counted as a
   plain row without key identity, one named gap reports the lost
   per-key detail, and tracking continues.
+- A call whose retained journal original can no longer be certified
+  at its claim step (a replayed or duplicate row, an original removed
+  by an image taint, or a tainted original still present) now degrades
+  the same way instead of stopping per-key tracking for the rest of
+  the run: the call stays a plain row with one counted gap that names
+  its caller, and the gap names a void only when that exact original
+  was recorded wiped by one.
 - System and cgroup captures no longer file a `pid_descendant_gaps`
   gap for a tracked process that exits but lingers unreaped: a
   still-listed whole-group zombie (`Z` with no live threads) is the

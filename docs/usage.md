@@ -2820,8 +2820,13 @@ against the window allowance, and memory snapshots read in bounded
 chunks — a large object degrades through a named gap when an
 allowance runs out, never through a size refusal. Decoding stops at
 512 accepted table candidates, 53,248 table entries, and 512 interface records;
-cgroup discovery considers at most 1024 members by default (`--max-scan-pids`)
-and planning has 2,112 attach slots. Every bounded omission forces `PARTIAL`;
+the deep-scan cap (`--max-scan-pids`) defaults per scope: 1024 processes per
+pass for `inventory --system` and for `profile`/`trace` captures, counting
+user processes only (kernel threads never count toward it and stay in the
+"processes in scope" total); `inventory --cgroup` pins at most 128 members
+per transaction and deep-scans 32 of them by default, a request above 128
+is held to 128, and when the cgroup has more members than one transaction
+pins the pass names that limit as a gap. Planning has 2,112 attach slots. Every bounded omission forces `PARTIAL`;
 no retry renews a budget. On hosts where the per-CPU STATS table would exceed
 `max(64 MiB, 1% of RAM)`, the ceiling sizes down at load instead (never below
 512 slots); the capture then names the sized ceiling once on stderr and in

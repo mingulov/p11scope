@@ -267,3 +267,127 @@ fn isolation_architecture_guard_detects_planted_violations() {
     assert!(setrlimit_violations(&allowed).is_empty());
     assert!(child_gate_violations(&allowed).is_empty());
 }
+
+/// The collectors whose deep-scan cap decision must go through the one
+/// census rule, with the marker that starts each file's inline test
+/// module (production text is everything before it).
+const CENSUS_COLLECTORS: &[(&str, &str)] = &[
+    ("src/inspect_system.rs", "#[cfg(test)]\nmod tests {"),
+    (
+        "src/inspect_system/inventory_cgroup.rs",
+        "#[cfg(test)]\nmod tests {",
+    ),
+];
+
+/// One owner for the census cap rule: `census_over_cap` is defined once,
+/// counts user processes through `user_process_pids`, and every collector
+/// calls it instead of comparing a raw pid count with its cap.
+fn census_cap_violations(sources: &[(String, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let owners: Vec<&(String, String)> = sources
+        .iter()
+        .filter(|(_, text)| text.contains("fn census_over_cap("))
+        .collect();
+    if owners.len() != 1 {
+        violations.push(format!(
+            "census_over_cap defined {} times (want exactly once)",
+            owners.len()
+        ));
+    }
+    for (path, text) in &owners {
+        let body = &text[text.find("fn census_over_cap(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        if !body.contains("user_process_pids(") {
+            violations.push(format!(
+                "{path}: census_over_cap does not count user processes"
+            ));
+        }
+    }
+    for (collector, test_marker) in CENSUS_COLLECTORS {
+        let Some((_, text)) = sources.iter().find(|(path, _)| path == collector) else {
+            violations.push(format!("{collector}: missing"));
+            continue;
+        };
+        let production = text.split(test_marker).next().unwrap_or(text);
+        // The owner's own body is the rule itself, not a bypass of it.
+        let production = match production.find("fn census_over_cap(") {
+            Some(start) => {
+                let end = production[start..]
+                    .find("\n}\n")
+                    .map_or(production.len(), |end| start + end);
+                format!("{}{}", &production[..start], &production[end..])
+            }
+            None => production.to_string(),
+        };
+        let compact: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars().filter(|character| !character.is_whitespace()))
+            .collect();
+        if !compact.contains("census_over_cap(") {
+            violations.push(format!(
+                "{collector}: cap decision bypasses census_over_cap"
+            ));
+        }
+        for raw in [".len()>cap", ".len()>max_scan_pids"] {
+            if compact.contains(raw) {
+                violations.push(format!("{collector}: raw census comparison `{raw}`"));
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn census_cap_rule_has_one_owner() {
+    let sources = rust_sources("src");
+    assert_eq!(
+        census_cap_violations(&sources),
+        Vec::<String>::new(),
+        "every collector's deep-scan cap must go through census_over_cap"
+    );
+}
+
+#[test]
+fn census_cap_guard_detects_planted_violations() {
+    let owner = (
+        "src/inspect_system.rs".to_string(),
+        "pub(crate) fn census_over_cap(pids: &[u32], proc_root: &Path, cap: usize) -> bool {\n    \
+         user_process_pids(pids, proc_root).len() > cap\n}\n\
+         fn collect() { let cap_hit = census_over_cap(&pids, root, cap); }\n\
+         #[cfg(test)]\nmod tests {\n    fn twin() { assert!(pids.len() > cap); }\n}\n"
+            .to_string(),
+    );
+    let cgroup = (
+        "src/inspect_system/inventory_cgroup.rs".to_string(),
+        "fn collect() { let cap_hit = census_over_cap(&pids, root, cap); }\n".to_string(),
+    );
+    assert!(census_cap_violations(&[owner.clone(), cgroup.clone()]).is_empty());
+    // A collector comparing its raw pid count with the cap.
+    let raw = (
+        "src/inspect_system/inventory_cgroup.rs".to_string(),
+        "fn collect() {\n    let cap_hit = pids.len()\n        > cap;\n}\n".to_string(),
+    );
+    assert_eq!(
+        census_cap_violations(&[owner.clone(), raw]),
+        vec![
+            "src/inspect_system/inventory_cgroup.rs: cap decision bypasses census_over_cap"
+                .to_string(),
+            "src/inspect_system/inventory_cgroup.rs: raw census comparison `.len()>cap`"
+                .to_string(),
+        ]
+    );
+    // A second owner, and an owner that counts every pid.
+    let second = (
+        "src/discovery/census.rs".to_string(),
+        "fn census_over_cap(pids: &[u32], cap: usize) -> bool {\n    pids.len() > cap\n}\n"
+            .to_string(),
+    );
+    assert_eq!(
+        census_cap_violations(&[owner, cgroup, second]),
+        vec![
+            "census_over_cap defined 2 times (want exactly once)".to_string(),
+            "src/discovery/census.rs: census_over_cap does not count user processes".to_string(),
+        ]
+    );
+}

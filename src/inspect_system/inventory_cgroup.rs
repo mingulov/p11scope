@@ -31,6 +31,9 @@ pub(crate) enum ScopedCollectionGap {
     ProcessUnavailable,
     GenerationChanged,
     ScanIncomplete,
+    /// A `--max-scan-pids` request above the per-transaction pin limit met
+    /// a cgroup with more members than one transaction pins.
+    DeepScanLimit,
 }
 impl ScopedCollectionOutcome {
     pub(crate) fn reason(self) -> &'static str {
@@ -56,6 +59,10 @@ impl ScopedCollectionOutcome {
             }
             Self::Incomplete(ScopedCollectionGap::ScanIncomplete) => {
                 "cgroup member scan was incomplete"
+            }
+            Self::Incomplete(ScopedCollectionGap::DeepScanLimit) => {
+                "cgroup deep-scan request is above the 128-member transaction limit; \
+                 members past it wait for the next transaction"
             }
         }
     }
@@ -905,6 +912,18 @@ pub(crate) enum CollectionStage {
     Prepared,
 }
 
+/// The cgroup deep-scan cap: the request (default 32) held to the
+/// per-transaction pin limit (128; neither value is ever lowered), plus
+/// whether that clamp cost this pass coverage. It bites only when the
+/// request is above the limit and the transaction filled it with members
+/// left unwalked (`slice_full`); a request above the limit on a smaller
+/// cgroup loses nothing and names nothing.
+pub(super) fn cgroup_deep_scan_cap(requested: Option<usize>, slice_full: bool) -> (usize, bool) {
+    let requested = requested.unwrap_or(DEFAULT_DEEP_SCAN_LIMIT);
+    let cap = requested.clamp(1, PROCESS_PIN_LIMIT);
+    (cap, slice_full && requested > PROCESS_PIN_LIMIT)
+}
+
 pub(crate) fn collect(
     request: CgroupCollectRequest,
     hints: &[PathBuf],
@@ -943,6 +962,8 @@ pub(crate) fn collect_with(
             work: Default::default(),
         }
     };
+    let slice_full = candidates.candidates.len() >= PROCESS_PIN_LIMIT
+        && candidates.outcome == CollectionOutcome::Incomplete(CgroupIncomplete::DiscoverySlice);
     let mut outcome = ScopedCollectionOutcome::from(candidates.outcome);
     checkpoint(CollectionStage::Traversed);
     if traversal_started && let Some(observer) = &observer {
@@ -1022,15 +1043,23 @@ pub(crate) fn collect_with(
         requests.clear();
     }
     let pids: Vec<_> = pinned.keys().copied().collect();
-    let cap = request
-        .max_scan_pids
-        .unwrap_or(DEFAULT_DEEP_SCAN_LIMIT)
-        .clamp(1, PROCESS_PIN_LIMIT);
+    let (cap, clamped) = cgroup_deep_scan_cap(request.max_scan_pids, slice_full);
+    // The clamp is the slice's cause: name it instead of the generic
+    // membership slice (the transaction stays incomplete either way).
+    if clamped
+        && outcome
+            == ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+                CgroupIncomplete::DiscoverySlice,
+            ))
+    {
+        outcome = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::DeepScanLimit);
+    }
+    let cap_hit = census_over_cap(&pids, Path::new("/proc"), cap);
     let mut timings = StageTimings::new();
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();
     let mut selected = pids.clone();
-    if pids.len() > cap {
+    if cap_hit {
         checkpoint(CollectionStage::Sweep);
         for &pid in &pids {
             if !work.charge(2) {
@@ -1108,7 +1137,7 @@ pub(crate) fn collect_with(
         enumerated: pids.clone(),
         selected,
         cap,
-        cap_hit: pids.len() > cap,
+        cap_hit,
         members,
         scope_gaps: Vec::new(),
         proc_list_failed: false,

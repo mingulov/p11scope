@@ -31,7 +31,7 @@ use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
 use crate::discovery::engine::{
     MAX_SCAN_PIDS, capture_manifest_object_key, parse_manifest_text, retarget_to_pins, scope_pids,
-    select_excluding_kernel_threads, sweep_process_maps, unreadable_member_skip,
+    select_excluding_kernel_threads, sweep_process_maps, unreadable_member_skip, user_process_pids,
 };
 use crate::discovery::handle_table::{DeferredReason, HandleTable};
 use crate::discovery::hooks::HookRegistry;
@@ -678,6 +678,20 @@ pub(crate) fn build_identity_custody(
     }
 }
 
+/// The one census cap rule every collector applies (capture discovery
+/// filters the same way through `user_process_pids` /
+/// `cached_user_process_pids` before its own comparison): a scope is over
+/// the deep-scan cap when its user processes outnumber the cap. Kernel
+/// threads never count, they have no user address space and cannot call a
+/// provider; they stay in the enumerated scope (the "N processes in scope"
+/// total) and in the under-cap selection, so only the verdict changes.
+/// Fail-closed like `user_process_pids`: an unreadable stat counts.
+/// `proc_root` is `/proc` live, a fixture tree in tests.
+pub(crate) fn census_over_cap(pids: &[u32], proc_root: &Path, cap: usize) -> bool {
+    // Under the cap on the raw count, no stat read can change the verdict.
+    pids.len() > cap && user_process_pids(pids, proc_root).len() > cap
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_members_identity(
     hints: &[PathBuf],
@@ -720,7 +734,8 @@ fn collect_members_identity(
     // then, from its counts.
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();
-    let mut selected: Vec<u32> = if pids.len() > cap {
+    let cap_hit = census_over_cap(&pids, Path::new("/proc"), cap);
+    let mut selected: Vec<u32> = if cap_hit {
         progress!(
             "p11scope: sweeping {} process maps (cap {cap})...",
             pids.len()
@@ -756,7 +771,6 @@ fn collect_members_identity(
         pids.sort_unstable();
         pids
     };
-    let cap_hit = pids.len() > cap;
 
     // Cross-pass deep-scan skip: selected members whose maps digest and
     // live generation both match the prior pass leave the deep-scan
@@ -12213,6 +12227,129 @@ mod take_anchors_wiring_tests {
         assert!(
             matches!(result.status, super::MemberStatus::Exited),
             "a zombie member reports Exited, not an unreadable gap"
+        );
+    }
+}
+
+/// One census cap rule (P5): capture discovery, `inspect --system` and the
+/// cgroup collector agree on what counts toward the deep-scan cap, over
+/// one fixture `/proc` tree.
+#[cfg(test)]
+mod census_tests {
+    use super::inventory_cgroup::cgroup_deep_scan_cap;
+    use super::*;
+
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+
+    /// A fixture tree: `kernel` kernel threads (pids 2..), `user` user
+    /// processes (pids 10000..) and one pid with no stat file (424242,
+    /// fail-closed: it stays eligible). Returns the root and every pid.
+    fn fixture(tag: &str, kernel: u32, user: u32) -> (PathBuf, Vec<u32>) {
+        let base = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let root = base.join(format!("census-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut pids = Vec::new();
+        for pid in (2..).take(kernel as usize) {
+            let dir = root.join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("stat"),
+                stat_line(pid, "kworker", crate::process::PF_KTHREAD),
+            )
+            .unwrap();
+            pids.push(pid);
+        }
+        for pid in (10000..).take(user as usize) {
+            let dir = root.join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stat"), stat_line(pid, "worker", 0)).unwrap();
+            pids.push(pid);
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        pids.push(424242);
+        (root, pids)
+    }
+
+    /// Capture discovery's rule (`discovery::engine`, initial discovery and
+    /// the live tick alike): the cap compares the user processes only.
+    fn engine_over_cap(pids: &[u32], root: &Path, cap: usize) -> bool {
+        user_process_pids(pids, root).len() > cap
+    }
+
+    /// The twin: every collector reaches the same over-cap verdict on one
+    /// tree, for a tree that is over the cap only when kernel threads
+    /// count, one over it either way, and one under it either way.
+    #[test]
+    fn census_collectors_agree_on_the_cap_over_one_proc_tree() {
+        // 40 kernel threads + 20 user processes + 1 unreadable = 61 pids,
+        // 21 user processes.
+        let (root, pids) = fixture("agree", 40, 20);
+        assert_eq!(pids.len(), 61);
+        let mut verdicts = Vec::new();
+        for cap in [21usize, 30, 60, 61, 20, 5] {
+            let engine = engine_over_cap(&pids, &root, cap);
+            let system = census_over_cap(&pids, &root, cap);
+            // The cgroup collector pins only processes with an executable,
+            // so its member list is the user processes; it applies the same
+            // rule to them under its own (clamped) cap.
+            let members = user_process_pids(&pids, &root);
+            let (cgroup_cap, _) = cgroup_deep_scan_cap(Some(cap), false);
+            let cgroup = census_over_cap(&members, &root, cgroup_cap);
+            verdicts.push((cap, engine, system, cgroup));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            verdicts,
+            vec![
+                (21, false, false, false),
+                (30, false, false, false),
+                (60, false, false, false),
+                (61, false, false, false),
+                (20, true, true, true),
+                (5, true, true, true),
+            ],
+            "(cap, engine, inspect --system, cgroup) over-cap verdicts"
+        );
+    }
+
+    /// Kernel threads stay in the "N processes in scope" count: the census
+    /// decides the cap only, the enumerated scope keeps every listed pid
+    /// (the under-cap output stays byte-identical).
+    #[test]
+    fn census_keeps_kernel_threads_in_the_scope_count() {
+        let (root, pids) = fixture("scope", 3, 2);
+        let over = census_over_cap(&pids, &root, 3);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!over, "3 user processes fit a cap of 3");
+        assert_eq!(
+            coverage_prefix(pids.len(), 3, 3, 0),
+            "6 processes in scope; 3 deep-scanned by provider rarity (limit 3); \
+             0 attributed to pinned provider objects by exact maps identity"
+        );
+    }
+
+    /// The cgroup clamp: the default and the 128 limit are unchanged, and
+    /// a request above the limit that meets a full transaction (more
+    /// members than one transaction pins) is a named loss, never silent.
+    #[test]
+    fn cgroup_clamp_is_a_named_gap_when_it_bites() {
+        assert_eq!(cgroup_deep_scan_cap(None, false), (32, false));
+        assert_eq!(cgroup_deep_scan_cap(None, true), (32, false));
+        assert_eq!(cgroup_deep_scan_cap(Some(1), true), (1, false));
+        assert_eq!(cgroup_deep_scan_cap(Some(128), true), (128, false));
+        // Above the limit with room to spare: every member fits, no loss.
+        assert_eq!(cgroup_deep_scan_cap(Some(500), false), (128, false));
+        // Above the limit with a full transaction: the clamp bites.
+        assert_eq!(cgroup_deep_scan_cap(Some(129), true), (128, true));
+        assert_eq!(cgroup_deep_scan_cap(Some(500), true), (128, true));
+        // The named gap the collector reports when the clamp bites.
+        use super::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+        assert_eq!(
+            ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::DeepScanLimit).reason(),
+            "cgroup deep-scan request is above the 128-member transaction limit; \
+             members past it wait for the next transaction"
         );
     }
 }

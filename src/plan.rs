@@ -3955,6 +3955,10 @@ impl AttachPlan {
         let prior_objects: BTreeSet<PinnedObjectId> =
             prior.modules.iter().map(|module| module.object).collect();
         let prior_keys: BTreeSet<AttachKey> = prior.slot_by_key.keys().copied().collect();
+        // Exact reuse assignments the extension will apply: migrated and
+        // reclaimed keys cost no fresh cell, so they are never "overflowing"
+        // and dropping their owner would lose an in-place reuse.
+        let (migrated, reclaimed, _) = prior.reuse_assignments(self);
         let object_of: BTreeMap<ModuleId, PinnedObjectId> = self
             .modules
             .iter()
@@ -3970,8 +3974,8 @@ impl AttachPlan {
             return 0;
         }
         // Fresh cells owned only by new objects: their keys were not active
-        // in the prior plan and hold no reclaim ticket, so giving them back
-        // returns room the extension would otherwise need.
+        // in the prior plan and take no reuse assignment, so giving them
+        // back returns room the extension would otherwise need.
         let freed: BTreeSet<usize> = self
             .slot_by_key
             .values()
@@ -3982,7 +3986,8 @@ impl AttachPlan {
                 };
                 let key = AttachKey::of(slot);
                 !prior_keys.contains(&key)
-                    && !self.reclaimed.contains_key(&key)
+                    && !migrated.contains_key(&key)
+                    && !reclaimed.contains_key(&key)
                     && !slot.module_ids.is_empty()
                     && slot.module_ids.iter().all(|id| new_ids.contains(id))
             })
@@ -4021,7 +4026,8 @@ impl AttachPlan {
                 .filter(|(key, _)| {
                     key.object == module.object
                         && !prior_keys.contains(key)
-                        && !self.reclaimed.contains_key(key)
+                        && !migrated.contains_key(key)
+                        && !reclaimed.contains_key(key)
                 })
                 .count();
             let reason = format!(

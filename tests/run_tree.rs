@@ -1436,12 +1436,18 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     let (_outdir, out) = out_dir();
     let mut script = String::new();
     // Phase 1: 280 sleepers to spend every member loader context. Each
-    // wave's 20 sleepers run concurrently for ~5 s (light load, fast
-    // frames, all admit), then join: 14 waves admit ~280 members and
-    // exhaust past the reserve line mid-run.
+    // wave's 20 sleepers run concurrently for ~5 s, then join: 14 waves
+    // admit ~280 members and exhaust past the reserve line mid-run. A
+    // member spends its context only once the observer has scanned and
+    // armed it before it exits, so the per-member scan must stay cheap:
+    // the cell's own sleeper maps only libc and ld.so. The system
+    // `sleep` may be a multicall binary mapping a dozen libraries (uutils
+    // on Ubuntu); on a busy host's 4-CPU vng guest with a debug observer
+    // it admitted 73-85 members, the C sleeper 200-224.
+    let sleeper = build_c(dir.path(), "rt-sleeper", SLEEPER_C);
     for _ in 0..SLEEPER_WAVES {
         for _ in 0..SLEEPERS_PER_WAVE {
-            script.push_str("sleep 5 & ");
+            script.push_str(&format!("{} 5 & ", sleeper.display()));
         }
         script.push_str("wait; ");
     }
@@ -1736,3 +1742,15 @@ fn privileged_run_tree_many_children_land_exact() {
     let sha = record_sha256(&profile, &module);
     assert_exact_counts(&function_calls(&profile, &sha), &want);
 }
+
+/// A minimal dynamically linked sleeper (libc and ld.so only): `rt-sleeper N`
+/// sleeps N seconds.
+const SLEEPER_C: &str = r#"
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    unsigned seconds = argc > 1 ? (unsigned)atoi(argv[1]) : 5;
+    while (seconds) seconds = sleep(seconds);
+    return 0;
+}
+"#;

@@ -88194,14 +88194,16 @@ fn owned_run_incomplete_rescans_spend_one_retry_per_tick() {
         assert_eq!(scans.len(), 1, "the rescan ran");
         deferred.contains(&me)
     };
-    // Tick 1: the refreshed rescan and the post-retirement rescan.
+    // The admission scan (serial 0) spent retry 1. Tick 1 spends retry 2
+    // once, over both the refreshed and the post-retirement rescan.
     engine.inventory_tick_serial += 1;
     assert!(rescan(&mut engine), "tick 1 owes a retry");
     assert!(
         rescan(&mut engine),
         "the same tick's second rescan still owes it"
     );
-    // Ticks 2 and 3 still owe their retries; tick 4 is past the bound.
+    // Tick 2 spends retry 3, the last within the bound, and still owes the
+    // rescan; tick 3 would spend a fourth and owes none.
     for (tick, owed) in [(2, true), (3, false)] {
         engine.inventory_tick_serial += 1;
         assert_eq!(rescan(&mut engine), owed, "tick {tick}");

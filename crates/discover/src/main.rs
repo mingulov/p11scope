@@ -700,7 +700,7 @@ mod tests {
         close_inherited_descriptors_with, collect_proc_fd_snapshot, write_private_atomically_with,
     };
     use std::io::{Error, ErrorKind};
-    use std::os::fd::IntoRawFd as _;
+    use std::os::fd::{AsRawFd as _, IntoRawFd as _, RawFd};
 
     /// Review M2: the manifest is never published into a world-writable
     /// directory without the sticky bit, where any user could rename or
@@ -792,9 +792,46 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    fn fd_identity(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0 {
+            let stat = unsafe { stat.assume_init() };
+            Some((stat.st_dev, stat.st_ino))
+        } else {
+            assert_eq!(Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            None
+        }
+    }
+
+    struct PlantedPipeGuard {
+        planted: RawFd,
+        identity: (libc::dev_t, libc::ino_t),
+        _anchor: std::io::PipeReader,
+        _peer: std::io::PipeWriter,
+    }
+
+    impl Drop for PlantedPipeGuard {
+        fn drop(&mut self) {
+            if fd_identity(self.planted) == Some(self.identity) {
+                let _ = unsafe { libc::close(self.planted) };
+            }
+        }
+    }
+
     #[test]
     fn close_range_failure_uses_verified_proc_fallback() {
-        let planted = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let (anchor, peer) = std::io::pipe().unwrap();
+        let identity = fd_identity(anchor.as_raw_fd()).expect("pipe anchor fstat");
+        let planted = anchor.try_clone().unwrap().into_raw_fd();
+        let guard = PlantedPipeGuard {
+            planted,
+            identity,
+            _anchor: anchor,
+            _peer: peer,
+        };
+        assert_eq!(fd_identity(planted), Some(guard.identity));
+
+        let closed = std::cell::RefCell::new(Vec::new());
         let enumeration_fd = 1_000_000;
         let result = close_inherited_descriptors_with(
             || Err(Error::from_raw_os_error(libc::EPERM)),
@@ -804,6 +841,7 @@ mod tests {
                     return Err(Error::from_raw_os_error(libc::EBADF));
                 }
                 if unsafe { libc::close(fd) } == 0 {
+                    closed.borrow_mut().push(fd);
                     Ok(())
                 } else {
                     Err(Error::last_os_error())
@@ -811,8 +849,12 @@ mod tests {
             },
         );
         assert!(result.is_ok(), "verified fallback failed: {result:?}");
-        assert_eq!(unsafe { libc::fcntl(planted, libc::F_GETFD) }, -1);
-        assert_eq!(Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(closed.borrow().as_slice(), &[planted]);
+        assert_ne!(
+            fd_identity(planted),
+            Some(guard.identity),
+            "planted descriptor {planted} still refers to the original pipe"
+        );
     }
 
     #[test]

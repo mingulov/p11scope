@@ -10,6 +10,10 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Fixed
 
+- A call set aside just before a tracking interruption no longer stops
+  per-key tracking: its observed call and return stay counted as a
+  plain row without key identity, one named gap reports the lost
+  per-key detail, and tracking continues.
 - System and cgroup captures no longer file a `pid_descendant_gaps`
   gap for a tracked process that exits but lingers unreaped: a
   still-listed whole-group zombie (`Z` with no live threads) is the

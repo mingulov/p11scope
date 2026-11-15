@@ -512,19 +512,21 @@ tracking continues for new work. A call whose caller took an extra
 pass to resolve and was set aside just before the interruption is
 also kept: its observed call is still counted and its return is
 preserved as a plain row without key identity, a counted gap names
-the lost per-key detail, and detailed tracking continues for every
-other key and call. This is rare — it requires a tracking
-interruption at the same moment a call is set aside.
+the lost per-key detail, and detailed tracking continues for other
+calls. If that call's caller still had calls waiting for a seal, the
+caller's feed falls back to plain rows until its next clean point.
+This is rare — it requires a tracking interruption at the same
+moment a call is set aside.
 
-Where automatic continuation does apply (up to 32 interruptions per
-rolling 2 minutes), once all 32 continuations are spent the next
-interruption stops detailed tracking (mechanisms and key operations)
-for the rest of the run: coverage is marked `PARTIAL`, stderr prints the
-stop counts, and the `semantic lane stopped` gap reports that tracking
-stopped because it already continued past 32 interruptions in the last
-2 minutes. In both stop cases, the broad inventory keeps running to the
-end of the window with exact call counts and detailed-tracking probes
-stay attached until exit.
+Automatic continuation covers up to 32 interruptions per rolling
+2 minutes; once all 32 continuations are spent the next interruption
+stops detailed tracking (mechanisms and key operations) for the rest
+of the run: coverage is marked `PARTIAL`, stderr prints the stop
+counts, and the `semantic lane stopped` gap reports that tracking
+stopped because it already continued past 32 interruptions in the
+last 2 minutes. The broad inventory keeps running to the end of the
+window with exact call counts, and detailed-tracking probes stay
+attached until exit.
 
 ### Calls through the p11-kit proxy can publish no mechanism names
 

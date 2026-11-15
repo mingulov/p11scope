@@ -125,6 +125,9 @@ pub(crate) struct MemberStopState {
     /// Tgids whose maps read fails, for the tests.
     #[cfg(test)]
     pub(crate) maps_fail: BTreeSet<u32>,
+    /// Devices (kernel encoding) the tests declare FUSE-backed.
+    #[cfg(test)]
+    pub(crate) fuse_devs: Option<BTreeSet<u64>>,
     pub(crate) stats: MemberStopStats,
 }
 
@@ -182,6 +185,8 @@ pub(crate) struct MemberStopStats {
     /// Stop-staged identities not retained past the cap (their staging
     /// then files the first-use row itself).
     pub(crate) stop_staged_overflow: u64,
+    /// Members resumed unproven because a mapped file is FUSE-backed.
+    pub(crate) fuse_resumes: u64,
 }
 
 /// One executable file row of a member's maps.
@@ -194,7 +199,37 @@ struct ExecRow {
     key: MemberFileKey,
     /// The inode number `maps` printed: what an opened file must match.
     maps_ino: u64,
+    /// The device `maps` printed, in the kernel encoding.
+    maps_dev: u64,
+    /// The row the kernel stop names (its exact mapping).
+    stopping: bool,
     path: Vec<u8>,
+}
+
+/// The devices (kernel encoding) of FUSE-backed mounts (`fuse`,
+/// `fuse.*`, `fuseblk`) in a `mountinfo` listing.
+fn fuse_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
+    let mut devices = BTreeSet::new();
+    for line in mountinfo.split(|byte| *byte == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let Some((mount, source)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fstype = source.split(' ').next().unwrap_or_default();
+        if !(fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse.")) {
+            continue;
+        }
+        let Some((major, minor)) = mount.split(' ').nth(2).and_then(|dev| dev.split_once(':'))
+        else {
+            continue;
+        };
+        if let (Ok(major), Ok(minor)) = (major.parse::<u64>(), minor.parse::<u64>()) {
+            devices.insert(kernel_dev(major, minor));
+        }
+    }
+    devices
 }
 
 /// Whether `tgid` is proven gone: its `/proc` directory does not exist.
@@ -326,6 +361,8 @@ fn exec_rows(maps: &[u8]) -> Vec<ExecRow> {
                 ino,
             },
             maps_ino: ino,
+            maps_dev: kernel_dev(major, minor),
+            stopping: false,
             path: path.to_vec(),
         });
     }
@@ -352,11 +389,13 @@ fn with_stopping_row(mut rows: Vec<ExecRow>, stop: &MemberStop) -> Vec<ExecRow> 
         return rows;
     };
     if rows[at].key == stop.file {
-        let row = rows.remove(at);
+        let mut row = rows.remove(at);
+        row.stopping = true;
         rows.insert(0, row);
     } else {
         let row = ExecRow {
             key: stop.file,
+            stopping: true,
             ..rows[at].clone()
         };
         rows.insert(0, row);
@@ -442,6 +481,21 @@ impl Engine {
     }
 
     /// Pins a stopped member (tests can script the failure).
+    /// The FUSE-backed devices of a stopped member's mount namespace.
+    fn member_fuse_devices(
+        &self,
+        proc: &crate::process::ProcPin<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<BTreeSet<u64>, String> {
+        #[cfg(test)]
+        if let Some(devices) = &self.member_stops.fuse_devs {
+            return Ok(devices.clone());
+        }
+        Ok(fuse_devices(
+            &proc.read_mountinfo(deadline, MEMBER_STOP_MAPS_BYTES)?,
+        ))
+    }
+
     fn open_member_pin(&self, tgid: u32) -> Result<crate::process::PidPin, String> {
         #[cfg(test)]
         if self.member_stops.pin_fail.contains(&tgid) {
@@ -629,10 +683,22 @@ impl Engine {
                     return Err("scripted maps failure".to_string());
                 }
                 let maps = proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES)?;
-                Ok((proc, with_stopping_row(exec_rows(&maps), &stop)))
+                let fuse = self.member_fuse_devices(&proc, deadline)?;
+                Ok((proc, with_stopping_row(exec_rows(&maps), &stop), fuse))
             })
-            .map(|(proc, rows)| self.prove_member_rows(&pin, &proc, rows, deadline));
-        let (cleared, providers) = match rows {
+            .map(|(proc, rows, fuse)| {
+                // A FUSE-backed file is never opened: its server may be
+                // another stopped member, and the open would block this
+                // thread (and every bound) until it ran again.
+                let (fuse_rows, rows): (Vec<_>, Vec<_>) = rows
+                    .into_iter()
+                    .partition(|row| fuse.contains(&row.maps_dev) || fuse.contains(&row.key.dev));
+                (
+                    self.prove_member_rows(&pin, &proc, rows, deadline),
+                    fuse_rows,
+                )
+            });
+        let ((cleared, providers), fuse_rows) = match rows {
             Ok(proven) => proven,
             Err(error) => {
                 self.member_stops.stats.unreadable =
@@ -649,6 +715,17 @@ impl Engine {
         };
         for key in &cleared {
             self.clear_member_file(io, *key);
+        }
+        if !fuse_rows.is_empty() {
+            // Unproven, so the named gap; cleared, so later mappers are
+            // not stopped on them again (the owned-tree watch still
+            // learns a FUSE-backed provider).
+            for row in fuse_rows.iter().take(MEMBER_STOP_FILES_PER_MEMBER) {
+                self.clear_member_file(io, row.key);
+            }
+            self.member_stops.stats.fuse_resumes =
+                self.member_stops.stats.fuse_resumes.saturating_add(1);
+            self.note_first_use_gap(tgid, "a mapped file is FUSE-backed");
         }
         if providers.is_empty() {
             // A stopping file that was not proven (unmapped since, or
@@ -1239,7 +1316,8 @@ impl Engine {
                  {} unreadable, {} departed, \
                  {} not members, {} kept for a retry, {} resumed unverified at bound, \
                  {} moved out and resumed, {} resumed unproven, \
-                 {} resumed at watchdog loss, {} staged identities over the cap; \
+                 {} resumed at watchdog loss, {} staged identities over the cap, \
+                 {} resumed with a FUSE-backed file; \
                  kernel requested {}, table full {}, signal refused {}, identity unread {}",
                 stats.stopped,
                 stats.cleared_files,
@@ -1256,6 +1334,7 @@ impl Engine {
                 stats.unproven_resumes,
                 stats.lost_guard_resumes,
                 stats.stop_staged_overflow,
+                stats.fuse_resumes,
                 kernel[0],
                 kernel[1],
                 kernel[2],
@@ -1268,6 +1347,21 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuse_devices_come_from_mountinfo() {
+        let mountinfo = b"22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n\
+40 22 0:45 / /mnt/sq ro,nosuid shared:20 - fuse.squashfuse squashfuse ro,user_id=1000\n\
+41 22 0:46 / /mnt/plain rw shared:21 - fuse /dev/fuse rw\n\
+42 22 7:3 / /mnt/blk rw shared:22 - fuseblk /dev/loop3 rw\n\
+43 22 0:47 / /mnt/fusectl rw shared:23 - fusectl fusectl rw\n";
+        let devices = fuse_devices(mountinfo);
+        assert_eq!(
+            devices,
+            BTreeSet::from([kernel_dev(0, 45), kernel_dev(0, 46), kernel_dev(7, 3)]),
+            "fuse, fuse.* and fuseblk only"
+        );
+    }
 
     #[test]
     fn stop_staged_identities_are_bounded_and_the_overflow_counts() {
@@ -1289,6 +1383,8 @@ mod tests {
             end: start + 0x1000,
             key: MemberFileKey { dev, ino },
             maps_ino: ino,
+            maps_dev: dev,
+            stopping: false,
             path: b"/usr/lib/libx.so".to_vec(),
         };
         let stop = |dev, ino, vm_start| MemberStop {
@@ -1344,6 +1440,8 @@ mod tests {
                 ino: key_ino,
             },
             maps_ino,
+            maps_dev: 1,
+            stopping: false,
             path: b"/x".to_vec(),
         };
         assert!(opened_row_file(open(), &row(ino, ino), true).is_ok());

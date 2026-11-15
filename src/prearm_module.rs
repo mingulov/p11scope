@@ -636,17 +636,38 @@ impl PrearmState {
             record.attached_at_ns = Some(attached_at);
             let endpoints = module_endpoints(plan, record.id, watch);
             record.first_attached_at_ns = first_attached_at(&endpoints, first_attached);
-            let points: Vec<crate::render::FirstAttachPoint> = endpoints
+            // Each endpoint's first attach is the earliest over every slot
+            // of the module at that file offset: a watch declares one
+            // object's keys, but the module's undeclared slots on another
+            // pinned identity of the same file (the same inode under a
+            // second device) may have attached, and counted, first.
+            let mut earliest: BTreeMap<u64, (Option<u64>, u64)> = BTreeMap::new();
+            let module_keys = plan
+                .slots
                 .iter()
-                .filter_map(|key| {
-                    first_attached.get(key).map(|(began_ns, attached_ns)| {
-                        crate::render::FirstAttachPoint {
-                            file_offset: key.file_offset,
-                            began_ns: *began_ns,
-                            attached_ns: *attached_ns,
-                        }
-                    })
-                })
+                .filter(|slot| slot.module_ids.contains(&record.id))
+                .map(AttachKey::of);
+            for key in endpoints.iter().copied().chain(module_keys) {
+                if let Some(&(began_ns, attached_ns)) = first_attached.get(&key) {
+                    earliest
+                        .entry(key.file_offset)
+                        .and_modify(|known| {
+                            if attached_ns < known.1 {
+                                *known = (began_ns, attached_ns);
+                            }
+                        })
+                        .or_insert((began_ns, attached_ns));
+                }
+            }
+            let points: Vec<crate::render::FirstAttachPoint> = earliest
+                .into_iter()
+                .map(
+                    |(file_offset, (began_ns, attached_ns))| crate::render::FirstAttachPoint {
+                        file_offset,
+                        began_ns,
+                        attached_ns,
+                    },
+                )
                 .collect();
             record.first_attach_points = (!points.is_empty()).then_some(points);
             let Some(attached_at) = attached_at else {
@@ -1244,6 +1265,48 @@ mod tests {
                     reason: UnobservedReason::MappedUnattached,
                 },
             ]),
+        );
+    }
+
+    /// One provider file seen under two pinned identities (vng 6.6: the
+    /// same inode under device 0:42 and 0:22): the watch declares the
+    /// later object's keys while the module's undeclared slots on the
+    /// first object attached earlier at the same file offsets and counted
+    /// the calls in between. Each endpoint's first attach is the earliest
+    /// over every slot of the module at that offset, never the declared
+    /// object's later stamp alone; the module's declared-set instant is
+    /// unchanged.
+    #[test]
+    fn assembly_takes_each_endpoints_first_attach_over_every_module_slot() {
+        let declared = key(8, 0x1000);
+        let mut plan =
+            crate::plan::AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 8, 0x1000, 3)]);
+        plan.modules = vec![module(3, 8)];
+        let mut state = PrearmState::empty();
+        state.set_scope_start_ns(Some(50));
+        state
+            .watches
+            .insert(PinnedObjectId(8), watched(BTreeSet::from([declared])));
+        let first = BTreeMap::from([
+            (key(7, 0x1000), (Some(90), 100)),
+            (declared, (Some(800), 900)),
+        ]);
+        let mut records = vec![record(3, vec!["scan", "prearm"])];
+        state.assemble(
+            &mut records,
+            &plan,
+            &BTreeMap::from([(0, 100), (1, 900)]),
+            &first,
+            &BTreeMap::new(),
+        );
+        assert_eq!(records[0].first_attached_at_ns, Some(900));
+        assert_eq!(
+            records[0].first_attach_points,
+            Some(vec![crate::render::FirstAttachPoint {
+                file_offset: 0x1000,
+                began_ns: Some(90),
+                attached_ns: 100,
+            }])
         );
     }
 

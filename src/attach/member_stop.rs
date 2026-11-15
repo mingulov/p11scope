@@ -308,6 +308,10 @@ impl Drop for MemberStopHooks {
         let pending = self.pending().unwrap_or_default();
         for (tgid, stop) in pending {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {
+                // Gone: withdrawn, so a normal end never sweeps for it.
+                if crate::discovery::engine::member_process_gone(tgid) {
+                    let _ = self.withdraw(tgid);
+                }
                 continue;
             };
             let member = match self.tree.contains_pinned(&pin) {

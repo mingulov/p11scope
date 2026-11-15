@@ -85999,6 +85999,31 @@ fn member_stop_never_proves_a_fuse_backed_file() {
     let _ = child.wait();
 }
 
+/// A row whose process is gone (and so cannot be pinned) is withdrawn
+/// at release: a normal finish leaves nothing for the watchdog to sweep.
+#[test]
+fn member_stop_release_withdraws_a_gone_members_row() {
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    let _ = gone.wait();
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+            hook_ts_ns: 1,
+            vm_start: 0x1000,
+            vm_end: 0x2000,
+        },
+    );
+    let mut engine = member_stop_engine();
+    engine.release_member_stops(&mut io);
+    assert!(
+        !io.rows.contains_key(&pid),
+        "the gone member's row is withdrawn"
+    );
+}
+
 /// Twin: without a service pass the stopped member stays stopped (the
 /// resume above is the service's, not the fixture's).
 #[test]

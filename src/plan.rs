@@ -1578,11 +1578,14 @@ fn target_object_from_summary(
 /// value across all of them. Only that robust shape is used for merge's
 /// reclaim accounting: any subset of the key's targets then builds exactly
 /// the predicted names and descriptor, so merge and extend agree by
-/// construction.
+/// construction. A key another group also targets builds as a shared slot
+/// (count-only, descriptor 0) whenever both claim it, and that is the shape
+/// merge charges; the semantic shape is not predicted for such a key.
 fn predicted_reclaim_shape<'a>(
     group: &'a [Discovered<'a>],
     key: &AttachKey,
     policy: AdmissionPolicy,
+    shared_target: bool,
 ) -> Option<(&'a str, &'a str, u32)> {
     let mut name: Option<&str> = None;
     let mut path: Option<&str> = None;
@@ -1628,7 +1631,8 @@ fn predicted_reclaim_shape<'a>(
     let path = path?;
     let names = [name.to_string()];
     let (descriptor, _) = crate::kinds::descriptor_index(&names);
-    let descriptor = if policy.forces_count_only() || !authorized.unwrap_or(false) {
+    let descriptor = if shared_target || policy.forces_count_only() || !authorized.unwrap_or(false)
+    {
         0
     } else {
         descriptor
@@ -1646,6 +1650,7 @@ fn reclaim_tickets(
     existing: &BTreeMap<AttachKey, usize>,
     claimed_positions: &BTreeSet<usize>,
     policy: AdmissionPolicy,
+    shared_targets: &BTreeSet<AttachKey>,
 ) -> BTreeMap<AttachKey, usize> {
     let index = memory.cross_index();
     let mut keys = BTreeSet::new();
@@ -1663,7 +1668,9 @@ fn reclaim_tickets(
         if existing.contains_key(&key) {
             continue;
         }
-        let Some((name, path, descriptor)) = predicted_reclaim_shape(group, &key, policy) else {
+        let Some((name, path, descriptor)) =
+            predicted_reclaim_shape(group, &key, policy, shared_targets.contains(&key))
+        else {
             continue;
         };
         let names = [name.to_string()];
@@ -4453,6 +4460,28 @@ fn merge(
         order.sort_by_key(|&position| classes[position].0 == AdmissionClass::ClosureArray);
     }
     let reserve = shared_scope_reserve(capacity);
+    // Exact targets claimed by more than one discovered object. Building
+    // marks such a slot shared — count-only with descriptor 0 — whatever the
+    // admitting tables' evidence, so reclaim prediction must predict the
+    // same shape or it would charge a reclaimed slot the build cannot reuse.
+    let mut target_groups: BTreeMap<AttachKey, usize> = BTreeMap::new();
+    for group in &groups {
+        let keys: BTreeSet<AttachKey> = group
+            .iter()
+            .flat_map(|module| &module.targets)
+            .map(|target| AttachKey {
+                object: target.object,
+                file_offset: target.file_offset,
+            })
+            .collect();
+        for key in keys {
+            *target_groups.entry(key).or_default() += 1;
+        }
+    }
+    let shared_targets: BTreeSet<AttachKey> = target_groups
+        .into_iter()
+        .filter_map(|(key, groups)| (groups > 1).then_some(key))
+        .collect();
     // PA-9/C1: the late-start prefix is granted only when the capture's
     // first plan also admitted a non-closure provider onto at least one
     // slot. An initial build IS the first plan: closures decide after every
@@ -4691,6 +4720,7 @@ fn merge(
                 existing_slots,
                 &claimed_positions,
                 admission_policy,
+                &shared_targets,
             )
         } else {
             BTreeMap::new()
@@ -20332,6 +20362,133 @@ pub(crate) mod tests {
         );
         assert_eq!(plan.slots.len(), 68, "no fresh semantic slots");
         assert_eq!(plan.module_ambiguous, 0, "one module owns the cells");
+        assert!(plan.retired_slots.is_empty(), "nothing stays retired");
+    }
+
+    /// A target two groups both name builds a shared, count-only slot
+    /// (descriptor 0) however semantic either table's evidence is. Merge's
+    /// reclaim prediction must use that shape so the charged count matches
+    /// what building and extension actually produce, including at MAX_SLOTS.
+    #[test]
+    fn slot_reclaim_predicts_cross_group_targets_as_count_only() {
+        let names: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        assert_eq!(names.len(), 68);
+        // A full budget with 68 retired cells of one same-file generation,
+        // then that generation's new pin (A, semantic) plus a forwarding
+        // table (B) naming the very same targets.
+        let scenario = |count_only_retired: bool| {
+            let filler =
+                provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
+            let mut plan = scoped_plan(
+                &[filler.clone(), sole_complete_module()],
+                AdmissionScope::Shared,
+            );
+            assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "the budget is full");
+            assert!(
+                plan.slots
+                    .iter()
+                    .filter(|slot| slot.object == PinnedObjectId(42))
+                    .all(|slot| slot.semantic_authorized && slot.descriptor_index != 0),
+                "the retired generation starts semantic"
+            );
+            if count_only_retired {
+                for slot in &mut plan.slots {
+                    if slot.object == PinnedObjectId(42) {
+                        slot.descriptor_index = 0;
+                        slot.semantics = SlotSemantics::COUNT_ONLY;
+                        slot.semantic_authorized = false;
+                    }
+                }
+            }
+            plan.object_identities
+                .insert(PinnedObjectId(42), test_identity(42, "sha-shared-target"));
+            let rebuilt =
+                plan.rebuild_from_sources(&[filler.clone()], &[], &PinnedObjects::empty());
+            let delta = plan.extend_exact(rebuilt).unwrap();
+            assert_eq!(delta.retire.len(), 68, "the generation retires");
+            assert_eq!(plan.retired_slots.len(), 68);
+            plan.revivable.clone_from(&plan.retired_keys);
+
+            let mut returning = sole_complete_module();
+            returning.object = PinnedObjectId(90);
+            returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+            let targets: Vec<(&'static str, u32, u64)> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (*name, 90, 0x1000 + index as u64 * 8))
+                .collect();
+            let mut forwarding = provider_with_tables(91, "/opt/forward.so", 1, 68, false);
+            replace_table_targets(&mut forwarding, 0, &targets);
+            let identities =
+                BTreeMap::from([(PinnedObjectId(90), test_identity(42, "sha-shared-target"))]);
+            let rebuilt = plan.rebuild_from_sources_with_identities(
+                &[filler, returning, forwarding],
+                &[],
+                &identities,
+            );
+            (plan, rebuilt)
+        };
+
+        // The shared target builds count-only, so a semantic retired cell
+        // cannot be reused. At MAX_SLOTS the honest outcome is a refusal
+        // whose charge matches the build, never an extension that has to
+        // allocate an uncharged fresh slot.
+        let (mut plan, rebuilt) = scenario(false);
+        assert!(
+            rebuilt.reclaimed.is_empty(),
+            "a shared slot never reclaims a semantic cell: {:?}",
+            rebuilt.reclaimed
+        );
+        assert_eq!(
+            rebuilt.modules_skipped.len(),
+            2,
+            "both groups are refused at the full budget: {:?}",
+            rebuilt.modules_skipped
+        );
+        assert!(
+            plan.extend_exact(rebuilt).is_ok(),
+            "merge charge and build agree"
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "capacity never grows");
+        assert_eq!(
+            plan.retired_slots.len(),
+            68,
+            "the semantic cells stay retired"
+        );
+        assert_eq!(
+            plan.active_slot_count(),
+            MAX_SLOTS as usize - 68,
+            "only the filler stays active"
+        );
+
+        // The same shared target does reoccupy a retired count-only cell of
+        // the same names: prediction and build both charge zero, so the
+        // extension reuses the retired indices even at MAX_SLOTS.
+        let (mut plan, rebuilt) = scenario(true);
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "shared targets reclaim count-only cells: {:?}",
+            rebuilt.reclaimed
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.new.len(), 68, "the retired indices are reoccupied");
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| slot.index as usize >= MAX_SLOTS as usize - 68),
+            "every reclaimed index is a retired one"
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "no capacity growth");
+        assert_eq!(
+            plan.active_slot_count(),
+            MAX_SLOTS as usize,
+            "every cell is active"
+        );
         assert!(plan.retired_slots.is_empty(), "nothing stays retired");
     }
 

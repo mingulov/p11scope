@@ -28,12 +28,14 @@ static MEMBER_STOP_OBJECT: &[u8] =
 pub(crate) const MEMBER_STOP_PROGRAM: &str = "p11_member_map_stop";
 const MEMBER_STOP_TARGET: &str = "uprobe_mmap";
 
-/// The loaded, attached member-stop object. Dropping it deactivates the
-/// hook and resumes every member still pending, so no early return can
-/// leave a member stopped by this capture.
+/// The loaded, attached member-stop object. Dropping it deactivates and
+/// detaches the hook, then resumes every member still pending, so no
+/// early return can leave a member stopped by this capture.
 pub(crate) struct MemberStopHooks {
     ebpf: aya::Ebpf,
     tree: RunTree,
+    /// The attached hook; detached before the final release scan.
+    link: Option<aya::programs::fentry::FEntryLinkId>,
 }
 
 /// The run cgroup tree the stops belong to: the cgroup v2 mount root
@@ -96,7 +98,7 @@ impl MemberStopHooks {
                 .context("publishing the run cgroup")?;
         }
         write_config(&mut ebpf, false, owned_tgid)?;
-        {
+        let link = {
             let program: &mut aya::programs::FEntry = ebpf
                 .program_mut(MEMBER_STOP_PROGRAM)
                 .ok_or_else(|| anyhow!("program {MEMBER_STOP_PROGRAM} missing from object"))?
@@ -106,10 +108,14 @@ impl MemberStopHooks {
                 .with_context(|| format!("loading {MEMBER_STOP_PROGRAM}"))?;
             program
                 .attach()
-                .with_context(|| format!("attaching {MEMBER_STOP_PROGRAM}"))?;
-        }
+                .with_context(|| format!("attaching {MEMBER_STOP_PROGRAM}"))?
+        };
         write_config(&mut ebpf, true, owned_tgid)?;
-        Ok(Self { ebpf, tree })
+        Ok(Self {
+            ebpf,
+            tree,
+            link: Some(link),
+        })
     }
 }
 
@@ -239,9 +245,29 @@ impl MemberStopIo for MemberStopHooks {
     }
 }
 
+impl MemberStopHooks {
+    /// Detaches the hook: an invocation that read `active` before the
+    /// deactivation may still insert a row and stop a member, so the
+    /// final scan runs only after the detach, which waits for in-flight
+    /// invocations. The maps stay readable while `ebpf` lives.
+    fn detach(&mut self) {
+        let Some(link) = self.link.take() else {
+            return;
+        };
+        let program: Option<&mut aya::programs::FEntry> = self
+            .ebpf
+            .program_mut(MEMBER_STOP_PROGRAM)
+            .and_then(|program| program.try_into().ok());
+        if let Some(program) = program {
+            let _ = program.detach(link);
+        }
+    }
+}
+
 impl Drop for MemberStopHooks {
     fn drop(&mut self) {
         let _ = self.deactivate();
+        self.detach();
         let pending = self.pending().unwrap_or_default();
         for (tgid, _) in pending {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {

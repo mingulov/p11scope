@@ -3,6 +3,7 @@
 //! Shared test-only process isolation: re-executed single-test children and
 //! guarded `RLIMIT_NOFILE` changes.
 
+use crate::fixture_guard::DieWithParent as _;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -74,6 +75,9 @@ pub(crate) fn run_child_with_timeout(
 ) -> Output {
     let mut command = command(test, key);
     configure(&mut command);
+    // The caller waits on this thread for the whole child lifetime, so the
+    // spawning thread is the owner whose death must kill the child.
+    command.die_with_parent();
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

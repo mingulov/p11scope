@@ -88055,7 +88055,7 @@ fn inject_mapping_changed_scan() {
 /// incomplete (it was mapping its provider at +5 ms) was never scanned
 /// again, so the provider attached only from the next worker, ~330 ms
 /// later. The incomplete scan still stages what it verified, and it now
-/// keeps a prompt rescan queued. A complete scan, and a cgroup scope the
+/// keeps a rescan queued with an expedited frame. A complete scan, and a cgroup scope the
 /// run does not own, keep the old one-scan admission.
 #[test]
 fn owned_run_newcomer_with_an_incomplete_first_scan_owes_a_prompt_rescan() {
@@ -88090,6 +88090,14 @@ fn owned_run_newcomer_with_an_incomplete_first_scan_owes_a_prompt_rescan() {
             engine.refresh_requested.contains_key(&me),
             owed,
             "owned {owned} incomplete {incomplete}: a rescan is requested"
+        );
+        // The inventory tick runs on the frame cadence (about once a
+        // second without loader records): only an expedited frame makes
+        // the rescan land inside a short-lived worker's life.
+        assert_eq!(
+            engine.take_learned_frame(),
+            owed,
+            "owned {owned} incomplete {incomplete}: the rescan owes an expedited frame"
         );
     }
 }

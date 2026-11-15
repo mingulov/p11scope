@@ -83702,7 +83702,7 @@ fn loader_pin_skip_is_silent_only_for_an_ending_group() {
         }
         engine.inject_loader_pin_skip_for_test = Some(Skipped {
             subject: "/lib/ld.so".into(),
-            reason: "injected loader pin skip".into(),
+            reason: "opening object within retained target root: injected loader pin skip".into(),
         });
         let armed = engine.arm_loader_or_partial(
             0,
@@ -83717,7 +83717,7 @@ fn loader_pin_skip_is_silent_only_for_an_ending_group() {
             .counters
             .object_skips
             .iter()
-            .any(|skip| skip.reason == "injected loader pin skip");
+            .any(|skip| skip.reason.ends_with("injected loader pin skip"));
         assert_eq!(
             injected, !ending,
             "ending {ending}: {:?}",
@@ -84251,4 +84251,155 @@ fn queue_retirement_reports_the_real_enqueue_line() {
 
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// The pin-wait subject check carries weight: a map_files fallback
+/// handle-exhaustion wait carries the fallback text an excused pin
+/// refusal also carries, so only the subject keeps it.
+#[test]
+fn pin_wait_with_map_files_fallback_text_is_never_excused() {
+    let reason = "/usr/lib/provider.so: opening object within retained target root: \
+                  Too many open files (os error 24) (map_files fallback: Too many open files); \
+                  the pin waits for the next tick";
+    let wait = Skipped {
+        subject: crate::discovery::identity::PIN_WAIT_SUBJECT.into(),
+        reason: reason.into(),
+    };
+    assert!(
+        !skip_is_ending_refusal(&wait),
+        "a pin wait is never excused"
+    );
+    let refusal = Skipped {
+        subject: "/usr/lib/provider.so".into(),
+        reason: "opening object within retained target root: No such file or directory \
+                 (os error 2) (map_files fallback: gone)"
+            .into(),
+    };
+    assert!(skip_is_ending_refusal(&refusal));
+}
+
+/// Loader-arm excuses follow the scan rule: on an ending group a loader
+/// pin skip that names a capture-wide budget stop, or that is not a
+/// per-process refusal, keeps its arming record.
+#[test]
+fn ending_loader_pin_skip_keeps_budget_stops_and_other_skips() {
+    for reason in [
+        format!("mapping identity unavailable: {WORK_CEILING_REASON}"),
+        "target path cannot be normalized; object was not pinned".to_string(),
+    ] {
+        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let view = engine.views[0].id();
+        engine.set_final_exit_for_test(view);
+        engine.inject_loader_pin_skip_for_test = Some(Skipped {
+            subject: "/lib/ld.so".into(),
+            reason: reason.clone(),
+        });
+        let armed = engine.arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = armed;
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason),
+            "{reason}: {:?}",
+            engine.counters.object_skips
+        );
+    }
+}
+
+/// An ending group's failed arm whose error names a capture-wide budget
+/// stop stays a disclosed arming gap, through both loader-arm excuses.
+#[test]
+fn ending_loader_arm_failure_naming_a_budget_stop_keeps_its_gap() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    engine.set_final_exit_for_test(view);
+    engine.fail_next_loader_locate_for_test = true;
+    engine.fail_next_loader_locate_reason_for_test = Some(SCAN_DEADLINE_REASON);
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut ScriptedSession::default(),
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    armed.expect("a failed arm returns");
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader arming" && skip.reason == SCAN_DEADLINE_REASON
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+
+    let result = engine.loader_arm_gap(view, WORK_CEILING_REASON);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(matches!(result, Ok(false)));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live loader arming" && skip.reason == WORK_CEILING_REASON
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// A capture-wide stop that fires during an ending group's scan can
+/// hide behind an excused refusal's text, so that scan excuses nothing.
+#[test]
+fn ending_scan_that_set_a_capture_stop_excuses_nothing() {
+    for stop in [true, false] {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(714), child.id()).unwrap();
+        let mut counters = DiscoveryCounters::default();
+        let mut budget = CaptureWorkBudget::default();
+        FORCE_ENDING_AT_SCAN_START.with(|force| force.set(true));
+        let result = scan_and_pin_with(
+            &view,
+            &[],
+            &HookRegistry::builtin(),
+            &mut budget,
+            &mut counters,
+            false,
+            &mut crate::timing::StageTimings::default(),
+            |_, _, budget| {
+                if stop {
+                    budget.set_deadline(Some(1));
+                    assert!(budget.check_deadline_now().is_some());
+                }
+                Ok::<_, String>(ScanOutcome::Scanned {
+                    modules: Vec::new(),
+                    skipped: vec![Skipped {
+                        subject: "capture discovery".into(),
+                        reason: crate::discovery::scan::MAPPING_CHANGED_REASON.into(),
+                    }],
+                    scan_ms: 0,
+                })
+            },
+            None,
+            crate::discovery::handle_table::Filing::Untracked,
+        );
+        FORCE_ENDING_AT_SCAN_START.with(|force| force.set(false));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        result.expect("the scan returns");
+        let kept = counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason == crate::discovery::scan::MAPPING_CHANGED_REASON);
+        assert_eq!(kept, stop, "stop {stop}: {:?}", counters.object_skips);
+        assert_eq!(counters.ending_suppressed_skips, u64::from(!stop));
+    }
 }

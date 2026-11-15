@@ -1149,6 +1149,9 @@ pub struct Engine {
     /// executable or mappings return.
     #[cfg(test)]
     fail_next_loader_locate_for_test: bool,
+    /// Replaces the injected locate failure's text when set.
+    #[cfg(test)]
+    fail_next_loader_locate_reason_for_test: Option<&'static str>,
     #[cfg(test)]
     pub(crate) inject_loader_pin_skip_for_test: Option<Skipped>,
     #[cfg(test)]
@@ -7251,15 +7254,17 @@ fn scan_and_pin_with_proof(
             .iter()
             .any(|skip| scan_skip_truncates(&skip.reason));
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
-    // Retain acquisition losses before pinning can fail on an exited generation.
+    // Retain acquisition losses before pinning can fail on an exited
+    // generation. Refusals an ending group may excuse are held until the
+    // pins are done: a capture-wide stop set during this scan can hide
+    // behind their text, so such a scan excuses nothing.
+    let mut held = Vec::new();
     for skipped in outcome.skipped() {
         if ending_at_start && skip_is_ending_refusal(skipped) {
-            counters.ending_suppressed_skips += 1;
+            held.push(skipped.clone());
             continue;
         }
-        counters.noise.note_skip(&skipped.subject, &skipped.reason);
-        attribution::note(skipped);
-        counters.object_skips.push(skipped.clone());
+        record_scan_skip(counters, skipped.clone());
     }
     if let ScanOutcome::Scanned { scan_ms, .. } = &outcome {
         counters.scan_ms = counters.scan_ms.saturating_add(*scan_ms);
@@ -7285,18 +7290,31 @@ fn scan_and_pin_with_proof(
         pin_start,
         crate::attach::monotonic_ns(),
     );
+    let excuse = ending_at_start && budget.stopped_reason() == stop_before;
+    if excuse {
+        counters.ending_suppressed_skips += held.len() as u64;
+    } else {
+        for skipped in held {
+            record_scan_skip(counters, skipped);
+        }
+    }
     let (pinned, pin_skips) =
         pinned.map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
     for skipped in pin_skips {
-        if ending_at_start && skip_is_ending_refusal(&skipped) {
+        if excuse && skip_is_ending_refusal(&skipped) {
             counters.ending_suppressed_skips += 1;
             continue;
         }
-        counters.noise.note_skip(&skipped.subject, &skipped.reason);
-        attribution::note(&skipped);
-        counters.object_skips.push(skipped);
+        record_scan_skip(counters, skipped);
     }
     Ok((modules, pinned, complete, scan_examined, scan_shape))
+}
+
+/// Records one scan or pin skip as a counted gap of this scan.
+fn record_scan_skip(counters: &mut DiscoveryCounters, skipped: Skipped) {
+    counters.noise.note_skip(&skipped.subject, &skipped.reason);
+    attribution::note(&skipped);
+    counters.object_skips.push(skipped);
 }
 
 /// Task 1.6 experiment: recognized fixed-family pool layout.
@@ -13206,6 +13224,8 @@ impl Engine {
             last_retirement_caller_line_for_test: None,
             #[cfg(test)]
             fail_next_loader_locate_for_test: false,
+            #[cfg(test)]
+            fail_next_loader_locate_reason_for_test: None,
             #[cfg(test)]
             inject_loader_pin_skip_for_test: None,
             #[cfg(test)]
@@ -23701,9 +23721,11 @@ impl Engine {
         }
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_loader_locate_for_test) {
-            return Err(LoaderArmFailure::ordinary(anyhow!(
-                "No such file or directory (os error 2)"
-            )));
+            let reason = self
+                .fail_next_loader_locate_reason_for_test
+                .take()
+                .unwrap_or("No such file or directory (os error 2)");
+            return Err(LoaderArmFailure::ordinary(anyhow!("{reason}")));
         }
         let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
             return Err(LoaderArmFailure::NotArmable);
@@ -23742,8 +23764,13 @@ impl Engine {
             return Err(LoaderArmFailure::Deferred { changed: false });
         }
         // The loader pin of a group in its final exit fails on its gone
-        // namespace or mappings: the group is ending, not refused.
-        if !loader_skips.is_empty() && self.original_ending(view_id) {
+        // namespace or mappings: the group is ending, not refused. Only
+        // when every skip is such a per-process refusal; a budget stop or
+        // any other skip keeps the arming gap.
+        if !loader_skips.is_empty()
+            && loader_skips.iter().all(skip_is_ending_refusal)
+            && self.original_ending(view_id)
+        {
             self.invalidate_causal_timing();
             return Err(LoaderArmFailure::NotArmable);
         }
@@ -24462,9 +24489,14 @@ impl Engine {
             // its executable or mappings) while its pidfd is not yet
             // ready. It can never load anything again, so the failure is
             // the process ending, not a refused arm: no record and no gap,
-            // exactly like a gone executable.
-            LoaderArmOutcome::OrdinaryFailure(_)
-                if !self.loader_view_has_live_context(view_id) && self.original_ending(view_id) =>
+            // exactly like a gone executable. A failure naming a
+            // capture-wide budget stop is the capture's limit and stays.
+            LoaderArmOutcome::OrdinaryFailure(ref error)
+                if !self.loader_view_has_live_context(view_id)
+                    && !crate::discovery::scan::names_capture_budget_stop(&format!(
+                        "{error:#}"
+                    ))
+                    && self.original_ending(view_id) =>
             {
                 self.invalidate_causal_timing();
                 LoaderArmOutcome::NotArmable
@@ -25784,7 +25816,8 @@ impl Engine {
         view: ProcessViewId,
         reason: &str,
     ) -> std::result::Result<bool, LoaderArmFailure> {
-        if self.original_ending(view) {
+        if !crate::discovery::scan::names_capture_budget_stop(reason) && self.original_ending(view)
+        {
             self.invalidate_causal_timing();
             return Err(LoaderArmFailure::NotArmable);
         }

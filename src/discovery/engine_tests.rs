@@ -83142,13 +83142,24 @@ int main(int argc, char **argv) {
             path
         })
         .collect();
-    let mut child = std::process::Command::new(&runner)
-        .arg(&gate)
-        .args(&providers)
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let live_pid = child.id();
+    let child = {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        OwnedChild(
+            std::process::Command::new(&runner)
+                .arg(&gate)
+                .args(&providers)
+                .die_with_parent()
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let live_pid = child.0.id();
     let mapped = |path: &PathBuf| {
         std::fs::read_to_string(format!("/proc/{live_pid}/maps"))
             .is_ok_and(|maps| maps.contains(path.to_str().unwrap()))
@@ -83315,6 +83326,5 @@ int main(int argc, char **argv) {
     );
     drop(topup);
     drop(seed);
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
 }

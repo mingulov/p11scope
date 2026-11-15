@@ -1119,6 +1119,17 @@ pub enum ModuleLayer {
     PreCopyUp,
 }
 
+/// One endpoint's first attach (`evidence.discovery[].first_attach_points`):
+/// the attach call's begin instant (`null` when the clock could not be
+/// read) and its completion stamp, `CLOCK_MONOTONIC`, kept across
+/// replaced probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FirstAttachPoint {
+    pub file_offset: u64,
+    pub began_ns: Option<u64>,
+    pub attached_ns: u64,
+}
+
 /// Who first loaded a learned provider file: the drain's reuse-immune
 /// `/proc/<loader>/exe` read at first sight, or the finite reason it
 /// could not be read, plus how many distinct loader processes were
@@ -1216,6 +1227,12 @@ pub struct DiscoveredModule {
     /// window says otherwise. Absent when any endpoint never attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_attached_at_ns: Option<u64>,
+    /// The first attach of each endpoint that ever attached, by file
+    /// offset: no call that entered before `began_ns` can be counted and
+    /// every call that entered after `attached_ns` is counted unless a
+    /// disclosed window says otherwise. Absent when no endpoint attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_attach_points: Option<Vec<FirstAttachPoint>>,
     /// Who first loaded this file, learned modules only. `None` — and
     /// absent on the wire — for every module no learn event staged.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8225,6 +8242,7 @@ pub(crate) mod tests {
             attached_at_ns: None,
             unobserved_windows: None,
             first_attached_at_ns: None,
+            first_attach_points: None,
             first_loaded_by: None,
             tables: vec![crate::plan::TableSummary {
                 version: (2, 40),

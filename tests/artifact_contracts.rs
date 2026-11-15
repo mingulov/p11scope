@@ -12862,6 +12862,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         attached_at_ns: None,
         unobserved_windows: None,
         first_attached_at_ns: None,
+        first_attach_points: None,
         first_loaded_by: None,
         interfaces: 0,
         skipped: vec![],

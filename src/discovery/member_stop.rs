@@ -42,6 +42,9 @@ pub(crate) trait MemberStopIo {
     /// reused by an unrelated process, which is never read or signalled.
     /// `Ok(false)` also when the pinned process exited meanwhile.
     fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String>;
+    /// Whether the watchdog that resumes members after an observer death
+    /// is gone: then no member may stay stopped on this observer alone.
+    fn guard_lost(&mut self) -> bool;
 }
 
 /// The longest a member stays stopped for one provider attach, counted
@@ -90,6 +93,8 @@ pub(crate) struct MemberStopState {
     pub(crate) stop_staged: BTreeSet<(u64, u64)>,
     /// Rows left in place for a retry (counted once as stopped).
     retrying: BTreeMap<u32, ()>,
+    /// The watchdog was lost: no further stops are serviced or made.
+    disabled: bool,
     /// Pinned identities whose staging was refused (cap, replaced file,
     /// pin budget, nothing pinnable): settled, but never attached.
     refused: BTreeSet<(u64, u64)>,
@@ -352,6 +357,19 @@ impl Engine {
         session: &mut dyn EngineSession,
         now_ns: Option<u64>,
     ) {
+        if self.member_stops.disabled {
+            return;
+        }
+        if io.guard_lost() {
+            // Without the watchdog an observer death would leave members
+            // stopped: stop stopping, and resume everyone now.
+            self.member_stops.disabled = true;
+            if crate::run::capture_diagnostics_on() {
+                eprintln!("p11scope: member-stop watchdog gone; run member stops disabled");
+            }
+            self.release_member_stops(io);
+            return;
+        }
         let Some(now_ns) = now_ns.or_else(crate::attach::monotonic_ns) else {
             return;
         };

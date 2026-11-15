@@ -60,6 +60,8 @@ const MEMBER_STOP_MEMBER_BUDGET: std::time::Duration = std::time::Duration::from
 const MEMBER_STOP_MAPS_BYTES: usize = 4 * 1024 * 1024;
 /// Bounded files inspected per stopped member and service pass.
 const MEMBER_STOP_FILES_PER_MEMBER: usize = 512;
+/// Bounded refused-staging memory (the learned settled set's own cap).
+const MEMBER_STOP_REFUSED_CAP: usize = 8192;
 /// Bounded retry bookkeeping (the kernel table holds at most 1024 rows).
 const MEMBER_STOP_RETRY_CAP: usize = 1024;
 /// Bounded local clearance memory (the kernel LRU is the authority; this
@@ -88,10 +90,24 @@ pub(crate) struct MemberStopState {
     pub(crate) stop_staged: BTreeSet<(u64, u64)>,
     /// Rows left in place for a retry (counted once as stopped).
     retrying: BTreeMap<u32, ()>,
+    /// Pinned identities whose staging was refused (cap, replaced file,
+    /// pin budget, nothing pinnable): settled, but never attached.
+    refused: BTreeSet<(u64, u64)>,
     /// Test override of [`MEMBER_STOP_INTAKE_PER_PASS`].
     #[cfg(test)]
     pub(crate) intake_cap: Option<usize>,
     pub(crate) stats: MemberStopStats,
+}
+
+impl MemberStopState {
+    /// Records a refused staging (bounded like the settled set: past the
+    /// cap a refused identity is not retained, and its hold ends at the
+    /// bound instead).
+    pub(crate) fn note_refused(&mut self, identity: (u64, u64)) {
+        if self.refused.len() < MEMBER_STOP_REFUSED_CAP {
+            self.refused.insert(identity);
+        }
+    }
 }
 
 /// Service totals, for the diagnostic summary and the tests.
@@ -102,6 +118,8 @@ pub(crate) struct MemberStopStats {
     pub(crate) provider_holds: u64,
     pub(crate) attached_resumes: u64,
     pub(crate) timed_out: u64,
+    /// Provider mappers resumed because their staging was refused.
+    pub(crate) refused_resumes: u64,
     pub(crate) unreadable: u64,
     pub(crate) departed: u64,
     /// Stopped members kept for a retry: not pinnable, membership
@@ -656,7 +674,13 @@ impl Engine {
             // An unreadable exit state is not a departure: a departed
             // member is withdrawn without a resume, so doubt must resume.
             let departed = held.pin.original_exited().unwrap_or(false);
-            let attached = !self.learned_unapplied
+            // A refused staging settles without probes: never "attached".
+            let refused = held
+                .providers
+                .iter()
+                .any(|identity| self.member_stops.refused.contains(identity));
+            let attached = !refused
+                && !self.learned_unapplied
                 && held.providers.iter().all(|identity| {
                     self.learned_settled.contains(identity)
                         && !self
@@ -665,7 +689,7 @@ impl Engine {
                             .any(|queued| (queued.dev, queued.ino) == *identity)
                 });
             let expired = now_ns.saturating_sub(held.since_ns) >= MEMBER_STOP_HOLD_NS;
-            if !(departed || attached || expired) {
+            if !(departed || attached || refused || expired) {
                 continue;
             }
             let held = self.member_stops.held.remove(&tgid).expect("held member");
@@ -682,6 +706,15 @@ impl Engine {
             if attached {
                 self.member_stops.stats.attached_resumes =
                     self.member_stops.stats.attached_resumes.saturating_add(1);
+            } else if refused {
+                // The refusal row names the provider; the first-use row
+                // says its calls (from this member on) may be missed.
+                self.member_stops.stats.refused_resumes =
+                    self.member_stops.stats.refused_resumes.saturating_add(1);
+                self.mark_partial(
+                    crate::render::LEARNED_SKIP_SUBJECT,
+                    crate::render::LEARNED_FIRST_RUN_REASON,
+                );
             } else {
                 // The member runs before its provider's probes: its first
                 // calls may go unobserved, the same named first-use row a
@@ -720,7 +753,8 @@ impl Engine {
             let kernel = io.counters().unwrap_or_default();
             eprintln!(
                 "p11scope: run member stops: {} stopped, {} files cleared, {} provider holds, \
-                 {} resumed attached, {} resumed at bound, {} unreadable, {} departed, \
+                 {} resumed attached, {} resumed at bound, {} resumed refused, \
+                 {} unreadable, {} departed, \
                  {} not members, {} kept for a retry; \
                  kernel requested {}, table full {}, signal refused {}, identity unread {}",
                 stats.stopped,
@@ -728,6 +762,7 @@ impl Engine {
                 stats.provider_holds,
                 stats.attached_resumes,
                 stats.timed_out,
+                stats.refused_resumes,
                 stats.unreadable,
                 stats.departed,
                 stats.not_members,

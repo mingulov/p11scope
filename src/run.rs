@@ -4267,10 +4267,6 @@ fn unsettled_child_note(child: &OwnedChild) -> Option<String> {
 }
 
 impl Owned {
-    /// Closes the pause epoch and settles the child, *before* any terminal
-    /// evidence is built: `child_still_running` is a fact the final document
-    /// reports, never a guess made after it was written. Resume comes first,
-    /// so a child still held by an accepted stop is never waited on.
     /// Ends the run-member stops: the hook switches off and detaches,
     /// every held or pending member resumes, and the watchdog ends in
     /// order. Runs at the capture loop's end, before the terminal
@@ -4282,6 +4278,10 @@ impl Owned {
         }
     }
 
+    /// Closes the pause epoch and settles the child, *before* any terminal
+    /// evidence is built: `child_still_running` is a fact the final document
+    /// reports, never a guess made after it was written. Resume comes first,
+    /// so a child still held by an accepted stop is never waited on.
     fn finish(
         &mut self,
         engine: &mut Engine,

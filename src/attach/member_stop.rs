@@ -259,7 +259,14 @@ impl MemberStopIo for MemberStopHooks {
         .and_then(|config| config.get(&0, 0))
         .map(|row| row.exempt_tgid)
         .unwrap_or(0);
-        write_config(&mut self.ebpf, false, exempt).map_err(|error| format!("{error:#}"))
+        let written =
+            write_config(&mut self.ebpf, false, exempt).map_err(|error| format!("{error:#}"));
+        // Detached too (idempotent with `Drop`): an invocation that read
+        // `active` before the write may still insert a row and stop a
+        // member, and the detach waits for in-flight invocations, so a
+        // release scan after this call sees every row there will be.
+        self.detach();
+        written
     }
 
     fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {

@@ -755,19 +755,21 @@ impl Engine {
                 self.member_stops.stats.fuse_resumes.saturating_add(1);
             self.note_first_use_gap(tgid, "a mapped file is FUSE-backed");
         }
+        // A stopping file that was not proven (unmapped since, or
+        // unreadable) stays uncleared, so a later mapper stops and tries
+        // again. This member runs with it unproven, whether at once or
+        // after a hold for another provider it maps: it may be a
+        // provider, so the named first-use gap is filed.
+        let stopping_proven = cleared.contains(&stop.file)
+            || self.member_stops.cleared.contains(&stop.file)
+            || providers.iter().any(|(key, _)| *key == stop.file);
+        if !stopping_proven {
+            self.member_stops.stats.unproven_resumes =
+                self.member_stops.stats.unproven_resumes.saturating_add(1);
+            self.note_first_use_gap(tgid, "its stopping file was not proven");
+        }
         if providers.is_empty() {
-            // A stopping file that was not proven (unmapped since, or
-            // unreadable) stays uncleared, so a later mapper stops and
-            // tries again. This member resumes with it unproven: it may
-            // be a provider, so the named first-use gap is filed.
-            let stopping_proven =
-                cleared.contains(&stop.file) || self.member_stops.cleared.contains(&stop.file);
             self.resume_or_force(io, &pin, since_ns, now_ns);
-            if !stopping_proven {
-                self.member_stops.stats.unproven_resumes =
-                    self.member_stops.stats.unproven_resumes.saturating_add(1);
-                self.note_first_use_gap(tgid, "its stopping file was not proven");
-            }
             return false;
         }
         let mut files = Vec::new();

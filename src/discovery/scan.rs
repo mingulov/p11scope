@@ -5910,16 +5910,26 @@ fn capture_scan_reason(reason: &str) -> bool {
 /// keeps the fail-closed clear. Maps byte/entry ceilings are truncated
 /// snapshots, not an exhausted allowance, so they stay out of this set.
 fn bracket_budget_exhaustion(reason: &str) -> bool {
-    matches!(
-        reason,
-        WORK_CEILING_REASON
-            | SCAN_DEADLINE_REASON
-            | SCAN_CLOCK_REASON
-            | IO_CEILING_REASON
-            | TABLE_WINDOW_CEILING_REASON
-            | INTERFACE_WINDOW_CEILING_REASON
-            | COLLECTION_STOP_REASON
-    )
+    BUDGET_EXHAUSTION_REASONS.contains(&reason)
+}
+
+const BUDGET_EXHAUSTION_REASONS: [&str; 7] = [
+    WORK_CEILING_REASON,
+    SCAN_DEADLINE_REASON,
+    SCAN_CLOCK_REASON,
+    IO_CEILING_REASON,
+    TABLE_WINDOW_CEILING_REASON,
+    INTERFACE_WINDOW_CEILING_REASON,
+    COLLECTION_STOP_REASON,
+];
+
+/// Whether a skip reason names a capture-wide budget stop, alone or as
+/// the detail of a refusal: such a stop is the capture's own limit, never
+/// a process ending, so the ending-at-scan-start excuse keeps it.
+pub(crate) fn names_capture_budget_stop(reason: &str) -> bool {
+    BUDGET_EXHAUSTION_REASONS
+        .iter()
+        .any(|budget| reason.contains(budget))
 }
 
 fn scan_skip(subject: &str, reason: String) -> Skipped {

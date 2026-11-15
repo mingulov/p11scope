@@ -83822,7 +83822,7 @@ fn scan_refusal_on_a_group_ended_before_its_scan_files_no_gap() {
             })
         },
         None,
-        None,
+        crate::discovery::handle_table::Filing::Untracked,
     );
     let _ = result;
     assert!(
@@ -83874,54 +83874,263 @@ fn folded_deferral_of_a_departed_view_keeps_the_records_standing() {
     );
 }
 
-/// The pin half of the scan-start excuse: a module the view cannot pin
-/// files a pin skip. For a group already ending when its scan started it
-/// is dropped; for a live group it stays a counted gap.
+/// One scan of a live `sleep` child whose scanner reports `module` and
+/// `scan_skips`, with the group forced ending (or not) at scan start.
+fn scan_child_with_forced_ending(
+    ending: bool,
+    edit: impl FnOnce(&mut ScannedModule),
+    scan_skips: Vec<Skipped>,
+    filing: crate::discovery::handle_table::Filing<'_>,
+) -> DiscoveryCounters {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(713), child.id()).unwrap();
+    let mut module = child_provider_modules(&view)[0].clone();
+    module.tables.clear();
+    edit(&mut module);
+    let mut counters = DiscoveryCounters::default();
+    FORCE_ENDING_AT_SCAN_START.with(|force| force.set(ending));
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: vec![module],
+                skipped: scan_skips,
+                scan_ms: 0,
+            })
+        },
+        None,
+        filing,
+    );
+    FORCE_ENDING_AT_SCAN_START.with(|force| force.set(false));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    result.expect("a live view scans and pins");
+    counters
+}
+
+/// The pin half of the scan-start excuse: a pin refused on the process's
+/// own root (here a mapped path its root does not hold) is dropped for a
+/// group already ending at scan start and kept for a live group. A pin
+/// skip that does not depend on the process (an unnormalizable path) is
+/// kept either way.
 #[test]
 fn pin_skips_are_dropped_only_for_a_group_ending_at_scan_start() {
+    let missing = "/p11scope-test-missing/provider.so";
     for ending in [true, false] {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        let view = ProcessView::open(ProcessViewId(713), child.id()).unwrap();
-        let mut module = child_provider_modules(&view)[0].clone();
-        module.path = "relative/provider.so".into();
-        module.tables.clear();
-        let mut counters = DiscoveryCounters::default();
-        FORCE_ENDING_AT_SCAN_START.with(|force| force.set(ending));
-        let result = scan_and_pin_with(
-            &view,
-            &[],
-            &HookRegistry::builtin(),
-            &mut CaptureWorkBudget::default(),
-            &mut counters,
-            false,
-            &mut crate::timing::StageTimings::default(),
-            |_, _, _| {
-                Ok::<_, String>(ScanOutcome::Scanned {
-                    modules: vec![module.clone()],
-                    skipped: Vec::new(),
-                    scan_ms: 0,
-                })
-            },
-            None,
-            None,
+        let counters = scan_child_with_forced_ending(
+            ending,
+            |module| module.path = missing.into(),
+            Vec::new(),
+            crate::discovery::handle_table::Filing::Untracked,
         );
-        FORCE_ENDING_AT_SCAN_START.with(|force| force.set(false));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        result.expect("a live view pins its unnormalizable module as a skip");
-        let filed = counters.object_skips.iter().any(|skip| {
-            skip.subject == "relative/provider.so"
-                && skip.reason == "target path cannot be normalized; object was not pinned"
-        });
-        assert_eq!(
-            filed, !ending,
+        let refused: Vec<_> = counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == missing)
+            .collect();
+        if ending {
+            assert!(refused.is_empty(), "ending: {:?}", counters.object_skips);
+            assert_eq!(counters.ending_suppressed_skips, 1);
+        } else {
+            assert_eq!(refused.len(), 1, "live: {:?}", counters.object_skips);
+            assert!(
+                skip_is_ending_refusal(refused[0]),
+                "the live refusal is one the excuse covers: {refused:?}"
+            );
+        }
+
+        let counters = scan_child_with_forced_ending(
+            ending,
+            |module| module.path = "relative/provider.so".into(),
+            Vec::new(),
+            crate::discovery::handle_table::Filing::Untracked,
+        );
+        assert!(
+            counters.object_skips.iter().any(|skip| {
+                skip.subject == "relative/provider.so"
+                    && skip.reason == "target path cannot be normalized; object was not pinned"
+            }),
             "ending {ending}: {:?}",
             counters.object_skips
         );
+    }
+}
+
+/// The excuse covers only per-process refusals: on a group ending at scan
+/// start, a capture-wide budget stop (bare or as a refusal's detail)
+/// stays published, while a plain mapping refusal is dropped.
+#[test]
+fn ending_scan_keeps_capture_budget_stops() {
+    let deadline_refusal = format!(
+        "memory scan refused: initial mapping validation unavailable: {SCAN_DEADLINE_REASON}"
+    );
+    let scan_skips = vec![
+        Skipped {
+            subject: "capture discovery".into(),
+            reason: SCAN_DEADLINE_REASON.into(),
+        },
+        Skipped {
+            subject: "capture discovery".into(),
+            reason: deadline_refusal.clone(),
+        },
+        Skipped {
+            subject: "capture discovery".into(),
+            reason: crate::discovery::scan::MAPPING_CHANGED_REASON.into(),
+        },
+    ];
+    for ending in [true, false] {
+        let counters = scan_child_with_forced_ending(
+            ending,
+            |_| {},
+            scan_skips.clone(),
+            crate::discovery::handle_table::Filing::Untracked,
+        );
+        let has = |reason: &str| {
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason)
+        };
+        assert!(has(SCAN_DEADLINE_REASON), "ending {ending}: bare stop kept");
+        assert!(
+            has(&deadline_refusal),
+            "ending {ending}: budget refusal kept"
+        );
+        assert_eq!(
+            has(crate::discovery::scan::MAPPING_CHANGED_REASON),
+            !ending,
+            "ending {ending}: {:?}",
+            counters.object_skips
+        );
+    }
+}
+
+/// A pin wait is the handle budget's control signal: an ending group's
+/// scan keeps it, so admission and refresh still defer the view and file
+/// the counted handle gap instead of binding a partial pin set.
+#[test]
+fn ending_scan_keeps_pin_wait_skips() {
+    for ending in [true, false] {
+        let mut table = crate::discovery::handle_table::HandleTable::new(0);
+        let counters = scan_child_with_forced_ending(
+            ending,
+            |_| {},
+            Vec::new(),
+            crate::discovery::handle_table::Filing::Acquire(
+                &mut table,
+                crate::discovery::handle_table::DeferredReason::Live,
+            ),
+        );
+        assert!(
+            pins_waited_for_handles_budget(&counters.object_skips),
+            "ending {ending}: {:?}",
+            counters.object_skips
+        );
+        assert_eq!(counters.ending_suppressed_skips, 0);
+    }
+}
+
+/// Defers view 0 of a fresh fixture with a zero quantum, then rescans it
+/// with `prepare` applied and the group forced ending (or not) at scan
+/// start. Returns the fixture after capture-end withdrawal and the
+/// deferral record.
+fn rescan_deferred_view(
+    ending: bool,
+    prepare: impl FnOnce(&mut Engine),
+) -> (RefreshFairnessFixture, Skipped) {
+    let mut fixture = RefreshFairnessFixture::new();
+    let view = fixture.engine.views[0].id();
+    fixture.engine.scheduler.set_tick_quantum_ns_for_test(0);
+    fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
+    let (scans, _, _, skipped) =
+        fixture
+            .engine
+            .scan_inventory_views(&BTreeSet::from([view]), "zero quantum", &mut || Some(0));
+    assert!(scans.is_empty());
+    let record = skipped
+        .iter()
+        .find(|skip| skip.reason.contains("tick deep-scan quantum exhausted"))
+        .expect("a deferral record")
+        .clone();
+    fixture.engine.counters.object_skips.push(record.clone());
+    fixture
+        .engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(u64::MAX);
+    fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
+    prepare(&mut fixture.engine);
+    FORCE_ENDING_AT_SCAN_START.with(|force| force.set(ending));
+    let (scans, failed, _, _) =
+        fixture
+            .engine
+            .scan_inventory_views(&BTreeSet::from([view]), "rescan", &mut || Some(0));
+    FORCE_ENDING_AT_SCAN_START.with(|force| force.set(false));
+    INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+    assert_eq!(scans.len(), 1, "the rescan ran: {failed:?}");
+    fixture.engine.withdraw_completed_quantum_deferrals();
+    (fixture, record)
+}
+
+/// A deferral filed while the view was live is settled only by a rescan
+/// that saw the view: a rescan of the same view that dropped refusals
+/// because the group was already ending keeps the deferral standing, like
+/// a departed view. A live rescan settles it and keeps its own refusal.
+#[test]
+fn ending_rescan_that_dropped_refusals_never_settles_a_live_deferral() {
+    let refusal = Skipped {
+        subject: "capture discovery".into(),
+        reason: crate::discovery::scan::MAPPING_CHANGED_REASON.into(),
+    };
+    for ending in [true, false] {
+        let (fixture, record) = rescan_deferred_view(ending, |_| {
+            INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().push(refusal.clone()));
+        });
+        let skips = &fixture.engine.counters.object_skips;
+        assert_eq!(
+            skips.contains(&record),
+            ending,
+            "ending {ending}: the deferral stands only after a hollow rescan: {skips:?}"
+        );
+        assert_eq!(
+            skips.contains(&refusal),
+            !ending,
+            "ending {ending}: {skips:?}"
+        );
+    }
+}
+
+/// The tier-3 probe: a rescan refused by the capture deadline settles the
+/// deferral for a live and an ending group alike, because the deadline
+/// refusal is never excused and stays a counted gap either way.
+#[test]
+fn ending_rescan_refused_by_deadline_keeps_a_counted_gap() {
+    for ending in [true, false] {
+        let (fixture, record) = rescan_deferred_view(ending, |engine| {
+            engine.budget.set_deadline(Some(1));
+        });
+        let skips = &fixture.engine.counters.object_skips;
+        let refused = skips
+            .iter()
+            .filter(|skip| {
+                crate::discovery::scan::names_capture_budget_stop(&skip.reason)
+                    && skip.reason.starts_with("memory scan refused: ")
+            })
+            .count();
+        assert!(
+            refused > 0,
+            "ending {ending}: the deadline refusal stays counted: {skips:?}"
+        );
+        assert!(!skips.contains(&record), "ending {ending}: settled");
     }
 }
 

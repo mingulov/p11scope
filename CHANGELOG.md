@@ -27,20 +27,24 @@ versioned separately and are opaque, exact dispatch keys.
   first live-tick walk: initial discovery already listed them, so
   their exits are proved like walk-listed ones (was: unproved until
   first listed, one gap each).
-- System and cgroup captures no longer report a lossy observation when
-  a process that used the provider exits while discovery is arming or
-  hooking it: a thread group that has exited, or whose every thread is
-  a zombie or already inside the kernel's exit path, can never call or
-  load again, so its failed loader arm, missing loader context, or
-  changed generation is the process ending, not a gap (was: an unbound
+- Captures no longer report a lossy observation when a process that
+  used the provider exits while discovery is arming or hooking it: a
+  thread group that has exited, or whose every thread is a zombie or
+  already inside the kernel's exit path, can never call or load again,
+  so its failed loader arm, missing loader context, or changed
+  generation is the process ending, not a gap (was: an unbound
   `loader_discovery` context plus "discovery unavailable" skips). A
-  memory-scan or pin refusal is excused only when the group was already
-  in that state when its scan started; a process that was running at
-  scan start keeps the refusal as a gap even if it exits mid-scan. The same failures on a live process stay named
-  gaps. A tick that stops only to finish cleaning up such ended
-  processes no longer files a postponement gap either, and a tick
-  deep-scan deferral is withdrawn at capture end once every deferred
-  process was rescanned (it stays when any rescan is still owed).
+  refused memory scan, or a pin refused on the process's namespace,
+  root or mappings, is excused only when the group was already in that
+  state when its scan started; a process that was running at scan start
+  keeps the refusal as a gap even if it exits mid-scan. Capture-wide
+  budget stops, handle-budget waits and other skips always stay, and
+  the same failures on a live process stay named gaps. A tick that
+  stops only to finish cleaning up such ended processes no longer files
+  a postponement gap either, and a tick deep-scan deferral is withdrawn
+  at capture end once every deferred process was rescanned (it stays
+  when any rescan is still owed, or when a rescan ran only after the
+  process began exiting and excused a refusal).
 
 ### Known limitations
 

@@ -6505,6 +6505,10 @@ struct DiscoveryCounters {
     /// scan, reported once as summaries, then cleared so live accumulation
     /// starts fresh.
     noise: DiscoveryNoiseAggregator,
+    /// Skips this scan dropped because its group was already ending at
+    /// scan start. Nonzero means the scan saw less than a live scan would
+    /// have, so it cannot settle work owed from before the group ended.
+    ending_suppressed_skips: u64,
 }
 
 impl DiscoveryCounters {
@@ -7121,11 +7125,46 @@ fn scan_and_pin_with(
 }
 
 // Test-only: make the next scans on this thread see their view as
-// already in its final exit at scan start.
+// already in its final exit at scan start, and add skips to the next
+// scan's outcome as if the scan itself had reported them.
 #[cfg(test)]
 thread_local! {
     pub(crate) static FORCE_ENDING_AT_SCAN_START: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    pub(crate) static INJECT_SCAN_SKIPS: std::cell::RefCell<Vec<Skipped>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pin refusals that come from the target process's own namespace, root
+/// or mappings: the parts an exiting process tears down.
+const ENDING_PIN_REFUSAL_PREFIXES: [&str; 7] = [
+    "cannot identify process mount namespace",
+    "process mount namespace changed during discovery",
+    "opening object within retained target root",
+    "mapping identity unavailable",
+    "the target mount table is unreadable",
+    "cold member ",
+    "cold process ",
+];
+
+/// Whether a skip from a scan of a group already ending at scan start is
+/// that ending rather than a gap: only a per-process acquisition refusal
+/// (a refused memory scan, or a pin refused on the process's namespace,
+/// root or mappings). A pin wait is the handle budget's control signal,
+/// a capture-wide budget stop is the capture's own limit, and every other
+/// skip (an unnormalizable path, a file-level identity refusal) does not
+/// depend on the process being alive, so all of those stay.
+fn skip_is_ending_refusal(skip: &Skipped) -> bool {
+    if skip.subject == crate::discovery::identity::PIN_WAIT_SUBJECT
+        || crate::discovery::scan::names_capture_budget_stop(&skip.reason)
+    {
+        return false;
+    }
+    skip.reason.starts_with("memory scan refused: ")
+        || skip.reason.contains("(map_files fallback: ")
+        || ENDING_PIN_REFUSAL_PREFIXES
+            .iter()
+            .any(|prefix| skip.reason.starts_with(prefix))
 }
 
 /// One scan plus its pins plus its shape proof: the modules, the pins,
@@ -7188,8 +7227,18 @@ fn scan_and_pin_with_proof(
         scan_start,
         crate::attach::monotonic_ns(),
     );
-    let (outcome, scan_examined, scan_shape) =
+    #[allow(unused_mut)]
+    let (mut outcome, scan_examined, scan_shape) =
         scanned.map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
+    #[cfg(test)]
+    INJECT_SCAN_SKIPS.with(|inject| {
+        let injected = std::mem::take(&mut *inject.borrow_mut());
+        match &mut outcome {
+            ScanOutcome::Scanned { skipped, .. } | ScanOutcome::Unavailable { skipped, .. } => {
+                skipped.extend(injected)
+            }
+        }
+    });
     let complete = outcome.unavailable_reason().is_none()
         && stop_before.is_none()
         && budget.stopped_reason().is_none()
@@ -7200,7 +7249,11 @@ fn scan_and_pin_with_proof(
             .any(|skip| scan_skip_truncates(&skip.reason));
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
     // Retain acquisition losses before pinning can fail on an exited generation.
-    for skipped in outcome.skipped().iter().filter(|_| !ending_at_start) {
+    for skipped in outcome.skipped() {
+        if ending_at_start && skip_is_ending_refusal(skipped) {
+            counters.ending_suppressed_skips += 1;
+            continue;
+        }
         counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
@@ -7231,7 +7284,11 @@ fn scan_and_pin_with_proof(
     );
     let (pinned, pin_skips) =
         pinned.map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
-    for skipped in pin_skips.into_iter().filter(|_| !ending_at_start) {
+    for skipped in pin_skips {
+        if ending_at_start && skip_is_ending_refusal(&skipped) {
+            counters.ending_suppressed_skips += 1;
+            continue;
+        }
         counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(&skipped);
         counters.object_skips.push(skipped);
@@ -28033,6 +28090,7 @@ impl Engine {
             // gap, and the commit below never sees it — never a
             // downgrade to unknown.
             let waited_for_handles = pins_waited_for_handles_budget(&counters.object_skips);
+            let hollow_ending_scan = counters.ending_suppressed_skips > 0;
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
                 // Completeness is intentionally unused here: refreshed
@@ -28067,12 +28125,19 @@ impl Engine {
                         &modules,
                     );
                     // The deferred rescan ran: that exact view allocation
-                    // is no longer owed.
+                    // is no longer owed. A rescan that dropped refusals
+                    // because the group was already ending did not see
+                    // what the deferral postponed, so like a departed
+                    // view it folds into the unsettled flag instead.
                     let admission = self.views[position].view_admission();
+                    let before = self.quantum_deferred_views.len();
                     self.quantum_deferred_views
                         .retain(|(owed, owed_admission)| {
                             !(owed == view_id && owed_admission.same_allocation(&admission))
                         });
+                    if hollow_ending_scan && self.quantum_deferred_views.len() != before {
+                        self.quantum_deferral_unsettled = true;
+                    }
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {

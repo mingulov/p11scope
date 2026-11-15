@@ -292,26 +292,29 @@ fn read_call_times(ledgers: &[PathBuf]) -> Vec<CallTime> {
     calls
 }
 
-/// The end of the report's disclosed first-use window for `module`: the
-/// module record's `first_attached_at_ns` (the first complete attach),
-/// which must lie inside a disclosed `pre_attach`/`late_discovery`
-/// unobserved window starting at scope start. Panics naming what is
-/// missing when the report does not disclose it.
-fn first_use_window_end(profile: &serde_json::Value, module: &Path) -> u64 {
+/// The report's discovery records for `module` (by path).
+fn module_records<'a>(profile: &'a serde_json::Value, module: &Path) -> Vec<&'a serde_json::Value> {
     let want = module.to_str().expect("utf8 module path");
-    let records: Vec<_> = profile
+    profile
         .get("evidence")
         .and_then(|evidence| evidence.get("discovery"))
         .and_then(|discovery| discovery.as_array())
         .expect("evidence.discovery")
         .iter()
         .filter(|record| record.get("path").and_then(|p| p.as_str()) == Some(want))
-        .collect();
+        .collect()
+}
+
+/// The module's first complete attach (`first_attached_at_ns`), which a
+/// disclosed `pre_attach`/`late_discovery` unobserved window starting at
+/// or before it must reach: the first-use gap is named, never silent.
+/// Panics naming what is missing.
+fn first_use_window_end(records: &[&serde_json::Value]) -> u64 {
     let first = records
         .iter()
         .filter_map(|record| record.get("first_attached_at_ns")?.as_u64())
         .min()
-        .unwrap_or_else(|| panic!("no first_attached_at_ns for {want}: {records:?}"));
+        .unwrap_or_else(|| panic!("no first_attached_at_ns: {records:?}"));
     let disclosed = records
         .iter()
         .filter_map(|record| record.get("unobserved_windows")?.as_array())
@@ -320,77 +323,164 @@ fn first_use_window_end(profile: &serde_json::Value, module: &Path) -> u64 {
             matches!(
                 window.get("reason").and_then(|r| r.as_str()),
                 Some("pre_attach" | "late_discovery")
-            ) && window.get("end_ns").and_then(|end| end.as_u64()) >= Some(first)
+            ) && window.get("start_ns").and_then(|start| start.as_u64()) <= Some(first)
+                && window.get("end_ns").and_then(|end| end.as_u64()) >= Some(first)
         });
     assert!(
         disclosed,
-        "no disclosed first-use window reaches the first attach {first}: {records:?}"
+        "no disclosed first-use window covers the first attach {first}: {records:?}"
     );
     first
 }
 
+/// Each endpoint's first attach by file offset: (begin, completion).
+fn first_attach_points(records: &[&serde_json::Value]) -> BTreeMap<u64, (Option<u64>, u64)> {
+    let mut points = BTreeMap::new();
+    for record in records {
+        for point in record
+            .get("first_attach_points")
+            .and_then(|points| points.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let offset = point
+                .get("file_offset")
+                .and_then(|o| o.as_u64())
+                .expect("file_offset");
+            let began = point.get("began_ns").and_then(|b| b.as_u64());
+            let attached = point
+                .get("attached_ns")
+                .and_then(|a| a.as_u64())
+                .expect("attached_ns");
+            points
+                .entry(offset)
+                .and_modify(|known: &mut (Option<u64>, u64)| {
+                    if attached < known.1 {
+                        *known = (began, attached);
+                    }
+                })
+                .or_insert((began, attached));
+        }
+    }
+    points
+}
+
+/// Per function row of `sha256`: (first name, target file offset, calls).
+fn function_rows_by_target(profile: &serde_json::Value, sha256: &str) -> Vec<(String, u64, u64)> {
+    profile
+        .get("functions")
+        .and_then(|functions| functions.as_array())
+        .expect("functions")
+        .iter()
+        .filter(|row| {
+            row.get("module")
+                .and_then(|module| module.get("sha256"))
+                .and_then(|sha| sha.as_str())
+                == Some(sha256)
+        })
+        .filter_map(|row| {
+            let name = row.get("names")?.as_array()?.first()?.as_str()?.to_string();
+            let offset = row.get("target")?.get("file_offset")?.as_u64()?;
+            let calls = row.get("calls").and_then(|c| c.as_u64()).unwrap_or(0);
+            Some((name, offset, calls))
+        })
+        .collect()
+}
+
 /// Exact accounting for a learned provider (owner ruling 2026-11-15: a
-/// percentage floor is the wrong check). Per function, the observed calls
-/// plus the calls inside the disclosed pre-attach window must account for
-/// the ground truth: every call that started after the window's end (the
-/// module's first complete attach, `first_attached_at_ns`) must be
-/// observed, and nothing may be observed beyond the ground truth. A
-/// call that started inside the window may land or not (its probe may
-/// attach while the call runs); the window is the report's disclosure of
-/// the first-use gap (the gap row names it, the observer cannot count
-/// calls it never saw). Any other miss, however small, is an undisclosed
-/// miss and fails (a mid-capture detach/replace window, slot churn).
+/// percentage floor is the wrong check), per call. Profile counts are
+/// completed calls (entry and return both observed), and the report
+/// publishes each function's first attach (`first_attach_points`: the
+/// attach call's begin and completion, kept across replaced probes). So
+/// every timed call is classified on its own: one that entered after its
+/// function's first attach completed must be counted; one that entered
+/// before the attach began cannot be; only one that entered while its
+/// first attach ran is ambiguous (counted or not, reported). Per function
+/// `must <= observed <= must + ambiguous`: a landed early call can never
+/// offset a later miss, because no call outside the ambiguous set may
+/// land. The module's first-use window must be disclosed. Any other miss,
+/// however small, is an undisclosed miss (a mid-capture detach/replace
+/// window, slot churn); a function that lost every counted call is named
+/// as probe loss, and overcounts or invented functions fail on their own
+/// (never under the undisclosed-miss text the run-tree harness declares).
 fn assert_exact_first_use_accounting(
     profile: &serde_json::Value,
     module: &Path,
     ledgers: &[PathBuf],
 ) {
     let sha = record_sha256(profile, module);
-    let observed = function_calls(profile, &sha);
+    let records = module_records(profile, module);
+    let window_end = first_use_window_end(&records);
+    let points = first_attach_points(&records);
+    let rows = function_rows_by_target(profile, &sha);
     let calls = read_call_times(ledgers);
     let oracle = sum_ledgers(ledgers);
-    let timed: u64 = calls.len() as u64;
     assert_eq!(
-        timed,
+        calls.len() as u64,
         oracle.values().sum::<u64>(),
         "every ledger call carries its time bounds"
     );
-    let window_end = first_use_window_end(profile, module);
-    let mut problems = Vec::new();
+    let mut misses = Vec::new();
+    let mut others = Vec::new();
     let mut summary = Vec::new();
     for (name, total) in &oracle {
-        let after = calls
-            .iter()
-            .filter(|call| &call.name == name && call.start_ns > window_end)
-            .count() as u64;
-        let seen = observed.get(name).copied().unwrap_or(0);
-        summary.push(format!(
-            "{name}: observed {seen}, after-window {after}, total {total}"
-        ));
-        if seen > *total {
-            problems.push(format!(
-                "{name}: observed {seen} exceeds the {total}-call ground truth"
+        let targets: Vec<_> = rows.iter().filter(|(row, _, _)| row == name).collect();
+        let [(_, offset, seen)] = targets.as_slice() else {
+            others.push(format!(
+                "{name}: {} function rows, want exactly one",
+                targets.len()
             ));
+            continue;
+        };
+        let Some((began, attached)) = points.get(offset).copied() else {
+            others.push(format!(
+                "{name}: the report discloses no first attach for offset {offset:#x}"
+            ));
+            continue;
+        };
+        let (mut must, mut ambiguous) = (0u64, 0u64);
+        for call in calls.iter().filter(|call| &call.name == name) {
+            if call.start_ns > attached {
+                must += 1;
+            } else if began.is_none_or(|began| call.start_ns >= began) {
+                ambiguous += 1;
+            }
         }
-        if seen < after {
-            problems.push(format!(
-                "undisclosed miss: {} calls after the pre-attach window ({name}: observed {seen} of {after} that started after {window_end})",
-                after - seen
+        summary.push(format!(
+            "{name}: observed {seen}, must {must}, ambiguous {ambiguous}, total {total}"
+        ));
+        if *seen > must + ambiguous {
+            others.push(format!(
+                "{name}: observed {seen} exceeds the {must} calls after its first attach plus {ambiguous} during it"
+            ));
+        } else if *seen == 0 && must > 0 {
+            others.push(format!(
+                "probe loss: {name} observed none of {must} calls after its first attach"
+            ));
+        } else if *seen < must {
+            misses.push(format!(
+                "undisclosed miss: {} calls after the pre-attach window ({name}: observed {seen} of {must} that entered after its first attach at {attached})",
+                must - seen
             ));
         }
     }
-    let invented: Vec<_> = observed
+    let invented: Vec<_> = rows
         .iter()
-        .filter(|(name, calls)| **calls > 0 && !oracle.contains_key(*name))
+        .filter(|(name, _, calls)| *calls > 0 && !oracle.contains_key(name))
         .collect();
     if !invented.is_empty() {
-        problems.push(format!(
+        others.push(format!(
             "observed functions the workload never called: {invented:?}"
         ));
     }
     assert!(
-        problems.is_empty(),
-        "exact accounting failed: {problems:?}; window end {window_end}; {summary:?}"
+        others.is_empty(),
+        "exact accounting failed (not an undisclosed miss): {others:?}; misses {} ; window end {window_end}; {summary:?}",
+        misses.len()
+    );
+    assert!(
+        misses.is_empty(),
+        "exact accounting failed: {misses:?}; window end {window_end}; {summary:?}"
     );
     eprintln!("exact accounting ok: window end {window_end}; {summary:?}");
 }
@@ -411,20 +501,6 @@ fn record_sha256(profile: &serde_json::Value, module: &Path) -> String {
         .and_then(|sha| sha.as_str())
         .expect("record sha256")
         .to_string()
-}
-
-/// Coverage of the oracle after the first worker, excluding the first
-/// worker's masking effect: observed calls cannot be attributed per
-/// worker, so the numerator subtracts the first worker's whole oracle
-/// (the most its landed calls could inflate it). A sound lower bound
-/// on later-worker recall: it never hides their misses behind the
-/// first worker's landed calls (about 3 points at 32 workers).
-fn coverage_after_first_worker(
-    observed_total: u64,
-    oracle_first_total: u64,
-    oracle_rest_total: u64,
-) -> f64 {
-    observed_total.saturating_sub(oracle_first_total) as f64 / oracle_rest_total as f64
 }
 
 /// Each profile row counts once, under its first name: a row's calls
@@ -453,24 +529,77 @@ fn function_calls_counts_each_row_once_not_per_alias() {
     );
 }
 
-/// The after-first-worker bound excludes first-worker masking: landed
-/// first-worker calls never inflate later-worker recall, and missed
-/// later-worker calls always show.
+/// Exact accounting classifies each call against its own function's
+/// first attach, never the module-wide one: a call that entered after
+/// `C_GetInfo` attached (200 > 100) but before a later endpoint finished
+/// the module's first complete attach (500) must land, so one observed
+/// call of two is an undisclosed miss; a per-count check against the
+/// module instant would let that early call offset the later miss. A call
+/// that entered before the attach began cannot land, so observing it is
+/// an overcount, never an undisclosed miss.
 #[test]
-fn coverage_after_first_worker_excludes_first_worker_masking() {
-    // Later workers land all 31 calls and the first worker's 1 call
-    // also landed: recall is 1.0, not 32/31.
-    assert_eq!(coverage_after_first_worker(32, 1, 31), 1.0);
-    // Later workers miss 3 of 31 (true 0.903); the first worker's
-    // landed call must not hide it.
-    let bound = coverage_after_first_worker(28 + 1, 1, 31);
-    assert!(
-        (bound - 28.0 / 31.0).abs() < 1e-12,
-        "misses show through the bound: {bound}"
+fn exact_accounting_never_lets_an_early_call_offset_a_later_miss() {
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let ledger = dir.path().join("l0");
+    std::fs::write(
+        &ledger,
+        "LEDGER C_GetInfo=2\nCALL C_GetInfo 200 210\nCALL C_GetInfo 600 610\n",
+    )
+    .expect("write ledger");
+    let module = Path::new("/opt/p11.so");
+    let profile = |calls: u64, began: u64, attached: u64| {
+        serde_json::json!({
+            "evidence": {"discovery": [{
+                "path": "/opt/p11.so",
+                "sha256": "abc",
+                "first_attached_at_ns": 500,
+                "unobserved_windows": [{"start_ns": 10, "end_ns": 500, "reason": "late_discovery"}],
+                "first_attach_points": [
+                    {"file_offset": 16, "began_ns": began, "attached_ns": attached},
+                    {"file_offset": 32, "began_ns": 450, "attached_ns": 500}
+                ]
+            }]},
+            "functions": [
+                {"module": {"sha256": "abc"}, "names": ["C_GetInfo"],
+                 "target": {"file_offset": 16}, "calls": calls},
+                {"module": {"sha256": "abc"}, "names": ["C_Finalize"],
+                 "target": {"file_offset": 32}, "calls": 0}
+            ]
+        })
+    };
+    let failure = |profile: serde_json::Value| {
+        let ledgers = vec![ledger.clone()];
+        std::panic::catch_unwind(move || {
+            assert_exact_first_use_accounting(&profile, module, &ledgers)
+        })
+        .err()
+        .map(|panic| panic.downcast_ref::<String>().cloned().unwrap_or_default())
+    };
+    assert_eq!(failure(profile(2, 90, 100)), None, "both calls landed");
+    // The 200 call entered while the attach ran (150..300): it may land.
+    assert_eq!(
+        failure(profile(2, 150, 300)),
+        None,
+        "an ambiguous call may land"
     );
-    assert!(bound < 0.95, "a 3-point shortfall fails the floor: {bound}");
-    // Nothing landed: zero, never negative.
-    assert_eq!(coverage_after_first_worker(0, 1, 31), 0.0);
+    assert_eq!(failure(profile(1, 150, 300)), None, "or not");
+    let miss = failure(profile(1, 90, 100)).expect("one landed call of two fails");
+    assert!(
+        miss.contains("undisclosed miss: 1 calls after the pre-attach window"),
+        "{miss}"
+    );
+    // Attach began at 250: the 200 call cannot land, so 2 is an overcount.
+    let over = failure(profile(2, 250, 300)).expect("an impossible landing fails");
+    assert!(
+        over.contains("not an undisclosed miss") && !over.contains("undisclosed miss:"),
+        "{over}"
+    );
+    // Nothing landed after the attach: probe loss, not a declared miss.
+    let lost = failure(profile(0, 90, 100)).expect("probe loss fails");
+    assert!(
+        lost.contains("probe loss") && !lost.contains("undisclosed miss:"),
+        "{lost}"
+    );
 }
 
 /// Exact counts in both directions: every ledger function observed
@@ -1260,9 +1389,9 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
 /// so the first live mapper must teach it the provider file: probes
 /// attach by file identity and every later grandchild's calls land.
 /// The first worker's calls may be missed honestly (PARTIAL with the
-/// learned-file gap row plus descendant gaps), so coverage of the oracle
-/// after the first worker must clear 95% (measured 1.0 across the fix1
-/// qualification runs: the linger keeps every mapper provable). The
+/// learned-file gap row plus descendant gaps); judged by exact accounting
+/// (owner ruling 2026-11-15): every call after its function's first
+/// attach must land (`assert_exact_first_use_accounting`). The
 /// linger is load-bearing, not padding: at ~15 ms without it the debug
 /// observer under test cannot complete a proof scan inside one lifetime,
 /// so the cell would test build-profile speed instead of the fix; the
@@ -1314,30 +1443,10 @@ fn privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage() {
         .and_then(|probes| probes.as_u64())
         .expect("attached_probes");
     assert!(probes > 0, "the run attached probes: {profile}");
-    // The oracle after the first worker: every later grandchild ran
-    // under attached file-identity probes, so its calls must land.
-    let oracle_rest = sum_ledgers(&ledgers[1..]);
-    let oracle_rest_total: u64 = oracle_rest.values().sum();
-    let oracle_first_total: u64 = sum_ledgers(&ledgers[..1]).values().sum();
-    assert!(oracle_rest_total > 0, "the oracle is non-empty");
-    let sha = record_sha256(&profile, &module);
-    let observed = function_calls(&profile, &sha);
-    let observed_total: u64 = observed.values().sum();
-    // Exactness still holds upward: no observed call is invented.
-    let oracle_all = sum_ledgers(&ledgers);
-    let oracle_all_total: u64 = oracle_all.values().sum();
-    assert!(
-        observed_total <= oracle_all_total,
-        "observed {observed_total} calls exceed the {oracle_all_total}-call oracle: {observed:?}"
-    );
-    // The bound excludes the first worker's masking effect (its landed
-    // calls cannot inflate later-worker recall).
-    let coverage =
-        coverage_after_first_worker(observed_total, oracle_first_total, oracle_rest_total);
-    assert!(
-        coverage >= 0.95,
-        "coverage after the first worker is {coverage:.4} ({observed_total}/{oracle_rest_total} less first-worker {oracle_first_total}): {observed:?}"
-    );
+    // Exact accounting: every call after its function's first attach
+    // lands; the first mapper's earlier calls fall in the disclosed
+    // first-use window.
+    assert_exact_first_use_accounting(&profile, &module, &ledgers);
     // Honesty half: the first mapper's miss stays disclosed, never silent.
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
     let learned = evidence

@@ -2789,7 +2789,15 @@ The old bounds are measurements, not a product startup SLA.
   in `budgets.native_departed.pair_prune_overflow`: no base is forgotten
   silently and the map does not grow; only exact per-pair revival is
   lost, and the published overflow count says so. `pair_dropped_rows`
-  and `pair_dropped_base` publish the exact aggregate.
+  and `pair_dropped_base` publish the exact aggregate. Every other
+  per-pid or per-image structure is hard-capped and its saturation is
+  published: the run-wide unidentified caller-image set (16,384;
+  `unbound_images_saturated` with `unidentified_pids_dropped`), the
+  per-module image sets (4,096; `images_saturated` with `pids_dropped`),
+  and the enumeration memory (65,536 tasks, with the documented
+  stop-time over-report when a live task is evicted). Under sustained
+  churn those caps bind within hours; afterwards the same memory is
+  reused, so no per-ever structure grows without a bound.
 
 ### Leader-exit and exec-chain callers under `--system` stay unattributed (DR-05)
 

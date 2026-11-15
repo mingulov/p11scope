@@ -436,6 +436,9 @@ fn accept_retained_inputs(
     for input in &inputs.inputs {
         let outcome = (|| -> Result<_> {
             let mut manifest = input.manifest.clone();
+            if !manifest.getters.is_empty() {
+                bail!(crate::inspect_system::INVENTORY_GETTER_REFUSAL);
+            }
             let manifest_pins = &input.pins;
             // Scan fallback preserves counts but cannot attest a stale object.
             if !input.stale.is_empty() || manifest_pins.check_unchanged() != Ok(true) {

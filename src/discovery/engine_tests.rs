@@ -33772,6 +33772,117 @@ fn a_gated_dynamic_view_with_manifest_getters_is_armed_on_the_next_scan() {
     assert!(!engine.getter_loader_views.contains(&view));
 }
 
+/// The first executable file mapping of `pid`: its path and the file
+/// offset where that mapping starts.
+fn executable_file_mapping(pid: u32) -> (String, u64) {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    maps.lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields.len() >= 6 && fields[1].contains('x') && fields[5].starts_with('/')).then(
+                || {
+                    (
+                        fields[5].to_string(),
+                        u64::from_str_radix(fields[2], 16).unwrap(),
+                    )
+                },
+            )
+        })
+        .expect("an executable file mapping")
+}
+
+/// End to end through the tick: a dynamically linked process in a cgroup
+/// scope maps an accepted getter manifest's object and owns no provider.
+/// The first pass asks for its loader, the next scan arms it, and the
+/// getter attaches under that loader context. A process that was running
+/// at capture start and never returned from its hooked getter is named
+/// at capture end (twin: a getter return clears it).
+#[test]
+fn a_gated_dynamic_getter_view_attaches_under_its_armed_loader() {
+    let sleeps = e06_spawn_sleeps(1);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    let (path, offset) = executable_file_mapping(pid);
+    let (manifest, pins) = manifest_and_pins_for(&path);
+    let mut manifest = with_getters(manifest, &[("C_GetFunctionList", 0, offset + 0x10)]);
+    manifest.surfaces.clear();
+    assert!(crate::manifest_input::is_getter_only(&manifest));
+    let _ = engine.pinned.absorb(pins);
+    engine.manifests = vec![manifest];
+    engine.manifest_ordinals = vec![0];
+    engine.startup_views.insert(view);
+    assert!(engine.loader_arming_gated(view));
+
+    let mut session = ScriptedSession::with_records([], 0);
+    session.dynamic_attach_reports_added = true;
+    engine.request_refresh(pid, None);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert!(
+        engine.getter_loader_views.contains(&view),
+        "the first pass asks for the getter view's loader"
+    );
+    assert!(engine.loader_registry.ids_for_view(view).is_empty());
+    refresh_inventory_with(&mut engine, &mut session);
+    let contexts = engine.loader_registry.ids_for_view(view);
+    assert_eq!(contexts.len(), 1, "the next scan armed its loader");
+    assert!(
+        session
+            .dynamic_export_links
+            .iter()
+            .any(|link| link.0 == contexts[0]),
+        "the getter attached under the loader context: {:?}",
+        session.dynamic_export_links
+    );
+    assert!(engine.manifest_getter_context_cached(view).is_none());
+    assert!(engine.getter_unreturned.contains(&view));
+
+    let named = |engine: &Engine| {
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason == GETTER_NO_RETURN)
+    };
+    let mut returned = engine.getter_unreturned.clone();
+    engine.note_getter_return(pid);
+    assert!(engine.getter_unreturned.is_empty(), "a return clears it");
+    engine.settle_frame_deferrals_at_capture_end();
+    assert!(!named(&engine));
+    engine.getter_unreturned.append(&mut returned);
+    engine.settle_frame_deferrals_at_capture_end();
+    assert!(
+        named(&engine),
+        "a startup view that never returned is named"
+    );
+}
+
+/// A loader hit can map a manifest getter's object into a tracked
+/// process; the record-path scan requests a refresh so the getter pass
+/// runs (twin: without a getter manifest it does not).
+#[test]
+fn a_loader_record_scan_requests_a_getter_pass_when_getters_are_accepted() {
+    for getters in [false, true] {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 0;
+        if getters {
+            accept_a_manifest_getter(&mut engine);
+        }
+        let pid = engine.views[0].pid();
+        engine.refresh_requested.clear();
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert_eq!(engine.loader_records_accepted, 1);
+        assert_eq!(
+            engine.refresh_requested.contains_key(&pid),
+            getters,
+            "getters={getters}"
+        );
+    }
+}
+
 /// A view whose manifest getter work a closed or spent pass skipped is
 /// requested again even with no loader context (a static program's owner
 /// is view-owned); a settled view is not.
@@ -42227,6 +42338,12 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
 /// the path the manifest names (`ObjectRecord.path`, which it opens), keyed by the
 /// identity that path resolves to right now.
 fn pin_as_manifest_object(object_path: &str) -> PinnedObjects {
+    manifest_and_pins_for(object_path).1
+}
+
+/// A manifest naming exactly the opened `object_path` (its real identity
+/// and provenance, no walked functions) and that manifest's own pins.
+fn manifest_and_pins_for(object_path: &str) -> (Manifest, PinnedObjects) {
     let file = p11scope_manifest::identity::open_object(Path::new(object_path)).unwrap();
     let found = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
     let identity = p11scope_manifest::identity::inspect_file(&file)
@@ -42244,7 +42361,8 @@ fn pin_as_manifest_object(object_path: &str) -> PinnedObjects {
     manifest.surfaces[0].acquisition = p11scope_manifest::manifest::Acquisition::Absent;
     manifest.surfaces[0].walk = p11scope_manifest::manifest::WalkOutcome::NotWalked;
     manifest.surfaces[0].functions.clear();
-    pin_manifest_objects(&manifest).unwrap()
+    let pins = pin_manifest_objects(&manifest).unwrap();
+    (manifest, pins)
 }
 
 fn entry(name: &'static str, object: ObjectKey, file_offset: u64) -> ScannedEntry {

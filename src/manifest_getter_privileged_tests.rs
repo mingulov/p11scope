@@ -6,11 +6,16 @@
 //! writes a manifest naming only the getters, by file offset from the
 //! program's own symbol table. `p11scope profile --pid --manifest` then
 //! hooks the getters, reads the tables they return at run time, and must
-//! count every table call exactly, named, with each call reached through
+//! count every table call exactly, under standard-layout names (marked
+//! not proven), with each call reached through
 //! either table counted once. A third cell lets the calls follow the
 //! getter's return at once: they race the table attach, and the report
 //! must name that window (`unprotected_live_windows`) rather than read
-//! exact.
+//! exact. A dynamically linked build of the same program (it embeds the
+//! provider and still exports nothing) runs under `--cgroup`: the scope
+//! leaves a provider-free process unarmed, so the getter waits for its
+//! loader to arm on the next scan and attaches under it. One cell takes
+//! the helper's default output (all three getters).
 //!
 //! Sync without sleeps: the program prints the addresses its tables
 //! hand out, and the cell waits until each of them reads back as a
@@ -89,19 +94,78 @@ fn build_app(dir: &Path) -> Result<PathBuf> {
             .context("running cc")?;
         ensure!(status.success(), "static fixture build failed");
     }
-    // The shape under test: no dynamic symbol table at all.
+    exports_no_getter(&app)?;
+    Ok(app)
+}
+
+/// The fixture linked dynamically (`PT_INTERP`), still exporting no
+/// PKCS#11 symbol: a program that embeds its provider.
+fn build_dynamic_app(dir: &Path) -> Result<PathBuf> {
+    let app = dir.join("dynamic_getter_app");
+    let status = Command::new("cc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&app)
+        .arg(repo("tests/fixtures/manifest-getter/static_getter_app.c"))
+        .status()
+        .context("running cc (a C compiler is required to build the fixture)")?;
+    ensure!(status.success(), "dynamic fixture build failed");
+    let headers = Command::new("readelf").arg("-l").arg(&app).output()?;
+    ensure!(
+        String::from_utf8_lossy(&headers.stdout).contains("INTERP"),
+        "the dynamic fixture has no PT_INTERP"
+    );
+    exports_no_getter(&app)?;
+    Ok(app)
+}
+
+/// The shape under test: no PKCS#11 getter in the dynamic symbol table.
+fn exports_no_getter(app: &Path) -> Result<()> {
     let output = Command::new("readelf")
         .arg("--dyn-syms")
-        .arg(&app)
+        .arg(app)
         .output()?;
     let text = String::from_utf8_lossy(&output.stdout);
     ensure!(
         !text.contains("C_Get"),
-        "the static fixture exports a PKCS#11 getter: {text}"
+        "the fixture exports a PKCS#11 getter: {text}"
     );
-    Ok(app)
+    Ok(())
 }
 
+/// A real cgroup v2 leaf holding only the app, removed when dropped
+/// (after the app has exited).
+struct ScratchCgroup(PathBuf);
+
+impl ScratchCgroup {
+    fn holding(pid: u32) -> Result<Self> {
+        let path = PathBuf::from(format!(
+            "/sys/fs/cgroup/p11scope-getter-cell-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path)
+            .with_context(|| format!("creating the cell cgroup {}", path.display()))?;
+        let cgroup = Self(path);
+        std::fs::write(cgroup.0.join("cgroup.procs"), format!("{pid}\n"))
+            .context("moving the app into the cell cgroup")?;
+        Ok(cgroup)
+    }
+}
+
+impl Drop for ScratchCgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellScope {
+    /// `profile --pid` of a static program.
+    StaticPid,
+    /// `profile --cgroup` of a dynamically linked program.
+    DynamicCgroup,
+}
+
+/// `getters` empty: the helper's default, every standard getter defined.
 fn getter_manifest(app: &Path, out: &Path, getters: &[&str]) -> Result<()> {
     let mut command = Command::new("python3");
     command
@@ -258,21 +322,65 @@ fn parse_fields(line: &str) -> BTreeMap<String, String> {
 /// `gated` waits until every published table function is probed before
 /// releasing the calls, so the counts must be exact; otherwise the calls
 /// race the table attach and the cell checks that the window is named.
-fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool) -> Result<()> {
+fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool, scope: CellScope) -> Result<()> {
     let observer = observer_binary()?;
     let dir = tempfile::tempdir()?;
-    let app_path = build_app(dir.path())?;
+    let app_path = match scope {
+        CellScope::StaticPid => build_app(dir.path())?,
+        CellScope::DynamicCgroup => build_dynamic_app(dir.path())?,
+    };
     let manifest = dir.path().join("getters.json");
     getter_manifest(&app_path, &manifest, getters)?;
+    let hooked: Vec<&str> = if getters.is_empty() {
+        vec!["C_GetFunctionList", "C_GetInterface", "C_GetInterfaceList"]
+    } else {
+        getters.to_vec()
+    };
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+    let mut named: Vec<&str> = written["getters"]
+        .as_array()
+        .context("manifest getters")?
+        .iter()
+        .filter_map(|getter| getter["name"].as_str())
+        .collect();
+    named.sort_unstable();
+    let mut want = hooked.clone();
+    want.sort_unstable();
+    ensure!(
+        named == want,
+        "the manifest names {named:?}, expected {want:?}"
+    );
     let rounds = 25;
+    // Declared before the app so it is removed after the app exited.
+    let mut cgroup = None;
     let mut app = App::spawn(&app_path, rounds, mode)?;
     let ready = parse_fields(&app.expect("READY ")?);
     let pid: u32 = ready.get("pid").context("ready pid")?.parse()?;
+    let getter_addresses: Vec<u64> = hooked
+        .iter()
+        .map(|name| {
+            let value = ready
+                .get(&format!("getter_{name}"))
+                .with_context(|| format!("ready getter {name}"))?;
+            Ok(u64::from_str_radix(value.trim_start_matches("0x"), 16)?)
+        })
+        .collect::<Result<_>>()?;
+    let target: Vec<String> = match scope {
+        CellScope::StaticPid => vec!["--pid".into(), pid.to_string()],
+        CellScope::DynamicCgroup => {
+            let held = ScratchCgroup::holding(pid)?;
+            let path = held.0.display().to_string();
+            cgroup = Some(held);
+            vec!["--cgroup".into(), path]
+        }
+    };
     let report = dir.path().join("profile.json");
     let log = dir.path().join("observer.log");
     let log_file = std::fs::File::create(&log)?;
     let mut child = Command::new(&observer)
-        .args(["profile", "--pid", &pid.to_string(), "--manifest"])
+        .arg("profile")
+        .args(&target)
+        .arg("--manifest")
         .arg(&manifest)
         .args(["--duration", "120s", "-o"])
         .arg(&report)
@@ -284,6 +392,9 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool) -> Result<()> 
         .context("spawning the observer")?;
     let result = (|| -> Result<serde_json::Value> {
         wait_for_text(&log, "p11scope: capturing:", &mut child)?;
+        // Every hooked getter is probed before the program calls one: a
+        // cgroup capture attaches them only after its loader armed.
+        wait_for_breakpoints(pid, &getter_addresses, &mut child, &log)?;
         app.gate(b'G')?;
         if !gated {
             // Both gates at once: the table calls follow the getter's
@@ -361,6 +472,8 @@ fn run_cell(tag: &str, getters: &[&str], mode: &str, gated: bool) -> Result<()> 
         println!("GETTER_CELL {tag} observer log:\n{}", tail(&log));
     }
     let report = result?;
+    drop(app);
+    drop(cgroup);
     let evidence = &report["evidence"];
     println!(
         "GETTER_CELL {tag} completeness={} verdict_detail={} gap_classes={} skipped={}",
@@ -398,13 +511,20 @@ fn privileged_getter_only_manifest_both_getters_counts_static_program_exactly() 
         &["C_GetFunctionList", "C_GetInterface"],
         "both",
         true,
+        CellScope::StaticPid,
     )
 }
 
 #[test]
 #[ignore = "privileged: profile --pid with a C_GetFunctionList-only manifest counts a static program's table calls exactly"]
 fn privileged_getter_only_manifest_function_list_counts_static_program_exactly() -> Result<()> {
-    run_cell("list", &["C_GetFunctionList"], "list", true)
+    run_cell(
+        "list",
+        &["C_GetFunctionList"],
+        "list",
+        true,
+        CellScope::StaticPid,
+    )
 }
 
 #[test]
@@ -415,5 +535,24 @@ fn privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed(
         &["C_GetFunctionList", "C_GetInterface"],
         "both",
         false,
+        CellScope::StaticPid,
+    )
+}
+
+#[test]
+#[ignore = "privileged: the helper's default manifest (all three getters) counts a static program's table calls exactly"]
+fn privileged_default_getter_manifest_counts_static_program_exactly() -> Result<()> {
+    run_cell("default", &[], "both", true, CellScope::StaticPid)
+}
+
+#[test]
+#[ignore = "privileged: profile --cgroup arms a dynamically linked embedding program's loader for its getters and counts its table calls exactly"]
+fn privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly() -> Result<()> {
+    run_cell(
+        "cgroup",
+        &["C_GetFunctionList", "C_GetInterface"],
+        "both",
+        true,
+        CellScope::DynamicCgroup,
     )
 }

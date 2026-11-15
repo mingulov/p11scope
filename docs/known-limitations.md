@@ -3078,8 +3078,9 @@ a silent drop.
 - What the user sees: with a getter-only manifest (or any manifest that
   names getters)
   ([usage](usage.md#getter-only-manifests-providers-linked-into-a-program)),
-  a program that embeds its provider gets named per-function counts,
-  but the report stays `PARTIAL`:
+  a program that embeds its provider gets per-function counts shown
+  under standard-layout names marked not proven, but the report stays
+  `PARTIAL`:
   - observation names `unprotected_live_windows` ("calls made while
     probes were being attached may be missing"): a table attaches only
     after its getter returned it, and no pause covers a getter return,
@@ -3087,19 +3088,27 @@ a silent drop.
     table once and calls it at once loses those first calls;
   - attribution is withheld (`semantic_unverified_slots`): the names
     follow the standard table layout, which a getter-only manifest does
-    not prove, so mechanisms are not decoded; a `C_GetInterface` table
+    not prove, so nothing is decoded (no mechanisms, no arguments); a
+    `C_GetInterface` table
     adds `function list counted without names` for its interface
     selection;
   - the getters attach in the capture's initial and refresh passes; a
-    provider a `run` child loads later gets them at the next rescan;
+    getter object a tracked process loads later (a library) gets them at
+    the rescan its loader hit requests;
   - under `--system` or a cgroup scope, a dynamically linked program
     that owns no other provider gets its getters at its next scan, once
     its loader is armed; calls before then fall in the named window;
   - a getter that returns a table outside the program's file data
     (heap or anonymous memory) is refused with a named gap;
-  - a process that already called the getter before the capture started
-    gives no new return to read: use `--module <program>` for its
-    file-backed tables;
+  - a process that already fetched its table before the capture started
+    gives no getter return to read, so none of its table calls are
+    counted; when it never calls a hooked getter while watched, the
+    report names it at its exit or at capture end ("a process running
+    before the capture never called its hooked manifest getter"). Start
+    the capture first, or use `--module <program>` for file-backed
+    tables;
+  - `inventory --manifest` refuses a manifest that names getters
+    (inventory never hooks a getter);
   - under `metrics`, a `C_GetInterface` getter is not hooked (a named
     gap); calls reached only through its table are not counted;
   - a getter record still queued when its process exits is a named loss.

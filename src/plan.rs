@@ -8690,7 +8690,7 @@ fn manifest_surface_label_bytes(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::discovery::scan::ScannedModule;
     use crate::process::{MountNamespaceId, ProcessViewId};
@@ -11987,7 +11987,7 @@ mod tests {
 
     /// A manifest that locates only its table getters: no surface is
     /// walked, and the getters name where the code lives.
-    fn getter_only_manifest(getters: &[(&str, u64)]) -> Manifest {
+    pub(crate) fn getter_only_manifest(getters: &[(&str, u64)]) -> Manifest {
         let mut m = manifest_with(vec![]);
         m.surfaces.clear();
         m.getters = getters
@@ -12061,6 +12061,34 @@ mod tests {
             problems.iter().any(|p| p.contains("shares its location")),
             "{problems:?}"
         );
+    }
+
+    /// A getter beside a walked selection table must agree with that
+    /// table's record of the same function, as with a surface's (twin:
+    /// the agreeing location raises no such problem).
+    #[test]
+    fn a_getter_disagreeing_with_a_selection_table_record_is_refused() {
+        let mut m = getter_only_manifest(&[("C_GetInterface", 0x54)]);
+        m.selection_evidence
+            .tables
+            .push(p11scope_manifest::manifest::SelectionTable {
+                id: 0,
+                version: p11scope_manifest::manifest::Version { major: 3, minor: 0 },
+                walk: WalkOutcome::Full,
+                functions: vec![resolved("C_GetInterface", 0x50)],
+                semantic_authorized: false,
+            });
+        let disagrees = |m: &Manifest| {
+            crate::manifest_input::validate_structure(m)
+                .iter()
+                .any(|p| p.contains("selection-table record"))
+        };
+        assert!(disagrees(&m));
+        m.getters[0].resolution = Resolution::Resolved {
+            object: 0,
+            file_offset: 0x50,
+        };
+        assert!(!disagrees(&m));
     }
 
     /// A getter locates code in the manifest's own module: a getter in a
@@ -12179,7 +12207,10 @@ mod tests {
                 file_offset: 0x44,
             },
         }];
-        refused(&walked, "disagrees with the surface record");
+        refused(
+            &walked,
+            "disagrees with the surface or selection-table record",
+        );
         walked.getters[0].resolution = Resolution::Resolved {
             object: 0,
             file_offset: 0x40,

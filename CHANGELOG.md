@@ -16,7 +16,8 @@ versioned separately and are opaque, exact dispatch keys.
   `surfaces: []`), for a program with a statically linked provider that
   `p11scope-discover` cannot load and that exports no PKCS#11 symbol.
   The observer hooks each getter's return, reads the table it hands out
-  at run time and counts its calls by name; both getters together count
+  at run time and counts its calls under standard-layout names marked
+  not proven (nothing is decoded); both getters together count
   a call reached through either table once. `scripts/getter-manifest.py`
   writes such a manifest from the program's own symbol table. Manifest
   trust checks are unchanged. Such captures name the window before the
@@ -72,7 +73,9 @@ versioned separately and are opaque, exact dispatch keys.
 
 - Getter-only manifests: a table attaches only after its getter
   returned it, so the report always names that window and stays
-  `PARTIAL`; names are not layout-proved (no mechanism decoding);
+  `PARTIAL`; names are not layout-proved (no mechanism decoding); a
+  process that fetched its table before the capture started is not
+  counted, and is named when it never calls a hooked getter;
   `--module` together with a getter-only manifest for the same program
   names a false static probe gap at exit (no call is lost; the exit
   retirement becomes a slot replacement, planned with gapless

@@ -861,10 +861,11 @@ pub fn is_getter_only(m: &Manifest) -> bool {
         && m.selection_evidence.tables.is_empty()
 }
 
-/// Getter records: each a distinct standard getter, resolved to a listed
-/// object. A getter named beside a walked surface must agree with that
-/// surface's own record of the same function, so two claims about one
-/// name can never disagree inside one manifest.
+/// Getter records: each a distinct standard getter, resolved inside the
+/// `module_path` object, at a location no other getter shares. A getter
+/// named beside a walked surface or selection table must agree with that
+/// walk's own record of the same function, so two claims about one name
+/// can never disagree inside one manifest.
 fn validate_getters(m: &Manifest, object_ids: &BTreeSet<u32>, problems: &mut Vec<String>) {
     if m.getters.len() > GETTER_NAMES.len() {
         problems.push(format!(
@@ -923,10 +924,18 @@ fn validate_getters(m: &Manifest, object_ids: &BTreeSet<u32>, problems: &mut Vec
                 getter.name
             ));
         }
+        // Every walked record of the same function counts: a surface's
+        // and a selection table's alike.
         let disagreeing = m
             .surfaces
             .iter()
             .flat_map(|surface| &surface.functions)
+            .chain(
+                m.selection_evidence
+                    .tables
+                    .iter()
+                    .flat_map(|table| &table.functions),
+            )
             .filter(|function| function.name == getter.name)
             .any(|function| {
                 !matches!(
@@ -937,7 +946,7 @@ fn validate_getters(m: &Manifest, object_ids: &BTreeSet<u32>, problems: &mut Vec
             });
         if disagreeing {
             problems.push(format!(
-                "getter {} disagrees with the surface record of the same function",
+                "getter {} disagrees with the surface or selection-table record of the same function",
                 getter.name
             ));
         }

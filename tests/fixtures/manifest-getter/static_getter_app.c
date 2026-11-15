@@ -12,7 +12,9 @@
  * Usage: static_getter_app N list|interface|both
  *
  * Protocol (stdin gate bytes, stdout lines):
- *   READY pid=<pid>          then waits for 'G'
+ *   READY pid=<pid> getter_<name>=<address>...
+ *                            naming where each of the three getters'
+ *                            code runs; then waits for 'G'
  *   PUBLISHED getters=<k> <name>=<address>...
  *                            after calling the selected getters once
  *                            each, naming the code each round reaches
@@ -27,6 +29,8 @@
  *
  * Build: cc -std=c11 -O2 -static -o static_getter_app static_getter_app.c
  * (no -rdynamic: the missing dynamic export is the shape under test).
+ * Without -static it is a dynamically linked program that embeds the
+ * same provider and still exports no PKCS#11 symbol.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -211,7 +215,10 @@ int main(int argc, char **argv) {
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
-    printf("READY pid=%ld\n", (long)getpid());
+    printf("READY pid=%ld getter_C_GetFunctionList=%p getter_C_GetInterface=%p "
+           "getter_C_GetInterfaceList=%p\n",
+           (long)getpid(), (void *)&C_GetFunctionList, (void *)&C_GetInterface,
+           (void *)&C_GetInterfaceList);
     gate('G');
     void *list = NULL;
     CK_INTERFACE *interface = NULL;
@@ -251,8 +258,8 @@ int main(int argc, char **argv) {
             return 5;
         }
     }
-    printf("DONE C_GetFunctionList=%d C_GetInterface=%d C_Initialize=%ld "
-           "C_GetInfo=%ld C_GetSlotList=%ld C_LoginUser=%ld\n",
+    printf("DONE C_GetFunctionList=%d C_GetInterface=%d C_GetInterfaceList=0 "
+           "C_Initialize=%ld C_GetInfo=%ld C_GetSlotList=%ld C_LoginUser=%ld\n",
            use_list, use_interface, rounds * (use_list + use_interface),
            use_list ? rounds : 0, use_interface ? rounds : 0,
            use_interface ? rounds : 0);

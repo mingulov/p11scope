@@ -48,7 +48,8 @@ pub struct Manifest {
 
 /// One table getter the manifest locates: a standard getter name
 /// (`C_GetFunctionList`, `C_GetInterfaceList` or `C_GetInterface`) and
-/// where its code lives, pinned to an object like every function record.
+/// where its code lives, resolved inside the `module_path` object (the
+/// observer refuses a getter located in any other listed object).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetterRecord {

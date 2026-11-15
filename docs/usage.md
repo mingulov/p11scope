@@ -688,18 +688,26 @@ record of the same function. `C_GetFunctionList` and `C_GetInterface` can
 be named together: a function both tables share is one probe, so each call
 is counted once whichever table it went through.
 
-What you get: named call counts for every table function, exact once the
-table's probes are attached. The table is attached only after its getter
+What you get: a call count for every table function, shown under its
+standard-layout name and marked not proven, exact once the table's probes
+are attached. The table is attached only after its getter
 returns it, so calls the program makes through it in that moment can be
 missed; every capture with a manifest that names getters (a getter-only
 one, or one that also walks a surface) therefore names that window
 (`calls made while probes were being attached may be missing`,
 `unprotected_live_windows`) and reads `PARTIAL`. A program that fetches
 its table once at start-up and calls it right away loses those first
-calls; a long-running one loses at most the calls of that first moment.
-The names come from the standard table layout, which a getter-only
-manifest does not prove, so attribution is withheld too
-(`semantic_unverified_slots`; mechanism decoding is not available). The
+calls. A process that fetched its table before the capture started makes
+no getter call to read, so none of its table calls are counted; when such
+a process never calls a hooked getter while watched, the report names it
+at its exit or at capture end (`a process running before the capture
+never called its hooked manifest getter`). Start the capture first
+(`run` starts the program itself), or use `--module <program>` when its
+tables are complete in its file data. The names come from the standard
+table layout, which a getter-only manifest does not prove, so attribution
+is withheld (`semantic_unverified_slots`) and nothing is decoded: no
+mechanisms, no arguments. `inventory --manifest` refuses a manifest that
+names getters: inventory never hooks one. The
 text coverage line still suggests `--manifest`; for a program
 `p11scope-discover` cannot load, that hint does not apply. See
 [known limitations](known-limitations.md#getter-only-manifests-count-tables-read-at-run-time).

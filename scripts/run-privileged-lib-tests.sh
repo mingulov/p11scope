@@ -624,7 +624,12 @@ attach::member_stop::tests::privileged_member_stop_stops_members_at_first_exec_m
 # (libc.a: libc6-dev on Debian/Ubuntu, glibc-static on Fedora; a host
 # without it gets a prebuilt copy via P11SCOPE_GETTER_STATIC_APP, else the
 # cell fails naming libc.a); spawns the observer (P11SCOPE_E2E_OBSERVER,
-# else the test binary's p11scope sibling).
+# else the test binary's p11scope sibling). One cell takes the helper's
+# default output (all three getters); one builds the program dynamically
+# (still exporting nothing) and captures it with profile --cgroup in a
+# scratch cgroup v2 leaf, where its loader arms for the getters.
+manifest_getter_privileged_tests::privileged_default_getter_manifest_counts_static_program_exactly
+manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly
 manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly
 manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed
 manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_counts_static_program_exactly

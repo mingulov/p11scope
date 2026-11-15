@@ -1064,6 +1064,15 @@ pub struct Engine {
     /// in: exempt from ownership-gated arming (`loader_arming_gated`)
     /// until released, so the next scan arms them.
     getter_loader_views: BTreeSet<ProcessViewId>,
+    /// Views present when the capture started (the owned `run` child
+    /// excepted): a table such a process fetched before then gives no
+    /// getter return to read.
+    startup_views: BTreeSet<ProcessViewId>,
+    /// Startup views whose manifest getter hooks attached and have not
+    /// returned since. One still here when it retires, or at capture end,
+    /// is named (`GETTER_NO_RETURN`): calls through a table it fetched
+    /// before the capture were not seen.
+    getter_unreturned: BTreeSet<ProcessViewId>,
     /// The deduplicated bound-context set behind `loader_discovery`'s
     /// strategy/timing/capture counts (design §9.2). Keyed by the exact
     /// internal `{process generation, bound identity state, load kind}` — so
@@ -10268,6 +10277,10 @@ pub(crate) const POLLED_PROVIDER_LOSS: &str = "a polling rescan found a provider
 /// Frame-budget deferral (H-1) delays work, it does not drop it (F4): it is
 /// counted in `scheduling.discovery_deferrals`. Only work the terminal drain
 /// still left undone is a loss.
+/// A process already running when the capture started never called its
+/// hooked manifest getter while watched.
+pub(crate) const GETTER_NO_RETURN: &str = "a process running before the capture never called its hooked manifest getter; calls through a function table it fetched before the capture, if any, were not counted";
+
 pub(crate) const UNFINISHED_DEFERRAL_LOSS: &str =
     "discovery work deferred by a frame budget was never completed before the capture ended";
 const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
@@ -13622,6 +13635,8 @@ impl Engine {
             orphaned_getter_contexts: Vec::new(),
             getter_sites_settled: BTreeSet::new(),
             getter_loader_views: BTreeSet::new(),
+            startup_views: BTreeSet::new(),
+            getter_unreturned: BTreeSet::new(),
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
@@ -14644,6 +14659,10 @@ impl Engine {
     /// end-of-run newcomer sweep runs first, so a pending birth gaps even
     /// when no deferral is owed.
     pub(crate) fn settle_frame_deferrals_at_capture_end(&mut self) {
+        let unreturned: Vec<_> = self.getter_unreturned.iter().copied().collect();
+        for view in unreturned {
+            self.note_getter_unreturned(view);
+        }
         self.note_graph_inputs_mutated();
         self.close_remaining_newcomer_gaps_at_finish();
         self.pending_loader_arm_scans.clear();
@@ -15634,6 +15653,8 @@ impl Engine {
         // carries it to a later view.
         self.getter_sites_settled.remove(&id);
         self.getter_loader_views.remove(&id);
+        self.note_getter_unreturned(id);
+        self.startup_views.remove(&id);
         // Its selection bindings fail closed now, as a retirement's do: a
         // C_GetInterface selection on the released view is never reported
         // as silently covered by a hook that is about to be detached.
@@ -20573,6 +20594,7 @@ impl Engine {
             );
         }
         let pid = (record.pid_tgid >> 32) as u32;
+        self.note_getter_return(pid);
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
             self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             self.mark_live_loss(
@@ -21186,6 +21208,7 @@ impl Engine {
             }
         }
         let broad_admit = self.broad_admit;
+        let record_path = catchup_authority.is_none();
         let (scan_result, scan_counters) = match mode {
             LoaderScanMode::Memory => Self::scan_retained_view(
                 &self.views[position],
@@ -21279,6 +21302,13 @@ impl Engine {
             self.views[position].view_admission(),
             &found,
         );
+        // A loader hit can map a manifest getter's object: the getter pass
+        // runs on refreshed views only, so request one (the catch-up scan
+        // after an arm is followed by that tick's own export pass).
+        if record_path && self.getter_manifest_active() {
+            let pid = self.views[position].pid();
+            self.request_refresh(pid, crate::attach::monotonic_ns());
+        }
         if mode == LoaderScanMode::MetadataOnly {
             for module in &mut found {
                 let Some(current) = self.modules.iter().find(|current| {
@@ -23533,6 +23563,7 @@ impl Engine {
             &mut PendingViewRetirements,
         )>,
     ) -> Result<DiscoveryRecordOutcome> {
+        self.note_getter_return((queued.record.pid_tgid >> 32) as u32);
         let transactional = transaction.is_some();
         let can_attach = transaction
             .as_ref()
@@ -24866,9 +24897,11 @@ impl Engine {
     ) -> (bool, bool, bool, bool) {
         let sites = match self.manifest_getter_sites(view) {
             Ok(sites) => sites,
+            // A maps read can fail on a transient budget or read refusal:
+            // named, and skipped so the view is requested again.
             Err(error) => {
                 self.mark_partial("live manifest getter hook", &error.to_string());
-                return (false, false, false, false);
+                return (false, false, true, false);
             }
         };
         if sites.is_empty() {
@@ -24943,6 +24976,9 @@ impl Engine {
         }
         let (retire, attached_complete, skipped, attached) =
             self.attach_export_work(view, &collected.dynamic, session, additions_allowed);
+        if attached && self.startup_views.contains(&view) {
+            self.getter_unreturned.insert(view);
+        }
         (
             retire,
             complete && attached_complete && collected.required_seed_complete,
@@ -25064,6 +25100,12 @@ impl Engine {
         closure: &mut PauseClosure,
     ) -> bool {
         let views: Vec<_> = self.views.iter().map(ProcessView::id).collect();
+        let startup: Vec<_> = views
+            .iter()
+            .copied()
+            .filter(|view| !self.owned_run_view(*view))
+            .collect();
+        self.startup_views.extend(startup);
         let mut export_incomplete = BTreeSet::new();
         let mut attached_any = false;
         for view in views {
@@ -26689,6 +26731,7 @@ impl Engine {
         closure: &mut PauseClosure,
     ) {
         self.getter_sites_settled.remove(&view);
+        self.note_getter_unreturned(view);
         let Some(context) = self.view_getter_contexts.remove(&view) else {
             return;
         };
@@ -26701,6 +26744,26 @@ impl Engine {
                 "live manifest getter detach",
                 "a manifest getter hook detach failed; replacement was blocked for this cycle",
             );
+        }
+    }
+
+    /// Names a startup view whose hooked manifest getter never returned
+    /// while it was watched: a table it fetched before the capture is
+    /// called without any record the observer could read.
+    fn note_getter_unreturned(&mut self, view: ProcessViewId) {
+        if self.getter_unreturned.remove(&view) {
+            self.mark_partial("live manifest getter hook", GETTER_NO_RETURN);
+        }
+    }
+
+    /// A getter (or export) return for `pid`: its startup views fetched a
+    /// table the observer reads from now on.
+    fn note_getter_return(&mut self, pid: u32) {
+        if self.getter_unreturned.is_empty() {
+            return;
+        }
+        for view in self.views.iter().filter(|view| view.pid() == pid) {
+            self.getter_unreturned.remove(&view.id());
         }
     }
 
@@ -40059,7 +40122,7 @@ pub(crate) mod session_fixture {
         pub(crate) scripted_last_check: Option<&'static str>,
         /// Dynamic exports requested by the Engine, in order.
         pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
-        dynamic_export_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64, HookAbi)>,
+        pub(crate) dynamic_export_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64, HookAbi)>,
         pub(crate) dynamic_attach_reports_added: bool,
         pub(crate) dynamic_loader_attach_calls: usize,
         pub(crate) dynamic_loader_reports_added: bool,

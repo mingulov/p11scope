@@ -2107,8 +2107,14 @@ fn read_count_manifest_file(path: &Path, budget: &mut CaptureWorkBudget) -> Resu
     )
     .map_err(anyhow::Error::msg)?;
     let text = String::from_utf8(bytes).context("manifest is not UTF-8")?;
-    parse_manifest_text(&text, path)
+    let manifest = parse_manifest_text(&text, path)?;
+    ensure!(manifest.getters.is_empty(), INVENTORY_GETTER_REFUSAL);
+    Ok(manifest)
 }
+
+/// `inventory` reads tables from file data and never hooks a getter, so
+/// a manifest that names getters has nothing it could use there.
+pub(crate) const INVENTORY_GETTER_REFUSAL: &str = "inventory does not hook table getters; a manifest that names getters is for profile, trace or run";
 
 /// Count one manifest's pinnable objects without spending budget:
 /// a plain bounded read plus the shared parser. Advisory only (the
@@ -5886,6 +5892,25 @@ mod tests {
     };
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
+
+    /// `inventory --manifest` refuses a manifest that names getters by
+    /// name (it never hooks one), instead of a misleading mapping refusal.
+    #[test]
+    fn inventory_refuses_a_getter_manifest_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("getters.json");
+        let manifest = crate::plan::tests::getter_only_manifest(&[("C_GetFunctionList", 0x1a70)]);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let error = super::read_count_manifest_file(
+            &path,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(super::INVENTORY_GETTER_REFUSAL),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn progress_gate_tracks_the_dashboard_switch() {

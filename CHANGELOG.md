@@ -45,7 +45,8 @@ versioned separately and are opaque, exact dispatch keys.
   the same way instead of stopping per-key tracking for the rest of
   the run: the call stays a plain row with one counted gap that names
   its caller, and the gap names a void only when that exact original
-  was recorded wiped by one.
+  was recorded wiped by one. Its still-unclaimed original is disposed
+  with the call, so the following calls keep per-key tracking.
 - System and cgroup captures no longer file a `pid_descendant_gaps`
   gap for a tracked process that exits but lingers unreaped: a
   still-listed whole-group zombie (`Z` with no live threads) is the

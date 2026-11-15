@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::attach::SessionDrainProducers;
+use crate::discovery::caller_registry::instance_input::PlainS1Cause;
 use crate::discovery::caller_registry::{CallerRegistry, RegistryGap};
 use crate::inventory_semantics::{JointCommitIo, JointContinuationView, RetainedJointBirths};
 use crate::semantics_objects::journal::joint_audit::{
@@ -1092,6 +1093,15 @@ impl PreparedSemanticBatch {
                     // counted once at reduction, where the caller is
                     // known; no claim classification stops the lane.
                     let cause = ingested.claim_refusal_cause(input, adapter);
+                    if cause == PlainS1Cause::Unclaimable {
+                        // The exact original is still retained and
+                        // unclaimed, but this call can never certify it.
+                        // Dispose it with the call (the reduction's gap
+                        // already counts the lost per-key detail) so the
+                        // key's next seal cannot find it unmatched and
+                        // end per-key tracking for the image.
+                        ingested.dispose_unclaimable_original(input, adapter);
+                    }
                     input.retain_as_plain_s1(cause);
                     next += 1;
                     continue;

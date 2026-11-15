@@ -645,7 +645,14 @@ an original removed by an image taint, or a tainted original still
 present), the call is kept the same way as a plain row with a
 counted gap naming the caller. The gap names a void only when that
 exact original was recorded wiped by one; otherwise its reason is
-cause-neutral. Tracking continues for the following calls.
+cause-neutral. Tracking continues for this process: when the exact
+original is still unclaimed, it is disposed with the call and the
+counted gap is its only loss, so the key's next seal keeps the
+following calls. A gap that repeats for the same caller and cause
+stands for that many calls: verbose text shows the count and JSON
+carries `repeats`, while the concise summary counts rows, not calls.
+With `--max-gaps` spent, a suppressed row is counted once in the
+suppressed total, not once per call.
 This is rare — it requires a tracking interruption or a journal
 inconsistency at the same moment a call is set aside.
 

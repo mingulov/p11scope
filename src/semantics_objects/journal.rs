@@ -5259,6 +5259,7 @@ impl JournalAdapter {
     /// original claims it; this reports only the exact wipe record. The
     /// H0 wire position stays in its own device domain: it is never
     /// compared with the journal consumption ordinal a fence records.
+    #[cfg(test)]
     pub(crate) fn admission_voided(&self, admitted: &AdmittedInstanceCall) -> bool {
         self.claim_refusal_cause(admitted) == PlainS1Cause::Voided
     }
@@ -5302,6 +5303,75 @@ impl JournalAdapter {
         } else {
             PlainS1Cause::Unretained
         }
+    }
+
+    /// Dispose one unclaimed retained original whose observed admission
+    /// can never certify it (the claim step routed that call to plain S1
+    /// under the cause-neutral `Unclaimable` cause). The call's lost
+    /// per-key detail is counted by the caller-registry gap at its S1
+    /// reduction; dropping the staged original here keeps the key's next
+    /// seal from finding an unmatched entry and ending per-key tracking
+    /// for the whole image. Only the exact unclaimed H8 original is
+    /// removed: a claim, conversion, refusal marker or S1Only subject
+    /// refuses disposal and keeps the older fail-closed path. A terminal
+    /// that arrives after the BEGIN was disposed is recorded as an
+    /// expected-absent one, so it cannot taint a stream whose original
+    /// this path deliberately released.
+    pub(crate) fn dispose_unclaimable_original(&mut self, admitted: &AdmittedInstanceCall) -> bool {
+        let (Some(_origin), Some(resource)) = (
+            admitted.collected_origin(),
+            admitted.joint_resource_origin(),
+        ) else {
+            return false;
+        };
+        if !self
+            .resource_producers
+            .as_ref()
+            .is_some_and(|producers| resource.matches_producers(producers))
+        {
+            return false;
+        }
+        let native = resource.invocation();
+        let Some(entry) = self.open.get(&native) else {
+            return false;
+        };
+        let (_, image, _, _) = admitted.journal_binding();
+        if entry.image != (image.task_cookie, image.exec_id) {
+            return false;
+        }
+        if entry.converted_ticket.is_some()
+            || entry.converted_for.is_some()
+            || entry.end_converted
+            || entry.call_key.is_some()
+            || entry.s1only_subject.is_some()
+            || entry.abandon.is_some()
+        {
+            return false;
+        }
+        if self.identity_claimed(&identity_of_begin(&entry.begin)) {
+            return false;
+        }
+        if !self.ledger.matches_unconverted_original(
+            entry.begin_ordinal,
+            resource.reservation(),
+            None,
+        ) {
+            return false;
+        }
+        let missing_terminal = entry.end.is_none();
+        if missing_terminal {
+            self.note_taint_derived_absence(entry.image, native);
+        }
+        let entry = self
+            .open
+            .remove(&native)
+            .expect("checked retained original");
+        self.retained_member_dec(
+            identity_of_begin(&entry.begin),
+            RetainedMember::Open(native),
+        );
+        self.ledger.release_h8open(entry.begin_ordinal);
+        true
     }
 
     /// Continued admission authority still requires an unclaimed original.

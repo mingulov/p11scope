@@ -592,6 +592,7 @@ impl IngestedRaw {
     /// Whether a void recorded wiping this admission's retained original
     /// before the claim: a same-domain collected admission whose exact H8
     /// invocation left `open` under the latest void wipe.
+    #[cfg(test)]
     pub(crate) fn admission_voided(
         &self,
         admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
@@ -599,6 +600,29 @@ impl IngestedRaw {
     ) -> bool {
         admitted.journal_binding().0 == self.raw.producers.native_domain()
             && adapter.admission_voided(admitted)
+    }
+
+    /// Dispose this admission's still-retained, unclaimed H8 original
+    /// when the claim step classified it as `Unclaimable`. Only an
+    /// admission this ingest can name (same native domain, collected
+    /// from this quantum or an older one) reaches the adapter's exact
+    /// checks; a stale caller-supplied ingest leaves a future quantum's
+    /// original alone.
+    pub(crate) fn dispose_unclaimable_original(
+        &self,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        adapter: &mut JournalAdapter,
+    ) -> bool {
+        if admitted.journal_binding().0 != self.raw.producers.native_domain() {
+            return false;
+        }
+        let Some(origin) = admitted.collected_origin() else {
+            return false;
+        };
+        if origin.newer_than(self.raw.identity) {
+            return false;
+        }
+        adapter.dispose_unclaimable_original(admitted)
     }
 
     /// Classify an admission whose exact claim failed, so the claim step

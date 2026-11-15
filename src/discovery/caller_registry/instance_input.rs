@@ -3425,10 +3425,12 @@ impl CallerRegistry {
             // it reduced S1-direct on either path (capture-wide Joint
             // accounting may still be inactive before the first Joint
             // feed). Count the one lost per-key detail for its caller
-            // under the exact cause. Historical, downgrade, capacity and
-            // reducer refusals return before this point and keep their
-            // own counted reasons.
-            self.record_gap(RegistryGap {
+            // under the exact cause. The reduction happens while this
+            // publication applies, so publish the gap now (a staged gap
+            // would trail its call by one pass). Historical, downgrade,
+            // capacity and reducer refusals return before this point and
+            // keep their own counted reasons.
+            self.push_gap(RegistryGap {
                 caller: Some(input.caller),
                 module: None,
                 pid: None,

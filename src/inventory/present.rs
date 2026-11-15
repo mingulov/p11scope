@@ -3220,7 +3220,7 @@ fn gap_plain_subject<'a>(subject: &'a str, reason: &'a str) -> &'a str {
             || reason.strip_prefix("joint_unretained_").is_some()
             || reason.strip_prefix("joint_unclaimable_").is_some()
         {
-            return "Per-key tracking lost history for tracked processes; function counts above are unaffected";
+            return "Per-key tracking lost history for this process; function counts above are unaffected";
         }
         if reason == "joint_resume_deferred_below_fence" {
             return "Per-key tracking paused for this process; function counts above are unaffected";
@@ -4708,10 +4708,16 @@ fn render_snapshot_inner(
         }
         // The re-arm gap merges every continuation into one row: show
         // its count in text, so a long run cannot hide hundreds of
-        // interruptions behind one line. (JSON carries `repeats` for
-        // every row.)
+        // interruptions behind one line. The retained-S1 gaps merge per
+        // caller and cause, so their repeats stand for lost calls and
+        // read in text too. (JSON carries `repeats` for every row.)
         let merged_rearms =
             gap.subject == crate::inventory_semantics::RUNNING_REARM_SUBJECT && gap.repeats > 1;
+        let merged_retained_s1 = gap.subject == "Joint key operations unavailable; retained S1"
+            && (gap.reason.strip_prefix("joint_void_").is_some()
+                || gap.reason.strip_prefix("joint_unretained_").is_some()
+                || gap.reason.strip_prefix("joint_unclaimable_").is_some())
+            && gap.repeats > 1;
         match gap.budget {
             Some(refusal) => {
                 let _ = writeln!(
@@ -4720,7 +4726,7 @@ fn render_snapshot_inner(
                     refusal.resource, refusal.limit, refusal.requested,
                 );
             }
-            None if merged_rearms => {
+            None if merged_rearms || merged_retained_s1 => {
                 let _ = writeln!(out, "gap [{subject}] {reason} ({} times)", gap.repeats);
             }
             None => {

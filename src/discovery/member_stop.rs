@@ -1389,8 +1389,10 @@ impl Engine {
     /// new stop, then the wait for hook invocations already running (the
     /// detach does not wait for them), then the refusal counters.
     fn end_kernel_stops(&mut self, io: &mut dyn MemberStopIo) {
-        let _ = io.deactivate();
-        self.member_stops.unsettled = !io.quiesce();
+        // A failed deactivation leaves `active` unproven: a call still
+        // before its RCU read section is covered only by that write.
+        let deactivated = io.deactivate().is_ok();
+        self.member_stops.unsettled = !io.quiesce() || !deactivated;
         if self.member_stops.unsettled && crate::run::capture_diagnostics_on() {
             eprintln!(
                 "p11scope: no grace period proven after the member-stop deactivation; \

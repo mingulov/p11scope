@@ -88022,3 +88022,127 @@ fn member_stop_stages_a_provider_the_module_selection_names() {
     assert!(!io.cleared.contains(&key));
     assert!(!resumed);
 }
+
+/// An owned run capture's cgroup engine with an unlimited tick quantum,
+/// for the incomplete-scan retry cells below. `owned` false keeps the
+/// same cgroup scope without an owned run.
+fn owned_run_incomplete_scan_engine(owned: bool) -> (tempfile::TempDir, Engine) {
+    let dir = tempfile::tempdir().expect("run cgroup dir");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open run cgroup dir")),
+    };
+    engine.owned_run_pid = owned.then(std::process::id);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.begin_deep_scan_tick(Some(0));
+    (dir, engine)
+}
+
+/// Makes the next scan incomplete the way a member mapping its provider
+/// mid-scan does (the maps changed under the scan).
+fn inject_mapping_changed_scan() {
+    INJECT_SCAN_SKIPS.with(|inject| {
+        inject.borrow_mut().push(Skipped {
+            subject: "capture discovery".into(),
+            reason: crate::discovery::scan::MAPPING_CHANGED_REASON.into(),
+        })
+    });
+}
+
+/// hostfill-31: an owned run member whose newcomer scan came back
+/// incomplete (it was mapping its provider at +5 ms) was never scanned
+/// again, so the provider attached only from the next worker, ~330 ms
+/// later. The incomplete scan still stages what it verified, and it now
+/// keeps a prompt rescan queued. A complete scan, and a cgroup scope the
+/// run does not own, keep the old one-scan admission.
+#[test]
+fn owned_run_newcomer_with_an_incomplete_first_scan_owes_a_prompt_rescan() {
+    let me = std::process::id();
+    for (owned, incomplete) in [(true, true), (true, false), (false, true)] {
+        let (_dir, mut engine) = owned_run_incomplete_scan_engine(owned);
+        INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+        if incomplete {
+            inject_mapping_changed_scan();
+        }
+        let max_scan_pids = engine.max_scan_pids;
+        let (new_views, failed, _) = engine.admit_inventory_new_views(
+            vec![me],
+            &AdmissionLedger::Free {
+                backlog: BTreeSet::new(),
+            },
+            max_scan_pids,
+            &mut || Some(0),
+        );
+        INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+        assert!(
+            new_views.iter().any(|(view, _, _)| view.pid() == me),
+            "owned {owned} incomplete {incomplete}: the scan stages what it verified"
+        );
+        let owed = owned && incomplete;
+        assert_eq!(
+            failed.contains(&me),
+            owed,
+            "owned {owned} incomplete {incomplete}: the request stays queued: {failed:?}"
+        );
+        assert_eq!(
+            engine.refresh_requested.contains_key(&me),
+            owed,
+            "owned {owned} incomplete {incomplete}: a rescan is requested"
+        );
+    }
+}
+
+/// The incomplete-scan retry is bounded: an owned member whose scans stay
+/// incomplete is rescanned `OWNED_INCOMPLETE_SCAN_RETRIES` times after its
+/// admission scan, then keeps the existing partial result and gap. A
+/// complete rescan ends the retries at once.
+#[test]
+fn owned_run_incomplete_rescans_stop_at_their_bound() {
+    let me = std::process::id();
+    for complete_at in [None, Some(1u32)] {
+        let (_dir, mut engine) = owned_run_incomplete_scan_engine(true);
+        INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+        inject_mapping_changed_scan();
+        let max_scan_pids = engine.max_scan_pids;
+        let (new_views, _, _) = engine.admit_inventory_new_views(
+            vec![me],
+            &AdmissionLedger::Free {
+                backlog: BTreeSet::new(),
+            },
+            max_scan_pids,
+            &mut || Some(0),
+        );
+        INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+        let (view, _, _) = new_views
+            .into_iter()
+            .find(|(view, _, _)| view.pid() == me)
+            .expect("the admission staged the member");
+        let id = view.id();
+        engine.views.push(view);
+        for retry in 1..=OWNED_INCOMPLETE_SCAN_RETRIES {
+            let complete = complete_at == Some(retry);
+            if !complete {
+                inject_mapping_changed_scan();
+            }
+            let (scans, failed, deferred, _) =
+                engine.scan_inventory_views(&BTreeSet::from([id]), "rescan", &mut || Some(0));
+            INJECT_SCAN_SKIPS.with(|inject| inject.borrow_mut().clear());
+            assert_eq!(scans.len(), 1, "retry {retry}: the rescan ran: {failed:?}");
+            let owed = complete_at.is_none() && retry < OWNED_INCOMPLETE_SCAN_RETRIES;
+            assert_eq!(
+                deferred.contains(&me),
+                owed,
+                "complete at {complete_at:?}, retry {retry}: {deferred:?}"
+            );
+            if complete {
+                break;
+            }
+        }
+        assert!(
+            !engine.owned_incomplete_scans.contains_key(&id) || complete_at.is_none(),
+            "a complete rescan forgets the retry count"
+        );
+    }
+}

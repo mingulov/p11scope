@@ -501,6 +501,10 @@ pub struct Engine {
     /// passes. Bounded by `OWNED_WATCH_UNPROVEN_CAP`; overflow members
     /// stay for the ordinary frame path with their honest gaps.
     owned_watch_unproven: BTreeMap<u32, OwnedWatchEntry>,
+    /// Incomplete scans per owned run member view, for the bounded
+    /// prompt rescan (`OWNED_INCOMPLETE_SCAN_RETRIES`). A complete scan
+    /// forgets the view; each tick prunes views no longer retained.
+    owned_incomplete_scans: BTreeMap<ProcessViewId, u32>,
     /// First-seen mono-ns per noticed owned-tree pid, for the rescan
     /// horizon. Pruned by liveness every run (an exit forgets, so a
     /// later pid reuse notices fresh); entries outlive rotation
@@ -6621,6 +6625,13 @@ pub(crate) const OWNED_WATCH_CHEAP_SCAN_BYTES: u64 = 128 * 1024;
 /// wall time understates their cost.
 /// Provisional — ratify by measurement.
 pub(crate) const OWNED_WATCH_RUN_IO_CAP_BYTES: u64 = 2_097_152;
+
+/// How many prompt rescans an owned run member's view gets after an
+/// incomplete scan (a member mapping its provider while the scan read its
+/// maps). Each retry is the next tick's rescan, so a short-lived worker
+/// still attaches inside its life; past the bound the view keeps its
+/// partial result and the scan's own gaps, as before.
+pub(crate) const OWNED_INCOMPLETE_SCAN_RETRIES: u32 = 3;
 
 /// How a marked newcomer generation's descendant gap was counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13238,6 +13249,7 @@ impl Engine {
             learned_cap_skipped: 0,
             learned_frame_owed: false,
             owned_watch_unproven: BTreeMap::new(),
+            owned_incomplete_scans: BTreeMap::new(),
             owned_watch_seen: BTreeMap::new(),
             owned_watch_last_ns: None,
             owned_watch_cursor: None,
@@ -22030,6 +22042,39 @@ impl Engine {
         }
     }
 
+    /// Whether an owned run member's view owes a prompt rescan after this
+    /// scan (hostfill-31). A newcomer scanned while it maps its provider
+    /// comes back incomplete with nothing proven, and nothing rescans a
+    /// retained view without a request: its provider then attached only
+    /// from the next worker, hundreds of milliseconds later. An incomplete
+    /// scan of an owned member keeps a refresh queued for the next tick,
+    /// at most `OWNED_INCOMPLETE_SCAN_RETRIES` times per view; then the
+    /// partial result and the scan's own gaps stand, as before. Only a scan
+    /// that found no module retries: a rescan replaces the view's modules,
+    /// so retrying a partial result that already attached could detach it
+    /// on a second partial scan. A complete scan, a found module, a stopped
+    /// capture budget, or a scope the run does not own owes nothing and
+    /// forgets the view's count.
+    fn owe_incomplete_owned_rescan(
+        &mut self,
+        view: ProcessViewId,
+        complete: bool,
+        found_modules: bool,
+    ) -> bool {
+        if complete
+            || found_modules
+            || self.owned_run_pid.is_none()
+            || !matches!(self.scope, Scope::Cgroup { .. })
+            || self.budget.stopped_now().is_some()
+        {
+            self.owned_incomplete_scans.remove(&view);
+            return false;
+        }
+        let count = self.owned_incomplete_scans.entry(view).or_insert(0);
+        *count = count.saturating_add(1);
+        *count <= OWNED_INCOMPLETE_SCAN_RETRIES
+    }
+
     /// Owned run-tree file learning (E1): stage scan-proven provider
     /// files as run-persistent attach roots. Callers prove files two
     /// ways: the watch's synchronous scans (members the frames never
@@ -28968,16 +29013,17 @@ impl Engine {
             let hollow_ending_scan = counters.ending_suppressed_skips > 0;
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
-                // Completeness is intentionally unused here: refreshed
-                // views are exec refreshes whose old image may be gone, so
-                // absence of the old modules is expected and retention
-                // would be unsound. The loader path above is where an
+                // Completeness never retains here: refreshed views are
+                // exec refreshes whose old image may be gone, so absence
+                // of the old modules is expected and retention would be
+                // unsound; it only schedules an owned member's bounded
+                // prompt rescan. The loader path above is where an
                 // incomplete scan of a stable generation retains.
                 // Replace-always is preserved: whatever the new image
                 // holds replaces the old, and the rotation classifier
                 // re-reads the outcome — a refreshed view with modules is
                 // owned, an empty never-dirty one stays exploratory.
-                Ok((modules, pins, _complete)) => {
+                Ok((modules, pins, complete)) => {
                     if waited_for_handles {
                         drop(pins);
                         let pid = self.views[position].pid();
@@ -28993,6 +29039,13 @@ impl Engine {
                         // so ending the service at the first wait
                         // leaves the remainder safely queued.
                         continue;
+                    }
+                    // An owned member still mapping its provider keeps
+                    // its request for another bounded prompt rescan.
+                    if self.owe_incomplete_owned_rescan(*view_id, complete, !modules.is_empty()) {
+                        let pid = self.views[position].pid();
+                        self.request_refresh(pid, crate::attach::monotonic_ns());
+                        deferred_pids.insert(pid);
                     }
                     self.note_scan_observed(
                         *view_id,
@@ -30624,9 +30677,10 @@ impl Engine {
             let budget_stop = scan_pins_waited_only_for_budget(&counters.object_skips);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
-                // Completeness is otherwise unused here: a new view has
-                // no retained modules, so a partial first scan simply
-                // attaches what it verified with the skips as evidence.
+                // A new view has no retained modules, so a partial first
+                // scan simply attaches what it verified with the skips as
+                // evidence; an owned run member also owes a bounded prompt
+                // rescan (`owe_incomplete_owned_rescan`).
                 Ok((modules, pins, complete)) => {
                     // Fix6 A3: handle exhaustion waits,
                     // never skips. A scan with waited pins defers whole
@@ -30713,6 +30767,12 @@ impl Engine {
                         );
                         staged_yield = Some((pid, (view, modules, pins)));
                         continue;
+                    }
+                    // An owned member scanned mid-map keeps its request
+                    // queued, so the next tick rescans the retained view.
+                    if self.owe_incomplete_owned_rescan(view.id(), complete, !modules.is_empty()) {
+                        self.request_refresh(pid, crate::attach::monotonic_ns());
+                        failed_refresh_pids.insert(pid);
                     }
                     self.note_scan_observed(view.id(), view.view_admission(), &modules);
                     self.scheduler.note_admitted(pid);
@@ -30860,6 +30920,12 @@ impl Engine {
         new_views: &mut Vec<InventoryNewView>,
         tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
+        if !self.owned_incomplete_scans.is_empty() {
+            let retained: BTreeSet<ProcessViewId> =
+                self.views.iter().map(ProcessView::id).collect();
+            self.owned_incomplete_scans
+                .retain(|view, _| retained.contains(view));
+        }
         if self.poll_global_retirement_barrier(session).is_some() {
             closure.fail();
             return Ok(false);

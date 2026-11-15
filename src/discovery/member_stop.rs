@@ -140,6 +140,9 @@ pub(crate) struct MemberStopState {
     /// Devices (kernel encoding) the tests declare FUSE-backed.
     #[cfg(test)]
     pub(crate) fuse_devs: Option<BTreeSet<u64>>,
+    /// Devices (kernel encoding) the tests declare overlay mounts.
+    #[cfg(test)]
+    pub(crate) overlay_devs: Option<BTreeSet<u64>>,
     pub(crate) stats: MemberStopStats,
 }
 
@@ -221,34 +224,42 @@ struct ExecRow {
     path: Vec<u8>,
 }
 
+/// Each mount of a `mountinfo` listing: its filesystem type and its
+/// device (kernel encoding). Unparsable lines are skipped.
+fn mount_types(mountinfo: &[u8]) -> impl Iterator<Item = (&str, u64)> {
+    mountinfo.split(|byte| *byte == b'\n').filter_map(|line| {
+        let line = std::str::from_utf8(line).ok()?;
+        let (mount, source) = line.split_once(" - ")?;
+        let fstype = source.split(' ').next().unwrap_or_default();
+        let (major, minor) = mount.split(' ').nth(2)?.split_once(':')?;
+        Some((
+            fstype,
+            kernel_dev(major.parse::<u64>().ok()?, minor.parse::<u64>().ok()?),
+        ))
+    })
+}
+
 /// The devices (kernel encoding) of FUSE-backed mounts (`fuse`,
 /// `fuse.*`, `fuseblk`, `fuseblk.*`) in a `mountinfo` listing.
 fn fuse_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
-    let mut devices = BTreeSet::new();
-    for line in mountinfo.split(|byte| *byte == b'\n') {
-        let Ok(line) = std::str::from_utf8(line) else {
-            continue;
-        };
-        let Some((mount, source)) = line.split_once(" - ") else {
-            continue;
-        };
-        let fstype = source.split(' ').next().unwrap_or_default();
-        if !(fstype == "fuse"
-            || fstype == "fuseblk"
-            || fstype.starts_with("fuse.")
-            || fstype.starts_with("fuseblk."))
-        {
-            continue;
-        }
-        let Some((major, minor)) = mount.split(' ').nth(2).and_then(|dev| dev.split_once(':'))
-        else {
-            continue;
-        };
-        if let (Ok(major), Ok(minor)) = (major.parse::<u64>(), minor.parse::<u64>()) {
-            devices.insert(kernel_dev(major, minor));
-        }
-    }
-    devices
+    mount_types(mountinfo)
+        .filter(|(fstype, _)| {
+            *fstype == "fuse"
+                || *fstype == "fuseblk"
+                || fstype.starts_with("fuse.")
+                || fstype.starts_with("fuseblk.")
+        })
+        .map(|(_, device)| device)
+        .collect()
+}
+
+/// The devices (kernel encoding) of overlay mounts in a `mountinfo`
+/// listing.
+fn overlay_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
+    mount_types(mountinfo)
+        .filter(|(fstype, _)| *fstype == "overlay")
+        .map(|(_, device)| device)
+        .collect()
 }
 
 /// Whether `tgid` is proven gone: its `/proc` directory does not exist.
@@ -388,7 +399,8 @@ fn exec_rows(maps: &[u8]) -> Vec<ExecRow> {
 /// Puts the stopping file first under its kernel key. `maps` prints the
 /// user-visible inode, while the hook reads the VMA's own file: for an
 /// overlayfs (backing-file) mapping the device, and possibly the inode
-/// number, differ from the row's. The kernel row names its mapping's
+/// number, differ from the row's. Only a row on an overlay mount (from
+/// the member's `mountinfo`) may differ in both. The kernel row names its mapping's
 /// exact range, so the `maps` row holding that range's start is the
 /// stopping file whatever it prints; it is proven again under the kernel
 /// key, so clearing that key is what stops later mappers from stopping on
@@ -401,11 +413,19 @@ fn exec_rows(maps: &[u8]) -> Vec<ExecRow> {
 /// too: another thread of the member may replace the range before the
 /// group stop completes, and the replacement proves nothing about the
 /// stopped file, which then stays unproven (the named gap).
-fn with_stopping_row(mut rows: Vec<ExecRow>, stop: &MemberStop) -> Vec<ExecRow> {
+fn with_stopping_row(
+    mut rows: Vec<ExecRow>,
+    stop: &MemberStop,
+    overlay: &BTreeSet<u64>,
+) -> Vec<ExecRow> {
     let Some(at) = rows.iter().position(|row| {
         row.start == stop.vm_start
             && row.end == stop.vm_end
-            && (row.maps_dev != stop.file.dev || row.maps_ino == stop.file.ino)
+            && if row.maps_dev == stop.file.dev {
+                row.maps_ino == stop.file.ino
+            } else {
+                overlay.contains(&row.maps_dev)
+            }
     }) else {
         return rows;
     };
@@ -452,8 +472,9 @@ fn open_exec_row(
 /// the range between the snapshot and the open, and a path may name a
 /// newer file. Through `map_files` the kernel row's own inode number is
 /// accepted too: on overlayfs that link opens the backing file, which
-/// the hook keyed. The stopping row through `map_files` must open the
-/// kernel row's inode itself (the VMA's own file is the stopped one).
+/// the hook keyed. The stopping row must open the kernel row's inode
+/// itself (the VMA's own file is the stopped one); by path, also the
+/// inode maps printed.
 /// Inode numbers only: the device encodings differ between `stat` and
 /// the kernel's superblock (btrfs subvolumes).
 fn opened_row_file(
@@ -466,8 +487,10 @@ fn opened_row_file(
         .metadata()
         .map_err(|error| format!("member file metadata: {error}"))?
         .ino();
-    let accepted = if through_map_files && row.stopping {
-        ino == row.key.ino
+    let accepted = if row.stopping {
+        // By path, the file maps printed: the stopped one only when
+        // that is the kernel row's inode too.
+        ino == row.key.ino && (through_map_files || ino == row.maps_ino)
     } else {
         ino == row.maps_ino || (through_map_files && ino == row.key.ino)
     };
@@ -508,22 +531,25 @@ impl Engine {
         Self::resume_member_with(io, pin, send)
     }
 
-    /// Pins a stopped member (tests can script the failure).
-    /// The FUSE-backed devices of a stopped member's mount namespace.
-    fn member_fuse_devices(
+    /// The FUSE-backed and the overlay devices of a stopped member's
+    /// mount namespace.
+    fn member_mount_devices(
         &self,
         proc: &crate::process::ProcPin<'_>,
         deadline: std::time::Instant,
-    ) -> Result<BTreeSet<u64>, String> {
+    ) -> Result<(BTreeSet<u64>, BTreeSet<u64>), String> {
         #[cfg(test)]
-        if let Some(devices) = &self.member_stops.fuse_devs {
-            return Ok(devices.clone());
+        if self.member_stops.fuse_devs.is_some() || self.member_stops.overlay_devs.is_some() {
+            return Ok((
+                self.member_stops.fuse_devs.clone().unwrap_or_default(),
+                self.member_stops.overlay_devs.clone().unwrap_or_default(),
+            ));
         }
-        Ok(fuse_devices(
-            &proc.read_mountinfo(deadline, MEMBER_STOP_MAPS_BYTES)?,
-        ))
+        let mountinfo = proc.read_mountinfo(deadline, MEMBER_STOP_MAPS_BYTES)?;
+        Ok((fuse_devices(&mountinfo), overlay_devices(&mountinfo)))
     }
 
+    /// Pins a stopped member (tests can script the failure).
     fn open_member_pin(&self, tgid: u32) -> Result<crate::process::PidPin, String> {
         #[cfg(test)]
         if self.member_stops.pin_fail.contains(&tgid) {
@@ -711,8 +737,12 @@ impl Engine {
                     return Err("scripted maps failure".to_string());
                 }
                 let maps = proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES)?;
-                let fuse = self.member_fuse_devices(&proc, deadline)?;
-                Ok((proc, with_stopping_row(exec_rows(&maps), &stop), fuse))
+                let (fuse, overlay) = self.member_mount_devices(&proc, deadline)?;
+                Ok((
+                    proc,
+                    with_stopping_row(exec_rows(&maps), &stop, &overlay),
+                    fuse,
+                ))
             })
             .map(|(proc, rows, fuse)| {
                 // A FUSE-backed file is never opened: its server may be
@@ -1493,6 +1523,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn overlay_devices_come_from_mountinfo() {
+        let mountinfo = b"22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n\
+50 22 0:51 / /merged rw shared:30 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n\
+51 22 0:52 / /mnt/fo rw shared:31 - fuse.fuse-overlayfs fuse-overlayfs rw\n";
+        assert_eq!(
+            overlay_devices(mountinfo),
+            BTreeSet::from([kernel_dev(0, 51)])
+        );
+    }
+
+    /// A row at the stopping range on another device stands for the
+    /// stopped file only when that device is an overlay mount (whose
+    /// maps name the overlay inode while the hook keys the backing
+    /// file); any other device there is a replaced mapping.
+    #[test]
+    fn a_stopping_row_on_another_device_needs_an_overlay_mount() {
+        let row = ExecRow {
+            start: 0x3000,
+            end: 0x4000,
+            key: MemberFileKey { dev: 43, ino: 7 },
+            maps_ino: 7,
+            maps_dev: 43,
+            stopping: false,
+            path: b"/usr/lib/libx.so".to_vec(),
+        };
+        let stop = MemberStop {
+            file: MemberFileKey { dev: 23, ino: 7 },
+            hook_ts_ns: 1,
+            vm_start: 0x3000,
+            vm_end: 0x4000,
+        };
+        let rows = with_stopping_row(vec![row.clone()], &stop, &BTreeSet::new());
+        assert!(!rows.iter().any(|row| row.stopping), "not an overlay");
+        let rows = with_stopping_row(vec![row], &stop, &BTreeSet::from([43]));
+        assert!(rows[0].stopping, "an overlay mount");
+    }
+
+    /// Opened by path (no `map_files`), the stopping row proves the
+    /// stopped file only when its maps inode is the kernel row's inode:
+    /// the path names what maps printed, not the VMA's own file.
+    #[test]
+    fn a_path_opened_stopping_row_needs_the_stopped_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+        let open = || std::fs::File::open("/proc/self/exe").unwrap();
+        let ino = open().metadata().unwrap().ino();
+        let row = ExecRow {
+            start: 0x1000,
+            end: 0x2000,
+            key: MemberFileKey {
+                dev: 1,
+                ino: ino + 1,
+            },
+            maps_ino: ino,
+            maps_dev: 2,
+            stopping: true,
+            path: b"/x".to_vec(),
+        };
+        assert!(opened_row_file(open(), &row, false).is_err());
+        let same = ExecRow {
+            key: MemberFileKey { dev: 1, ino },
+            ..row
+        };
+        assert!(opened_row_file(open(), &same, false).is_ok());
+    }
+
     /// The stopping row is the kernel's exact mapping: another range at
     /// the same start, or (same device domain) another inode there, is a
     /// replaced mapping and proves nothing about the stopped file.
@@ -1513,14 +1609,26 @@ mod tests {
             vm_start,
             vm_end,
         };
-        let rows = with_stopping_row(vec![row(1, 7, 0x3000, 0x4000)], &stop(1, 7, 0x3000, 0x5000));
+        let rows = with_stopping_row(
+            vec![row(1, 7, 0x3000, 0x4000)],
+            &stop(1, 7, 0x3000, 0x5000),
+            &BTreeSet::new(),
+        );
         assert!(!rows.iter().any(|row| row.stopping), "another range end");
-        let rows = with_stopping_row(vec![row(1, 9, 0x3000, 0x4000)], &stop(1, 7, 0x3000, 0x4000));
+        let rows = with_stopping_row(
+            vec![row(1, 9, 0x3000, 0x4000)],
+            &stop(1, 7, 0x3000, 0x4000),
+            &BTreeSet::new(),
+        );
         assert!(
             !rows.iter().any(|row| row.stopping),
             "another inode, same domain"
         );
-        let rows = with_stopping_row(vec![row(1, 7, 0x3000, 0x4000)], &stop(1, 7, 0x3000, 0x4000));
+        let rows = with_stopping_row(
+            vec![row(1, 7, 0x3000, 0x4000)],
+            &stop(1, 7, 0x3000, 0x4000),
+            &BTreeSet::new(),
+        );
         assert!(rows[0].stopping, "the exact mapping");
     }
 
@@ -1585,6 +1693,7 @@ mod tests {
         let rows = with_stopping_row(
             vec![row(1, 5, 0x1000), row(1, 7, 0x3000)],
             &stop(1, 7, 0x3000),
+            &BTreeSet::new(),
         );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].key, MemberFileKey { dev: 1, ino: 7 });
@@ -1593,6 +1702,7 @@ mod tests {
         let rows = with_stopping_row(
             vec![row(43, 5, 0x1000), row(43, 7, 0x3000)],
             &stop(23, 7, 0x3000),
+            &BTreeSet::from([43]),
         );
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].key, MemberFileKey { dev: 23, ino: 7 });
@@ -1601,13 +1711,18 @@ mod tests {
         let rows = with_stopping_row(
             vec![row(43, 5, 0x1000), row(43, 7, 0x3000)],
             &stop(23, 991, 0x3000),
+            &BTreeSet::from([43]),
         );
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].key, MemberFileKey { dev: 23, ino: 991 });
         assert_eq!(rows[0].start, 0x3000);
         assert_eq!(rows[0].maps_ino, 7, "an open still matches what maps names");
         // A same-inode row elsewhere is not the stopping mapping.
-        let rows = with_stopping_row(vec![row(43, 7, 0x1000)], &stop(23, 7, 0x8000));
+        let rows = with_stopping_row(
+            vec![row(43, 7, 0x1000)],
+            &stop(23, 7, 0x8000),
+            &BTreeSet::from([43]),
+        );
         assert_eq!(rows.len(), 1, "unmapped since: nothing to prove");
         assert_eq!(rows[0].key, MemberFileKey { dev: 43, ino: 7 });
     }

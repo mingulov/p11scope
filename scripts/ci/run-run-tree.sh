@@ -78,9 +78,13 @@ privileged_run_tree_non_member_provider_is_never_staged
 #
 # The cells judge exact accounting (owner ruling 2026-11-15): every call
 # that entered after its function's first attach must be observed, so any
-# undisclosed miss fails, however small. Overcounts, invented functions
-# and a function that lost every call (probe loss) fail under their own
-# text, never the declared undisclosed-miss signature.
+# miss fails, however small. The declared signature matches only a miss
+# the report itself ties to a replace: the cell names a "replace witness"
+# (a second counter-slot row for that endpoint, or a failed replacement's
+# null attached_at_ns) and the loss fits in the calls that entered before
+# the last re-attach. Any other partial loss is an "unexplained miss";
+# it, overcounts, invented functions and a function that lost every call
+# (probe loss) fail under their own text, never the declared signature.
 #
 # never_pause_still_learns:
 # - PLAN-REPLACE-GAP (base bug, not the run-tree learning). A new worker's
@@ -95,8 +99,8 @@ privileged_run_tree_non_member_provider_is_never_staged
 #   2112-slot ceiling and the capture aborts (CI 43704790202 host:
 #   2176 > 2112).
 # parallel_never_pause_covers_waves:
-# - PLAN-REPLACE-GAP, as above: undisclosed misses after the first attach
-#   (host 2026-11-15, 1 of 2 runs: 21 of 80 C_GetSlotInfo calls).
+# - PLAN-REPLACE-GAP, as above: witnessed misses after the first attach
+#   (host 2026-11-15: 21 of 80 C_GetSlotInfo calls; 7 slot rows each).
 # arming_exhaustion_still_stages_and_counts:
 # - PLAN-REPLACE-GAP, as above: undisclosed misses after the first
 #   provider attach (CI 43704790202 v6.6 under the old floor: 0.8996).
@@ -108,10 +112,10 @@ privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves
 privileged_run_tree_arming_exhaustion_still_stages_and_counts
 )
 EXPECTED_SIGNATURES=(
-'undisclosed miss: [0-9]+ calls after the pre-attach window'
+'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
 'attach plan requires [0-9]+ allocated slots but only [0-9]+ are available'
-'undisclosed miss: [0-9]+ calls after the pre-attach window'
-'undisclosed miss: [0-9]+ calls after the pre-attach window'
+'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
+'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
 )
 EXPECTED_REASONS=(
 'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
@@ -251,7 +255,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     local parallel=privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves
     # Each declared signature of a cell is an expected failure...
     LOG_BODY="thread 'x' panicked at tests/run_tree.rs:330:5:
-exact accounting failed: [\"undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 30 of 31 that started after 1)\"]
+exact accounting failed: [\"undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 30 of 31 that entered after its first attach at 1; replace witness: 25 slot rows, 31 calls entered before the last re-attach)\"]
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$never" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
     LOG_BODY="p11scope: attach plan requires 2176 allocated slots but only 2112 are available; refusing to attach a prefix
@@ -260,7 +264,7 @@ run exits with the shell's status
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$never" 101 0 False expected-failure 'SLOT-RECLAIM: descriptor-replaced slots'
     LOG_BODY="thread 'x' panicked at tests/run_tree.rs:330:5:
-exact accounting failed: [\"undisclosed miss: 28 calls after the pre-attach window (C_GetSlotList: observed 50 of 62 that started after 1)\"]
+exact accounting failed: [\"undisclosed miss: 28 calls after the pre-attach window (C_GetSlotList: observed 50 of 62 that entered after its first attach at 1; replace witness: 7 slot rows, 62 calls entered before the last re-attach)\"]
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.00s"
     check "$arming" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
     check "$parallel" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
@@ -286,6 +290,18 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     LOG_BODY="exact accounting failed (not an undisclosed miss): [\"probe loss: C_GetInfo observed none of 31 calls after its first attach\"]; misses 0 ; window end 1
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$parallel" 101 1 False failed 'rc=101'
+    # A partial miss without the report's replace evidence (no witness,
+    # or more than could enter before the last re-attach) is not the
+    # declared gap, and neither is a miss text that names no witness.
+    LOG_BODY="exact accounting failed (not an undisclosed miss): [\"unexplained miss: C_GetInfo lost 1 calls after its first attach at 1 with no replace witness (one slot row, attached)\"]; misses 0 ; window end 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$never" 101 1 False failed 'rc=101'
+    LOG_BODY="exact accounting failed (not an undisclosed miss): [\"unexplained miss: C_GetInfo lost 3 calls after its first attach at 1, more than the 2 that entered before the last re-attach at 8 (2 slot rows)\"]; misses 0 ; window end 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$parallel" 101 1 False failed 'rc=101'
+    LOG_BODY="exact accounting failed: [\"undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 30 of 31 that started after 1)\"]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$arming" 101 1 False failed 'rc=101'
     # ...and so does a timeout, even with a signature in the log.
     LOG_BODY='undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 1 of 2)'
     check "$never" 124 1 False failed 'TIMEOUT after 300s'

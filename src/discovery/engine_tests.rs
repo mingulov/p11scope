@@ -61262,6 +61262,49 @@ fn automatic_exec_named_pid_exit_after_an_in_place_slot_update_has_no_physical_g
     assert_physical_gap_public_categories(&engine, &[]);
 }
 
+/// Negative twins: a plan slot that no longer names the attached probe (a
+/// different cookie descriptor, object, offset or decoding semantics)
+/// cannot mint the ended original's proof, while one that changed only
+/// in-place metadata (owners, names, alias and authority marks) can.
+#[test]
+fn automatic_exec_named_pid_end_receipt_follows_the_attached_target_only() {
+    let (mut fixture, engine, session) = continuity_route();
+    let slots = engine.plan.slots.clone();
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let owner = &engine.views[0];
+    assert!(
+        session
+            .prepare_ended_pid_retirement(owner, &slots)
+            .is_some()
+    );
+    for change in ["descriptor", "object", "offset", "semantics", "metadata"] {
+        let mut changed = slots.clone();
+        let slot = &mut changed[0];
+        match change {
+            "descriptor" => slot.descriptor_index += 1,
+            "object" => slot.object = PinnedObjectId(slot.object.0 + 1000),
+            "offset" => slot.file_offset += 8,
+            "semantics" => slot.semantics.operations ^= 1,
+            _ => {
+                slot.module_ids.push(plan::ModuleId(999));
+                slot.names.push("C_GetFunctionList".into());
+                slot.aliased = !slot.aliased;
+                slot.semantic_authorized = !slot.semantic_authorized;
+            }
+        }
+        let proof = session.prepare_ended_pid_retirement(owner, &changed);
+        assert_eq!(proof.is_some(), change == "metadata", "{change}");
+        if let Some(proof) = proof {
+            assert_eq!(
+                proof.slots(),
+                slots,
+                "the proof names the slots as attached"
+            );
+        }
+    }
+}
+
 #[test]
 fn automatic_exec_named_pid_original_pin_exit_does_not_create_physical_gap() {
     assert_proven_named_exit_has_no_new_physical_gap(false);

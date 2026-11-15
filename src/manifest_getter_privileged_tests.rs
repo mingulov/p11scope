@@ -344,59 +344,85 @@ fn manifest_getter_offsets(manifest: &Path) -> Result<Vec<u64>> {
         .collect()
 }
 
-/// Waits until the observer holds the getter hooks themselves, an entry
-/// and a return probe link for every getter offset in `object` (fdinfo
-/// names each link's path and its probes' cookies and offsets). The
-/// getter's entry breakpoint and the table slot links that also cover
-/// its address carry slot cookies (slot index in the high half); a
-/// getter hook carries a small capture-local cookie. A breakpoint byte
-/// alone does not prove the return is watched. A kernel whose fdinfo
-/// lists no probe offsets leaves the breakpoint wait as the only sync.
-fn wait_for_getter_hooks(
+/// The observer's small-cookie probes at each getter offset in `object`,
+/// counted per side (`true` = return), from its link fdinfo (which names
+/// each link's path and its probes' cookies and offsets); `None` when the
+/// kernel's fdinfo lists no probe offsets. A cookie is
+/// `slot | descriptor << 32`, so a getter hook (a capture-local cookie)
+/// and a count-only static slot at the same offset (descriptor 0) both
+/// carry a small cookie; only the count tells them apart.
+fn getter_hook_probes(
+    observer: &Child,
+    object: &Path,
+    offsets: &[u64],
+) -> Result<Option<BTreeMap<(bool, u64), usize>>> {
+    let path_line = format!("path:\t{}", object.display());
+    let mut listed = false;
+    let mut probes = BTreeMap::new();
+    for entry in std::fs::read_dir(format!("/proc/{}/fdinfo", observer.id()))? {
+        let Ok(text) = std::fs::read_to_string(entry?.path()) else {
+            continue;
+        };
+        let kind = if text.contains("link_type:\turetprobe_multi") {
+            true
+        } else if text.contains("link_type:\tuprobe_multi") {
+            false
+        } else {
+            continue;
+        };
+        listed |= text.contains("uprobe_cnt:");
+        if !text.lines().any(|line| line == path_line) {
+            continue;
+        }
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(cookie), Some(offset)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let (Ok(cookie), Some(Ok(offset))) = (
+                cookie.parse::<u64>(),
+                offset
+                    .strip_prefix("0x")
+                    .map(|hex| u64::from_str_radix(hex, 16)),
+            ) else {
+                continue;
+            };
+            if cookie < 1 << 32 && offsets.contains(&offset) {
+                *probes.entry((kind, offset)).or_insert(0) += 1;
+            }
+        }
+    }
+    Ok(listed.then_some(probes))
+}
+
+/// Waits until the observer holds the getter hooks themselves: one more
+/// entry and one more return small-cookie probe at every getter offset
+/// than `baseline` held. A count-only static slot at a getter offset (a
+/// getter-only manifest's startup slot) also carries a small cookie, so a
+/// cell whose static slots exist before its getter hooks passes the
+/// count it took before the hooks could attach. A breakpoint byte alone
+/// does not prove the return is watched. A kernel whose fdinfo lists no
+/// probe offsets leaves the breakpoint wait as the only sync.
+fn wait_for_getter_hooks_since(
     observer: &mut Child,
     object: &Path,
     offsets: &[u64],
+    baseline: &BTreeMap<(bool, u64), usize>,
     log: &Path,
 ) -> Result<()> {
     let deadline = Instant::now() + STEP;
-    let path_line = format!("path:\t{}", object.display());
     loop {
-        let mut listed = false;
-        let mut hooked = std::collections::BTreeSet::new();
-        for entry in std::fs::read_dir(format!("/proc/{}/fdinfo", observer.id()))? {
-            let Ok(text) = std::fs::read_to_string(entry?.path()) else {
-                continue;
-            };
-            let kind = if text.contains("link_type:\turetprobe_multi") {
-                true
-            } else if text.contains("link_type:\tuprobe_multi") {
-                false
-            } else {
-                continue;
-            };
-            listed |= text.contains("uprobe_cnt:");
-            if !text.lines().any(|line| line == path_line) {
-                continue;
-            }
-            for line in text.lines() {
-                let mut fields = line.split_whitespace();
-                let (Some(cookie), Some(offset)) = (fields.next(), fields.next()) else {
-                    continue;
-                };
-                let (Ok(cookie), Some(Ok(offset))) = (
-                    cookie.parse::<u64>(),
-                    offset
-                        .strip_prefix("0x")
-                        .map(|hex| u64::from_str_radix(hex, 16)),
-                ) else {
-                    continue;
-                };
-                if cookie < 1 << 32 && offsets.contains(&offset) {
-                    hooked.insert((kind, offset));
-                }
-            }
-        }
-        if !listed || hooked.len() == offsets.len() * 2 {
+        let Some(probes) = getter_hook_probes(observer, object, offsets)? else {
+            return Ok(());
+        };
+        let missing: Vec<_> = offsets
+            .iter()
+            .flat_map(|offset| [(false, *offset), (true, *offset)])
+            .filter(|key| {
+                probes.get(key).copied().unwrap_or(0) <= baseline.get(key).copied().unwrap_or(0)
+            })
+            .collect();
+        if missing.is_empty() {
             return Ok(());
         }
         if let Some(status) = observer.try_wait()? {
@@ -407,13 +433,20 @@ fn wait_for_getter_hooks(
         }
         ensure!(
             Instant::now() < deadline,
-            "only {}/{} getter hook probes attached: {}",
-            hooked.len(),
-            offsets.len() * 2,
+            "getter hook probes missing at {missing:x?} (baseline {baseline:x?}): {}",
             tail(log)
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn wait_for_getter_hooks(
+    observer: &mut Child,
+    object: &Path,
+    offsets: &[u64],
+    log: &Path,
+) -> Result<()> {
+    wait_for_getter_hooks_since(observer, object, offsets, &BTreeMap::new(), log)
 }
 
 fn parse_fields(line: &str) -> BTreeMap<String, String> {
@@ -877,6 +910,8 @@ fn privileged_getter_manifest_counts_a_later_dlopen_under_a_named_pid() -> Resul
         );
         // Let the capture settle into quiet ticks before the dlopen.
         settle();
+        // The startup getter slots already sit at the getter offsets.
+        let baseline = getter_hook_probes(&child, &library, &getter_offsets)?.unwrap_or_default();
         app.gate(b'L')?;
         let ready = parse_fields(&app.expect("READY ")?);
         let getters: Vec<u64> = ["C_GetFunctionList", "C_GetInterface", "C_GetInterfaceList"]
@@ -889,7 +924,7 @@ fn privileged_getter_manifest_counts_a_later_dlopen_under_a_named_pid() -> Resul
             })
             .collect::<Result<_>>()?;
         wait_for_breakpoints(pid, &getters, &mut child, &log)?;
-        wait_for_getter_hooks(&mut child, &library, &getter_offsets, &log)?;
+        wait_for_getter_hooks_since(&mut child, &library, &getter_offsets, &baseline, &log)?;
         app.gate(b'G')?;
         let published = parse_fields(&app.expect("PUBLISHED ")?);
         let addresses: Vec<u64> = published
@@ -930,16 +965,11 @@ fn privileged_getter_manifest_counts_a_later_dlopen_under_a_named_pid() -> Resul
     let report = result?;
     drop(app);
     // Named, not lost: a dlopen in a running process has no pause to prove
-    // it ran before the library's constructor (`loader_discovery`), and
-    // the interface the program selected is not proven for a table only a
-    // getter-only manifest names (`interface_selection`). The ended
-    // process retires its probes with no physical gap.
-    check_evidence(
-        tag,
-        &report,
-        &["interface_selection", "loader_discovery"],
-        &[],
-    )
+    // it ran before the library's constructor (`loader_discovery`). The
+    // getter hooks attach before the program calls a getter, so its
+    // interface selection is observed; the ended process retires its
+    // probes with no physical gap.
+    check_evidence(tag, &report, &["loader_discovery"], &[])
 }
 
 #[test]
@@ -995,6 +1025,7 @@ fn privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child() -> Result<(
             !maps.contains(&library.display().to_string()),
             "the provider object is mapped before the dlopen"
         );
+        let baseline = getter_hook_probes(&child, &library, &getter_offsets)?.unwrap_or_default();
         gate(b'L')?;
         let ready = parse_fields(&lines.expect("READY ")?);
         let getters: Vec<u64> = ["C_GetFunctionList", "C_GetInterface", "C_GetInterfaceList"]
@@ -1009,7 +1040,7 @@ fn privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child() -> Result<(
         // The loader hit's rescan attaches the getters in the newly
         // mapped object before the program calls one.
         wait_for_breakpoints(pid, &getters, &mut child, &log)?;
-        wait_for_getter_hooks(&mut child, &library, &getter_offsets, &log)?;
+        wait_for_getter_hooks_since(&mut child, &library, &getter_offsets, &baseline, &log)?;
         gate(b'G')?;
         let published = parse_fields(&lines.expect("PUBLISHED ")?);
         let addresses: Vec<u64> = published

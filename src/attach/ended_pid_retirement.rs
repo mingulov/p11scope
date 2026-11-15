@@ -37,14 +37,16 @@ fn original_group_ended(state: Result<OriginalGenerationState, String>) -> bool 
 }
 
 /// Whether a plan slot names the probe the Session attached for its index:
-/// the same object, offset and cookie descriptor. Plan metadata a merge
-/// updates in place without reattaching (names, owning modules, semantics,
-/// alias marks) does not change which probe is linked.
+/// the same object, offset, cookie descriptor and decoding semantics.
+/// Plan metadata a merge updates in place without reattaching (names,
+/// owning modules, alias and authority marks) does not change which probe
+/// is linked or what it decodes.
 fn names_attached_target(attached: &Slot, slot: &Slot) -> bool {
     attached.index == slot.index
         && attached.object == slot.object
         && attached.file_offset == slot.file_offset
         && attached.descriptor_index == slot.descriptor_index
+        && attached.semantics == slot.semantics
 }
 
 fn retiring_pairs(

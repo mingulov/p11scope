@@ -4,7 +4,8 @@
 # run-tree-vng.sh TESTBIN OUTDIR KERNEL — run the run-tree CLI
 # cells as root inside one virtme-ng guest booted on KERNEL (a mainline
 # tag such as v6.6.157) via scripts/ci/run-run-tree.sh, and judge the
-# rows exactly like the host leg (exit 0 plus eight qualified rows).
+# rows exactly like the host leg (the nine run-tree cells, each qualified
+# or a declared intermittent failure).
 #
 # The guest shares the host rootfs read-only and hides /tmp and /var/tmp,
 # so TESTBIN and OUTDIR must live under /home. Inside the guest the cells
@@ -161,7 +162,7 @@ if [ ! -s "$OUT/cells/results.jsonl" ] || [ ! -s "$OUT/cells/summary.txt" ]; the
     echo "run-tree-vng.sh: guest produced no cell results on $KERNEL" >&2
     exit 2
 fi
-# The rows must be exactly the eight run-tree cells: a truncated or
+# The rows must be exactly the nine run-tree cells: a truncated or
 # hand-edited file is a harness error, never a partial pass.
 if ! python3 -I - "$OUT/cells/results.jsonl" <<'PY'
 import json,sys

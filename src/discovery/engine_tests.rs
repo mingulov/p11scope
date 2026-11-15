@@ -14978,6 +14978,8 @@ fn retained_views_survive_ordinary_rotation_passes() {
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert!(
         (1..=2).contains(&initial.len()),
@@ -15328,13 +15330,14 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
 
     // Identical settled sleepers admit lowest-pid representatives cleanly.
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert_eq!(
         initial.as_slice(),
         &pids[..initial.len()],
         "the retained views are the lowest-pid members"
     );
-    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
     engine.scheduler.set_slice_pids_for_test(2);
 
     // Cadence 2: one ordinary pass between reconciles; sweeps land on
@@ -17342,6 +17345,8 @@ fn generic_terminal_assembly_discloses_late_discovery_window() {
 fn a_late_provider_keeps_single_active_slots_across_refreshes() {
     let mut fixture = DiscoveryLifecycleFixture::start();
     let mut engine = fixture.discover_scan_only_before_load();
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     fixture.load();
     refresh_until_provider_mapped(&mut engine, fixture.pid());
     engine.publish_current_capture_facts().unwrap();
@@ -17433,6 +17438,8 @@ pub(crate) fn prearm_mapped_engine_with_declared_stamps(
 ) -> (DiscoveryLifecycleFixture, Engine, ScriptedSession, Vec<u32>) {
     let mut fixture = DiscoveryLifecycleFixture::start();
     let mut engine = fixture.discover_prearm_before_load();
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     assert!(engine.has_prearm_watches());
     fixture.load();
     refresh_until_provider_mapped(&mut engine, fixture.pid());
@@ -20950,6 +20957,8 @@ fn exec_refresh_attaches_provider_exports_before_readiness() {
     let pid = view.pid();
     let view_id = view.id();
     let mut engine = Engine::empty();
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     engine.scope = Scope::Pid(pid);
     engine.next_view_id = 1;
     engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
@@ -32523,6 +32532,7 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
         engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
         // The twin compares decisions, not wall-time budgets: an infinite
         // tick quantum keeps deep-scan admission deterministic under load.
+        engine.scheduler.set_quantum_ns_for_test(u64::MAX);
         engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
         // The waiter sits out reconcile selection on cooldown (reconcile
         // pools exclude cooling pids without bypass), so the first sweep
@@ -32717,6 +32727,8 @@ fn unchanged_tick_builder_matches_full_build_over_recorded_inputs() {
     let mut waiting = SettledChild::spawn();
     let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
     let (mut recorder, _dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
+    recorder.scheduler.set_quantum_ns_for_test(u64::MAX);
+    recorder.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     recorder.max_scan_pids = 2;
     recorder
         .views
@@ -48946,6 +48958,8 @@ fn refresh_tick_bounds_new_admissions_with_explicit_deferral() {
 
     let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
     assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     engine.scheduler.set_max_new_views_for_test(2);
 
     let rest = e06_spawn_sleeps(5);
@@ -49510,6 +49524,8 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
     let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(2));
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     assert_eq!(engine.views.len(), 2);
     assert!(engine.plan.modules.is_empty());
     let loader_view = engine
@@ -50189,6 +50205,8 @@ fn rotation_covers_every_pid_within_a_finite_bound() {
     let args = e06_cgroup_args(scope_dir.path(), vec![], Some(2));
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut seen: BTreeSet<u32> = engine.views.iter().map(|view| view.pid()).collect();
     for _ in 1..=24 {
         refresh_inventory_once(&mut engine);
@@ -51715,6 +51733,8 @@ fn tick_with_release_and_pending_handles_owes_frame() {
 fn discovery_batch_publishes_synchronously_before_it_returns() {
     let mut fixture = DiscoveryLifecycleFixture::start();
     let mut engine = fixture.discover_before_load();
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     engine.publish_batch_tail(false).unwrap();
     let pre_plan = engine.plan.clone();
     let published_before = engine.published_facts_revision;
@@ -51872,6 +51892,8 @@ fn cold_and_warm_discovery_agree_on_catalog_attach_sets_and_call_counts() {
     for tag in ["cold", "warm"] {
         let wall_start = std::time::Instant::now();
         let mut engine = discover_loaded(&fixture);
+        engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+        engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
         engine.publish_batch_tail(false).unwrap();
         // One refresh cycle exercises the newcomer arrival → admission
         // path; the trailing quiet tail exercises the B1 skip.

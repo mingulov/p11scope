@@ -176,6 +176,17 @@ impl AggregateOwner {
             (Self::Sole(_), Self::Sole(_)) => Self::Ambiguous,
         }
     }
+
+    /// Reclaim application: a cell cleared to `Unowned` (a candidate that was
+    /// never accepted) takes the returning target's sole owner, so its counts
+    /// are attributable again. Ambiguous cells stay ambiguous; two sole
+    /// owners still merge to ambiguous.
+    fn reclaim(self, current: Self) -> Self {
+        match self {
+            Self::Unowned => current,
+            _ => self.merge(current),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2482,7 +2493,7 @@ impl AttachPlan {
             };
             let previous_owner = self.aggregate_owners[position];
             self.aggregate_owners[position] =
-                previous_owner.merge(AggregateOwner::from_module_ids(&updated.module_ids));
+                previous_owner.reclaim(AggregateOwner::from_module_ids(&updated.module_ids));
             self.slots[position] = updated.clone();
             self.slot_by_key.insert(key, position);
             self.retired_slots.remove(&position);
@@ -3156,7 +3167,7 @@ impl AttachPlan {
                 } else {
                     AggregateOwner::from_module_ids(&updated.module_ids)
                 };
-                let merged = previous.merge(candidate);
+                let merged = previous.reclaim(candidate);
                 aggregate_owners[*position] = merged;
                 if merged == AggregateOwner::Ambiguous && updated.descriptor_index != 0 {
                     updated.descriptor_index = 0;
@@ -3319,7 +3330,7 @@ impl AttachPlan {
                 } else {
                     AggregateOwner::from_module_ids(&updated.module_ids)
                 };
-                let merged_owner = previous_owner.merge(candidate_owner);
+                let merged_owner = previous_owner.reclaim(candidate_owner);
                 aggregate_owners[position] = merged_owner;
                 if merged_owner == AggregateOwner::Ambiguous && updated.descriptor_index != 0 {
                     updated.descriptor_index = 0;
@@ -20040,6 +20051,45 @@ pub(crate) mod tests {
                 "{label}: retired cell kept"
             );
         }
+    }
+
+    /// Reclaim restores a cell whose owner was cleared (a candidate that
+    /// was never accepted): the returning sole owner claims it again, so
+    /// its counts are attributable instead of `module_unresolved`.
+    #[test]
+    fn slot_reclaim_restores_a_cleared_cell_owner() {
+        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-owner"));
+        for owner in &mut plan.aggregate_owners {
+            *owner = AggregateOwner::Unowned;
+        }
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        let mut returning = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        returning.object = PinnedObjectId(90);
+        returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+        let identities = BTreeMap::from([(PinnedObjectId(90), test_identity(82, "sha-owner"))]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&returning),
+            &[],
+            &identities,
+        );
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(
+            plan.module_of_slot(0),
+            Some(plan.modules[0].id),
+            "the reclaimed cell has its returning module as sole owner"
+        );
+        assert_eq!(plan.module_ambiguous, 0);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| plan.module_of_slot(slot.index).is_some()),
+            "no reclaimed cell stays unresolved"
+        );
     }
 
     /// Merge's reclaim accounting uses the same names/descriptor gate as

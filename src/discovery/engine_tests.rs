@@ -86254,6 +86254,8 @@ struct ScriptedMemberStops {
     fail_pending: bool,
     /// A scripted watchdog loss.
     guard_lost: bool,
+    /// Tgids whose membership read fails.
+    membership_errors: BTreeSet<u32>,
     /// Ordered log of withdrawals (and of a test's own signal sends).
     events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
 }
@@ -86287,10 +86289,16 @@ impl MemberStopIo for ScriptedMemberStops {
         Ok(())
     }
     fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {
-        Ok(!self.non_members.contains(&pin.pid()))
+        self.tgid_in_run_tree(pin.pid())
     }
     fn guard_lost(&mut self) -> bool {
         self.guard_lost
+    }
+    fn tgid_in_run_tree(&mut self, tgid: u32) -> Result<bool, String> {
+        if self.membership_errors.contains(&tgid) {
+            return Err(format!("scripted membership read failure for {tgid}"));
+        }
+        Ok(!self.non_members.contains(&tgid))
     }
 }
 
@@ -86645,6 +86653,114 @@ fn member_still_stopped_for_test(pid: u32) -> bool {
         .unwrap()
         .values()
         .all(|state| *state == b'T')
+}
+
+fn files_the_first_use_row(engine: &Engine) -> bool {
+    engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .any(|skip| {
+            skip.name == "learned provider file"
+                && skip.reason
+                    == "a provider file was learned after its first use; \
+                         its earlier calls were not observed"
+        })
+}
+
+/// A stopped member that cannot be pinned (descriptor or `/proc`
+/// pressure that never clears) is retried only inside the bound: at the
+/// bound it resumes anyway, and the first-use gap is named.
+#[test]
+fn member_stop_unpinnable_member_resumes_at_the_bound() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let mut engine = member_stop_engine();
+    engine.member_stops.pin_fail.insert(pid);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(io.rows.contains_key(&pid), "inside the bound the row stays");
+    assert!(member_still_stopped_for_test(pid));
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(stop_ns + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(
+        member_resumed_for_test(pid),
+        "the bound resumes it unpinned"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(engine.member_stop_stats_for_test().forced_resumes, 1);
+    assert!(files_the_first_use_row(&engine), "the gap is named");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The same bound for a member whose run-tree membership cannot be read:
+/// doubt resumes it at the bound, with the named gap.
+#[test]
+fn member_stop_unverified_member_resumes_at_the_bound() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    io.membership_errors.insert(pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(io.rows.contains_key(&pid), "inside the bound the row stays");
+    assert!(member_still_stopped_for_test(pid));
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(stop_ns + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(member_resumed_for_test(pid), "the bound resumes it");
+    assert!(!io.rows.contains_key(&pid));
+    assert_eq!(engine.member_stop_stats_for_test().forced_resumes, 1);
+    assert!(files_the_first_use_row(&engine));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Twin: at the bound, a tgid whose process was born after the row's
+/// stop is another process (the member exited and its number was
+/// reused): its row is withdrawn and it is never signalled.
+#[test]
+fn member_stop_bound_never_signals_a_process_born_after_the_stop() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    stop_member_for_test(pid);
+    let mut io = ScriptedMemberStops::default();
+    // Stamped at boot: long before this process existed.
+    io.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+            hook_ts_ns: 1,
+            vm_start: 0x1000,
+            vm_end: 0x2000,
+        },
+    );
+    let mut engine = member_stop_engine();
+    engine.member_stops.pin_fail.insert(pid);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(1 + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(!io.rows.contains_key(&pid), "the stale row is withdrawn");
+    assert!(member_still_stopped_for_test(pid), "it is never signalled");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.forced_resumes, 0);
+    assert_eq!(stats.not_members, 1);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The resume signal goes first; the row is withdrawn only after it was

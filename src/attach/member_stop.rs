@@ -262,6 +262,10 @@ impl MemberStopIo for MemberStopHooks {
     fn guard_lost(&mut self) -> bool {
         self.watchdog.as_mut().is_none_or(watchdog::Watchdog::lost)
     }
+
+    fn tgid_in_run_tree(&mut self, tgid: u32) -> Result<bool, String> {
+        self.tree.contains(tgid)
+    }
 }
 
 impl MemberStopHooks {

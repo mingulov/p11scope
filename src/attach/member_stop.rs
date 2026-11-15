@@ -21,7 +21,7 @@ use p11scope_ebpf_common::{
 use crate::discovery::engine::MemberStopIo;
 
 pub(crate) mod watchdog;
-pub(crate) use watchdog::WatchdogLauncher;
+pub(crate) use watchdog::{WatchdogLauncher, process_stopped};
 
 static MEMBER_STOP_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-member-stop"));
@@ -292,13 +292,15 @@ impl Drop for MemberStopHooks {
         let _ = self.deactivate();
         self.detach();
         let pending = self.pending().unwrap_or_default();
-        for (tgid, _) in pending {
+        for (tgid, stop) in pending {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {
                 continue;
             };
             let member = match self.tree.contains_pinned(&pin) {
                 Ok(true) => true,
-                Ok(false) => false,
+                Ok(false) => {
+                    crate::discovery::engine::stopped_member_moved_out(&pin, stop.hook_ts_ns)
+                }
                 Err(_) => continue,
             };
             if !member {

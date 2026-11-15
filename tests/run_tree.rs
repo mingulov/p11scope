@@ -7,11 +7,13 @@
 //! child never maps the provider itself, so every observed provider
 //! call proves a descendant was followed. Most cells pre-arm SoftHSM
 //! and pin the deterministic ledger-exact shape; the unprearmed
-//! shortlived cell instead proves the run learns the provider file
-//! from its own short-lived descendants (high coverage after the
-//! first worker, never exact: the first mapper's calls may be missed
-//! honestly). Workloads are runtime-generated C (P2-7 `TARGET_C`
-//! precedent), so no committed fixtures and no license row.
+//! shortlived cells instead prove the run learns the provider file
+//! from its own short-lived descendants, judged by exact per-call
+//! accounting: only a call that entered before or during its
+//! function's first attach may be missed (the disclosed first-use
+//! window); every later call is counted. Workloads are
+//! runtime-generated C (P2-7 `TARGET_C` precedent), so no committed
+//! fixtures and no license row.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

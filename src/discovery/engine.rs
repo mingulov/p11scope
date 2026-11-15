@@ -22171,6 +22171,8 @@ impl Engine {
     /// (marks dedupe, so the excess names itself once per capture).
     fn refuse_learned_candidate(&mut self, candidate: crate::fanotify::LearnedCandidate) {
         self.note_learned_settled((candidate.dev, candidate.ino));
+        self.member_stops
+            .note_refused((candidate.dev, candidate.ino));
         self.learned_load_tally
             .remove(&(candidate.dev, candidate.ino));
         self.learned_cap_skipped = self.learned_cap_skipped.saturating_add(1);
@@ -22227,6 +22229,7 @@ impl Engine {
     /// pathname names anymore.
     fn refuse_learned_gone_file(&mut self, identity: (u64, u64), display_path: &str) {
         self.note_learned_settled(identity);
+        self.member_stops.note_refused(identity);
         self.learned_load_tally.remove(&identity);
         self.mark_partial(
             crate::render::LEARNED_SKIP_SUBJECT,
@@ -22323,6 +22326,7 @@ impl Engine {
                 attribution::note(&skip);
                 self.counters.object_skips.push(skip);
                 self.note_learned_settled(identity);
+                self.member_stops.note_refused(identity);
                 self.learned_load_tally.remove(&identity);
                 return;
             }
@@ -22368,6 +22372,7 @@ impl Engine {
                 return;
             }
             self.note_learned_settled(identity);
+            self.member_stops.note_refused(identity);
             self.learned_load_tally.remove(&identity);
             return;
         }

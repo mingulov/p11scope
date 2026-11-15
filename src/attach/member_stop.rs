@@ -292,17 +292,19 @@ impl Drop for MemberStopHooks {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {
                 continue;
             };
-            match self.tree.contains_pinned(&pin) {
-                Ok(true) => {
-                    if pin.probe_signal_authority().is_ok() {
-                        let _ = self.withdraw(tgid);
-                        let _ = pin.send_signal(libc::SIGCONT);
-                    }
-                }
-                Ok(false) => {
-                    let _ = self.withdraw(tgid);
-                }
-                Err(_) => {}
+            let member = match self.tree.contains_pinned(&pin) {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(_) => continue,
+            };
+            if !member {
+                let _ = self.withdraw(tgid);
+                continue;
+            }
+            // Signal first: a failed send of a live member keeps the row,
+            // and the watchdog sweeps instead of ending in order.
+            if pin.send_signal(libc::SIGCONT).is_ok() || matches!(pin.original_exited(), Ok(true)) {
+                let _ = self.withdraw(tgid);
             }
         }
         // An orderly end only when nothing is left: a row this release

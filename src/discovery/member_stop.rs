@@ -56,6 +56,9 @@ pub(crate) trait MemberStopIo {
 /// (never-stop). A member read late (a busy pass) resumes in the pass
 /// that reads it.
 pub(crate) const MEMBER_STOP_HOLD_NS: u64 = 1_000_000_000;
+/// Bounded memory of provider identities staged by a stop (the learned
+/// settled set's own cap).
+pub(crate) const MEMBER_STOP_STAGED_CAP: usize = 8192;
 /// Stopped members taken per service pass, oldest stop first.
 const MEMBER_STOP_INTAKE_PER_PASS: usize = 64;
 /// Wall-time budget of one pass's intake (maps reads and ELF proofs).
@@ -109,10 +112,25 @@ pub(crate) struct MemberStopState {
     /// the tests.
     #[cfg(test)]
     pub(crate) pin_fail: BTreeSet<u32>,
+    /// Tgids whose maps read fails, for the tests.
+    #[cfg(test)]
+    pub(crate) maps_fail: BTreeSet<u32>,
     pub(crate) stats: MemberStopStats,
 }
 
 impl MemberStopState {
+    /// Records a provider identity staged by a stop, bounded: past the
+    /// cap an identity is not retained and the overflow counts. Its
+    /// staging then files the first-use row (one redundant row at worst,
+    /// the safe direction).
+    pub(crate) fn note_stop_staged(&mut self, identity: (u64, u64)) {
+        if self.stop_staged.len() < MEMBER_STOP_STAGED_CAP || self.stop_staged.contains(&identity) {
+            self.stop_staged.insert(identity);
+        } else {
+            self.stats.stop_staged_overflow = self.stats.stop_staged_overflow.saturating_add(1);
+        }
+    }
+
     /// Records a refused staging (bounded like the settled set: past the
     /// cap a refused identity is not retained, and its hold ends at the
     /// bound instead).
@@ -145,6 +163,15 @@ pub(crate) struct MemberStopStats {
     pub(crate) forced_resumes: u64,
     /// Stopped members moved out of the run tree, resumed.
     pub(crate) moved_out_resumes: u64,
+    /// Members resumed with their stopping file unproven (neither
+    /// cleared nor staged): named first-use gap.
+    pub(crate) unproven_resumes: u64,
+    /// Held or pending members resumed unattached when the watchdog was
+    /// lost: named first-use gap.
+    pub(crate) lost_guard_resumes: u64,
+    /// Stop-staged identities not retained past the cap (their staging
+    /// then files the first-use row itself).
+    pub(crate) stop_staged_overflow: u64,
 }
 
 /// One executable file row of a member's maps.
@@ -609,7 +636,7 @@ impl Engine {
             {
                 continue;
             }
-            self.member_stops.stop_staged.insert(identity);
+            self.member_stops.note_stop_staged(identity);
             if self.pending_learned.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP {
                 self.refuse_learned_candidate(candidate);
             } else {
@@ -979,7 +1006,8 @@ impl Engine {
                  {} resumed attached, {} resumed at bound, {} resumed refused, \
                  {} unreadable, {} departed, \
                  {} not members, {} kept for a retry, {} resumed unverified at bound, \
-                 {} moved out and resumed; \
+                 {} moved out and resumed, {} resumed unproven, \
+                 {} resumed at watchdog loss, {} staged identities over the cap; \
                  kernel requested {}, table full {}, signal refused {}, identity unread {}",
                 stats.stopped,
                 stats.cleared_files,
@@ -993,6 +1021,9 @@ impl Engine {
                 stats.resume_unavailable,
                 stats.forced_resumes,
                 stats.moved_out_resumes,
+                stats.unproven_resumes,
+                stats.lost_guard_resumes,
+                stats.stop_staged_overflow,
                 kernel[0],
                 kernel[1],
                 kernel[2],
@@ -1005,6 +1036,19 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_staged_identities_are_bounded_and_the_overflow_counts() {
+        let mut state = MemberStopState::default();
+        for ino in 0..MEMBER_STOP_STAGED_CAP as u64 + 3 {
+            state.note_stop_staged((7, ino));
+        }
+        assert_eq!(state.stop_staged.len(), MEMBER_STOP_STAGED_CAP);
+        assert_eq!(state.stats.stop_staged_overflow, 3);
+        // A retained identity stays retained.
+        state.note_stop_staged((7, 0));
+        assert_eq!(state.stats.stop_staged_overflow, 3);
+    }
 
     #[test]
     fn the_stopping_row_is_proven_under_its_kernel_key() {

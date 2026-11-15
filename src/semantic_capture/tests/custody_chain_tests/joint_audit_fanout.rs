@@ -11227,6 +11227,161 @@ fn joint_claim_refuses_an_absent_original_without_a_void() {
     );
 }
 
+/// Keyrows N1 negative control for the invocation-containment clause:
+/// after a real void, an older-quantum admission whose native
+/// invocation is present in `open` again (a fresh call with the same
+/// caller, image, function and sequence) is not a proven voided claim.
+/// Presence of any retained entry under the invocation means the void
+/// did not account for the older original, so the claim must refuse.
+/// Dropping the `open` containment check would route this admission to
+/// plain S1 instead of refusing.
+#[test]
+fn joint_claim_refuses_an_older_admission_with_a_retained_invocation_after_a_void() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let older = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    let (ingested1, _proof, grant) = fixture.ingest_with_grant(raw1);
+    assert!(
+        ingested1.matches_admission(&older),
+        "the first quantum owns the older admission"
+    );
+    // The real ingest-break void fences the consumed history and wipes
+    // every retained original; the stream re-syncs on the next collect.
+    {
+        let owner = fixture.real.scene.coordinator.joint_capture_mut();
+        owner.adapter_mut().break_stream_for_test();
+        assert!(
+            owner
+                .void_ingest_break()
+                .expect("the test void fits its ledger"),
+            "the broken stream raises one void fence"
+        );
+        assert!(
+            owner.adapter().voided_through_for_test() > 0,
+            "the real void raised its fence"
+        );
+        assert!(
+            !ingested1.matches_retained_admission(&older, owner.adapter()),
+            "the void wiped the older admission's original"
+        );
+    }
+    // A fresh call with the same native invocation re-opens that key.
+    // The older admission's original is gone; this entry is not it.
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw2 = fixture.collect_with_fault(&BirthFault);
+    fixture.real.h0.0.borrow_mut().collected = Some(raw2);
+    let _batch2 = fixture.real.tick();
+    let raw2 = fixture
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .expect("the second tick returns the collected raw");
+    let ingested2 = raw2
+        .ingest(
+            fixture
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.producers,
+            &grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("the post-void quantum ingests: {reason:?}"));
+    assert!(
+        !ingested2.matches_admission(&older),
+        "the older admission belongs to the earlier quantum"
+    );
+    let refusal = match fixture
+        .real
+        .scene
+        .coordinator
+        .claim_next_prepared_admission(&fixture.producers, &ingested2)
+    {
+        Ok(claim) => {
+            panic!("an older admission with a retained invocation must not claim: {claim:?}")
+        }
+        Err(refusal) => refusal,
+    };
+    assert_eq!(
+        refusal,
+        RawQuantumRefusal::Admission,
+        "the claim refuses while a retained entry owns the invocation"
+    );
+    let adapter = fixture.real.scene.coordinator.joint_capture().adapter();
+    assert!(
+        !ingested2.matches_retained_admission(&older, adapter),
+        "the fresh same-invocation call is not the older admission's original"
+    );
+    assert!(
+        !ingested2.admission_voided(&older, adapter),
+        "a retained invocation is not a proven voided original"
+    );
+}
+
+/// Keyrows N1 consistency control: a self-inconsistent admission whose
+/// collected-origin position disagrees with its own H0 ordinal is not a
+/// voided claim, even after a real fence and with its invocation gone.
+/// The retained-original predicate requires those positions to agree,
+/// so the voided route must not accept what that predicate rejects.
+/// Dropping the position check would route this admission to plain S1.
+#[test]
+fn joint_voided_admission_with_a_misaligned_origin_stays_a_refusal() {
+    let mut fixture = JointScene::new(1);
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    fixture.push(pid, 0, "C_SignInit", 1);
+    let raw1 = fixture.prepare(1);
+    let mut older = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("one prepared admission")
+        .clone();
+    let (ingested1, _proof, _grant) = fixture.ingest_with_grant(raw1);
+    {
+        let owner = fixture.real.scene.coordinator.joint_capture_mut();
+        owner.adapter_mut().break_stream_for_test();
+        assert!(
+            owner
+                .void_ingest_break()
+                .expect("the test void fits its ledger"),
+            "the broken stream raises one void fence"
+        );
+    }
+    {
+        let adapter = fixture.real.scene.coordinator.joint_capture().adapter();
+        assert!(
+            ingested1.admission_voided(&older, adapter),
+            "the voided original left `open` under a real fence"
+        );
+        older.misalign_h0_ordinal_for_test();
+        assert!(
+            !ingested1.admission_voided(&older, adapter),
+            "an origin position that disagrees with the admission's H0 ordinal is not a voided claim"
+        );
+    }
+}
+
 /// Keyrows T1 fix4 B1 twin: a Joint feed's seal waits (BoundNotReady)
 /// behind a long call from the same process that is still running, so
 /// the frame's completed call stays staged while its consumer goes

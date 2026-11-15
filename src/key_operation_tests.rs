@@ -15501,6 +15501,94 @@ fn key_operation_voided_claim_reduces_s1_on_a_joint_feed() {
     );
 }
 
+/// N1/C4: a voided pre-void claim whose own Joint feed still holds a
+/// queued call falls that feed back in order before reducing the claim
+/// direct. The queued call replays first, the ending is named
+/// `joint_fallback_voided_admission` once for its caller, and the
+/// orphan keeps its observed call as a plain S1 row. Reducing direct
+/// without the ordered fallback would overtake the queued call and
+/// leave its staging behind.
+#[test]
+fn key_operation_voided_claim_behind_a_queued_call_falls_back_in_order() {
+    use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+    // A completed Init stays queued on the Joint feed awaiting its seal.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (init_facts, init_position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, init_position, init_facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "the Init selects the Joint feed"
+    );
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        1,
+        "the Init is queued awaiting its seal"
+    );
+    // A voided pre-void admission from the same instance arrives after
+    // the queued Init; reducing it direct must not overtake it.
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, position) = guarded.admit_shape(&sign);
+    let mut orphan =
+        AdmittedInstanceCall::scripted(joint_key.clone(), guarded.caller, position, facts);
+    orphan.retain_as_plain_s1();
+    guarded.registry.observe_instance_semantic(orphan);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let ended: Vec<_> = guarded
+        .registry
+        .gaps()
+        .iter()
+        .cloned()
+        .chain(guarded.registry.staged_gaps_for_test())
+        .filter(|gap| gap.reason == "joint_fallback_voided_admission")
+        .map(|gap| (gap.caller, gap.reason))
+        .collect();
+    assert_eq!(
+        ended,
+        [(
+            Some(guarded.caller),
+            "joint_fallback_voided_admission".to_string()
+        )],
+        "the voided-claim fallback is named once, for its caller"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the feed falls back for the queued call"
+    );
+    assert_eq!(
+        guarded.registry.joint_direct_fallback(),
+        1,
+        "the orphan is counted once as a call reduced without Joint evidence"
+    );
+    assert_eq!(
+        (
+            guarded.edge_calls(joint_id),
+            guarded.edge_started(joint_id),
+            guarded.edge_completed(joint_id)
+        ),
+        (2, 1, 1),
+        "the queued Init replays before the orphan's Sign reduces"
+    );
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        0,
+        "the fallback releases every queued ticket"
+    );
+}
+
 /// N1: seal delivery replays the staged head through the shared
 /// reducer, releases the ledger, and capture commits Populated from
 /// the retained projection.

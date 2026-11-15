@@ -1059,6 +1059,13 @@ impl AdmittedInstanceCall {
             plain_s1: false,
         }
     }
+
+    /// Tests-only inconsistency: move the admission's H0 ordinal away
+    /// from its collected-origin position, so predicates requiring the
+    /// two to agree can be exercised.
+    pub(crate) fn misalign_h0_ordinal_for_test(&mut self) {
+        self.position.ordinal = self.position.ordinal.saturating_add(1);
+    }
 }
 
 impl fmt::Debug for InstanceKey {

@@ -930,6 +930,21 @@ impl NativeBinder {
         self.domains.iter().map(|domain| domain.exec_ns.len()).sum()
     }
 
+    /// Test-only: remembered exec sequences across all open domains.
+    #[cfg(test)]
+    pub(crate) fn cookie_sequences_for_test(&self) -> usize {
+        self.domains
+            .iter()
+            .map(|domain| {
+                domain
+                    .cookies
+                    .values()
+                    .map(|execs| execs.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
     pub(crate) fn absorb_lifecycle(&mut self, batch: &DiscoveryBatch) {
         let index = self.domain_index(batch.domain);
         let limit = self.limits.exec_tgids;

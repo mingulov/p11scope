@@ -632,6 +632,10 @@ PROCESS_VIEW_CAPACITY_EXHAUSTED = (
     "capture process-view capacity was exhausted; remaining generations were not scanned"
 )
 LOADER_CONTEXT_CAPACITY_EXHAUSTED = "loader context capacity 256 is exhausted"
+LOADER_CONTEXT_CHILD_RESERVE = (
+    "loader contexts 249-256 are reserved for the run's own command; "
+    "a descendant arm past 248 was refused"
+)
 LOADER_SCAN_LEDGER_EXCEEDED = (
     "a deferred loader memory scan exceeded the bounded loader-context ledger"
 )
@@ -808,6 +812,7 @@ DISCOVERY_REASONS = {
     PROCESS_VIEW_CAPACITY_EXHAUSTED,
     DEEP_SCAN_SELECTION_CAPPED,
     LOADER_CONTEXT_CAPACITY_EXHAUSTED,
+    LOADER_CONTEXT_CHILD_RESERVE,
     LOADER_SCAN_LEDGER_EXCEEDED,
     LOADER_ARM_LEDGER_FULL,
     MANIFEST_OBJECT_UNAVAILABLE,

@@ -2553,8 +2553,12 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
     };
     assert!(
         snapshot.contains(&format!(
-            "budgets: callers {} | modules {} | edges {} | endpoints {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {} | inventory_attach_modules {}",
-            row("callers"),
+            "budgets: callers {}/{} refused {} retired {} late {} | modules {} | edges {} | endpoints {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {} | inventory_attach_modules {} | native_departed pair_rows {} pair_base {} pair_overflow {} exec_overflow {}",
+            budgets["callers"]["occupied"],
+            budgets["callers"]["limit"],
+            budgets["callers"]["refused"],
+            budgets["callers"]["retired"],
+            budgets["callers"]["late_refused"],
             row("modules"),
             row("edges"),
             row("endpoints"),
@@ -2570,6 +2574,10 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             budgets["retained_history"]["suppressed"],
             row("inventory_endpoints"),
             row("inventory_attach_modules"),
+            budgets["native_departed"]["pair_dropped_rows"],
+            budgets["native_departed"]["pair_dropped_base"],
+            budgets["native_departed"]["pair_prune_overflow"],
+            budgets["native_departed"]["exec_prune_overflow"],
         )),
         "snapshot budgets"
     );

@@ -93,6 +93,27 @@ pub(crate) struct AdapterLens {
     pub live_by_pid: CounterRow,
 }
 
+/// R1 native-retention lens: the coordinator's per-ever native maps
+/// after the pass prune. Each is bounded (exec stash and both tombstone
+/// sets by their caps, pair targets and counts by the grace window,
+/// aggregates by key class), so the soak can attribute the native lane
+/// separately from the RSS rollup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeRetentionLens {
+    pub exec_exe: CounterRow,
+    pub exec_pruned: CounterRow,
+    pub exec_loss_domains: CounterRow,
+    pub pair_targets: CounterRow,
+    pub pair_counts: CounterRow,
+    pub pair_tombstones: CounterRow,
+    pub pair_totals: CounterRow,
+    pub preadmission: CounterRow,
+    pub pending_ids: CounterRow,
+    pub placement_generations: CounterRow,
+    pub recoveries: CounterRow,
+    pub rendered_callers: CounterRow,
+}
+
 /// R3 lens: per-edge session/operation/mechanism maps, summed over
 /// the registry's materialized edges (O(edges), emit path only).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +327,7 @@ pub(crate) struct ProfileLens {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InventoryLens {
     pub adapter: AdapterLens,
+    pub native: NativeRetentionLens,
     pub registry: RegistryLens,
     pub history: HistoryLens,
     pub model: ModelLens,
@@ -322,6 +344,18 @@ pub(crate) struct MemorySnapshot {
     r1_adapter_callers: Option<CounterRow>,
     r1_adapter_incarnations: Option<CounterRow>,
     r1_adapter_live_by_pid: Option<CounterRow>,
+    r1_native_exec_exe: Option<CounterRow>,
+    r1_native_exec_pruned: Option<CounterRow>,
+    r1_native_exec_loss_domains: Option<CounterRow>,
+    r1_native_pair_targets: Option<CounterRow>,
+    r1_native_pair_counts: Option<CounterRow>,
+    r1_native_pair_tombstones: Option<CounterRow>,
+    r1_native_pair_totals: Option<CounterRow>,
+    r1_native_preadmission: Option<CounterRow>,
+    r1_native_pending_ids: Option<CounterRow>,
+    r1_native_placement_generations: Option<CounterRow>,
+    r1_native_recoveries: Option<CounterRow>,
+    r1_native_rendered_callers: Option<CounterRow>,
     r2_registry_callers: Option<CounterRow>,
     r2_registry_retired: Option<CounterRow>,
     r2_registry_modules: Option<CounterRow>,
@@ -478,6 +512,18 @@ impl MemorySnapshot {
             r1_adapter_callers: None,
             r1_adapter_incarnations: None,
             r1_adapter_live_by_pid: None,
+            r1_native_exec_exe: None,
+            r1_native_exec_pruned: None,
+            r1_native_exec_loss_domains: None,
+            r1_native_pair_targets: None,
+            r1_native_pair_counts: None,
+            r1_native_pair_tombstones: None,
+            r1_native_pair_totals: None,
+            r1_native_preadmission: None,
+            r1_native_pending_ids: None,
+            r1_native_placement_generations: None,
+            r1_native_recoveries: None,
+            r1_native_rendered_callers: None,
             r2_registry_callers: None,
             r2_registry_retired: None,
             r2_registry_modules: None,
@@ -563,6 +609,18 @@ impl MemorySnapshot {
             r1_adapter_callers: Some(lens.adapter.callers),
             r1_adapter_incarnations: Some(lens.adapter.incarnations),
             r1_adapter_live_by_pid: Some(lens.adapter.live_by_pid),
+            r1_native_exec_exe: Some(lens.native.exec_exe),
+            r1_native_exec_pruned: Some(lens.native.exec_pruned),
+            r1_native_exec_loss_domains: Some(lens.native.exec_loss_domains),
+            r1_native_pair_targets: Some(lens.native.pair_targets),
+            r1_native_pair_counts: Some(lens.native.pair_counts),
+            r1_native_pair_tombstones: Some(lens.native.pair_tombstones),
+            r1_native_pair_totals: Some(lens.native.pair_totals),
+            r1_native_preadmission: Some(lens.native.preadmission),
+            r1_native_pending_ids: Some(lens.native.pending_ids),
+            r1_native_placement_generations: Some(lens.native.placement_generations),
+            r1_native_recoveries: Some(lens.native.recoveries),
+            r1_native_rendered_callers: Some(lens.native.rendered_callers),
             r2_registry_callers: Some(lens.registry.callers),
             r2_registry_retired: Some(lens.registry.retired),
             r2_registry_modules: Some(lens.registry.modules),
@@ -892,6 +950,20 @@ mod tests {
                 incarnations: row(2),
                 live_by_pid: row(3),
             },
+            native: NativeRetentionLens {
+                exec_exe: row(21),
+                exec_pruned: row(22),
+                exec_loss_domains: row(23),
+                pair_targets: row(24),
+                pair_counts: row(25),
+                pair_tombstones: row(26),
+                pair_totals: row(27),
+                preadmission: row(32),
+                pending_ids: row(28),
+                placement_generations: row(29),
+                recoveries: row(30),
+                rendered_callers: row(31),
+            },
             registry: RegistryLens {
                 callers: row(3),
                 retired: row(4),
@@ -1039,6 +1111,17 @@ mod tests {
         assert_eq!(inventory.r4_pruned_sessions, Some(14));
         assert_eq!(inventory.r4_pruned_objects, Some(15));
         assert_eq!(inventory.r1_adapter_live_by_pid.expect("R1").len, 3);
+        assert_eq!(inventory.r1_native_exec_exe.expect("native").len, 21);
+        assert_eq!(inventory.r1_native_exec_pruned.expect("native").len, 22);
+        assert_eq!(inventory.r1_native_pair_targets.expect("native").len, 24);
+        assert_eq!(inventory.r1_native_pair_totals.expect("native").len, 27);
+        assert_eq!(inventory.r1_native_preadmission.expect("native").len, 32);
+        assert_eq!(
+            inventory.r1_native_rendered_callers.expect("native").len,
+            31
+        );
+        assert!(profile.r1_native_exec_exe.is_none());
+        assert!(trace.r1_native_pair_targets.is_none());
         assert_eq!(inventory.r2_modules_by_key.expect("R2").len, 7);
         assert_eq!(inventory.r2_gap_index.expect("R2").len, 8);
         assert_eq!(inventory.r3_edge_detached.expect("R3").len, 11);

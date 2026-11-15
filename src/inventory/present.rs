@@ -461,7 +461,6 @@ pub(crate) struct SemanticResourceView {
     pub occupancy: S1Occupancy,
 }
 
-#[cfg(test)]
 impl Default for SemanticResourceView {
     fn default() -> Self {
         Self {
@@ -472,7 +471,7 @@ impl Default for SemanticResourceView {
 }
 
 /// Every budgeted resource with limit, occupancy, and loss counter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct BudgetView {
     pub callers_limit: usize,
     pub callers_occupied: usize,
@@ -480,6 +479,9 @@ pub(crate) struct BudgetView {
     /// Proven-exited caller rows retired after they were rendered into
     /// the counted aggregate (their `callers[]` row no longer appears).
     pub callers_retired: u64,
+    /// Late mapping notes refused for a retired caller incarnation
+    /// (counted; they never invent a fresh caller row).
+    pub callers_late_refused: u64,
     pub modules_limit: usize,
     pub modules_occupied: usize,
     pub modules_refused: u64,
@@ -525,6 +527,15 @@ pub(crate) struct BudgetView {
     /// held per (pid, module) until their caller's admission; `None` in
     /// the scan lane.
     pub preadmission: Option<crate::discovery::engine::inventory_coordinator::PreadmissionCounters>,
+    /// Departed native retention accounting (additive within v1):
+    /// exact pruned dropped-pair rows and their absolute bases, the
+    /// rows folded past the exact tombstone bound, and the pruned
+    /// EXEC stashes discarded past their bound. Every fold is counted
+    /// once; a base is never forgotten silently.
+    pub native_pair_dropped_rows: u64,
+    pub native_pair_dropped_base: u64,
+    pub native_pair_prune_overflow: u64,
+    pub native_exec_prune_overflow: u64,
 }
 
 impl BudgetView {
@@ -969,6 +980,7 @@ impl Presentation {
         }
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
+        let dropped_pairs = coordinator.pruned_pair_totals();
         let render_index = PresentationRenderIndex::build(&instances, &semantic_edges);
         let (excluded_modules, unmatched_excludes) = coordinator.excluded_snapshot();
         let module_keys: Vec<(ModuleId, String, (u64, u64), u64)> = modules
@@ -1040,6 +1052,7 @@ impl Presentation {
                     .admit_refused()
                     .saturating_add(registry.callers_refused()),
                 callers_retired: coordinator.retired_callers(),
+                callers_late_refused: registry.retired_mapping_refusals(),
                 modules_limit: limits.max_modules,
                 modules_occupied: registry.module_count(),
                 modules_refused: registry.modules_refused(),
@@ -1085,6 +1098,10 @@ impl Presentation {
                 retained: registry.gaps().len(),
                 retained_suppressed: registry.gaps_suppressed(),
                 preadmission: coordinator.preadmission_counters(),
+                native_pair_dropped_rows: dropped_pairs.0,
+                native_pair_dropped_base: dropped_pairs.1,
+                native_pair_prune_overflow: coordinator.pair_prune_overflow(),
+                native_exec_prune_overflow: coordinator.exec_prune_overflow(),
             },
             key_operations_requested: coordinator.key_operations_requested(),
             manifests_present: coordinator.has_manifests(),
@@ -4497,11 +4514,12 @@ fn render_snapshot_inner(
     );
     let _ = writeln!(
         out,
-        "budgets: callers {}/{} refused {} retired {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {} | {}",
+        "budgets: callers {}/{} refused {} retired {} late {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {} | native_departed pair_rows {} pair_base {} pair_overflow {} exec_overflow {} | {}",
         budgets.callers_occupied,
         budgets.callers_limit,
         budgets.callers_refused,
         budgets.callers_retired,
+        budgets.callers_late_refused,
         budgets.modules_occupied,
         budgets.modules_limit,
         budgets.modules_refused,
@@ -4527,6 +4545,10 @@ fn render_snapshot_inner(
         budgets.inventory_modules_occupied,
         budgets.inventory_modules_limit,
         budgets.inventory_modules_refused,
+        budgets.native_pair_dropped_rows,
+        budgets.native_pair_dropped_base,
+        budgets.native_pair_prune_overflow,
+        budgets.native_exec_prune_overflow,
         semantic_resource_line(&budgets.instance_semantic_resources),
     );
     if presentation.caller_metadata.summary.enabled {

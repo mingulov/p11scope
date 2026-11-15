@@ -2884,6 +2884,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             callers_occupied: 1,
             callers_refused: 0,
             callers_retired: 0,
+            callers_late_refused: 0,
             modules_limit: 8,
             modules_occupied: 1,
             modules_refused: 0,
@@ -2920,6 +2921,10 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             retained: 1,
             retained_suppressed: 0,
             preadmission: None,
+            native_pair_dropped_rows: 0,
+            native_pair_dropped_base: 0,
+            native_pair_prune_overflow: 0,
+            native_exec_prune_overflow: 0,
         },
     }
 }

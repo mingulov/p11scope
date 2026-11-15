@@ -1310,6 +1310,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
             callers_occupied: 0,
             callers_refused: 0,
             callers_retired: 0,
+            callers_late_refused: 0,
             modules_limit: 0,
             modules_occupied: 0,
             modules_refused: 0,
@@ -1346,6 +1347,10 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
             retained: 0,
             retained_suppressed: 0,
             preadmission: None,
+            native_pair_dropped_rows: 0,
+            native_pair_dropped_base: 0,
+            native_pair_prune_overflow: 0,
+            native_exec_prune_overflow: 0,
         },
         semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
         object_observations: crate::key_operation_projection::ObjectObservations::unavailable(

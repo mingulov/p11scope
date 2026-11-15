@@ -869,9 +869,12 @@ fn native_semantic_resource_final_types_pinned() {
     // unmatched `--module` inputs); operator-bounded like the other
     // unmatched lists. The pin predates the field, so it measured 1392
     // against a 1416 struct until this repin.
+    // +48 (v0.8.0 departed-retention publication): five inline budget
+    // scalars — late retired-caller refusals and the exact pair
+    // row/base plus pair/EXEC overflow counters — with padding.
     pin!(
         crate::inventory_present::Presentation,
-        1288 + size_of::<crate::inventory_present::PresentationRenderIndex>()
+        1336 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 5 * size_of::<Vec<u8>>()
             // a2 re-arm rate: joint_audit_subjects
             + size_of::<

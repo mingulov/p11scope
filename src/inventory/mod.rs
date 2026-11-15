@@ -10231,6 +10231,10 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             // the aggregate, not silently lost; the rows no longer
             // appear in `callers[]`.
             "retired": budgets.callers_retired,
+            // Additive (v1, v0.8.0): late mapping notes refused for a
+            // retired caller incarnation. Counted, never silently
+            // merged into a fresh caller row.
+            "late_refused": budgets.callers_late_refused,
         },
         "modules": {
             "limit": budgets.modules_limit,
@@ -10324,6 +10328,21 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             "refused": stash.refused,
             "pruned": stash.pruned,
         })),
+        // Additive (v1, v0.8.0): departed native retention accounting.
+        // `pair_dropped_*` is the exact aggregate of pruned dropped-pair
+        // rows (bases folded per key class, never forgotten silently);
+        // `pair_prune_overflow` counts the rows folded past the exact
+        // per-pair tombstone bound (their revival rebases approximately,
+        // never re-absorbs a count), and `exec_prune_overflow` counts
+        // pruned EXEC stashes discarded past their bound (the domain
+        // latches `exec_record_lost`). Every overflow row is counted
+        // once, when it leaves the map.
+        "native_departed": {
+            "pair_dropped_rows": budgets.native_pair_dropped_rows,
+            "pair_dropped_base": budgets.native_pair_dropped_base,
+            "pair_prune_overflow": budgets.native_pair_prune_overflow,
+            "exec_prune_overflow": budgets.native_exec_prune_overflow,
+        },
     })
 }
 
@@ -10364,6 +10383,29 @@ pub(crate) fn render_text_with_verbosity<Source: ProcessSource>(
 #[cfg(test)]
 mod tests {
     use crate::fixture_guard::DieWithParent as _;
+
+    #[test]
+    fn budgets_json_publishes_departed_retention_and_late_refusals() {
+        let budgets = crate::inventory_present::BudgetView {
+            callers_retired: 7,
+            callers_late_refused: 3,
+            native_pair_dropped_rows: 11,
+            native_pair_dropped_base: 42,
+            native_pair_prune_overflow: 2,
+            native_exec_prune_overflow: 1,
+            ..Default::default()
+        };
+        let json = super::budgets_json(&budgets);
+        assert_eq!(json["callers"]["retired"], 7);
+        assert_eq!(json["callers"]["late_refused"], 3);
+        assert_eq!(json["native_departed"]["pair_dropped_rows"], 11);
+        assert_eq!(json["native_departed"]["pair_dropped_base"], 42);
+        assert_eq!(json["native_departed"]["pair_prune_overflow"], 2);
+        assert_eq!(json["native_departed"]["exec_prune_overflow"], 1);
+        // Additive: the existing budget rows are untouched.
+        assert_eq!(json["callers"]["limit"], 0);
+        assert_eq!(json["modules"]["occupied"], 0);
+    }
 
     #[test]
     fn owner_terminal_error_preserves_primary_and_typed_interruption() {

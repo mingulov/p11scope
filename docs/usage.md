@@ -1004,13 +1004,17 @@ descendant held at its first map is resumed by `run`'s watchdog: a small
 the hook attaches and before it can stop anyone. When the observer dies without
 its cleanup the watchdog sends SIGCONT to every stopped member of the run
 cgroup tree except the direct child (pinned by pidfd, rechecked as stopped and
-as a member). Its sweeps start between 0 and 1.6 s after the death, so the
-last one starts by 1.6 s (measured: every member ran again 0.2-0.5 s after a
-SIGKILL under load); then it exits. A capture end that could not resume a
+as a member). The walk is bounded: 256 cgroups, 8 levels deep and 4 MiB per
+`cgroup.procs` list. Its sweeps are scheduled between 0 and 1.6 s after the
+death (a slow sweep delays the later ones; measured: every member ran again
+0.2-0.5 s after a SIGKILL under load); then it exits. A capture end that could not resume a
 member itself leaves it to the same sweep. That sweep also resumes a member the
 user had stopped on purpose; it does not see a member moved out of the run
 cgroup. If the watchdog itself is killed, the observer stops stopping and
-resumes every member at once. Killing the observer and the watchdog together
+resumes every held and pending member at once; one it cannot pin or verify
+is resumed by number, only while its start time precedes its stop, and a
+member resumed before its provider attached files the learned first-use gap
+row. Killing the observer and the watchdog together
 (`pkill -9 p11scope`, a kill of a cgroup holding both, the OOM killer taking
 both) is not covered: the watchdog's own session keeps a terminal hangup or
 Ctrl-C away from it, but nothing resumes a member then; check the tree with

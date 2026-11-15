@@ -2883,6 +2883,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             callers_limit: 8,
             callers_occupied: 1,
             callers_refused: 0,
+            callers_retired: 0,
             modules_limit: 8,
             modules_occupied: 1,
             modules_refused: 0,

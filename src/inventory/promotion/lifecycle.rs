@@ -1309,6 +1309,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
             callers_limit: 0,
             callers_occupied: 0,
             callers_refused: 0,
+            callers_retired: 0,
             modules_limit: 0,
             modules_occupied: 0,
             modules_refused: 0,

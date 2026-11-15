@@ -41,10 +41,10 @@ use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::DEFAULT_MAX_GAPS;
 use crate::discovery::caller_registry::{
     AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
-    CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity, ExeResolution,
-    ImageAuthority, MappingState, ModuleId, ModuleInfo, ModuleKey, PendingCountOutcome,
-    PendingRejection, ProcessSource, RegistryGap, RegistryLimits, ScopedOwnerProof, UnboundExe,
-    UnboundImage, UnknownReason, UseCoverage,
+    CallerLifecycle, CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity,
+    ExeResolution, ImageAuthority, MappingState, ModuleId, ModuleInfo, ModuleKey,
+    PendingCountOutcome, PendingRejection, ProcessSource, RegistryGap, RegistryLimits,
+    ScopedOwnerProof, UnboundExe, UnboundImage, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, DecisionLog, ENDPOINT_RESOURCE,
@@ -653,6 +653,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// EXEC records shed past the stash cap (sticky): the shed
     /// record may be an image's EXEC, so the domain latches loss.
     exec_exe_shed: u64,
+    /// EXEC stashes pruned after their process departed, bounded: a
+    /// later row for the image reads `exec_record_lost` (the record
+    /// existed and the observer discarded it), never `no_exec_record`.
+    /// Past the bound the domain latches loss and
+    /// `exec_pruned_overflow` counts it.
+    exec_pruned: HashSet<DomainCookie>,
+    exec_pruned_cap: usize,
+    exec_pruned_overflow: u64,
     /// Domains with EXEC evidence loss (binder loss or stash shed):
     /// their still-unjoined images read `exec_record_lost`.
     exec_loss_domains: HashSet<NativeDomainId>,
@@ -674,8 +682,23 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Decided pairs (C7 C4): bound pairs stage their counts to one
     /// edge, dropped pairs (binder-unbound, ambiguous, or edgeless)
     /// never publish — DR-C51-PREADMIT stays out. One entry per
-    /// decided row at most.
+    /// decided row at most. Departed dropped rows move to
+    /// `pair_dropped_tombstones` once their base is older than the
+    /// grace, keeping the exact base for a late revival.
     pair_targets: HashMap<PairKey, PairTarget>,
+    /// Dropped pair bases pruned out of `pair_targets`, bounded. A late
+    /// row for one of these pairs still rebases past this exact base,
+    /// so pruning never double-counts it. Past the bound the prune
+    /// stops and `pair_prune_overflow` counts the retained rows.
+    pair_dropped_tombstones: HashMap<PairKey, PrunedPairBase>,
+    /// Exact aggregate of pruned dropped-pair bases per key class
+    /// (domain and object): rows and saturating base total. Counts stay
+    /// exact when the per-pair rows leave the map.
+    pair_dropped_totals: HashMap<PairKeyClass, DroppedPairTotal>,
+    /// Dropped rows that stayed in `pair_targets` because the tombstone
+    /// bound was full (sticky, saturating).
+    pair_prune_overflow: u64,
+    pair_prune_cap: usize,
     /// Outstanding publication-time count placements (P3): each staged
     /// pending count's opaque handle back to its pair. Drained with the
     /// publication's decisions; one entry per staged pending count.
@@ -689,6 +712,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
+    /// Caller rows a published presentation has rendered; retirement of
+    /// a proven-exited row waits until it has appeared at least once.
+    rendered_callers: BTreeSet<CallerId>,
+    /// Proven-exited caller rows retired into the counted aggregate
+    /// (monotonic, saturating).
+    retired_caller_rows: u64,
     /// Held exec handoffs (H6 slice 2): at most one per ended caller, keyed
     /// by it — no new unbounded table, one entry per retired caller
     /// reservation at most. Unscoped handoffs commit immediately; scoped
@@ -875,9 +904,22 @@ fn exit_clocks_comparable_with(
 /// Never lowered.
 const DEFAULT_MAX_EXEC_EXE_STASH: usize = 16_384;
 /// How long a gone process's EXEC evidence stays retained: a row read
-/// shortly after its exit still resolves; older rows cannot bind a live
-/// caller and are pruned.
+/// shortly after its exit still resolves. Older rows cannot bind a live
+/// caller, but a retained incarnation's late row can still be decided
+/// through the post-exit fallback, so its exec instants and image
+/// sequences are kept as vetoes for as long as the caller record is
+/// retained; only evidence no retained caller can consult prunes here.
 const EXEC_STATE_GRACE_NS: u64 = 180 * 1_000_000_000;
+/// Dropped pair bases kept as exact revival tombstones. Never lowered:
+/// each entry is ~40 B, so the full bound is a few MiB. Past it the
+/// prune stops (the rows stay in `pair_targets`) and
+/// `pair_prune_overflow` counts them; no base is ever forgotten.
+const MAX_PRUNED_PAIR_TOMBSTONES: usize = 65_536;
+/// Pruned EXEC stashes remembered per cookie. Past it the domain latches
+/// EXEC loss and `exec_pruned_overflow` counts the discarded tombstones;
+/// a missing record then reads `exec_record_lost`, never
+/// `no_exec_record`.
+const MAX_PRUNED_EXEC_TOMBSTONES: usize = 65_536;
 
 /// Scan-learned exe-probe cache: one entry per distinct caller path
 /// at most, so the retained set cannot outnumber admitted callers
@@ -1243,12 +1285,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             exec_exe: HashMap::new(),
             exec_exe_cap: DEFAULT_MAX_EXEC_EXE_STASH,
             exec_exe_shed: 0,
+            exec_pruned: HashSet::new(),
+            exec_pruned_cap: MAX_PRUNED_EXEC_TOMBSTONES,
+            exec_pruned_overflow: 0,
             exec_loss_domains: HashSet::new(),
             exe_resolver: ExeResolver::new(),
             exe_probe_cache: HashMap::new(),
             timens_boottime_ok: None,
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
+            pair_dropped_tombstones: HashMap::new(),
+            pair_dropped_totals: HashMap::new(),
+            pair_prune_overflow: 0,
+            pair_prune_cap: MAX_PRUNED_PAIR_TOMBSTONES,
             pending_ids: HashMap::new(),
             placement_generations: HashMap::new(),
             count_ownership: CountOwnership::new(registry_limits),
@@ -1258,6 +1307,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
+            rendered_callers: BTreeSet::new(),
+            retired_caller_rows: 0,
             pending_successors: BTreeMap::new(),
             leader_link_loss_noted: BTreeSet::new(),
             pending_leader_exits: BTreeMap::new(),
@@ -5181,20 +5232,98 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// otherwise grows with every short-lived process until its hard
     /// limit: rows for a gone generation can no longer bind to a live
     /// caller, so their exec stashes and ordering instants only cost
-    /// memory. The hard limits and live entries are untouched.
+    /// memory. Retained caller incarnations are the exception: their
+    /// exec and image evidence is the veto a late row is decided by, so
+    /// it survives until that caller record retires. The hard limits and
+    /// live entries are untouched.
     fn prune_departed_native_state(&mut self, now_ns: u64) {
         let source = self.adapter.source();
+        // A retired caller record still carries the post-exit fallback
+        // and its Rule 4/5 vetoes. Keep the pid's evidence while any
+        // incarnation for it is retained (the coordinator cannot tell a
+        // per-domain cookie, so pid is the conservative key).
+        let retained_pids: HashSet<u32> = self.adapter.records().map(|record| record.pid).collect();
         if let Some(capture) = self.capture.as_mut() {
             // Existing bounded stash: entries for gone pids (or a pid
             // reused by another process) can never matter again.
             capture.preadmission.prune(source);
         }
-        self.binder
-            .prune_departed(|pid| source.gone(pid), now_ns, EXEC_STATE_GRACE_NS);
-        self.exec_exe.retain(|_, exec| {
-            !source.gone(exec.pid_host)
-                || now_ns.saturating_sub(exec.hook_ts_ns) < EXEC_STATE_GRACE_NS
+        self.binder.prune_departed(
+            |pid| source.gone(pid),
+            |pid| retained_pids.contains(&pid),
+            now_ns,
+            EXEC_STATE_GRACE_NS,
+        );
+        let mut pruned = Vec::new();
+        self.exec_exe.retain(|cookie, exec| {
+            let keep = !source.gone(exec.pid_host)
+                || retained_pids.contains(&exec.pid_host)
+                || now_ns.saturating_sub(exec.hook_ts_ns) < EXEC_STATE_GRACE_NS;
+            if !keep {
+                pruned.push(*cookie);
+            }
+            keep
         });
+        for cookie in pruned {
+            self.note_exec_pruned(cookie);
+        }
+        self.prune_dropped_pair_targets(now_ns);
+    }
+
+    /// Remember that one departed image's EXEC stash was pruned: a late
+    /// row for it must read `exec_record_lost`, never `no_exec_record`.
+    /// The bounded tombstone set keeps the distinction exact; past the
+    /// bound the domain latches EXEC loss (conservative for every
+    /// unjoined image there) and the overflow is counted.
+    fn note_exec_pruned(&mut self, cookie: DomainCookie) {
+        if self.exec_pruned.len() < self.exec_pruned_cap {
+            self.exec_pruned.insert(cookie);
+            return;
+        }
+        self.exec_pruned_overflow = self.exec_pruned_overflow.saturating_add(1);
+        let domain = cookie.domain();
+        if self.exec_loss_domains.insert(domain) {
+            self.registry.flip_unbound_exec_loss(domain);
+        }
+    }
+
+    /// Prune dropped pair targets whose base is older than the grace
+    /// into the exact per-class aggregate. A tombstone keeps the base
+    /// so a late revival rebases past it; past the tombstone bound the
+    /// row stays and the overflow counts.
+    fn prune_dropped_pair_targets(&mut self, now_ns: u64) {
+        let due: Vec<PairKey> = self
+            .pair_targets
+            .iter()
+            .filter_map(|(key, target)| match target {
+                PairTarget::Dropped { base_since, .. }
+                    if now_ns.saturating_sub(*base_since) >= EXEC_STATE_GRACE_NS =>
+                {
+                    Some(*key)
+                }
+                _ => None,
+            })
+            .collect();
+        for key in due {
+            if self.pair_dropped_tombstones.len() >= self.pair_prune_cap {
+                self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
+                continue;
+            }
+            let Some(PairTarget::Dropped { base, base_since }) = self.pair_targets.get(&key) else {
+                continue;
+            };
+            let (base, base_since) = (*base, *base_since);
+            self.pair_targets.remove(&key);
+            let class = PairKeyClass {
+                domain: key.image.domain(),
+                object: key.object,
+            };
+            let total = self.pair_dropped_totals.entry(class).or_default();
+            total.rows = total.rows.saturating_add(1);
+            total.base = total.base.saturating_add(base);
+            self.pair_dropped_tombstones
+                .insert(key, PrunedPairBase { base, base_since });
+        }
     }
 
     /// Test-only: the retained EXEC exe stash size.
@@ -5203,28 +5332,131 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.exec_exe.len()
     }
 
+    /// Test-only: pruned EXEC-stash tombstones remembered.
+    #[cfg(test)]
+    pub(crate) fn exec_pruned_for_test(&self) -> usize {
+        self.exec_pruned.len()
+    }
+
+    /// Test-only: tombstone-overflow prunes counted (sticky).
+    #[cfg(test)]
+    pub(crate) fn exec_pruned_overflow_for_test(&self) -> u64 {
+        self.exec_pruned_overflow
+    }
+
+    /// Test-only: shrink the pruned EXEC tombstone bound.
+    #[cfg(test)]
+    pub(crate) fn set_exec_pruned_cap_for_test(&mut self, cap: usize) {
+        self.exec_pruned_cap = cap;
+    }
+
     /// Test-only: summed bases in the departed dropped-pair aggregate.
     #[cfg(test)]
     pub(crate) fn dropped_pair_base_total_for_test(&self) -> u64 {
-        0
+        self.pair_dropped_totals
+            .values()
+            .map(|total| total.base)
+            .sum()
+    }
+
+    /// Test-only: pruned dropped-pair tombstones remembered.
+    #[cfg(test)]
+    pub(crate) fn dropped_pair_tombstones_for_test(&self) -> usize {
+        self.pair_dropped_tombstones.len()
+    }
+
+    /// Test-only: dropped rows the tombstone bound kept in the map.
+    #[cfg(test)]
+    pub(crate) fn pair_prune_overflow_for_test(&self) -> u64 {
+        self.pair_prune_overflow
+    }
+
+    /// Test-only: shrink the pruned dropped-pair tombstone bound.
+    #[cfg(test)]
+    pub(crate) fn set_pair_prune_cap_for_test(&mut self, cap: usize) {
+        self.pair_prune_cap = cap;
     }
 
     /// Record caller rows that a presentation has rendered. Retirement is
     /// only allowed after this, so a row still shown keeps its facts.
-    #[cfg(test)]
-    pub(crate) fn note_rendered_callers(&mut self, _ids: &[CallerId]) {}
+    pub(crate) fn note_rendered_callers(&mut self, ids: &[CallerId]) {
+        self.rendered_callers.extend(ids.iter().copied());
+    }
 
     /// Retire rendered caller rows whose process is proven ended into the
-    /// counted aggregates. Returns how many rows retired.
-    #[cfg(test)]
+    /// counted aggregate. A row referenced by a pending row, an owner,
+    /// a handoff, a pair target or any rendered registry fact keeps its
+    /// facts. Returns how many rows retired.
     pub(crate) fn retire_rendered_callers(&mut self, _now_ns: u64) -> u64 {
-        0
+        let rendered = std::mem::take(&mut self.rendered_callers);
+        let mut retired = 0;
+        for id in rendered {
+            let Some(record) = self.adapter.record(id) else {
+                continue;
+            };
+            if !record.retired
+                || !matches!(
+                    record.lifecycle,
+                    CallerLifecycle::Exited | CallerLifecycle::ExecRetired
+                )
+            {
+                continue;
+            }
+            if self.caller_row_referenced(id) {
+                continue;
+            }
+            // A pending binder row still needs its incarnation snapshot;
+            // keep the record until that row decides.
+            if !self.binder.release_retired_caller(id) {
+                continue;
+            }
+            if self.adapter.forget_caller(id) {
+                self.registry.compact_retired_caller(id);
+                self.leader_link_loss_noted.remove(&id);
+                self.staged_retirements.remove(&id);
+                self.retired_caller_rows = self.retired_caller_rows.saturating_add(1);
+                retired += 1;
+            }
+        }
+        retired
+    }
+
+    /// Whether a caller row still backs a rendered fact or pending work.
+    /// Such a row must keep its facts until that consumer releases it.
+    fn caller_row_referenced(&self, id: CallerId) -> bool {
+        self.capture
+            .as_ref()
+            .is_some_and(|capture| capture.bound == Some(id))
+            || self.owners.contains_key(&id)
+            || self.pending_successors.contains_key(&id)
+            || self.pending_leader_exits.contains_key(&id)
+            || self.pending_adjudication.contains_key(&id)
+            || self
+                .recoveries
+                .values()
+                .any(|recovery| recovery.caller == id)
+            || self.pair_targets.values().any(|target| match target {
+                PairTarget::Bound { caller, .. }
+                | PairTarget::Pending { caller, .. }
+                | PairTarget::Suspended { caller, .. } => *caller == id,
+                PairTarget::Dropped { .. } => false,
+            })
+            || self
+                .pending_ids
+                .values()
+                .any(|pending| pending.caller == id)
+            || self.registry.caller_has_rendered_state(id)
+    }
+
+    /// Caller rows retired into the counted aggregate.
+    pub(crate) fn retired_callers(&self) -> u64 {
+        self.retired_caller_rows
     }
 
     /// Test-only: caller rows retired into the counted aggregates.
     #[cfg(test)]
     pub(crate) fn retired_caller_rows_for_test(&self) -> u64 {
-        0
+        self.retired_caller_rows
     }
 
     /// One pass with no scan behind it: the collection failed after at
@@ -7479,7 +7711,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let dropped = matches!(
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
-            );
+            ) || self.pair_dropped_tombstones.contains_key(&key);
             if !dropped {
                 self.pair_counts
                     .entry(key)
@@ -7526,7 +7758,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let dropped = matches!(
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
-            );
+            ) || self.pair_dropped_tombstones.contains_key(&key);
             // Keep the refresh PRE bound for future base coverage and
             // the common POST bound for this count's observation. Neither
             // claims exactly when this particular pair was looked up.
@@ -8187,7 +8419,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     base, base_since, ..
                 },
             ) => (*base, *base, *base_since, *base_since),
-            None => (0, 0, 0, held_first),
+            // A pruned dropped pair keeps its exact base as a tombstone:
+            // the revival rebases past it exactly like an unpruned drop.
+            None => {
+                self.pair_dropped_tombstones
+                    .get(&key)
+                    .map_or((0, 0, 0, held_first), |pruned| {
+                        (
+                            pruned.base,
+                            pruned.base,
+                            pruned.base_since,
+                            pruned.base_since,
+                        )
+                    })
+            }
         };
         if self.diagnostics.is_some() {
             let mut record = if let Some(count) = self.pair_counts.get(&key).map(|held| held.read) {
@@ -8237,6 +8482,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             recovery.blocked = false;
         }
         self.bump_placement_generation(key);
+        self.pair_dropped_tombstones.remove(&key);
         self.pair_targets.insert(
             key,
             PairTarget::Pending {
@@ -9232,6 +9478,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .pair_counts
             .get(&key)
             .map(|count| (count.count, count.anchor_ns))
+            .or_else(|| {
+                self.pair_dropped_tombstones
+                    .get(&key)
+                    .map(|pruned| (pruned.base, pruned.base_since))
+            })
             .unwrap_or((0, 0));
         if let Some(recorder) = &mut self.diagnostics {
             let held = self.pair_counts.get(&key).map(|held| held.read);
@@ -9251,6 +9502,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             recorder.record(record);
         }
+        self.pair_dropped_tombstones.remove(&key);
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
         self.pair_counts.remove(&key);
@@ -9307,13 +9559,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         });
                         self.resolve_unbound_exe(stashed, learned, all_learned)
                     }
-                    None if self.exec_evidence_lost(cookie.domain()) => UnboundExe {
-                        dev: 0,
-                        ino: 0,
-                        path: None,
-                        resolution: ExeResolution::ExecRecordLost,
-                        identity_candidates: Vec::new(),
-                    },
+                    None if self.exec_pruned.contains(&cookie)
+                        || self.exec_evidence_lost(cookie.domain()) =>
+                    {
+                        UnboundExe {
+                            dev: 0,
+                            ino: 0,
+                            path: None,
+                            resolution: ExeResolution::ExecRecordLost,
+                            identity_candidates: Vec::new(),
+                        }
+                    }
                     None => UnboundExe {
                         dev: 0,
                         ino: 0,
@@ -11442,7 +11698,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         registry_applied: usize,
     ) -> BatchReceipt {
         self.finalize_pending_counts();
-        if let Some((collection, _)) = completion.cgroup {
+        if let Some((collection, now_ns)) = completion.cgroup {
             collection.observe_publication(
                 completion.admitted,
                 completion.scan_callers,
@@ -11456,6 +11712,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 admitted: completion.admitted,
                 scan_callers: completion.scan_callers,
             });
+            // A cgroup-scope capture opens the same native lane, so its
+            // pass seam releases departed native state exactly like the
+            // classic catalog seam. The transaction has just completed;
+            // nothing in this pass still reads the pruned evidence.
+            self.prune_departed_native_state(now_ns);
         }
         self.synchronize_caller_metadata(crate::discovery::caller_registry::now_ns());
         BatchReceipt {
@@ -11530,6 +11791,31 @@ impl PairKey {
             object: update.object.index(),
         }
     }
+}
+
+/// The exact class of a pruned dropped pair: its native identity domain
+/// and the object it names. Classes are bounded by the capture's
+/// domains and attach objects, so their aggregate is small, while the
+/// per-pair rows it replaces are per-ever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PairKeyClass {
+    domain: NativeDomainId,
+    object: u32,
+}
+
+/// One pruned dropped pair's absolute base and its read anchor: a late
+/// revival rebases past exactly this, so pruning never double-counts.
+#[derive(Debug, Clone, Copy)]
+struct PrunedPairBase {
+    base: u64,
+    base_since: u64,
+}
+
+/// Exact aggregate of pruned dropped-pair bases for one class.
+#[derive(Debug, Clone, Copy, Default)]
+struct DroppedPairTotal {
+    rows: u64,
+    base: u64,
 }
 
 /// The latest known count of one pair (C7 C4): an absolute saturating
@@ -23004,6 +23290,42 @@ exit 0
             27,
             "the aggregate holds exactly the pruned bases"
         );
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            2,
+            "both exact bases stay available to a late revival"
+        );
+    }
+
+    /// The pair prune keeps its grace: a freshly dropped pair is still
+    /// live accounting state, not departed history.
+    #[test]
+    fn fresh_dropped_pair_bases_survive_the_grace() {
+        let (mut native, _caller) = NativeScene::new();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 9,
+                base_since: 5_000,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(5_000 + EXEC_STATE_GRACE_NS - 1);
+        assert!(
+            native.scene.coordinator.pair_targets.contains_key(&key),
+            "a within-grace dropped pair keeps its exact base"
+        );
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_base_total_for_test(),
+            0
+        );
     }
 
     /// A rendered, proven-exited caller row retires into counted
@@ -23045,10 +23367,21 @@ exit 0
             native.scene.coordinator.adapter.record(exited).is_some(),
             "an unrendered row keeps its facts"
         );
+        native.scene.source.spawn(9, 900);
+        let fresh = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(
+                9,
+                crate::discovery::caller_registry::ImageAuthority::ScanPinned,
+                100,
+            )
+            .unwrap();
         native
             .scene
             .coordinator
-            .note_rendered_callers(&[exited, live]);
+            .note_rendered_callers(&[exited, live, fresh]);
         assert_eq!(
             native.scene.coordinator.retire_rendered_callers(400),
             1,
@@ -23062,11 +23395,29 @@ exit 0
             native.scene.coordinator.adapter.record(live).is_some(),
             "a live rendered row stays"
         );
+        assert!(
+            native.scene.coordinator.adapter.record(fresh).is_some(),
+            "a live rendered row with no edge stays"
+        );
         assert_eq!(
             native.scene.coordinator.retired_caller_rows_for_test(),
             1,
             "the retirement is counted, never silent"
         );
+        // A rendered caller that still backs an edge keeps its facts:
+        // the edge row resolves it in every later presentation.
+        native
+            .scene
+            .coordinator
+            .adapter
+            .exec_transition_scoped(live, 500);
+        native.scene.coordinator.note_rendered_callers(&[live]);
+        assert_eq!(
+            native.scene.coordinator.retire_rendered_callers(600),
+            0,
+            "a caller backing a rendered edge is not retired"
+        );
+        assert!(native.scene.coordinator.adapter.record(live).is_some());
     }
 
     /// Twin: an exec newcomer the next pass enumerates and admits is
@@ -25966,6 +26317,106 @@ exit 0
             edge_count(&native, "b.so"),
             Some(2),
             "a revived pair stages post-drop growth, never the dropped absolute"
+        );
+        let gaps: Vec<_> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "the drop's disclosure stands exactly once: {:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+        let _ = shared;
+    }
+
+    #[test]
+    fn pruned_dropped_pair_revival_rebases_past_the_pruned_base() {
+        // Round 4, rebind (R4-N1 R2): demote (A=1) then reject over 19
+        // disclosed calls; sharing resolves; a repeated row plus an
+        // advance to 22 must stage only post-drop growth (B=2) — never
+        // re-absorb the dropped absolute.
+        use crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 20)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Sharing resolves: A leaves, B stays the sole admitted member.
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        // The drop's exact base moves to the bounded tombstone after the
+        // grace; the dispatch and aggregate keep it available.
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(native.stamps.tick() + EXEC_STATE_GRACE_NS);
+        // A repeated witness row rebinds the pruned dropped pair (its
+        // refresh was skipped while dropped, so nothing stages yet).
+        let repeat = native.row(41, 1, 7, 100, 0);
+        native.read(vec![repeat]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // The next advance stages only post-drop growth.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 22)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_count = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(
+            edge_count(&native, "a.so"),
+            Some(1),
+            "A keeps exactly its history"
+        );
+        assert_eq!(
+            edge_count(&native, "b.so"),
+            Some(2),
+            "a revival past the pruned base stages post-drop growth, never the dropped absolute"
         );
         let gaps: Vec<_> = native
             .scene
@@ -33129,6 +33580,112 @@ int main(void) {
         let pids = native.scene.coordinator.registry.unidentified_pids();
         assert_eq!(pids.len(), 1);
         assert_eq!(pids[0].exe.resolution, ExeResolution::ExecRecordLost);
+    }
+
+    /// A departed EXEC stash pruned after the grace was real evidence
+    /// the observer discarded: a late row for that image reads
+    /// `exec_record_lost`, never the false claim that no record existed.
+    #[test]
+    fn pruned_exec_record_reads_lost_not_missing() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        let at = native.stamps.tick();
+        native.execs(vec![exec_record(41, 9, at, 8, 99)]);
+        assert_eq!(native.scene.coordinator.exec_exe_len_for_test(), 1);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.exec_exe_len_for_test(), 0);
+        assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 1);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(
+            exes[0].resolution,
+            ExeResolution::ExecRecordLost,
+            "a pruned record is named lost, never missing"
+        );
+    }
+
+    /// Past the pruned-EXEC tombstone bound the distinction cannot stay
+    /// exact: the domain latches EXEC loss and the overflow is counted,
+    /// so an unjoined image still reads lost rather than missing.
+    #[test]
+    fn pruned_exec_tombstone_overflow_latches_domain_loss_and_counts() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.scene.coordinator.set_exec_pruned_cap_for_test(1);
+        let at = native.stamps.tick();
+        native.execs(vec![
+            exec_record(41, 9, at, 8, 99),
+            exec_record(42, 10, at, 8, 100),
+        ]);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 1);
+        assert_eq!(native.scene.coordinator.exec_pruned_overflow_for_test(), 1);
+        native.witness(vec![native.row(42, 1, 10, 210, 0)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(exes[0].resolution, ExeResolution::ExecRecordLost);
+    }
+
+    /// Past the pruned-pair tombstone bound no base is forgotten: the
+    /// row stays in the map and the overflow counts, so the aggregate
+    /// plus the map still sums exactly.
+    #[test]
+    fn dropped_pair_tombstone_overflow_keeps_rows_and_counts() {
+        let (mut native, _caller) = NativeScene::new();
+        native.scene.coordinator.set_pair_prune_cap_for_test(1);
+        let keys = [
+            PairKey {
+                image: DomainCookie::scripted(native.domain, 41),
+                exec: 1,
+                object: 0,
+            },
+            PairKey {
+                image: DomainCookie::scripted(native.domain, 42),
+                exec: 1,
+                object: 0,
+            },
+        ];
+        for (index, key) in keys.iter().enumerate() {
+            native.scene.coordinator.pair_targets.insert(
+                *key,
+                PairTarget::Dropped {
+                    base: 10 + index as u64,
+                    base_since: 1_000,
+                },
+            );
+        }
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(1_000 + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.pair_targets.len(),
+            1,
+            "the over-bound row stays in the map"
+        );
+        assert_eq!(native.scene.coordinator.pair_prune_overflow_for_test(), 1);
+        let remaining: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .filter_map(|target| match target {
+                PairTarget::Dropped { base, .. } => Some(*base),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            remaining + native.scene.coordinator.dropped_pair_base_total_for_test(),
+            21,
+            "no base is forgotten at the tombstone bound"
+        );
     }
 
     /// Resolution source (b): the coordinator exposes the

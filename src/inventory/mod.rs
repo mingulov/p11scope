@@ -1416,27 +1416,36 @@ pub(crate) fn trim_pass_heap() {
 }
 
 /// Drop `value` on a short-lived worker thread and wait for its pthread
-/// teardown (`tcache_thread_shutdown`) before trimming the heap. Pass
-/// transients allocated on the collector thread are freed into that
-/// thread's arena/tcache; freeing them on the main thread would leave the
-/// owning arena's pages resident. The worker's exit flushes its tcache, so
-/// the trim can then hand the pages back.
+/// teardown (`tcache_thread_shutdown`). Pass transients allocated on the
+/// collector thread are freed into that thread's arena/tcache; freeing
+/// them on the main thread would leave the owning arena's pages resident.
+/// The worker's exit flushes its tcache, so the caller's pass-boundary
+/// [`trim_pass_heap`] can then hand the pages back; this function runs no
+/// trim of its own (the pass already runs one at its publication seam).
+/// A worker panic is reported rather than swallowed; any value it did not
+/// take is dropped on this thread as the safe fallback.
 pub(crate) fn drop_off_main_thread<T: Send>(value: T) {
     let slot = std::sync::Mutex::new(Some(value));
     std::thread::scope(|scope| {
         if let Ok(handle) = std::thread::Builder::new()
             .name("p11scope-reclaim".into())
             .spawn_scoped(scope, || {
+                // A poisoned slot means an earlier drop panicked while
+                // holding it; leaving the value in the slot lets the
+                // main thread's fallback below own the drop.
                 if let Ok(mut guard) = slot.lock() {
                     drop(guard.take());
                 }
             })
+            && handle.join().is_err()
         {
-            let _ = handle.join();
+            let _ = crate::sink::try_stderr_line(
+                "p11scope: pass-heap reclaim worker panicked; its transient stays \
+                 on the main thread's heap until the next pass trim",
+            );
         }
     });
     drop(slot);
-    trim_pass_heap();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1955,6 +1964,7 @@ fn run_with_terminal_budget(
                     let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
                 }
                 drop(presentation);
+                retire_rendered_callers(driver, &stream_state, now_ns);
                 // The pass freed its pin batch and transient view; hand
                 // the peak back now that both are dead (see
                 // `reclaim_pass_heap`).
@@ -8800,6 +8810,21 @@ fn stream_view_guarded(
     Some(presentation)
 }
 
+/// Retire caller rows the last published pass presentation rendered and
+/// whose process is proven ended. The presentation already owns the row's
+/// facts; the coordinator only drops state that no later render can need.
+/// The final view is captured after this, so every caller still present
+/// there keeps its row.
+fn retire_rendered_callers(driver: &mut ClassicDriver<'_>, state: &StreamState, now_ns: u64) {
+    let Some(view) = state.last_stream_view.as_ref() else {
+        return;
+    };
+    let ids: Vec<crate::discovery::caller_registry::CallerId> =
+        view.callers.iter().map(|caller| caller.id).collect();
+    driver.coordinator.note_rendered_callers(&ids);
+    driver.coordinator.retire_rendered_callers(now_ns);
+}
+
 /// The dashboard pass views: `None` while a publication pends
 /// ([`publication_pending_for_view`]), so the caller skips both the
 /// stream emit and the display offer and both keep their prior view.
@@ -9060,6 +9085,7 @@ fn run_dashboard(
                     }
                     display.offer(display_view);
                 }
+                retire_rendered_callers(driver, &stream_state, now_ns);
                 // A0 periodic line: every loop pass publishes through
                 // this arm, so the 60 s check lives here.
                 driver.coordinator.maybe_emit_memory_line();
@@ -10200,6 +10226,11 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             "limit": budgets.callers_limit,
             "occupied": budgets.callers_occupied,
             "refused": budgets.callers_refused,
+            // Additive (v1, v0.8.0): proven-exited caller rows retired
+            // after a presentation rendered them. Their counts are in
+            // the aggregate, not silently lost; the rows no longer
+            // appear in `callers[]`.
+            "retired": budgets.callers_retired,
         },
         "modules": {
             "limit": budgets.modules_limit,

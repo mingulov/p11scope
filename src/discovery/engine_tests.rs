@@ -86902,8 +86902,9 @@ fn member_stop_refused_provider_is_no_attached_resume() {
 }
 
 /// The watchdog gone, the observer alone must not keep anyone stopped:
-/// the next pass deactivates the stops and resumes every held and
-/// pending member, and later passes do nothing.
+/// the next pass deactivates (and detaches) the stops and resumes every
+/// held and pending member, and later passes resume any row that is
+/// still found.
 #[test]
 fn member_stop_watchdog_loss_releases_every_member() {
     let (fixture, _view, _module, _pins) = loaded_seed_provider();
@@ -86931,9 +86932,29 @@ fn member_stop_watchdog_loss_releases_every_member() {
     io.rows.insert(pid, member_stop_row(pid, &library, key));
     engine.service_member_stops(&mut io, &mut session, Some(30));
     assert!(
-        io.rows.contains_key(&pid),
-        "a disabled service takes nothing"
+        !io.rows.contains_key(&pid),
+        "a row that appears after the loss is still resumed"
     );
+}
+
+/// After the watchdog loss the hook is detached, so any row still found
+/// (an invocation that passed the active check before the detach) is
+/// owed a resume: every later pass drains the whole table.
+#[test]
+fn member_stop_row_after_watchdog_loss_is_resumed() {
+    let mut io = ScriptedMemberStops::default();
+    io.guard_lost = true;
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(io.deactivated);
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(member_resumed_for_test(pid), "the late member runs again");
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert!(files_the_first_use_row(&engine), "its file is unproven");
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// A held provider mapper that exits before its provider attaches must

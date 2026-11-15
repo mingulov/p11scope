@@ -20062,9 +20062,7 @@ pub(crate) mod tests {
         let mut plan = scoped_plan(std::slice::from_ref(&gen1), AdmissionScope::Shared);
         plan.object_identities
             .insert(PinnedObjectId(82), test_identity(82, "sha-owner"));
-        for owner in &mut plan.aggregate_owners {
-            *owner = AggregateOwner::Unowned;
-        }
+        plan.aggregate_owners.fill(AggregateOwner::Unowned);
         let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
         plan.extend_exact(rebuilt).unwrap();
         plan.revivable.clone_from(&plan.retired_keys);

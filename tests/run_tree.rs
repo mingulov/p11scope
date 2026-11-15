@@ -401,10 +401,13 @@ fn function_rows_by_target(profile: &serde_json::Value, sha256: &str) -> Vec<(St
 /// `must <= observed <= must + ambiguous`: a landed early call can never
 /// offset a later miss, because no call outside the ambiguous set may
 /// land. The module's first-use window must be disclosed. Any other miss,
-/// however small, is an undisclosed miss (a mid-capture detach/replace
-/// window, slot churn); a function that lost every counted call is named
-/// as probe loss, and overcounts or invented functions fail on their own
-/// (never under the undisclosed-miss text the run-tree harness declares).
+/// however small, fails. It carries the undisclosed-miss text the run-tree
+/// harness declares (PLAN-REPLACE-GAP) only with the report's replace
+/// evidence for that endpoint (a second counter-slot row or a failed
+/// replacement) and only within the calls that entered before the last
+/// re-attach; any other partial loss is an unexplained miss. A function
+/// that lost every counted call is named as probe loss, and overcounts or
+/// invented functions fail on their own, never under the declared text.
 fn assert_exact_first_use_accounting(
     profile: &serde_json::Value,
     module: &Path,
@@ -422,6 +425,15 @@ fn assert_exact_first_use_accounting(
         oracle.values().sum::<u64>(),
         "every ledger call carries its time bounds"
     );
+    // The last re-attach any replaced probe could have completed by: the
+    // records' current attach (the max over current slots); a null one is a
+    // failed replacement and bounds nothing.
+    let replace_end = records
+        .iter()
+        .filter_map(|record| record.get("attached_at_ns"))
+        .map(|current| current.as_u64().unwrap_or(u64::MAX))
+        .max()
+        .unwrap_or(0);
     let mut misses = Vec::new();
     let mut others = Vec::new();
     let mut summary = Vec::new();
@@ -464,10 +476,36 @@ fn assert_exact_first_use_accounting(
                 "probe loss: {name} observed none of {must} calls after its first attach"
             ));
         } else if *seen < must {
-            misses.push(format!(
-                "undisclosed miss: {} calls after the pre-attach window ({name}: observed {seen} of {must} that entered after its first attach at {attached})",
-                must - seen
-            ));
+            // The declared replace gap needs the report's own evidence: a
+            // second counter-slot row for this endpoint (a replaced or
+            // reclaimed probe) or a failed replacement (null current
+            // attach), and the loss must fit in the calls that entered
+            // between the first attach and the last re-attach.
+            let missed = must - seen;
+            let witness = if targets.len() >= 2 {
+                Some(format!("{} slot rows", targets.len()))
+            } else if replace_end == u64::MAX {
+                Some("a failed replacement".to_string())
+            } else {
+                None
+            };
+            let replaceable = calls
+                .iter()
+                .filter(|call| {
+                    &call.name == name && call.start_ns > attached && call.start_ns <= replace_end
+                })
+                .count() as u64;
+            match witness {
+                Some(witness) if missed <= replaceable => misses.push(format!(
+                    "undisclosed miss: {missed} calls after the pre-attach window ({name}: observed {seen} of {must} that entered after its first attach at {attached}; replace witness: {witness}, {replaceable} calls entered before the last re-attach)"
+                )),
+                Some(witness) => others.push(format!(
+                    "unexplained miss: {name} lost {missed} calls after its first attach at {attached}, more than the {replaceable} that entered before the last re-attach at {replace_end} ({witness})"
+                )),
+                None => others.push(format!(
+                    "unexplained miss: {name} lost {missed} calls after its first attach at {attached} with no replace witness (one slot row, attached)"
+                )),
+            }
         }
     }
     let invented: Vec<_> = rows
@@ -553,11 +591,14 @@ fn exact_accounting_never_lets_an_early_call_offset_a_later_miss() {
     )
     .expect("write ledger");
     let module = Path::new("/opt/p11.so");
+    // C_GetInfo's probe was replaced (a second, empty slot row; re-attached
+    // by 700), so a partial miss here is the declared replace gap.
     let profile = |calls: u64, began: u64, attached: u64| {
         serde_json::json!({
             "evidence": {"discovery": [{
                 "path": "/opt/p11.so",
                 "sha256": "abc",
+                "attached_at_ns": 700,
                 "first_attached_at_ns": 500,
                 "unobserved_windows": [{"start_ns": 10, "end_ns": 500, "reason": "late_discovery"}],
                 "first_attach_points": [
@@ -568,6 +609,8 @@ fn exact_accounting_never_lets_an_early_call_offset_a_later_miss() {
             "functions": [
                 {"module": {"sha256": "abc"}, "names": ["C_GetInfo"],
                  "target": {"file_offset": 16}, "calls": calls},
+                {"module": {"sha256": "abc"}, "names": ["C_GetInfo"],
+                 "target": {"file_offset": 16}, "calls": 0},
                 {"module": {"sha256": "abc"}, "names": ["C_Finalize"],
                  "target": {"file_offset": 32}, "calls": 0}
             ]
@@ -606,6 +649,78 @@ fn exact_accounting_never_lets_an_early_call_offset_a_later_miss() {
         lost.contains("probe loss") && !lost.contains("undisclosed miss:"),
         "{lost}"
     );
+}
+
+/// A partial miss is the declared replace gap only with the report's own
+/// replace evidence for that endpoint (a second counter-slot row, or a
+/// failed replacement's null `attached_at_ns`) and only within the calls
+/// that entered before the last re-attach; any other partial loss fails
+/// under its own text, never the declared undisclosed-miss signature.
+#[test]
+fn exact_accounting_ties_a_partial_miss_to_replace_evidence() {
+    let dir = tempfile::tempdir().expect("ledger dir");
+    let ledger = dir.path().join("l0");
+    std::fs::write(
+        &ledger,
+        "LEDGER C_GetInfo=4\nCALL C_GetInfo 600 610\nCALL C_GetInfo 700 710\nCALL C_GetInfo 900 910\nCALL C_GetInfo 950 960\n",
+    )
+    .expect("write ledger");
+    let module = Path::new("/opt/p11.so");
+    // (counts per slot row, the record's current attach)
+    let profile = |rows: &[u64], attached_at: serde_json::Value| {
+        let functions: Vec<_> = rows
+            .iter()
+            .map(|calls| {
+                serde_json::json!({"module": {"sha256": "abc"}, "names": ["C_GetInfo"],
+                 "target": {"file_offset": 16}, "calls": calls})
+            })
+            .collect();
+        serde_json::json!({
+            "evidence": {"discovery": [{
+                "path": "/opt/p11.so",
+                "sha256": "abc",
+                "attached_at_ns": attached_at,
+                "first_attached_at_ns": 500,
+                "unobserved_windows": [{"start_ns": 10, "end_ns": 500, "reason": "late_discovery"}],
+                "first_attach_points": [
+                    {"file_offset": 16, "began_ns": 450, "attached_ns": 500}
+                ]
+            }]},
+            "functions": functions
+        })
+    };
+    let failure = |profile: serde_json::Value| {
+        let ledgers = vec![ledger.clone()];
+        std::panic::catch_unwind(move || {
+            assert_exact_first_use_accounting(&profile, module, &ledgers)
+        })
+        .err()
+        .map(|panic| panic.downcast_ref::<String>().cloned().unwrap_or_default())
+    };
+    let declared = |text: &str| text.contains("undisclosed miss: ");
+    // One slot, attached once: a lost call has no replace witness.
+    let bare = failure(profile(&[3], serde_json::json!(500))).expect("a miss fails");
+    assert!(
+        bare.contains("unexplained miss") && !declared(&bare),
+        "{bare}"
+    );
+    // A replacement re-attached at 800: the 600/700 calls may fall in its
+    // gap, so one or two missed calls are the declared replace gap.
+    let replaced = failure(profile(&[1, 2], serde_json::json!(800))).expect("a miss fails");
+    assert!(declared(&replaced), "{replaced}");
+    let two = failure(profile(&[1, 1], serde_json::json!(800))).expect("a miss fails");
+    assert!(declared(&two), "{two}");
+    // The 900 and 950 calls entered after the last re-attach: three missed
+    // calls exceed the two that could fall in a replace gap.
+    let beyond = failure(profile(&[1, 0], serde_json::json!(800)))
+        .expect("a loss past the last re-attach fails");
+    assert!(
+        beyond.contains("unexplained miss") && !declared(&beyond),
+        "{beyond}"
+    );
+    // A failed replacement (null current attach) bounds nothing after it.
+    let failed = failure(profile(&[3], serde_json::Value::Null)).expect("a miss fails");
+    assert!(declared(&failed), "{failed}");
 }
 
 /// Function rows are per counter slot: a replaced or reclaimed probe for

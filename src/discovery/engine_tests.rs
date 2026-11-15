@@ -83426,6 +83426,44 @@ fn member_stop_resumes_a_stopped_member_moved_out_of_the_run_tree() {
     let _ = child.wait();
 }
 
+/// A stopped member whose maps cannot be read resumes (never wedged),
+/// and since nothing about its stopping file is proven, the named
+/// first-use gap is filed.
+#[test]
+fn member_stop_unreadable_maps_resume_files_the_first_use_row() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let mut engine = member_stop_engine();
+    engine.member_stops.maps_fail.insert(pid);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert!(!io.rows.contains_key(&pid));
+    assert_eq!(engine.member_stop_stats_for_test().unreadable, 1);
+    assert!(files_the_first_use_row(&engine), "the gap is named");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A stopped member whose stopping file is not proven (here: its row
+/// names a range the member no longer maps) resumes with the named
+/// first-use gap; a proven non-provider files nothing (the twin
+/// `member_stop_clears_non_provider_files_and_resumes_at_once`).
+#[test]
+fn member_stop_unproven_stopping_file_resume_files_the_first_use_row() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(member_resumed_for_test(pid), "the member runs again");
+    assert!(!io.rows.contains_key(&pid));
+    assert_eq!(engine.member_stop_stats_for_test().unproven_resumes, 1);
+    assert!(files_the_first_use_row(&engine), "the gap is named");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// An `original_exited` read error is not a departure: the held member
 /// is not abandoned. Its row stays, and the next pass re-pins and resumes
 /// it.

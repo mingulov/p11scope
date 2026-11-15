@@ -593,9 +593,16 @@ impl Engine {
             }
         }
         let deadline = (std::time::Instant::now() + MEMBER_STOP_MEMBER_BUDGET).min(pass_deadline);
+        #[cfg(test)]
+        let scripted_maps_failure = self.member_stops.maps_fail.contains(&tgid);
+        #[cfg(not(test))]
+        let scripted_maps_failure = false;
         let rows = pin
             .open_proc_dir()
             .and_then(|proc| {
+                if scripted_maps_failure {
+                    return Err("scripted maps failure".to_string());
+                }
                 let maps = proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES)?;
                 Ok((proc, with_stopping_row(exec_rows(&maps), &stop)))
             })
@@ -609,6 +616,9 @@ impl Engine {
                     eprintln!("p11scope: stopped run member {tgid} unreadable: {error}; resumed");
                 }
                 self.resume_or_force(io, &pin, since_ns, now_ns);
+                // Nothing about its stopping file is proven: it may be a
+                // provider whose first calls now run unwatched.
+                self.note_first_use_gap(tgid, "its maps were unreadable");
                 return false;
             }
         };
@@ -618,8 +628,16 @@ impl Engine {
         if providers.is_empty() {
             // A stopping file that was not proven (unmapped since, or
             // unreadable) stays uncleared, so a later mapper stops and
-            // tries again.
+            // tries again. This member resumes with it unproven: it may
+            // be a provider, so the named first-use gap is filed.
+            let stopping_proven =
+                cleared.contains(&stop.file) || self.member_stops.cleared.contains(&stop.file);
             self.resume_or_force(io, &pin, since_ns, now_ns);
+            if !stopping_proven {
+                self.member_stops.stats.unproven_resumes =
+                    self.member_stops.stats.unproven_resumes.saturating_add(1);
+                self.note_first_use_gap(tgid, "its stopping file was not proven");
+            }
             return false;
         }
         let mut files = Vec::new();
@@ -671,14 +689,19 @@ impl Engine {
     /// the named first-use row is filed (its first calls may be missed).
     fn note_unattached_resume(&mut self, tgid: u32) {
         self.member_stops.stats.timed_out = self.member_stops.stats.timed_out.saturating_add(1);
+        self.note_first_use_gap(tgid, "hold bound");
+    }
+
+    /// Files the named first-use row for a member resumed before any
+    /// probe of a file it may use was attached (one deduped row per
+    /// capture; over-reporting is the safe direction).
+    fn note_first_use_gap(&mut self, tgid: u32, why: &str) {
         self.mark_partial(
             crate::render::LEARNED_SKIP_SUBJECT,
             crate::render::LEARNED_FIRST_RUN_REASON,
         );
         if crate::run::capture_diagnostics_on() {
-            eprintln!(
-                "p11scope: run member {tgid} resumed before its provider attached (hold bound)"
-            );
+            eprintln!("p11scope: run member {tgid} resumed before its provider attached ({why})");
         }
     }
 

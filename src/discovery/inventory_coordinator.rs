@@ -4323,9 +4323,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         );
     }
 
-    /// A0 snapshot over the coordinator's owned structures (R1-R4,
-    /// R6, metadata). Read-only; the R3 aggregation is O(edges) on
-    /// the emit path, never on the hot path.
     /// R1 native-retention rows: every coordinator-owned per-ever map
     /// that the pass prune bounds, so a soak attributes the native lane
     /// instead of lumping it into the RSS residual.
@@ -4400,6 +4397,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// A0 snapshot over the coordinator's owned structures (R1-R4,
+    /// R6, metadata). Read-only; the R3 aggregation is O(edges) on
+    /// the emit path, never on the hot path.
     pub(crate) fn memory_snapshot(
         &self,
         elapsed_secs: u64,

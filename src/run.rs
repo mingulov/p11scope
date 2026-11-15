@@ -6779,10 +6779,11 @@ fn run_owned_inner_with_host(
     // Started before the barrier release, so no member predates it. A
     // load refusal keeps the run (learning still covers later mappers).
     if owned.coordinator.is_armed()
-        && owned.run_cgroup.is_some()
+        && let Some(group) = owned.run_cgroup.as_ref()
         && let Scope::Cgroup { dir, .. } = &scope
     {
-        match crate::attach::member_stop::MemberStopHooks::start(dir, pid) {
+        let tree = crate::attach::member_stop::RunTree::of(group);
+        match crate::attach::member_stop::MemberStopHooks::start(dir, tree, pid) {
             Ok(hooks) => owned.member_stops = Some(hooks),
             Err(error) => {
                 if capture_diagnostics_on() {

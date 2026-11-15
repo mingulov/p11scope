@@ -86061,6 +86061,8 @@ struct ScriptedMemberStops {
     cleared: BTreeSet<p11scope_ebpf_common::MemberFileKey>,
     withdrawn: Vec<u32>,
     deactivated: bool,
+    /// Tgids scripted as outside the run tree.
+    non_members: BTreeSet<u32>,
 }
 
 impl MemberStopIo for ScriptedMemberStops {
@@ -86086,6 +86088,9 @@ impl MemberStopIo for ScriptedMemberStops {
     fn deactivate(&mut self) -> Result<(), String> {
         self.deactivated = true;
         Ok(())
+    }
+    fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {
+        Ok(!self.non_members.contains(&pin.pid()))
     }
 }
 
@@ -86302,6 +86307,46 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_inode() {
         io.cleared
     );
     assert!(member_resumed_for_test(pid), "the member runs again");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A row whose tgid now names a process outside the run tree (the
+/// stopped member exited and its number was reused) is withdrawn without
+/// reading, clearing or signalling that process.
+#[test]
+fn member_stop_leaves_a_process_outside_the_run_tree_untouched() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let exe = loop {
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            && exe.file_name().is_some_and(|name| name == "sleep")
+        {
+            break exe;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &exe);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &exe, key));
+    io.non_members.insert(pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(io.cleared.is_empty(), "nothing of it is read or cleared");
+    assert_eq!(io.withdrawn, vec![pid], "its row is withdrawn");
+    assert_eq!(engine.member_stop_stats_for_test().not_members, 1);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let states = crate::discovery::pause::read_task_states(pid).unwrap();
+    assert!(
+        states.values().all(|state| *state == b'T'),
+        "the process is never signalled"
+    );
     let _ = child.kill();
     let _ = child.wait();
 }

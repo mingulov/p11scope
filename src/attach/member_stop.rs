@@ -33,13 +33,54 @@ const MEMBER_STOP_TARGET: &str = "uprobe_mmap";
 /// leave a member stopped by this capture.
 pub(crate) struct MemberStopHooks {
     ebpf: aya::Ebpf,
+    tree: RunTree,
+}
+
+/// The run cgroup tree the stops belong to: the cgroup v2 mount root
+/// (`/proc/<pid>/cgroup` paths are relative to it) and the run cgroup.
+#[derive(Debug, Clone)]
+pub(crate) struct RunTree {
+    pub(crate) cgroup_root: std::path::PathBuf,
+    pub(crate) run_cgroup: std::path::PathBuf,
+}
+
+impl RunTree {
+    pub(crate) fn of(group: &crate::scope::RunCgroup) -> Self {
+        Self {
+            cgroup_root: group.cgroup_root().to_path_buf(),
+            run_cgroup: group.path().to_path_buf(),
+        }
+    }
+
+    /// Whether `/proc/<pid>/cgroup` places `pid` in the run cgroup or
+    /// below it.
+    pub(crate) fn contains(&self, pid: u32) -> Result<bool, String> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .map_err(|error| format!("reading the cgroup of {pid}: {error}"))?;
+        let relative = crate::scope::parse_cgroup_v2_relative(&text)
+            .ok_or_else(|| format!("no cgroup v2 line for {pid}"))?;
+        Ok(self
+            .cgroup_root
+            .join(relative)
+            .starts_with(&self.run_cgroup))
+    }
+
+    /// [`Self::contains`] for a pinned process: the read is accepted only
+    /// while the pin still names the process it opened.
+    pub(crate) fn contains_pinned(&self, pin: &crate::process::PidPin) -> Result<bool, String> {
+        let inside = self.contains(pin.pid());
+        if !pin.still_the_same() {
+            return Ok(false);
+        }
+        inside
+    }
 }
 
 impl MemberStopHooks {
     /// Loads the object against the host BTF, publishes the run cgroup and
     /// the owned child's exemption, validates the map shapes, attaches the
     /// hook and only then activates it.
-    pub(crate) fn start(cgroup: &File, owned_tgid: u32) -> Result<Self> {
+    pub(crate) fn start(cgroup: &File, tree: RunTree, owned_tgid: u32) -> Result<Self> {
         let btf = aya::Btf::from_sys_fs().context("reading the host BTF")?;
         let mut loader = aya::EbpfLoader::new();
         loader.btf(Some(&btf));
@@ -68,7 +109,7 @@ impl MemberStopHooks {
                 .with_context(|| format!("attaching {MEMBER_STOP_PROGRAM}"))?;
         }
         write_config(&mut ebpf, true, owned_tgid)?;
-        Ok(Self { ebpf })
+        Ok(Self { ebpf, tree })
     }
 }
 
@@ -192,6 +233,10 @@ impl MemberStopIo for MemberStopHooks {
         .unwrap_or(0);
         write_config(&mut self.ebpf, false, exempt).map_err(|error| format!("{error:#}"))
     }
+
+    fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {
+        self.tree.contains_pinned(pin)
+    }
 }
 
 impl Drop for MemberStopHooks {
@@ -199,9 +244,18 @@ impl Drop for MemberStopHooks {
         let _ = self.deactivate();
         let pending = self.pending().unwrap_or_default();
         for (tgid, _) in pending {
-            let _ = self.withdraw(tgid);
-            if let Ok(pin) = crate::process::PidPin::open(tgid) {
-                let _ = pin.send_signal(libc::SIGCONT);
+            let Ok(pin) = crate::process::PidPin::open(tgid) else {
+                continue;
+            };
+            match self.tree.contains_pinned(&pin) {
+                Ok(true) => {
+                    let _ = self.withdraw(tgid);
+                    let _ = pin.send_signal(libc::SIGCONT);
+                }
+                Ok(false) => {
+                    let _ = self.withdraw(tgid);
+                }
+                Err(_) => {}
             }
         }
     }
@@ -263,7 +317,8 @@ mod tests {
             .spawn()
             .unwrap();
         group.place(exempt.id()).unwrap();
-        let mut hooks = MemberStopHooks::start(&dir, exempt.id()).expect("member-stop starts");
+        let mut hooks = MemberStopHooks::start(&dir, RunTree::of(&group), exempt.id())
+            .expect("member-stop starts");
         let mut member = std::process::Command::new("sh")
             .args(["-c", "read line; exec /bin/true"])
             .stdin(std::process::Stdio::piped())

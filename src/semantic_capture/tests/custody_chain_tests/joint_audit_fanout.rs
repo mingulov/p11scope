@@ -11425,6 +11425,224 @@ fn joint_machine_tainted_stashed_call_reduces_to_s1_and_lane_continues() {
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
+/// Keyrows follow-up (tier-3 review): an admission that cannot certify
+/// its still-retained, unclaimed journal original (misaligned H0 here)
+/// reduces as plain S1, and that exact original is disposed with the
+/// call instead of being left for the key's next seal to find
+/// unmatched. The lane must publish the counted gap beside the call it
+/// names, seal the following call and keep per-key tracking.
+#[test]
+fn joint_machine_misaligned_unclaimed_original_keeps_tracking_after_next_seal() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let adapter_starts_before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .retained_starts_for_test()
+        .len();
+    let api_before = fixture.api_returns_total();
+    let direct_before = fixture.direct_fallback_total();
+    let reduced_before = fixture.reduced_for(0);
+    let caller = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .expect("the prime retained one feed")
+        .caller;
+    // The second call reaches the claim step; its H0 ordinal no longer
+    // names the retained original, so the claim scan retains the call
+    // as plain S1 instead of claiming it.
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.reach_phase("Claiming");
+    let victim = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("the second call is prepared")
+        .clone();
+    let invocation = victim
+        .joint_resource_origin()
+        .expect("the collected call names its H8 original")
+        .invocation();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .retained_starts_for_test()
+            .iter()
+            .any(|(thread, sequence, _)| (*thread, *sequence) == invocation),
+        "precondition: the misaligned call's original is still retained"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .misalign_next_prepared_ordinal_for_test();
+    fixture.published_labeled("misaligned-claim", None);
+    assert_eq!(
+        fixture.api_returns_total(),
+        api_before + 1,
+        "the misaligned call is kept as plain S1"
+    );
+    assert_eq!(
+        fixture.direct_fallback_total(),
+        direct_before + 1,
+        "the call reduces S1-direct without Joint evidence"
+    );
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced_before,
+        "the misaligned call carries no key identity"
+    );
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert_eq!(
+            adapter.retained_starts_for_test().len(),
+            adapter_starts_before,
+            "the exact unclaimed original is disposed with its call"
+        );
+        assert!(
+            !adapter
+                .retained_starts_for_test()
+                .iter()
+                .any(|(thread, sequence, _)| (*thread, *sequence) == invocation),
+            "the disposed original is the misaligned call's own"
+        );
+    }
+    // The one counted gap is published with the call it names, for the
+    // tracked caller, under the cause-neutral unclaimable reason.
+    {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        assert!(
+            !registry
+                .staged_gaps_for_test()
+                .iter()
+                .any(|gap| gap.reason == "joint_unclaimable_claim_history_loss"),
+            "the gap publishes with its call instead of waiting for the next pass"
+        );
+        let retained: Vec<_> = registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats())
+            .filter(|(gap, _)| gap.reason == "joint_unclaimable_claim_history_loss")
+            .collect();
+        assert_eq!(
+            retained.len(),
+            1,
+            "one counted gap names the retained call: {:?}",
+            registry
+                .gaps()
+                .iter()
+                .map(|gap| (gap.caller, &gap.subject, &gap.reason))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            retained[0].0.subject, "Joint key operations unavailable; retained S1",
+            "the gap keeps the Joint-unavailable subject"
+        );
+        assert_eq!(
+            retained[0].0.caller,
+            Some(caller),
+            "the gap names the tracked caller"
+        );
+        assert_eq!(*retained[0].1, 1, "one retained call, counted once");
+    }
+    // The disposed original never reaches the seal as an unmatched
+    // entry: the feed stays Joint instead of closing its segment.
+    {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let feed = &registry
+            .instance_semantic_edges()
+            .next()
+            .expect("the prime retained one feed")
+            .feed;
+        assert_eq!(
+            feed.mode(),
+            FeedMode::Joint,
+            "the tracked feed keeps Joint after the degradation"
+        );
+        assert!(
+            !feed.fell_back() && !feed.degraded_loss(),
+            "no segment ends at the misaligned call"
+        );
+    }
+    // The next quantum carries two calls. The test misalignment wrote
+    // the next H0 ordinal into the degraded admission, so the first of
+    // them is counted as an out-of-order return (it only advances H0
+    // past that artifact); the second is the following call whose
+    // claim and seal must survive the disposed original.
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!(
+                "the next seal stopped the lane at {reason:?} ({:?}, {:?}); the disposed original must not become unmatched",
+                fixture.machine.latched_phase_label(),
+                fixture.machine.staging_detail_for_test(),
+            ),
+        }
+    }
+    assert!(published, "the quantum after the degradation publishes");
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced_before + 1,
+        "the following call still gets per-key tracking"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        None,
+        "the lane never latches"
+    );
+    let feed = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .expect("the prime retained one feed")
+        .feed
+        .mode();
+    assert_eq!(
+        feed,
+        FeedMode::Joint,
+        "the tracked process keeps its Joint feed"
+    );
+}
+
 /// Keyrows F4: an admission from an earlier H0 quantum whose retained
 /// original is gone from `open` without a void is degraded per item.
 /// The stop path clears every retained entry and records no void wipe,

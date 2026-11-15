@@ -4884,7 +4884,7 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     for full in [
         "Per-key tracking did not start for this process; function counts above are unaffected",
         "per-key tracking is off; function and mechanism counts are unaffected",
-        "Per-key tracking lost history for tracked processes; function counts above are unaffected",
+        "Per-key tracking lost history for this process; function counts above are unaffected",
         "Per-key tracking paused for this process; function counts above are unaffected",
     ] {
         assert!(verbose.contains(full), "{full} missing: {verbose}");
@@ -4899,6 +4899,38 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     ] {
         assert!(verbose.contains(token), "{token} missing: {verbose}");
     }
+}
+
+/// Retained-S1 gaps merge per caller and cause, so their `repeats`
+/// stand for lost calls: verbose text shows the count instead of
+/// hiding several calls behind one row. A single call reads without
+/// a count.
+#[test]
+fn verbose_retained_s1_gap_shows_its_call_count() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "Joint key operations unavailable; retained S1".into(),
+        reason: "joint_unclaimable_claim_history_loss".into(),
+        budget: None,
+        repeats: 3,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        out.contains("(3 times)"),
+        "three calls need their count: {out}"
+    );
+    presentation.gaps[0].repeats = 1;
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        !out.contains("times"),
+        "one call reads without a count: {out}"
+    );
 }
 
 /// Concise gaps use plain words for the semantic-tracking tokens, never

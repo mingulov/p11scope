@@ -11252,6 +11252,86 @@ fn arming_a_view_exited_mid_arm_is_silent_not_unavailable() {
     assert_eq!(aggregate.dlopen_timing.none, 0);
 }
 
+/// A quiescent child whose `execve` and dynamic-linker startup have already
+/// completed before [`SettledChild::spawn`] returns. Writing `"ok\n"` from
+/// `sh` proves `ld-linux` RELRO protections and initial mappings are static
+/// before reading `/proc/<pid>/maps`, and blocking on `read _` prevents timed
+/// `sleep` exits under parallel load.
+pub(super) struct SettledChild {
+    child: std::process::Child,
+    _stdin: Option<std::process::ChildStdin>,
+    live: bool,
+}
+
+impl SettledChild {
+    pub(super) fn spawn() -> Self {
+        use std::io::Read as _;
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "printf 'ok\\n'; read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .expect("spawn settled child");
+        let stdin = child.stdin.take();
+        let mut stdout = child.stdout.take().expect("settled child stdout");
+        let mut buf = [0u8; 3];
+        stdout
+            .read_exact(&mut buf)
+            .expect("settled child signaled post-startup readiness");
+        assert_eq!(&buf, b"ok\n", "unexpected settled child readiness banner");
+        Self {
+            child,
+            _stdin: stdin,
+            live: true,
+        }
+    }
+
+    pub(super) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub(super) fn id(&self) -> u32 {
+        self.pid()
+    }
+
+    pub(super) fn maps(&self) -> Vec<MapEntry> {
+        parse_maps(
+            &std::fs::read(format!("/proc/{}/maps", self.pid())).expect("read settled child maps"),
+        )
+        .expect("parse settled child maps")
+    }
+
+    pub(super) fn exe_path(&self) -> PathBuf {
+        std::fs::read_link(format!("/proc/{}/exe", self.pid()))
+            .expect("read settled child exe link")
+    }
+
+    pub(super) fn kill(&mut self) -> std::io::Result<()> {
+        self._stdin = None;
+        self.child.kill()
+    }
+
+    pub(super) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.live = false;
+        Ok(status)
+    }
+}
+
+impl Drop for SettledChild {
+    fn drop(&mut self) {
+        self._stdin = None;
+        if self.live {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.live = false;
+        }
+    }
+}
+
 /// fix5 twin (CI run 43274912275 mt-system v6.18.58, 346d2c875): a live
 /// view whose loader arm is denied by a SIBLING's silent proven-exit abort
 /// must retry, not record unbound. The loader candidate spans every
@@ -11264,11 +11344,7 @@ fn arming_a_view_exited_mid_arm_is_silent_not_unavailable() {
 fn sibling_silent_abort_defers_loader_arm_without_recording() {
     let (mut sibling, mut engine, _modules) = engine_with_one_accepted_provider();
     let sibling_id = ProcessViewId(3);
-    let mut victim = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
+    let mut victim = SettledChild::spawn();
     let victim_pid = victim.id();
     let victim_id = ProcessViewId(4);
     engine
@@ -11421,11 +11497,7 @@ fn sibling_loud_abort_still_records_the_loader_gap() {
     let sibling_pid = sibling.id();
     engine.views[0] =
         crate::process::reused_process_view_for_test(sibling_id, sibling_pid).unwrap();
-    let mut victim = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
+    let mut victim = SettledChild::spawn();
     let victim_pid = victim.id();
     let victim_id = ProcessViewId(4);
     engine
@@ -11602,11 +11674,7 @@ fn replacement_detach_failure_still_records_loader_gap() {
     accepted.semantic_authorized = true;
     accepted.semantic_ambiguous = false;
     engine.plan.validate_slot_index().unwrap();
-    let mut victim = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
+    let mut victim = SettledChild::spawn();
     let victim_pid = victim.id();
     let victim_id = ProcessViewId(4);
     engine
@@ -11681,11 +11749,7 @@ fn failed_replacement_with_detach_failure_still_records_loader_gap() {
     accepted.semantic_authorized = true;
     accepted.semantic_ambiguous = false;
     engine.plan.validate_slot_index().unwrap();
-    let mut victim = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
+    let mut victim = SettledChild::spawn();
     let victim_pid = victim.id();
     let victim_id = ProcessViewId(4);
     engine
@@ -11753,11 +11817,7 @@ fn failed_replacement_with_detach_failure_still_records_loader_gap() {
 #[test]
 fn sibling_closed_tick_still_defers_loader_arm_without_recording() {
     let (mut sibling, mut engine, modules) = engine_with_one_accepted_provider();
-    let mut victim = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
+    let mut victim = SettledChild::spawn();
     let victim_pid = victim.id();
     let victim_id = ProcessViewId(4);
     engine
@@ -12392,20 +12452,22 @@ fn a_cleanly_retired_loader_context_publishes_no_skip() {
     );
 }
 
-/// One retained live view for this process, one *attached* loader context
+/// One retained live view for `pid`, one *attached* loader context
 /// frozen on `mapping`, and an `ExecRefresh` already queued for that view:
 /// the state every capture whose target execs passes through between the
 /// exec record and the refresh it queues.
-fn engine_with_exec_refreshed_loader(
+fn engine_with_exec_refreshed_loader_for(
+    pid: u32,
     mapping: MapEntry,
 ) -> (Engine, LoaderContextId, ProcessViewId) {
     use p11scope_manifest::elf::SymbolFact;
 
-    let pid = std::process::id();
     let view = ProcessView::open(ProcessViewId(0), pid).expect("a live process view");
     let view_id = view.id();
     let mut engine = Engine::empty();
     engine.scope = Scope::Pid(pid);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
     engine.views.push(view);
     engine.next_view_id = 1;
     let prepared = engine
@@ -12439,11 +12501,13 @@ fn engine_with_exec_refreshed_loader(
 /// contains the matching exec record.
 #[test]
 fn a_loader_hit_remapped_by_a_preexisting_exec_refresh_is_a_discovery_loss() {
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let child = SettledChild::spawn();
+    let pid = child.pid();
+    let maps = child.maps();
     let observed = maps
         .iter()
         .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-        .expect("this process maps its own executable text")
+        .expect("settled child maps its own executable text")
         .clone();
     // The same object at the load base it had before the exec: identity,
     // file offset and protection unchanged, only the address moved.
@@ -12451,8 +12515,8 @@ fn a_loader_hit_remapped_by_a_preexisting_exec_refresh_is_a_discovery_loss() {
     armed.start -= 0x1000_0000;
     armed.end -= 0x1000_0000;
 
-    let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
-    let mut record = loader_record_for(context, std::process::id());
+    let (mut engine, context, _) = engine_with_exec_refreshed_loader_for(pid, armed);
+    let mut record = loader_record_for(context, pid);
     record.table_ptr = observed.start + 0x10;
     let mut session = ScriptedSession::with_records([], 1);
     apply_ordinary_batch(&mut engine, &mut session, vec![record])
@@ -12481,24 +12545,26 @@ fn a_loader_hit_remapped_by_a_preexisting_exec_refresh_is_a_discovery_loss() {
 /// exact same-batch lifecycle match explains its moved mapping.
 #[test]
 fn a_loader_hit_remapped_by_a_same_batch_exec_is_not_a_discovery_loss() {
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let child = SettledChild::spawn();
+    let pid = child.pid();
+    let maps = child.maps();
     let observed = maps
         .iter()
         .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-        .expect("this process maps its own executable text")
+        .expect("settled child maps its own executable text")
         .clone();
     let mut armed = observed.clone();
     armed.start -= 0x1000_0000;
     armed.end -= 0x1000_0000;
 
-    let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+    let (mut engine, context, _) = engine_with_exec_refreshed_loader_for(pid, armed);
     engine.retirement_intents.clear();
     engine.refresh_requested.clear();
-    let mut loader = loader_record_for(context, std::process::id());
+    let mut loader = loader_record_for(context, pid);
     loader.table_ptr = observed.start + 0x10;
     let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
     exec.kind = DISCOVERY_KIND_EXEC;
-    exec.pid_tgid = u64::from(std::process::id()) << 32;
+    exec.pid_tgid = u64::from(pid) << 32;
     exec.hook_ts_ns = engine.views[0].admitted_ns();
     let mut session = ScriptedSession::with_records([], 1);
     let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![loader, exec])
@@ -13546,11 +13612,13 @@ fn prefix_gap_stderr_names_partial_coverage_not_refusal() {
 /// slots and every counter clean, attributed to this exact site.
 #[test]
 fn a_loader_hit_unmapped_by_a_queued_exec_refresh_is_not_a_discovery_loss() {
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let child = SettledChild::spawn();
+    let pid = child.pid();
+    let maps = child.maps();
     let armed = maps
         .iter()
         .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-        .expect("this process maps its own executable text")
+        .expect("settled child maps its own executable text")
         .clone();
     // Below `mmap_min_addr`: never mapped, so the hook address resolves to
     // nothing at all rather than to a moved mapping.
@@ -13562,8 +13630,8 @@ fn a_loader_hit_unmapped_by_a_queued_exec_refresh_is_not_a_discovery_loss() {
         "the null page is not mapped"
     );
 
-    let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
-    let mut record = loader_record_for(context, std::process::id());
+    let (mut engine, context, _) = engine_with_exec_refreshed_loader_for(pid, armed);
+    let mut record = loader_record_for(context, pid);
     record.table_ptr = unmapped;
     let mut session = ScriptedSession::with_records([], 1);
     apply_ordinary_batch(&mut engine, &mut session, vec![record])
@@ -13594,22 +13662,24 @@ fn a_loader_hit_unmapped_by_a_queued_exec_refresh_is_not_a_discovery_loss() {
 /// and `sched_process_exec` is attached unconditionally.
 #[test]
 fn a_loader_hit_whose_armed_image_is_gone_is_not_a_discovery_loss() {
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let child = SettledChild::spawn();
+    let pid = child.pid();
+    let maps = child.maps();
     let observed = maps
         .iter()
         .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-        .expect("this process maps its own executable text")
+        .expect("settled child maps its own executable text")
         .clone();
     let mut armed = observed.clone();
     armed.start -= 0x1000_0000;
     armed.end -= 0x1000_0000;
 
-    let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+    let (mut engine, context, _) = engine_with_exec_refreshed_loader_for(pid, armed);
     // Neither channel knows about the exec yet: the record is still behind
     // this hit in the ring.
     engine.retirement_intents.clear();
     engine.refresh_requested.clear();
-    let mut record = loader_record_for(context, std::process::id());
+    let mut record = loader_record_for(context, pid);
     record.table_ptr = 0x1000;
     let mut session = ScriptedSession::with_records([], 1);
     apply_ordinary_batch(&mut engine, &mut session, vec![record])
@@ -13633,17 +13703,18 @@ fn a_loader_hit_whose_armed_image_is_gone_is_not_a_discovery_loss() {
 /// child exec'd has no mapping of its own to judge by.
 #[test]
 fn a_sticky_refresh_request_does_not_excuse_a_live_armed_mapping() {
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let child = SettledChild::spawn();
+    let pid = child.pid();
+    let maps = child.maps();
     // Armed on a mapping this live image still holds: nothing about it says
     // `exec`.
     let armed = maps
         .iter()
         .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-        .expect("this process maps its own executable text")
+        .expect("settled child maps its own executable text")
         .clone();
-    let pid = std::process::id();
 
-    let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+    let (mut engine, context, _) = engine_with_exec_refreshed_loader_for(pid, armed);
     engine.retirement_intents.clear();
     engine.request_refresh(pid, None);
     let mut record = loader_record_for(context, pid);
@@ -13670,22 +13741,24 @@ fn a_sticky_refresh_request_does_not_excuse_a_live_armed_mapping() {
 /// decision stands.
 #[test]
 fn the_identity_branch_still_requires_a_queued_exec_refresh() {
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let child = SettledChild::spawn();
+    let pid = child.pid();
+    let maps = child.maps();
     let observed = maps
         .iter()
         .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-        .expect("this process maps its own executable text")
+        .expect("settled child maps its own executable text")
         .clone();
     let mut armed = observed.clone();
     armed.start -= 0x1000_0000;
     armed.end -= 0x1000_0000;
 
-    let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+    let (mut engine, context, _) = engine_with_exec_refreshed_loader_for(pid, armed);
     // No exec queued and no request outstanding: the mapping moved for a
     // reason this capture cannot name.
     engine.retirement_intents.clear();
     engine.refresh_requested.clear();
-    let mut record = loader_record_for(context, std::process::id());
+    let mut record = loader_record_for(context, pid);
     record.table_ptr = observed.start + 0x10;
     let mut session = ScriptedSession::with_records([], 1);
     apply_ordinary_batch(&mut engine, &mut session, vec![record])
@@ -14869,28 +14942,8 @@ fn churned_workers_share_one_file_proof_and_count_calls_with_named_gaps() {
 /// names exact counts without naming any pid.
 #[test]
 fn retained_views_survive_ordinary_rotation_passes() {
-    struct ChildrenGuard(Vec<std::process::Child>);
-    impl Drop for ChildrenGuard {
-        fn drop(&mut self) {
-            for child in &mut self.0 {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-
-    let mut children = ChildrenGuard(
-        (0..5)
-            .map(|_| {
-                std::process::Command::new("sleep")
-                    .arg("30")
-                    .die_with_parent()
-                    .spawn()
-                    .unwrap()
-            })
-            .collect(),
-    );
-    let mut pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    let mut children = e06_spawn_sleeps(5);
+    let mut pids: Vec<_> = children.iter().map(SystemScopeChildGuard::pid).collect();
     pids.sort_unstable();
     let dir = tempfile::tempdir().expect("a scope directory");
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
@@ -14923,21 +14976,6 @@ fn retained_views_survive_ordinary_rotation_passes() {
         attach_backend: BackendSelection::default(),
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
-
-    let self_exe = std::env::current_exe().unwrap();
-    for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
-    }
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
@@ -14993,9 +15031,8 @@ fn retained_views_survive_ordinary_rotation_passes() {
     );
     assert_eq!(kept.len(), 2, "the cap stays full without churn");
 
-    for child in &mut children.0 {
-        child.kill().unwrap();
-        child.wait().unwrap();
+    for child in &mut children {
+        child.reap().unwrap();
     }
 }
 
@@ -15254,28 +15291,8 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
 /// that rotation has since moved on from.)
 #[test]
 fn reconcile_cursor_advances_incrementally_and_wraps() {
-    struct ChildrenGuard(Vec<std::process::Child>);
-    impl Drop for ChildrenGuard {
-        fn drop(&mut self) {
-            for child in &mut self.0 {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-
-    let mut children = ChildrenGuard(
-        (0..5)
-            .map(|_| {
-                std::process::Command::new("sleep")
-                    .arg("30")
-                    .die_with_parent()
-                    .spawn()
-                    .unwrap()
-            })
-            .collect(),
-    );
-    let mut pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    let mut children = e06_spawn_sleeps(5);
+    let mut pids: Vec<_> = children.iter().map(SystemScopeChildGuard::pid).collect();
     pids.sort_unstable();
     let dir = tempfile::tempdir().expect("a scope directory");
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
@@ -15309,39 +15326,8 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
-    let self_exe = std::env::current_exe().unwrap();
-    for child in &children.0 {
-        let pid = child.id();
-        let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
-            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "sleep child {pid} never execed");
-    }
-
-    // The initial sweep can transiently degrade under parallel load (one maps
-    // read fails, that pid trails as an individual, and the representatives
-    // move), so retry for an agreeing lowest-first discovery. A
-    // deterministically broken selection never agrees and still fails on the
-    // last attempt (Task-2 retry idiom).
-    let mut agreed = None;
-    for _ in 0..50 {
-        let candidate =
-            Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
-        let view_pids: Vec<u32> = candidate.views.iter().map(|view| view.pid()).collect();
-        let agrees = view_pids.as_slice() == &pids[..view_pids.len()];
-        agreed = Some(candidate);
-        if agrees {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let mut engine = agreed.unwrap();
+    // Identical settled sleepers admit lowest-pid representatives cleanly.
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert_eq!(
         initial.as_slice(),
@@ -15445,9 +15431,8 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
         engine.counters.object_skips
     );
 
-    for child in &mut children.0 {
-        child.kill().unwrap();
-        child.wait().unwrap();
+    for child in &mut children {
+        child.reap().unwrap();
     }
 }
 
@@ -18095,6 +18080,10 @@ fn lifecycle_exit_before_discovery_service_stays_explicitly_uncorroborated() {
 /// pathname. Manifest acquisition must not inspect that test worker's maps.
 #[test]
 fn lifecycle_manifest_acquisition_ignores_an_unrelated_deleted_mapping() {
+    const TEST: &str = "discovery::engine::tests::lifecycle_manifest_acquisition_ignores_an_unrelated_deleted_mapping";
+    if !crate::test_support::isolation::enter(TEST, "e07-unrelated-deleted-mapping") {
+        return;
+    }
     let unrelated = E07Provider::dlopen();
     std::fs::remove_file(&unrelated.path).unwrap();
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
@@ -20567,10 +20556,7 @@ fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleeper");
+    let mut sleeper = SettledChild::spawn();
     engine
         .views
         .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
@@ -32524,18 +32510,9 @@ fn repeated_single_view_eviction_still_dirties_facts() {
 /// byte-identical decisions; only idle ticks may differ in rebuild counts.
 #[test]
 fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
-    let mut first = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let mut second = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let mut waiting = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
+    let mut first = SettledChild::spawn();
+    let mut second = SettledChild::spawn();
+    let mut waiting = SettledChild::spawn();
     let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
     assert!(p1 < p2 && p2 < p3, "spawn order pins pid order");
     let dir = tempfile::tempdir().expect("a scope directory");
@@ -32629,10 +32606,7 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
     // newcomers find no slot, so the ordinary tick stays idle: only the full
     // path rebuilds. (The waiters' skip texts are static, so the fast-path
     // merge sees no fresh input here; the builder twin covers freshness.)
-    let mut fourth = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
+    let mut fourth = SettledChild::spawn();
     let p4 = fourth.id();
     assert!(p3 < p4, "spawn order pins pid order");
     let listing: String = [p1, p2, p3, p4]
@@ -32738,18 +32712,9 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
 /// merged — replayed with an in-vec duplicate so both merge arms run.
 #[test]
 fn unchanged_tick_builder_matches_full_build_over_recorded_inputs() {
-    let mut first = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let mut second = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let mut waiting = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
+    let mut first = SettledChild::spawn();
+    let mut second = SettledChild::spawn();
+    let mut waiting = SettledChild::spawn();
     let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
     let (mut recorder, _dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
     recorder.max_scan_pids = 2;
@@ -34337,7 +34302,8 @@ fn loader_pin_reuse_keeps_generation_checks_at_apply() {
 
 #[test]
 fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
-    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let child = SettledChild::spawn();
+    let view = ProcessView::open(ProcessViewId(0), child.pid()).unwrap();
     let (raw_modules, mut provider_pins) = pinned_owned_fixture();
     let provider_modules = reconcile_for_test(&raw_modules, &mut provider_pins);
     let mut engine = Engine::empty();
@@ -34345,9 +34311,9 @@ fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
     engine.pinned = provider_pins;
     engine.modules = provider_modules;
 
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
-    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
-    let executable = std::env::current_exe().unwrap();
+    let maps = child.maps();
+    let map_index = MapIndex::new(&maps).expect("settled child maps snapshot is valid");
+    let executable = child.exe_path();
     let (loader_mapping, loader_path) = maps
         .iter()
         .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
@@ -34358,7 +34324,7 @@ fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
             } if path != executable => Some((mapping, path)),
             _ => None,
         })
-        .expect("the test process has a mapped executable dependency");
+        .expect("settled child has a mapped executable dependency");
     let loader_module = mapped_object(&view, loader_mapping, &loader_path);
     let loader_pins = pin_test_module(&view, &loader_module);
     let local_loader = loader_pins
@@ -34474,6 +34440,10 @@ fn exact_loader_pin_survives_cross_overlay_canonicalization() {
 
 #[test]
 fn loader_collision_candidate_keeps_provider_retirement_without_loader_id() {
+    const TEST: &str = "discovery::engine::tests::loader_collision_candidate_keeps_provider_retirement_without_loader_id";
+    if !crate::test_support::isolation::enter(TEST, "loader-collision-candidate") {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("provider-and-loader.so");
     // A small owned fixture, not the test binary: instrumented builds
@@ -46173,6 +46143,11 @@ fn counted_calls(state: &semantics::State) -> u64 {
 /// no detaches.
 #[test]
 fn e07_unchanged_complete_loader_rescan_retires_nothing() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_unchanged_complete_loader_rescan_retires_nothing";
+    if !crate::test_support::isolation::enter(TEST, "e07-unchanged-complete") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46237,6 +46212,11 @@ fn e07_unchanged_complete_loader_rescan_retires_nothing() {
 /// budget on top of the planted one; the rescan decodes its repeat free.
 #[test]
 fn e07_saturated_table_cap_unchanged_rescan_retires_nothing() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_saturated_table_cap_unchanged_rescan_retires_nothing";
+    if !crate::test_support::isolation::enter(TEST, "e07-saturated-table-cap") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46326,6 +46306,11 @@ fn e07_saturated_table_cap_unchanged_rescan_retires_nothing() {
 /// their pins revalidate; the stop stays explicit evidence.
 #[test]
 fn e07_incomplete_loader_rescan_retains_validated_endpoints() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_incomplete_loader_rescan_retains_validated_endpoints";
+    if !crate::test_support::isolation::enter(TEST, "e07-incomplete-retains") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46385,6 +46370,10 @@ fn e07_incomplete_loader_rescan_retains_validated_endpoints() {
 /// rescan. After dlclose the loader scan verifies absence and detaches.
 #[test]
 fn e07_genuine_unmap_retires_on_a_complete_rescan() {
+    const TEST: &str = "discovery::engine::tests::e07_genuine_unmap_retires_on_a_complete_rescan";
+    if !crate::test_support::isolation::enter(TEST, "e07-genuine-unmap") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46428,6 +46417,10 @@ fn e07_genuine_unmap_retires_on_a_complete_rescan() {
 /// Zeroing the version word makes the next complete scan verify absence.
 #[test]
 fn e07_changed_table_bytes_retire_stale_targets() {
+    const TEST: &str = "discovery::engine::tests::e07_changed_table_bytes_retire_stale_targets";
+    if !crate::test_support::isolation::enter(TEST, "e07-changed-table-bytes") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46475,6 +46468,11 @@ fn e07_changed_table_bytes_retire_stale_targets() {
 /// detach with the refusal as evidence.
 #[test]
 fn e07_deleted_provider_file_retires_safely_with_evidence() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_deleted_provider_file_retires_safely_with_evidence";
+    if !crate::test_support::isolation::enter(TEST, "e07-deleted-provider-file") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46517,6 +46515,11 @@ fn e07_deleted_provider_file_retires_safely_with_evidence() {
 /// longer validate, so the stale targets retire.
 #[test]
 fn e07_incomplete_rescan_over_replaced_files_does_not_retain() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_incomplete_rescan_over_replaced_files_does_not_retain";
+    if !crate::test_support::isolation::enter(TEST, "e07-incomplete-replaced") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46565,6 +46568,11 @@ fn e07_incomplete_rescan_over_replaced_files_does_not_retain() {
 /// remaining pins validate.
 #[test]
 fn e07_same_files_with_changed_pins_replaces_stale_identity() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_same_files_with_changed_pins_replaces_stale_identity";
+    if !crate::test_support::isolation::enter(TEST, "e07-changed-pins") {
+        return;
+    }
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -46652,6 +46660,10 @@ fn e07_same_files_with_changed_pins_replaces_stale_identity() {
 /// no stale module is retained, no target stays active.
 #[test]
 fn e07_same_key_renamed_path_replaces_stale_module() {
+    const TEST: &str = "discovery::engine::tests::e07_same_key_renamed_path_replaces_stale_module";
+    if !crate::test_support::isolation::enter(TEST, "e07-renamed-path") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46725,6 +46737,11 @@ fn e07_same_key_renamed_path_replaces_stale_module() {
 /// retire while the retargeted table stays covered.
 #[test]
 fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_complete_rescan_with_retargeted_table_retires_stale_targets";
+    if !crate::test_support::isolation::enter(TEST, "e07-retargeted-table") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46831,6 +46848,11 @@ fn e07_complete_rescan_with_retargeted_table_retires_stale_targets() {
 /// disproved retained module ID.
 #[test]
 fn e07_incomplete_rescan_refuses_facts_for_disproved_module() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_incomplete_rescan_refuses_facts_for_disproved_module";
+    if !crate::test_support::isolation::enter(TEST, "e07-disproved-module") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46914,6 +46936,11 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_module() {
 /// disproved retained dependency ID either.
 #[test]
 fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_incomplete_rescan_refuses_facts_for_disproved_dependency";
+    if !crate::test_support::isolation::enter(TEST, "e07-disproved-dependency") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -46991,6 +47018,10 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
 /// (partial evidence keeps the conservative union).
 #[test]
 fn e07_incomplete_rescan_with_agreeing_pins_retains() {
+    const TEST: &str = "discovery::engine::tests::e07_incomplete_rescan_with_agreeing_pins_retains";
+    if !crate::test_support::isolation::enter(TEST, "e07-agreeing-pins") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -47041,6 +47072,10 @@ fn e07_incomplete_rescan_with_agreeing_pins_retains() {
 /// a disproved identity refuses, never a changed-but-agreed observation.
 #[test]
 fn e07_incomplete_rescan_unions_agreed_fresh_facts() {
+    const TEST: &str = "discovery::engine::tests::e07_incomplete_rescan_unions_agreed_fresh_facts";
+    if !crate::test_support::isolation::enter(TEST, "e07-unions-fresh-facts") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -47088,6 +47123,11 @@ fn e07_incomplete_rescan_unions_agreed_fresh_facts() {
 /// targets and slot indices with zero detach/re-add.
 #[test]
 fn e07_metadata_only_rescan_preserves_validated_endpoints() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_metadata_only_rescan_preserves_validated_endpoints";
+    if !crate::test_support::isolation::enter(TEST, "e07-metadata-only") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -47210,6 +47250,10 @@ fn e07_metadata_only_rescan_preserves_validated_endpoints() {
 /// provider's files never changed.
 #[test]
 fn e07_metadata_rescan_with_new_provider_preserves_existing_coverage() {
+    const TEST: &str = "discovery::engine::tests::e07_metadata_rescan_with_new_provider_preserves_existing_coverage";
+    if !crate::test_support::isolation::enter(TEST, "e07-metadata-new-provider") {
+        return;
+    }
     let existing = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![existing.path.clone()];
@@ -47307,6 +47351,11 @@ fn e07_metadata_rescan_with_new_provider_preserves_existing_coverage() {
 /// stay bound to the same dependency identity.
 #[test]
 fn e07_metadata_contradiction_in_one_provider_preserves_the_other() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_metadata_contradiction_in_one_provider_preserves_the_other";
+    if !crate::test_support::isolation::enter(TEST, "e07-metadata-contradiction") {
+        return;
+    }
     let first = E07Provider::dlopen();
     let second = E07Provider::dlopen();
     let mut engine = e07_engine();
@@ -47421,6 +47470,10 @@ fn e07_metadata_contradiction_in_one_provider_preserves_the_other() {
 /// loader catch-up and interface selection for the surviving provider.
 #[test]
 fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
+    const TEST: &str = "discovery::engine::tests::review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan";
+    if !crate::test_support::isolation::enter(TEST, "e07-metadata-unmap") {
+        return;
+    }
     let first = E07Provider::dlopen();
     let second = E07Provider::dlopen();
     let mut engine = e07_engine();
@@ -47588,6 +47641,11 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
 #[cfg(target_env = "gnu")]
 #[test]
 fn e07_complete_rescan_with_fewer_loads_lowers_load_count() {
+    const TEST: &str =
+        "discovery::engine::tests::e07_complete_rescan_with_fewer_loads_lowers_load_count";
+    if !crate::test_support::isolation::enter(TEST, "e07-fewer-loads") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -47658,6 +47716,10 @@ fn e07_complete_rescan_with_fewer_loads_lowers_load_count() {
 /// exactly the stale targets; later rescans are quiet again.
 #[test]
 fn late_provider_loader_rescans_keep_stable_slots() {
+    const TEST: &str = "discovery::engine::tests::late_provider_loader_rescans_keep_stable_slots";
+    if !crate::test_support::isolation::enter(TEST, "e07-late-provider-slots") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -47872,13 +47934,7 @@ fn late_provider_loader_rescans_keep_stable_slots() {
 /// retirement: the engine's modules, pins and plan are untouched.
 #[test]
 fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .die_with_parent()
-        .spawn()
-        .expect("an owned sleeper");
+    let mut child = SettledChild::spawn();
     let pid = child.id();
     let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
     let view_id = view.id();
@@ -48031,6 +48087,11 @@ fn view_pin_revalidation_detects_replaced_files() {
 /// and a failed merge must leave the facts usable — the merge is atomic.
 #[test]
 fn merge_preflight_agrees_with_merge_on_failure_modes() {
+    const TEST: &str =
+        "discovery::engine::tests::merge_preflight_agrees_with_merge_on_failure_modes";
+    if !crate::test_support::isolation::enter(TEST, "e07-merge-preflight-failures") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -48195,6 +48256,11 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
 /// and public projections.
 #[test]
 fn merge_preflight_success_implies_identical_merge_results() {
+    const TEST: &str =
+        "discovery::engine::tests::merge_preflight_success_implies_identical_merge_results";
+    if !crate::test_support::isolation::enter(TEST, "e07-merge-preflight-success") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];
@@ -48478,7 +48544,7 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
         .map(|_| {
             SystemScopeChildGuard::new(
                 std::process::Command::new("sleep")
-                    .arg("30")
+                    .arg("infinity")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -48488,21 +48554,44 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
             )
         })
         .collect();
-    // Readiness (same idiom as the cap siblings): discover only once every
-    // child execed sleep, so no maps read races a fork-exec transition.
+    // Readiness: wait until every child has exec'd `sleep` and finished
+    // dynamic-linker startup (blocked in nanosleep, or fallback to valid maps
+    // when /proc/<pid>/wchan is unavailable/zero on restricted kernels), so
+    // neither maps snapshots nor 30s walls race under heavy parallel load.
     let self_exe = std::env::current_exe().unwrap();
     for guard in &guards {
         let pid = guard.pid();
         let exe = format!("/proc/{pid}/exe");
-        let mut execed = false;
-        for _ in 0..500 {
+        let wchan = format!("/proc/{pid}/wchan");
+        let maps_path = format!("/proc/{pid}/maps");
+        let mut settled = false;
+        for _ in 0..1000 {
             if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
-                execed = true;
-                break;
+                let sleeping = std::fs::read_to_string(&wchan)
+                    .ok()
+                    .map(|text| text.trim().to_string());
+                if sleeping
+                    .as_deref()
+                    .is_some_and(|text| text.contains("nanosleep"))
+                {
+                    settled = true;
+                    break;
+                }
+                if matches!(sleeping.as_deref(), None | Some("" | "0"))
+                    && let Ok(bytes) = std::fs::read(&maps_path)
+                    && let Ok(maps) = parse_maps(&bytes)
+                    && maps
+                        .iter()
+                        .any(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+                    && MapIndex::new(&maps).is_ok()
+                {
+                    settled = true;
+                    break;
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(execed, "sleep child {pid} never execed");
+        assert!(settled, "sleep child {pid} never settled");
     }
     guards
 }
@@ -51174,6 +51263,11 @@ fn intra_scan_reserve_stop_defers_whole_view_for_retry() {
 /// deterministically on the second new pin.
 #[test]
 fn intra_scan_budget_stop_defers_whole_view_for_retry() {
+    const TEST: &str =
+        "discovery::engine::tests::intra_scan_budget_stop_defers_whole_view_for_retry";
+    if !crate::test_support::isolation::enter(TEST, "e07-intra-scan-budget") {
+        return;
+    }
     let first = E07Provider::dlopen();
     let second = E07Provider::dlopen();
     let live_pid = std::process::id();
@@ -72893,6 +72987,11 @@ impl Drop for LegacyPrefixBoundaryFixture {
 
 #[test]
 fn exact_read_recovers_legacy_prefix_at_readable_mapping_boundary() {
+    const TEST: &str =
+        "discovery::engine::tests::exact_read_recovers_legacy_prefix_at_readable_mapping_boundary";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-exact-read") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     let view = ProcessView::open(ProcessViewId(4243), std::process::id()).unwrap();
@@ -72961,6 +73060,11 @@ fn exact_read_recovers_legacy_prefix_at_readable_mapping_boundary() {
 
 #[test]
 fn exact_read_refuses_an_extended_mapping_changed_after_maps_a() {
+    const TEST: &str =
+        "discovery::engine::tests::exact_read_refuses_an_extended_mapping_changed_after_maps_a";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-extended-map") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     let address = fixture.write_table(0x0203, 68);
     let view = ProcessView::open(ProcessViewId(4244), std::process::id()).unwrap();
@@ -72984,6 +73088,10 @@ fn exact_read_refuses_an_extended_mapping_changed_after_maps_a() {
 
 #[test]
 fn legacy_prefix_publication_refuses_changed_or_overlong_carried_pointers() {
+    const TEST: &str = "discovery::engine::tests::legacy_prefix_publication_refuses_changed_or_overlong_carried_pointers";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-overlong-ptrs") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     let address = fixture.write_table(0x0203, 68);
@@ -73093,6 +73201,10 @@ fn compatibility_lower_self(record: &DiscoveryRecord) -> ScannedModule {
 
 #[test]
 fn acquired_legacy_extent_is_independent_of_version_and_physical_tail() {
+    const TEST: &str = "discovery::engine::tests::acquired_legacy_extent_is_independent_of_version_and_physical_tail";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-extent-version") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     for word in [
@@ -73122,6 +73234,11 @@ fn acquired_legacy_extent_is_independent_of_version_and_physical_tail() {
 
 #[test]
 fn acquired_sparse_legacy_keeps_first_middle_and_last_ordinals() {
+    const TEST: &str =
+        "discovery::engine::tests::acquired_sparse_legacy_keeps_first_middle_and_last_ordinals";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-sparse") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     for ordinal in [0usize, 27, 67] {
@@ -73145,6 +73262,11 @@ fn acquired_sparse_legacy_keeps_first_middle_and_last_ordinals() {
 
 #[test]
 fn acquired_all_null_legacy_is_an_empty_table_observation() {
+    const TEST: &str =
+        "discovery::engine::tests::acquired_all_null_legacy_is_an_empty_table_observation";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-all-null") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     let address = fixture.write_table(0xe707, 68);
@@ -73159,6 +73281,10 @@ fn acquired_all_null_legacy_is_an_empty_table_observation() {
 
 #[test]
 fn acquired_short_legacy_keeps_completed_words_without_inventing_null_tail() {
+    const TEST: &str = "discovery::engine::tests::acquired_short_legacy_keeps_completed_words_without_inventing_null_tail";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-short") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     for count in [1usize, 3, 67] {
@@ -73175,6 +73301,11 @@ fn acquired_short_legacy_keeps_completed_words_without_inventing_null_tail() {
 
 #[test]
 fn acquired_legacy_keeps_good_targets_around_invalid_words() {
+    const TEST: &str =
+        "discovery::engine::tests::acquired_legacy_keeps_good_targets_around_invalid_words";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-good-around-invalid") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     for broken in [5usize, 67] {
@@ -73777,6 +73908,10 @@ int main(int argc, char **argv) {
 
 #[test]
 fn acquired_interfaces_keep_the_observed_extent_across_version_labels() {
+    const TEST: &str = "discovery::engine::tests::acquired_interfaces_keep_the_observed_extent_across_version_labels";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-version-labels") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     for word in [0x0003u64, 0x0103, 0x0203] {
@@ -73811,6 +73946,10 @@ fn acquired_interfaces_keep_the_observed_extent_across_version_labels() {
 
 #[test]
 fn acquired_invalid_word_changes_still_fail_carried_content_coherence() {
+    const TEST: &str = "discovery::engine::tests::acquired_invalid_word_changes_still_fail_carried_content_coherence";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-invalid-word-change") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     let address = fixture.write_table(0x2802, 68);
@@ -73899,6 +74038,10 @@ fn empty_anonymous_publication_with_ambiguous_owner_is_handled_as_an_observation
 
 #[test]
 fn acquired_header_and_pointer_failure_keeps_completed_legacy_words() {
+    const TEST: &str = "discovery::engine::tests::acquired_header_and_pointer_failure_keeps_completed_legacy_words";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-header-ptr-fail") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     fixture.protect_tail();
     let address = fixture.write_table(0x0203, 1);
@@ -73913,6 +74056,11 @@ fn acquired_header_and_pointer_failure_keeps_completed_legacy_words() {
 
 #[test]
 fn acquired_unreadable_header_keeps_the_complete_observed_body() {
+    const TEST: &str =
+        "discovery::engine::tests::acquired_unreadable_header_keeps_the_complete_observed_body";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-unreadable-header") {
+        return;
+    }
     let fixture = LegacyPrefixBoundaryFixture::new();
     let address = unsafe { fixture.base.cast::<u8>().add(fixture.page - 8) } as u64;
     let target = self_export_fixture(ProcessViewId(4305)).2.pointers[0];
@@ -73989,6 +74137,10 @@ fn failed_acquisition_keeps_targets_and_discloses_uncertain_metadata() {
 
 #[test]
 fn address_only_header_availability_distinguishes_observed_zero_from_placeholder() {
+    const TEST: &str = "discovery::engine::tests::address_only_header_availability_distinguishes_observed_zero_from_placeholder";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-addr-only") {
+        return;
+    }
     for unavailable in [false, true] {
         let fixture = LegacyPrefixBoundaryFixture::new();
         let address = unsafe { fixture.base.cast::<u8>().add(fixture.page - 8) } as u64;
@@ -74130,6 +74282,10 @@ fn address_only_publication_has_no_captured_zero_version() {
 
 #[test]
 fn opaque_publication_retains_observation_without_standard_names_or_list_position() {
+    const TEST: &str = "discovery::engine::tests::opaque_publication_retains_observation_without_standard_names_or_list_position";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-opaque-pub") {
+        return;
+    }
     use crate::discovery::scan::{table_name_authorized, table_observation_authorized};
 
     let fixture = LegacyPrefixBoundaryFixture::new();
@@ -74192,6 +74348,10 @@ fn opaque_publication_retains_observation_without_standard_names_or_list_positio
 
 #[test]
 fn mixed_legacy_and_opaque_publications_preserve_the_stronger_name_proof() {
+    const TEST: &str = "discovery::engine::tests::mixed_legacy_and_opaque_publications_preserve_the_stronger_name_proof";
+    if !crate::test_support::isolation::enter(TEST, "legacy-prefix-mixed-pub") {
+        return;
+    }
     use crate::discovery::scan::{table_name_authorized, table_observation_authorized};
 
     let fixture = LegacyPrefixBoundaryFixture::new();
@@ -82178,6 +82338,11 @@ fn handle_table_deferred_record_restores_at_head_with_one_gap() {
 /// to re-park.
 #[test]
 fn handle_table_loader_scan_defers_whole_on_budget_wait() {
+    const TEST: &str =
+        "discovery::engine::tests::handle_table_loader_scan_defers_whole_on_budget_wait";
+    if !crate::test_support::isolation::enter(TEST, "e07-handle-table-budget") {
+        return;
+    }
     let provider = E07Provider::dlopen();
     let mut engine = e07_engine();
     engine.module_hints = vec![provider.path.clone()];

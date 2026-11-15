@@ -652,9 +652,10 @@ fn counter_start_state_with_owning_modules_survives_loader_arming() {
     // active, consumed, and in order (growth staging matches keys by index).
     use crate::discovery::identity::test_fixture as fixture;
     let mut engine = Engine::empty_for_test();
-    let pid = std::process::id();
+    let child = super::tests::SettledChild::spawn();
+    let pid = child.pid();
     let view = crate::process::ProcessView::open(crate::process::ProcessViewId(0), pid).unwrap();
-    let exe = std::env::current_exe().unwrap();
+    let exe = child.exe_path();
     let pins = fixture::real_scan_pin(&exe, None, 1, &"ab".repeat(32));
     let object = pins.pinned().next().expect("one pin").id;
     let plan = counters_plan_on(8, object);

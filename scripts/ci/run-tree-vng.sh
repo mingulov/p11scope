@@ -186,7 +186,13 @@ fi
 all_pass=$(python3 -I -c '
 import json,sys
 rows=[json.loads(line) for line in open(sys.argv[1]) if line.strip()]
-print("yes" if all(row["pass"] and row["qualification"] == "qualified" for row in rows) else "no")
+# A declared expected failure (run-run-tree.sh EXPECTED_FAILURES) passes
+# the leg only as a failed row; its unexpected pass fails the leg.
+def ok(row):
+    if row["qualification"] == "expected-failure":
+        return not row["pass"]
+    return row["pass"] and row["qualification"] == "qualified"
+print("yes" if all(ok(row) for row in rows) else "no")
 ' "$OUT/cells/results.jsonl")
 if [ "$runtree_exit" -eq 0 ] && [ "$all_pass" = yes ]; then
     echo "run-tree-vng.sh: PASS on $KERNEL in ${wall}s ($OUT/cells/results.jsonl)"

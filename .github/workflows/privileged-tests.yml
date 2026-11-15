@@ -1852,13 +1852,18 @@ jobs:
           else
             scripts/ci/run-tree-vng.sh "$RUNTREE_TESTBIN" "$out" "${{ matrix.kernel }}"
           fi
-          # The shared closed-set gate: the same 4 cells on every leg,
+          # The shared closed-set gate: the same 9 cells on every leg,
           # all exact-positive.
           python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
             --require privileged_run_tree_shell_wrapper_shows_grandchild_calls \
             --require privileged_run_tree_double_fork_shows_reparented_calls \
             --require privileged_run_tree_outliving_child_is_disclosed \
-            --require privileged_run_tree_many_children_land_exact
+            --require privileged_run_tree_many_children_land_exact \
+            --require privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage \
+            --require privileged_run_tree_unprearmed_shortlived_never_pause_still_learns \
+            --require privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves \
+            --require privileged_run_tree_arming_exhaustion_still_stages_and_counts \
+            --require privileged_run_tree_non_member_provider_is_never_staged
       - name: Upload the run-tree results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

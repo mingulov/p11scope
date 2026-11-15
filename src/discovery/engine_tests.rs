@@ -86678,6 +86678,40 @@ fn member_stop_unproven_stopping_file_resume_files_the_first_use_row() {
     let _ = child.wait();
 }
 
+/// The watchdog gone, a pending member that cannot be pinned is not
+/// left stopped without a bound: the loss resumes it at once (the
+/// start-time guarded forced resume) with the named gap, and a pinnable
+/// pending member resumes unattached with the same row, counted.
+#[test]
+fn member_stop_watchdog_loss_resumes_unpinnable_and_pending_members() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut unpinnable, unpinnable_pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (mut pending, pending_pid, _) = stopped_member_with_row(&mut io);
+    let mut engine = member_stop_engine();
+    engine.member_stops.pin_fail.insert(unpinnable_pid);
+    io.guard_lost = true;
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(io.deactivated, "no new stops");
+    assert!(
+        member_resumed_for_test(unpinnable_pid),
+        "the unpinnable member runs again"
+    );
+    assert!(
+        member_resumed_for_test(pending_pid),
+        "the pending member runs again"
+    );
+    assert!(io.rows.is_empty(), "every row is withdrawn");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.forced_resumes, 1, "{stats:?}");
+    assert_eq!(stats.lost_guard_resumes, 1, "{stats:?}");
+    assert!(files_the_first_use_row(&engine), "the gap is named");
+    for child in [&mut unpinnable, &mut pending] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// An `original_exited` read error is not a departure: the held member
 /// is not abandoned. Its row stays, and the next pass re-pins and resumes
 /// it.
@@ -86886,6 +86920,11 @@ fn member_stop_watchdog_loss_releases_every_member() {
     assert!(io.deactivated, "no new stops");
     assert!(!engine.member_stops_held());
     assert!(member_resumed_for_test(pid), "the held member runs again");
+    assert!(
+        files_the_first_use_row(&engine),
+        "the held provider mapper resumed unattached: the gap is named"
+    );
+    assert_eq!(engine.member_stop_stats_for_test().lost_guard_resumes, 1);
     io.rows.insert(pid, member_stop_row(pid, &library, key));
     engine.service_member_stops(&mut io, &mut session, Some(30));
     assert!(

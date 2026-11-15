@@ -77,6 +77,13 @@ const MEMBER_STOP_RETRY_CAP: usize = 1024;
 /// only saves repeated proofs of files already cleared this capture).
 const MEMBER_STOP_LOCAL_CLEARED_CAP: usize = 16_384;
 
+/// Where a held member's hold stands (see `Engine::hold_state`).
+struct HoldState {
+    departed: bool,
+    attached: bool,
+    refused: bool,
+}
+
 /// One stopped member waiting for its providers' attach.
 pub(crate) struct HeldMember {
     pin: crate::process::PidPin,
@@ -102,6 +109,11 @@ pub(crate) struct MemberStopState {
     retrying: BTreeMap<u32, u64>,
     /// The watchdog was lost: no further stops are serviced or made.
     disabled: bool,
+    /// After the loss, rows still owed a resume: the table was unreadable
+    /// at the loss, or a forced resume was refused (retried each pass).
+    loss_drain: bool,
+    /// The loss drain has not yet read the table once.
+    loss_drain_all: bool,
     /// Pinned identities whose staging was refused (cap, replaced file,
     /// pin budget, nothing pinnable): settled, but never attached.
     refused: BTreeSet<(u64, u64)>,
@@ -460,6 +472,9 @@ impl Engine {
         now_ns: Option<u64>,
     ) {
         if self.member_stops.disabled {
+            if self.member_stops.loss_drain {
+                self.drain_after_guard_loss(io, now_ns.or_else(crate::attach::monotonic_ns));
+            }
             return;
         }
         if io.guard_lost() {
@@ -469,7 +484,7 @@ impl Engine {
             if crate::run::capture_diagnostics_on() {
                 eprintln!("p11scope: member-stop watchdog gone; run member stops disabled");
             }
-            self.release_member_stops(io);
+            self.release_after_guard_loss(io, now_ns.or_else(crate::attach::monotonic_ns));
             return;
         }
         let Some(now_ns) = now_ns.or_else(crate::attach::monotonic_ns) else {
@@ -937,6 +952,150 @@ impl Engine {
         }
     }
 
+    /// Where a hold stands: its member left, its providers are attached,
+    /// or a staging was refused.
+    fn hold_state(&self, held: &HeldMember) -> HoldState {
+        // An unreadable exit state is not a departure: a departed member
+        // is withdrawn without a resume, so doubt must resume.
+        let departed = held.pin.original_exited().unwrap_or(false);
+        // A refused staging settles without probes: never "attached".
+        let refused = held
+            .providers
+            .iter()
+            .any(|identity| self.member_stops.refused.contains(identity));
+        let attached = !refused
+            && !self.learned_unapplied
+            && held.providers.iter().all(|identity| {
+                self.learned_settled.contains(identity)
+                    && !self
+                        .pending_learned
+                        .iter()
+                        .any(|queued| (queued.dev, queued.ino) == *identity)
+            });
+        HoldState {
+            departed,
+            attached,
+            refused,
+        }
+    }
+
+    /// The watchdog was lost: no new stops, and every held and pending
+    /// member resumes now, accounted like a hold's end. A member resumed
+    /// before its provider attached files the named first-use row (its
+    /// staging, marked stop-staged, would otherwise stage silently). A
+    /// member whose resume cannot be sent, or that cannot be pinned or
+    /// verified, gets the start-time guarded forced resume at once: with
+    /// no watchdog and no further stops, nothing else would bound it.
+    fn release_after_guard_loss(&mut self, io: &mut dyn MemberStopIo, now_ns: Option<u64>) {
+        let _ = io.deactivate();
+        let held = std::mem::take(&mut self.member_stops.held);
+        for (tgid, member) in held {
+            let HoldState {
+                departed,
+                attached,
+                refused,
+            } = self.hold_state(&member);
+            for key in &member.files {
+                self.clear_member_file(io, *key);
+            }
+            if departed {
+                let _ = io.withdraw(tgid);
+                self.member_stops.stats.departed =
+                    self.member_stops.stats.departed.saturating_add(1);
+                continue;
+            }
+            if !Self::resume_member(io, &member.pin) {
+                self.force_resume(io, tgid, member.since_ns, "watchdog lost");
+                continue;
+            }
+            if attached {
+                self.member_stops.stats.attached_resumes =
+                    self.member_stops.stats.attached_resumes.saturating_add(1);
+            } else if refused {
+                self.member_stops.stats.refused_resumes =
+                    self.member_stops.stats.refused_resumes.saturating_add(1);
+                self.note_first_use_gap(tgid, "its staging was refused");
+            } else {
+                self.member_stops.stats.lost_guard_resumes =
+                    self.member_stops.stats.lost_guard_resumes.saturating_add(1);
+                self.note_first_use_gap(tgid, "watchdog lost");
+            }
+        }
+        self.member_stops.loss_drain = true;
+        self.member_stops.loss_drain_all = true;
+        self.drain_after_guard_loss(io, now_ns);
+    }
+
+    /// Resumes the pending rows owed a resume after the watchdog loss:
+    /// every row on the first readable pass, then only those a refused
+    /// forced resume kept. Ends once nothing is owed.
+    fn drain_after_guard_loss(&mut self, io: &mut dyn MemberStopIo, now_ns: Option<u64>) {
+        let Ok(pending) = io.pending() else {
+            // Unreadable: retried on the next pass.
+            return;
+        };
+        let owed: BTreeMap<u32, u64> = std::mem::take(&mut self.member_stops.retrying);
+        let all = std::mem::replace(&mut self.member_stops.loss_drain_all, false);
+        let now_ns = now_ns.unwrap_or(0);
+        for (tgid, stop) in pending {
+            let first_seen = owed.get(&tgid).copied();
+            if !all && first_seen.is_none() {
+                continue;
+            }
+            let since_ns = stop_since(&stop, first_seen, now_ns);
+            self.resume_pending_after_guard_loss(io, tgid, since_ns);
+        }
+        self.member_stops.loss_drain = !self.member_stops.retrying.is_empty();
+    }
+
+    fn resume_pending_after_guard_loss(
+        &mut self,
+        io: &mut dyn MemberStopIo,
+        tgid: u32,
+        since_ns: u64,
+    ) {
+        let pin = match self.open_member_pin(tgid) {
+            Ok(pin) => pin,
+            Err(_) if process_gone(tgid) => {
+                let _ = io.withdraw(tgid);
+                self.member_stops.stats.departed =
+                    self.member_stops.stats.departed.saturating_add(1);
+                return;
+            }
+            Err(_) => {
+                self.force_resume(io, tgid, since_ns, "watchdog lost; not pinnable");
+                return;
+            }
+        };
+        let moved_out = match io.is_run_member(&pin) {
+            Ok(true) => false,
+            Ok(false) if stopped_member_moved_out(&pin, since_ns) => true,
+            Ok(false) => {
+                let _ = io.withdraw(tgid);
+                self.member_stops.stats.not_members =
+                    self.member_stops.stats.not_members.saturating_add(1);
+                return;
+            }
+            Err(_) => {
+                self.force_resume(io, tgid, since_ns, "watchdog lost; membership unverified");
+                return;
+            }
+        };
+        if !Self::resume_member(io, &pin) {
+            self.force_resume(io, tgid, since_ns, "watchdog lost; no signal authority");
+            return;
+        }
+        // Its stopping file was never proven: the named gap.
+        if moved_out {
+            self.member_stops.stats.moved_out_resumes =
+                self.member_stops.stats.moved_out_resumes.saturating_add(1);
+        } else {
+            self.member_stops.stats.lost_guard_resumes =
+                self.member_stops.stats.lost_guard_resumes.saturating_add(1);
+        }
+        self.note_first_use_gap(tgid, "watchdog lost");
+    }
+
     /// Ends every hold whose providers are attached, whose member left,
     /// or whose bound passed.
     fn resolve_member_holds(&mut self, io: &mut dyn MemberStopIo, now_ns: u64) {
@@ -945,23 +1104,11 @@ impl Engine {
             let Some(held) = self.member_stops.held.get(&tgid) else {
                 continue;
             };
-            // An unreadable exit state is not a departure: a departed
-            // member is withdrawn without a resume, so doubt must resume.
-            let departed = held.pin.original_exited().unwrap_or(false);
-            // A refused staging settles without probes: never "attached".
-            let refused = held
-                .providers
-                .iter()
-                .any(|identity| self.member_stops.refused.contains(identity));
-            let attached = !refused
-                && !self.learned_unapplied
-                && held.providers.iter().all(|identity| {
-                    self.learned_settled.contains(identity)
-                        && !self
-                            .pending_learned
-                            .iter()
-                            .any(|queued| (queued.dev, queued.ino) == *identity)
-                });
+            let HoldState {
+                departed,
+                attached,
+                refused,
+            } = self.hold_state(held);
             let expired = now_ns.saturating_sub(held.since_ns) >= MEMBER_STOP_HOLD_NS;
             if !(departed || attached || refused || expired) {
                 continue;

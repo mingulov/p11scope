@@ -859,7 +859,12 @@ mod tests {
         }
     }
 
-    fn ptrace_op(request: libc::c_uint, tid: libc::pid_t, data: usize) {
+    #[cfg(any(target_env = "gnu", target_env = "uclibc"))]
+    type PtraceRequest = libc::c_uint;
+    #[cfg(not(any(target_env = "gnu", target_env = "uclibc")))]
+    type PtraceRequest = libc::c_int;
+
+    fn ptrace_op(request: PtraceRequest, tid: libc::pid_t, data: usize) {
         // SAFETY: `tid` is stopped under our ptrace; `data` is valid for
         // the request (a flag word or a writable `c_ulong`).
         let rc = unsafe { libc::ptrace(request, tid, 0usize, data) };

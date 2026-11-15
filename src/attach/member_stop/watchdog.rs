@@ -174,10 +174,17 @@ impl Watchdog {
     }
 
     /// Closes the pipe without [`DONE`]: the watchdog sweeps as it would
-    /// after an observer death.
+    /// after an observer death. The wait is bounded; a watchdog still
+    /// sweeping after it is reaped in the background when its sweeps
+    /// end, so no zombie waits for the observer's exit.
     pub(crate) fn abandon(mut self) {
         self.alive = None;
-        self.reap();
+        if !self.reap() {
+            std::thread::spawn(move || {
+                let mut this = self;
+                let _ = this.child.wait();
+            });
+        }
     }
 
     /// [`Self::abandon`] without waiting for the sweeps to end.
@@ -552,6 +559,34 @@ mod tests {
         assert!(
             !Path::new(&format!("/proc/{watchdog_pid}")).exists(),
             "the watchdog exited and was reaped"
+        );
+        let _ = member.kill();
+        let _ = member.wait();
+    }
+
+    /// An abandoned watchdog sweeps past the observer's bounded wait; it
+    /// is still reaped when its sweeps end (no zombie until the observer
+    /// exits).
+    #[test]
+    fn an_abandoned_watchdog_is_reaped_after_its_sweeps() {
+        let mut member = stopped_sleep();
+        let (_root, tree) = listed_tree(&[member.id()]);
+        let watchdog = Watchdog::start(&WatchdogLauncher::TestHarness, &tree, 0).unwrap();
+        let watchdog_pid = watchdog.pid();
+        watchdog.abandon();
+        assert!(
+            resumes_within(member.id(), Duration::from_secs(2)),
+            "the sweep resumes the member"
+        );
+        let end = std::time::Instant::now() + Duration::from_secs(4);
+        while Path::new(&format!("/proc/{watchdog_pid}")).exists()
+            && std::time::Instant::now() < end
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !Path::new(&format!("/proc/{watchdog_pid}")).exists(),
+            "the abandoned watchdog was reaped"
         );
         let _ = member.kill();
         let _ = member.wait();

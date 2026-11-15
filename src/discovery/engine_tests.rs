@@ -87592,6 +87592,53 @@ fn member_stop_staging_stays_unapplied_after_an_accept_without_additions() {
     );
 }
 
+/// Twin: in counter mode a refused bank growth still ran the attach
+/// call, so the accepted candidate consumed the learned staging and the
+/// latch clears (it would otherwise rebuild a whole-scope candidate every
+/// tick). The provider never attached: the hold stays per file, and a
+/// watchdog loss still files the first-use row.
+#[test]
+fn member_stop_counter_refusal_clears_the_latch_and_still_files_the_row() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    io.rows.insert(pid, member_stop_row(pid, &library, key));
+    let mut engine = member_stop_engine();
+    engine.pause_owned_batch = true;
+    let mut session = attaching_session();
+    session.capture_policy = Some(CapturePolicy::Counter(CounterMode::Counts));
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert_eq!(engine.learned_staged_files_for_test(), 1);
+    assert!(engine.learned_unapplied, "the staging waits for the batch");
+    engine.pause_owned_batch = false;
+    engine.service_member_stops(&mut io, &mut session, Some(20));
+    assert!(
+        !session.staged_counter_calls.is_empty(),
+        "the apply ran the counter growth"
+    );
+    assert!(
+        !engine.learned_unapplied,
+        "an accepted apply whose attach call ran consumed the staging"
+    );
+    assert!(
+        engine.member_stops_held(),
+        "the refused provider is not attached: {:?}",
+        engine.member_stop_stats_for_test()
+    );
+    assert_eq!(engine.member_stop_stats_for_test().attached_resumes, 0);
+    io.guard_lost = true;
+    engine.service_member_stops(&mut io, &mut session, Some(30));
+    assert!(!engine.member_stops_held());
+    assert!(member_resumed_for_test(pid));
+    assert!(
+        files_the_first_use_row(&engine),
+        "the unattached provider's gap is named"
+    );
+}
+
 /// Twin: an accepted apply whose session reports no attach-complete
 /// stamp for the provider's slots is no attach: the hold keeps waiting
 /// for real stamps, and at the bound it files the first-use row.

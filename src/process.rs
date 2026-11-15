@@ -747,8 +747,17 @@ impl ProcessView {
     /// Whether this view's original thread group has exited or can never
     /// run user code again (see `PidPin::final_exit_in_progress`).
     pub(crate) fn final_exit_in_progress(&self) -> bool {
-        self.pin
-            .final_exit_in_progress(&mut leader_exit::LeaderExitReadBudget::for_final_exit_proof())
+        self.final_exit_in_progress_within(
+            &mut leader_exit::LeaderExitReadBudget::for_final_exit_proof(),
+        )
+    }
+
+    /// [`Self::final_exit_in_progress`] charged to a caller-owned budget.
+    pub(crate) fn final_exit_in_progress_within(
+        &self,
+        work: &mut leader_exit::LeaderExitReadBudget,
+    ) -> bool {
+        self.pin.final_exit_in_progress(work)
     }
 
     pub(crate) fn run_while_same<T>(&self, action: impl FnOnce() -> T) -> Result<T, String> {

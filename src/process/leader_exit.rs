@@ -299,27 +299,20 @@ impl PidPin {
     }
 }
 
-/// `SIGKILL` (9) in a `SigPnd`/`ShdPnd` mask.
-const SIGKILL_PENDING_MASK: u64 = 1 << (libc::SIGKILL - 1);
-
-/// One task's exit-relevant state: its stat line plus whether `SIGKILL`
-/// is pending on it (private or shared).
+/// One task's exit-relevant state: its stat line.
 #[derive(Clone, Copy)]
 struct ExitingTask {
     stat: TaskStat,
-    sigkill: bool,
 }
 
 impl ExitingTask {
     /// Whether this task can never execute user code again: it is a
-    /// zombie or dead, it is already in `do_exit` (`PF_EXITING` is never
-    /// cleared), or an unblockable `SIGKILL` is pending, which the kernel
-    /// delivers before any return to user mode. Each of these is
-    /// irreversible.
+    /// zombie or dead, or it is already in `do_exit` (`PF_EXITING` is set
+    /// there and never cleared). Both are irreversible. A merely pending
+    /// `SIGKILL` does not count: a task running in user mode can execute
+    /// a little more user code before the kernel takes the signal.
     fn past_user_mode(self) -> bool {
-        matches!(self.stat.state, b'Z' | b'X' | b'x')
-            || self.stat.flags & PF_EXITING != 0
-            || self.sigkill
+        matches!(self.stat.state, b'Z' | b'X' | b'x') || self.stat.flags & PF_EXITING != 0
     }
 }
 
@@ -339,12 +332,14 @@ trait FinalExitIo {
 ///
 /// A task in that state never runs user code again, so the group can make
 /// no further provider call and no further `dlopen`. Thread creation needs
-/// a task still in user mode, and a group exit or exec kill marks every
-/// linked thread under the same lock that `clone` checks, so a member
-/// born during the walk always has a live creator the walk sees. An
-/// `exec` kill leaves the execing thread live, so it never qualifies.
-/// Any unreadable member, a reused leader, or an exhausted budget answers
-/// false: only a positive proof counts.
+/// a creator that is not yet exiting, and the new thread is linked into
+/// the group before `clone` returns to it. A member created during the
+/// first listing may be missed by it, but its creator is then read later
+/// and was not exiting at creation time; so the task list is read a
+/// second time after every member was proven, and any thread it adds
+/// fails the proof. An `exec` kill leaves the execing thread live, so it
+/// never qualifies. Any unreadable member, a reused leader, or an
+/// exhausted budget answers false: only a positive proof counts.
 fn final_exit_with<Io: FinalExitIo>(
     io: &mut Io,
     retained_birth: u64,
@@ -368,6 +363,7 @@ fn final_exit_with<Io: FinalExitIo>(
     let Ok(tasks) = io.tasks() else {
         return false;
     };
+    let mut seen = std::collections::BTreeSet::new();
     for entry in tasks {
         if !work.spend(2) {
             return false;
@@ -375,10 +371,28 @@ fn final_exit_with<Io: FinalExitIo>(
         let Ok(tid) = entry else {
             return false;
         };
+        seen.insert(tid);
         match io.member(tid) {
             Ok(None) => {}
             Ok(Some(task)) if task.past_user_mode() => {}
             Ok(Some(_)) | Err(()) => return false,
+        }
+    }
+    // A thread the first listing missed was created by a member that was
+    // not yet exiting: any such thread fails the proof.
+    if !work.spend(1) {
+        return false;
+    }
+    let Ok(again) = io.tasks() else {
+        return false;
+    };
+    for entry in again {
+        if !work.spend(1) {
+            return false;
+        }
+        match entry {
+            Ok(tid) if seen.contains(&tid) => {}
+            _ => return false,
         }
     }
     // Close the walk on the same original leader: a reused or recovered
@@ -415,15 +429,8 @@ fn read_relative_io(
     String::from_utf8(bytes).map_err(io::Error::other)
 }
 
-fn parse_exiting_task(stat: &str, status: &str) -> Result<ExitingTask, ()> {
+fn parse_exiting_task(stat: &str) -> Result<ExitingTask, ()> {
     let end = stat.rfind(')').ok_or(())?;
-    let mask = |key: &str| -> Result<u64, ()> {
-        let value = status
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .ok_or(())?;
-        u64::from_str_radix(value.trim(), 16).map_err(|_| ())
-    };
     Ok(ExitingTask {
         stat: TaskStat {
             birth: start_time_from_stat(stat).map_err(|_| ())?,
@@ -435,7 +442,6 @@ fn parse_exiting_task(stat: &str, status: &str) -> Result<ExitingTask, ()> {
                 .ok_or(())?,
             flags: stat_flags_from_stat_text(stat).ok_or(())?,
         },
-        sigkill: (mask("SigPnd:")? | mask("ShdPnd:")?) & SIGKILL_PENDING_MASK != 0,
     })
 }
 
@@ -449,8 +455,7 @@ impl FinalExitIo for OsExitIo<'_> {
     fn leader(&mut self) -> Result<ExitingTask, ()> {
         let directory = self.directory.directory.as_fd();
         let stat = read_relative_io(directory, c"stat", STAT_BYTES).map_err(|_| ())?;
-        let status = read_relative_io(directory, c"status", STATUS_BYTES).map_err(|_| ())?;
-        parse_exiting_task(&stat, &status)
+        parse_exiting_task(&stat)
     }
     fn tasks(&mut self) -> Result<Self::Tasks, ()> {
         ExitIo::tasks(self)
@@ -470,12 +475,7 @@ impl FinalExitIo for OsExitIo<'_> {
             Err(Some(())) => return Ok(None),
             Err(None) => return Err(()),
         };
-        let status = match read("status", STATUS_BYTES) {
-            Ok(status) => status,
-            Err(Some(())) => return Ok(None),
-            Err(None) => return Err(()),
-        };
-        parse_exiting_task(&stat, &status).map(Some)
+        parse_exiting_task(&stat).map(Some)
     }
 }
 
@@ -652,6 +652,8 @@ mod tests {
         members: Vec<(u32, Result<Option<ExitingTask>, ()>)>,
         reused_leader_after_walk: bool,
         leader_reads: usize,
+        late_member: Option<u32>,
+        listings: usize,
     }
     impl FinalExitIo for ScriptedFinalExit {
         type Tasks = std::vec::IntoIter<Result<u32, ()>>;
@@ -667,8 +669,12 @@ mod tests {
             Ok(leader)
         }
         fn tasks(&mut self) -> Result<Self::Tasks, ()> {
+            self.listings += 1;
             let mut tids = vec![Ok(7)];
             tids.extend(self.members.iter().map(|(tid, _)| Ok(*tid)));
+            if self.listings > 1 {
+                tids.extend(self.late_member.map(Ok));
+            }
             Ok(tids.into_iter())
         }
         fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()> {
@@ -682,27 +688,28 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
     }
-    fn task(state: u8, flags: u32, sigkill: bool) -> ExitingTask {
+    fn task(state: u8, flags: u32) -> ExitingTask {
         ExitingTask {
             stat: TaskStat {
                 birth: 500,
                 state,
                 flags,
             },
-            sigkill,
         }
     }
     fn dying_group() -> ScriptedFinalExit {
         ScriptedFinalExit {
             exited: false,
-            leader: task(b'Z', PF_EXITING, false),
+            leader: task(b'Z', PF_EXITING),
             members: vec![
-                (8, Ok(Some(task(b'R', PF_EXITING, false)))),
-                (9, Ok(Some(task(b'S', 0, true)))),
+                (8, Ok(Some(task(b'R', PF_EXITING)))),
+                (9, Ok(Some(task(b'X', 0)))),
                 (10, Ok(None)),
             ],
             reused_leader_after_walk: false,
             leader_reads: 0,
+            late_member: None,
+            listings: 0,
         }
     }
     fn final_exit(io: &mut ScriptedFinalExit) -> bool {
@@ -713,11 +720,11 @@ mod tests {
         assert!(final_exit(&mut dying_group()));
         let mut single = dying_group();
         single.members.clear();
-        single.leader = task(b'R', PF_EXITING, false);
+        single.leader = task(b'R', PF_EXITING);
         assert!(final_exit(&mut single), "a single task already in do_exit");
         let mut exited = dying_group();
         exited.exited = true;
-        exited.leader = task(b'S', 0, false);
+        exited.leader = task(b'S', 0);
         assert!(
             final_exit(&mut exited),
             "the original pidfd proves it outright"
@@ -727,11 +734,11 @@ mod tests {
     fn any_task_still_in_user_mode_keeps_the_group_live() {
         // A leader that left by pthread_exit while a worker runs.
         let mut worker = dying_group();
-        worker.members.push((11, Ok(Some(task(b'S', 0, false)))));
+        worker.members.push((11, Ok(Some(task(b'S', 0)))));
         assert!(!final_exit(&mut worker));
         // An exec kill: the execing leader stays live.
         let mut exec = dying_group();
-        exec.leader = task(b'R', 0, false);
+        exec.leader = task(b'R', 0);
         assert!(!final_exit(&mut exec));
         // An unreadable member is never proof.
         let mut unreadable = dying_group();
@@ -758,26 +765,27 @@ mod tests {
         }
     }
     #[test]
-    fn exiting_task_reads_sigkill_from_either_pending_mask() {
-        let stat = "7 (x) R 1 7 7 0 -1 4194564 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0";
-        let status = |pnd: &str, shd: &str| format!("Name:\tx\nSigPnd:\t{pnd}\nShdPnd:\t{shd}\n");
+    fn pending_sigkill_alone_and_late_threads_never_prove_final_exit() {
+        // A task that only has a fatal signal pending is still in user
+        // mode until the kernel takes it: running, sleeping or stopped.
+        for state in *b"RSDT" {
+            let mut pending = dying_group();
+            pending.members.push((11, Ok(Some(task(state, 0)))));
+            assert!(!final_exit(&mut pending), "{}", state as char);
+        }
+        // A thread created while the first listing ran fails the proof.
+        let mut late = dying_group();
+        late.late_member = Some(12);
+        assert!(!final_exit(&mut late));
+        assert_eq!(late.listings, 2, "the task list is read twice");
         let parsed =
-            parse_exiting_task(stat, &status("0000000000000000", "0000000000000000")).unwrap();
-        assert!(!parsed.sigkill);
+            parse_exiting_task("7 (x) R 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0")
+                .unwrap();
         assert_eq!(parsed.stat.birth, 500);
+        assert!(!parsed.past_user_mode());
         assert!(
-            parse_exiting_task(stat, &status("0000000000000100", "0000000000000000"))
-                .unwrap()
-                .sigkill
-        );
-        assert!(
-            parse_exiting_task(stat, &status("0000000000000000", "0000000000000100"))
-                .unwrap()
-                .sigkill
-        );
-        assert!(
-            parse_exiting_task(stat, "Name:\tx\n").is_err(),
-            "missing masks are not proof"
+            parse_exiting_task("7 (x").is_err(),
+            "a torn stat is not proof"
         );
     }
     #[test]

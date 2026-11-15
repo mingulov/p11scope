@@ -870,8 +870,14 @@ pub struct Engine {
     /// deferral postpones a rescan with its request retained; it is a gap
     /// only when that rescan never completes. At capture end the records
     /// stand while any view is still owed and are withdrawn otherwise.
-    /// Keyed by view, not pid, so a reused pid never settles a deferral.
-    quantum_deferred_views: BTreeSet<ProcessViewId>,
+    /// Keyed by the view's allocation, not its pid or reusable id, so a
+    /// later view that reuses either never settles a deferral.
+    quantum_deferred_views: Vec<(ProcessViewId, ViewAdmission)>,
+    /// A deferred view left before its rescan: that rescan can never
+    /// run, so the records stand for the rest of the capture. Owed
+    /// entries for such views are folded into this flag, which keeps
+    /// the owed list bounded by the retained views.
+    quantum_deferral_unsettled: bool,
     quantum_deferral_records: Vec<Skipped>,
     retirement_intents: PendingViewRetirements,
     ready_expected_removals: BTreeSet<ProcessViewId>,
@@ -1140,6 +1146,10 @@ pub struct Engine {
     /// executable or mappings return.
     #[cfg(test)]
     fail_next_loader_locate_for_test: bool,
+    #[cfg(test)]
+    pub(crate) inject_loader_pin_skip_for_test: Option<Skipped>,
+    #[cfg(test)]
+    pub(crate) lose_generation_after_arm_for_test: bool,
     /// Graphs created by the barrier (test count, G12/G20/G22/G23).
     #[cfg(test)]
     collected_graphs_created: u32,
@@ -7147,6 +7157,11 @@ fn scan_and_pin_with_proof(
 ) -> Result<ScanProofResult> {
     let stop_before = budget.stopped_reason();
     let refusals_before = budget.refusal_counts();
+    // A group already in its final exit when its scan starts can run no
+    // code during or after the scan, so a refusal or pin skip on it is the
+    // process ending, not a provider gone unobserved. A group that was
+    // live at scan start keeps every refusal, even if it exits mid-scan.
+    let ending_at_start = view.final_exit_in_progress();
     let scan_start = crate::attach::monotonic_ns();
     let scanned = scan(
         &ScanRequest {
@@ -7175,7 +7190,7 @@ fn scan_and_pin_with_proof(
             .any(|skip| scan_skip_truncates(&skip.reason));
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
     // Retain acquisition losses before pinning can fail on an exited generation.
-    for skipped in outcome.skipped() {
+    for skipped in outcome.skipped().iter().filter(|_| !ending_at_start) {
         counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
@@ -7206,7 +7221,7 @@ fn scan_and_pin_with_proof(
     );
     let (pinned, pin_skips) =
         pinned.map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
-    for skipped in pin_skips {
+    for skipped in pin_skips.into_iter().filter(|_| !ending_at_start) {
         counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(&skipped);
         counters.object_skips.push(skipped);
@@ -13033,7 +13048,8 @@ impl Engine {
             exit_ended_by_route: [0, 0, 0],
             pending_rejected_keys: BTreeSet::new(),
             pending_retirements: BTreeSet::new(),
-            quantum_deferred_views: BTreeSet::new(),
+            quantum_deferred_views: Vec::new(),
+            quantum_deferral_unsettled: false,
             quantum_deferral_records: Vec::new(),
             retirement_intents: PendingViewRetirements::new(),
             ready_expected_removals: BTreeSet::new(),
@@ -13118,6 +13134,10 @@ impl Engine {
             final_exit_views_for_test: BTreeSet::new(),
             #[cfg(test)]
             fail_next_loader_locate_for_test: false,
+            #[cfg(test)]
+            inject_loader_pin_skip_for_test: None,
+            #[cfg(test)]
+            lose_generation_after_arm_for_test: false,
             #[cfg(test)]
             collected_graphs_created: 0,
             #[cfg(test)]
@@ -23637,7 +23657,12 @@ impl Engine {
             pin_start,
             crate::attach::monotonic_ns(),
         );
-        let (loader_pins, loader_skips) = pinned.map_err(anyhow::Error::msg)?;
+        #[allow(unused_mut)]
+        let (loader_pins, mut loader_skips) = pinned.map_err(anyhow::Error::msg)?;
+        #[cfg(test)]
+        if let Some(skip) = self.inject_loader_pin_skip_for_test.take() {
+            loader_skips.push(skip);
+        }
         // A budget wait defers arming for a refresh with its counted
         // gap: the view re-arms next tick instead of binding partial.
         if pins_waited_for_handles_budget(&loader_skips) {
@@ -24357,6 +24382,9 @@ impl Engine {
             .views
             .get(position)
             .is_some_and(|view| view.id() == view_id && view.still_the_same());
+        #[cfg(test)]
+        let generation_valid =
+            generation_valid && !std::mem::take(&mut self.lose_generation_after_arm_for_test);
         let outcome = match loader_arm_outcome(generation_valid, result) {
             // A group in its final exit fails its arm reads (`ENOENT` on
             // its executable or mappings) while its pidfd is not yet
@@ -24547,7 +24575,7 @@ impl Engine {
     /// rescanned later postponed work that then completed, so its records
     /// are withdrawn. Any view still owed keeps every record.
     pub(crate) fn withdraw_completed_quantum_deferrals(&mut self) {
-        if !self.quantum_deferred_views.is_empty() {
+        if self.quantum_deferral_unsettled || !self.quantum_deferred_views.is_empty() {
             return;
         }
         for record in std::mem::take(&mut self.quantum_deferral_records) {
@@ -25383,6 +25411,12 @@ impl Engine {
         // clearing exec state, merging causes, or settling loader scans.
         if cause == RetirementCause::GenerationLost && !proven_exited {
             match self.retained_generation_state(view) {
+                // A group in its final exit has ended even while its pidfd
+                // is not ready yet: retire it as an expected end, like a
+                // proven exit, instead of deferring with a gap.
+                Some(Ok(OriginalGenerationState::Current)) if self.original_ending(view) => {
+                    cause = RetirementCause::ExpectedRemoval;
+                }
                 Some(Ok(OriginalGenerationState::Current)) | Some(Err(_)) | None => {
                     self.mark_partial(
                         "live discovery generation",
@@ -25552,6 +25586,19 @@ impl Engine {
     /// the same moment would have covered. Unlike `original_exited`, it
     /// never consumes a scripted pin answer.
     fn original_ending(&self, view: ProcessViewId) -> bool {
+        self.original_ending_within(
+            view,
+            &mut crate::process::leader_exit::LeaderExitReadBudget::for_final_exit_proof(),
+        )
+    }
+
+    /// [`Self::original_ending`] charged to a caller-owned budget, so a
+    /// loop over many views shares one bound; exhaustion answers false.
+    fn original_ending_within(
+        &self,
+        view: ProcessViewId,
+        work: &mut crate::process::leader_exit::LeaderExitReadBudget,
+    ) -> bool {
         #[cfg(test)]
         if self.final_exit_views_for_test.contains(&view) {
             return true;
@@ -25559,7 +25606,7 @@ impl Engine {
         self.views
             .iter()
             .find(|candidate| candidate.id() == view)
-            .is_some_and(ProcessView::final_exit_in_progress)
+            .is_some_and(|retained| retained.final_exit_in_progress_within(work))
     }
 
     #[cfg(test)]
@@ -25580,12 +25627,15 @@ impl Engine {
         no_new_views: bool,
         no_refreshed_views: bool,
     ) -> bool {
+        // One bound for the whole batch: a large retirement set spends at
+        // most one proof's budget, and a spent budget keeps the gap.
+        let mut work = crate::process::leader_exit::LeaderExitReadBudget::for_final_exit_proof();
         no_new_views
             && no_refreshed_views
             && self.pending_rejected_keys.is_empty()
             && self.pending_retirements.iter().all(|view| {
                 !self.views.iter().any(|retained| retained.id() == *view)
-                    || self.original_ending(*view)
+                    || self.original_ending_within(*view, &mut work)
             })
     }
 
@@ -27855,8 +27905,42 @@ impl Engine {
                         "tick deep-scan quantum exhausted; {left} refreshed {noun} deferred to the next tick"
                     ),
                 };
+                // Fold owed views that are no longer retained: they can
+                // never be rescanned.
+                let views = &self.views;
+                let before = self.quantum_deferred_views.len();
                 self.quantum_deferred_views
-                    .extend(ordered[index..].iter().copied());
+                    .retain(|(owed, owed_admission)| {
+                        views.iter().any(|view| {
+                            view.id() == *owed
+                                && view.view_admission().same_allocation(owed_admission)
+                        })
+                    });
+                if self.quantum_deferred_views.len() != before {
+                    self.quantum_deferral_unsettled = true;
+                }
+                for id in &ordered[index..] {
+                    let admission = self
+                        .views
+                        .iter()
+                        .find(|view| view.id() == *id)
+                        .map(ProcessView::view_admission);
+                    // A deferred id no retained view backs can never be
+                    // rescanned.
+                    let Some(admission) = admission else {
+                        self.quantum_deferral_unsettled = true;
+                        continue;
+                    };
+                    let known = self
+                        .quantum_deferred_views
+                        .iter()
+                        .any(|(owed, owed_admission)| {
+                            owed == id && owed_admission.same_allocation(&admission)
+                        });
+                    if !known {
+                        self.quantum_deferred_views.push((*id, admission));
+                    }
+                }
                 if !self.quantum_deferral_records.contains(&record) {
                     self.quantum_deferral_records.push(record.clone());
                 }
@@ -27928,8 +28012,13 @@ impl Engine {
                         self.views[position].view_admission(),
                         &modules,
                     );
-                    // The deferred rescan ran: that view is no longer owed.
-                    self.quantum_deferred_views.remove(view_id);
+                    // The deferred rescan ran: that exact view allocation
+                    // is no longer owed.
+                    let admission = self.views[position].view_admission();
+                    self.quantum_deferred_views
+                        .retain(|(owed, owed_admission)| {
+                            !(owed == view_id && owed_admission.same_allocation(&admission))
+                        });
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {

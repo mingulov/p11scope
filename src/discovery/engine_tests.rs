@@ -83506,7 +83506,10 @@ fn quantum_deferral_records_stand_only_while_a_rescan_is_owed() {
             .into(),
     };
     let seed = |engine: &mut Engine, owed: &[ProcessViewId]| {
-        engine.quantum_deferred_views.extend(owed.iter().copied());
+        engine.quantum_deferred_views.extend(
+            owed.iter()
+                .map(|id| (*id, crate::process::ViewAdmission::test_new())),
+        );
         engine.quantum_deferral_records.push(record.clone());
         engine.counters.object_skips.push(record.clone());
         engine.plan.skipped.push(record.clone());
@@ -83555,4 +83558,318 @@ fn generation_change_on_a_group_in_final_exit_files_no_loss() {
         child.kill().unwrap();
         child.wait().unwrap();
     }
+}
+
+/// A deferred rescan is owed by the exact deferred view allocation: a
+/// later view that reuses its id never settles it, while a rescan of the
+/// same view does.
+#[test]
+fn quantum_deferral_owed_by_a_reused_view_id_is_never_settled_by_its_successor() {
+    for same_view in [true, false] {
+        let mut fixture = RefreshFairnessFixture::new();
+        let view = fixture.engine.views[0].id();
+        fixture.engine.scheduler.set_tick_quantum_ns_for_test(0);
+        fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
+        let (scans, _, _, skipped) = fixture.engine.scan_inventory_views(
+            &BTreeSet::from([view]),
+            "zero quantum",
+            &mut || Some(0),
+        );
+        assert!(scans.is_empty());
+        let record = skipped
+            .iter()
+            .find(|skip| skip.reason.contains("tick deep-scan quantum exhausted"))
+            .expect("a deferral record")
+            .clone();
+        fixture.engine.counters.object_skips.push(record.clone());
+        if !same_view {
+            // The deferred view is retired and its id goes to a new view.
+            let successor = ProcessView::open(view, fixture.children[1].pid()).unwrap();
+            fixture.engine.views[0] = successor;
+        }
+        fixture
+            .engine
+            .scheduler
+            .set_tick_quantum_ns_for_test(u64::MAX);
+        fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
+        let (scans, failed, _, _) =
+            fixture
+                .engine
+                .scan_inventory_views(&BTreeSet::from([view]), "rescan", &mut || Some(0));
+        assert_eq!(scans.len(), 1, "the rescan ran: {failed:?}");
+        fixture.engine.withdraw_completed_quantum_deferrals();
+        assert_eq!(
+            fixture.engine.counters.object_skips.contains(&record),
+            !same_view,
+            "same view {same_view}: only a rescan of the deferred view settles it"
+        );
+    }
+}
+
+fn arming_skips(engine: &Engine) -> Vec<&Skipped> {
+    engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| {
+            matches!(
+                skip.subject.as_str(),
+                "live loader arming" | "live discovery generation" | "live export hook"
+            ) || skip.reason == "injected loader pin skip"
+        })
+        .collect()
+}
+
+/// The real generation-change order (retirement queue first, then the
+/// loss mark) files nothing for a group in its final exit, and both marks
+/// for a live one whose pin still reads current.
+#[test]
+fn generation_change_retirement_on_an_ending_group_files_no_generation_loss() {
+    for ending in [true, false] {
+        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let view = engine.views[0].id();
+        if ending {
+            engine.set_final_exit_for_test(view);
+        }
+        let mut pending = PendingViewRetirements::new();
+        engine.queue_stale_views(&BTreeSet::from([view]), &mut pending);
+        engine.mark_generation_change(
+            view,
+            "live loader arming",
+            "the process generation changed before the loader-arm postcheck",
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let subjects: Vec<_> = arming_skips(&engine)
+            .iter()
+            .map(|skip| skip.subject.clone())
+            .collect();
+        if ending {
+            assert!(subjects.is_empty(), "{subjects:?}");
+            assert_eq!(
+                pending.get(&view).copied(),
+                Some(RetirementCause::ExpectedRemoval),
+                "an ending group retires as an expected end"
+            );
+        } else {
+            assert!(
+                subjects.iter().any(|s| s == "live discovery generation"),
+                "{subjects:?}"
+            );
+            assert!(
+                subjects.iter().any(|s| s == "live loader arming"),
+                "{subjects:?}"
+            );
+        }
+    }
+}
+
+/// `loader_arm_gap`, the helper behind every per-step loader-arm failure:
+/// silent NotArmable for an ending group, a named gap for a live one.
+#[test]
+fn loader_arm_gap_is_silent_only_for_an_ending_group() {
+    for ending in [true, false] {
+        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let view = engine.views[0].id();
+        if ending {
+            engine.set_final_exit_for_test(view);
+        }
+        let result = engine.loader_arm_gap(view, "the exact loader mapping could not be pinned");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        if ending {
+            assert!(matches!(result, Err(LoaderArmFailure::NotArmable)));
+            assert!(arming_skips(&engine).is_empty());
+        } else {
+            assert!(matches!(result, Ok(false)));
+            assert!(engine.counters.object_skips.iter().any(|skip| {
+                skip.subject == "live loader arming"
+                    && skip.reason == "the exact loader mapping could not be pinned"
+            }));
+        }
+    }
+}
+
+/// A loader pin skip during a real arm: dropped as NotArmable with no
+/// unbound record for an ending group, kept as a named skip for a live one.
+#[test]
+fn loader_pin_skip_is_silent_only_for_an_ending_group() {
+    for ending in [true, false] {
+        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let view = engine.views[0].id();
+        if ending {
+            engine.set_final_exit_for_test(view);
+        }
+        engine.inject_loader_pin_skip_for_test = Some(Skipped {
+            subject: "/lib/ld.so".into(),
+            reason: "injected loader pin skip".into(),
+        });
+        let armed = engine.arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = armed;
+        let injected = engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason == "injected loader pin skip");
+        assert_eq!(
+            injected, !ending,
+            "ending {ending}: {:?}",
+            engine.counters.object_skips
+        );
+        if ending {
+            assert_eq!(engine.loader_discovery().strategies.unavailable, 0);
+        }
+    }
+}
+
+/// A failed arm whose generation is then lost: an ending group files no
+/// unbound loader record (the expected-exit rule), a live one does.
+#[test]
+fn lost_generation_after_a_failed_arm_records_nothing_only_for_an_ending_group() {
+    for ending in [true, false] {
+        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        engine.scope = Scope::System;
+        let view = engine.views[0].id();
+        if ending {
+            engine.set_final_exit_for_test(view);
+        }
+        engine.fail_next_loader_locate_for_test = true;
+        engine.lose_generation_after_arm_for_test = true;
+        let armed = engine.arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        armed.expect("an unnamed scope returns");
+        let aggregate = engine.loader_discovery();
+        assert_eq!(
+            aggregate.strategies.unavailable,
+            u64::from(!ending),
+            "ending {ending}: {:?}",
+            engine.counters.object_skips
+        );
+        assert_eq!(
+            arming_skips(&engine).is_empty(),
+            ending,
+            "{:?}",
+            engine.counters.object_skips
+        );
+    }
+}
+
+/// The export-hook generation-change mark: silent for an ending group,
+/// a named gap for a live one.
+#[test]
+fn export_generation_change_is_silent_only_for_an_ending_group() {
+    for ending in [true, false] {
+        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let view = engine.views[0].id();
+        if ending {
+            engine.set_final_exit_for_test(view);
+        }
+        engine.mark_export_generation_change(view);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let filed = engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live export hook"
+                && skip.reason
+                    == "the process generation changed around a dynamic export attachment"
+        });
+        assert_eq!(filed, !ending);
+    }
+}
+
+/// Ending twin beside the `p2_*` refusal tests: a group already in its
+/// final exit when its scan starts files no scan or pin refusal, while a
+/// group live at scan start keeps them even when it exits mid-scan (`p2_*`).
+#[test]
+fn scan_refusal_on_a_group_ended_before_its_scan_files_no_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(712), child.id()).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let mut counters = DiscoveryCounters::default();
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: vec![Skipped {
+                    subject: "capture discovery".into(),
+                    reason: crate::discovery::scan::MAPPING_CHANGED_REASON.into(),
+                }],
+                scan_ms: 0,
+            })
+        },
+        None,
+        None,
+    );
+    let _ = result;
+    assert!(
+        counters.object_skips.is_empty(),
+        "{:?}",
+        counters.object_skips
+    );
+}
+
+/// Owed deferrals of views that left are folded into one standing flag at
+/// the next deferral, so the owed list stays bounded by retained views,
+/// and a later settled rescan of the successor still withdraws nothing.
+#[test]
+fn folded_deferral_of_a_departed_view_keeps_the_records_standing() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let view = fixture.engine.views[0].id();
+    let defer = |engine: &mut Engine| {
+        engine.scheduler.set_tick_quantum_ns_for_test(0);
+        engine.scheduler.begin_deep_scan_tick(Some(0));
+        let (_, _, _, skipped) =
+            engine.scan_inventory_views(&BTreeSet::from([view]), "zero quantum", &mut || Some(0));
+        engine.counters.object_skips.extend(skipped);
+    };
+    defer(&mut fixture.engine);
+    fixture.engine.views[0] = ProcessView::open(view, fixture.children[1].pid()).unwrap();
+    defer(&mut fixture.engine);
+    assert_eq!(fixture.engine.quantum_deferred_views.len(), 1, "bounded");
+    assert!(fixture.engine.quantum_deferral_unsettled);
+    fixture
+        .engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(u64::MAX);
+    fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
+    let (scans, _, _, _) =
+        fixture
+            .engine
+            .scan_inventory_views(&BTreeSet::from([view]), "rescan", &mut || Some(0));
+    assert_eq!(scans.len(), 1);
+    assert!(fixture.engine.quantum_deferred_views.is_empty());
+    fixture.engine.withdraw_completed_quantum_deferrals();
+    assert!(
+        fixture
+            .engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("tick deep-scan quantum exhausted")),
+        "the departed view's deferral still stands"
+    );
 }

@@ -29848,6 +29848,7 @@ fn conservative_replays_under_churn_never_burn_capacity() {
     let view = ProcessView::open(ProcessViewId(3), _reap.0.id()).unwrap();
     let modules = child_provider_modules(&view);
     let busy = with_endpoints(modules[0].clone(), capacity - 100);
+    let busy_path = busy.path.clone();
     let late = with_endpoints(modules[1].clone(), 50);
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
@@ -29887,10 +29888,23 @@ fn conservative_replays_under_churn_never_burn_capacity() {
             "exit {exit}: a replay with additions closed allocates nothing"
         );
     }
+    // The 30 retired cells arm the Named reserve, so every replay states the
+    // busy provider's 30 re-listed non-active endpoints as an honest growth
+    // omission. No provider is refused whole and no slot is minted: the
+    // omission is the reserve working, not the capacity burn PC-1 fixed.
     assert!(
-        engine.plan.modules_skipped.is_empty(),
-        "no capacity refusal was published: {:?}",
+        engine
+            .plan
+            .modules_skipped
+            .iter()
+            .all(|skip| skip.subject == busy_path && plan::is_growth_omission(&skip.reason)),
+        "only the busy provider's own growth is omitted: {:?}",
         engine.plan.modules_skipped
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        allocated,
+        "a replay with additions closed allocates nothing"
     );
 
     // Discovery still admits a later provider that fits, and retries the
@@ -29907,11 +29921,12 @@ fn conservative_replays_under_churn_never_burn_capacity() {
         .apply_candidate(&mut session, candidate, &mut true, false, &[])
         .unwrap();
     assert!(outcome.accepted());
-    // The Detailed Shared reserve holds room for corroborated tables once
-    // heuristic modules pass the reserve-free ceiling. The busy provider's
-    // own growth keeps its place and is re-attempted (30 fresh cells when
-    // additions open), while the later heuristic provider is refused by the
-    // reserve rather than starving the room it protects.
+    // The Named reserve is armed once churn has retired slots (retired = 30
+    // here), so an already-admitted heuristic provider keeps its active
+    // endpoints but its 30 re-listed non-active endpoints are new growth and
+    // are omitted, never allocated into the reserve. The later heuristic
+    // provider is refused by the same reserve rather than starving the room
+    // it protects.
     assert!(
         engine.plan.modules_skipped.iter().any(|skip| {
             skip.subject.contains("libc.so.6") && skip.reason.contains("are reserved")
@@ -29919,8 +29934,17 @@ fn conservative_replays_under_churn_never_burn_capacity() {
         "the later heuristic provider meets the reserve: {:?}",
         engine.plan.modules_skipped
     );
-    assert_eq!(engine.plan.slots.len(), allocated + 30);
-    assert_eq!(engine.plan.active_slot_count(), allocated);
+    assert!(
+        engine
+            .plan
+            .modules_skipped
+            .iter()
+            .any(|skip| skip.reason.starts_with("admitted module needs")),
+        "the busy provider's growth is an omission, not a slot: {:?}",
+        engine.plan.modules_skipped
+    );
+    assert_eq!(engine.plan.slots.len(), allocated);
+    assert_eq!(engine.plan.active_slot_count(), allocated - 30);
 }
 
 /// Kills and reaps its child when dropped.

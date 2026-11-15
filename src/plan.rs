@@ -4585,13 +4585,14 @@ fn merge(
             closure_late_start
         } else if matches!(admission_policy, AdmissionPolicy::Detailed(_)) {
             // The reserve holds room for a *new* corroborated arrival. An
-            // already-admitted module's growth competes against the full
-            // budget: its active footprint already determined the reserve
-            // outcome when it was admitted, and re-applying the ceiling to
-            // its own re-listed endpoints only publishes a false loss (the
-            // PC-1 replay shape). Churn generations are new modules (no
-            // kept endpoints), so the F2 reserve still applies to them.
-            class.leaves_reserve() && (shared || retired > 0) && kept.is_empty()
+            // already-admitted heuristic module keeps its active endpoints
+            // — they are already allocated, so re-admitting them adds
+            // nothing to the budget — but its *new* growth still stops at
+            // capacity - reserve. Letting a rescan grow into the reserve
+            // would starve the corroborated provider the reserve protects;
+            // the kept-only retry preserves the active footprint when that
+            // growth is refused.
+            class.leaves_reserve() && (shared || retired > 0)
         } else {
             shared && class.leaves_reserve()
         };
@@ -19839,6 +19840,64 @@ pub(crate) mod tests {
                 .count(),
             68,
             "exact gets 68 slots"
+        );
+    }
+
+    /// An already-admitted heuristic module keeps its active endpoints but
+    /// its *new* growth never enters the shared corroborated reserve. The
+    /// first plan fills the reserve-free ceiling exactly (1,574 corroborated
+    /// + 10 heuristic = 1,584); a rescan that re-lists those 10 and adds a
+    /// 528-entry second table attaches only the kept 10. Without the reserve
+    /// on kept growth the module would consume the whole reserve and reach
+    /// MAX_SLOTS (2,112).
+    #[test]
+    fn slot_reclaim_shared_heuristic_growth_stays_out_of_reserve() {
+        let capacity = MAX_SLOTS as usize;
+        let reserve = shared_scope_reserve(MAX_SLOTS as usize);
+        let ceiling = capacity - reserve;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, ceiling - 10, true);
+        let initial = provider_with_tables(52, "/opt/grown.so", 1, 10, false);
+        let mut plan = scoped_plan(&[filler.clone(), initial], AdmissionScope::Shared);
+        assert_eq!(
+            plan.slots.len(),
+            ceiling,
+            "the first plan fills the reserve-free ceiling"
+        );
+        let mut grown = provider_with_tables(52, "/opt/grown.so", 2, 10, false);
+        let growth: Vec<(&'static str, u32, u64)> = (0..reserve)
+            .map(|entry| ("C_Sign", 52, 0x10_0000 + entry as u64 * 8))
+            .collect();
+        replace_table_targets(&mut grown, 1, &growth);
+        let rebuilt = plan.rebuild_from_sources(&[filler, grown], &[], &PinnedObjects::empty());
+        assert_eq!(
+            rebuilt.slots.len(),
+            ceiling,
+            "heuristic kept-growth stays at capacity - reserve"
+        );
+        assert_eq!(
+            slots_of(&rebuilt, 52),
+            10,
+            "the module keeps its already-admitted endpoints"
+        );
+        let omission = refusal_of(&rebuilt, "/opt/grown.so").expect("growth omission recorded");
+        assert!(
+            is_growth_omission(&omission.reason),
+            "the reserve refusal is a growth omission: {}",
+            omission.reason
+        );
+        assert_eq!(
+            growth_omitted_count(&omission.reason),
+            Some(reserve),
+            "the whole new table is omitted: {}",
+            omission.reason
+        );
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.new.len(), 0, "no fresh slot is minted");
+        assert_eq!(plan.slots.len(), ceiling, "no slot burns into the reserve");
+        assert_eq!(
+            plan.active_slot_count(),
+            ceiling,
+            "every admitted endpoint stays active"
         );
     }
 

@@ -852,7 +852,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
 fn joint_prepared_foreign_or_old_raw_proof_never_claims() {
     let mut fixture = JointScene::new(1);
     let pid = std::process::id();
-    fixture.bind(pid, image(7), &[0]);
+    let caller = fixture.bind(pid, image(7), &[0]);
     fixture.push(pid, 0, "C_SignInit", 1);
     let raw = fixture.prepare(1);
     fixture.assert_claims(&[]);
@@ -973,6 +973,32 @@ fn joint_prepared_foreign_or_old_raw_proof_never_claims() {
     assert_eq!(
         operation_edge_rows(&fixture.real.scene),
         vec![(Some(2), 0, false, 1, 0)]
+    );
+    // No feed ever entered FeedMode::Joint here, so capture-wide Joint
+    // accounting is still inactive when the retained sibling reduces.
+    // The S1-direct reduction still records its one counted gap, naming
+    // this caller and the exact retained cause.
+    let registry = fixture.real.scene.coordinator.registry();
+    let staged = registry.staged_gaps_for_test();
+    let retained_gaps = registry
+        .gaps()
+        .iter()
+        .chain(staged.iter())
+        .filter(|gap| gap.subject == "Joint key operations unavailable; retained S1")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained_gaps.len(),
+        1,
+        "the pre-Joint-feed retained call records exactly one counted gap"
+    );
+    assert_eq!(
+        retained_gaps[0].caller,
+        Some(caller),
+        "the retained-S1 gap names the caller"
+    );
+    assert_eq!(
+        retained_gaps[0].reason, "joint_unclaimable_claim_history_loss",
+        "the retained-S1 gap names the exact cause"
     );
 }
 

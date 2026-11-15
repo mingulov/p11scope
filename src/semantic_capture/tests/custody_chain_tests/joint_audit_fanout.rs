@@ -11555,7 +11555,24 @@ fn joint_claim_retains_an_absent_original_without_a_void_as_s1() {
         "a claim decision alone records no retained-S1 gap"
     );
     // M2: a rescan retries the same marked admission without refusing,
-    // re-marking or counting it again.
+    // re-marking or counting it again. Rewind the claim cursor first so
+    // the rescan reaches the retained-as-plain-S1 guard instead of
+    // returning at the already-complete cursor.
+    fixture
+        .real
+        .scene
+        .coordinator
+        .rewind_prepared_claims_for_test();
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .prepared_staging_progress(&fixture.real.lane)
+            .map(|progress| progress.0),
+        Some(0),
+        "the rescan starts at the retained admission"
+    );
     assert_eq!(
         fixture
             .real
@@ -11565,6 +11582,17 @@ fn joint_claim_retains_an_absent_original_without_a_void_as_s1() {
             .expect("a rescan of a retained admission degrades, never refuses"),
         None,
         "the marked admission is scanned again without a new claim"
+    );
+    let progress = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_staging_progress(&fixture.real.lane)
+        .expect("the prepared batch stays pending");
+    assert_eq!(
+        (progress.0, progress.2),
+        (progress.2, progress.2),
+        "the rescan walked the retained admission to the batch end"
     );
     let prepared = fixture
         .real
@@ -11841,7 +11869,24 @@ fn joint_claim_retains_a_newer_admission_against_a_stale_ingest_as_s1() {
         "a claim decision alone records no retained-S1 gap"
     );
     // M2: a rescan retries the same marked admission without refusing,
-    // re-marking or counting it again.
+    // re-marking or counting it again. Rewind the claim cursor first so
+    // the rescan reaches the retained-as-plain-S1 guard instead of
+    // returning at the already-complete cursor.
+    fixture
+        .real
+        .scene
+        .coordinator
+        .rewind_prepared_claims_for_test();
+    assert_eq!(
+        fixture
+            .real
+            .scene
+            .coordinator
+            .prepared_staging_progress(&fixture.real.lane)
+            .map(|progress| progress.0),
+        Some(0),
+        "the rescan starts at the retained admission"
+    );
     assert_eq!(
         fixture
             .real
@@ -11851,6 +11896,17 @@ fn joint_claim_retains_a_newer_admission_against_a_stale_ingest_as_s1() {
             .expect("a rescan of a retained admission degrades, never refuses"),
         None,
         "the marked admission is scanned again without a new claim"
+    );
+    let progress = fixture
+        .real
+        .scene
+        .coordinator
+        .prepared_staging_progress(&fixture.real.lane)
+        .expect("the prepared batch stays pending");
+    assert_eq!(
+        (progress.0, progress.2),
+        (progress.2, progress.2),
+        "the rescan walked the retained admission to the batch end"
     );
     let prepared = fixture
         .real
@@ -16966,6 +17022,39 @@ fn prepared_birth_with_claim_predecessor(
     crate::attach::AttachedSemanticSet,
     SessionDrainGrant,
 ) {
+    prepared_birth_with_flags(
+        providers,
+        repeated_key,
+        stop_after_first_claim,
+        refused_predecessor,
+        false,
+    )
+}
+
+fn prepared_plain_s1_birth_originals(
+    providers: usize,
+    repeated_key: bool,
+) -> (
+    JointScene,
+    IngestedRaw,
+    crate::attach::AttachedSemanticSet,
+    SessionDrainGrant,
+) {
+    prepared_birth_with_flags(providers, repeated_key, false, false, true)
+}
+
+fn prepared_birth_with_flags(
+    providers: usize,
+    repeated_key: bool,
+    stop_after_first_claim: bool,
+    refused_predecessor: bool,
+    plain_s1: bool,
+) -> (
+    JointScene,
+    IngestedRaw,
+    crate::attach::AttachedSemanticSet,
+    SessionDrainGrant,
+) {
     let (held, attached) =
         HeldProviders::with_attachment(providers, &["C_CreateObject", "C_SignInit"]);
     let mut scene = JointScene::from_held(held, Some(attached));
@@ -17016,6 +17105,13 @@ fn prepared_birth_with_claim_predecessor(
     scene.prepare_batch(batch, providers + usize::from(repeated_key));
     let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
     let (ingested, _, grant) = scene.ingest_with_grant(raw);
+    if plain_s1 {
+        scene
+            .real
+            .scene
+            .coordinator
+            .misalign_next_prepared_ordinal_for_test();
+    }
     let mut count = 0;
     while let Some((_, claim)) = scene
         .real
@@ -17035,7 +17131,14 @@ fn prepared_birth_with_claim_predecessor(
             adapter.stop(model);
         }
     }
-    assert_eq!(count, providers + usize::from(repeated_key));
+    if plain_s1 {
+        assert_eq!(
+            count, 0,
+            "the misaligned admission is retained as plain S1, never claimed"
+        );
+    } else {
+        assert_eq!(count, providers + usize::from(repeated_key));
+    }
     let attached = attachment(&mut scene);
     assert!(
         scene
@@ -17409,6 +17512,72 @@ fn finish_reserved_birth_frame(
         reads.get().0,
         expected_reads,
         "each original selected domain rechecks the same live native source once"
+    );
+}
+
+#[test]
+fn joint_birth_skips_a_plain_s1_admission_without_a_claim() {
+    use crate::discovery::caller_registry::instance_input::PlainS1Cause;
+    use crate::inventory_semantics::RetainedJointBirths;
+
+    let (mut scene, ingested, _attached, _grant) = prepared_plain_s1_birth_originals(1, false);
+    let prepared = scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap();
+    let retained = prepared
+        .admissions()
+        .next()
+        .expect("the retained admission stays prepared");
+    assert!(retained.plain_s1(), "the observed call is kept as plain S1");
+    assert_eq!(
+        retained.plain_s1_cause(),
+        Some(PlainS1Cause::Unclaimable),
+        "the misaligned original cannot be certified"
+    );
+    let caller = retained.journal_binding().3;
+    let mut births = RetainedJointBirths::new();
+    let mut native_calls = 0;
+    let disposition = scene
+        .real
+        .scene
+        .coordinator
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| {
+                native_calls += 1;
+                panic!("a plain-S1 admission binds no birth")
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (native_calls, disposition.installed, births.as_slice().len()),
+        (0, 0, 0),
+        "no birth is bound to the retained admission"
+    );
+    let gaps = scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_gaps_for_test();
+    let birth_gaps = gaps
+        .iter()
+        .filter(|gap| gap.subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        birth_gaps.len(),
+        1,
+        "the receipt still discloses its one per-key refusal"
+    );
+    assert_eq!(birth_gaps[0].caller, Some(caller));
+    assert_eq!(
+        birth_gaps[0].reason, "joint_birth_no_admission",
+        "a plain-S1 admission offers no claim, not a missing one"
     );
 }
 

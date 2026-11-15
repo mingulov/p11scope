@@ -1135,6 +1135,34 @@ impl PreparedSemanticBatch {
         self.claim_cursor = self.entries.len();
     }
 
+    /// Test-only: restart the claim scan over entries already decided, so
+    /// a rescan twin actually reaches the retained-as-plain-S1 guard.
+    #[cfg(test)]
+    pub(super) fn rewind_claims_for_test(&mut self) {
+        assert!(
+            self.entries.iter().all(|entry| entry.claim.is_none()),
+            "only claim-free entries may be rescanned"
+        );
+        self.claim_cursor = 0;
+    }
+
+    /// Test-only: move the next prepared admission's H0 ordinal so its
+    /// retained original can no longer certify it. The claim scan then
+    /// retains it as plain S1 while the admission stays in its own
+    /// quantum, the shape the birth association must skip.
+    #[cfg(test)]
+    pub(super) fn misalign_next_admission_ordinal_for_test(&mut self) {
+        let input = self
+            .entries
+            .iter_mut()
+            .find_map(|entry| match &mut entry.input {
+                Some(Ok(input)) => Some(input),
+                _ => None,
+            })
+            .expect("a prepared admission is present");
+        input.misalign_h0_ordinal_for_test();
+    }
+
     pub(super) fn stage_next(
         &mut self,
         registry: &mut CallerRegistry,
@@ -1746,6 +1774,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .and_then(|state| state.pending_semantic.as_mut())
         {
             batch.test_legacy_claims = on;
+        }
+    }
+
+    /// Test-only: rescan already-decided claims so a rescan twin reaches
+    /// the retained-as-plain-S1 guard in `claim_next`.
+    #[cfg(test)]
+    pub(crate) fn rewind_prepared_claims_for_test(&mut self) {
+        if let Some(PendingSemanticBatch::Prepared(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        {
+            batch.rewind_claims_for_test();
+        }
+    }
+
+    /// Test-only: misalign the next prepared admission's H0 ordinal so the
+    /// claim scan retains it as plain S1 within its own quantum.
+    #[cfg(test)]
+    pub(crate) fn misalign_next_prepared_ordinal_for_test(&mut self) {
+        if let Some(PendingSemanticBatch::Prepared(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        {
+            batch.misalign_next_admission_ordinal_for_test();
         }
     }
 

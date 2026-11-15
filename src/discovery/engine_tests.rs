@@ -87193,6 +87193,33 @@ fn member_stop_row_after_watchdog_loss_is_resumed() {
     let _ = child.wait();
 }
 
+/// Capture end after a lost watchdog: a stopped member whose run-tree
+/// membership cannot be read still resumes, through the start-time
+/// guarded forced resume (nothing else would bound it: no watchdog and
+/// no further stops), and files the first-use row.
+#[test]
+fn member_stop_release_after_watchdog_loss_resumes_an_unreadable_member() {
+    let mut io = ScriptedMemberStops {
+        guard_lost: true,
+        ..Default::default()
+    };
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(10));
+    assert!(io.deactivated);
+    let (mut child, pid, _stop_ns) = stopped_member_with_row(&mut io);
+    io.membership_errors.insert(pid);
+    engine.release_member_stops(&mut io);
+    assert!(
+        member_resumed_for_test(pid),
+        "an unreadable member is not left stopped"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert!(files_the_first_use_row(&engine));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// A held provider mapper that exits before its provider attaches must
 /// not clear the provider: the next mapper is then stopped and held (or
 /// files the row), instead of running unprotected with no row.

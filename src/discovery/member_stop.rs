@@ -1627,6 +1627,17 @@ impl Engine {
                 Ok(false) => {
                     let _ = io.withdraw(tgid);
                 }
+                // Unreadable membership: with the watchdog still alive its
+                // sweep bounds the stop, but after a lost watchdog nothing
+                // else would, so the start-time guarded forced resume runs.
+                Err(_) if self.member_stops.disabled => {
+                    self.force_resume(
+                        io,
+                        tgid,
+                        stop.hook_ts_ns,
+                        "capture end without the watchdog, membership unreadable",
+                    );
+                }
                 Err(_) => {}
             }
         }

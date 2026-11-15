@@ -810,9 +810,12 @@ impl Engine {
     /// that fails while the member lives keeps the row, so a later pass,
     /// the bound, the final release and the watchdog still resume it. The
     /// hook refuses a second row for a tgid, so a file the member maps in
-    /// the instant between the resume and the withdraw does not stop it;
-    /// the owned-tree watch still learns such a file, with its first-use
-    /// row. A pin without a pidfd is re-pinned and accepted only for the
+    /// the instant between the resume and the withdraw does not stop it.
+    /// The owned-tree watch still learns such a file, and its staging
+    /// files the first-use row, except when another member's stop already
+    /// staged the same file (`stop_staged`): that narrow case (a second
+    /// first mapper inside this microsecond window while the first is
+    /// held) can miss the row. A pin without a pidfd is re-pinned and accepted only for the
     /// same start time. Returns false, with the row kept, when no resume
     /// was sent.
     fn resume_member(io: &mut dyn MemberStopIo, pin: &crate::process::PidPin) -> bool {
@@ -1016,6 +1019,7 @@ impl Engine {
     /// no watchdog and no further stops, nothing else would bound it.
     fn release_after_guard_loss(&mut self, io: &mut dyn MemberStopIo, now_ns: Option<u64>) {
         let _ = io.deactivate();
+        self.note_kernel_stop_refusals(io);
         let held = std::mem::take(&mut self.member_stops.held);
         for (tgid, member) in held {
             let HoldState {
@@ -1189,10 +1193,30 @@ impl Engine {
         }
     }
 
+    /// Stops the kernel refused (table full, signal refused, identity
+    /// unread) let their members run unprotected, possibly a provider
+    /// another member's stop staged without its row: one deduped
+    /// first-use row discloses them (over-reporting is the safe
+    /// direction). An unreadable counter is doubt, and files it too.
+    fn note_kernel_stop_refusals(&mut self, io: &mut dyn MemberStopIo) {
+        let refused = io.counters().map_or(1, |counts| {
+            counts[1]
+                .saturating_add(counts[2])
+                .saturating_add(counts[3])
+        });
+        if refused > 0 {
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_FIRST_RUN_REASON,
+            );
+        }
+    }
+
     /// Capture end: no new stops, every held or pending member resumes.
     /// Pending rows the service never took resume too.
     pub(crate) fn release_member_stops(&mut self, io: &mut dyn MemberStopIo) {
         let _ = io.deactivate();
+        self.note_kernel_stop_refusals(io);
         // A resume that cannot be sent keeps its row: the hooks' own
         // release and the watchdog still resume that member.
         let held = std::mem::take(&mut self.member_stops.held);

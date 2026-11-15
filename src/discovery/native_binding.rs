@@ -519,8 +519,6 @@ impl BindingCensus {
 pub(crate) struct BinderRetentionRows {
     pub exec_ns: crate::memory_counters::CounterRow,
     pub cookies: crate::memory_counters::CounterRow,
-    pub pending: crate::memory_counters::CounterRow,
-    pub callers: crate::memory_counters::CounterRow,
 }
 
 /// Table bounds. Every bound reached is a counted `Capacity` verdict (or a
@@ -1007,17 +1005,9 @@ impl NativeBinder {
             .iter()
             .map(|domain| domain.cookies.values().map(BTreeMap::len).sum::<usize>())
             .sum();
-        let pending = self.domains.iter().map(|domain| domain.pending.len()).sum();
-        let callers = self.domains.iter().map(|domain| domain.callers.len()).sum();
         BinderRetentionRows {
             exec_ns: counter_row(exec_ns, size_of::<(u32, u64)>(), HEAP_MAP_ENTRY),
             cookies: counter_row(cookies, size_of::<(u64, ExecSeen)>(), HEAP_MAP_ENTRY),
-            pending: counter_row(pending, size_of::<Pending>(), HEAP_MAP_ENTRY),
-            callers: counter_row(
-                callers,
-                size_of::<(CallerId, (DomainCookie, u64))>(),
-                HEAP_MAP_ENTRY,
-            ),
         }
     }
 

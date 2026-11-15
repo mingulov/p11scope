@@ -77,8 +77,10 @@ privileged_run_tree_non_member_provider_is_never_staged
 # for it back into --require.
 #
 # The cells judge exact accounting (owner ruling 2026-11-15): every call
-# that started after the report's disclosed pre-attach window must be
-# observed, so any undisclosed miss fails, however small.
+# that entered after its function's first attach must be observed, so any
+# undisclosed miss fails, however small. Overcounts, invented functions
+# and a function that lost every call (probe loss) fail under their own
+# text, never the declared undisclosed-miss signature.
 #
 # never_pause_still_learns:
 # - PLAN-REPLACE-GAP (base bug, not the run-tree learning). A new worker's
@@ -276,6 +278,14 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
 run exits with the shell's status
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$never" 101 1 False failed 'rc=101'
+    # An overcount or probe loss is never the declared miss, even beside
+    # one (the cell then names neither under the undisclosed-miss text).
+    LOG_BODY="exact accounting failed (not an undisclosed miss): [\"C_GetInfo: observed 40 exceeds the 31 calls after its first attach plus 0 during it\"]; misses 1 ; window end 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$never" 101 1 False failed 'rc=101'
+    LOG_BODY="exact accounting failed (not an undisclosed miss): [\"probe loss: C_GetInfo observed none of 31 calls after its first attach\"]; misses 0 ; window end 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$parallel" 101 1 False failed 'rc=101'
     # ...and so does a timeout, even with a signature in the log.
     LOG_BODY='undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 1 of 2)'
     check "$never" 124 1 False failed 'TIMEOUT after 300s'

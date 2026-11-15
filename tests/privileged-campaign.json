@@ -252,6 +252,7 @@
     "manifest_getter_privileged_tests::privileged_default_getter_manifest_counts_static_program_exactly",
     "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly",
     "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child",
+    "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_later_dlopen_under_a_named_pid",
     "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_program_that_fetched_before_the_capture",
     "manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly",
     "manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed",

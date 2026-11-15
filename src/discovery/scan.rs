@@ -7953,7 +7953,7 @@ fn scan_view_examined_mode(
             .filter(|(name, _)| request.hooks.abi(name).is_some())
             .map(|(name, _)| name.clone())
             .collect();
-        let getter_object = hook_exports.is_empty() && budget.scans_getter_object(&file);
+        let mut getter_object = hook_exports.is_empty() && budget.scans_getter_object(&file);
         if request.hints.is_empty() && hook_exports.is_empty() && !getter_object {
             // Opened, identified, and read: examined, and not a provider.
             if let Some(held) = held {
@@ -8045,10 +8045,12 @@ fn scan_view_examined_mode(
                         .filter(|(name, _)| request.hooks.abi(name).is_some())
                         .map(|(name, _)| name.clone())
                         .collect();
-                    if request.hints.is_empty()
-                        && lower_hooks.is_empty()
-                        && !budget.scans_getter_object(&proof.file)
-                    {
+                    // The joined lower file is the object this module now
+                    // describes: the getter-object decision follows it, or
+                    // the no-table remedy below would judge the upper file.
+                    let lower_getter_object =
+                        lower_hooks.is_empty() && budget.scans_getter_object(&proof.file);
+                    if request.hints.is_empty() && lower_hooks.is_empty() && !lower_getter_object {
                         // Opened, identified, and read: examined, and not
                         // a provider.
                         offer_examined_file(
@@ -8092,6 +8094,7 @@ fn scan_view_examined_mode(
                     }
                     facts = lower_facts;
                     hook_exports = lower_hooks;
+                    getter_object = lower_getter_object;
                     named_hint = lower_hint;
                     scanned_identity = Some(proof.mapped.identity);
                     module_mapped = Some(proof.mapped);

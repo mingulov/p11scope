@@ -36,6 +36,17 @@ fn original_group_ended(state: Result<OriginalGenerationState, String>) -> bool 
     state == Ok(OriginalGenerationState::Exited)
 }
 
+/// Whether a plan slot names the probe the Session attached for its index:
+/// the same object, offset and cookie descriptor. Plan metadata a merge
+/// updates in place without reattaching (names, owning modules, semantics,
+/// alias marks) does not change which probe is linked.
+fn names_attached_target(attached: &Slot, slot: &Slot) -> bool {
+    attached.index == slot.index
+        && attached.object == slot.object
+        && attached.file_offset == slot.file_offset
+        && attached.descriptor_index == slot.descriptor_index
+}
+
 fn retiring_pairs(
     slots: &[Slot],
     links: &[RegisteredLink],
@@ -53,14 +64,17 @@ fn retiring_pairs(
     slots
         .iter()
         .map(|slot| {
-            if retained.get(&slot.index)?.slot != *slot {
+            let attached = &retained.get(&slot.index)?.slot;
+            if !names_attached_target(attached, slot) {
                 return None;
             }
             let (entry, return_) = current_pair(slot.index, links, &sides)?;
             Some((
                 slot.index,
                 RetiringPair {
-                    slot: slot.clone(),
+                    // The attached slot, so a later in-place plan update
+                    // neither breaks the final check nor what detaches.
+                    slot: attached.clone(),
                     entry,
                     return_,
                 },

@@ -31780,6 +31780,33 @@ impl Engine {
             closure.fail();
             return Ok(false);
         }
+        // An owed getter pass needs no rescan, so it must not wait for one:
+        // a quiet tick (no request, nothing new or removed) returns before
+        // the export loop below, and a named-pid capture with no request
+        // returns earlier still. Pay the debt first, every tick.
+        if !self.getter_pass_owed.is_empty() && *additions_allowed {
+            let mut export_incomplete = BTreeSet::new();
+            self.run_owed_getter_passes(
+                session,
+                additions_allowed,
+                pending_views,
+                closure,
+                &mut export_incomplete,
+            );
+            // A skipped pass (a refused maps read, a closed cycle) is
+            // requested like the tick's skipped export work.
+            self.request_skipped_export_views(&export_incomplete);
+            if !pending_views.is_empty() {
+                let _ = self.process_discovery_records(
+                    session,
+                    records,
+                    pending_views,
+                    additions_allowed,
+                    collect,
+                    closure,
+                )?;
+            }
+        }
         if matches!(self.scope, Scope::Pid(_)) {
             let mut stale: BTreeSet<_> = self
                 .views

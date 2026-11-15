@@ -29,6 +29,12 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Fixed
 
+- A `--pid` capture whose target ends no longer reports a phantom
+  `static probe coverage gap incomplete` when a probe it attached was
+  later also claimed by another discovered module (for example a
+  getter-only manifest's getter probe once the dlopened library's
+  tables are scanned): the probe itself never changed, so its exit
+  retirement is proven like any other.
 - A call set aside just before a tracking interruption no longer stops
   per-key tracking: its observed call and return stay counted as a
   plain row without key identity, one named gap reports the lost

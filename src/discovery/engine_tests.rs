@@ -33896,8 +33896,9 @@ fn an_unreturned_getter_with_a_scanned_table_names_nothing() {
 }
 
 /// A loader hit can map a manifest getter's object into a tracked
-/// process; the record-path scan owes the view a getter pass on the next
-/// tick without a rescan (twin: without a getter manifest it does not).
+/// process; the record-path scan owes the view a getter pass, paid by a
+/// tick without a rescan even when the tick has nothing else to do (twin:
+/// without a getter manifest nothing settles).
 #[test]
 fn a_loader_record_scan_owes_a_getter_pass_when_getters_are_accepted() {
     for getters in [false, true] {
@@ -33911,10 +33912,13 @@ fn a_loader_record_scan_owes_a_getter_pass_when_getters_are_accepted() {
         engine.refresh_requested.clear();
         apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
         assert_eq!(engine.loader_records_accepted, 1);
+        // The batch's own tick pays the debt the record scan owed, although
+        // a named-pid tick with no refresh request does nothing else.
+        assert!(engine.getter_pass_owed.is_empty(), "getters={getters}");
         assert_eq!(
-            engine.getter_pass_owed.contains(&view),
+            engine.getter_sites_settled.contains(&view),
             getters,
-            "getters={getters}"
+            "getters={getters}: the owed getter pass ran"
         );
         // No rescan: it would retire the loader context with its deferred
         // scans (seen live as a named loader memory discovery loss).
@@ -33922,12 +33926,136 @@ fn a_loader_record_scan_owes_a_getter_pass_when_getters_are_accepted() {
             !engine.refresh_requested.contains_key(&pid),
             "getters={getters}"
         );
+        // A debt a spent frame carried over is paid by a later quiet tick.
+        engine.getter_sites_settled.remove(&view);
+        engine.getter_pass_owed.insert(view);
+        refresh_inventory_with(&mut engine, &mut session);
+        assert!(engine.getter_pass_owed.is_empty(), "getters={getters}");
+        assert_eq!(
+            engine.getter_sites_settled.contains(&view),
+            getters,
+            "getters={getters}: the owed pass ran on the quiet tick"
+        );
+        assert!(
+            !engine.refresh_requested.contains_key(&pid),
+            "getters={getters}"
+        );
+        engine.getter_pass_owed.insert(view);
         engine.release_view_id(view);
         assert!(
             engine.getter_pass_owed.is_empty(),
             "release clears the debt"
         );
     }
+}
+
+/// A scope tick with nothing removed, refreshed or new still runs an owed
+/// getter pass; without getters accepted there is nothing to settle.
+#[test]
+fn a_quiet_scope_tick_runs_an_owed_getter_pass() {
+    for getters in [false, true] {
+        let sleeps = e06_spawn_sleeps(1);
+        let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+        let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+        engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+        refresh_inventory_once(&mut engine);
+        let view = engine.views[0].id();
+        engine.refresh_requested.clear();
+        if getters {
+            accept_a_manifest_getter(&mut engine);
+        }
+        assert!(!engine.getter_sites_settled.contains(&view));
+        engine.getter_pass_owed.insert(view);
+        refresh_inventory_once(&mut engine);
+        assert!(engine.getter_pass_owed.is_empty(), "getters={getters}");
+        assert_eq!(
+            engine.getter_sites_settled.contains(&view),
+            getters,
+            "getters={getters}"
+        );
+    }
+}
+
+/// A kept slot that shares an attach group with retired ones has no
+/// narrowed ended-pid proof: the ended original's whole proof detaches the
+/// group with no new physical gap, and the candidate deactivates the kept
+/// slot with it, so no slot stays active without a link.
+#[test]
+fn an_ended_pid_retirement_keeping_a_grouped_slot_deactivates_it() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .group_all();
+    let slots = engine.plan.slots.clone();
+    assert!(
+        slots.len() >= 2,
+        "the route needs a kept and a retired slot"
+    );
+    let kept = slots[0].index;
+    let retired = slots[1..].to_vec();
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let owner = engine.views.remove(0);
+    assert!(
+        session
+            .prepare_ended_pid_retirement(&owner, &retired)
+            .is_none(),
+        "premise: a grouped subset has no narrowed proof"
+    );
+    let proof = session
+        .prepare_ended_pid_retirement(&owner, &slots)
+        .unwrap();
+    let ended = PendingEndedPidRetirement { owner, proof };
+    let mut plan = engine.plan.clone();
+    for slot in &retired {
+        plan.deactivate(slot.index);
+    }
+    assert!(plan.is_active(kept));
+    let candidate = LiveCandidate {
+        pinned: std::mem::replace(&mut engine.pinned, PinnedObjects::empty()),
+        modules: Vec::new(),
+        plan,
+        delta: plan::AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: retired,
+        },
+        views: BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    };
+    let outcome = engine
+        .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
+        .unwrap();
+    assert!(!outcome.detach_failed);
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        0,
+        "the kept grouped slot is deactivated with the whole proof"
+    );
+    assert!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .is_empty(),
+        "the whole group detached"
+    );
+    assert_eq!(session.physical_gap_summary().episodes, 0);
 }
 
 /// A view whose manifest getter work a closed or spent pass skipped is
@@ -61092,6 +61220,44 @@ fn assert_proven_named_exit_has_no_new_physical_gap(queued_exit: bool) {
         session.physical_gap_summary().episodes,
         0,
         "retiring a proved ended original group cannot open a new live coverage interval"
+    );
+    assert_physical_gap_public_categories(&engine, &[]);
+}
+
+/// A merge can update a linked slot in place without reattaching it (a
+/// getter-only manifest's startup getter slot that a later scan of the
+/// dlopened object also claims gains that module). The attached probe is
+/// the same target, so the ended original's proof still retires it with no
+/// new physical gap.
+#[test]
+fn automatic_exec_named_pid_exit_after_an_in_place_slot_update_has_no_physical_gap() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let extra = plan::ModuleId(engine.plan.modules.len() as u32 + 7);
+    {
+        let slot = &mut engine.plan.slots[0];
+        slot.module_ids.push(extra);
+        slot.names.push("C_GetFunctionList".into());
+        slot.names.sort();
+        slot.names.dedup();
+    }
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(engine.expected_target_exit());
+    assert_eq!(engine.plan.active_slot_count(), 0);
+    assert!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .is_empty()
+    );
+    assert_eq!(
+        session.physical_gap_summary().episodes,
+        0,
+        "an in-place metadata update must not cost the ended proof"
     );
     assert_physical_gap_public_categories(&engine, &[]);
 }

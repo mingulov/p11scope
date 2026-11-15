@@ -199,8 +199,12 @@ struct App {
 
 impl App {
     fn spawn(app: &Path, rounds: u32, mode: &str) -> Result<Self> {
+        Self::spawn_with(app, &[rounds.to_string().as_str(), mode])
+    }
+
+    fn spawn_with(app: &Path, args: &[&str]) -> Result<Self> {
         let mut child = Command::new(app)
-            .args([rounds.to_string().as_str(), mode])
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -830,6 +834,112 @@ impl RunLines {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "privileged: a named-pid capture with a getter-only manifest counts a provider object the process dlopens after the capture started exactly"]
+fn privileged_getter_manifest_counts_a_later_dlopen_under_a_named_pid() -> Result<()> {
+    // A named-pid tick with no refresh request does nothing else, so the
+    // getter pass the loader hit owes must still run on that tick.
+    let tag = "pid-dlopen";
+    let observer = observer_binary()?;
+    let dir = tempfile::tempdir()?;
+    let (library, loader) = build_dlopen_fixture(dir.path())?;
+    let manifest = dir.path().join("getters.json");
+    getter_manifest(&library, &manifest, &[])?;
+    let getter_offsets = manifest_getter_offsets(&manifest)?;
+    let library_arg = library.display().to_string();
+    let mut app = App::spawn_with(&loader, &[library_arg.as_str(), "25", "both"])?;
+    let loader_line = parse_fields(&app.expect("LOADER ")?);
+    let pid: u32 = loader_line.get("pid").context("loader pid")?.parse()?;
+    let report = dir.path().join("profile.json");
+    let log = dir.path().join("observer.log");
+    let log_file = std::fs::File::create(&log)?;
+    let mut child = Command::new(&observer)
+        .arg("profile")
+        .args(["--pid", pid.to_string().as_str()])
+        .arg("--manifest")
+        .arg(&manifest)
+        .args(["--duration", "120s", "-o"])
+        .arg(&report)
+        .stdin(Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .die_with_parent()
+        .spawn()
+        .context("spawning the observer")?;
+    let result = (|| -> Result<serde_json::Value> {
+        wait_for_text(&log, "p11scope: capturing:", &mut child)?;
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
+        ensure!(
+            !maps.contains(&library_arg),
+            "the provider object is mapped before the dlopen"
+        );
+        // Let the capture settle into quiet ticks before the dlopen.
+        settle();
+        app.gate(b'L')?;
+        let ready = parse_fields(&app.expect("READY ")?);
+        let getters: Vec<u64> = ["C_GetFunctionList", "C_GetInterface", "C_GetInterfaceList"]
+            .iter()
+            .map(|name| {
+                let value = ready
+                    .get(&format!("getter_{name}"))
+                    .with_context(|| format!("ready getter {name}"))?;
+                Ok(u64::from_str_radix(value.trim_start_matches("0x"), 16)?)
+            })
+            .collect::<Result<_>>()?;
+        wait_for_breakpoints(pid, &getters, &mut child, &log)?;
+        wait_for_getter_hooks(&mut child, &library, &getter_offsets, &log)?;
+        app.gate(b'G')?;
+        let published = parse_fields(&app.expect("PUBLISHED ")?);
+        let addresses: Vec<u64> = published
+            .iter()
+            .filter(|(key, _)| key.starts_with("C_"))
+            .map(|(_, value)| u64::from_str_radix(value.trim_start_matches("0x"), 16))
+            .collect::<Result<_, _>>()?;
+        ensure!(!addresses.is_empty(), "no published table addresses");
+        wait_for_breakpoints(pid, &addresses, &mut child, &log)?;
+        app.gate(b'C')?;
+        let done = app.expect("DONE ")?;
+        println!("GETTER_CELL {tag} ledger {done}");
+        settle();
+        app.gate(b'X')?;
+        let deadline = Instant::now() + STEP * 3;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "the observer never stopped: {}",
+                tail(&log)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        println!("GETTER_CELL {tag} observer {status}");
+        ensure!(status.success(), "profile exited {status}: {}", tail(&log));
+        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report)?)?;
+        check_counts(tag, &report, &done, &log, |_| (true, false))?;
+        Ok(report)
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        println!("GETTER_CELL {tag} observer log:\n{}", tail(&log));
+    }
+    let report = result?;
+    drop(app);
+    // Named, not lost: a dlopen in a running process has no pause to prove
+    // it ran before the library's constructor (`loader_discovery`), and
+    // the interface the program selected is not proven for a table only a
+    // getter-only manifest names (`interface_selection`). The ended
+    // process retires its probes with no physical gap.
+    check_evidence(
+        tag,
+        &report,
+        &["interface_selection", "loader_discovery"],
+        &[],
+    )
 }
 
 #[test]

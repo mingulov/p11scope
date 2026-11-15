@@ -3098,11 +3098,14 @@ a silent drop.
     for file-backed function tables, the same search `--module <program>`
     runs, without narrowing the scan; a table found there is attached at
     start and counted, also for a process that fetched it before the
-    capture;
+    capture. The observer resolves `module_path` in its own mount
+    namespace: a program visible only inside a target's own mount
+    namespace (a container image path) is not scanned at start, and
+    only its getter hooks count it;
   - the getters attach in the capture's initial and refresh passes; a
     getter object a tracked process loads later (a library) is scanned
     at its loader hit and gets its getters in the next tick's getter
-    pass;
+    pass, also on a tick with nothing else to refresh;
   - under `--system` or a cgroup scope, a dynamically linked program
     that owns no other provider gets its getters at its next scan, once
     its loader is armed; calls before then fall in the named window;

@@ -82861,6 +82861,9 @@ struct ScriptedMemberStops {
     membership_errors: BTreeSet<u32>,
     /// Ordered log of withdrawals (and of a test's own signal sends).
     events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    /// The kernel's counters (requested, table full, signal refused,
+    /// identity unread).
+    counters: [u64; 4],
 }
 
 impl MemberStopIo for ScriptedMemberStops {
@@ -82885,7 +82888,7 @@ impl MemberStopIo for ScriptedMemberStops {
         Ok(())
     }
     fn counters(&mut self) -> Result<[u64; 4], String> {
-        Ok([0; 4])
+        Ok(self.counters)
     }
     fn deactivate(&mut self) -> Result<(), String> {
         self.deactivated = true;
@@ -83773,6 +83776,36 @@ fn member_stop_watchdog_loss_keeps_a_departed_holds_provider_uncleared() {
     engine.service_member_stops(&mut io, &mut session, Some(20));
     assert_eq!(engine.member_stop_stats_for_test().departed, 1);
     assert!(!io.cleared.contains(&key));
+}
+
+/// Stops the kernel refused (table full, signal refused, identity
+/// unread) let a member run unprotected: each release files the named
+/// first-use row; stops the kernel made are no gap.
+#[test]
+fn member_stop_kernel_refusals_file_the_first_use_row_at_release() {
+    let mut io = ScriptedMemberStops {
+        counters: [3, 1, 0, 0],
+        ..Default::default()
+    };
+    let mut engine = member_stop_engine();
+    engine.release_member_stops(&mut io);
+    assert!(files_the_first_use_row(&engine), "a full table is a gap");
+    let mut quiet = ScriptedMemberStops {
+        counters: [3, 0, 0, 0],
+        ..Default::default()
+    };
+    let mut engine = member_stop_engine();
+    engine.release_member_stops(&mut quiet);
+    assert!(!files_the_first_use_row(&engine), "made stops are no gap");
+    let mut lost = ScriptedMemberStops {
+        counters: [0, 0, 0, 2],
+        guard_lost: true,
+        ..Default::default()
+    };
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut lost, &mut session, Some(10));
+    assert!(files_the_first_use_row(&engine), "the loss release too");
 }
 
 /// Twin: without a service pass the stopped member stays stopped (the

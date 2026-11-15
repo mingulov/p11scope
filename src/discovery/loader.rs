@@ -20,7 +20,8 @@ pub(crate) const MAX_LOADER_CONTEXTS: usize = 256;
 /// owned runs, non-child member arms refuse at
 /// `MAX_LOADER_CONTEXTS - OWNED_CHILD_CONTEXT_RESERVE` so the child's
 /// own re-arms after exec never lose the last contexts to descendant
-/// churn. The refusal names the capacity reason, like exhaustion.
+/// churn. The refusal names the reserve
+/// ([`LOADER_CHILD_RESERVE_REASON`]), not the exhaustion.
 pub(crate) const OWNED_CHILD_CONTEXT_RESERVE: usize = 8;
 /// Finite reason when no loader context is available: the registry is
 /// full.

@@ -234,7 +234,7 @@ fn fuse_devices(mountinfo: &[u8]) -> BTreeSet<u64> {
 
 /// Whether `tgid` is proven gone: its `/proc` directory does not exist.
 /// Any other doubt keeps a stopped member's row.
-fn process_gone(tgid: u32) -> bool {
+pub(crate) fn process_gone(tgid: u32) -> bool {
     matches!(
         std::fs::symlink_metadata(format!("/proc/{tgid}")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -1304,6 +1304,12 @@ impl Engine {
         }
         for (tgid, stop) in io.pending().unwrap_or_default() {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {
+                // Gone: nothing is stopped, and a row left behind would
+                // make the hooks' release hand a normal end to the
+                // watchdog's sweep.
+                if process_gone(tgid) {
+                    let _ = io.withdraw(tgid);
+                }
                 continue;
             };
             match io.is_run_member(&pin) {

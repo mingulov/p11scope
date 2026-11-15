@@ -3058,6 +3058,23 @@ pub(crate) struct AttachOutcome {
     exhausted_enfile: bool,
 }
 
+/// The begin of one slot's attach in this call, for its first-attach
+/// window: the first native attach call of the slot's own attach round
+/// (its return side, before the entry that makes a call countable), the
+/// earliest when it has several, else the call's entry instant.
+fn slot_attach_began(
+    rounds: &[pid_continuity::AttachRound],
+    slot: u32,
+    batch_began: Option<u64>,
+) -> Option<u64> {
+    rounds
+        .iter()
+        .filter(|round| round.slots.contains(&slot))
+        .filter_map(|round| round.started_ns)
+        .min()
+        .or(batch_began)
+}
+
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 
@@ -9119,6 +9136,9 @@ impl Session {
         objects: &PinnedObjects,
         ended: &BTreeSet<crate::plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
+        // The call's entry instant: the fallback first-attach begin for a
+        // slot whose own attach round has no usable clock
+        // (`slot_attach_began`).
         let attach_began_ns = monotonic_ns();
         // No probe attaches after its watch's `until_ns` (packet 6.13,
         // R2-D1-7): ended-watch targets skip (with a stderr note each) so
@@ -9465,9 +9485,10 @@ impl Session {
             if let Some(stamp) = stamp {
                 self.slot_attached_at.entry(*slot).or_insert(*stamp);
                 if let Some(target) = targets.iter().find(|target| target.index == *slot) {
+                    let began = slot_attach_began(&continuity_rounds, *slot, attach_began_ns);
                     self.key_first_attach
                         .entry(crate::plan::AttachKey::of(target))
-                        .or_insert((attach_began_ns, *stamp));
+                        .or_insert((began, *stamp));
                 }
             }
         }
@@ -20701,6 +20722,30 @@ mod tests {
         );
         assert_eq!(outcome.failures.len(), 1);
         assert!(outcome.completed.is_empty());
+    }
+
+    #[test]
+    fn first_attach_begins_at_each_slots_own_attach_round() {
+        let round = |slots: Vec<u32>, started_ns| pid_continuity::AttachRound {
+            slots,
+            started_ns,
+            last_call_ns: None,
+        };
+        let rounds = [
+            round(vec![0], Some(40)),
+            round(vec![1, 2], Some(60)),
+            round(vec![3], None),
+            round(vec![2], Some(50)),
+        ];
+        // A later slot of one batch begins at its own round, not the batch.
+        assert_eq!(slot_attach_began(&rounds, 0, Some(10)), Some(40));
+        assert_eq!(slot_attach_began(&rounds, 1, Some(10)), Some(60));
+        // Two rounds for one slot: the earlier start bounds it.
+        assert_eq!(slot_attach_began(&rounds, 2, Some(10)), Some(50));
+        // No usable round clock: the batch begin still bounds it.
+        assert_eq!(slot_attach_began(&rounds, 3, Some(10)), Some(10));
+        assert_eq!(slot_attach_began(&rounds, 4, Some(10)), Some(10));
+        assert_eq!(slot_attach_began(&rounds, 4, None), None);
     }
 
     #[test]

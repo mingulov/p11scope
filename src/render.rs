@@ -1120,9 +1120,10 @@ pub enum ModuleLayer {
 }
 
 /// One endpoint's first attach (`evidence.discovery[].first_attach_points`):
-/// the attach call's begin instant (`null` when the clock could not be
-/// read) and its completion stamp, `CLOCK_MONOTONIC`, kept across
-/// replaced probes.
+/// the instant just before the endpoint's own first native attach call
+/// (its return side; the attach batch's start when that round has no
+/// usable clock; `null` when no clock could be read) and its completion
+/// stamp, `CLOCK_MONOTONIC`, kept across replaced probes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FirstAttachPoint {
     pub file_offset: u64,

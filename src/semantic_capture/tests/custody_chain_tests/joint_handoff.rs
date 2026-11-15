@@ -484,6 +484,33 @@ impl JointScene {
         self.drain.source_mut().push_record(end.to_vec());
     }
 
+    /// One original pair for a modeled object function whose END needs
+    /// its real object tail (absent tails ride only non-object
+    /// functions). Only the two fixture functions used by the
+    /// unclaimable-disposal negatives are shaped here.
+    fn push_object(&mut self, pid: u32, file: u32, name: &str, sequence: u64) {
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_DESTROY, OBJECT_ACTION_GENERATE};
+        let (mut begin, _) = self.encoded(pid, file, name, sequence);
+        let end = match name {
+            "C_DestroyObject" => {
+                begin[88..96].copy_from_slice(&0x5151u64.to_le_bytes());
+                begin[126] = 1;
+                end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 10)
+            }
+            "C_GenerateKey" => {
+                let mut end = end_bytes(&begin, OBJECT_ACTION_GENERATE, 0, ENTRY_NS + 10);
+                // A successful generation mints its key: the result
+                // word and status the CREATE-only forge leaves zero.
+                end[424..432].copy_from_slice(&0x9090_9090_9090_9090u64.to_le_bytes());
+                end[506] = 1;
+                end
+            }
+            other => panic!("unsupported object fixture {other}"),
+        };
+        self.drain.source_mut().push_record(begin.to_vec());
+        self.drain.source_mut().push_record(end.to_vec());
+    }
+
     /// One original physical pair; future-END tests retain these bytes only
     /// on the fixture stack until the same cursor actually receives END.
     ///

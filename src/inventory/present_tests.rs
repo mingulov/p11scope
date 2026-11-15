@@ -4784,9 +4784,9 @@ fn gap_plain_reason_names_replaced_pinning_failure_for_deleted_subject() {
 /// tokens. The journal gap reads on the key-operations line instead
 /// of here, so concise states "per-key tracking is off" once;
 /// verbose keeps its plain words with the machine tokens beside
-/// them. The void gaps share the Joint-unavailable stored subject
-/// with the seal gaps but read scope-wide (no "did not start for
-/// this process" claim); the deferral reads paused, never unstarted.
+/// them. Capture-wide void gaps read "for tracked processes" (no
+/// caller), while per-call retained-S1 claim gaps read "for this
+/// process"; the deferral reads paused, never unstarted.
 #[test]
 fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     let harness = varied_harness();
@@ -4885,9 +4885,31 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
         "Per-key tracking did not start for this process; function counts above are unaffected",
         "per-key tracking is off; function and mechanism counts are unaffected",
         "Per-key tracking lost history for this process; function counts above are unaffected",
+        "Per-key tracking lost history for tracked processes; function counts above are unaffected",
         "Per-key tracking paused for this process; function counts above are unaffected",
     ] {
         assert!(verbose.contains(full), "{full} missing: {verbose}");
+    }
+    // A capture-wide void names tracked processes, never this one; a
+    // per-call retained-S1 claim names the one process it degraded.
+    for (token, expected) in [
+        (
+            "(joint_void_fault_changed_history_loss)",
+            "Per-key tracking lost history for tracked processes",
+        ),
+        (
+            "(joint_unclaimable_claim_history_loss)",
+            "Per-key tracking lost history for this process",
+        ),
+    ] {
+        let line = verbose
+            .lines()
+            .find(|line| line.contains(token))
+            .unwrap_or_else(|| panic!("{token} missing: {verbose}"));
+        assert!(
+            line.contains(expected),
+            "{token} must read {expected:?}: {line:?}"
+        );
     }
     // Verbose keeps each new machine token beside its plain words.
     for token in [

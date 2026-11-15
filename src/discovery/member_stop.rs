@@ -995,7 +995,9 @@ impl Engine {
     /// with signal authority can be opened now, the checks read the
     /// pinned process and the signal goes through its pidfd, so the
     /// number cannot be reused between the check and the signal; only
-    /// without one is the number signalled.
+    /// without one is the number signalled. (`PidPin::open` reads the
+    /// start time just before it opens the pidfd: a reuse inside those
+    /// microseconds would need a full pid wrap, and is not told apart.)
     fn force_resume(&mut self, io: &mut dyn MemberStopIo, tgid: u32, stop_ns: u64, why: &str) {
         if process_gone(tgid) {
             let _ = io.withdraw(tgid);

@@ -11867,10 +11867,7 @@ pub(crate) mod tests {
         // Omission + lowering: one file partially covered.
         let out = summary(vec![omission(), lowering()]);
         assert!(out.contains("1 provider file partially covered"), "{out}");
-        assert!(
-            !out.contains("2 provider files partially covered"),
-            "{out}"
-        );
+        assert!(!out.contains("2 provider files partially covered"), "{out}");
         // Refusal + lowering: the file counts once, as not watched.
         // (The gaps listing below still names the lowering row
         // "partially covered"; only the count fragment dedupes.)
@@ -11896,10 +11893,7 @@ pub(crate) mod tests {
         let value = versioned_evidence(&ev);
         assert_eq!(value["modules_skipped"][0]["name"], "/opt/p.so");
         assert_eq!(value["modules_skipped"][1]["name"], "/opt/p.so");
-        assert_eq!(
-            value["modules_skipped"][1]["reason"],
-            LOWERING_RECORD
-        );
+        assert_eq!(value["modules_skipped"][1]["reason"], LOWERING_RECORD);
     }
 
     /// The terminal summary names a refused module with its reason in plain

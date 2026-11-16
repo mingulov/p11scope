@@ -957,9 +957,12 @@ run_prearm() {
   # Owned-run pre-arm exactness (packet 6.13, R2-D1-6): the pause-held
   # twin publishes unobserved_windows [] with exact ledger/trace counts;
   # the passive twin (--pause never) keeps its single pre_attach window.
-  # On kernels before 6.8 the overlayfs scan/pre-arm split joins live
-  # across an id change the exactness proof cannot span (W8B-66), so both
-  # twins disclose exactly [late_discovery, mapped_unattached] instead.
+  # On kernels before 6.8 the overlayfs scan/pre-arm split either
+  # absorbs into the kept pre-arm object at absorb time (the same two
+  # shapes as above) or joins live across an id change the exactness
+  # proof cannot span (W8B-66: both twins disclose exactly
+  # [late_discovery, mapped_unattached] instead). The oracle accepts
+  # exactly these two disclosures per twin; anything else fails.
   local name policy ledger output rc pp detail
   for name in held passive; do
     policy=auto; [ "$name" = passive ] && policy=never
@@ -1008,6 +1011,32 @@ def assert_handoff_pair(module):
     assert unattached["start_ns"] == late["start_ns"], windows
     assert unattached["start_ns"] <= unattached["end_ns"], windows
 
+def assert_pre68_held(module):
+    # Pre-6.8 held twin: the overlay split either absorbs into the
+    # kept pre-arm object at absorb time (the >= 6.8 exact shape, [])
+    # or joins live across the id change (the exact handoff pair).
+    # The reasons dispatch; nothing else passes. Returns the observed
+    # shape label for the detail line.
+    reasons = [w["reason"] for w in (module.get("unobserved_windows") or [])]
+    if reasons == ["late_discovery", "mapped_unattached"]:
+        assert_handoff_pair(module)
+        return "handoff pair"
+    assert module["unobserved_windows"] == [], module["unobserved_windows"]
+    return "merged []"
+
+def assert_pre68_passive(module):
+    # Pre-6.8 passive twin: same dispatch as the held twin, with the
+    # merged arm the exact single pre_attach window of the >= 6.8
+    # branch. Returns the observed shape label for the detail line.
+    reasons = [w["reason"] for w in (module.get("unobserved_windows") or [])]
+    if reasons == ["late_discovery", "mapped_unattached"]:
+        assert_handoff_pair(module)
+        return "handoff pair"
+    windows = module["unobserved_windows"]
+    assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows
+    assert windows[0]["end_ns"] == module["attached_at_ns"], windows
+    return "merged pre_attach"
+
 def load(name):
     # EVIDENCE rides the -o report file (default stdout omits the blob;
     # diagnostics go to stderr).
@@ -1036,7 +1065,7 @@ pre_68 = kernel_is_pre_68()
 held_evidence, held_ledger, held_text = load("held")
 held = prearmed_module(held_evidence)
 if pre_68:
-    assert_handoff_pair(held)
+    held_shape = assert_pre68_held(held)
 else:
     assert held["unobserved_windows"] == [], held["unobserved_windows"]
 assert "scan" in held["sources"], held["sources"]
@@ -1048,13 +1077,13 @@ assert counts == (3, 3, 1), counts
 passive = prearmed_module(load("passive")[0])
 assert "scan" in passive["sources"], passive["sources"]
 if pre_68:
-    assert_handoff_pair(passive)
+    passive_shape = assert_pre68_passive(passive)
 else:
     windows = passive["unobserved_windows"]
     assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows
     assert windows[0]["end_ns"] == passive["attached_at_ns"], windows
 if pre_68:
-    print("held/passive disclose the exact handoff pair with 3/3 ledger and 3/3/1 trace")
+    print(f"pre-6.8 exact: held {held_shape}, passive {passive_shape}, 3/3 ledger and 3/3/1 trace")
 else:
     print("held [] with 3/3 ledger and 3/3/1 trace; passive keeps single pre_attach")
 PY

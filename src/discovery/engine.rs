@@ -19492,6 +19492,22 @@ impl Engine {
                 DiagnosticOutcome::Rejected
             });
         }
+        if crate::run::capture_diagnostics_on()
+            && candidate
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID)
+        {
+            eprintln!(
+                "p11scope: apply outcome for run-learned tables: accepted={} disposition={:?} \
+                 static_failures={} detach_failed={} changed={}",
+                outcome.accepted(),
+                outcome.disposition,
+                outcome.static_failures.len(),
+                outcome.detach_failed,
+                outcome.changed,
+            );
+        }
         Ok(outcome)
     }
 

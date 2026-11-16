@@ -658,10 +658,16 @@ impl SealEffectBound {
             lifetime_ends: prospective_objects,
             downgrades: prospective_objects,
             session_ends: prospective_sessions,
-            // A view allocates with no established field, so one created
-            // during the seal is invalidated only after an `establish`,
-            // which the per-input term already counts.
-            invalidations: objects.checked_add(calls.checked_mul(MAX_INPUT_HANDLES)?)?,
+            // Each invalidation needs an arming: a pre-seal object
+            // arrives armed (one per object), `establish` re-arms at
+            // most one view per input handle, and R2 promotion arms
+            // each view a creation mints, at most one per result
+            // handle — a view created during the seal invalidates
+            // without any `establish` once a later write in the same
+            // seal reaches it.
+            invalidations: objects
+                .checked_add(calls.checked_mul(MAX_INPUT_HANDLES)?)?
+                .checked_add(calls.checked_mul(MAX_RESULT_HANDLES)?)?,
             direct: calls.checked_mul(per_call)?.checked_add(SEAL_LEVEL_GAPS)?,
             loss: objects
                 .checked_add(sessions)?

@@ -1737,6 +1737,22 @@ impl AttachPlan {
         self.slot_unnamed_reasons.clear();
     }
 
+    /// Drops unnamed-reason entries no surviving slot can read. An
+    /// entry stays only while some slot under its key still names
+    /// `unknown` — retired rows keep rendering, so they count too.
+    /// Shared by extend surgery and the unlinked-cell give-backs so
+    /// the map cannot outlive its rows.
+    fn retain_readable_unnamed_reasons(&mut self) {
+        let unknown_keys: BTreeSet<AttachKey> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.names.as_slice() == [UNKNOWN_FUNCTION_NAME])
+            .map(AttachKey::of)
+            .collect();
+        self.slot_unnamed_reasons
+            .retain(|key, _| unknown_keys.contains(key));
+    }
+
     /// Borrow presentation metadata before reserving its eventual owned copy.
     pub(crate) fn borrowed_ordinals_of(
         &self,
@@ -2281,7 +2297,13 @@ impl AttachPlan {
             let mut names: Vec<_> = claims.names.into_iter().map(str::to_string).collect();
             drop_transparent_unknown(&mut names);
             if names.as_slice() == [UNKNOWN_FUNCTION_NAME] && !claims.unproven.is_empty() {
-                self.slot_unnamed_reasons.insert(key, claims.unproven);
+                // A retired same-key row keeps rendering, so its
+                // reasons union with the fresh claim (like extend
+                // surgery) instead of being replaced by it.
+                self.slot_unnamed_reasons
+                    .entry(key)
+                    .or_default()
+                    .extend(claims.unproven);
             }
             let slot = Slot {
                 index: self.slots.len() as u32,
@@ -2814,20 +2836,13 @@ impl AttachPlan {
         // Unnamed reasons follow the final names, not the maps: a slot the
         // surgery left unknown unions the superseded and rebuilt reasons
         // (both proved the key unproven), while a slot the surgery named
-        // drops its reasons with `unknown`. Retired rows keep rendering,
-        // so the retain covers retired positions too, not just live keys.
+        // drops its reasons with `unknown`.
         let mut merged_reasons = std::mem::take(&mut self.slot_unnamed_reasons);
         for (key, reasons) in rebuilt.slot_unnamed_reasons {
             merged_reasons.entry(key).or_default().extend(reasons);
         }
-        let unknown_keys: BTreeSet<AttachKey> = self
-            .slots
-            .iter()
-            .filter(|slot| slot.names.as_slice() == [UNKNOWN_FUNCTION_NAME])
-            .map(AttachKey::of)
-            .collect();
-        merged_reasons.retain(|key, _| unknown_keys.contains(key));
         self.slot_unnamed_reasons = merged_reasons;
+        self.retain_readable_unnamed_reasons();
         self.object_identities.extend(rebuilt.object_identities);
         self.modules = rebuilt.modules;
         // The spill count is current-state evidence like `entries_seen`,
@@ -3042,6 +3057,8 @@ impl AttachPlan {
         let slot_by_key = &self.slot_by_key;
         self.provisional_get_function_list
             .retain(|key, _| slot_by_key.contains_key(key));
+        // Given-back cells take their reason entries with them.
+        self.retain_readable_unnamed_reasons();
         self.module_ambiguous = self
             .aggregate_owners
             .iter()
@@ -3158,6 +3175,8 @@ impl AttachPlan {
         let slot_by_key = &self.slot_by_key;
         self.provisional_get_function_list
             .retain(|key, _| slot_by_key.contains_key(key));
+        // Excised cells take their reason entries with them.
+        self.retain_readable_unnamed_reasons();
         self.module_ambiguous = self
             .aggregate_owners
             .iter()

@@ -913,6 +913,24 @@ fn stage_projection(
             )?;
         }
         charge(tree_bytes::<u64, u64>(row.rv_counts.len()).ok_or_else(budget)?)?;
+        // The staged owned copy of this row's unnamed reasons: the
+        // list plus one `String` per token, like `names` above.
+        let reasons = plan.unnamed_reasons_of(slot);
+        charge(
+            reasons
+                .len()
+                .checked_mul(size_of::<String>())
+                .and_then(|bytes| bytes.checked_add(OWNED_ALLOCATION_PADDING))
+                .ok_or_else(budget)?,
+        )?;
+        for reason in &reasons {
+            charge(
+                reason
+                    .len()
+                    .checked_add(OWNED_ALLOCATION_PADDING)
+                    .ok_or_else(budget)?,
+            )?;
+        }
     }
     let storage = reserve.reserve(bytes).map_err(|_| budget())?;
     // Fold exec-generation duplicates like the legacy reader: two slots

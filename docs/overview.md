@@ -61,7 +61,7 @@ available and never calls `C_Initialize`; live observation remains passive.
 
 After installing, check host readiness, then start with a whole-machine
 inventory and inspect a process you found there. Below is real output
-from the v0.8.0 release binary on Ubuntu 26.04 (kernel 7.0.0-43,
+from the v0.7.1 release binary on Ubuntu 26.04 (kernel 7.0.0-43,
 `perf_event_paranoid=4`, lockdown `integrity`); the `--system` window
 is shortened to 15 s here and the `--pid` target is a long-lived
 SoftHSM caller:

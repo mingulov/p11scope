@@ -5148,3 +5148,134 @@ fn newsite_created_poly1305_key_promotes_value_len_without_label() {
     );
     assert_eq!(v.label, None, "a size alone never labels");
 }
+
+// Keymeta §6 pending-ruling pin (owner/design ruling outstanding):
+// 0x40 (CKK_EC_EDWARDS) and 0x41 (CKK_EC_MONTGOMERY) with an
+// established matching curve stay unlabeled — the closed label
+// vocabulary defines no Edwards/Montgomery join, so `label()`
+// falls through to `_ => None` (R2 port-exact). The established
+// facts themselves (key type, curve) still publish. A mismatched
+// family (0x40 + X25519) stays unlabeled too. Flip this twin if
+// the ruling adds 0x40/0x41 label arms.
+#[test]
+fn newsite_created_edwards_montgomery_with_curve_stay_unlabeled() {
+    const ED25519: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x70];
+    const X25519: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x6e];
+    for (key_type, params, curve, case) in [
+        (0x40, &ED25519, SafeCurve::Ed25519, "edwards + ed25519"),
+        (0x41, &X25519, SafeCurve::X25519, "montgomery + x25519"),
+        (
+            0x40,
+            &X25519,
+            SafeCurve::X25519,
+            "edwards + x25519 (mismatch)",
+        ),
+    ] {
+        let mut h = Hist::qualified();
+        h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+        let template = attrs(&[
+            scalar(CKA_CLASS, 3),
+            scalar(CKA_KEY_TYPE, u64::from(key_type)),
+            AttrObservation::curve(CKA_EC_PARAMS, params, LinuxLayout::Lp64),
+        ]);
+        let x = h.run(
+            3,
+            create(SA).request(0, template),
+            4,
+            ok().result(0, H1),
+        );
+        let e = h.settle(4);
+        let id = created(&e, x, 0).unwrap();
+        let p = h.project();
+        let v = view(&p, id);
+        assert_eq!(
+            v.established.field(SafeAttributeKind::KeyType),
+            scalar_field(key_type),
+            "{case}: creation result establishes the requested key type"
+        );
+        assert_eq!(
+            v.established.field(SafeAttributeKind::EcParams),
+            FieldState::Value(FieldValue::Curve(curve)),
+            "{case}: creation result establishes the requested curve"
+        );
+        assert_eq!(
+            v.label, None,
+            "{case}: no Edwards/Montgomery label (pending ruling)"
+        );
+    }
+}
+
+// Keymeta §6 pending-ruling pin (owner/design ruling outstanding):
+// a nine-slot creation template promotes from the retained first
+// eight cells only — the wire TRUNCATED flag (a template beyond
+// eight slots) is dropped before promotion (`AttributeList::new`
+// keeps the first eight; the journal `attribute_list` never reads
+// the flag and `AttributeList::truncated` has no consumer), so a
+// conflicting finite tail is unobserved, never a conflict. Here
+// the ninth slot carries CKA_VALUE_LEN 48 against an in-window
+// 32: the first-eight facts establish, the view labels AES-128,
+// and no conflict is claimed. Flip this twin if the ruling
+// refuses promotion (or records a reason) on truncation.
+#[test]
+fn newsite_created_nine_slot_template_promotes_first_eight_only() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 32),
+        scalar(CKA_TOKEN, 1),
+        scalar(CKA_MODULUS_BITS, 2048),
+        AttrObservation::curve(CKA_EC_PARAMS, &SECP256R1, LinuxLayout::Lp64),
+        scalar(CKA_PARAMETER_SET, 1),
+        scalar(CKA_ID, 7),
+        scalar(CKA_VALUE_LEN, 48),
+    ]);
+    let x = h.run(
+        3,
+        create(SA).request(0, template),
+        4,
+        ok().result(0, H1),
+    );
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::Class),
+        scalar_field(4),
+        "creation result establishes the first-eight class"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        scalar_field(0x1f),
+        "creation result establishes the first-eight key type"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        scalar_field(32),
+        "the unobserved tail size never conflicts the first-eight size"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ModulusBits),
+        scalar_field(2048),
+        "creation result establishes the first-eight modulus bits"
+    );
+    assert!(
+        matches!(
+            v.established.field(SafeAttributeKind::EcParams),
+            FieldState::Value(FieldValue::Curve(SafeCurve::Secp256r1))
+        ),
+        "creation result establishes the first-eight curve"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ParameterSet),
+        scalar_field(1),
+        "creation result establishes the first-eight parameter set"
+    );
+    assert_eq!(
+        v.label,
+        Some(KeyLabel::Aes { value_len: 32 }),
+        "the first-eight triple labels without a query"
+    );
+}

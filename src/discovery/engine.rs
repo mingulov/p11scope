@@ -22896,13 +22896,18 @@ impl Engine {
     /// and same-file proofs from later provers union into it. The
     /// proof's pins join the committed set first (absorb merges by
     /// identity, so the later file staging and live applies resolve
-    /// the same objects); proofs that add no new object identity
-    /// union tables only, without re-absorbing. Bounded by the
-    /// learned-file cap: past it the tables refuse loudly through
-    /// the same finite cap row as the files. A harvest that grows
-    /// the store owes the expedited frame and the learned apply, so
-    /// members the first-map stop holds resume with table probes
-    /// attached instead of at their bound.
+    /// the same objects), then the module's own file raw and entry
+    /// raws alias under the reserved owner: the learned entry keeps
+    /// its own bindable pins across proving-view retire and reuse,
+    /// instead of borrowing the transient view's rows. Proofs whose
+    /// raws already alias there union tables only, without
+    /// re-absorbing. Bounded by the learned-file cap as a second
+    /// 32-entry budget beside the file store: past it the tables
+    /// refuse loudly through their own finite cap row, counted in
+    /// the same `learned_cap_skipped` as the files. A harvest that
+    /// changes the store owes the expedited frame and the learned
+    /// apply, so members the first-map stop holds resume with table
+    /// probes attached instead of at their bound.
     fn harvest_run_learned_tables(&mut self, pins: &PinnedObjects, proof: &OwnedLearnProof) {
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
             return;
@@ -22938,100 +22943,54 @@ impl Engine {
         if will_push
             && self.run_learned_modules.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
         {
+            self.learned_cap_skipped = self.learned_cap_skipped.saturating_add(1);
             self.mark_partial(
                 crate::render::LEARNED_SKIP_SUBJECT,
-                crate::render::LEARNED_CAP_REASON,
+                crate::render::LEARNED_TABLE_CAP_REASON,
             );
             if crate::run::capture_diagnostics_on() {
                 eprintln!(
-                    "p11scope: run-learned tables for {} refused: past the learned cap",
+                    "p11scope: run-learned tables for {} refused: past the learned table cap",
                     proof.path
                 );
             }
             return;
         }
-        // Absorb the proving scan's pins when they carry object
-        // identity the store has not seen: the candidate bind below
-        // resolves module and entry objects through the committed
-        // set. Re-absorbing every proof would stack duplicate bind
-        // claims; absorbing once per new identity keeps the join
-        // bounded while a later fuller proof still contributes its
-        // dependencies.
-        let mut wanted: BTreeSet<ObjectKey> = BTreeSet::from([module.key]);
-        wanted.extend(
-            module
-                .tables
-                .iter()
-                .flat_map(|table| &table.entries)
-                .map(|entry| entry.object),
-        );
-        let mut known: BTreeSet<ObjectKey> = BTreeSet::new();
-        for stored in &self.run_learned_modules {
-            if stored.mount_namespace == module.mount_namespace && stored.key == module.key {
-                known.insert(stored.key);
-                known.extend(
-                    stored
-                        .tables
-                        .iter()
-                        .flat_map(|table| &table.entries)
-                        .map(|entry| entry.object),
-                );
-            }
-        }
-        if !wanted.is_subset(&known) {
+        // Absorb the proving scan's pins while the module has a pin
+        // gap under the reserved owner, then alias its raws there:
+        // the candidate bind below resolves module and entry objects
+        // through the committed set, and the reserved aliases keep
+        // them bindable after the proving view retires or its id is
+        // reused. A second 32-entry budget bounds the aliases; the
+        // absorb merges by identity and the alias call is
+        // idempotent, so a later fuller proof still contributes its
+        // dependencies without stacking claims.
+        if !self
+            .pinned
+            .module_aliased_under(&module, Self::RUN_LEARNED_VIEW_ID)
+        {
             let absorbed = self.pinned.absorb(pins.clone());
             attribution::note_all(&absorbed);
-            self.counters.object_skips.extend(absorbed);
+            for skip in absorbed {
+                if !self.counters.object_skips.contains(&skip) {
+                    self.counters.object_skips.push(skip);
+                }
+            }
+            self.pinned
+                .alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
         }
-        let before = (
-            self.run_learned_modules.len(),
-            self.run_learned_modules
-                .iter()
-                .map(|stored| {
-                    (
-                        stored.tables.len(),
-                        stored.interfaces.len(),
-                        stored.exports.len(),
-                    )
-                })
-                .fold((0usize, 0usize, 0usize), |total, one| {
-                    (
-                        total.0.saturating_add(one.0),
-                        total.1.saturating_add(one.1),
-                        total.2.saturating_add(one.2),
-                    )
-                }),
-        );
+        let before = self.run_learned_modules.clone();
         merge_scanned_module(&mut self.run_learned_modules, module);
-        let after = (
-            self.run_learned_modules.len(),
-            self.run_learned_modules
-                .iter()
-                .map(|stored| {
-                    (
-                        stored.tables.len(),
-                        stored.interfaces.len(),
-                        stored.exports.len(),
-                    )
-                })
-                .fold((0usize, 0usize, 0usize), |total, one| {
-                    (
-                        total.0.saturating_add(one.0),
-                        total.1.saturating_add(one.1),
-                        total.2.saturating_add(one.2),
-                    )
-                }),
-        );
         if crate::run::capture_diagnostics_on() {
             eprintln!(
                 "p11scope: run-learned tables for {}: {} tables {} interfaces (store {} modules)",
                 proof.path,
                 proof.module.tables.len(),
                 proof.module.interfaces.len(),
-                after.0,
+                self.run_learned_modules.len(),
             );
         }
-        if after == before {
+        if self.run_learned_modules == before {
             return;
         }
         self.plan_rebuild_stable = false;
@@ -31608,12 +31567,12 @@ impl Engine {
 
     /// Reserved owner for run-persistent learned tables (E1): never
     /// allocated either, and distinct from the probationary
-    /// sentinel. Learned tables file their bind claims under it, so
-    /// no view retirement ever drops them; every live candidate
-    /// rebinds them as scan inputs. No `ProcessView` ever carries
-    /// this ID, and no engine path may open, retain, refresh or
-    /// retire it.
-    const RUN_LEARNED_VIEW_ID: ProcessViewId = ProcessViewId(u32::MAX - 1);
+    /// sentinel. Learned tables file their bind claims and their
+    /// pin aliases under it, so no view retirement ever drops them;
+    /// every live candidate rebinds them as scan inputs. No
+    /// `ProcessView` ever carries this ID, and no engine path may
+    /// open, retain, refresh or retire it.
+    pub(crate) const RUN_LEARNED_VIEW_ID: ProcessViewId = ProcessViewId(u32::MAX - 1);
 
     /// Probationary provider probe for a pending newcomer with no view slot
     /// and no evictable view anywhere (Lane-A P3, the last resort). Opens

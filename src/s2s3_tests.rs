@@ -5539,7 +5539,8 @@ fn newsite_created_template_seen_and_pair_half_recorded() {
     let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
     let e = h.settle(4);
     let id = created(&e, x, 0).unwrap();
-    let v = view(&h.project(), id);
+    let p = h.project();
+    let v = view(&p, id);
     assert!(
         v.creation_template_seen,
         "a captured template records as seen"
@@ -5551,7 +5552,8 @@ fn newsite_created_template_seen_and_pair_half_recorded() {
     let x = h.run(3, create(SA), 4, ok().result(0, H1));
     let e = h.settle(4);
     let id = created(&e, x, 0).unwrap();
-    let v = view(&h.project(), id);
+    let p = h.project();
+    let v = view(&p, id);
     assert!(!v.creation_template_seen, "no requested list, nothing seen");
     assert!(!v.keypair_private, "a single creation is no pair half");
     // A keypair: slot 0 public, slot 1 private, each with its own

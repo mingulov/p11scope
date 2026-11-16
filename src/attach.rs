@@ -3039,6 +3039,25 @@ fn entry_program(
     }
 }
 
+/// Journal-aware entry-program resolution for the in-place downgrade
+/// (A′): a journal session's narrowed slot keeps `p11_entry_journal`,
+/// never the plain program the non-journal resolver returns; every
+/// other session resolves through the attach-time [`entry_program`].
+/// Mirrors the attach-time grouping resolver.
+fn downgrade_entry_program(
+    journal: bool,
+    semantics: &SlotSemantics,
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    target_abi: ElfAbi,
+) -> &'static str {
+    if journal {
+        "p11_entry_journal"
+    } else {
+        entry_program(semantics, policy, object_has_unsafe, target_abi)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AttachOutcome {
     successful: BTreeSet<StaticEndpoint>,
@@ -9815,7 +9834,8 @@ impl Session {
                 ));
                 continue;
             }
-            let resolved = entry_program(
+            let resolved = downgrade_entry_program(
+                self.journal,
                 &slot.semantics,
                 self.policy,
                 self.embedded_flavor.unsafe_present,
@@ -12559,13 +12579,98 @@ mod tests {
         for (signature, marker) in [
             ("    pub fn downgrade_in_place(", "downgrade_entry_program("),
             ("fn downgrade_entry_program(", "p11_entry_journal"),
-            ("fn downgrade_entry_program(", "entry_program("),
+            (
+                "fn downgrade_entry_program(",
+                "entry_program(semantics, policy, object_has_unsafe, target_abi)",
+            ),
         ] {
             let start = source.find(signature).unwrap();
             let tail = source[start..].replacen(marker, "REMOVED", 1);
             assert!(
                 !contract(&format!("{}{}", &source[..start], tail)),
                 "removed {marker}"
+            );
+        }
+    }
+
+    /// Journal-aware resolution, behaviorally: journal sessions keep
+    /// the journal pair for every semantics flavor, while non-journal
+    /// sessions resolve through the attach-time programs (plain,
+    /// template triple, ia32).
+    #[test]
+    fn downgrade_entry_program_resolves_each_flavor() {
+        use p11scope_ebpf_common::{SlotSemantics, semantic_flags};
+        use p11scope_manifest::elf::ElfAbi;
+        let count_only = SlotSemantics::COUNT_ONLY;
+        let template_pair = SlotSemantics {
+            template1_arg: 1,
+            ..count_only
+        };
+        let template_types = SlotSemantics {
+            semantic_flags: semantic_flags::TEMPLATE0_TYPES_ONLY,
+            ..count_only
+        };
+        let template = SlotSemantics {
+            template0_arg: 1,
+            ..count_only
+        };
+        let safe = super::CapturePolicy::Allowlisted;
+        let unsafe_policy = super::CapturePolicy::UnsafeUnvalidatedMetadata;
+        for (journal, semantics, policy, object_has_unsafe, abi, expected) in [
+            (false, &count_only, safe, false, ElfAbi::Lp64, "p11_entry"),
+            (
+                false,
+                &template_pair,
+                unsafe_policy,
+                true,
+                ElfAbi::Lp64,
+                "p11_entry_template_pair",
+            ),
+            (
+                false,
+                &template_types,
+                unsafe_policy,
+                true,
+                ElfAbi::Lp64,
+                "p11_entry_template_types",
+            ),
+            (
+                false,
+                &template,
+                unsafe_policy,
+                true,
+                ElfAbi::Lp64,
+                "p11_entry_template",
+            ),
+            (
+                false,
+                &count_only,
+                safe,
+                true,
+                ElfAbi::Ilp32,
+                "p11_entry_ia32",
+            ),
+            (
+                true,
+                &count_only,
+                safe,
+                false,
+                ElfAbi::Lp64,
+                "p11_entry_journal",
+            ),
+            (
+                true,
+                &template_pair,
+                unsafe_policy,
+                true,
+                ElfAbi::Ilp32,
+                "p11_entry_journal",
+            ),
+        ] {
+            assert_eq!(
+                super::downgrade_entry_program(journal, semantics, policy, object_has_unsafe, abi),
+                expected,
+                "journal={journal} abi={abi:?}"
             );
         }
     }

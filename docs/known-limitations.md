@@ -3225,10 +3225,14 @@ a silent drop.
   descendants that map a getter-only provider (hidden table symbols,
   nothing to pre-arm) learns the transient members' decoded tables
   as run inputs, so later mappers' table calls are counted without
-  waiting for frame admission. The per-function counts are
-  standard-layout names, not proven: attribution is withheld
-  (`semantic_unverified_slots`) and nothing is decoded from the
-  tables (no mechanisms, no arguments). The report stays `PARTIAL`:
+  waiting for frame admission. The per-function counts carry standard-layout
+  names from two evidences: getter-only tables stay names-only and unproven
+  (attribution withheld via `semantic_unverified_slots`, never decoded), while
+  file-scanned learned tables with interface-linkage standard-layout evidence
+  are semantic-authorized under the standard-layout scan policy and may decode
+  their mechanism arguments (mechanism types are approved v3 data; values
+  outside the registered registry count only, never publish). The report stays
+  `PARTIAL`:
   calls made before the tables attached stay missing inside the
   module's disclosed `late_discovery`/`mapped_unattached` window,
   and departed unadmitted members still count `pid_descendant_gaps`.

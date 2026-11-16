@@ -384,7 +384,9 @@ fn check_exact_accounting(
     let gated = evidence
         .get("unregistered_standard_layout_mechanisms")
         .and_then(serde_json::Value::as_u64)
-        .context("observed profile evidence has no unregistered_standard_layout_mechanisms count")?;
+        .context(
+            "observed profile evidence has no unregistered_standard_layout_mechanisms count",
+        )?;
     ensure!(
         gated == 0,
         "unregistered_standard_layout_mechanisms={gated}: a standard-layout-slot mechanism value \
@@ -424,9 +426,9 @@ fn check_exact_accounting(
         .and_then(serde_json::Value::as_array)
         .context("attribution gap class names no causes")?;
     ensure!(
-        causes
-            .iter()
-            .any(|cause| cause.as_str().is_some_and(|cause| cause == "semantic_unverified_slots")),
+        causes.iter().any(|cause| cause
+            .as_str()
+            .is_some_and(|cause| cause == "semantic_unverified_slots")),
         "attribution is withheld without the semantic_unverified_slots cause: {causes:?}"
     );
     Ok(())

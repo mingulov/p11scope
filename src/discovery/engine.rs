@@ -24744,6 +24744,24 @@ impl Engine {
     /// `skipped` false; `attached` is true when at least one hook newly
     /// attached, so the startup completion can tell whether it added
     /// coverage.
+    ///
+    /// A committed attach also receipts itself on stderr under capture
+    /// diagnostics ([`Self::note_dynamic_export_attached`]): the getter
+    /// cells gate their programs on those per-offset lines, since an
+    /// fdinfo small-cookie count cannot tell a count-only static slot
+    /// from the getter hook at the same offset.
+    ///
+    /// No identity rides the line: the ABI plus the file offset cannot
+    /// name a process, a path, or a proof.
+    fn note_dynamic_export_attached(work: &DynamicExportWork) {
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "p11scope: dynamic export attached file_offset={:#x} abi={:?}",
+                work.file_offset, work.abi,
+            );
+        }
+    }
+
     fn attach_export_work(
         &mut self,
         view: ProcessViewId,
@@ -24805,6 +24823,7 @@ impl Engine {
             match attach {
                 GenerationMutation::Committed(Ok((added, completed))) => {
                     attached |= added;
+                    Self::note_dynamic_export_attached(work);
                     if let Some(mut binding) = work.selection_binding {
                         binding.attached = true;
                         self.selection_bindings.insert(binding.id, binding);
@@ -24831,6 +24850,7 @@ impl Engine {
                 }
                 GenerationMutation::PostcheckFailed(Ok((added, _))) => {
                     attached |= added;
+                    Self::note_dynamic_export_attached(work);
                     if let Some(mut binding) = work.selection_binding {
                         binding.attached = true;
                         self.selection_bindings.insert(binding.id, binding);

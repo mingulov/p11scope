@@ -18688,6 +18688,9 @@ impl Engine {
                     "a new process mapped a provider after the capture began stopping; its calls were not observed",
                 );
             }
+            if crate::run::capture_diagnostics_on() && carries_run_learned {
+                eprintln!("p11scope: run-learned apply refused at stop gate");
+            }
             return Ok(outcome);
         }
         // A pending batch owns the whole global candidate boundary, including
@@ -18697,6 +18700,11 @@ impl Engine {
             outcome
                 .unpublished_views
                 .extend(extra_views.iter().map(|view| view.id()));
+            if crate::run::capture_diagnostics_on() && carries_run_learned {
+                eprintln!(
+                    "p11scope: run-learned apply deferred behind a pending global retirement"
+                );
+            }
             return Ok(outcome);
         }
         if !preflighted {
@@ -18767,6 +18775,9 @@ impl Engine {
                 "live discovery identity",
                 "candidate identity conflicted with an active loader context; the context was selected for conservative retirement before rebuild",
             );
+            if crate::run::capture_diagnostics_on() && carries_run_learned {
+                eprintln!("p11scope: run-learned apply refused on loader-context conflict");
+            }
             return Ok(outcome);
         }
         // Owned run-tree file learning (E1) runs before the generation
@@ -18849,6 +18860,9 @@ impl Engine {
                     "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
                 );
             }
+            if crate::run::capture_diagnostics_on() && carries_run_learned {
+                eprintln!("p11scope: run-learned apply refused on stale generation");
+            }
             return Ok(outcome);
         }
         if !admission.targets_ok {
@@ -18857,6 +18871,9 @@ impl Engine {
                 "live discovery transaction",
                 "candidate preflight failed; canonical identity, plan, and links were unchanged",
             );
+            if crate::run::capture_diagnostics_on() && carries_run_learned {
+                eprintln!("p11scope: run-learned apply refused on target preflight");
+            }
             return Ok(outcome);
         }
         // The last fallible preparation this candidate needs. Past the first
@@ -18915,6 +18932,9 @@ impl Engine {
             self.continuity_deferred = true;
             *additions_allowed = false;
             self.mark_partial("live exec continuity", "current Session/request/target/health/frontier refused preservation before mutation; refresh remains pending");
+            if crate::run::capture_diagnostics_on() && carries_run_learned {
+                eprintln!("p11scope: run-learned apply refused on exec preservation");
+            }
             return Ok(outcome);
         }
         if candidate.has_exec_receipts() {
@@ -19099,6 +19119,11 @@ impl Engine {
             outcome
                 .unpublished_views
                 .extend(extra_views.iter().map(|view| view.id()));
+            if crate::run::capture_diagnostics_on() && carries_run_learned {
+                eprintln!(
+                    "p11scope: run-learned apply deferred by a detach-pending global retirement"
+                );
+            }
             return Ok(outcome);
         }
         let detach_failed = match detach_slots_outcome {

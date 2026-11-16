@@ -2332,8 +2332,7 @@ mod tests {
         use crate::capture::MECHANISM_VALUE;
         use crate::object_capture::handle_status as hst;
         use crate::object_wire::{
-            OBJECT_DERIVE_CONCAT_BASE_AND_KEY, OBJECT_DERIVE_HKDF_DATA,
-            OBJECT_DERIVE_HKDF_DERIVE,
+            OBJECT_DERIVE_CONCAT_BASE_AND_KEY, OBJECT_DERIVE_HKDF_DATA, OBJECT_DERIVE_HKDF_DERIVE,
         };
         let descriptor = 23u32;
         let row = ObjectDescriptorWire {

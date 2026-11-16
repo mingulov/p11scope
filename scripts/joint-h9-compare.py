@@ -77,7 +77,7 @@ CREATIONS = {"create", "copy", "generate", "generate_pair", "derive",
              "unwrap"}
 # H9 section v2 additions (packet 6.07c): v1 tables stay frozen.
 CREATIONS_V2 = CREATIONS | {"encapsulate", "decapsulate"}
-SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5)
+SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5, 6)
 LABELS = {"rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
           "aes_192", "aes_256", "aes_other", "ec_p256", "ec_p384", "ec_p521"}
 # H9 section v4 (DEMO-4 late attach): a first-observed key whose
@@ -99,6 +99,18 @@ PQC_LABELS = {"ml_dsa_44", "ml_dsa_65", "ml_dsa_87",
               "slh_dsa_sha2_256f", "slh_dsa_shake_256f"}
 LABELS_V5 = LABELS_V4 | PQC_LABELS
 OBJECT_LABELS_V5 = LABELS | PQC_LABELS
+# H9 section v6 (R2 new-site key metadata): the sixteen combined
+# labels (four Montgomery/Edwards curves, six HKDF sizes, six
+# generic-secret sizes). Key rows accept the v5 labels plus all
+# sixteen; object views accept the v5 object labels plus the
+# sixteen (`unknown` stays row-level only).
+NEWSITE_LABELS = {"x25519", "x448", "ed25519", "ed448",
+                  "hkdf_96", "hkdf_128", "hkdf_192", "hkdf_256",
+                  "hkdf_384", "hkdf_other",
+                  "generic_96", "generic_128", "generic_192",
+                  "generic_256", "generic_384", "generic_other"}
+LABELS_V6 = LABELS_V5 | NEWSITE_LABELS
+OBJECT_LABELS_V6 = OBJECT_LABELS_V5 | NEWSITE_LABELS
 UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "metadata_conflicting", "role_unavailable", "not_applicable"}
@@ -427,6 +439,8 @@ def _snapshot_labels(document):
     version = document["version"]
     _require(type(version) is int and version in SNAPSHOT_VERSIONS,
              "snapshot version mismatch")
+    if version >= 6:
+        return LABELS_V6
     if version >= 5:
         return LABELS_V5
     return LABELS_V4 if version >= 4 else LABELS
@@ -437,6 +451,8 @@ def _snapshot_object_labels(document):
     version = document["version"]
     _require(type(version) is int and version in SNAPSHOT_VERSIONS,
              "snapshot version mismatch")
+    if version >= 6:
+        return OBJECT_LABELS_V6
     return OBJECT_LABELS_V5 if version >= 5 else LABELS
 
 
@@ -482,10 +498,11 @@ def _check_unattributed(document):
     """Validate not-attributed counters: present iff version >= 3.
 
     Version 3 requires a nonempty list (it is emitted iff a count
-    exists); versions 4 and 5 always carry the key and it may be empty.
+    exists); versions 4, 5 and 6 always carry the key and it may be
+    empty.
     """
     version = document["version"]
-    if version not in (3, 4, 5):
+    if version not in (3, 4, 5, 6):
         _require("unattributed" not in document,
                  "unattributed counters before section version 3")
         return
@@ -513,7 +530,7 @@ def validate_snapshot(document):
     keys = {"version", "revision", "status", "reason", "sessions",
             "objects", "key_operations", "unknown_key_operations",
             "gaps", "budgets"}
-    if type(document) is dict and document.get("version") in (3, 4, 5):
+    if type(document) is dict and document.get("version") in (3, 4, 5, 6):
         keys |= {"unattributed"}
     _keys(document, keys)
     _check_unattributed(document)
@@ -745,7 +762,10 @@ def compare_stream(events, feeds, snapshot):
         if kind == "object_observed":
             version = _row_version(event, where, {"revision", "row"})
             _, creations = _row_vocabularies(version)
-            obj_labels = OBJECT_LABELS_V5 if version >= 5 else LABELS
+            if version >= 6:
+                obj_labels = OBJECT_LABELS_V6
+            else:
+                obj_labels = OBJECT_LABELS_V5 if version >= 5 else LABELS
             _require(_integer(event["revision"]), f"{where}: revision out of range")
             key = ("object", _check_object_row(event["row"], where, creations,
                                                 obj_labels))
@@ -754,7 +774,9 @@ def compare_stream(events, feeds, snapshot):
         elif kind == "key_operations_observed":
             version = _row_version(event, where, {"revision", "bucket", "row"})
             roles, _ = _row_vocabularies(version)
-            if version >= 5:
+            if version >= 6:
+                labels = LABELS_V6
+            elif version >= 5:
                 labels = LABELS_V5
             else:
                 labels = LABELS_V4 if version >= 4 else LABELS

@@ -210,9 +210,11 @@ UNKNOWN_BUDGET_KEYS = {"occupied"}
 FIELD_KEYS = {"status", "value"}
 # H9 section v6 (keymeta §6/K5): every metadata field carries the
 # per-field `source` beside status/value; the two provenances are
-# the closed vocabulary, null is the only other spelling.
-FIELD_KEYS_V6 = {"status", "value", "source"}
+# the closed vocabulary, null is the only other spelling. Ruling 2
+# adds the per-field `reason`: the one-member truncation vocabulary.
+FIELD_KEYS_V6 = {"status", "value", "source", "reason"}
 FIELD_SOURCES = ("query", "creation_success")
+FIELD_REASONS = ("template truncated (first 8 attributes captured)",)
 MECHANISM_ROW_KEYS = {"mechanism", "mechanism_hex", "name", "operations", "calls",
                       "errors", "last_seen_ns", "evidence"}
 MECHANISM_EVIDENCE_KEYS = {"functions", "returns", "truncated"}
@@ -381,11 +383,18 @@ def _metadata_block(block, keys=METADATA_KEYS,
             if source is None:
                 _require(not established or status != "value",
                          "established value carries no source")
+            else:
+                _require(type(source) is str and source in FIELD_SOURCES,
+                         "unexpected metadata source")
+                _require(established, "requested metadata carries a source")
+                _require(status == "value", "unvalued metadata carries a source")
+        if "reason" in fields:
+            reason = cell["reason"]
+            if reason is None:
                 continue
-            _require(type(source) is str and source in FIELD_SOURCES,
-                     "unexpected metadata source")
-            _require(established, "requested metadata carries a source")
-            _require(status == "value", "unvalued metadata carries a source")
+            _require(type(reason) is str and reason in FIELD_REASONS,
+                     "unexpected metadata reason")
+            _require(status == "unknown", "known metadata carries a reason")
 
 
 def _check_sessions(rows):
@@ -434,6 +443,11 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
                 _require(row["established"][name]["source"] != "query"
                          or queries[name] != "not_queried",
                          "query source without a query")
+        if "reason" in fields:
+            for name in keys:
+                _require(row["established"][name]["reason"] is None
+                         or row["requested"][name]["status"] == "unknown",
+                         "established reason on an observed request")
         if row["label"] is not None:
             _label(row["label"], labels, "object metadata")
         _require(_u64(row["successful_references"])

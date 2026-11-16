@@ -158,6 +158,44 @@ def base_units():
                       passed=0, skipped=0)]
 
 
+def write_tool_cell(tmp, run_calls=5, run_calls_b=5):
+    """A reader-less (suite=no) cell: no results/reports legs, exits only."""
+    base = Path(tmp)
+    module = make_module(tmp)
+    rows_b = [function_row(["C_Initialize"], module_identity(module),
+                           run_calls_b,
+                           {"0x0000000000000000": run_calls_b})]
+    (base / "observed-b.json").write_text(
+        json.dumps(observed_doc(rows_b)), encoding="utf-8")
+    rows_c = [function_row(["C_Initialize"], module_identity(module),
+                           run_calls,
+                           {"0x0000000000000000": run_calls})]
+    (base / "observed-c.json").write_text(
+        json.dumps(observed_doc(rows_c)), encoding="utf-8")
+    (base / "inventory.json").write_text(
+        json.dumps(inventory_doc(module, 4242, 12)),
+        encoding="utf-8")
+    (base / "manifest.json").write_text(
+        json.dumps(KRYOPTIC_MANIFEST), encoding="utf-8")
+    (base / "discover.stderr").write_text("", encoding="utf-8")
+    args = ["--provider", "kryoptic", "--provider-version", "1.5.2",
+            "--module", str(module),
+            "--discover-rc", "0",
+            "--manifest", str(base / "manifest.json"),
+            "--discover-stderr", str(base / "discover.stderr"),
+            "--suite", "no",
+            "--exit-a", "0", "--wall-a", "1.0",
+            "--exit-b", "0", "--wall-b", "2.0",
+            "--exit-c", "0", "--wall-c", "3.0",
+            "--observed-b", str(base / "observed-b.json"),
+            "--observed-c", str(base / "observed-c.json"),
+            "--inventory", str(base / "inventory.json"),
+            "--workload-pid", "4242",
+            "--out-results", str(base / "results.jsonl"),
+            "--out-summary", str(base / "summary.txt")]
+    return base, args
+
+
 def leg_prep_source():
     """The verbatim leg_prep function from the shipped cell script."""
     text = SCRIPT.read_text(encoding="utf-8")
@@ -792,6 +830,73 @@ class MainTests(unittest.TestCase):
                           coverage["detail"])
             self.assertIn("default-run-coverage: 0.0000",
                           (base / "summary.txt").read_text(encoding="utf-8"))
+
+    def test_no_suite_run_observed_keeps_real_capture(self):
+        # Reader-less cells have no oracle, but the observed gate still
+        # runs on the real manifest-leg capture: the no-suite branch
+        # must null only the oracles, never the capture.
+        seen = {}
+        original = _COMPARE.judge_run_observed
+
+        def spy(observed, module_path, oracle=None, capture=None):
+            seen["oracle"] = oracle
+            seen["capture"] = capture
+            return original(observed, module_path, oracle, capture)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base, args = write_tool_cell(tmp)
+            module = args[args.index("--module") + 1]
+            expected, _ = _COMPARE.target_capture(
+                json.loads((base / "observed-c.json").read_text(
+                    encoding="utf-8")), module)
+            self.assertTrue(expected, "fixture capture is empty")
+            _COMPARE.judge_run_observed = spy
+            try:
+                rc = _COMPARE.main(args)
+            finally:
+                _COMPARE.judge_run_observed = original
+            self.assertEqual(0, rc)
+            self.assertIsNone(seen["oracle"])
+            self.assertEqual(expected, seen["capture"])
+            rows = [json.loads(line) for line in
+                    (base / "results.jsonl").read_text(
+                        encoding="utf-8").splitlines()]
+            observed = next(row for row in rows
+                            if row["cell"] == "kryoptic-run-observed")
+            self.assertTrue(observed["pass"])
+            self.assertIn("no oracle (tool probe)", observed["detail"])
+            self.assertNotIn("call_recall", observed["detail"])
+
+    def test_no_suite_zero_calls_fails_as_not_observed(self):
+        # Without a suite the observed gate still decides on attributed
+        # calls: 0 calls in the manifest leg fails the cell.
+        with tempfile.TemporaryDirectory() as tmp:
+            base, args = write_tool_cell(tmp, run_calls=0)
+            rc = _COMPARE.main(args)
+            self.assertEqual(1, rc)
+            rows = [json.loads(line) for line in
+                    (base / "results.jsonl").read_text(
+                        encoding="utf-8").splitlines()]
+            observed = next(row for row in rows
+                            if row["cell"] == "kryoptic-run-observed")
+            self.assertFalse(observed["pass"])
+            self.assertIn("not observed", observed["detail"])
+
+    def test_suite_yes_empty_oracle_has_no_recall_denominator(self):
+        # The suite=yes side of the same path: empty oracle reports mean
+        # no recall denominator, while attributed calls still pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            base, args = self.write_cell(tmp)
+            rc = _COMPARE.main(args)
+            self.assertEqual(0, rc)
+            rows = [json.loads(line) for line in
+                    (base / "results.jsonl").read_text(
+                        encoding="utf-8").splitlines()]
+            observed = next(row for row in rows
+                            if row["cell"] == "kryoptic-run-observed")
+            self.assertTrue(observed["pass"])
+            self.assertIn("oracle logged 0 calls (no recall denominator)",
+                          observed["detail"])
 
 
 PROXY_CONFIG_SNIPPET = (ROOT / "scripts" / "provider-matrix"

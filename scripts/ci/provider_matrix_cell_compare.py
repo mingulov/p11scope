@@ -508,7 +508,6 @@ def main(argv):
 
         observed_b = load_json(args.observed_b, "observed profile (leg b)")
         observed_c = load_json(args.observed_c, "observed profile (leg c)")
-        capture_b, _ = target_capture(observed_b, args.module)
         capture_c, _ = target_capture(observed_c, args.module)
         schema_b = observed_b.get("schema", "")
         schema_c = observed_c.get("schema", "")
@@ -528,7 +527,7 @@ def main(argv):
             oracle_b, _, _ = _BASE.oracle_counts(args.report_b)
             oracle_c, _, _ = _BASE.oracle_counts(args.report_c)
         else:
-            oracle_b, oracle_c, capture_b, capture_c = None, None, None, None
+            oracle_b, oracle_c = None, None
         run_ok, run_detail, recall = judge_run_observed(
             observed_c, args.module, oracle_c, capture_c)
         cov_detail, cov_recall = judge_default_coverage(

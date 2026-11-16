@@ -13601,6 +13601,72 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_reseed_eligible_with_post_void_affecting_call_still_uncovered() {
+        // Eligibility compares only the image's FIRST affecting call
+        // against the void watermark: an affecting call staged after
+        // the void but before any new cut does not change the answer.
+        // That coarseness is safe because the fallback birth's seal
+        // still refuses uncovered staged history (birth_covers_staged):
+        // the eligibility gate admits the attempt, the seal gates the
+        // proof.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        let fence = scene.adapter.voided_through_for_test();
+        assert!(
+            scene.adapter.novelty_broken_reseed_eligible((COOKIE, EXEC)),
+            "precondition: fenced clean history reseeds"
+        );
+        // An affecting call after the void but before any new cut.
+        let late = begin_bytes(2, 1, create, 0);
+        assert_eq!(scene.ingest(&late), JournalDisposition::BeginAdmitted);
+        scene.ingest(&end_bytes(&late, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.attest_function("C_CreateObject");
+        scene.prepare_claims();
+        assert!(
+            scene.adapter.consumed_through > fence,
+            "precondition: the late call sits above the void watermark"
+        );
+        assert!(
+            scene.adapter.novelty_broken_reseed_eligible((COOKIE, EXEC)),
+            "a post-void affecting call does not change eligibility"
+        );
+        let live = scene.adapter.live_keys_for_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.birth_covers_staged(
+                y_proof.key,
+                &live,
+                (COOKIE, EXEC),
+                scene.adapter.consumed_through,
+            ),
+            "the staged post-void history still blocks any seal at/above it"
+        );
+    }
+
+    #[test]
     fn object_journal_seal_below_fence_counts_ending() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
@@ -15278,16 +15344,23 @@ pub(crate) mod tests {
 
     #[test]
     fn object_journal_void_wiped_begin_end_stays_untainted() {
-        // A BEGIN wiped by a void leaves its terminal expected-absent:
-        // the straddling END keeps the Contradiction disposition and
-        // telemetry, but it is the void working as intended, not new
-        // evidence, so it never permanently taints the image.
+        // A neutral BEGIN wiped by a void leaves its terminal
+        // expected-absent: the straddling END keeps the Contradiction
+        // disposition and telemetry, but it is the void working as
+        // intended, not new evidence, so it never permanently taints
+        // the image. Only effect-neutral calls are excused (a
+        // state-changing call that outlived its wipe is unattributed
+        // state change); C_SignInit reads a binding without changing
+        // later resolution.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
         let mut scene = Scene::new(image_default());
-        let create = function_id("C_CreateObject");
-        let begin = begin_bytes(1, 1, create, 0);
+        let sign_init = function_id("C_SignInit");
+        let mut begin = begin_bytes(1, 1, sign_init, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         scene.adapter.void_staged();
-        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 50);
         assert_eq!(
             scene.ingest(&end),
             JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
@@ -15300,13 +15373,13 @@ pub(crate) mod tests {
 
     #[test]
     fn object_journal_void_wiped_begin_abandon_stays_untainted() {
-        // Abandon twin of the void-wipe twin above: a BEGIN wiped by a
-        // void leaves its ABANDON expected-absent too, never a
-        // permanent taint.
+        // Abandon twin of the void-wipe twin above: a neutral BEGIN
+        // wiped by a void leaves its ABANDON expected-absent too,
+        // never a permanent taint.
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
         let mut scene = Scene::new(image_default());
-        let create = function_id("C_CreateObject");
-        let begin = begin_bytes(1, 1, create, 0);
+        let sign = function_id("C_Sign");
+        let begin = begin_bytes(1, 1, sign, 0);
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         scene.adapter.void_staged();
         let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
@@ -15341,6 +15414,170 @@ pub(crate) mod tests {
         assert!(
             scene.adapter.image_refused((COOKIE, EXEC)),
             "a duplicate terminal after a void still promotes"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_wiped_destroy_end_still_taints() {
+        // A state-changing BEGIN wiped by a void is never
+        // expected-absent: excusing its END would let a destroy that
+        // outlived the wipe disappear from the object model, so a
+        // later bind of the reused handle could name the destroyed
+        // key. The straddling END still taints (fail closed).
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_DESTROY;
+        let mut scene = Scene::new(image_default());
+        let destroy = function_id("C_DestroyObject");
+        let mut begin = begin_bytes(1, 1, destroy, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let end = end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped destroy terminal still taints"
+        );
+    }
+
+    #[test]
+    fn object_journal_lifted_image_destroy_end_still_taints() {
+        // A destroy dropped by a shed-taint must not ride the lift:
+        // the lift clears the taint but purges non-neutral absences,
+        // so the straddling END still taints instead of disappearing
+        // a state change from the object model.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_DESTROY;
+        let mut scene = Scene::new(image_default());
+        let destroy = function_id("C_DestroyObject");
+        let mut begin = begin_bytes(1, 1, destroy, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "precondition: the shed-taint lifts"
+        );
+        let end = end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a lifted-image destroy terminal still taints"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_wiped_bad_return_end_still_taints() {
+        // The function alone is not enough: a void-wiped neutral call
+        // whose END reports a handle/session failure may have cleared
+        // or closed what a later call reuses, so it still taints like
+        // the unclaimable-original disposal it mirrors (Ok, Partial
+        // and plain Failed alone are excused).
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        let mut scene = Scene::new(image_default());
+        let sign_init = function_id("C_SignInit");
+        let mut begin = begin_bytes(1, 1, sign_init, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let rv = pkcs11_types::CkRv::OBJECT_HANDLE_INVALID.0;
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, rv, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped bad-return terminal still taints"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_wiped_noend_begin_end_still_taints() {
+        // A void wipe must not excuse what the live entry would reject:
+        // a NO_END BEGIN wiped by a void is skipped like a staged
+        // terminal, so its END still taints instead of being swallowed
+        // as expected-absent.
+        use p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        let mut scene = Scene::new(image_default());
+        let sign_init = function_id("C_SignInit");
+        let mut begin = begin_bytes(1, 1, sign_init, JOURNAL_BEGIN_NO_END);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped NO_END terminal still taints"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_wiped_corroborated_begin_end_still_taints() {
+        // A void wipe must not excuse what the live entry would reject:
+        // an END for a corroborated return is a never-both
+        // contradiction (CallAndEnd), so a corroborated BEGIN wiped by
+        // a void is skipped and its END still taints.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        let mut scene = Scene::new(image_default());
+        let sign_init = function_id("C_SignInit");
+        let mut begin = begin_bytes(1, 1, sign_init, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        scene.adapter.void_staged();
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped corroborated terminal still taints"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_staged_abandon_duplicate_still_taints() {
+        // Abandon half of the staged-terminal filter: a call whose
+        // ABANDON was already staged before the void has no terminal
+        // still to arrive, so the void must not record it
+        // expected-absent and re-ingesting the same ABANDON after the
+        // void still promotes. A neutral function isolates the
+        // staged-terminal arm from the effect-neutral filter.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        let mut scene = Scene::new(image_default());
+        let sign_init = function_id("C_SignInit");
+        let begin = begin_bytes(1, 1, sign_init, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        scene.adapter.void_staged();
+        assert_eq!(
+            scene.ingest(&abandon),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a duplicate abandon after a void still promotes"
         );
     }
 

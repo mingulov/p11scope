@@ -459,6 +459,15 @@ impl JointStaging {
         self.record_fence(fence);
     }
 
+    /// Pose a feed mode for tests. Production flows never stage onto
+    /// an S1Only feed ("S1Only never owns a staged suffix"), so the
+    /// reseed twin poses Joint to stage a remainder, then poses
+    /// S1Only back to pin the drained-staging arm alone.
+    #[cfg(test)]
+    pub(crate) fn pose_mode_for_test(&mut self, mode: FeedMode) {
+        self.mode = mode;
+    }
+
     /// Re-enter Joint at a clean point after a fallback or loss
     /// ended the previous segment. Only a feed that was selected
     /// Joint at registration (retained receipt), actually left it,

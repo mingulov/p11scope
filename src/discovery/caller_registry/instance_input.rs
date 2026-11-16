@@ -2399,6 +2399,17 @@ impl CallerRegistry {
         std::mem::take(&mut self.joint_reseed_queue)
     }
 
+    /// Queue one reseed image (a fenced void ending the test arranges
+    /// separately, or not at all): the machine twin drives the drain
+    /// without a full void.
+    #[cfg(test)]
+    pub(crate) fn queue_joint_reseed_for_test(
+        &mut self,
+        image: p11scope_ebpf_common::ImageIdentity,
+    ) {
+        self.joint_reseed_queue.push(image);
+    }
+
     /// Latch the lane's journal linkage from its drain producers. The
     /// Joint birth path calls this every quantum; tests latch the world
     /// they model. Only a linked lane installs Joint feeds.

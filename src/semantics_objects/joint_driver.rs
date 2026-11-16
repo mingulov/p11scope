@@ -3206,6 +3206,197 @@ mod tests {
     }
 
     #[test]
+    fn joint_resource_untainted_derived_absent_end_grants_nothing_without_refusal() {
+        // I1: on an UNTAINTED image, a void-wiped neutral BEGIN's END
+        // is derived-absent: collection grants no resource but must
+        // NOT refuse (the journal already disposes it as
+        // expected-absent). Sparing here is the absence working as
+        // intended.
+        use crate::semantics_objects::journal::tests::{
+            COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes, function_id,
+        };
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0xf110);
+        let retained = producers(&events);
+        let mut begin = begin_bytes(1, 1, function_id("C_SignInit"), 0);
+        begin[88..96].copy_from_slice(&0x9090_9090_9090_9090u64.to_le_bytes());
+        begin[126] = 1;
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 100);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec()], 1),
+            events.clone(),
+        );
+        let start = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(!start.resource_refused);
+        let reservation = start.invocations[0].reservation;
+        assert_eq!(
+            adapter.ingest_any_from_raw(start.ordered[0], Some(reservation), false),
+            super::super::JournalDisposition::BeginAdmitted
+        );
+        drop(start);
+        adapter.ledger.release_raw(&reservation);
+        adapter.void_staged();
+        assert!(
+            !adapter.image_refused((COOKIE, EXEC)),
+            "precondition: the wiped image stays untainted"
+        );
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([end.to_vec()], 1), events);
+        let terminal = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(
+            !terminal.resource_refused,
+            "a derived-absent END must not void the collection"
+        );
+        assert_eq!(terminal.ordinary.len(), 1);
+        assert!(terminal.ordinary[0].joint_resource.is_none());
+    }
+
+    #[test]
+    fn joint_resource_untainted_unmatched_end_without_absence_refuses() {
+        // I1: an unmatched END with no derived absence on an untainted
+        // image still refuses (voids): sparing is the absence working
+        // as intended, never a blanket excuse for unknown terminals.
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes, function_id,
+        };
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0xf111);
+        let retained = producers(&events);
+        let mut begin = begin_bytes(1, 1, function_id("C_SignInit"), 0);
+        begin[88..96].copy_from_slice(&0x9090_9090_9090_9090u64.to_le_bytes());
+        begin[126] = 1;
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 100);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([end.to_vec()], 1), events);
+        let terminal = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(
+            terminal.resource_refused,
+            "an unmatched END without absence must refuse"
+        );
+    }
+
+    #[test]
+    fn joint_resource_consumed_absent_end_duplicate_refuses() {
+        // I1: derived absence is consumed on arrival. A second collect
+        // of the same END after the journal consumed its excuse finds
+        // no absence and refuses: duplicates still void.
+        use crate::semantics_objects::journal::tests::{
+            COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes, function_id,
+        };
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0xf112);
+        let retained = producers(&events);
+        let mut begin = begin_bytes(1, 1, function_id("C_SignInit"), 0);
+        begin[88..96].copy_from_slice(&0x9090_9090_9090_9090u64.to_le_bytes());
+        begin[126] = 1;
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 100);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec()], 1),
+            events.clone(),
+        );
+        let start = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        let reservation = start.invocations[0].reservation;
+        assert_eq!(
+            adapter.ingest_any_from_raw(start.ordered[0], Some(reservation), false),
+            super::super::JournalDisposition::BeginAdmitted
+        );
+        drop(start);
+        adapter.ledger.release_raw(&reservation);
+        adapter.void_staged();
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([end.to_vec()], 1), events.clone());
+        let first = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(
+            !first.resource_refused,
+            "precondition: the absent END is spared once"
+        );
+        assert_eq!(
+            adapter.ingest_any_from_raw(first.ordered[0], None, false),
+            super::super::JournalDisposition::Contradiction(
+                super::super::JournalContradiction::TerminalBeforeBegin
+            )
+        );
+        assert!(
+            !adapter.image_refused((COOKIE, EXEC)),
+            "precondition: the consumed excuse taints nothing"
+        );
+        drop(first);
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([end.to_vec()], 1), events);
+        let second = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(
+            second.resource_refused,
+            "a duplicate END after consumption must refuse"
+        );
+    }
+
+    #[test]
     fn joint_resource_foreign_session_events_and_ledger_refuse_before_mutation() {
         use crate::semantics_objects::journal::tests::{
             ENTRY_NS, begin_bytes, end_bytes_absent, function_id,

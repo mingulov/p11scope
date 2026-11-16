@@ -22691,27 +22691,36 @@ fn key_operation_reseed_refuses_wrong_receipts_and_states() {
         assert_eq!(staging.mode(), FeedMode::S1Only);
         assert_eq!(staging.selected_receipt(), None);
     }
-    // Staged remainder blocks a reseed.
+    // Staged remainder blocks a reseed on its own arm: a degraded
+    // S1Only feed holding its receipt with a clean watchdog refuses a
+    // fresh at-fence receipt naming its own incarnation, with only the
+    // drained-staging gate deciding. Production never stages onto
+    // S1Only, so the remainder is staged under a posed Joint mode
+    // and the S1Only mode is posed back before the attempt.
     {
-        let mut scene = JointScene::new();
-        let bootstrap = scene.bootstrap();
-        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let (mut scene, bootstrap, mut staging) = degraded();
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+        assert_eq!(staging.staged_len(), 0);
+        staging.pose_mode_for_test(FeedMode::Joint);
         prepare_call(
             &mut scene,
             &mut staging,
             &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
         );
+        staging.pose_mode_for_test(FeedMode::S1Only);
         assert_eq!(staging.staged_len(), 1);
         let fresh = BootstrapReceipt::scripted(
             bootstrap.proof(),
             BirthKind::AttachObserved,
-            0,
+            1,
             bootstrap.closure_generation(),
         );
         assert!(
             !staging.reselect_joint(&fresh),
             "staged remainder blocks a reseed"
         );
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+        assert_eq!(staging.selected_receipt(), Some(&bootstrap));
     }
 }
 

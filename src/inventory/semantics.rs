@@ -1157,6 +1157,12 @@ pub(crate) struct AttestedSemanticLane {
     /// assert the fence queued calls met without forging H0 outcomes.
     #[cfg(test)]
     last_conversion_barrier: Option<u64>,
+    /// Tests-only reseed wiring log: every image the Joint machine
+    /// sent for reseed re-arm, in order, including on a shell lane
+    /// (which re-arms nothing). The machine twin asserts the drain
+    /// wiring without forging a live capture.
+    #[cfg(test)]
+    reseed_rearm_calls: Vec<ImageIdentity>,
 }
 
 /// Bound on refresh receipts stashed ahead of the next tick: one tick
@@ -2241,6 +2247,8 @@ impl AttestedSemanticLane {
             fail_next_cut: false,
             #[cfg(test)]
             last_conversion_barrier: None,
+            #[cfg(test)]
+            reseed_rearm_calls: Vec::new(),
         })
     }
 
@@ -2286,9 +2294,19 @@ impl AttestedSemanticLane {
     /// has no capture and re-arms nothing. Returns how many keys
     /// re-armed.
     pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> usize {
+        #[cfg(test)]
+        self.reseed_rearm_calls.push(image);
         self.live
             .as_mut()
             .map_or(0, |live| live.capture.rearm_image_for_reseed(image))
+    }
+
+    /// Tests-only reseed wiring log: every image the Joint machine
+    /// sent for reseed re-arm, in order. The machine twin asserts the
+    /// drain wiring through this.
+    #[cfg(test)]
+    pub(crate) fn reseed_rearm_calls_for_test(&self) -> &[ImageIdentity] {
+        &self.reseed_rearm_calls
     }
 
     /// Count coordinator admissions that found no binding for their
@@ -2487,6 +2505,8 @@ impl AttestedSemanticLane {
             fail_next_cut: false,
             #[cfg(test)]
             last_conversion_barrier: None,
+            #[cfg(test)]
+            reseed_rearm_calls: Vec::new(),
         })
     }
 

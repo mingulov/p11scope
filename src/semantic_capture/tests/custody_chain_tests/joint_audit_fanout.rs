@@ -14831,6 +14831,61 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
     assert!(audit_no_progress_gaps(&fixture).is_empty());
 }
 
+#[test]
+fn joint_machine_births_phase_rearms_queued_reseed_images() {
+    // M3: the Births phase drains the coordinator's reseed queue and
+    // sends each queued image for re-arm on the lane, so the image's
+    // next continued observation offers one more birth at/above the
+    // fence. Without the re-arm call the queue still drains but no
+    // rebirth follows. The fixture lane is a shell (no live capture
+    // exists in unit tests), so the twin asserts the machine-to-lane
+    // wiring log; the router re-arm itself is pinned at the router.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    assert!(
+        fixture
+            .scene
+            .real
+            .lane
+            .reseed_rearm_calls_for_test()
+            .is_empty(),
+        "precondition: the prime drains an empty queue"
+    );
+    let image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 0xC0FF_EE71_C0FF_EE72,
+        exec_id: 0x1ACE_9EED_1ACE_9EEF,
+    };
+    // Queue the image and publish: the Births phase drains the queue
+    // and sends the image for re-arm on the lane.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .queue_joint_reseed_for_test(image);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.published_labeled("reseed-rearm", None);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry_mut()
+            .drain_joint_reseed_queue()
+            .is_empty(),
+        "the Births phase drains the reseed queue"
+    );
+    assert_eq!(
+        fixture.scene.real.lane.reseed_rearm_calls_for_test(),
+        &[image],
+        "the Births phase sends each queued image for re-arm"
+    );
+}
+
 /// A running original left in AwaitH0 by one route-waiting call (file 0's
 /// scans fail), followed by the same pass's actual binder refresh (the
 /// `apply` step between hooks) before any further hook tick. With

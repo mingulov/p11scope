@@ -16443,6 +16443,126 @@ mod tests {
         );
     }
 
+    /// Fail-closed twin: an unprovable fallback pin (`still_the_same() ==
+    /// false` with no start time) on a live, mapped process keeps the read
+    /// wording — a transient stat failure or missing start time never names
+    /// an exit without maps proof.
+    #[test]
+    fn zero_byte_snapshot_of_an_unprovable_live_process_keeps_the_read_wording() {
+        let pid = std::process::id();
+        let view = crate::process::unprovable_process_view_for_test(ProcessViewId(77), pid)
+            .expect("an unprovable view opens on the live process");
+        assert!(
+            !view.still_the_same(),
+            "the unprovable pin reads not-the-same on a live pid"
+        );
+        assert_ne!(
+            view.original_exited(),
+            Ok(true),
+            "no exit is proven without a start time"
+        );
+        assert!(
+            !std::fs::read_to_string(format!("/proc/{pid}/maps"))
+                .expect("live maps are readable")
+                .is_empty(),
+            "the live process stays mapped"
+        );
+        assert!(
+            !zero_read_names_exit(&view),
+            "an unproven pin never names an exit without maps proof"
+        );
+        let mut fixture = BracketFixture::new(8, false);
+        fixture.mem.set_len(0).unwrap();
+        let identity = crate::discovery::identity::FileIdentity { dev: 37, ino: 9 };
+        fixture.mapped = Some((identity, identity));
+        let hooks = HookRegistry::builtin();
+        let hints = [fixture.path.clone()];
+        let (outcome, _, _, _) = scan_view_with_examined(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+            true,
+        )
+        .expect("a live scan names its gaps, it does not error");
+        let reasons: Vec<&str> = outcome
+            .skipped()
+            .iter()
+            .map(|skip| skip.reason.as_str())
+            .collect();
+        assert!(
+            reasons.iter().any(|reason| reason.contains("read 0 of")
+                && reason.contains("the read returned no bytes")),
+            "the unproven zero-byte read keeps its wording: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains("the process exited during the snapshot")),
+            "an unproven pin never names an exit: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains(NO_TABLE_FOUND_MARKER)),
+            "zero examined bytes claim no verified absence: {reasons:?}"
+        );
+    }
+
+    /// No-table suppression, partial-read arm: a data mapping that yields
+    /// bytes and then hits the zero-byte stop still truncates its module —
+    /// the per-mapping partial row stays, but the verified-absence marker
+    /// must not claim a complete scan from a truncated snapshot.
+    #[test]
+    fn partial_snapshot_followed_by_a_zero_read_keeps_no_verified_absence_row() {
+        let mut f = BracketFixture::new(8, false);
+        let code = f
+            .maps_a
+            .lines()
+            .find(|line| line.contains(" r-xp ") && line.contains("provider.so"))
+            .expect("the fixture still maps provider code")
+            .to_string();
+        let data_line = f
+            .maps_a
+            .lines()
+            .find(|line| line.contains(" rw-p ") && line.contains("provider.so"))
+            .expect("the fixture still carries the rw-p range");
+        let identity = data_line
+            .split_once("00002000 ")
+            .expect("the rw-p offset still pins the identity")
+            .1;
+        let huge_maps = format!("{code}\n4000-204000 rw-p 00002000 {identity}\n");
+        f.maps_a = huge_maps.clone();
+        f.maps_b = huge_maps;
+        f.mem.set_len(0x5000).unwrap();
+        let identity = crate::discovery::identity::FileIdentity { dev: 37, ino: 9 };
+        f.mapped = Some((identity, identity));
+        let outcome = f
+            .run(&mut CaptureWorkBudget::default())
+            .expect("a partial scan names its gaps, it does not error");
+        let reasons: Vec<&str> = outcome
+            .skipped()
+            .iter()
+            .map(|skip| skip.reason.as_str())
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("read 4096 of 2097152 bytes")),
+            "the partial zero-stop names its shortfall: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains(NO_TABLE_FOUND_MARKER)),
+            "a truncated snapshot claims no verified absence: {reasons:?}"
+        );
+    }
+
     #[test]
     fn a_pointer_into_data_or_nowhere_rejects_the_whole_candidate() {
         let maps = parse_maps(

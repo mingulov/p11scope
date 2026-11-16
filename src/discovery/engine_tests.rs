@@ -70740,6 +70740,66 @@ fn retry_breakdown_sums_across_consecutive_noise_flushes() {
     assert_eq!(classes.len(), 2, "only nonzero classes appear: {classes:?}");
 }
 
+/// Retry breakdown, all flush sites: base, scan-input and stale-view noise
+/// survive the stale-view flush with no loss and no double-count, and the
+/// end-of-capture flush sums on top.
+#[test]
+fn retry_breakdown_sums_across_stale_view_and_end_of_capture_flushes() {
+    let stale = ProcessView::open(ProcessViewId(90), std::process::id()).unwrap();
+    let survivor = ProcessView::open(ProcessViewId(91), std::process::id()).unwrap();
+    let mut engine = lifecycle_discovered(vec![stale, survivor]);
+    engine.base_counters.noise.note_skip(
+        "process view",
+        "the process generation could not be retained: gone",
+    );
+    let mut scan_counters = DiscoveryCounters::default();
+    scan_counters.noise.note_skip(
+        "memory scan",
+        "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot",
+    );
+    scan_counters.noise.note_skip(
+        "memory scan",
+        "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot",
+    );
+    engine.scan_inputs.insert(
+        ProcessViewId(91),
+        ScanInput {
+            modules: Vec::new(),
+            pins: PinnedObjects::empty(),
+            counters: scan_counters,
+        },
+    );
+    remove_stale_views(&mut engine, &[ProcessViewId(90)]).unwrap();
+    let classes = engine.discovery_retry_classes();
+    assert_eq!(classes.get("process-view"), Some(&1));
+    assert_eq!(classes.get("maps-snapshot"), Some(&2));
+    assert_eq!(classes.get("stale-view"), Some(&1));
+    assert_eq!(classes.len(), 3, "no loss, no double-count: {classes:?}");
+    assert!(
+        engine.counters.noise.is_empty(),
+        "the stale flush clears the live accumulator"
+    );
+    assert!(
+        engine.base_counters.noise.is_empty(),
+        "the stale flush clears the base accumulator"
+    );
+    engine.counters.noise.note_skip(
+        "process view",
+        "the process generation could not be scanned: gone",
+    );
+    engine.counters.noise.note_skip(
+        "live discovery generation",
+        "candidate generation exited before mutation; canonical identity, plan, and links were unchanged",
+    );
+    engine.report_discovery_noise();
+    let classes = engine.discovery_retry_classes();
+    assert_eq!(classes.get("process-view"), Some(&2));
+    assert_eq!(classes.get("maps-snapshot"), Some(&2));
+    assert_eq!(classes.get("stale-view"), Some(&1));
+    assert_eq!(classes.get("process-ended"), Some(&1));
+    assert_eq!(classes.len(), 4, "cross-flush summation: {classes:?}");
+}
+
 /// T4a helper: service collected Finish until the boxed graph reaches
 /// `phase`. Panics on the 30 s guard when the phase never arrives.
 fn drive_engine_graph_to_phase(

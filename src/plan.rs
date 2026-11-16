@@ -1455,7 +1455,11 @@ struct ReclaimTarget<'a> {
 /// retired index only when it is the same exact target, or — for a new pin
 /// of the same file — the same file offset, path, names and descriptor,
 /// with a positive file identity match on both sides. A missing identity
-/// never reclaims: path names are not identity. Aggregated ownership is
+/// never reclaims: path names are not identity. A return onto a
+/// count-only retired cell reoccupies it as count-only (extend forces the
+/// shape, the way the kept path keeps a count-only cell's descriptor at
+/// zero), so flip-flopping generations reuse one index instead of burning
+/// a fresh slot per alternation. Aggregated ownership is
 /// applied separately (a reclaim that would make a semantic cell ambiguous
 /// downgrades it to count-only and reports the ambiguity) so merge can
 /// account the same set before module IDs are resolved.
@@ -1474,10 +1478,22 @@ fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
         // way the kept path restores them over `unknown`, keeps the cell
         // count-only, and attaches a new link, so the retired cell's
         // descriptor is never applied. Anything wider or different, or any
-        // authorized/descriptor-bearing return, stays an exact-shape match
-        // only.
-        return new.descriptor_index == 0
+        // authorized/descriptor-bearing return onto a semantic cell, stays
+        // an exact-shape match only.
+        if new.descriptor_index == 0
             && !new.semantic_authorized
+            && !new.names.is_empty()
+            && new
+                .names
+                .iter()
+                .all(|name| name == UNKNOWN_FUNCTION_NAME || old.slot.names.contains(name))
+        {
+            return true;
+        }
+        // The reverse flip: a return onto its own retired count-only cell
+        // reoccupies that index — as count-only, never restoring a
+        // descriptor — instead of burning a fresh slot per alternation.
+        return old.slot.descriptor_index == 0
             && !new.names.is_empty()
             && new
                 .names
@@ -1499,7 +1515,11 @@ fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
     {
         return false;
     }
-    old.slot.descriptor_index == new.descriptor_index && old.slot.names == new.names
+    // A new pin of the same file reoccupies a count-only retired cell as
+    // count-only; names stay exact across pins, and extend forces the
+    // count-only shape.
+    (old.slot.descriptor_index == new.descriptor_index || old.slot.descriptor_index == 0)
+        && old.slot.names == new.names
 }
 
 /// Migration predicate for a same-file new pin arriving while the old pin
@@ -3464,6 +3484,15 @@ impl AttachPlan {
                 let mut updated = slot.clone();
                 updated.index = position as u32;
                 let old_slot = slots[position].clone();
+                // A return onto a count-only retired cell reoccupies it as
+                // count-only, the way the kept path keeps a count-only
+                // cell's descriptor at zero: the retired cell never regains
+                // a descriptor through reclaim.
+                if old_slot.descriptor_index == 0 {
+                    updated.descriptor_index = 0;
+                    updated.semantics = SlotSemantics::COUNT_ONLY;
+                    updated.semantic_authorized = false;
+                }
                 // A same-key count-only return may carry no names (or only a
                 // subset of the retired cell's names). Reoccupy the index the
                 // same way the kept path treats `unknown`: keep the old

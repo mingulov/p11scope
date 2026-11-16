@@ -2602,6 +2602,76 @@ impl PinnedObjects {
         Some(removed)
     }
 
+    /// Whether `module`'s own file raw and every table-entry
+    /// dependency raw already file under `view` with live committed
+    /// identities behind them. Learned tables consult this before
+    /// absorbing a proof's pins: only a module with a gap re-absorbs.
+    pub(crate) fn module_aliased_under(&self, module: &ScannedModule, view: ProcessViewId) -> bool {
+        let owned = self.raw_ownership.get(&view);
+        let aliased = |raw: &RawObjectInstance| {
+            owned.is_some_and(|owned| owned.contains(raw))
+                && self
+                    .raw_to_id
+                    .get(raw)
+                    .is_some_and(|id| self.by_id.contains_key(id))
+        };
+        let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) else {
+            return false;
+        };
+        if !aliased(&own) {
+            return false;
+        }
+        module
+            .tables
+            .iter()
+            .flat_map(|table| &table.entries)
+            .filter_map(|entry| {
+                RawObjectInstance::scanned(module, entry.object, &entry.object_path)
+            })
+            .all(|raw| aliased(&raw))
+    }
+
+    /// Files scan-owned raw aliases for `module` — its own file plus
+    /// every table-entry dependency already in `raw_to_id` — under
+    /// `view`, with pin claims keeping the entries' custody.
+    /// Run-persistent learned tables persist their bindable identity
+    /// under the reserved owner through this: the proving view's
+    /// later retirement or refresh then prunes only its own rows,
+    /// never the learned module's. Raws with no committed identity
+    /// (an absorb rejection) are skipped, so their bind still fails
+    /// loudly per entry. Idempotent: repeated calls add nothing.
+    pub(crate) fn alias_scanned_module_under(
+        &mut self,
+        module: &ScannedModule,
+        view: ProcessViewId,
+    ) {
+        self.bump_revision();
+        let mut raws = Vec::new();
+        if let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) {
+            raws.push(own);
+        }
+        for entry in module.tables.iter().flat_map(|table| &table.entries) {
+            if let Some(target) =
+                RawObjectInstance::scanned(module, entry.object, &entry.object_path)
+            {
+                raws.push(target);
+            }
+        }
+        for raw in raws {
+            let Some(id) = self.raw_to_id.get(&raw).copied() else {
+                continue;
+            };
+            if !self.by_id.contains_key(&id) {
+                continue;
+            }
+            self.raw_ownership.entry(view).or_default().insert(raw);
+            let claims = self.ownership.entry(view).or_default();
+            if !claims.pins.contains(&id) {
+                claims.pins.push(id);
+            }
+        }
+    }
+
     /// The one pin opened for a manifest object before it is absorbed into the
     /// capture set. Used only to compare that opened object with scan-owned pins.
     /// Same-id duplicates (a manifest and a pre-arm alias merged onto one
@@ -9821,10 +9891,21 @@ pub fn bind_scanned_modules(
     let mut lost = Vec::new();
     for module in modules {
         let Some(object) = pinned.id_for_scanned(module, module.key, &module.path) else {
-            lost.push(Skipped {
-                subject: module.path.clone(),
-                reason: "module has no comparable pinned identity; it was not attached".into(),
-            });
+            // A run-persistent learned module that cannot bind names
+            // the finite learned-tables row: its path-carrying skip
+            // would collapse to the generic discovery row and hide
+            // which capture input lost its tables.
+            if module.view == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID {
+                lost.push(Skipped {
+                    subject: crate::render::LEARNED_SKIP_SUBJECT.into(),
+                    reason: crate::render::LEARNED_TABLE_UNBOUND_REASON.into(),
+                });
+            } else {
+                lost.push(Skipped {
+                    subject: module.path.clone(),
+                    reason: "module has no comparable pinned identity; it was not attached".into(),
+                });
+            }
             continue;
         };
         if module.decoder_abi.is_some_and(|decoded| {

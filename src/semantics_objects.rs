@@ -622,6 +622,13 @@ pub(crate) struct AttributeList {
     /// unobserved tail, and fields not seen carry the truncation
     /// reason. Pinned by the nine-slot s2s3 twins.
     truncated: bool,
+    /// The probe only partly read this template (fix round 4): the
+    /// wire HEADER_READ_FAILURE or INVALID_SPAN bit, plumbed
+    /// through promotion. Observed cells still promote as facts;
+    /// fields not seen carry the partly-read reason, which keeps
+    /// precedence over truncation (the truncation string would
+    /// claim the first eight were captured).
+    partly_read: bool,
 }
 
 impl AttributeList {
@@ -633,21 +640,31 @@ impl AttributeList {
         Self {
             items,
             truncated: observations.len() > MAX_TEMPLATE_ATTRIBUTES,
+            partly_read: false,
         }
     }
 
-    /// Journal decode: the wire TRUNCATED bit rides beside the
-    /// retained first eight cells (the slice never holds more than
-    /// eight past the validator, so the bit — not the length —
-    /// carries the verdict here).
-    pub(crate) fn with_truncated(observations: &[AttrObservation], truncated: bool) -> Self {
+    /// Journal decode: the wire TRUNCATED and read-failure bits ride
+    /// beside the retained first eight cells (the slice never holds
+    /// more than eight past the validator, so the bits — not the
+    /// length — carry the verdict here).
+    pub(crate) fn with_flags(
+        observations: &[AttrObservation],
+        truncated: bool,
+        partly_read: bool,
+    ) -> Self {
         let mut list = Self::new(observations);
         list.truncated = list.truncated || truncated;
+        list.partly_read = partly_read;
         list
     }
 
     pub(crate) fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    pub(crate) fn partly_read(&self) -> bool {
+        self.partly_read
     }
 
     fn observations(&self) -> impl Iterator<Item = &AttrObservation> {
@@ -1135,6 +1152,22 @@ pub(crate) struct ObjectView {
     /// unclassifiable value (fix round 3). Seen-but-valueless fields
     /// name the unsupported reason, never the truncation reason.
     pub(crate) creation_seen: [bool; METADATA_FIELDS],
+    /// The view's own creation template was captured and fully read
+    /// (fix round 4): a birth fact, set once at promotion, never
+    /// cleared. The Edwards/Montgomery curve reason needs it —
+    /// query-only keys and unread templates stay reason-free.
+    pub(crate) creation_template_seen: bool,
+    /// The view's own creation template carried a header or span
+    /// read failure (fix round 4): a birth fact, set once at
+    /// promotion, never cleared. Unseen fields on such a view name
+    /// the partly-read reason.
+    pub(crate) creation_partly_read: bool,
+    /// The view is the slot-1 (private) half of a
+    /// `C_GenerateKeyPair` return (fix round 4): a birth fact, set
+    /// once at promotion, never cleared. `CKA_EC_PARAMS` lives in
+    /// the public template, so the private half never carries the
+    /// curve reason.
+    pub(crate) keypair_private: bool,
 }
 
 /// Cardinalities of retained state.

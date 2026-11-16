@@ -787,7 +787,8 @@ class ObservedRsaTests(unittest.TestCase):
                              ("template truncated "
                               "(first 8 attributes captured)",
                               "template value outside approved finite set",
-                              "curve unusable for key type"))
+                              "curve unusable for key type",
+                              "template partly read"))
         with self.subTest("v6 scalar values"):
             block = defs["metadata_block"]["properties"]
             self.assertEqual(set(ORACLE.METADATA_FIELD_VALUES_V6)

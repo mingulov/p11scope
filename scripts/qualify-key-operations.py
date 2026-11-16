@@ -69,6 +69,7 @@ OBSERVATIONS_VERSION_V2 = 2
 OBSERVATIONS_VERSION_V3 = 3
 OBSERVATIONS_VERSION_V4 = 4
 OBSERVATIONS_VERSION_V5 = 5
+OBSERVATIONS_VERSION_V6 = 6
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -108,7 +109,16 @@ METADATA_FIELD_VALUES_V5 = {
     "key_type": METADATA_FIELD_VALUES["key_type"] + (73, 74, 75),
     "parameter_set": tuple(range(1, 13)),
 }
+# H9 section v6 (R2 new-site): the CKK_HKDF key-type code 66 and the
+# 12/48 value lengths beside the v5 values; v1-v5 tables stay frozen.
+METADATA_FIELD_VALUES_V6 = {
+    **METADATA_FIELD_VALUES_V5,
+    "key_type": METADATA_FIELD_VALUES_V5["key_type"] + (66,),
+    "value_len": METADATA_FIELD_VALUES_V5["value_len"] + (12, 48),
+}
 CURVE_LABELS = ("secp256r1", "secp384r1", "secp521r1")
+# H9 section v6 (R2 new-site): the Montgomery/Edwards curve names.
+CURVE_LABELS_V6 = CURVE_LABELS + ("x25519", "x448", "ed25519", "ed448")
 QUERY_STATUSES = ("not_queried", "established", "unavailable", "size_only", "unsupported",
                   "malformed", "excluded")
 METADATA_LABELS = ("rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
@@ -137,6 +147,18 @@ PQC_METADATA_LABELS = ("ml_dsa_44", "ml_dsa_65", "ml_dsa_87",
                        "slh_dsa_sha2_256f", "slh_dsa_shake_256f")
 METADATA_LABELS_V5 = METADATA_LABELS_V4 + PQC_METADATA_LABELS
 OBJECT_LABELS_V5 = METADATA_LABELS + PQC_METADATA_LABELS
+# H9 section v6 (R2 new-site): the four Montgomery/Edwards curve
+# labels, the six HKDF size labels and the six generic-secret size
+# labels. Key rows accept the v5 labels plus all sixteen; object
+# views accept the twelve established labels plus PQC plus the
+# sixteen (`unknown` stays row-level only).
+NEWSITE_METADATA_LABELS = ("x25519", "x448", "ed25519", "ed448",
+                           "hkdf_96", "hkdf_128", "hkdf_192", "hkdf_256",
+                           "hkdf_384", "hkdf_other",
+                           "generic_96", "generic_128", "generic_192",
+                           "generic_256", "generic_384", "generic_other")
+METADATA_LABELS_V6 = METADATA_LABELS_V5 + NEWSITE_METADATA_LABELS
+OBJECT_LABELS_V6 = OBJECT_LABELS_V5 + NEWSITE_METADATA_LABELS
 CATEGORIES = ("digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "verify_recover", "message_encrypt", "message_decrypt", "message_sign",
               "message_verify", "generate_key", "generate_key_pair", "wrap", "unwrap",
@@ -186,6 +208,11 @@ BUDGET_KEYS = {"key_rows", "object_rows", "unknown_rows", "encoded_bytes",
 ROW_BUDGET_KEYS = {"limit", "occupied", "refused"}
 UNKNOWN_BUDGET_KEYS = {"occupied"}
 FIELD_KEYS = {"status", "value"}
+# H9 section v6 (keymeta §6/K5): every metadata field carries the
+# per-field `source` beside status/value; the two provenances are
+# the closed vocabulary, null is the only other spelling.
+FIELD_KEYS_V6 = {"status", "value", "source"}
+FIELD_SOURCES = ("query", "creation_success")
 MECHANISM_ROW_KEYS = {"mechanism", "mechanism_hex", "name", "operations", "calls",
                       "errors", "last_seen_ns", "evidence"}
 MECHANISM_EVIDENCE_KEYS = {"functions", "returns", "truncated"}
@@ -332,20 +359,31 @@ def read_observer_file(path):
 
 
 def _metadata_block(block, keys=METADATA_KEYS,
-                    values=METADATA_FIELD_VALUES):
+                    values=METADATA_FIELD_VALUES,
+                    curves=CURVE_LABELS,
+                    fields=FIELD_KEYS,
+                    established=False):
     _keys(block, keys)
     for name in keys:
         cell = block[name]
-        _keys(cell, FIELD_KEYS)
-        _label(cell["status"], FIELD_STATUSES, "metadata field status")
+        _keys(cell, fields)
+        status = _label(cell["status"], FIELD_STATUSES, "metadata field status")
         value = cell["value"]
         if name == "ec_params":
-            _require(value is None or (type(value) is str and value in CURVE_LABELS),
+            _require(value is None or (type(value) is str and value in curves),
                      "unexpected metadata curve")
         else:
             _require(value is None or (type(value) is int
                                        and value in values[name]),
                      "invalid metadata scalar")
+        if "source" in fields:
+            source = cell["source"]
+            if source is None:
+                continue
+            _require(type(source) is str and source in FIELD_SOURCES,
+                     "unexpected metadata source")
+            _require(established, "requested metadata carries a source")
+            _require(status == "value", "unvalued metadata carries a source")
 
 
 def _check_sessions(rows):
@@ -363,7 +401,8 @@ def _check_sessions(rows):
 
 
 def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
-                   keys=METADATA_KEYS, values=METADATA_FIELD_VALUES):
+                   keys=METADATA_KEYS, values=METADATA_FIELD_VALUES,
+                   curves=CURVE_LABELS, fields=FIELD_KEYS):
     _require(type(rows) is list, "unexpected fields")
     ids = set()
     for row in rows:
@@ -382,8 +421,8 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
         _label(row["attribution"], ATTRIBUTIONS, "object attribution")
         if row["attribution_reason"] is not None:
             _label(row["attribution_reason"], GAP_REASONS, "attribution reason")
-        _metadata_block(row["requested"], keys, values)
-        _metadata_block(row["established"], keys, values)
+        _metadata_block(row["requested"], keys, values, curves, fields, False)
+        _metadata_block(row["established"], keys, values, curves, fields, True)
         queries = row["queries"]
         _keys(queries, keys)
         for name in keys:
@@ -506,30 +545,43 @@ def check_section(section):
     version = section.get("version") if type(section) is dict else None
     _keys(section, SECTION_KEYS_V3
           if version in (OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
-                         OBSERVATIONS_VERSION_V5)
+                         OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6)
           else SECTION_KEYS)
     _require(type(version) is int
              and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
                              OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
-                             OBSERVATIONS_VERSION_V5),
+                             OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6),
              "unsupported observations version")
     roles = ROLES_V2 if version >= OBSERVATIONS_VERSION_V2 else ROLES
     creations = CREATIONS_V2 if version >= OBSERVATIONS_VERSION_V2 else CREATIONS
-    if version >= OBSERVATIONS_VERSION_V5:
+    if version >= OBSERVATIONS_VERSION_V6:
+        labels = METADATA_LABELS_V6
+        obj_labels = OBJECT_LABELS_V6
+        keys = METADATA_KEYS_V5
+        values = METADATA_FIELD_VALUES_V6
+        curves = CURVE_LABELS_V6
+        fields = FIELD_KEYS_V6
+    elif version >= OBSERVATIONS_VERSION_V5:
         labels = METADATA_LABELS_V5
         obj_labels = OBJECT_LABELS_V5
         keys = METADATA_KEYS_V5
         values = METADATA_FIELD_VALUES_V5
+        curves = CURVE_LABELS
+        fields = FIELD_KEYS
     elif version >= OBSERVATIONS_VERSION_V4:
         labels = METADATA_LABELS_V4
         obj_labels = METADATA_LABELS
         keys = METADATA_KEYS
         values = METADATA_FIELD_VALUES
+        curves = CURVE_LABELS
+        fields = FIELD_KEYS
     else:
         labels = METADATA_LABELS
         obj_labels = METADATA_LABELS
         keys = METADATA_KEYS
         values = METADATA_FIELD_VALUES
+        curves = CURVE_LABELS
+        fields = FIELD_KEYS
     unattributed = (_check_unattributed(
                         section["unattributed"],
                         allow_empty=version >= OBSERVATIONS_VERSION_V4)
@@ -540,7 +592,7 @@ def check_section(section):
     _require((reason == "none") == (status == "populated"), "status and reason disagree")
     sessions = _check_sessions(section["sessions"])
     objects = _check_objects(section["objects"], sessions, creations,
-                             obj_labels, keys, values)
+                             obj_labels, keys, values, curves, fields)
     tallies = {}
     order = []
     _require(type(section["key_operations"]) is list, "unexpected fields")

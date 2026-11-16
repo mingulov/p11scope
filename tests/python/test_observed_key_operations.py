@@ -743,6 +743,77 @@ class ObservedRsaTests(unittest.TestCase):
                     tuple(ORACLE.METADATA_FIELD_VALUES_V5[field]),
                     tuple(accepted), field)
 
+    def test_oracle_v6_tables_match_v6_schema(self):
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v6.schema.json",
+                  encoding="utf-8") as stream:
+            schema = json.load(stream)
+        defs = schema["$defs"]
+        with self.subTest("version const"):
+            self.assertEqual(schema["properties"]["version"]["const"], 6)
+            self.assertEqual(ORACLE.OBSERVATIONS_VERSION_V6, 6)
+        with self.subTest("METADATA_LABELS_V6"):
+            self.assertEqual(set(ORACLE.METADATA_LABELS_V6),
+                             set(defs["metadata_label"]["enum"]))
+            self.assertEqual(tuple(ORACLE.METADATA_LABELS_V6),
+                             tuple(ORACLE.METADATA_LABELS_V5)
+                             + tuple(ORACLE.NEWSITE_METADATA_LABELS))
+            self.assertEqual(len(ORACLE.NEWSITE_METADATA_LABELS), 16)
+        with self.subTest("OBJECT_LABELS_V6"):
+            label = defs["object_row"]["properties"]["label"]["enum"]
+            self.assertEqual(set(ORACLE.OBJECT_LABELS_V6),
+                             set(label) - {None})
+            self.assertEqual(tuple(ORACLE.OBJECT_LABELS_V6),
+                             tuple(ORACLE.OBJECT_LABELS_V5)
+                             + tuple(ORACLE.NEWSITE_METADATA_LABELS))
+        with self.subTest("FIELD_KEYS_V6"):
+            self.assertEqual(set(ORACLE.FIELD_KEYS), {"status", "value"})
+            self.assertEqual(set(ORACLE.FIELD_KEYS_V6),
+                             {"status", "value", "source"})
+            for name in ("metadata_field_class", "metadata_field_key_type",
+                         "metadata_field_token", "metadata_field_value_len",
+                         "metadata_field_modulus_bits", "metadata_field_curve",
+                         "metadata_field_parameter_set"):
+                cell = defs[name]
+                self.assertEqual(set(cell["required"]),
+                                 set(ORACLE.FIELD_KEYS_V6), name)
+                self.assertEqual(set(cell["properties"]["source"]["enum"]),
+                                 set(ORACLE.FIELD_SOURCES) | {None}, name)
+            self.assertEqual(tuple(ORACLE.FIELD_SOURCES),
+                             ("query", "creation_success"))
+        with self.subTest("v6 scalar values"):
+            block = defs["metadata_block"]["properties"]
+            self.assertEqual(set(ORACLE.METADATA_FIELD_VALUES_V6)
+                             | {"ec_params"},
+                             set(block))
+            key_type = defs["metadata_field_key_type"]["properties"]["value"]["enum"]
+            self.assertEqual(
+                set(ORACLE.METADATA_FIELD_VALUES_V6["key_type"]),
+                set(key_type) - {None})
+            self.assertEqual(
+                tuple(ORACLE.METADATA_FIELD_VALUES_V6["key_type"]),
+                tuple(ORACLE.METADATA_FIELD_VALUES_V5["key_type"]) + (66,))
+            value_len = defs["metadata_field_value_len"]["properties"]["value"]["enum"]
+            self.assertEqual(
+                set(ORACLE.METADATA_FIELD_VALUES_V6["value_len"]),
+                set(value_len) - {None})
+            self.assertEqual(
+                tuple(ORACLE.METADATA_FIELD_VALUES_V6["value_len"]),
+                tuple(ORACLE.METADATA_FIELD_VALUES_V5["value_len"])
+                + (12, 48))
+            for field, accepted in ORACLE.METADATA_FIELD_VALUES_V5.items():
+                if field in ("key_type", "value_len"):
+                    continue
+                self.assertEqual(
+                    tuple(ORACLE.METADATA_FIELD_VALUES_V6[field]),
+                    tuple(accepted), field)
+        with self.subTest("CURVE_LABELS_V6"):
+            curve = defs["metadata_field_curve"]["properties"]["value"]["enum"]
+            self.assertEqual(set(ORACLE.CURVE_LABELS_V6), set(curve) - {None})
+            self.assertEqual(tuple(ORACLE.CURVE_LABELS_V6),
+                             tuple(ORACLE.CURVE_LABELS)
+                             + ("x25519", "x448", "ed25519", "ed448"))
+
     def test_h9_v5_section_checks_structurally(self):
         # v5 shape with the cell's RSA key rows: the PQC content rides
         # the object views (key_type 74, parameter_set 2, ml_dsa_65
@@ -821,11 +892,115 @@ class ObservedRsaTests(unittest.TestCase):
                                         "unexpected object metadata label"):
                 ORACLE.check_section(mutated)
         with self.subTest("unknown versions refused"):
-            for version in (0, 6, 99):
+            for version in (0, 7, 99):
                 mutated = copy.deepcopy(section)
                 mutated["version"] = version
                 with self.assertRaises(ORACLE.OracleRefusal):
                     ORACLE.check_section(mutated)
+
+    def test_h9_v6_section_checks_structurally(self):
+        # v6 shape with the cell's RSA key rows: the new-site content
+        # rides the object views (key_type 66, value_len 48, hkdf_384
+        # object label, creation_success sources). Requested value
+        # cells and non-value established cells carry null sources.
+        # Key rows carry the cell pin (rsa_2048): a new-site key row
+        # is accepted by the v6 vocabulary and then refused by name,
+        # never as an unsupported version.
+        section = observed("clean.json")
+        section["version"] = 6
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for name, block in (("requested", row["requested"]),
+                                ("established", row["established"])):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None, "source": None}
+                for cell_name, cell in block.items():
+                    if cell_name == "parameter_set":
+                        continue
+                    if name == "established" and cell["status"] == "value":
+                        cell["source"] = "query"
+                    else:
+                        cell["source"] = None
+            row["queries"]["parameter_set"] = "not_queried"
+        promoted = section["objects"][0]
+        promoted["established"]["key_type"] = {"status": "value",
+                                               "value": 66,
+                                               "source": "creation_success"}
+        promoted["established"]["value_len"] = {"status": "value",
+                                                "value": 48,
+                                                "source": "creation_success"}
+        promoted["queries"]["key_type"] = "not_queried"
+        promoted["queries"]["value_len"] = "not_queried"
+        promoted["label"] = "hkdf_384"
+        with self.subTest("v6 shape checks"):
+            facts = ORACLE.check_section(copy.deepcopy(section))
+            self.assertEqual(len(facts["rows"]), 2)
+            self.assertEqual(len(facts["unknown"]), 0)
+        with self.subTest("new-site key rows fail by name, never by version"):
+            mutated = copy.deepcopy(section)
+            mutated["key_operations"][0]["metadata_at_use"] = "hkdf_384"
+            with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                ORACLE.check_section(mutated)
+            self.assertIn("unexpected key metadata", str(caught.exception))
+            self.assertNotIn("unsupported observations version",
+                             str(caught.exception))
+        with self.subTest("v6 content at v5 refused"):
+            mutated = copy.deepcopy(section)
+            mutated["version"] = 5
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("v6 with two-key cells refused"):
+            mutated = copy.deepcopy(section)
+            for row in mutated["objects"]:
+                for block in (row["requested"], row["established"]):
+                    for cell in block.values():
+                        del cell["source"]
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("unlisted source refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][0]["established"]["key_type"]["source"] = \
+                "mechanism"
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "unexpected metadata source"):
+                ORACLE.check_section(mutated)
+        with self.subTest("requested creation_success refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][0]["requested"]["key_type"]["source"] = \
+                "creation_success"
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "requested metadata carries a source"):
+                ORACLE.check_section(mutated)
+        with self.subTest("source on a non-value refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][0]["established"]["ec_params"]["source"] = "query"
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "unvalued metadata carries a source"):
+                ORACLE.check_section(mutated)
+        with self.subTest("HKDF key type below v6 refused"):
+            mutated = copy.deepcopy(section)
+            mutated["version"] = 5
+            for row in mutated["objects"]:
+                for block in (row["requested"], row["established"]):
+                    for cell in block.values():
+                        del cell["source"]
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "invalid metadata scalar"):
+                ORACLE.check_section(mutated)
+        with self.subTest("HKDF object label below v6 refused"):
+            mutated = copy.deepcopy(section)
+            mutated["version"] = 5
+            mutated["objects"][0]["established"]["key_type"] = {
+                "status": "value", "value": 0x1f, "source": None}
+            mutated["objects"][0]["established"]["value_len"] = {
+                "status": "value", "value": 32, "source": None}
+            for row in mutated["objects"]:
+                for block in (row["requested"], row["established"]):
+                    for cell in block.values():
+                        del cell["source"]
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "unexpected object metadata label"):
+                ORACLE.check_section(mutated)
 
 
 # S1 twins: the installed RSA capture as v0.5.0 reports it (no key-operation

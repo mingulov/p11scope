@@ -16,12 +16,12 @@
 
 use super::{
     AffectedScope, AsyncValue, AttributeList, Attribution, Birth, CallKey, CallToken,
-    CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
-    HandleInput, KeyLabel, KnownScope, Lifetime, LostOutcome, METADATA_FIELDS, MechanismEvidence,
-    MetadataView, ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId,
-    ObjectLimits, ObjectProjection, ObjectView, OriginFact, OutputEvidence, QueryStatus,
-    ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState,
-    SessionView, SlotScope, StateEstimate, StateUsage, ViewOrigin, field_index,
+    CompleteInputPrefix, CompletedFact, CreationFamily, FieldSource, FieldState, FieldValue,
+    FindResult, HandleInput, KeyLabel, KnownScope, Lifetime, LostOutcome, METADATA_FIELDS,
+    MechanismEvidence, MetadataView, ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap,
+    ObjectHandle, ObjectId, ObjectLimits, ObjectProjection, ObjectView, OriginFact, OutputEvidence,
+    QueryStatus, ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin,
+    SessionState, SessionView, SlotScope, StateEstimate, StateUsage, ViewOrigin, field_index,
 };
 use crate::semantics::{KNOWN_CANCEL_FLAGS, cancel_operation_mask, direct_cancel_flag};
 use p11scope_ebpf_common::object_policy::{
@@ -480,6 +480,10 @@ struct ViewRecord {
     pair_mate: Option<ObjectId>,
     requested: [FieldState; METADATA_FIELDS],
     established: [FieldState; METADATA_FIELDS],
+    /// Per-field provenance for the established slots (keymeta §6/K5):
+    /// which proof established each `Value` — a query read or a
+    /// creation-success promotion. `None` for every other state.
+    established_source: [Option<FieldSource>; METADATA_FIELDS],
     queries: [QueryStatus; METADATA_FIELDS],
 }
 
@@ -509,12 +513,15 @@ impl ViewRecord {
         }
         let key_type = scalar(SafeAttributeKind::KeyType)?;
         // An established class incompatible with the key type withholds
-        // the combined label: AES and generic_secret need secret_key;
-        // RSA and EC need public_key or private_key. Unknown and
-        // invalidated classes are not established and do not block.
+        // the combined label: AES, generic_secret and HKDF need
+        // secret_key; RSA and EC need public_key or private_key.
+        // Unknown and invalidated classes are not established and do
+        // not block.
         if let Some(class) = scalar(SafeAttributeKind::Class) {
             let compatible = match key_type {
-                0x1f | 0x10 => class == 4,
+                // R2 new-site: HKDF keys are secret-key objects, like
+                // AES and generic_secret.
+                0x1f | 0x10 | 0x42 => class == 4,
                 0x00 | 0x03 => class == 2 || class == 3,
                 // F16 (7.05 PQC): ML-KEM/ML-DSA/SLH-DSA keys are
                 // public/private-key objects, like RSA/EC.
@@ -529,6 +536,13 @@ impl ViewRecord {
             0x1f => {
                 scalar(SafeAttributeKind::ValueLen).map(|value_len| KeyLabel::Aes { value_len })
             }
+            // R2 new-site: HKDF and generic-secret labels join the
+            // established key type with the established byte size.
+            0x42 => {
+                scalar(SafeAttributeKind::ValueLen).map(|value_len| KeyLabel::Hkdf { value_len })
+            }
+            0x10 => scalar(SafeAttributeKind::ValueLen)
+                .map(|value_len| KeyLabel::GenericSecret { value_len }),
             0x00 => scalar(SafeAttributeKind::ModulusBits)
                 .map(|modulus_bits| KeyLabel::Rsa { modulus_bits }),
             0x03 => match field(SafeAttributeKind::EcParams) {
@@ -2189,6 +2203,7 @@ impl ModelState {
                 pair_mate: None,
                 requested,
                 established: [FieldState::Unknown; METADATA_FIELDS],
+                established_source: [None; METADATA_FIELDS],
                 queries: [QueryStatus::NotQueried; METADATA_FIELDS],
             },
         );
@@ -3207,6 +3222,35 @@ impl ModelState {
                         object: id,
                         session,
                     });
+                    // R2 new-site (allowlist-v3 R2 amendment): a
+                    // successful creation return promotes the fresh
+                    // view's finite requested facts to established,
+                    // except `CKA_TOKEN` (token persistence stays
+                    // query-established). Success means the provider
+                    // honored the exact finite template or failed the
+                    // call; unknown/conflict shapes never promote.
+                    // No MetadataEstablished effect: the Created
+                    // effect marks the call, and queries stay
+                    // NotQueried (no attribute was read back). Later
+                    // queries conflict/invalidate through `establish`.
+                    // Promoted facts record source `creation_success`
+                    // per field (keymeta §6/K5).
+                    if let Some(view) = self.objects.get_mut(&id) {
+                        for kind in [
+                            SafeAttributeKind::Class,
+                            SafeAttributeKind::KeyType,
+                            SafeAttributeKind::ValueLen,
+                            SafeAttributeKind::ModulusBits,
+                            SafeAttributeKind::EcParams,
+                            SafeAttributeKind::ParameterSet,
+                        ] {
+                            let index = field_index(kind);
+                            if let FieldState::Value(value) = view.requested[index] {
+                                view.established[index] = FieldState::Value(value);
+                                view.established_source[index] = Some(FieldSource::CreationSuccess);
+                            }
+                        }
+                    }
                 }
                 Err(reason) => {
                     self.set_binding(call.domain, session, handle, None);
@@ -3493,8 +3537,12 @@ impl ModelState {
             view.established[index] = match view.established[index] {
                 FieldState::Unknown | FieldState::Invalidated(_) => {
                     established = true;
+                    // Keymeta §6/K5: a query read proves this field.
+                    view.established_source[index] = Some(FieldSource::Query);
                     FieldState::Value(value)
                 }
+                // A confirming query keeps the first establisher: a
+                // promoted fact never changes source silently.
                 FieldState::Value(old) if old == value => FieldState::Value(old),
                 // Conflict, never last-writer-wins: the earlier value stays
                 // as history.
@@ -4562,9 +4610,11 @@ impl ModelState {
                 key_uses: v.key_uses,
                 requested: MetadataView {
                     fields: v.requested,
+                    sources: [None; METADATA_FIELDS],
                 },
                 established: MetadataView {
                     fields: v.established,
+                    sources: v.established_source,
                 },
                 queries: v.queries,
                 label: self.resolved_label(*id),
@@ -4938,6 +4988,7 @@ mod tests {
             pair_mate: None,
             requested: [FieldState::Unknown; METADATA_FIELDS],
             established,
+            established_source: [None; METADATA_FIELDS],
             queries: [QueryStatus::NotQueried; METADATA_FIELDS],
         }
     }

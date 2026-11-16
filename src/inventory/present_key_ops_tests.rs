@@ -95,6 +95,7 @@ fn object_row(object: u64) -> ObjectRow {
         status: "absent",
         scalar: None,
         curve: None,
+        source: None,
     };
     let block = MetadataBlock {
         class: blank,
@@ -1026,11 +1027,13 @@ fn key_ops_line_carries_no_object_identity() {
         status: "value",
         scalar: Some(42421),
         curve: None,
+        source: None,
     };
     row.established.ec_params = MetadataField {
         status: "value",
         scalar: None,
         curve: Some("secp384r1"),
+        source: Some("query"),
     };
     observations.objects.push(row);
     let mut key = key_row("sign", "key", 2, 0, 1, "operations");

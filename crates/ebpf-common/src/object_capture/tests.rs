@@ -245,6 +245,15 @@ const SEL_SEED: u64 = 0x0637;
 const EC_P256: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 const EC_P384: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22];
 const EC_P521: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23];
+// R2 new-site reviewed encodings: the measured 11-byte X25519 OID
+// plus one RFC 8410 5-byte form per family.
+const EC_X25519_DRAFT: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01,
+];
+const EC_X25519: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6e];
+const EC_X448: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6f];
+const EC_ED25519: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
+const EC_ED448: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x71];
 
 use attr_kind as ak;
 use attr_list_flag as alf;
@@ -1114,6 +1123,10 @@ const DERIVE_POSITIVES: &[(u64, ScalarDeriveMechanism, u8)] = &[
     (0x393, ScalarDeriveMechanism::Sha256, 2),
     (0x1050, ScalarDeriveMechanism::Ecdh1, 3),
     (0x1051, ScalarDeriveMechanism::Ecdh1Cofactor, 4),
+    // R2 new-site reviewed rows: HKDF derive/data and concatenation.
+    (0x402a, ScalarDeriveMechanism::HkdfDerive, 5),
+    (0x402b, ScalarDeriveMechanism::HkdfData, 6),
+    (0x360, ScalarDeriveMechanism::ConcatBaseAndKey, 7),
 ];
 
 /// Successful ignored-`phKey` standards (SSL3/TLS12/WTLS key-material or PRF
@@ -1147,7 +1160,7 @@ fn object_producer_derive_guard_precedes_all_reads() {
     const PHKEY_SENTINEL: u64 = 0xDEAD_BEEF;
     let derive = fid("C_DeriveKey");
 
-    // (a) All four positives on both layouts: exactly one entry word read
+    // (a) All seven positives on both layouts: exactly one entry word read
     // (nested parameter canaries untouched), retention, template access,
     // matching return evidence and one `phKey` read.
     for (mechanism, expected, code) in DERIVE_POSITIVES {
@@ -2169,8 +2182,17 @@ fn object_producer_attributes_full_width_and_no_read() {
         }
     }
 
-    // (c) Curves: exact bytes only, lengths 7/10, nothing else.
-    for (bytes, curve) in [(EC_P256, 1u16), (EC_P384, 2), (EC_P521, 3)] {
+    // (c) Curves: exact bytes only, lengths 5/7/10/11, nothing else.
+    for (bytes, curve) in [
+        (EC_P256, 1u16),
+        (EC_P384, 2),
+        (EC_P521, 3),
+        (EC_X25519_DRAFT, 4),
+        (EC_X25519, 4),
+        (EC_X448, 5),
+        (EC_ED25519, 6),
+        (EC_ED448, 7),
+    ] {
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             let w = layout.word_bytes() as u64;
             let target = fresh(w);
@@ -2227,7 +2249,7 @@ fn object_producer_attributes_full_width_and_no_read() {
         assert_eq!(outcome.cells[0].status, ast::UNSUPPORTED, "len {len}");
         assert_eq!(outcome.cells[0].value, 0);
     }
-    for len in [0u64, 1, 6, 8, 9, 11, 16] {
+    for len in [0u64, 1, 6, 8, 9, 12, 16] {
         let target = fresh_lp64();
         prog_attr(&target, 0x5000, 0, 8, SEL_ECPARAMS, 0x9000, len);
         let (mut read_word, mut read_bytes) = readers(&target);

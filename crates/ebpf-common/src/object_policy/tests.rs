@@ -20,11 +20,11 @@ const SCALARS: &[(SafeAttributeKind, &[u64])] = &[
     (
         SafeAttributeKind::KeyType,
         &[
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x49, 0x4a, 0x4b,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x42, 0x49, 0x4a, 0x4b,
         ],
     ),
     (SafeAttributeKind::Token, &[0, 1]),
-    (SafeAttributeKind::ValueLen, &[16, 24, 32]),
+    (SafeAttributeKind::ValueLen, &[12, 16, 24, 32, 48]),
     (
         SafeAttributeKind::ModulusBits,
         &[1024, 2048, 3072, 4096, 8192],
@@ -50,6 +50,18 @@ const CURVES: &[(&[u8], SafeCurve)] = &[
         &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23],
         SafeCurve::Secp521r1,
     ),
+    // R2 new-site reviewed rows: the measured 11-byte draft-josefsson
+    // Curve25519 OID plus the four RFC 8410 5-byte OIDs.
+    (
+        &[
+            0x06, 0x09, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01,
+        ],
+        SafeCurve::X25519,
+    ),
+    (&[0x06, 0x03, 0x2b, 0x65, 0x6e], SafeCurve::X25519),
+    (&[0x06, 0x03, 0x2b, 0x65, 0x6f], SafeCurve::X448),
+    (&[0x06, 0x03, 0x2b, 0x65, 0x70], SafeCurve::Ed25519),
+    (&[0x06, 0x03, 0x2b, 0x65, 0x71], SafeCurve::Ed448),
 ];
 
 const DERIVE: &[(u64, ScalarDeriveMechanism)] = &[
@@ -57,6 +69,10 @@ const DERIVE: &[(u64, ScalarDeriveMechanism)] = &[
     (0x393, ScalarDeriveMechanism::Sha256),
     (0x1050, ScalarDeriveMechanism::Ecdh1),
     (0x1051, ScalarDeriveMechanism::Ecdh1Cofactor),
+    // R2 new-site reviewed rows: HKDF derive/data and concatenation.
+    (0x402a, ScalarDeriveMechanism::HkdfDerive),
+    (0x402b, ScalarDeriveMechanism::HkdfData),
+    (0x360, ScalarDeriveMechanism::ConcatBaseAndKey),
 ];
 
 // Mutation caught: any additional selector or scalar permission, including an
@@ -96,7 +112,7 @@ fn s2s3_key_types_pin_oasis_numbers() {
     // F16 (7.05 PQC) reviewed values: CKK_ML_KEM/CKK_ML_DSA/CKK_SLH_DSA
     // from OASIS PKCS #11 3.2 sections 6.67.1/6.68.1/6.69.1.
     const ACCEPTED: &[u64] = &[
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x49, 0x4a, 0x4b,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x42, 0x49, 0x4a, 0x4b,
     ];
     for value in ACCEPTED {
         assert_eq!(
@@ -123,7 +139,7 @@ fn s2s3_safe_lengths_follow_target_width() {
             for len in 0..=16 {
                 let expected = match kind {
                     SafeAttributeKind::Token => len == 1,
-                    SafeAttributeKind::EcParams => len == 7 || len == 10,
+                    SafeAttributeKind::EcParams => len == 5 || len == 7 || len == 10 || len == 11,
                     _ => len == word,
                 };
                 assert_eq!(
@@ -192,7 +208,7 @@ fn s2s3_classification_rejects_high_bits() {
             for (layout, word) in [(LinuxLayout::Lp64, 8), (LinuxLayout::Ilp32, 4)] {
                 let lengths: &[u64] = match kind {
                     SafeAttributeKind::Token => &[1],
-                    SafeAttributeKind::EcParams => &[7, 10],
+                    SafeAttributeKind::EcParams => &[5, 7, 10, 11],
                     _ => core::slice::from_ref(&word),
                 };
                 for &len in lengths {

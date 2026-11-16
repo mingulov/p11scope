@@ -1984,6 +1984,28 @@ pub(crate) fn metadata_label(label: crate::semantics_objects::KeyLabel) -> &'sta
             SafeCurve::Secp256r1 => "ec_p256",
             SafeCurve::Secp384r1 => "ec_p384",
             SafeCurve::Secp521r1 => "ec_p521",
+            // R2 new-site: Montgomery/Edwards curve names.
+            SafeCurve::X25519 => "x25519",
+            SafeCurve::X448 => "x448",
+            SafeCurve::Ed25519 => "ed25519",
+            SafeCurve::Ed448 => "ed448",
+        },
+        // R2 new-site: HKDF and generic-secret sizes in bits.
+        KeyLabel::Hkdf { value_len } => match value_len {
+            12 => "hkdf_96",
+            16 => "hkdf_128",
+            24 => "hkdf_192",
+            32 => "hkdf_256",
+            48 => "hkdf_384",
+            _ => "hkdf_other",
+        },
+        KeyLabel::GenericSecret { value_len } => match value_len {
+            12 => "generic_96",
+            16 => "generic_128",
+            24 => "generic_192",
+            32 => "generic_256",
+            48 => "generic_384",
+            _ => "generic_other",
         },
         // F16 (7.05 PQC): the closed eighteen-value vocabulary,
         // exhaustive by construction (see `PqcCode`).
@@ -2040,6 +2062,13 @@ fn usable_label(receipt: &KeyReceipt) -> Option<&'static str> {
                 | (1 << crate::semantics_objects::field_index(SafeAttributeKind::KeyType))
                 | (1 << crate::semantics_objects::field_index(SafeAttributeKind::EcParams))
         }
+        // R2 new-site: HKDF and generic-secret labels need their
+        // class, key type and value length all non-conflicting.
+        KeyLabel::Hkdf { .. } | KeyLabel::GenericSecret { .. } => {
+            (1 << crate::semantics_objects::field_index(SafeAttributeKind::Class))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::KeyType))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::ValueLen))
+        }
         // F16 (7.05 PQC): a usable PQC label needs its class, key
         // type and parameter set all non-conflicting.
         KeyLabel::Pqc(..) => {
@@ -2057,14 +2086,16 @@ fn usable_label(receipt: &KeyReceipt) -> Option<&'static str> {
 /// The metadata label a receipt rows under: its usable established
 /// label, or — for any proved object (first-observed under DEMO-4
 /// late attach, or created in the observed window but never given an
-/// established type/size, such as a generic-secret HMAC key or a key
-/// whose attributes were never read back) with valid attribution, no
-/// established label and no metadata conflict — the honest `unknown`
-/// label. The per-key row is kept with the object id and its exact
-/// counts; no type or size is guessed (requested-only sizes still
-/// never label). Calls happened on a proved key, so its row shows.
-/// Later learned metadata never rewrites this snapshot: a later use
-/// after an established attribute read buckets under its own label.
+/// established type/size, such as a key whose creation template
+/// omitted the type or whose attributes were never read back) with
+/// valid attribution, no established label and no metadata conflict
+/// — the honest `unknown` label. The per-key row is kept with the
+/// object id and its exact counts; no type or size is guessed
+/// (incomplete requested triples still never label; complete ones
+/// establish on successful creation per the v3 R2 amendment). Calls
+/// happened on a proved key, so its row shows. Later learned
+/// metadata never rewrites this snapshot: a later use after an
+/// established attribute read buckets under its own label.
 fn row_label(receipt: &KeyReceipt) -> Option<&'static str> {
     if let Some(label) = usable_label(receipt) {
         return Some(label);

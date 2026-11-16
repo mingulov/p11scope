@@ -1139,16 +1139,23 @@ contracts are
 [inventory-v1-object-observations-v3.schema.json](inventory-v1-object-observations-v3.schema.json)
 (section version 3),
 [inventory-v1-object-observations-v4.schema.json](inventory-v1-object-observations-v4.schema.json)
-(section version 4) and
+(section version 4),
 [inventory-v1-object-observations-v5.schema.json](inventory-v1-object-observations-v5.schema.json)
-(section version 5); consumers must reject unknown section versions,
+(section version 5) and
+[inventory-v1-object-observations-v6.schema.json](inventory-v1-object-observations-v6.schema.json)
+(section version 6); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` follows the content: 5 iff PQC content is present — a
+- `version` follows the content: 6 iff new-site content is present —
+  a new-site `metadata_at_use` or object label (`x25519`, `x448`,
+  `ed25519`, `ed448`, `hkdf_*`, `generic_*`), the HKDF key-type
+  scalar (66, requested or established), a 12/48 value length, a
+  new curve name, or any established field with a non-`query`
+  source — else 5 iff PQC content is present — a
   PQC `metadata_at_use` or object label, a PQC key-type scalar
   (73, 74 or 75, requested or established), a non-blank
   `parameter_set` field, or a `parameter_set` query other than
@@ -1156,15 +1163,16 @@ never imply S1 loss.
   `unknown` metadata label (a proved key with valid attribution and
   no metadata conflict that has no usable label: a first-observed key
   — first seen before attach — or a key created in the window whose
-  type/size were never established, such as a generic-secret HMAC
-  key; its identity and counts are proved, no label is guessed),
+  type/size were never established, such as a keypair template that
+  omitted the key type; its identity and counts are proved, no label
+  is guessed),
   else 3 iff an `unattributed` counter is present, else 2 iff a KEM
   creation (`encapsulate`, `decapsulate`) or role
   (`encapsulation_key`, `decapsulation_key`) label is present,
-  otherwise byte-stable 1. Versions 1, 2, 3 and 4 are frozen;
+  otherwise byte-stable 1. Versions 1, 2, 3, 4 and 5 are frozen;
   version 1 never carries KEM labels and neither 1 nor 2 carries
-  `unattributed`; versions 4 and 5 always carry `unattributed`
-  (possibly empty), and version 5 always carries the seven-key
+  `unattributed`; versions 4, 5 and 6 always carry `unattributed`
+  (possibly empty), and versions 5 and 6 always carry the seven-key
   metadata blocks. A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
@@ -1189,31 +1197,45 @@ never imply S1 loss.
   token inventory.
 - `requested`/`established` each hold the fixed metadata slots —
   six at section versions 1–4 (`class`, `key_type`, `token`,
-  `value_len`, `modulus_bits`, `ec_params`), seven at version 5
+  `value_len`, `modulus_bits`, `ec_params`), seven at versions 5–6
   (plus `parameter_set`) — every slot `{status, value}` with
-  `status` one of `unknown`, `value`, `conflict` or `invalidated`.
+  `status` one of `unknown`, `value`, `conflict` or `invalidated`,
+  plus `source` at version 6 (`query`, `creation_success` or null:
+  how the field was established — a provider attribute-result read
+  or a successful creation return promoting its own finite
+  template; null unless `status` is `value`, and requested blocks
+  always carry null).
   A `value` carries the accepted numeric code or null: class 0-4,
-  key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (73, 74, 75 for ML-KEM,
-  ML-DSA, SLH-DSA at version 5; OASIS numbers), token 0 or 1,
-  value length 16, 24 or 32 bytes, modulus bits 1024, 2048, 3072,
-  4096 or 8192, the EC curve name (`secp256r1`, `secp384r1`,
-  `secp521r1`) or null, and the parameter-set code 1..=12 at
-  version 5. Labels are presentation names; JSON carries numeric
-  codes. Requested metadata never establishes result properties;
-  conflicting duplicates stay conflicts, never last-writer-wins.
+  key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at version 6;
+  73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–6; OASIS
+  numbers), token 0 or 1, value length 12, 16, 24, 32 or 48 bytes
+  (16/24/32 at versions 1–5), modulus bits 1024, 2048, 3072,
+  4096 or 8192, the curve name (`secp256r1`, `secp384r1`,
+  `secp521r1`, plus `x25519`, `x448`, `ed25519`, `ed448` at
+  version 6) or null, and the parameter-set code 1..=12 at
+  versions 5–6. Labels are presentation names; JSON carries numeric
+  codes. Since version 6, a successful creation return promotes its
+  own complete finite template to established (requested `CKA_TOKEN`,
+  unknown/conflict shapes and incomplete triples still never
+  establish); conflicting duplicates stay conflicts, never
+  last-writer-wins.
 - `queries` holds the per-field latest query outcome (`not_queried`,
   `established`, `unavailable`, `size_only`, `unsupported`,
   `malformed`, `excluded`), distinct from current validity, over
-  the six metadata fields (seven at section version 5).
+  the six metadata fields (seven at section versions 5–6).
 - `label` is the combined key label from established facts of the same
   view only (`rsa_1024`, `rsa_2048`, `rsa_3072`, `rsa_4096`,
   `rsa_other`, `aes_128`, `aes_192`, `aes_256`, `aes_other`,
-  `ec_p256`, `ec_p384`, `ec_p521`, and at section version 5 the
+  `ec_p256`, `ec_p384`, `ec_p521`, at section version 5 the
   eighteen PQC labels `ml_dsa_44`, `ml_dsa_65`, `ml_dsa_87`,
   `ml_kem_512`, `ml_kem_768`, `ml_kem_1024` and the twelve
-  `slh_dsa_*` sets) or null. It is withheld when class
+  `slh_dsa_*` sets, and at section version 6 the sixteen new-site
+  labels `x25519`, `x448`, `ed25519`, `ed448`, `hkdf_96`,
+  `hkdf_128`, `hkdf_192`, `hkdf_256`, `hkdf_384`, `hkdf_other`,
+  `generic_96`, `generic_128`, `generic_192`, `generic_256`,
+  `generic_384`, `generic_other`) or null. It is withheld when class
   conflicts or an established class is incompatible with the key type
-  (AES needs `secret_key`; RSA/EC/PQC need
+  (AES, generic-secret and HKDF need `secret_key`; RSA/EC/PQC need
   `public_key`/`private_key`). A PQC label joins an established
   parameter-set code with the established key type from the same
   view; a code alone, a type alone, or a recognized mechanism never

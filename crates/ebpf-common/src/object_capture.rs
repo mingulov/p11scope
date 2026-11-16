@@ -35,8 +35,10 @@ use crate::object_policy::{
     SafeAttributeKind, SafeCurve, ScalarDeriveMechanism,
 };
 use crate::object_wire::{
-    ObjectAttributeListWire, ObjectAttributeWire, OBJECT_DERIVE_DH_PKCS, OBJECT_DERIVE_ECDH1,
-    OBJECT_DERIVE_ECDH1_COFACTOR, OBJECT_DERIVE_SHA256, OBJECT_DERIVE_UNAVAILABLE,
+    ObjectAttributeListWire, ObjectAttributeWire, OBJECT_DERIVE_CONCAT_BASE_AND_KEY,
+    OBJECT_DERIVE_DH_PKCS, OBJECT_DERIVE_ECDH1, OBJECT_DERIVE_ECDH1_COFACTOR,
+    OBJECT_DERIVE_HKDF_DATA, OBJECT_DERIVE_HKDF_DERIVE, OBJECT_DERIVE_SHA256,
+    OBJECT_DERIVE_UNAVAILABLE,
 };
 use crate::{instance, target_word_end, InstanceStamp, LinuxLayout, ARG_NONE};
 
@@ -197,7 +199,7 @@ pub enum DeriveEntry {
 }
 
 impl DeriveEntry {
-    /// Finite entry-derive wire code (0..=4).
+    /// Finite entry-derive wire code (0..=7).
     pub const fn code(self) -> u8 {
         match self {
             DeriveEntry::Accepted(ScalarDeriveMechanism::DhPkcs) => OBJECT_DERIVE_DH_PKCS,
@@ -205,6 +207,11 @@ impl DeriveEntry {
             DeriveEntry::Accepted(ScalarDeriveMechanism::Ecdh1) => OBJECT_DERIVE_ECDH1,
             DeriveEntry::Accepted(ScalarDeriveMechanism::Ecdh1Cofactor) => {
                 OBJECT_DERIVE_ECDH1_COFACTOR
+            }
+            DeriveEntry::Accepted(ScalarDeriveMechanism::HkdfDerive) => OBJECT_DERIVE_HKDF_DERIVE,
+            DeriveEntry::Accepted(ScalarDeriveMechanism::HkdfData) => OBJECT_DERIVE_HKDF_DATA,
+            DeriveEntry::Accepted(ScalarDeriveMechanism::ConcatBaseAndKey) => {
+                OBJECT_DERIVE_CONCAT_BASE_AND_KEY
             }
             DeriveEntry::Unavailable => OBJECT_DERIVE_UNAVAILABLE,
         }
@@ -218,6 +225,9 @@ pub const fn derive_mechanism_code(mechanism: ScalarDeriveMechanism) -> u64 {
         ScalarDeriveMechanism::Sha256 => 0x393,
         ScalarDeriveMechanism::Ecdh1 => 0x1050,
         ScalarDeriveMechanism::Ecdh1Cofactor => 0x1051,
+        ScalarDeriveMechanism::HkdfDerive => 0x402a,
+        ScalarDeriveMechanism::HkdfData => 0x402b,
+        ScalarDeriveMechanism::ConcatBaseAndKey => 0x360,
     }
 }
 
@@ -463,6 +473,10 @@ fn safe_curve_code(curve: SafeCurve) -> u16 {
         SafeCurve::Secp256r1 => 1,
         SafeCurve::Secp384r1 => 2,
         SafeCurve::Secp521r1 => 3,
+        SafeCurve::X25519 => 4,
+        SafeCurve::X448 => 5,
+        SafeCurve::Ed25519 => 6,
+        SafeCurve::Ed448 => 7,
     }
 }
 
@@ -472,13 +486,13 @@ fn safe_curve_code(curve: SafeCurve) -> u16 {
 fn min_exact_len(kind: SafeAttributeKind, layout: LinuxLayout) -> u64 {
     match kind {
         SafeAttributeKind::Token => 1,
-        SafeAttributeKind::EcParams => 7,
+        SafeAttributeKind::EcParams => 5,
         _ => layout.word_bytes() as u64,
     }
 }
 
 /// Read and classify one established value span. `len` is the exact accepted
-/// length (token 1, EC 7/10, scalar `W`). Returns the classified code or the
+/// length (token 1, EC 5/7/10/11, scalar `W`). Returns the classified code or the
 /// failure status; unreadable means the read failed, unsupported means the
 /// bytes were read but classify to nothing.
 #[inline(always)]
@@ -497,17 +511,17 @@ fn read_classified_value(
             classify_attribute_scalar(kind, u64::from(byte[0])).ok_or(attr_status::UNSUPPORTED)
         }
         SafeAttributeKind::EcParams => {
-            if len != 7 && len != 10 {
+            if len != 5 && len != 7 && len != 10 && len != 11 {
                 return Err(attr_status::INVALID_LENGTH);
             }
             // Keep this fixed initialization in the scalar reader's frame:
             // a synthesized memset adds a level to the BPF return chain.
-            let mut storage = core::mem::MaybeUninit::<[u8; 10]>::uninit();
-            // SAFETY: the ten byte stores initialize every array element
+            let mut storage = core::mem::MaybeUninit::<[u8; 11]>::uninit();
+            // SAFETY: the eleven byte stores initialize every array element
             // before a reference is formed; this byte array has no padding.
             let buf = unsafe {
                 let bytes = storage.as_mut_ptr().cast::<u8>();
-                for index in 0..10 {
+                for index in 0..11 {
                     bytes.add(index).write_volatile(0);
                 }
                 storage.assume_init_mut()

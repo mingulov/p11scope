@@ -48,6 +48,12 @@ pub(crate) const OBSERVATIONS_VERSION_V4: u8 = 4;
 /// emits v5 exactly when PQC content is present; v1–v4 output stays
 /// byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V5: u8 = 5;
+/// Section version 6 (R2 new-site): v5 vocabulary plus the HKDF and
+/// generic-secret size labels, the Montgomery/Edwards curve labels,
+/// the CKK_HKDF key-type code, the 12/48 value lengths and the new
+/// curve names. The renderer emits v6 exactly when such content is
+/// present; v1–v5 output stays byte-stable.
+pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
 /// The metadata label of a first-observed key at use: its identity
 /// and counts are proved, its type/size are not (first seen before
 /// attach). Frozen v4 vocabulary; never a guessed label.
@@ -176,6 +182,9 @@ pub(crate) mod contract {
         "parameter_set",
     ];
     pub(crate) const FIELD_KEYS: [&str; 2] = ["status", "value"];
+    /// H9 section v6 metadata field keys (R2 new-site + keymeta
+    /// §6/K5): status/value plus the per-field `source`.
+    pub(crate) const FIELD_KEYS_V6: [&str; 3] = ["status", "value", "source"];
     pub(crate) const FIELD_STATUSES: [&str; 4] = ["unknown", "value", "conflict", "invalidated"];
     pub(crate) const QUERY_STATUSES: [&str; 7] = [
         "not_queried",
@@ -187,10 +196,23 @@ pub(crate) mod contract {
         "excluded",
     ];
     pub(crate) const CURVE_LABELS: [&str; 3] = ["secp256r1", "secp384r1", "secp521r1"];
+    /// H9 section v6 curve vocabulary (R2 new-site): the three NIST
+    /// names plus the Montgomery/Edwards names.
+    pub(crate) const CURVE_LABELS_V6: [&str; 7] = [
+        "secp256r1",
+        "secp384r1",
+        "secp521r1",
+        "x25519",
+        "x448",
+        "ed25519",
+        "ed448",
+    ];
 
     /// Frozen metadata-at-use labels: established RSA modulus bits, AES
-    /// value length in bits, EC finite curve. Requested-only sizes never
-    /// label.
+    /// value length in bits, EC finite curve. (R2 new-site: complete
+    /// finite creation templates establish on success, so these labels
+    /// now cover promoted facts too; incomplete requested triples
+    /// still never label.)
     pub(crate) const METADATA_LABELS: [&str; 12] = [
         "rsa_1024",
         "rsa_2048",
@@ -259,6 +281,59 @@ pub(crate) mod contract {
         "slh_dsa_shake_256s",
         "slh_dsa_sha2_256f",
         "slh_dsa_shake_256f",
+    ];
+
+    /// H9 section v6 metadata vocabulary (R2 new-site): the v5
+    /// labels plus the four Montgomery/Edwards curve labels, the six
+    /// HKDF size labels and the six generic-secret size labels.
+    pub(crate) const METADATA_LABELS_V6: [&str; 47] = [
+        "rsa_1024",
+        "rsa_2048",
+        "rsa_3072",
+        "rsa_4096",
+        "rsa_other",
+        "aes_128",
+        "aes_192",
+        "aes_256",
+        "aes_other",
+        "ec_p256",
+        "ec_p384",
+        "ec_p521",
+        "unknown",
+        "ml_dsa_44",
+        "ml_dsa_65",
+        "ml_dsa_87",
+        "ml_kem_512",
+        "ml_kem_768",
+        "ml_kem_1024",
+        "slh_dsa_sha2_128s",
+        "slh_dsa_shake_128s",
+        "slh_dsa_sha2_128f",
+        "slh_dsa_shake_128f",
+        "slh_dsa_sha2_192s",
+        "slh_dsa_shake_192s",
+        "slh_dsa_sha2_192f",
+        "slh_dsa_shake_192f",
+        "slh_dsa_sha2_256s",
+        "slh_dsa_shake_256s",
+        "slh_dsa_sha2_256f",
+        "slh_dsa_shake_256f",
+        "x25519",
+        "x448",
+        "ed25519",
+        "ed448",
+        "hkdf_96",
+        "hkdf_128",
+        "hkdf_192",
+        "hkdf_256",
+        "hkdf_384",
+        "hkdf_other",
+        "generic_96",
+        "generic_128",
+        "generic_192",
+        "generic_256",
+        "generic_384",
+        "generic_other",
     ];
 
     /// Frozen operation categories: 11 machine operations, 9 direct
@@ -468,16 +543,20 @@ impl ObsStatus {
 
 /// One metadata field: frozen status plus the retained observation
 /// (u16 scalar or finite curve name — never key material). Exactly
-/// one of `scalar` / `curve` applies per field kind.
+/// one of `scalar` / `curve` applies per field kind. `source` names
+/// the proof behind an established value (`query` or
+/// `creation_success`); it renders only at section version 6+ and is
+/// `None` for every other state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataField {
     pub status: &'static str,
     pub scalar: Option<u16>,
     pub curve: Option<&'static str>,
+    pub source: Option<&'static str>,
 }
 
 /// The seven fixed metadata slots, requested or established. The
-/// `parameter_set` slot renders only in section version 5 (see
+/// `parameter_set` slot renders only at v5+ (see
 /// [`observations_version`]); v1–v4 sections carry the six frozen keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataBlock {
@@ -491,7 +570,7 @@ pub(crate) struct MetadataBlock {
 }
 
 /// One query outcome per field (latest status, not validity). The
-/// `parameter_set` outcome renders only in section version 5.
+/// `parameter_set` outcome renders only at v5+.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueriesBlock {
     pub class: &'static str,
@@ -529,6 +608,38 @@ pub(crate) fn is_pqc_metadata_label(label: &str) -> bool {
             | "slh_dsa_sha2_256f"
             | "slh_dsa_shake_256f"
     )
+}
+
+/// Whether a `metadata_at_use`/object label is one of the sixteen
+/// R2 new-site labels. Part of the version trigger behind v6
+/// sections; the contract test pins agreement with
+/// `contract::METADATA_LABELS_V6`.
+pub(crate) fn is_newsite_metadata_label(label: &str) -> bool {
+    matches!(
+        label,
+        "x25519"
+            | "x448"
+            | "ed25519"
+            | "ed448"
+            | "hkdf_96"
+            | "hkdf_128"
+            | "hkdf_192"
+            | "hkdf_256"
+            | "hkdf_384"
+            | "hkdf_other"
+            | "generic_96"
+            | "generic_128"
+            | "generic_192"
+            | "generic_256"
+            | "generic_384"
+            | "generic_other"
+    )
+}
+
+/// Whether an `ec_params` block curve name is one of the four R2
+/// new-site names. Part of the version trigger behind v6 sections.
+pub(crate) fn is_newsite_curve_name(name: &str) -> bool {
+    matches!(name, "x25519" | "x448" | "ed25519" | "ed448")
 }
 
 /// One session row: public id, origin, status. No instance: the
@@ -748,8 +859,13 @@ fn measure(observations: &ObjectObservations) -> usize {
 }
 
 /// Render one metadata field: frozen status plus the scalar or the
-/// curve name (never key material).
-pub(crate) fn metadata_field_json(field: &MetadataField, curve: bool) -> serde_json::Value {
+/// curve name (never key material). The `source` key renders only
+/// at v6+: v1–v5 sections keep the two frozen keys byte-stable.
+pub(crate) fn metadata_field_json(
+    field: &MetadataField,
+    curve: bool,
+    version: u8,
+) -> serde_json::Value {
     let value = if curve {
         field
             .curve
@@ -761,30 +877,43 @@ pub(crate) fn metadata_field_json(field: &MetadataField, curve: bool) -> serde_j
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null)
     };
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "status": field.status,
         "value": value,
-    })
+    });
+    if version >= OBSERVATIONS_VERSION_V6
+        && let Some(map) = out.as_object_mut()
+    {
+        map.insert(
+            "source".to_string(),
+            field
+                .source
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    out
 }
 
 /// Render one seven-slot metadata block (requested or established).
 /// The `parameter_set` key renders only at v5+: v1–v4 sections keep
-/// the six frozen keys byte-stable.
+/// the six frozen keys byte-stable. Every field carries `source`
+/// only at v6+.
 pub(crate) fn metadata_block_json(block: &MetadataBlock, version: u8) -> serde_json::Value {
     let mut out = serde_json::json!({
-        "class": metadata_field_json(&block.class, false),
-        "key_type": metadata_field_json(&block.key_type, false),
-        "token": metadata_field_json(&block.token, false),
-        "value_len": metadata_field_json(&block.value_len, false),
-        "modulus_bits": metadata_field_json(&block.modulus_bits, false),
-        "ec_params": metadata_field_json(&block.ec_params, true),
+        "class": metadata_field_json(&block.class, false, version),
+        "key_type": metadata_field_json(&block.key_type, false, version),
+        "token": metadata_field_json(&block.token, false, version),
+        "value_len": metadata_field_json(&block.value_len, false, version),
+        "modulus_bits": metadata_field_json(&block.modulus_bits, false, version),
+        "ec_params": metadata_field_json(&block.ec_params, true, version),
     });
     if version >= OBSERVATIONS_VERSION_V5
         && let Some(map) = out.as_object_mut()
     {
         map.insert(
             "parameter_set".to_string(),
-            metadata_field_json(&block.parameter_set, false),
+            metadata_field_json(&block.parameter_set, false, version),
         );
     }
     out
@@ -914,14 +1043,14 @@ pub(crate) fn budgets_json(budgets: &ObsBudgets) -> serde_json::Value {
     })
 }
 
-/// The H9 section version for these observations: v5 iff PQC
-/// content is present (a PQC label, a PQC key-type scalar, or a
-/// non-blank parameter-set field/query), else v4 iff a key row
-/// carries the `unknown` metadata label, else v3 iff a
-/// not-attributed count is present, else v2 iff a KEM creation or
-/// role label is present, otherwise v1. The single version
-/// authority behind the JSON section, the JSONL row payloads and
-/// the pass marker.
+/// The H9 section version for these observations: v6 iff R2
+/// new-site content is present, else v5 iff PQC content is present
+/// (a PQC label, a PQC key-type scalar, or a non-blank
+/// parameter-set field/query), else v4 iff a key row carries the
+/// `unknown` metadata label, else v3 iff a not-attributed count is
+/// present, else v2 iff a KEM creation or role label is present,
+/// otherwise v1. The single version authority behind the JSON
+/// section, the JSONL row payloads and the pass marker.
 fn has_pqc_content(observations: &ObjectObservations) -> bool {
     const PQC_KEY_TYPES: [u16; 3] = [0x49, 0x4a, 0x4b];
     if observations
@@ -945,7 +1074,57 @@ fn has_pqc_content(observations: &ObjectObservations) -> bool {
     })
 }
 
+/// R2 new-site content: a new label, the HKDF key-type scalar, a
+/// 12/48 value length, or a new curve name in any row or block —
+/// or, keymeta §6/K5, any established field with a non-`query`
+/// source (a view carrying `creation_success` emits v6, never v7).
+fn has_newsite_content(observations: &ObjectObservations) -> bool {
+    if observations
+        .key_operations
+        .iter()
+        .any(|row| is_newsite_metadata_label(row.metadata_at_use))
+    {
+        return true;
+    }
+    observations.objects.iter().any(|row| {
+        row.label.is_some_and(is_newsite_metadata_label)
+            || [row.requested, row.established].iter().any(|block| {
+                block.key_type.scalar.is_some_and(|scalar| scalar == 0x42)
+                    || block
+                        .value_len
+                        .scalar
+                        .is_some_and(|scalar| scalar == 12 || scalar == 48)
+                    || block.ec_params.curve.is_some_and(is_newsite_curve_name)
+            })
+            || block_has_creation_source(&row.established)
+    })
+}
+
+/// Whether any field of one established block was proven by a
+/// successful creation return rather than a query.
+fn block_has_creation_source(block: &MetadataBlock) -> bool {
+    const CREATION_SUCCESS: &str = "creation_success";
+    [
+        block.class,
+        block.key_type,
+        block.token,
+        block.value_len,
+        block.modulus_bits,
+        block.ec_params,
+        block.parameter_set,
+    ]
+    .iter()
+    .any(|field| {
+        field
+            .source
+            .is_some_and(|source| source == CREATION_SUCCESS)
+    })
+}
+
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
+    if has_newsite_content(observations) {
+        return OBSERVATIONS_VERSION_V6;
+    }
     if has_pqc_content(observations) {
         return OBSERVATIONS_VERSION_V5;
     }
@@ -1129,9 +1308,9 @@ pub(crate) mod producer {
     use super::*;
     use crate::semantics_key_use::{FeedMode, JointStaging, KeyUseReducer};
     use crate::semantics_objects::{
-        Attribution, Birth, CreationFamily, FieldState, FieldValue, Lifetime, MetadataView,
-        ObjectGap, ObjectProjection, ObjectView, QueryStatus, SessionOrigin, SessionState,
-        SessionView, ViewOrigin, field_index,
+        Attribution, Birth, CreationFamily, FieldSource, FieldState, FieldValue, Lifetime,
+        MetadataView, ObjectGap, ObjectProjection, ObjectView, QueryStatus, SessionOrigin,
+        SessionState, SessionView, ViewOrigin, field_index,
     };
     use p11scope_ebpf_common::object_policy::{SafeAttributeKind, SafeCurve};
 
@@ -1481,17 +1660,38 @@ pub(crate) mod producer {
 
     fn metadata_block(view: &MetadataView) -> MetadataBlock {
         MetadataBlock {
-            class: metadata_field(view.field(SafeAttributeKind::Class)),
-            key_type: metadata_field(view.field(SafeAttributeKind::KeyType)),
-            token: metadata_field(view.field(SafeAttributeKind::Token)),
-            value_len: metadata_field(view.field(SafeAttributeKind::ValueLen)),
-            modulus_bits: metadata_field(view.field(SafeAttributeKind::ModulusBits)),
-            ec_params: metadata_field(view.field(SafeAttributeKind::EcParams)),
-            parameter_set: metadata_field(view.field(SafeAttributeKind::ParameterSet)),
+            class: metadata_field(
+                view.field(SafeAttributeKind::Class),
+                view.source(SafeAttributeKind::Class),
+            ),
+            key_type: metadata_field(
+                view.field(SafeAttributeKind::KeyType),
+                view.source(SafeAttributeKind::KeyType),
+            ),
+            token: metadata_field(
+                view.field(SafeAttributeKind::Token),
+                view.source(SafeAttributeKind::Token),
+            ),
+            value_len: metadata_field(
+                view.field(SafeAttributeKind::ValueLen),
+                view.source(SafeAttributeKind::ValueLen),
+            ),
+            modulus_bits: metadata_field(
+                view.field(SafeAttributeKind::ModulusBits),
+                view.source(SafeAttributeKind::ModulusBits),
+            ),
+            ec_params: metadata_field(
+                view.field(SafeAttributeKind::EcParams),
+                view.source(SafeAttributeKind::EcParams),
+            ),
+            parameter_set: metadata_field(
+                view.field(SafeAttributeKind::ParameterSet),
+                view.source(SafeAttributeKind::ParameterSet),
+            ),
         }
     }
 
-    pub(crate) fn metadata_field(state: FieldState) -> MetadataField {
+    pub(crate) fn metadata_field(state: FieldState, source: Option<FieldSource>) -> MetadataField {
         let (status, scalar, curve) = match state {
             FieldState::Unknown => ("unknown", None, None),
             FieldState::Value(FieldValue::Scalar(value)) => ("value", Some(value), None),
@@ -1501,10 +1701,18 @@ pub(crate) mod producer {
             FieldState::Conflict(value) => ("conflict", scalar_of(value), curve_of(value)),
             FieldState::Invalidated(value) => ("invalidated", scalar_of(value), curve_of(value)),
         };
+        // Keymeta §6/K5: the source rides `value` states only; every
+        // other state carries null however the slot was proven.
+        let source = if matches!(state, FieldState::Value(_)) {
+            source.map(FieldSource::label)
+        } else {
+            None
+        };
         MetadataField {
             status,
             scalar,
             curve,
+            source,
         }
     }
 
@@ -1527,6 +1735,11 @@ pub(crate) mod producer {
             SafeCurve::Secp256r1 => "secp256r1",
             SafeCurve::Secp384r1 => "secp384r1",
             SafeCurve::Secp521r1 => "secp521r1",
+            // R2 new-site: Montgomery/Edwards curve names.
+            SafeCurve::X25519 => "x25519",
+            SafeCurve::X448 => "x448",
+            SafeCurve::Ed25519 => "ed25519",
+            SafeCurve::Ed448 => "ed448",
         }
     }
 

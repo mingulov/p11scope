@@ -1124,11 +1124,15 @@ fn privileged_downgrade_in_place_object_straddle_keeps_exact_rows_lp64() -> Resu
 }
 
 /// Negative control for the straddle cell: today's detach+reattach
-/// fallback across a held object-required call is observably lossy.
-/// The return-side object lookup keys off the live (reattached
-/// count-only) cookie, misses the semantic side row, and faults, so
-/// the completion never emits and returned never bumps. In-place
-/// downgrade must show none of this.
+/// fallback across a held object-required call is observably lossy —
+/// the completion never emits and returned never bumps, on every
+/// kernel. Where the post-reattach return fires (6.12+, 7.x), the
+/// return-side object lookup keys off the live (reattached
+/// count-only) cookie, misses the semantic side row, and faults an
+/// unmatched return. On 6.6 the post-reattach return never fires at
+/// all (silent miss, no fault; observed deterministically on
+/// 6.6.157, twice). In-place downgrade must show none of this: it
+/// completes 1/1 with a joined route and no fault.
 #[test]
 #[ignore = "privileged: reattach across a held object call faults"]
 fn privileged_reattach_mid_object_call_faults_instead_of_straddling_lp64() -> Result<()> {
@@ -1196,21 +1200,36 @@ fn privileged_reattach_mid_object_call_faults_instead_of_straddling_lp64() -> Re
     }
     let (entered, returned) = downgrade_slot_stats(&harness.session, 0)?;
     let evidence_after = object_call_evidence(&harness.session)?;
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|raw| raw.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    // Only 6.6 silently misses the post-reattach return (observed);
+    // every other kernel — and any unparsable release, fail-closed —
+    // must fire it and fault. The lost completion itself (1/0/silent)
+    // is asserted unconditionally below.
+    let silent_miss = matches!(crate::doctor::parse_major_minor(&release), Some((6, 6)));
     eprintln!(
-        "reattach control: entered={entered} returned={returned} collected={collected} \
-         routed={calls} evidence={evidence_before:?} -> {evidence_after:?}"
+        "reattach control: kernel={release} entered={entered} returned={returned} \
+         collected={collected} routed={calls} evidence={evidence_before:?} -> {evidence_after:?}"
     );
     ensure!(
         entered == 1 && returned == 0,
-        "the faulted completion counts its entry but never its return: {entered}/{returned}"
+        "the lost completion counts its entry but never its return: {entered}/{returned}"
     );
-    ensure!(
-        evidence_after.1 > evidence_before.1,
-        "the cookie mismatch faults an unmatched return: {evidence_before:?} -> {evidence_after:?}"
-    );
+    if silent_miss {
+        ensure!(
+            evidence_after == evidence_before,
+            "6.6 never fires the post-reattach return: {evidence_before:?} -> {evidence_after:?}"
+        );
+    } else {
+        ensure!(
+            evidence_after.1 > evidence_before.1,
+            "the cookie mismatch faults an unmatched return: {evidence_before:?} -> {evidence_after:?}"
+        );
+    }
     ensure!(
         collected == 0 && calls == 0,
-        "the faulted completion emits no call: collected={collected} routed={calls}"
+        "the lost completion emits no call: collected={collected} routed={calls}"
     );
     Ok(())
 }

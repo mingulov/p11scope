@@ -88440,10 +88440,7 @@ fn mid_scan_exit_race_with_live_leader_and_member_stays_loud() {
         !crate::process::process_is_zombie(pid),
         "the leader is running"
     );
-    assert!(
-        proc_task_is_live(pid, member),
-        "the member thread is live"
-    );
+    assert!(proc_task_is_live(pid, member), "the member thread is live");
     let view = ProcessView::open(ProcessViewId(720), pid).unwrap();
     assert!(
         !proc_tgid_maps_is_empty(pid),

@@ -23,6 +23,7 @@ use crate::discovery::overlay_witness::{
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
+use crate::process::leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
 use crate::process::{
     MappedOpenError, MountNamespaceId, MountTableCache, PidPin, ProcessView, ProcessViewId,
 };
@@ -4500,11 +4501,14 @@ const ZERO_READ_CAUSE: &str = "the read returned no bytes";
 const ZERO_READ_EXIT_CAUSE: &str = "the process exited during the snapshot";
 
 /// True when `/proc/<pid>/maps` reads empty right now, or the pid is
-/// gone: the target's mm is gone, so the scanned generation exited or
-/// is past running user code. A live user process always maps
-/// something, and the scan only reaches a zero-length read for a group
-/// its own maps snapshot listed — so an empty re-read proves the
-/// mapping vanished with its process. This catches what the pin
+/// gone: the TGID's mm reads gone. For a single-threaded target that means
+/// the scanned generation exited or is past running user code, and the scan
+/// only reaches a zero-length read for a group its own maps snapshot
+/// listed — so an empty re-read proves the mapping vanished with its
+/// process. A zombie-leader group with live members is the one exception:
+/// its TGID maps are always empty while the group is alive, so callers must
+/// exclude the proven-live shape (see [`zero_read_names_exit`]) before
+/// naming an exit from this re-read. This catches what the pin
 /// cannot: a start-time fallback pin reads an unreaped zombie as
 /// alive, and even a pidfd pin stays unready while the task runs its
 /// own exit path with the mm already released (state `R`, empty maps
@@ -4523,6 +4527,36 @@ fn target_maps_now_empty(pid: u32) -> bool {
     };
     let mut first = [0u8; 1];
     matches!(maps.read(&mut first), Ok(0))
+}
+
+/// Whether a zero-length mapping read names the exit exactly: the pin is
+/// dead (the scanned generation is gone), or a live re-read shows the mm
+/// gone while no live member proves the group alive. A zombie-leader group
+/// with live members always shows empty TGID maps while alive, so an empty
+/// TGID re-read alone never names the exit once a live non-leader member
+/// proves the group alive — that shape keeps the established wording. A
+/// start-time fallback pin has no member authority and an exhausted read
+/// budget proves nothing, so anything unproven keeps the established
+/// rename: the single-threaded exit window — mm released before the pin
+/// settles — still names its exit.
+fn zero_read_names_exit(view: &ProcessView) -> bool {
+    if !view.still_the_same() {
+        return true;
+    }
+    if !target_maps_now_empty(view.pid()) {
+        return false;
+    }
+    !group_has_proven_live_member(view)
+}
+
+/// Whether a live non-leader member positively proves the view's group
+/// alive (the zombie-leader shape). Pidfd authority only: a start-time
+/// fallback pin, an unreadable task set, or an exhausted read budget all
+/// answer unknown, never alive.
+fn group_has_proven_live_member(view: &ProcessView) -> bool {
+    view.retained_pin()
+        .leader_exit_observation(&mut LeaderExitReadBudget::for_final_exit_proof())
+        == LeaderExitObservation::LiveNonleader
 }
 
 /// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A partial read simply
@@ -8321,12 +8355,14 @@ fn scan_view_examined_mode(
             // it: a fallback pin reads an unreaped zombie as alive, and a
             // pidfd pin stays unready while the task runs its own exit
             // path with the mm already released — so a dead pin renames
-            // outright, while a live-looking pin re-checks the maps.
+            // outright, while a live-looking pin re-checks the maps, unless
+            // a live member proves the group alive (a zombie leader's TGID
+            // maps are always empty while members live).
             let short = match short {
                 Some(reason)
                     if !exhausted
                         && reason.contains(ZERO_READ_CAUSE)
-                        && (!view.still_the_same() || target_maps_now_empty(view.pid())) =>
+                        && zero_read_names_exit(view) =>
                 {
                     Some(reason.replace(ZERO_READ_CAUSE, ZERO_READ_EXIT_CAUSE))
                 }

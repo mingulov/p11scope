@@ -211,18 +211,22 @@ FIELD_KEYS = {"status", "value"}
 # H9 section v6 (keymeta §6/K5): every metadata field carries the
 # per-field `source` beside status/value; the two provenances are
 # the closed vocabulary, null is the only other spelling. Ruling 2
-# adds the per-field `reason`: the three-member vocabulary (fix
-# round 3) — truncation for never-seen fields, unsupported for
+# adds the per-field `reason`: the four-member vocabulary (fix
+# round 4) — truncation for never-seen fields, unsupported for
 # seen-but-unclassifiable kinds, unusable-curve for
-# mismatched/unestablished Edwards/Montgomery curves.
+# mismatched/unestablished Edwards/Montgomery curves on created
+# views, partly-read for never-seen fields on partly-read
+# templates.
 FIELD_KEYS_V6 = {"status", "value", "source", "reason"}
 FIELD_SOURCES = ("query", "creation_success")
 TRUNCATED_TEMPLATE_REASON = "template truncated (first 8 attributes captured)"
 UNSUPPORTED_TEMPLATE_VALUE_REASON = "template value outside approved finite set"
 CURVE_UNUSABLE_REASON = "curve unusable for key type"
+PARTLY_READ_TEMPLATE_REASON = "template partly read"
 FIELD_REASONS = (TRUNCATED_TEMPLATE_REASON,
                  UNSUPPORTED_TEMPLATE_VALUE_REASON,
-                 CURVE_UNUSABLE_REASON)
+                 CURVE_UNUSABLE_REASON,
+                 PARTLY_READ_TEMPLATE_REASON)
 MECHANISM_ROW_KEYS = {"mechanism", "mechanism_hex", "name", "operations", "calls",
                       "errors", "last_seen_ns", "evidence"}
 MECHANISM_EVIDENCE_KEYS = {"functions", "returns", "truncated"}
@@ -396,6 +400,9 @@ def _metadata_block(block, keys=METADATA_KEYS,
                          "unexpected metadata source")
                 _require(established, "requested metadata carries a source")
                 _require(status == "value", "unvalued metadata carries a source")
+                _require(not (established and name == "token"
+                              and source == "creation_success"),
+                         "token carries creation success")
         if "reason" in fields:
             reason = cell["reason"]
             if reason is None:
@@ -424,16 +431,24 @@ def _check_sessions(rows):
 
 
 def _require_curve_reasons(row, keys):
-    """Completeness for Edwards/Montgomery curves (fix round 3)."""
+    """Completeness for Edwards/Montgomery curves (fix round 3, with
+    fix-round-4 soundness: no spurious curve reason, and demands on
+    created rows only)."""
     if "ec_params" not in keys or "key_type" not in keys:
         return
     if row["label"] is not None:
         return
+    if row["origin"] != "created":
+        return  # query-only rows carry no curve reason (t3 I1)
     established_type = row["established"]["key_type"]
-    if established_type["status"] != "value" or established_type["value"] not in (64, 65):
+    if established_type["status"] != "value":
+        return
+    established_curve = row["established"]["ec_params"]
+    if established_type["value"] not in (64, 65):
+        _require(established_curve["reason"] != CURVE_UNUSABLE_REASON,
+                 "unexpected curve reason")
         return
     key_type = established_type["value"]
-    established_curve = row["established"]["ec_params"]
     if established_curve["status"] == "value":
         curve = established_curve["value"]
         matched = ((key_type == 64 and curve in ("ed25519", "ed448"))
@@ -441,13 +456,16 @@ def _require_curve_reasons(row, keys):
         if not matched:
             _require(established_curve["reason"] == CURVE_UNUSABLE_REASON,
                      "mismatched curve carries no reason")
+        else:
+            _require(established_curve["reason"] is None,
+                     "unexpected curve reason")
         return
     if established_curve["status"] != "unknown":
         return
     if row["requested"]["ec_params"]["status"] != "unknown":
         return
     if established_curve["reason"] is not None:
-        return  # truncation or unsupported already names the unknown
+        return  # truncation, unsupported or partly-read already names the unknown
     _require(False, "unestablished curve carries no reason")
 
 
@@ -483,11 +501,20 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
                 _require(row["established"][name]["source"] != "query"
                          or queries[name] != "not_queried",
                          "query source without a query")
+                _require(row["origin"] == "created"
+                         or row["established"][name]["source"] != "creation_success",
+                         "creation source without a creation")
         if "reason" in fields:
+            if row["origin"] != "created":
+                for name in keys:
+                    for block in ("requested", "established"):
+                        _require(row[block][name]["reason"] is None,
+                                 "first-observed field carries a reason")
             for name in keys:
                 established_reason = row["established"][name]["reason"]
                 if (established_reason == CURVE_UNUSABLE_REASON
-                        and name == "ec_params"):
+                        and name == "ec_params"
+                        and row["established"][name]["status"] == "value"):
                     continue  # mismatch lands on the established valued curve
                 _require(established_reason is None
                          or row["requested"][name]["status"] == "unknown",
@@ -510,6 +537,11 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
             has_truncated = any(
                 row[block][name]["reason"] == TRUNCATED_TEMPLATE_REASON
                 for block in ("requested", "established") for name in keys)
+            has_partly_read = any(
+                row[block][name]["reason"] == PARTLY_READ_TEMPLATE_REASON
+                for block in ("requested", "established") for name in keys)
+            _require(not (has_truncated and has_partly_read),
+                     "mixed template reasons")
             if has_truncated:
                 for name in keys:
                     if (row["requested"][name]["status"] == "unknown"
@@ -517,6 +549,13 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
                         _require(row["requested"][name]["reason"] is not None
                                  and row["established"][name]["reason"] is not None,
                                  "incomplete truncation reasons")
+            if has_partly_read:
+                for name in keys:
+                    if (row["requested"][name]["status"] == "unknown"
+                            and row["established"][name]["status"] == "unknown"):
+                        _require(row["requested"][name]["reason"] is not None
+                                 and row["established"][name]["reason"] is not None,
+                                 "incomplete partly-read reasons")
             _require_curve_reasons(row, keys)
         if row["label"] is not None:
             _label(row["label"], labels, "object metadata")

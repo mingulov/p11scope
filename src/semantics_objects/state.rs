@@ -492,6 +492,18 @@ struct ViewRecord {
     /// Per-field presence in the retained creation window (fix round
     /// 3): a birth fact, set once at promotion, never cleared.
     creation_seen: [bool; METADATA_FIELDS],
+    /// The view's own creation template was captured and fully read
+    /// (fix round 4): a birth fact, set once at promotion, never
+    /// cleared. Gates the Edwards/Montgomery curve reason.
+    creation_template_seen: bool,
+    /// The view's own creation template carried a header or span
+    /// read failure (fix round 4): a birth fact, set once at
+    /// promotion, never cleared.
+    creation_partly_read: bool,
+    /// The view is the slot-1 (private) half of a
+    /// `C_GenerateKeyPair` return (fix round 4): a birth fact, set
+    /// once at promotion, never cleared.
+    keypair_private: bool,
 }
 
 impl ViewRecord {
@@ -570,9 +582,10 @@ impl ViewRecord {
             // Controller KEYMETA-T1 rulings 2026-11-16, ruling 1:
             // CKK_EC_EDWARDS (0x40) with an established ed25519/ed448
             // curve, and CKK_EC_MONTGOMERY (0x41) with an established
-            // x25519/x448 curve, from the same key's template label.
-            // Both facts are already-captured approved reads; the
-            // label is a projection, no new capture. A mismatched or
+            // x25519/x448 curve, from the same view's established
+            // facts (creation or query reads alike) label. Both
+            // facts are already-captured approved reads; the label
+            // is a projection, no new capture. A mismatched or
             // unestablished curve stays unlabeled (the underlying
             // facts keep their states); the 0x03 arm above keeps the
             // R2 join unchanged.
@@ -2243,6 +2256,9 @@ impl ModelState {
                 queries: [QueryStatus::NotQueried; METADATA_FIELDS],
                 creation_truncated: false,
                 creation_seen: [false; METADATA_FIELDS],
+                creation_template_seen: false,
+                creation_partly_read: false,
+                keypair_private: false,
             },
         );
         self.instances
@@ -3283,6 +3299,22 @@ impl ModelState {
                             .as_ref()
                             .is_some_and(AttributeList::truncated);
                         view.creation_seen = requested_seen(call.requested[template].as_ref());
+                        // Fix round 4: the curve reason needs a fully
+                        // read template, and never the private half of
+                        // a keypair (slot 1 carries the private
+                        // template; `CKA_EC_PARAMS` lives in the
+                        // public one). A partly-read template is not
+                        // seen: its unseen fields name the
+                        // partly-read reason instead.
+                        let partly_read = call.requested[template]
+                            .as_ref()
+                            .is_some_and(AttributeList::partly_read);
+                        view.creation_partly_read = partly_read;
+                        view.creation_template_seen =
+                            call.requested[template].is_some() && !partly_read;
+                        if family == CreationFamily::GeneratePair && slot == 1 {
+                            view.keypair_private = true;
+                        }
                         for kind in [
                             SafeAttributeKind::Class,
                             SafeAttributeKind::KeyType,
@@ -3653,8 +3685,10 @@ impl ModelState {
             }
         }
         // Seal bound (journal `SealEffectBound`): only an established or
-        // conflicting field invalidates, and only `establish` (once per
-        // input handle) re-arms one.
+        // conflicting field invalidates. Each invalidation needs an
+        // arming: `establish` re-arms at most one view per input
+        // handle, and R2 promotion arms each minted view, at most
+        // one per result handle — the bound counts both terms.
         if changed {
             effects.push(ObjectEffect::MetadataInvalidated { object: id, reason });
         }
@@ -4678,6 +4712,9 @@ impl ModelState {
                 accessing_sessions: relations.get(id).copied().unwrap_or(0),
                 creation_truncated: v.creation_truncated,
                 creation_seen: v.creation_seen,
+                creation_template_seen: v.creation_template_seen,
+                creation_partly_read: v.creation_partly_read,
+                keypair_private: v.keypair_private,
             })
             .collect();
         ObjectProjection {
@@ -5067,6 +5104,9 @@ mod tests {
             queries: [QueryStatus::NotQueried; METADATA_FIELDS],
             creation_truncated: false,
             creation_seen: [false; METADATA_FIELDS],
+            creation_template_seen: false,
+            creation_partly_read: false,
+            keypair_private: false,
         }
     }
 

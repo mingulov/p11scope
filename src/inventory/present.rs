@@ -4342,6 +4342,43 @@ fn render_snapshot_inner(
                     if unusable_curve_objects == 1 { "" } else { "s" },
                 );
             }
+            // Fix round 4: objects with a partly-read creation
+            // template name the partly-read reason here (verbose
+            // only) with the same string the unseen fields carry in
+            // JSON. Counts only.
+            let partly_read_objects = observations
+                .objects
+                .iter()
+                .filter(|row| {
+                    [&row.requested, &row.established].iter().any(|block| {
+                        [
+                            &block.class,
+                            &block.key_type,
+                            &block.token,
+                            &block.value_len,
+                            &block.modulus_bits,
+                            &block.ec_params,
+                            &block.parameter_set,
+                        ]
+                        .iter()
+                        .any(|field| {
+                            field.reason
+                                == Some(
+                                    crate::key_operation_projection::PARTLY_READ_TEMPLATE_REASON,
+                                )
+                        })
+                    })
+                })
+                .count();
+            if verbose && partly_read_objects > 0 {
+                let _ = writeln!(
+                    out,
+                    "  {} ({} object{})",
+                    crate::key_operation_projection::PARTLY_READ_TEMPLATE_REASON,
+                    partly_read_objects,
+                    if partly_read_objects == 1 { "" } else { "s" },
+                );
+            }
         }
     }
     {

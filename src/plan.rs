@@ -22977,6 +22977,84 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
+    /// Extension fallback, re-admission (tier-3 review of port3): with 100
+    /// lifetime slots free, an existing module growing by 101 past them and
+    /// a new 50-endpoint module, shedding the new module whole first and
+    /// then the whole growth over-refuses (151 shed where 101 suffice).
+    /// Once the plan fits, the fallback re-admits whole-refused victims in
+    /// admission order: the 50-endpoint module fits beside the omitted
+    /// growth, so it stays admitted and only the growth gap is recorded.
+    #[test]
+    fn fallback_readmits_a_whole_refused_module_once_the_plan_fits() {
+        use crate::discovery::scan::ScannedEntry;
+
+        let others = provider_with_tables(50, "/opt/others.so", 1, 944, true);
+        let grown = provider_with_tables(52, "/opt/grown.so", 1, 1000, true);
+        let retired = provider_with_tables(53, "/opt/retired.so", 1, 68, true);
+        let mut plan = scoped_plan(
+            &[others.clone(), grown.clone(), retired],
+            AdmissionScope::Named,
+        );
+        assert_eq!(plan.slots.len(), 2012);
+        let rebuilt = plan.rebuild_from_sources(
+            &[others.clone(), grown.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 68);
+        let mut grown_plus = grown;
+        let fresh: Vec<ScannedEntry> = (0..101u64)
+            .map(|entry| ScannedEntry {
+                name: "C_Sign",
+                object: grown_plus.scanned.key,
+                object_path: grown_plus.scanned.path.clone(),
+                file_offset: 1000 * 8 + entry * 8,
+            })
+            .collect();
+        grown_plus.scanned.tables[0].entries.extend(fresh);
+        grown_plus.entry_objects = vec![vec![grown_plus.object; 1101]];
+        grown_plus.forward_verified = vec![vec![false; 1101]];
+        let new = provider_with_tables(60, "/opt/new.so", 1, 50, true);
+        // Fresh snapshot: 2,095 slots fit on their own; only the lifetime
+        // prior makes the extension overflow.
+        let rebuilt = scoped_plan(&[others, grown_plus, new], AdmissionScope::Named);
+        assert_eq!(rebuilt.slots.len(), 2095);
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("a fitting module must admit, not abort: {error}"));
+        assert_eq!(
+            slots_of(&plan, 60),
+            50,
+            "the whole-refused module is re-admitted once the plan fits"
+        );
+        assert_eq!(
+            slots_of(&plan, 52),
+            1000,
+            "the grown module keeps its cells"
+        );
+        let omission = refusal_of(&plan, "/opt/grown.so").expect("the growth is a counted gap");
+        assert!(
+            is_growth_omission(&omission.reason),
+            "existing growth omits, never refuses whole: {}",
+            omission.reason
+        );
+        assert_eq!(
+            growth_omitted_count(&omission.reason),
+            Some(101),
+            "the gap counts the fresh cells: {}",
+            omission.reason
+        );
+        assert!(
+            refusal_of(&plan, "/opt/new.so").is_none(),
+            "the re-admitted module carries no refusal: {:?}",
+            plan.modules_skipped
+        );
+        assert_eq!(plan.modules_skipped.len(), 1);
+        assert_eq!(plan.slots.len(), 2062, "only the fitting demand attaches");
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
     /// Reclaim flip, both orders (tier-3 review of port3, option (b)): a
     /// key remembers one count-only and one semantic retired generation,
     /// and an exact-shape return reoccupies its own generation first — so
@@ -23561,6 +23639,20 @@ pub(crate) mod tests {
             whole_refusal_needed_count(&refused.reason),
             Some(60),
             "the refusal counts its demand: {}",
+            refused.reason
+        );
+        // Tier-3 review of port3: refusal holders count kept and reused
+        // cells only — the surviving provider's 60 fresh cells hold no
+        // room yet, so the holder clause names the 1,400 kept filler
+        // cells and nothing else.
+        assert!(
+            refused.reason.contains("held by /opt/filler.so 1400"),
+            "the refusal names what holds the room: {}",
+            refused.reason
+        );
+        assert!(
+            !refused.reason.contains("/opt/a.so"),
+            "holders count kept cells only, never fresh demand: {}",
             refused.reason
         );
         assert_eq!(plan.modules_skipped.len(), 1);

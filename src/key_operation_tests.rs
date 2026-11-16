@@ -22627,6 +22627,24 @@ fn key_operation_reseed_refuses_wrong_receipts_and_states() {
         );
         assert_eq!(staging.mode(), FeedMode::S1Only);
     }
+    // A cut above the old cut but below the fence refuses on the fence
+    // alone: cut 1 over old cut 0 already passes the progress check, so
+    // only the recorded fence (2) decides.
+    {
+        let (_, bootstrap, mut staging) = degraded();
+        staging.record_fence_for_test(Some(2));
+        let fenced = BootstrapReceipt::scripted(
+            bootstrap.proof(),
+            BirthKind::AttachObserved,
+            1,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            !staging.reselect_joint(&fenced),
+            "a below-fence cut never reseeds"
+        );
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+    }
     // A tripped watchdog never reseeds.
     {
         let (_, bootstrap, mut staging) = degraded();

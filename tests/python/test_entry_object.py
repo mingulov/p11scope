@@ -2175,10 +2175,13 @@ class EntryObjectTests(unittest.TestCase):
         """OBJECT_DESCRIPTORS joins the gated-source inventory.
 
         In-place downgrade (A'): the object marker is consulted only on
-        the switch-unset side — every in-consumer OBJECT_DESCRIPTORS
-        lookup and every object_marker_for internal call must carry
-        ("switch", "unset"). Entry roots must actually consult the
-        marker (non-vacuous); returns never do.
+        the switch-unset side — every object_marker_for internal call
+        must carry ("switch", "unset"), and every in-consumer
+        OBJECT_DESCRIPTORS lookup is inventoried (object-block
+        internals keyed by object state, never by the live cookie).
+        Entry roots must actually consult the marker (non-vacuous)
+        except the template continuation, which re-reads only
+        semantics; returns never do.
         """
         for variant in OBJECTS:
             entries = ["p11_entry"] if variant == "default" else [
@@ -2194,7 +2197,7 @@ class EntryObjectTests(unittest.TestCase):
                     self.assertIn("object_marker_calls", report,
                                   f"{name} reports its object-marker calls")
                     seen = len(report["object_marker_lookups"]) + len(report["object_marker_calls"])
-                    if name in entries:
+                    if name in entries and name != "p11_entry_template_second":
                         self.assertGreaterEqual(seen, 1,
                                                 f"{name} consults the object marker")
                     else:

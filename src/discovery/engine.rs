@@ -7584,6 +7584,48 @@ fn skip_is_ending_refusal(skip: &Skipped) -> bool {
             .any(|prefix| skip.reason.starts_with(prefix))
 }
 
+/// Generation/exit wordings a memory scan files when its target group
+/// exits between two checks of the scan bracket: the `run_while_same`
+/// generation errors (`process.rs`) at the initial maps acquisition, the
+/// mem-open gate and the final maps re-read, and the original-exit
+/// findings of proc-directory acquisition and warm filesystem
+/// identification (`process.rs`, `view_filesystem.rs`). Each reaches the
+/// engine wrapped once in its `memory scan refused` bracket refusal (the
+/// mem-open gate double-wraps). Deliberately absent: the reuse crossing
+/// (`proc acquisition crossed a process generation change` proves a live
+/// new generation holds the pid), mapping changes, empty or malformed
+/// snapshots, and every budget stop — none of those is an exit finding,
+/// so they stay loud whatever the pin proves.
+const MID_SCAN_EXIT_RACE_DETAILS: [&str; 6] = [
+    "process generation changed before target access",
+    "process generation changed during target access",
+    "original process exited before proc acquisition",
+    "original process exited during proc acquisition",
+    "original process exited while proc identity was read",
+    "original process exited while its filesystem was identified",
+];
+
+/// Whether a scan skip is a mid-scan exit race: a `memory scan refused`
+/// refusal whose detail names the target group's exit between two scan
+/// checks. Candidates only — the silence proof decides.
+fn skip_is_mid_scan_exit_refusal(skip: &Skipped) -> bool {
+    skip.reason.starts_with("memory scan refused: ")
+        && MID_SCAN_EXIT_RACE_DETAILS
+            .iter()
+            .any(|detail| skip.reason.contains(detail))
+}
+
+/// Whether the view's original thread group provably exited during its
+/// scan with no live reuse of its pid: the pin proves the original gone
+/// and a fresh read proves the pid names no live process now. A reused
+/// pid (live new occupant), an exec (same process alive), a live member,
+/// a transient check failure and an unprovable pin all read false and
+/// stay loud; so does a fallback-pinned zombie, whose start time still
+/// matches (fail closed, like the mem-open proof).
+fn mid_scan_exit_proven(view: &ProcessView) -> bool {
+    view.original_exited() == Ok(true) && process::generation_dead(view.pid())
+}
+
 /// One scan plus its pins plus its shape proof: the modules, the pins,
 /// the completeness verdict, the negative examined-file evidence, and
 /// the provider `.so`-set of the scan's own initial maps.
@@ -7670,9 +7712,23 @@ fn scan_and_pin_with_proof(
     // pins are done: a capture-wide stop set during this scan can hide
     // behind their text, so such a scan excuses nothing.
     let mut held = Vec::new();
+    // A group that was live at scan start but provably exited by the
+    // failed validation takes the silent exited path for its exit races:
+    // no record (an exit is not undisclosed loss), but the class still
+    // counts in the retry breakdown like every other skip. Evaluated
+    // lazily and once: only an exit-shaped refusal pays for the fresh
+    // proof read.
+    let mut mid_scan_exit: Option<bool> = None;
     for skipped in outcome.skipped() {
         if ending_at_start && skip_is_ending_refusal(skipped) {
             held.push(skipped.clone());
+            continue;
+        }
+        if skip_is_mid_scan_exit_refusal(skipped)
+            && *mid_scan_exit.get_or_insert_with(|| mid_scan_exit_proven(view))
+        {
+            counters.noise.note_skip(&skipped.subject, &skipped.reason);
+            attribution::note(skipped);
             continue;
         }
         record_scan_skip(counters, skipped.clone());

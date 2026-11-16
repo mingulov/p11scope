@@ -8832,11 +8832,24 @@ fn retire_rendered_callers(
     };
     let ids: Vec<crate::discovery::caller_registry::CallerId> =
         view.callers.iter().map(|caller| caller.id).collect();
-    // Fold only callers whose every edge already streamed (or every
-    // caller when no log runs): a folded-never-streamed edge would
-    // leave the stream silently incomplete. Unstreamed callers wait
-    // for the FIFO to serve them, then fold next pass.
+    // Fold only callers whose every edge and instance already
+    // streamed (or every caller when no log runs): a
+    // folded-never-streamed edge or instance would leave the stream
+    // silently incomplete. Unstreamed callers wait for the FIFO to
+    // serve them, then fold next pass.
     let foldable: Vec<crate::discovery::caller_registry::CallerId> = if stream.emits() {
+        // One per-caller instance index per call, not one scan per
+        // candidate: the registry holds instances in one map.
+        let mut instances_by_caller: BTreeMap<
+            crate::discovery::caller_registry::CallerId,
+            Vec<crate::discovery::caller_registry::instance_input::RegistryInstanceId>,
+        > = BTreeMap::new();
+        for record in driver.coordinator.registry().instances() {
+            instances_by_caller
+                .entry(record.caller)
+                .or_default()
+                .push(record.id);
+        }
         ids.into_iter()
             .filter(|id| {
                 driver
@@ -8844,6 +8857,11 @@ fn retire_rendered_callers(
                     .registry()
                     .edges_of(*id)
                     .all(|edge| state.edges.has_record(*id, edge.module))
+                    && instances_by_caller.get(id).is_none_or(|members| {
+                        members
+                            .iter()
+                            .all(|instance| state.instances.has_record(*instance))
+                    })
             })
             .collect()
     } else {

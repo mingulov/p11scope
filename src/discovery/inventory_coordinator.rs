@@ -5506,6 +5506,89 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Settle one pair recovery that can never suspend: a Dropped or
+    /// pruned pair (never publishes, so no retirement proof is needed),
+    /// or any pair whose caller record is gone (folded or otherwise
+    /// forgotten). The withheld range discloses through the existing
+    /// retirement-count gap (never silent; gaps name the folded caller
+    /// by label without pinning it), the Dropped base, tombstone and
+    /// aggregate stay untouched for exact pruning and revival, a live
+    /// target naming the same gone caller drops into Dropped (like the
+    /// fold), and the recovery leaves the map and order. A live target
+    /// naming a different caller (a revival past a stuck entry) keeps
+    /// its target, held read and generation — only the stuck recovery
+    /// leaves, so the reviving caller can mint its own. Never suspends,
+    /// never rewrites a base to a watermark, never clobbers.
+    fn settle_pair_recovery(
+        &mut self,
+        key: PairKey,
+        mut recovery: PairRecovery,
+        held: Option<PairCount>,
+    ) {
+        let live_same_caller = matches!(
+            self.pair_targets.get(&key),
+            Some(
+                PairTarget::Bound { caller, .. }
+                    | PairTarget::Pending { caller, .. }
+                    | PairTarget::Suspended { caller, .. }
+            ) if *caller == recovery.caller
+        );
+        // A held read for a different live caller belongs to that
+        // caller, not to this recovery: never gap it here.
+        let gap_held = if live_same_caller
+            || !matches!(
+                self.pair_targets.get(&key),
+                Some(
+                    PairTarget::Bound { .. }
+                        | PairTarget::Pending { .. }
+                        | PairTarget::Suspended { .. }
+                )
+            ) {
+            held
+        } else {
+            None
+        };
+        recovery.withhold_reads();
+        if let Some(read) = recovery.fence.take() {
+            recovery.withheld_through = recovery.withheld_through.max(read.count);
+        }
+        let flushed = recovery.withheld_through.max(recovery.discarded_through);
+        if let Some(held) = gap_held {
+            self.diagnostic_withheld(
+                key,
+                &recovery,
+                recovery.watermark,
+                held.count,
+                DiagnosticReason::IdentityChanged,
+                Some(held),
+            );
+            self.registry.note_retirement_count_gap(
+                recovery.caller,
+                recovery.watermark,
+                held.count,
+            );
+            recovery.watermark = recovery.watermark.max(held.count);
+        }
+        recovery.withheld_through = recovery.watermark.max(flushed);
+        recovery.discarded_through = recovery.watermark;
+        self.flush_withheld_prefix(key, &mut recovery, DiagnosticReason::IdentityChanged);
+        if live_same_caller {
+            let (base, base_since) = self.pair_drop_base(&key);
+            let _ = self.take_pruned_pair_base(&key);
+            self.pair_targets
+                .insert(key, PairTarget::Dropped { base, base_since });
+            self.pair_counts.remove(&key);
+            self.placement_generations.remove(&key);
+        }
+        if let Some(pos) = self.recovery_order.iter().position(|keyed| *keyed == key) {
+            self.recovery_order.swap_remove(pos);
+            if self.recovery_cursor > pos {
+                self.recovery_cursor -= 1;
+            }
+            self.recovery_cursor %= self.recovery_order.len().max(1);
+        }
+    }
+
     /// Drop one departed caller's live pair targets (bound, pending or
     /// suspended) into the existing Dropped machinery: the staged
     /// absolute lands in the base exactly like a rejected drop, the
@@ -5542,6 +5625,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
                 self.recovery_cursor %= self.recovery_order.len().max(1);
             }
+        }
+        // Dropped or pruned pairs keep their exact base for the grace
+        // prune and revival, but their recoveries name this caller and
+        // must settle here: left behind, per-pass servicing would cancel
+        // and suspend them into live targets naming the folded caller,
+        // rewriting the staged base to a watermark and clobbering any
+        // revived pair. The settle discloses any withheld range and
+        // removes the recovery without touching the base.
+        let stranded: Vec<PairKey> = self
+            .recoveries
+            .iter()
+            .filter(|(_, recovery)| recovery.caller == id)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stranded {
+            let Some(recovery) = self.recoveries.remove(&key) else {
+                continue;
+            };
+            // Dropped pairs hold no read (the absorb path skips them);
+            // a held read here belongs to a revived live caller for the
+            // same key, never to this recovery, so settle does not gap it.
+            self.settle_pair_recovery(key, recovery, None);
         }
     }
 
@@ -9671,10 +9776,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // fixed receipt resolution operations, including refused branches.
             // The allowance is reserved once, never refilled for another pair.
             budget.spend(48);
-            let Some(mut recovery) = self.recoveries.remove(&key) else {
+            let Some(recovery) = self.recoveries.remove(&key) else {
                 continue;
             };
             let held = self.pair_counts.get(&key).map(|held| held.read);
+            // A recovery that can never suspend settles here instead of
+            // cancelling into a live target: a Dropped or pruned pair
+            // (never publishes), or any pair whose caller record is gone
+            // (folded or otherwise forgotten). Suspending either would
+            // rewrite the staged base to a watermark, strand a live
+            // target naming a dead caller that never prunes, block a
+            // fresh recovery, and clobber any revived pair every pass.
+            let live = matches!(
+                self.pair_targets.get(&key),
+                Some(
+                    PairTarget::Bound { .. }
+                        | PairTarget::Pending { .. }
+                        | PairTarget::Suspended { .. }
+                )
+            );
+            if !live || self.adapter.record(recovery.caller).is_none() {
+                self.settle_pair_recovery(key, recovery, held);
+                continue;
+            }
+            let mut recovery = recovery;
             let ownership = self
                 .count_ownership
                 .ordinary_view(recovery.caller, key.object);

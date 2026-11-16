@@ -8248,11 +8248,10 @@ fn demotion_retirement_round6_dropped_pair_recovery_settles_at_fold() {
         key,
         "the rejected row names the placed pair"
     );
-    let base = scene
-        .native
-        .scene
-        .coordinator
-        .drop_pair_count(&row, crate::inventory_diagnostics::DiagnosticReason::NotAdmitted);
+    let base = scene.native.scene.coordinator.drop_pair_count(
+        &row,
+        crate::inventory_diagnostics::DiagnosticReason::NotAdmitted,
+    );
     let coordinator = &scene.native.scene.coordinator;
     assert!(
         matches!(
@@ -8327,18 +8326,27 @@ fn demotion_retirement_round6_dropped_pair_recovery_settles_at_fold() {
     // Per-pass servicing must not resurrect a live target naming the
     // folded caller.
     round2_quiet_ownership(&mut scene);
+    // Servicing stages gap mutations; commit applies them so the
+    // disclosure is visible in gaps().
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
     let coordinator = &scene.native.scene.coordinator;
     assert!(
-        coordinator.recoveries.values().all(|recovery| recovery.caller != folded),
+        coordinator
+            .recoveries
+            .values()
+            .all(|recovery| recovery.caller != folded),
         "no stranded recovery names the folded caller"
     );
     assert!(
-        coordinator.pair_targets.values().all(|target| match target {
-            PairTarget::Suspended { caller, .. } => *caller != folded,
-            PairTarget::Bound { caller, .. } | PairTarget::Pending { caller, .. } =>
-                *caller != folded,
-            PairTarget::Dropped { .. } => true,
-        }),
+        coordinator
+            .pair_targets
+            .values()
+            .all(|target| match target {
+                PairTarget::Suspended { caller, .. } => *caller != folded,
+                PairTarget::Bound { caller, .. } | PairTarget::Pending { caller, .. } =>
+                    *caller != folded,
+                PairTarget::Dropped { .. } => true,
+            }),
         "servicing never suspends a live target naming the folded caller"
     );
     assert!(
@@ -8370,7 +8378,12 @@ fn demotion_retirement_round6_dropped_pair_recovery_settles_at_fold() {
         "the staged absolute reaches the counted totals exactly once"
     );
     assert!(
-        scene.native.scene.coordinator.pair_targets.get(&key).is_none(),
+        !scene
+            .native
+            .scene
+            .coordinator
+            .pair_targets
+            .contains_key(&key),
         "the dropped pair prunes on schedule"
     );
     // A revival past the pruned base (cookie reuse by a new process)
@@ -8432,11 +8445,10 @@ fn demotion_retirement_round6_gone_caller_recovery_settles_without_suspend() {
         .counts_read(Vec::new(), vec![(41, 1, 0, watermark.saturating_add(3))]);
     let row = scene.native.row(41, 1, 7, 300, 0);
     assert_eq!(PairKey::of(&row), key, "the drop names the placed pair");
-    let base = scene
-        .native
-        .scene
-        .coordinator
-        .drop_pair_count(&row, crate::inventory_diagnostics::DiagnosticReason::NotAdmitted);
+    let base = scene.native.scene.coordinator.drop_pair_count(
+        &row,
+        crate::inventory_diagnostics::DiagnosticReason::NotAdmitted,
+    );
     assert_ne!(
         base, watermark,
         "the test needs distinct base and watermark"
@@ -8527,25 +8539,26 @@ fn demotion_retirement_round6_gone_caller_recovery_settles_without_suspend() {
             diagnostic: RecoveryDiagnostics::default(),
         },
     );
-    scene
-        .native
-        .scene
-        .coordinator
-        .recovery_order
-        .push(key);
+    scene.native.scene.coordinator.recovery_order.push(key);
     round2_quiet_ownership(&mut scene);
+    // Servicing stages gap mutations; commit applies them so the
+    // disclosure is visible in gaps().
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
     let coordinator = &scene.native.scene.coordinator;
     assert!(
         !coordinator.recoveries.contains_key(&key),
         "a gone caller's recovery is settled and removed, never retained"
     );
     assert!(
-        coordinator.pair_targets.values().all(|target| match target {
-            PairTarget::Suspended { caller, .. } => *caller != gone,
-            PairTarget::Bound { caller, .. } | PairTarget::Pending { caller, .. } =>
-                *caller != gone,
-            PairTarget::Dropped { .. } => true,
-        }),
+        coordinator
+            .pair_targets
+            .values()
+            .all(|target| match target {
+                PairTarget::Suspended { caller, .. } => *caller != gone,
+                PairTarget::Bound { caller, .. } | PairTarget::Pending { caller, .. } =>
+                    *caller != gone,
+                PairTarget::Dropped { .. } => true,
+            }),
         "servicing never suspends a live target naming the gone caller"
     );
     assert!(
@@ -8621,13 +8634,7 @@ fn demotion_retirement_round6_fold_gate_pending_successor_blocks_fold() {
         "a caller with a pending successor keeps its facts"
     );
     assert!(
-        scene
-            .native
-            .scene
-            .coordinator
-            .adapter
-            .record(old)
-            .is_some(),
+        scene.native.scene.coordinator.adapter.record(old).is_some(),
         "the pinned row stays"
     );
     scene
@@ -8642,15 +8649,12 @@ fn demotion_retirement_round6_fold_gate_pending_successor_blocks_fold() {
         .scene
         .coordinator
         .retire_rendered_callers(2002, None);
-    assert_eq!(receipt.retired, 1, "the caller folds after the pin releases");
+    assert_eq!(
+        receipt.retired, 1,
+        "the caller folds after the pin releases"
+    );
     assert!(
-        scene
-            .native
-            .scene
-            .coordinator
-            .adapter
-            .record(old)
-            .is_none(),
+        scene.native.scene.coordinator.adapter.record(old).is_none(),
         "the folded row leaves the adapter"
     );
     assert_eq!(
@@ -8751,12 +8755,7 @@ fn demotion_retirement_round6_fold_gate_pending_count_blocks_fold() {
             .is_some(),
         "the pinned row stays"
     );
-    scene
-        .native
-        .scene
-        .coordinator
-        .pending_ids
-        .remove(&999_999);
+    scene.native.scene.coordinator.pending_ids.remove(&999_999);
     scene
         .native
         .scene

@@ -847,6 +847,19 @@ any other failure stay failed. Timing the interval and disclosing the
 window is planned (the `PLAN-REPLACE-GAP` fix lane). Rerunning the
 capture usually lands a clean run.
 
+### Stub-pool provider manifests cover one getter-call order
+
+Since 0.8.0 the offline helper mints the interface enumeration before
+the legacy table, so the manifest records the first-mint v3 slots
+(68/69, `C_GetInterfaceList`/`C_GetInterface`) that a workload's first
+v3 getter call uses. That is the observed order: every p11-kit matrix
+leg calls a v3 getter first. The trade-off is the reverse order: a
+workload that calls `C_GetFunctionList` first and a v3 getter second
+spends its first pool mint on the 68-slot table, so its second-table
+v3-only calls land on stubs the manifest never recorded and stay
+unattached. Static providers return the same tables whatever the
+order, so their manifests are unchanged.
+
 ## Known limitations in 0.6.0
 
 The following limits apply to the v0.6.0 release. Rate, latency and

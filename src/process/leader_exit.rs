@@ -318,16 +318,24 @@ impl ExitingTask {
 
 trait FinalExitIo {
     type Tasks: Iterator<Item = Result<u32, ()>>;
+    type Member;
     fn group_exited(&mut self) -> Result<bool, ()>;
     fn leader(&mut self) -> Result<ExitingTask, ()>;
     fn tasks(&mut self) -> Result<Self::Tasks, ()>;
-    /// `Ok(None)` only when the member's directory is provably gone
-    /// (`ENOENT`: the thread was released); any other failure is `Err`.
-    fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()>;
-    /// The member's `Tgid` membership, with the same gone-vs-error
-    /// contract as [`Self::member`]: `Ok(None)` only when the thread
-    /// was released between the listing and this read.
-    fn task_tgid(&mut self, tid: u32) -> Result<Option<u32>, ()>;
+    /// Open the member's `task/<tid>` directory, holding the tid
+    /// against reuse: an open task directory pins the struct pid, so
+    /// the number cannot be recycled while the handle lives. `Ok(None)`
+    /// only when the member is provably gone between the listing and
+    /// this open (`ENOENT`/`ESRCH`); any other failure is `Err`.
+    fn open_member(&mut self, tid: u32) -> Result<Option<Self::Member>, ()>;
+    /// Read the held member's stat through its directory: the same
+    /// thread the open pinned, never a recycled occupant. Any failure,
+    /// including a release after the open, is `Err` and fails closed.
+    fn member(&mut self, member: &Self::Member) -> Result<ExitingTask, ()>;
+    /// The held member's `Tgid` through the same directory, so the stat
+    /// and membership reads cannot straddle a reuse. Any failure is
+    /// `Err` and fails closed.
+    fn task_tgid(&mut self, member: &Self::Member) -> Result<u32, ()>;
 }
 
 /// Whether the retained thread group is in its final exit: either the
@@ -337,18 +345,30 @@ trait FinalExitIo {
 /// A task in that state never runs user code again, so the group can make
 /// no further provider call and no further `dlopen`. Thread creation needs
 /// a creator that is not yet exiting, and the new thread is linked into
-/// the group before `clone` returns to it. A member created during the
-/// first listing may be missed by it, but its creator is then read later
-/// and was not exiting at creation time; so the task list is read a
-/// second time after every member was proven, and every thread it lists
-/// is re-read: the same birth, still past user mode, still in this
-/// group (`Tgid == pid`). A recycled tid backed by a live new thread
-/// (a new birth) fails the proof, as does any thread the first listing
-/// missed. A member that was already gone in the first walk and
-/// reappears in the closing listing is a new thread and fails too. An
-/// `exec` kill leaves the execing thread live, so it never qualifies.
-/// Any unreadable member, a reused leader, or an exhausted budget
-/// answers false: only a positive proof counts.
+/// the group before `clone` returns to it.
+///
+/// Identity is pinned, not re-read by number: the first walk opens each
+/// listed member's `task/<tid>` directory and holds it, which pins the
+/// struct pid so the tid cannot be recycled while the handle lives; the
+/// stat and `Tgid` reads go through the held directory, so a recycled
+/// number, a same-tick birth collision, or a stat/status straddle cannot
+/// substitute a live thread. A member gone between the first listing and
+/// its open stays out of the proven set: a tid listed in the closing
+/// walk without a held handle is a new thread and fails.
+///
+/// The task list is read a second time after every member was proven,
+/// and every thread it lists must have a held handle with the same
+/// birth, still past user mode, still in this group (`Tgid == pid`). A
+/// thread listed but gone at its closing re-read fails: it may have
+/// created a child after the listing that neither walk lists. An `exec`
+/// kill leaves the execing thread live, so it never qualifies. Any
+/// unreadable member, a reused leader, or an exhausted budget answers
+/// false: only a positive proof counts.
+///
+/// The proof assumes a task listing names every thread present when it
+/// starts; a thread created after the closing listing started would need
+/// a live creator outside the proven past set, which the closing walk
+/// would have listed as a new tid.
 fn final_exit_with<Io: FinalExitIo>(
     io: &mut Io,
     pid: u32,
@@ -373,30 +393,38 @@ fn final_exit_with<Io: FinalExitIo>(
     let Ok(tasks) = io.tasks() else {
         return false;
     };
-    // Every proven member by (tid, birth). A member already gone is
-    // left out: a tid that reappears in the closing listing is a new
-    // thread, never the released one.
+    // Every proven member by tid, with its birth and its held task
+    // directory: the open pins the struct pid, so the number cannot be
+    // recycled under the closing re-read. A member already gone between
+    // the listing and its open is left out: a tid that reappears in the
+    // closing listing without a handle is a new thread, never the
+    // released one.
     let mut seen = std::collections::BTreeMap::new();
     for entry in tasks {
-        if !work.spend(2) {
+        if !work.spend(3) {
             return false;
         }
         let Ok(tid) = entry else {
             return false;
         };
-        match io.member(tid) {
-            Ok(None) => {}
-            Ok(Some(task)) if task.past_user_mode() => {
-                seen.insert(tid, task.stat.birth);
+        let held = match io.open_member(tid) {
+            Ok(Some(held)) => held,
+            Ok(None) => continue,
+            Err(()) => return false,
+        };
+        match io.member(&held) {
+            Ok(task) if task.past_user_mode() => {
+                seen.insert(tid, (task.stat.birth, held));
             }
-            Ok(Some(_)) | Err(()) => return false,
+            Ok(_) | Err(()) => return false,
         }
     }
-    // Re-validate every thread the closing listing carries: a new tid,
-    // a recycled tid (a new birth under an old number), a recovered
-    // member, or a member that left this group all fail the proof. A
-    // thread gone between the listing and its re-read already exited,
-    // so it keeps the proof.
+    // Re-validate every thread the closing listing carries through its
+    // held directory: a new tid, a recycled number (which would need a
+    // handle the first walk never opened), a recovered member, or a
+    // member that left this group all fail the proof. A thread gone
+    // between the closing listing and its re-read fails too: it may have
+    // created a child after the listing that neither walk lists.
     if !work.spend(1) {
         return false;
     }
@@ -410,16 +438,17 @@ fn final_exit_with<Io: FinalExitIo>(
         let Ok(tid) = entry else {
             return false;
         };
-        let Some(first) = seen.get(&tid) else {
+        let Some((first, held)) = seen.get(&tid) else {
             return false;
         };
-        match io.member(tid) {
-            Ok(None) => {}
-            Ok(Some(task))
-                if task.stat.birth == *first
-                    && task.past_user_mode()
-                    && io.task_tgid(tid) == Ok(Some(pid)) => {}
-            Ok(Some(_)) | Err(()) => return false,
+        let Ok(task) = io.member(held) else {
+            return false;
+        };
+        if task.stat.birth != *first || !task.past_user_mode() {
+            return false;
+        }
+        if io.task_tgid(held) != Ok(pid) {
+            return false;
         }
     }
     // Close the walk on the same original leader: a reused or recovered
@@ -456,6 +485,27 @@ fn read_relative_io(
     String::from_utf8(bytes).map_err(io::Error::other)
 }
 
+fn open_task_dir(directory: BorrowedFd<'_>, tid: u32) -> Result<Option<OwnedFd>, ()> {
+    let path = std::ffi::CString::new(format!("task/{tid}")).map_err(|_| ())?;
+    // SAFETY: live directory fd and NUL-terminated, internally selected path.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(());
+    }
+    // SAFETY: openat returned a newly owned fd.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
 fn parse_exiting_task(stat: &str) -> Result<ExitingTask, ()> {
     let end = stat.rfind(')').ok_or(())?;
     Ok(ExitingTask {
@@ -475,6 +525,7 @@ fn parse_exiting_task(stat: &str) -> Result<ExitingTask, ()> {
 impl FinalExitIo for OsExitIo<'_> {
     type Tasks =
         std::iter::Map<std::fs::ReadDir, fn(io::Result<std::fs::DirEntry>) -> Result<u32, ()>>;
+    type Member = OwnedFd;
 
     fn group_exited(&mut self) -> Result<bool, ()> {
         self.original.original_exited().map_err(|_| ())
@@ -487,42 +538,20 @@ impl FinalExitIo for OsExitIo<'_> {
     fn tasks(&mut self) -> Result<Self::Tasks, ()> {
         ExitIo::tasks(self)
     }
-    fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()> {
-        let directory = self.directory.directory.as_fd();
-        let read = |name: &str, limit| {
-            let path = std::ffi::CString::new(format!("task/{tid}/{name}")).map_err(|_| None)?;
-            read_relative_io(directory, &path, limit).map_err(|error| {
-                (error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH))
-                .then_some(())
-            })
-        };
-        let stat = match read("stat", STAT_BYTES) {
-            Ok(stat) => stat,
-            Err(Some(())) => return Ok(None),
-            Err(None) => return Err(()),
-        };
-        parse_exiting_task(&stat).map(Some)
+    fn open_member(&mut self, tid: u32) -> Result<Option<Self::Member>, ()> {
+        open_task_dir(self.directory.directory.as_fd(), tid)
     }
-    fn task_tgid(&mut self, tid: u32) -> Result<Option<u32>, ()> {
-        let directory = self.directory.directory.as_fd();
-        let path = std::ffi::CString::new(format!("task/{tid}/status")).map_err(|_| ())?;
-        let text = match read_relative_io(directory, &path, STATUS_BYTES) {
-            Ok(text) => text,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                return Ok(None);
-            }
-            Err(_) => return Err(()),
-        };
+    fn member(&mut self, member: &Self::Member) -> Result<ExitingTask, ()> {
+        let stat = read_relative_io(member.as_fd(), c"stat", STAT_BYTES).map_err(|_| ())?;
+        parse_exiting_task(&stat)
+    }
+    fn task_tgid(&mut self, member: &Self::Member) -> Result<u32, ()> {
+        let text = read_relative_io(member.as_fd(), c"status", STATUS_BYTES).map_err(|_| ())?;
         text.lines()
             .find_map(|line| line.strip_prefix("Tgid:"))
             .ok_or(())?
             .trim()
             .parse()
-            .map(Some)
             .map_err(|_| ())
     }
 }
@@ -710,6 +739,7 @@ mod tests {
     }
     impl FinalExitIo for ScriptedFinalExit {
         type Tasks = std::vec::IntoIter<Result<u32, ()>>;
+        type Member = u32;
         fn group_exited(&mut self) -> Result<bool, ()> {
             Ok(self.exited)
         }
@@ -750,39 +780,53 @@ mod tests {
             }
             Ok(tids.into_iter())
         }
-        fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()> {
+        fn open_member(&mut self, tid: u32) -> Result<Option<Self::Member>, ()> {
             if tid == 7 {
-                return Ok(Some(self.leader));
+                return Ok(Some(7));
+            }
+            match self.members.iter().find(|(member, _)| *member == tid) {
+                Some((_, Ok(None))) => Ok(None),
+                Some((_, Err(()))) => Err(()),
+                Some((_, Ok(Some(_)))) => Ok(Some(tid)),
+                None => Err(()),
+            }
+        }
+        fn member(&mut self, member: &Self::Member) -> Result<ExitingTask, ()> {
+            let tid = *member;
+            if tid == 7 {
+                return Ok(self.leader);
             }
             // A seen tid listed in the closing listing but released
             // before its re-read, after creating a child the closing
-            // walk never lists: the re-read observes the release.
+            // walk never lists: the held re-read fails and must fail
+            // the proof closed.
             if self.listings > 1 && Some(tid) == self.gone_at_reread {
-                return Ok(None);
+                return Err(());
             }
             // A tid recycled between the two listings: the first walk
             // reads the old past (or gone) member, the closing re-read
-            // sees the live new thread under the same tid.
+            // sees the live new thread under the same tid. Held task
+            // directories pin the number against this reuse; the script
+            // keeps the birth/liveness check as defense in depth.
             if self.listings > 1 {
                 if let Some((reused, fresh)) = self.reused_member
                     && tid == reused
                 {
-                    return Ok(Some(fresh));
+                    return Ok(fresh);
                 }
                 if let Some((resurrected, fresh)) = self.resurrected
                     && tid == resurrected
                 {
-                    return Ok(Some(fresh));
+                    return Ok(fresh);
                 }
             }
-            self.members
-                .iter()
-                .find(|(member, _)| *member == tid)
-                .map(|(_, task)| *task)
-                .unwrap_or(Ok(None))
+            match self.members.iter().find(|(member, _)| *member == tid) {
+                Some((_, Ok(Some(task)))) => Ok(*task),
+                Some((_, Ok(None))) | Some((_, Err(()))) | None => Err(()),
+            }
         }
-        fn task_tgid(&mut self, _tid: u32) -> Result<Option<u32>, ()> {
-            Ok(Some(self.tgid))
+        fn task_tgid(&mut self, _member: &Self::Member) -> Result<u32, ()> {
+            Ok(self.tgid)
         }
     }
     fn task(state: u8, flags: u32) -> ExitingTask {
@@ -943,10 +987,10 @@ mod tests {
     fn listed_member_gone_at_the_closing_re_read_after_spawning_keeps_the_group_unproven() {
         // A seen tid listed in the closing listing, released before
         // its re-read after creating a child the closing walk never
-        // lists (created after the last directory read): the re-read
-        // observes `Ok(None)` while a live thread runs, so the proof
-        // must fail. Accepting the release would prove an exit with a
-        // live creator's child unlisted.
+        // lists (created after the last directory read): the held
+        // re-read fails while a live thread runs, so the proof must
+        // fail. Accepting the release would prove an exit with a live
+        // creator's child unlisted.
         let mut gone = dying_group();
         gone.gone_at_reread = Some(8);
         assert!(

@@ -1863,8 +1863,10 @@ pub(crate) fn process_proven_exited(pid: u32) -> bool {
 /// the proof behind the zero-byte exit wording and the errno'd
 /// mem-open silent path. It holds when the retained pidfd reports the
 /// group gone, when the leader and every member are past user mode
-/// ([`PidPin::final_exit_in_progress`], with per-member birth and
-/// `Tgid` re-validation), or when `kill` answers `ESRCH`
+/// ([`PidPin::final_exit_in_progress`], holding each member's task
+/// directory against tid reuse, with per-member birth and `Tgid`
+/// re-validation through the held handle, failing closed on a
+/// listed-but-gone member), or when `kill` answers `ESRCH`
 /// ([`process_proven_exited`], hidepid-proof). Pidfd authority only for
 /// the pin arm: a start-time fallback pin's mismatch means the pid was
 /// reused by a live process, which is NOT an exit. A fallback pin with
@@ -1878,11 +1880,11 @@ pub(crate) fn process_proven_exited(pid: u32) -> bool {
 /// mem arm (a zombie-aware leader read, not a whole-group proof) and
 /// the engine's `generation_dead` silence (owned by MT-EXIT-SCAN; this
 /// helper governs the exit decision, not that path's per-class
-/// accounting). Silent paths must use this proof or a documented
-/// exception, never an empty maps re-read alone: a zombie-leader group
-/// shows empty TGID maps while alive, and a leader running `exit_mm`
-/// empties its TGID maps while members keep the mm — either would drop
-/// gaps for a live group.
+/// accounting, which is not implemented in this lane). Silent paths
+/// must use this proof or a documented exception, never an empty maps
+/// re-read alone: a zombie-leader group shows empty TGID maps while
+/// alive, and a leader running `exit_mm` empties its TGID maps while
+/// members keep the mm — either would drop gaps for a live group.
 pub(crate) fn whole_group_proven_exited(view: &ProcessView) -> bool {
     // Pidfd authority only: without it a mismatch is pid reuse.
     if view.retained_pin().pidfd().is_ok() && view.original_exited() == Ok(true) {

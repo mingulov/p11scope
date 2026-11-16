@@ -7820,10 +7820,11 @@ fn scan_view_examined_mode(
         // takes the exited error path (the engine drops the view
         // silently, like a pid that exited before discovery) instead of
         // latching a global `scan_unavailable`: the ordinary end of a
-        // process is already counted via the exit ledger (descendant
-        // gaps), never a memory-unreadable loss. A short-lived child
-        // exiting mid-scan — reaped (`ENOENT`), zombie (`ESRCH`), or
-        // churning through the cold-filesystem exit states — must not
+        // process is never a memory-unreadable loss. The ruling's
+        // per-class count for this silent path is owned by MT-EXIT-SCAN
+        // and is not the exit ledger's descendant gaps. A short-lived
+        // child exiting mid-scan — reaped (`ENOENT`), zombie (`ESRCH`),
+        // or churning through the cold-filesystem exit states — must not
         // fail a never-mapped cell, while a live group's refusal stays
         // loud (the pin proves the group, never just its leader).
         if let Err(error) = &mem
@@ -12570,45 +12571,9 @@ int main(int argc, char **argv) {
             }
         }
 
-        const MT_EXIT_SOURCE: &str = r#"
-#define _GNU_SOURCE
-#include <pthread.h>
-#include <stdlib.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
-static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
-static unsigned ready = 0;
-
-static void *worker(void *arg) {
-    int fd = *(int *)arg;
-    if (pthread_mutex_lock(&gate)) _exit(10);
-    ready++;
-    if (pthread_cond_broadcast(&changed)) _exit(11);
-    if (pthread_mutex_unlock(&gate)) _exit(12);
-    char byte;
-    if (read(fd, &byte, 1) != 1) _exit(13);
-    syscall(SYS_exit, 0);
-    return NULL;
-}
-
-int main(int argc, char **argv) {
-    if (argc != 3) return 2;
-    static int fds[2];
-    fds[0] = atoi(argv[1]);
-    fds[1] = atoi(argv[2]);
-    pthread_t t0, t1;
-    if (pthread_create(&t0, NULL, worker, &fds[0])) return 3;
-    if (pthread_create(&t1, NULL, worker, &fds[1])) return 4;
-    if (pthread_mutex_lock(&gate)) return 5;
-    while (ready != 2)
-        if (pthread_cond_wait(&changed, &gate)) return 6;
-    if (pthread_mutex_unlock(&gate)) return 7;
-    if (write(STDOUT_FILENO, "R", 1) != 1) return 8;
-    pthread_exit(NULL);
-}
-"#;
+        // One traced two-worker shape for the module: the shared
+        // helper builds this same fixture.
+        const MT_EXIT_SOURCE: &str = TRACED_MT_EXIT_SOURCE;
 
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("mt-exit.c");

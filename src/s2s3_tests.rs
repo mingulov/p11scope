@@ -4898,3 +4898,189 @@ fn pqc_parameter_set_secret_alias_twins() {
         }
     }
 }
+
+// R2 new-site RED: a symmetric key created in-window with a complete
+// finite template (class + key type + value length) establishes those
+// facts and labels its view once creation succeeds — no attribute
+// query needed. Fails today: requested facts never establish, so the
+// established fields stay unknown and the label stays None.
+#[test]
+fn newsite_created_symmetric_key_establishes_and_labels() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 32),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::Class),
+        scalar_field(4),
+        "creation result establishes the requested class"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        scalar_field(0x1f),
+        "creation result establishes the requested key type"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        scalar_field(32),
+        "creation result establishes the requested size"
+    );
+    assert_eq!(
+        v.label,
+        Some(KeyLabel::Aes { value_len: 32 }),
+        "complete creation template labels without a query"
+    );
+}
+
+// R2 new-site RED: creation promotes finite parameter facts even when
+// the template omits the key type (the measured Firefox ephemeral
+// keypair shape: curve params, no class/type). The curve establishes,
+// but the label stays None: a key type is still required. Fails
+// today on the established curve (unknown); the label half pins the
+// unchanged completeness rule.
+#[test]
+fn newsite_created_params_without_type_stay_unlabeled() {
+    const X25519_DRAFT: [u8; 11] = [
+        0x06, 0x09, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01,
+    ];
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let public = attrs(&[AttrObservation::curve(
+        CKA_EC_PARAMS,
+        &X25519_DRAFT,
+        LinuxLayout::Lp64,
+    )]);
+    let x = h.run(
+        3,
+        call("C_GenerateKeyPair").on(SA).request(0, public),
+        4,
+        ok().result(0, H1).result(1, H2),
+    );
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert!(
+        matches!(
+            v.established.field(SafeAttributeKind::EcParams),
+            FieldState::Value(FieldValue::Curve(_))
+        ),
+        "creation result establishes the requested curve"
+    );
+    assert_eq!(
+        v.label, None,
+        "curve without key type: no label (unchanged rule)"
+    );
+}
+
+// R2 new-site RED: the full HKDF path — a derived HKDF key (class +
+// CKK_HKDF + value length) establishes and labels. Fails today:
+// the key type and size do not classify and requested facts never
+// establish. Asserts through existing API (established fields plus
+// label presence); the exact label string is pinned with GREEN.
+#[test]
+fn newsite_derived_hkdf_key_establishes_and_labels() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x42),
+        scalar(CKA_VALUE_LEN, 48),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        scalar_field(0x42),
+        "creation result establishes the HKDF key type"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        scalar_field(48),
+        "creation result establishes the requested size"
+    );
+    assert!(
+        v.label.is_some(),
+        "complete HKDF creation template labels without a query"
+    );
+}
+
+// Keymeta §6 generic unlisted-type twin: a creation template carrying
+// an unlisted key type (`CKK_CHACHA20`, 0x33) promotes only the
+// value-length fact — the key type stays unknown and the view never
+// labels. A later use still counts without labeling (no
+// mechanism-derived fact; the use-side family inference arrives with
+// Task 3).
+#[test]
+fn newsite_created_chacha20_key_promotes_value_len_without_label() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x33),
+        scalar(CKA_VALUE_LEN, 32),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    h.run(5, sign_init(SA, H1), 6, ok());
+    let e = h.settle(6);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        FieldState::Unknown,
+        "the unlisted key type promotes nothing"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        scalar_field(32),
+        "the finite value length still promotes"
+    );
+    assert_eq!(v.label, None, "a size alone never labels");
+}
+
+// Keymeta §6 generic unlisted-type twin (`CKK_POLY1305`, 0x34),
+// through the generate family: same rule — the value length
+// promotes, the type stays unknown, the view stays unlabeled.
+#[test]
+fn newsite_created_poly1305_key_promotes_value_len_without_label() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x34),
+        scalar(CKA_VALUE_LEN, 16),
+    ]);
+    let x = h.run(
+        3,
+        call("C_GenerateKey").on(SA).request(0, template),
+        4,
+        ok().result(0, H1),
+    );
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        FieldState::Unknown,
+        "the unlisted key type promotes nothing"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        scalar_field(16),
+        "the finite value length still promotes"
+    );
+    assert_eq!(v.label, None, "a size alone never labels");
+}

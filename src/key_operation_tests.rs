@@ -25309,3 +25309,160 @@ fn key_operation_kem_labelled_input_rows_proved() {
         );
     }
 }
+
+/// Keymeta §6/K5 source twin: a complete creation template honored by
+/// a successful return promotes with per-field source
+/// `creation_success` — visible on the objects[] established block,
+/// with queries staying `not_queried` (no read-back happened).
+#[test]
+fn key_operation_newsite_promoted_field_carries_creation_source() {
+    use crate::semantics_key_use::KeyUseReducer;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1f), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&committed);
+    let established = &section["objects"][0]["established"];
+    for field in ["class", "key_type", "value_len"] {
+        assert_eq!(
+            established[field]["status"], "value",
+            "{field}: the honored template establishes"
+        );
+        assert_eq!(
+            established[field]["source"], "creation_success",
+            "{field}: promoted facts carry their source"
+        );
+    }
+    assert_eq!(established["key_type"]["value"], 0x1f);
+    assert_eq!(established["value_len"]["value"], 32);
+    let queries = &section["objects"][0]["queries"];
+    for field in ["class", "key_type", "value_len"] {
+        assert_eq!(
+            queries[field], "not_queried",
+            "{field}: promotion records the creation result, never a read-back"
+        );
+    }
+}
+
+/// Keymeta §6/K5 source twin: a field established by an attribute
+/// query carries source `query`, distinct from promoted facts.
+#[test]
+fn key_operation_newsite_queried_field_carries_query_source() {
+    use crate::semantics_key_use::KeyUseReducer;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&committed);
+    let established = &section["objects"][0]["established"];
+    for field in ["class", "key_type", "value_len"] {
+        assert_eq!(
+            established[field]["status"], "value",
+            "{field}: the query establishes"
+        );
+        assert_eq!(
+            established[field]["source"], "query",
+            "{field}: queried facts carry their source"
+        );
+    }
+}
+
+/// Keymeta §6 source twin: `CKA_TOKEN` never promotes. The same
+/// template's finite class, key type and value length establish with
+/// `creation_success`, while the token slot stays unknown with a null
+/// source — token persistence keeps its query-established bar.
+#[test]
+fn key_operation_newsite_token_request_never_promotes() {
+    use crate::semantics_key_use::KeyUseReducer;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![
+                (1u8, 1u8, 4u16),
+                (2u8, 1u8, 0x1f),
+                (3u8, 1u8, 1u16),
+                (4u8, 1u8, 32u16),
+            ],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&committed);
+    let established = &section["objects"][0]["established"];
+    for field in ["class", "key_type", "value_len"] {
+        assert_eq!(
+            established[field]["source"], "creation_success",
+            "{field}: the finite template promotes"
+        );
+    }
+    assert_eq!(
+        established["token"]["status"], "unknown",
+        "a TOKEN request never promotes"
+    );
+    assert!(
+        established["token"]["source"].is_null(),
+        "an unpromoted slot carries no source"
+    );
+}

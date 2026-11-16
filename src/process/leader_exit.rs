@@ -303,6 +303,11 @@ impl PidPin {
 #[derive(Clone, Copy)]
 struct ExitingTask {
     stat: TaskStat,
+    /// Stat field 20 (`num_threads`): the group's unreleased thread
+    /// count, read under the task's `siglock` after its state field
+    /// (`fs/proc/array.c` `do_task_stat`); 0 when the task was released
+    /// mid-read. `None` when the field is malformed.
+    threads: Option<u32>,
 }
 
 impl ExitingTask {
@@ -519,6 +524,10 @@ fn parse_exiting_task(stat: &str) -> Result<ExitingTask, ()> {
                 .ok_or(())?,
             flags: stat_flags_from_stat_text(stat).ok_or(())?,
         },
+        threads: stat[end + 1..]
+            .split_whitespace()
+            .nth(17)
+            .and_then(|v| v.parse().ok()),
     })
 }
 
@@ -734,6 +743,13 @@ mod tests {
         reused_member: Option<(u32, ExitingTask)>,
         resurrected: Option<(u32, ExitingTask)>,
         gone_at_reread: Option<u32>,
+        /// Seen in the first walk, released before the closing listing
+        /// (omitted there, its held re-read fails).
+        released_after_walk: Option<u32>,
+        /// Listed twice by the closing listing.
+        duplicate_in_closing: Option<u32>,
+        /// The group's unreleased thread count every leader stat reports.
+        leader_threads: u32,
         tgid: u32,
         listings: usize,
     }
@@ -746,6 +762,7 @@ mod tests {
         fn leader(&mut self) -> Result<ExitingTask, ()> {
             self.leader_reads += 1;
             let mut leader = self.leader;
+            leader.threads = Some(self.leader_threads);
             if self.reused_leader_after_walk && self.leader_reads > 1 {
                 leader.stat.birth += 1;
             }
@@ -759,8 +776,9 @@ mod tests {
                 // listing omits it unless a new thread reused the tid
                 // (scripted via `resurrected`).
                 if self.listings > 1
-                    && matches!(task, Ok(None))
-                    && Some(*tid) != self.resurrected.map(|(resurrected, _)| resurrected)
+                    && ((matches!(task, Ok(None))
+                        && Some(*tid) != self.resurrected.map(|(resurrected, _)| resurrected))
+                        || Some(*tid) == self.released_after_walk)
                 {
                     None
                 } else {
@@ -769,6 +787,7 @@ mod tests {
             }));
             if self.listings > 1 {
                 tids.extend(self.late_member.map(Ok));
+                tids.extend(self.duplicate_in_closing.map(Ok));
                 if let Some((resurrected, _)) = self.resurrected
                     && !self
                         .members
@@ -795,6 +814,9 @@ mod tests {
             let tid = *member;
             if tid == 7 {
                 return Ok(self.leader);
+            }
+            if self.listings > 1 && Some(tid) == self.released_after_walk {
+                return Err(());
             }
             // A seen tid listed in the closing listing but released
             // before its re-read, after creating a child the closing
@@ -836,6 +858,7 @@ mod tests {
                 state,
                 flags,
             },
+            threads: None,
         }
     }
     fn dying_group() -> ScriptedFinalExit {
@@ -853,6 +876,10 @@ mod tests {
             reused_member: None,
             resurrected: None,
             gone_at_reread: None,
+            released_after_walk: None,
+            duplicate_in_closing: None,
+            // The zombie leader plus the unreleased members 8 and 9.
+            leader_threads: 3,
             tgid: 7,
             listings: 0,
         }
@@ -949,6 +976,7 @@ mod tests {
                     state: b'S',
                     flags: 0,
                 },
+                threads: None,
             },
         ));
         assert!(
@@ -968,6 +996,7 @@ mod tests {
                     state: b'S',
                     flags: 0,
                 },
+                threads: None,
             },
         ));
         assert!(
@@ -999,6 +1028,369 @@ mod tests {
         );
         assert_eq!(gone.listings, 2, "the task list is read twice");
     }
+    /// A non-leader `exec` moves the leader's struct pid (the TGID) to
+    /// the execing thread and copies the leader's start time into it
+    /// (`fs/exec.c` `de_thread`), so the held leader directory follows
+    /// the new task: birth and `Tgid` still match, and once that task
+    /// leaves by a thread exit it reads past. A live thread it created
+    /// after the closing listing is in neither listing; only the
+    /// group's unreleased-thread count shows it, so the proof must fail.
+    #[test]
+    fn non_leader_exec_with_an_unlisted_live_thread_keeps_the_group_unproven() {
+        let exec = || {
+            let mut exec = dying_group();
+            // Member 8 was seen past, then released before the closing
+            // listing (the exec reaps every other thread).
+            exec.members = vec![(8, Ok(Some(task(b'R', PF_EXITING))))];
+            exec.released_after_walk = Some(8);
+            exec
+        };
+        let mut live = exec();
+        // The execing thread, now the zombie leader, plus its live,
+        // unlisted thread.
+        live.leader_threads = 2;
+        assert!(
+            !final_exit(&mut live),
+            "an exec-transferred leader with an unlisted live thread keeps the group unproven"
+        );
+        // Healthy twin: the zombie leader is the group's only thread.
+        let mut alone = exec();
+        alone.leader_threads = 1;
+        assert!(
+            final_exit(&mut alone),
+            "a zombie leader alone in its group is the final exit"
+        );
+    }
+
+    /// The thread count read with the zombie leader must be fully
+    /// accounted for by distinct held members still present after it:
+    /// an extra unreleased thread, a duplicated listing entry, or a
+    /// leader released mid-read never proves the exit.
+    #[test]
+    fn thread_census_must_account_for_every_unreleased_thread() {
+        assert!(final_exit(&mut dying_group()), "the exact census proves");
+        let mut extra = dying_group();
+        extra.leader_threads = 4;
+        assert!(
+            !final_exit(&mut extra),
+            "an unlisted unreleased thread keeps the group unproven"
+        );
+        let mut duplicate = dying_group();
+        duplicate.leader_threads = 4;
+        duplicate.duplicate_in_closing = Some(8);
+        assert!(
+            !final_exit(&mut duplicate),
+            "a member listed twice counts once"
+        );
+        let mut released = dying_group();
+        released.leader_threads = 0;
+        assert!(
+            !final_exit(&mut released),
+            "a count read after the leader's release is no census"
+        );
+        let parsed =
+            parse_exiting_task("7 (x) Z 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 3 0 500 0 0")
+                .unwrap();
+        assert_eq!(parsed.threads, Some(3), "stat field 20");
+        let torn = parse_exiting_task("7 (x) Z 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 x").unwrap();
+        assert_eq!(torn.threads, None, "a malformed count is no count");
+    }
+
+    /// The count is read after the state field but before the flags
+    /// word, so only a dead state (zombie) proves the census: a leader
+    /// still in `do_exit` could have created a thread between the two
+    /// fields. Such a group stays unproven until the leader is a zombie
+    /// (or the pidfd reports the end).
+    #[test]
+    fn a_leader_not_yet_a_zombie_never_proves_the_census() {
+        let mut single = dying_group();
+        single.members.clear();
+        single.leader = task(b'R', PF_EXITING);
+        single.leader_threads = 1;
+        assert!(
+            !final_exit(&mut single),
+            "a lone leader still in do_exit is unproven"
+        );
+        single.leader = task(b'Z', PF_EXITING);
+        assert!(final_exit(&mut single), "a lone zombie leader proves");
+        let mut exiting = dying_group();
+        exiting.leader = task(b'D', PF_EXITING);
+        assert!(
+            !final_exit(&mut exiting),
+            "an exiting, non-zombie leader is unproven"
+        );
+    }
+
+    /// Real `/proc` reproducer of the non-leader `exec` identity
+    /// transfer: the leader leaves by `pthread_exit`, a worker execs,
+    /// and the new image (now the leader under the original pid with
+    /// the original start time) creates a blocked thread and leaves by
+    /// `pthread_exit` too. The held leader task directory follows the
+    /// execing thread. The proof runs against the real kernel state
+    /// with the live thread hidden from both listings — what a thread
+    /// created after the closing listing looks like — and must fail.
+    #[test]
+    fn real_non_leader_exec_with_a_hidden_live_thread_keeps_the_group_unproven() {
+        let step = std::sync::Arc::new(std::sync::Mutex::new("start"));
+        let (done, result) = std::sync::mpsc::channel();
+        let body_step = std::sync::Arc::clone(&step);
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                exec_transfer_walk(&body_step)
+            }));
+            let _ = done.send(outcome);
+        });
+        match result.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!(
+                "the exec-transfer walk did not finish within 60 s; stuck at: {}",
+                step.lock().unwrap()
+            ),
+        }
+    }
+
+    /// The real OS proof IO with one tid hidden from every listing.
+    struct HidingIo<'a> {
+        inner: OsExitIo<'a>,
+        hidden: u32,
+    }
+    impl FinalExitIo for HidingIo<'_> {
+        type Tasks = std::vec::IntoIter<Result<u32, ()>>;
+        type Member = OwnedFd;
+        fn group_exited(&mut self) -> Result<bool, ()> {
+            FinalExitIo::group_exited(&mut self.inner)
+        }
+        fn leader(&mut self) -> Result<ExitingTask, ()> {
+            FinalExitIo::leader(&mut self.inner)
+        }
+        fn tasks(&mut self) -> Result<Self::Tasks, ()> {
+            let hidden = self.hidden;
+            Ok(FinalExitIo::tasks(&mut self.inner)?
+                .filter(|tid| *tid != Ok(hidden))
+                .collect::<Vec<_>>()
+                .into_iter())
+        }
+        fn open_member(&mut self, tid: u32) -> Result<Option<Self::Member>, ()> {
+            FinalExitIo::open_member(&mut self.inner, tid)
+        }
+        fn member(&mut self, member: &Self::Member) -> Result<ExitingTask, ()> {
+            FinalExitIo::member(&mut self.inner, member)
+        }
+        fn task_tgid(&mut self, member: &Self::Member) -> Result<u32, ()> {
+            FinalExitIo::task_tgid(&mut self.inner, member)
+        }
+    }
+
+    /// Kills and reaps the exec fixture on every exit path.
+    struct ExecGroup(Option<std::process::Child>);
+    impl Drop for ExecGroup {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn task_tids(pid: u32) -> Vec<u32> {
+        let mut tids: Vec<u32> = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        tids.sort_unstable();
+        tids
+    }
+
+    fn exec_transfer_walk(step: &std::sync::Mutex<&'static str>) {
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+        let at = |name: &'static str| *step.lock().unwrap() = name;
+
+        at("build the fixture");
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("mt-exec.c");
+        let executable = dir.path().join("mt-exec");
+        std::fs::write(&source, MT_EXEC_SOURCE).unwrap();
+        let built = std::process::Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-O1"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(built.success(), "fixture build failed: {built}");
+
+        at("spawn the fixture");
+        let (gate_r, mut gate_w) = std::io::pipe().unwrap();
+        let (release_r, mut release_w) = std::io::pipe().unwrap();
+        let (gate_raw, release_raw) = (gate_r.as_raw_fd(), release_r.as_raw_fd());
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args(["before", &gate_raw.to_string(), &release_raw.to_string()])
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: only async-signal-safe prctl/fcntl before exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0
+                    || libc::fcntl(gate_raw, libc::F_SETFD, 0) != 0
+                    || libc::fcntl(release_raw, libc::F_SETFD, 0) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop((gate_r, release_r));
+        let pid = child.id();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut group = ExecGroup(Some(child));
+        let pin = PidPin::open(pid).unwrap();
+        assert!(pin.pidfd().is_ok(), "the proof needs a pidfd pin");
+        let birth = pin.start_time().expect("the pin retains the birth");
+
+        let wait_for = |what: &'static str, done: &dyn Fn() -> bool| {
+            at(what);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wait_for("zombie leader with the gated worker", &|| {
+            crate::process::process_is_zombie(pid) && task_tids(pid).len() == 2
+        });
+        let before = task_tids(pid);
+        let worker = *before.iter().find(|tid| **tid != pid).unwrap();
+        // Hold the leader's task directory across the exec.
+        let held = open_task_dir(pin.open_proc_dir().unwrap().directory.as_fd(), pid)
+            .unwrap()
+            .expect("the zombie leader's task directory opens");
+        let read_held = || {
+            parse_exiting_task(&read_relative_io(held.as_fd(), c"stat", STAT_BYTES).unwrap())
+                .unwrap()
+        };
+        let old = read_held();
+        assert_eq!(old.stat.state, b'Z');
+        assert_eq!(old.stat.birth, birth);
+        assert!(
+            !pin.final_exit_in_progress(&mut LeaderExitReadBudget::for_test(512)),
+            "a live worker keeps the zombie-leader group live"
+        );
+
+        at("non-leader exec");
+        gate_w.write_all(&[1]).unwrap();
+        let mut ready = [0u8; 1];
+        stdout.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, *b"R", "the new image is up");
+        wait_for("exec'd leader leaves, its thread lives", &|| {
+            let tids = task_tids(pid);
+            crate::process::process_is_zombie(pid) && tids.len() == 2 && !tids.contains(&worker)
+        });
+        let after = task_tids(pid);
+        let live = *after.iter().find(|tid| **tid != pid).unwrap();
+
+        at("held leader follows the execing thread");
+        let new = read_held();
+        assert_eq!(
+            new.stat.state, b'Z',
+            "the exec'd leader left by pthread_exit"
+        );
+        assert_eq!(
+            new.stat.birth, birth,
+            "de_thread copies the leader's start time"
+        );
+        assert_eq!(new.threads, Some(2), "the count sees the live thread");
+        assert_eq!(pin.original_exited(), Ok(false), "the group lives");
+
+        at("proof with the live thread hidden");
+        let mut hiding = HidingIo {
+            inner: OsExitIo {
+                original: &pin,
+                directory: pin.open_proc_dir().unwrap(),
+            },
+            hidden: live,
+        };
+        assert!(
+            !final_exit_with(
+                &mut hiding,
+                pid,
+                birth,
+                &mut LeaderExitReadBudget::for_test(512)
+            ),
+            "an unlisted live thread after a non-leader exec keeps the group unproven"
+        );
+        assert!(
+            !pin.final_exit_in_progress(&mut LeaderExitReadBudget::for_test(512)),
+            "the listed live thread keeps the group live"
+        );
+
+        at("release the live thread");
+        release_w.write_all(&[1]).unwrap();
+        let mut child = group.0.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the group never ended");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(status.success(), "{status}");
+        assert_eq!(pin.original_exited(), Ok(true));
+    }
+
+    /// `before GATE RELEASE`: the leader leaves by `pthread_exit` while a
+    /// worker waits on GATE, then execs this binary as `after`. `after`:
+    /// now the leader, it starts a thread blocked on RELEASE (which then
+    /// ends the group with status 0), reports `R` and leaves by
+    /// `pthread_exit`.
+    const MT_EXEC_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static char *gate_arg;
+static char *release_arg;
+
+static void *execer(void *arg) {
+    (void)arg;
+    char byte;
+    if (read(atoi(gate_arg), &byte, 1) != 1) _exit(20);
+    char *const argv[] = {"mt-exec", "after", gate_arg, release_arg, NULL};
+    /* /proc/self/exe follows the zombie leader, which has no mm. */
+    execv("/proc/thread-self/exe", argv);
+    _exit(21);
+}
+
+static void *blocker(void *arg) {
+    (void)arg;
+    char byte;
+    if (read(atoi(release_arg), &byte, 1) != 1) _exit(22);
+    _exit(0);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) return 2;
+    gate_arg = argv[2];
+    release_arg = argv[3];
+    pthread_t thread;
+    if (strcmp(argv[1], "before") == 0) {
+        if (pthread_create(&thread, NULL, execer, NULL)) return 3;
+    } else {
+        if (pthread_create(&thread, NULL, blocker, NULL)) return 4;
+        if (write(STDOUT_FILENO, "R", 1) != 1) return 5;
+    }
+    pthread_exit(NULL);
+}
+"#;
+
     #[test]
     fn real_live_group_is_not_in_final_exit_until_it_exits() {
         let mut child = std::process::Command::new("sleep")

@@ -23562,8 +23562,8 @@ impl Engine {
             }
             let now_ns = crate::attach::monotonic_ns();
             let pids: Vec<u32> = self.views.iter().map(ProcessView::pid).collect();
-            for pid in pids {
-                self.request_refresh(pid, now_ns);
+            for pid in &pids {
+                self.request_refresh(*pid, now_ns);
             }
             if crate::run::capture_diagnostics_on() {
                 eprintln!(

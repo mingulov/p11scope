@@ -3769,6 +3769,31 @@ def exact_function_target(item):
     require(keys == sorted(set(keys)), f"ordinals are not sorted and unique: {item}")
 
 
+# V3-additive `functions[].unnamed_reasons` (observed-profile-v3): the
+# sorted, deduplicated reasons a row's names stayed ["unknown"], from a
+# closed vocabulary. Presence-conditional: v2 documents predate the key
+# (bare unknowns are legal there, and the key arrived within v3 with no
+# new revision to gate on), so absence is always accepted and only a
+# present key is validated.
+UNNAMED_REASON_TOKENS = ("heuristic_table", "selection_without_standard_proof")
+
+
+def exact_unnamed_reasons(item):
+    """A present `unnamed_reasons` sits only on ["unknown"] rows: nonempty,
+    closed-vocabulary, sorted and unique. Absent (never null) elsewhere."""
+    reasons = item.get("unnamed_reasons")
+    if reasons is None:
+        require("unnamed_reasons" not in item, f"unnamed_reasons is null: {item}")
+        return
+    require(item["names"] == ["unknown"], f"named row carries unnamed_reasons: {item}")
+    require(isinstance(reasons, list) and reasons, f"unnamed_reasons is empty: {item}")
+    require(
+        all(isinstance(reason, str) and reason in UNNAMED_REASON_TOKENS for reason in reasons),
+        f"unnamed_reasons outside the closed vocabulary: {item}",
+    )
+    require(reasons == sorted(set(reasons)), f"unnamed_reasons not sorted and unique: {item}")
+
+
 def exact_capture_modules(document):
     """`capture.modules[]` — v2's replacement for the singular `capture.module`.
 
@@ -3811,6 +3836,7 @@ def exact_capture_modules(document):
             isinstance(item["aliased"], bool) and item["aliased"] == (len(names) > 1),
             f"function alias flag disagrees with names: {item}",
         )
+        exact_unnamed_reasons(item)
         owner, ambiguous = item["module"], item["module_ambiguous"]
         if owner is None:
             # Two stated reasons exist, and `exact_module_ownership` above has
@@ -7848,6 +7874,30 @@ def self_test():
     complete_but_unresolved["evidence"]["completeness"] = "COMPLETE"
     rejected(lambda: exact_module_ownership(complete_but_unresolved))
     print("module ownership is an exact exclusive relation and unresolved is PARTIAL: OK")
+    exact_unnamed_reasons({"names": ["unknown"], "unnamed_reasons": ["heuristic_table"]})
+    exact_unnamed_reasons(
+        {
+            "names": ["unknown"],
+            "unnamed_reasons": ["heuristic_table", "selection_without_standard_proof"],
+        }
+    )
+    exact_unnamed_reasons({"names": ["C_Sign"]})
+    exact_unnamed_reasons({"names": ["unknown"]})
+    for mutate in (
+        lambda d: d.update(names=["C_Sign"]),
+        lambda d: d.update(unnamed_reasons=[]),
+        lambda d: d.update(unnamed_reasons=None),
+        lambda d: d.update(unnamed_reasons=["heuristic_table", "heuristic_table"]),
+        lambda d: d.update(
+            unnamed_reasons=["selection_without_standard_proof", "heuristic_table"]
+        ),
+        lambda d: d.update(unnamed_reasons=["heuristic_table", "invented"]),
+        lambda d: d.update(unnamed_reasons="heuristic_table"),
+    ):
+        bad = {"names": ["unknown"], "unnamed_reasons": ["heuristic_table"]}
+        mutate(bad)
+        rejected(lambda bad=bad: exact_unnamed_reasons(bad))
+    print("unnamed_reasons is unknown-only, closed-vocabulary, sorted and unique: OK")
 
     # ---- active-to-empty lifecycle --------------------------------------
     # The target exited normally: links, pins and views are gone, and every

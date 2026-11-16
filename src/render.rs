@@ -9713,6 +9713,138 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn retire_rename_cycles_keep_reasons_on_unknown_rows_only() {
+        // Extend surgery can leave a retired unknown slot and a fresh
+        // named slot sharing one AttachKey: retire drops the key from
+        // the attach index while the slot keeps rendering, and a
+        // reappearing key with different names takes a fresh slot (no
+        // revivable clearance, names differ). The mirror happens when
+        // the same key later reappears unknown: a retired named hole
+        // beside an active unknown row. Reasons live in a per-key map,
+        // so the lookup must gate on each slot's own names: unknown
+        // rows carry `unnamed_reasons`, named rows omit it. Both
+        // shapes and both directions are asserted at the rendered
+        // JSON seam.
+        use crate::discovery::identity::PinnedObjectId;
+        use crate::plan::{AttachKey, AttachPlan, ModuleSummary, SelectionTableTarget};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+
+        let object = PinnedObjectId(7);
+        let module = || ModuleSummary {
+            id: ModuleId(0),
+            object,
+            key: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            path: "/opt/module7.so".into(),
+            tables: vec![],
+            interfaces: 0,
+            source: "manifest",
+            corroborated: false,
+            skipped: vec![],
+            admission_class: None,
+        };
+        let candidate = |name: &'static str, file_offset: u64| {
+            let mut plan = AttachPlan::from_slots(vec![]);
+            plan.modules = vec![module()];
+            let allocated = plan.clone();
+            plan.add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [SelectionTableTarget::provider_local(
+                    object,
+                    "/proc/self/fd/7".into(),
+                    file_offset,
+                    name,
+                )],
+            )
+            .unwrap();
+            plan
+        };
+
+        let mut plan = candidate("unknown", 0x10);
+        plan.extend_exact(candidate("unknown", 0x20)).unwrap();
+        plan.extend_exact(candidate("C_Login", 0x10)).unwrap();
+        plan.extend_exact(candidate("unknown", 0x20)).unwrap();
+        plan.extend_exact(candidate("unknown", 0x10)).unwrap();
+
+        assert_eq!(plan.slots.len(), 5);
+        let (retired, fresh) = (&plan.slots[0], &plan.slots[2]);
+        assert_eq!(retired.names, ["unknown"]);
+        assert_eq!(fresh.names, ["C_Login"]);
+        assert_eq!(AttachKey::of(retired), AttachKey::of(fresh));
+        assert!(!plan.is_active(0));
+        assert_eq!(
+            plan.unnamed_reasons_of(retired),
+            ["selection_without_standard_proof"]
+        );
+        assert!(
+            plan.unnamed_reasons_of(fresh).is_empty(),
+            "a named slot carries no reason even with an unknown same-key sibling"
+        );
+        let (retired_named, fresh_unknown) = (&plan.slots[2], &plan.slots[4]);
+        assert_eq!(retired_named.names, ["C_Login"]);
+        assert_eq!(fresh_unknown.names, ["unknown"]);
+        assert_eq!(AttachKey::of(retired_named), AttachKey::of(fresh_unknown));
+        assert!(!plan.is_active(2));
+        assert!(plan.is_active(4));
+        assert_eq!(
+            plan.unnamed_reasons_of(fresh_unknown),
+            ["selection_without_standard_proof"]
+        );
+        assert!(
+            plan.unnamed_reasons_of(retired_named).is_empty(),
+            "a retired named hole reads no reason from its unknown same-key successor"
+        );
+
+        // Render level: the rows map names and reasons exactly like
+        // the production SlotReport builders (metrics::slot_report and
+        // the counter projection), which both delegate to
+        // `unnamed_reasons_of` with no further gating.
+        let row = |slot: &crate::plan::Slot| {
+            let mut out = report(&slot.names.join("|"), 0, 0, slot.names.len() > 1);
+            out.names = slot.names.clone();
+            out.file_offset = slot.file_offset;
+            out.unnamed_reasons = plan
+                .unnamed_reasons_of(slot)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            out
+        };
+        let v = profile_json(
+            &[
+                row(retired),
+                row(fresh),
+                row(fresh_unknown),
+                row(retired_named),
+            ],
+            VersionedEvidence::wrap(&evidence()),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            v["functions"][0]["unnamed_reasons"],
+            serde_json::json!(["selection_without_standard_proof"])
+        );
+        assert!(
+            v["functions"][1].get("unnamed_reasons").is_none(),
+            "named row omits the key: {}",
+            v["functions"][1]
+        );
+        assert_eq!(
+            v["functions"][2]["unnamed_reasons"],
+            serde_json::json!(["selection_without_standard_proof"])
+        );
+        assert!(
+            v["functions"][3].get("unnamed_reasons").is_none(),
+            "retired named row omits the key: {}",
+            v["functions"][3]
+        );
+    }
+
+    #[test]
     fn interface_name_bytes_never_reach_capture_output() {
         // inspect may show names; capture output may not (spec §4.3, allowlist v1).
         // The count is the evidence; the bytes came out of a provider's memory.

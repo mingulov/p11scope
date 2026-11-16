@@ -1715,6 +1715,14 @@ impl AttachPlan {
     /// Why this slot's names stayed unknown, as stable schema tokens,
     /// sorted. Empty unless the slot's names are `[UNKNOWN_FUNCTION_NAME]`.
     pub(crate) fn unnamed_reasons_of(&self, slot: &Slot) -> Vec<&'static str> {
+        // Extend surgery can leave a retired unknown slot and a fresh
+        // named slot sharing one AttachKey while the key-keyed reasons
+        // map keeps the unknown sibling's entry (the retain covers
+        // retired positions too). Gate on this slot's own names so a
+        // named row never borrows its sibling's reasons.
+        if slot.names.as_slice() != [UNKNOWN_FUNCTION_NAME] {
+            return Vec::new();
+        }
         self.slot_unnamed_reasons
             .get(&AttachKey::of(slot))
             .map(|reasons| reasons.iter().copied().map(UnprovenNames::token).collect())
@@ -2218,6 +2226,15 @@ impl AttachPlan {
                     ordinal,
                 }));
             if let Some(position) = self.slot_by_key.get(&key).copied() {
+                // A retired unknown sibling keeps rendering under this
+                // key, so the entry stays for it when one exists; named
+                // slots read nothing regardless (see
+                // `unnamed_reasons_of`).
+                let keep_for_sibling = self.slots.iter().enumerate().any(|(index, slot)| {
+                    index != position
+                        && AttachKey::of(slot) == key
+                        && slot.names.as_slice() == [UNKNOWN_FUNCTION_NAME]
+                });
                 let slot = &mut self.slots[position];
                 slot.names
                     .extend(claims.names.into_iter().map(str::to_string));
@@ -2232,7 +2249,7 @@ impl AttachPlan {
                         .entry(key)
                         .or_default()
                         .extend(claims.unproven);
-                } else {
+                } else if !keep_for_sibling {
                     self.slot_unnamed_reasons.remove(&key);
                 }
                 slot.aliased |= slot.names.len() >= 2;
@@ -12693,6 +12710,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn selection_claim_on_a_named_sibling_keeps_the_retired_unknown_reason() {
+        // With a retired unknown slot and an active named slot sharing
+        // one AttachKey, a selection claim that touches the named slot
+        // must not strip the unknown sibling's reason: the retired row
+        // keeps rendering, so the entry stays for it.
+        let object = PinnedObjectId(7);
+        let base = exact_plan(vec![], vec![exact_module(0, object)]);
+        let candidate = |name: &'static str, file_offset: u64| {
+            let mut plan = base.clone();
+            let allocated = plan.clone();
+            plan.add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [selection_target(object, file_offset, name)],
+            )
+            .unwrap();
+            plan
+        };
+
+        let mut plan = candidate(UNKNOWN_FUNCTION_NAME, 0x10);
+        plan.extend_exact(candidate(UNKNOWN_FUNCTION_NAME, 0x20))
+            .unwrap();
+        plan.extend_exact(candidate("C_Login", 0x10)).unwrap();
+        assert_eq!(plan.slots.len(), 3);
+        assert_eq!(AttachKey::of(&plan.slots[0]), AttachKey::of(&plan.slots[2]));
+
+        let snapshot = plan.clone();
+        plan.add_selection_table(
+            &snapshot,
+            ModuleId(0),
+            [selection_target(object, 0x10, "C_Login")],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            [UnprovenNames::SelectionWithoutStandardProof.token()],
+            "the retired unknown sibling keeps its reason"
+        );
+        assert!(
+            plan.unnamed_reasons_of(&plan.slots[2]).is_empty(),
+            "the named slot still reads no reason"
+        );
+    }
+
+    #[test]
     fn named_slot_carries_no_unnamed_reason() {
         // Positive twins: a manifest-authorized slot, and a slot where an
         // authorized name displaced `unknown`, carry no reason.
@@ -12762,6 +12824,75 @@ pub(crate) mod tests {
         cursor.assemble(&old);
         let out = cursor.output.take().expect("assembly produces a plan");
         assert_eq!(out.slot_unnamed_reasons, old.slot_unnamed_reasons);
+    }
+
+    #[test]
+    fn conservative_rebuild_preserves_unnamed_reasons() {
+        // End-to-end drive of `poll_conservative_rebuild` over a
+        // nonempty reasons map: the measure/reserve/copy/assemble
+        // stages carry the map whole, and the reservation covers it.
+        use crate::discovery::identity::GraphStep;
+        use crate::semantics_edge::resources::SemanticResourcePool;
+
+        let drive = |old: &AttachPlan, surviving: &[ReconciledModule]| {
+            let pins = PinnedObjects::empty();
+            let mut stable = |object: PinnedObjectId| Some(ModuleId(object.0));
+            let pool = SemanticResourcePool::default();
+            let reserve = pool.reserver();
+            let mut cursor = ConservativePlanCursor::new();
+            let mut ready = false;
+            for _ in 0..10_000 {
+                let sources = ConservativePlanSources::new(surviving, &[], &pins, false);
+                match old
+                    .poll_conservative_rebuild(sources, &mut stable, &mut cursor, &reserve, 256)
+                    .expect("conservative rebuild of a surviving module")
+                {
+                    GraphStep::Ready => {
+                        ready = true;
+                        break;
+                    }
+                    GraphStep::Advanced | GraphStep::Yielded => {}
+                }
+            }
+            assert!(ready, "the conservative rebuild reaches Ready");
+            let rebuilt = cursor
+                .plan()
+                .expect("ready cursor holds the rebuilt plan")
+                .clone();
+            let required = cursor.required_bytes().expect("measure completed");
+            (rebuilt, required)
+        };
+
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let old = build_from_test_sources(std::slice::from_ref(&scanned), &[]);
+        assert_eq!(old.slots.len(), 1);
+        assert_eq!(old.slots[0].names, [UNKNOWN_FUNCTION_NAME]);
+        assert!(
+            !old.slot_unnamed_reasons.is_empty(),
+            "precondition: the old plan names a reason"
+        );
+        let surviving = [scanned];
+        let (rebuilt, required) = drive(&old, &surviving);
+        assert_eq!(rebuilt.slots.len(), old.slots.len());
+        assert_eq!(
+            rebuilt.slot_unnamed_reasons, old.slot_unnamed_reasons,
+            "reasons survive the conservative rebuild"
+        );
+        for slot in &rebuilt.slots {
+            assert!(
+                !rebuilt.unnamed_reasons_of(slot).is_empty(),
+                "the rebuilt unknown slot still reports its reason"
+            );
+        }
+        // The twin differs only in the cleared map, so a larger
+        // reservation proves the measure stage charges the map.
+        let mut stripped = old.clone();
+        stripped.slot_unnamed_reasons.clear();
+        let (_, stripped_required) = drive(&stripped, &surviving);
+        assert!(
+            required > stripped_required,
+            "the reservation covers the reasons map: {required} > {stripped_required}"
+        );
     }
 
     #[test]

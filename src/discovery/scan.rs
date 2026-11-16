@@ -11372,6 +11372,73 @@ mod tests {
         }
     }
 
+    /// Scripted maps plus one scripted no-errno `/proc/<pid>/mem`
+    /// failure: a wrapped cold-proof message, as `ProcScanIo::open_mem`
+    /// surfaces `with_filesystem` errors via `io::Error::other`.
+    struct MemMsgFixture {
+        maps: Vec<u8>,
+        message: String,
+    }
+    impl ScanIo for MemMsgFixture {
+        type Memory = File;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
+        }
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<File> {
+            Err(std::io::Error::other(self.message.clone()))
+        }
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+    }
+
+    /// Scripted maps plus a mem open that reaps the subject first: the
+    /// whole group exits between the open and the post-check, so the
+    /// scan takes the generation-change refusal, never silence.
+    struct MemKillFixture {
+        maps: Vec<u8>,
+        child: Option<std::process::Child>,
+    }
+    impl ScanIo for MemKillFixture {
+        type Memory = File;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
+        }
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<File> {
+            let mut child = self.child.take().expect("one mem open per scan");
+            child.kill().expect("the subject dies on demand");
+            child.wait().expect("the subject is reaped");
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        }
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+    }
+
     fn scan_own_view_with_mem_errno(mem_errno: i32) -> Result<ScanOutcome, String> {
         let pid = std::process::id();
         let view = ProcessView::open(ProcessViewId(0), pid).expect("own view opens");
@@ -11406,17 +11473,29 @@ mod tests {
         );
     }
 
-    /// A child reaped between the maps read and the mem open surfaces
-    /// `ENOENT`: no `/proc/<pid>` entry at all. Same ordinary end as
-    /// `ESRCH` above, same exited path.
+    /// `ENOENT` from the mem open proves nothing by itself: a live
+    /// target whose `/proc` visibility changes between the maps read
+    /// and the mem open (a committed setuid under hidepid) surfaces
+    /// the same errno as a reaped child. Only a fresh whole-group
+    /// proof takes the exited path; a live pid keeps its loud
+    /// refusal, counted with its own reason.
     #[test]
-    fn mem_enoent_mid_scan_takes_the_exited_path_not_unavailable() {
+    fn mem_enoent_on_a_live_view_stays_unavailable() {
         let pid = std::process::id();
         let result = scan_own_view_with_mem_errno(libc::ENOENT);
-        let error = result.expect_err("ENOENT mem must take the exited path, not Unavailable");
+        let outcome = result.expect("ENOENT mem on a live view must stay loud, not take Err");
+        assert_eq!(
+            outcome.unavailable_reason(),
+            Some("unreadable"),
+            "ENOENT mem on a live view must stay loud: {outcome:?}"
+        );
         assert!(
-            error.contains(&format!("pid {pid} exited before discovery")),
-            "{error}"
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == format!("/proc/{pid}/mem")),
+            "ENOENT mem on a live view stays counted: {:?}",
+            outcome.skipped()
         );
     }
 
@@ -11493,6 +11572,312 @@ mod tests {
             outcome.skipped()
         );
         group.call_three();
+    }
+
+    /// A fallback pin (no pidfd) cannot see zombies through its
+    /// start-time comparison, but leader-Z still proves only the
+    /// leader dead: a dead leader with a live member keeps the live
+    /// group's errno'd refusal loud and counted. Only a reaped pid
+    /// (`kill` `ESRCH`, hidepid-proof) silences without pidfd
+    /// authority.
+    #[test]
+    fn mem_eacces_on_dead_leader_with_fallback_pin_stays_unavailable() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pid = group.pid();
+        assert!(
+            crate::process::process_is_zombie(pid),
+            "fixture precondition: the leader is Z"
+        );
+        assert!(
+            crate::process::generation_dead(pid),
+            "fixture precondition: leader-Z reads dead via the bare pid"
+        );
+        let view = crate::process::start_time_pinned_process_view_for_test(
+            ProcessViewId(78),
+            pid,
+        )
+        .expect("a cold view opens through the live survivor");
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "fixture precondition: the whole group still runs via the pin"
+        );
+        assert!(
+            view.retained_pin().pidfd().is_err(),
+            "fixture precondition: a fallback pin without pidfd authority"
+        );
+        let maps = b"00400000-00401000 r--p 00000000 08:01 1234 /bin/true\n".to_vec();
+        let mut io = MemErrnoFixture {
+            maps,
+            mem_errno: libc::EACCES,
+        };
+        let result = scan_process_view_with_io(
+            &ScanRequest {
+                pid,
+                hints: &[],
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut io,
+        );
+        let outcome = result.expect("EACCES mem on a live group must stay loud, not take Err");
+        assert_eq!(
+            outcome.unavailable_reason(),
+            Some("ptrace"),
+            "dead leader + live member refusal stays loud: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == format!("/proc/{pid}/mem")),
+            "dead leader + live member refusal stays counted: {:?}",
+            outcome.skipped()
+        );
+        group.call_three();
+    }
+
+    /// Non-exit cold-proof failures are never an exit, even with the
+    /// leader at Z: budget, deadline, metadata I/O, namespace and
+    /// ambiguity refusals stay loud and counted with their own
+    /// reason. Only the known exit-churn messages may silence.
+    #[test]
+    fn mem_non_exit_cold_proof_failures_stay_loud() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pid = group.pid();
+        assert!(
+            crate::process::process_is_zombie(pid),
+            "fixture precondition: the leader is Z"
+        );
+        assert!(
+            crate::process::generation_dead(pid),
+            "fixture precondition: leader-Z reads dead via the bare pid"
+        );
+        let view = ProcessView::open(ProcessViewId(79), pid)
+            .expect("a cold view opens through the live survivor");
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "fixture precondition: the whole group still runs via the pin"
+        );
+        let maps = b"00400000-00401000 r--p 00000000 08:01 1234 /bin/true\n".to_vec();
+        let loud: &[(&str, &str)] = &[
+            (
+                "budget",
+                "capture discovery work ceiling reached; remaining provider bytes were not scanned",
+            ),
+            (
+                "deadline",
+                "cold process filesystem proof deadline exhausted",
+            ),
+            (
+                "metadata io",
+                "cold process filesystem metadata I/O is unavailable",
+            ),
+            (
+                "metadata unreadable",
+                "cold process filesystem metadata unreadable: Input/output error (os error 5)",
+            ),
+            (
+                "census io",
+                "cold process task census unavailable: No such file or directory (os error 2)",
+            ),
+            (
+                "namespace",
+                "cannot identify process mount namespace: Permission denied (os error 13)",
+            ),
+            (
+                "ambiguity",
+                "cold process filesystem is ambiguous: live members do not share one mount namespace and root",
+            ),
+            (
+                "membership",
+                "cold process member no longer proves original group membership",
+            ),
+            (
+                "fresh custody",
+                "a retained view crossed leader exit and requires fresh member custody",
+            ),
+        ];
+        for (label, message) in loud {
+            let mut io = MemMsgFixture {
+                maps: maps.clone(),
+                message: message.to_string(),
+            };
+            let result = scan_process_view_with_io(
+                &ScanRequest {
+                    pid,
+                    hints: &[],
+                    hooks: &HookRegistry::builtin(),
+                },
+                &view,
+                &mut CaptureWorkBudget::default(),
+                &mut io,
+            );
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => panic!("{label} mem failure must stay loud, not take Err: {error}"),
+            };
+            assert_eq!(
+                outcome.unavailable_reason(),
+                Some("unreadable"),
+                "{label} mem failure must stay loud: {outcome:?}"
+            );
+            assert!(
+                outcome.skipped().iter().any(|skip| {
+                    skip.subject == format!("/proc/{pid}/mem") && skip.reason == *message
+                }),
+                "{label} mem failure stays counted with its own reason: {:?}",
+                outcome.skipped()
+            );
+        }
+        group.call_three();
+    }
+
+    /// Guard for the allowlist above: the known cold exit-churn
+    /// messages still take the silent exited path while the leader
+    /// reads dead, so dying children never latch a global
+    /// `scan_unavailable`.
+    #[test]
+    fn mem_known_exit_churn_stays_silent() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pid = group.pid();
+        assert!(
+            crate::process::process_is_zombie(pid),
+            "fixture precondition: the leader is Z"
+        );
+        let view = ProcessView::open(ProcessViewId(80), pid)
+            .expect("a cold view opens through the live survivor");
+        let maps = b"00400000-00401000 r--p 00000000 08:01 1234 /bin/true\n".to_vec();
+        let churn: &[&str] = &[
+            "cold process filesystem requires the original leader at Z",
+            "cold process task census contains an unproven or exiting member",
+            "cold process leader generation or Z boundary changed",
+            "cold process task census changed; filesystem remains unproven",
+            "cold process member generation or liveness changed",
+            "cold process member changed while its filesystem was checked",
+            "cold process member changed during directory acquisition",
+            "cold process filesystem has no proven live nonleader",
+            "original process exited while its filesystem was identified",
+            "original process exited during filesystem access",
+        ];
+        for message in churn {
+            let mut io = MemMsgFixture {
+                maps: maps.clone(),
+                message: message.to_string(),
+            };
+            let result = scan_process_view_with_io(
+                &ScanRequest {
+                    pid,
+                    hints: &[],
+                    hooks: &HookRegistry::builtin(),
+                },
+                &view,
+                &mut CaptureWorkBudget::default(),
+                &mut io,
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(outcome) => panic!("{message} must stay silent: {outcome:?}"),
+            };
+            assert!(
+                error.contains(&format!("pid {pid} exited before discovery")),
+                "{message}: {error}"
+            );
+        }
+        group.call_three();
+    }
+
+    /// Guard for the `ENOENT` proof: a reaped pid still takes the
+    /// silent exited path. The view opens on the live child; the
+    /// kill plus reap proves the end before the decision runs.
+    #[test]
+    fn mem_enoent_after_reap_takes_the_exited_path() {
+        use crate::fixture_guard::DieWithParent as _;
+        use std::process::Command;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .expect("a sleeper spawns");
+        let pid = child.id();
+        let view =
+            ProcessView::open(ProcessViewId(81), pid).expect("a view opens on the live child");
+        child.kill().expect("the child dies on demand");
+        child.wait().expect("the child is reaped");
+        assert!(
+            crate::process::process_proven_exited(pid),
+            "fixture precondition: the pid names no process"
+        );
+        assert_eq!(
+            view.original_exited(),
+            Ok(true),
+            "fixture precondition: the pin proves the original exited"
+        );
+        assert!(
+            mem_open_exited_for_view(
+                &view,
+                pid,
+                &std::io::Error::from_raw_os_error(libc::ENOENT)
+            ),
+            "ENOENT after a proven reap takes the exited path"
+        );
+    }
+
+    /// The whole group can still exit between the mem open and the
+    /// post-check: that race takes the generation-change refusal,
+    /// never the silent exited path and never a global latch.
+    #[test]
+    fn mem_open_generation_change_takes_refused_not_silent() {
+        use crate::fixture_guard::DieWithParent as _;
+        use std::process::Command;
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .expect("a sleeper spawns");
+        let pid = child.id();
+        let view =
+            ProcessView::open(ProcessViewId(82), pid).expect("a view opens on the live child");
+        let maps = b"00400000-00401000 r--p 00000000 08:01 1234 /bin/true\n".to_vec();
+        let mut io = MemKillFixture {
+            maps,
+            child: Some(child),
+        };
+        let result = scan_process_view_with_io(
+            &ScanRequest {
+                pid,
+                hints: &[],
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut io,
+        );
+        let outcome = result.expect("a mid-open exit refuses, never the silent Err path");
+        assert!(
+            outcome.skipped().iter().any(|skip| skip
+                .reason
+                .contains(SCAN_GENERATION_CHANGED_REASON)),
+            "a mid-open exit names the generation change: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "a refused scan decodes nothing: {:?}",
+            outcome.modules()
+        );
     }
 
     /// `mem_open_exited` decides from the strongest proof available: the

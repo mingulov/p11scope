@@ -18007,7 +18007,9 @@ impl Engine {
         // exactly like frame-scan tables. The reserved owner view
         // is never retired, so their slots persist for the run and
         // later mappers' calls attach without frame admission.
+        let raw_before_learned = raw_modules.len();
         raw_modules.extend(self.run_learned_modules.iter().cloned());
+        let raw_with_learned = raw_modules.len();
         raw_modules.retain(|module| {
             !pinned.rejects(module.key)
                 && !module
@@ -18016,6 +18018,14 @@ impl Engine {
                     .flat_map(|table| &table.entries)
                     .any(|entry| pinned.rejects(entry.object))
         });
+        if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
+            eprintln!(
+                "p11scope: candidate scan inputs: {} frame + {} run-learned, {} survive rejects",
+                raw_before_learned,
+                raw_with_learned - raw_before_learned,
+                raw_modules.len(),
+            );
+        }
         pinned.reset_derived_claims();
         // Restore the scan-owned pin layer before the rebind below appends
         // its module/entry pins; otherwise every tick stacks another pin
@@ -18029,6 +18039,20 @@ impl Engine {
         );
         let bind_start = crate::attach::monotonic_ns();
         let (modules, binding_skips) = bind_scanned_modules(&raw_modules, &mut pinned);
+        if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
+            eprintln!(
+                "p11scope: candidate bind: {} raw -> {} bound ({} skips)",
+                raw_modules.len(),
+                modules.len(),
+                binding_skips.len(),
+            );
+            for skip in &binding_skips {
+                eprintln!(
+                    "p11scope: candidate bind skip: {}: {}",
+                    skip.subject, skip.reason
+                );
+            }
+        }
         self.stage_timings.span(
             crate::timing::StageKind::Bind,
             "bind_live_modules",

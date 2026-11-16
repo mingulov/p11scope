@@ -539,7 +539,8 @@ use p11scope_ebpf_common::object_journal::{
 use p11scope_ebpf_common::object_wire::{
     OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, OBJECT_ACTION_CREATE, OBJECT_ACTION_DECAPSULATE,
     OBJECT_ACTION_DESTROY, OBJECT_ACTION_ENCAPSULATE, OBJECT_ACTION_FIND, OBJECT_ACTION_GENERATE,
-    ObjectDescriptorWire, publish_object_descriptors, verify_object_descriptors,
+    OBJECT_ACTION_PAIR, ObjectDescriptorWire, publish_object_descriptors,
+    verify_object_descriptors,
 };
 use p11scope_ebpf_common::{Event, ImageIdentity, InstanceStamp, MAX_DESCRIPTORS};
 
@@ -732,9 +733,22 @@ struct ShapedS1 {
     /// Requested (creation-template) cells for pair 0 as (kind,
     /// status, value); empty leaves the zero list.
     request_cells: Vec<(u8, u8, u16)>,
+    /// Requested cells for pair 1 (the private template of
+    /// `C_GenerateKeyPair`); empty leaves the zero list.
+    request_cells_1: Vec<(u8, u8, u16)>,
     /// Wire TRUNCATED bit on the pair-0 list: the template carried
     /// more than the eight retained cells.
     request_truncated: bool,
+    /// Wire HEADER_READ_FAILURE bit on the pair-0 list: some header
+    /// reads failed while the retained cells were inspected.
+    request_header_failure: bool,
+    /// The pair-0 list is a bare INVALID_SPAN refusal: no inspected
+    /// cells, the span never validated. Requires empty
+    /// `request_cells`.
+    request_invalid_span: bool,
+    /// `C_GenerateKeyPair` result words (public, private); `None`
+    /// leaves both result slots absent.
+    pair_results: Option<(u64, u64)>,
     /// KEM result (word, status) override (`None` = the healthy
     /// minted-output default).
     kem_result: Option<(u64, u8)>,
@@ -766,7 +780,11 @@ impl ShapedS1 {
             find_handles: None,
             getattr_cells: Vec::new(),
             request_cells: Vec::new(),
+            request_cells_1: Vec::new(),
             request_truncated: false,
+            request_header_failure: false,
+            request_invalid_span: false,
+            pair_results: None,
             kem_result: None,
         }
     }
@@ -845,7 +863,18 @@ fn begin_for_call(scene: &JointScene, call: &ShapedS1, sequence: u64) -> [u8; 22
     // Requested pair 0: record[128..164], eight 4-byte cells, the
     // inspected count at +32 and the present flag at +33 — the same
     // list shape `end_bytes_getattr` emits for GET results.
-    if !call.request_cells.is_empty() {
+    if call.request_invalid_span {
+        assert!(
+            call.request_cells.is_empty(),
+            "an invalid span carries no inspected cells"
+        );
+        assert!(
+            !call.request_truncated && !call.request_header_failure,
+            "an invalid span carries no other list flags"
+        );
+        begin[160] = 0;
+        begin[161] = 8;
+    } else if !call.request_cells.is_empty() {
         assert!(
             call.request_cells.len() <= 8,
             "at most eight requested cells"
@@ -861,6 +890,25 @@ fn begin_for_call(scene: &JointScene, call: &ShapedS1, sequence: u64) -> [u8; 22
         if call.request_truncated {
             begin[161] |= 2;
         }
+        if call.request_header_failure {
+            begin[161] |= 4;
+        }
+    }
+    // Requested pair 1: record[164..200], same shape (the private
+    // template of `C_GenerateKeyPair`).
+    if !call.request_cells_1.is_empty() {
+        assert!(
+            call.request_cells_1.len() <= 8,
+            "at most eight requested cells"
+        );
+        for (index, (kind, status, value)) in call.request_cells_1.iter().enumerate() {
+            let base = 164 + index * 4;
+            begin[base] = *kind;
+            begin[base + 1] = *status;
+            begin[base + 2..base + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        begin[196] = call.request_cells_1.len() as u8;
+        begin[197] = 1;
     }
     begin
 }
@@ -890,6 +938,22 @@ fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
                 end[424..432].copy_from_slice(&CREATED_KEY.to_le_bytes());
             }
             end[506] = 1;
+            end
+        }
+        "C_GenerateKeyPair" => {
+            let mut end = end_bytes(begin, OBJECT_ACTION_PAIR, call.rv, ENTRY_NS + 50);
+            // Tail result slots 0 (public) and 1 (private):
+            // record[506]/[507] statuses, words at [424..432]/[432..440].
+            let (public, private) = call
+                .pair_results
+                .expect("generate-pair tests name both result handles");
+            assert_ne!(public, 0, "valid pair results are nonzero");
+            assert_ne!(private, 0, "valid pair results are nonzero");
+            assert_ne!(public, private, "pair halves never share a handle");
+            end[506] = 1;
+            end[424..432].copy_from_slice(&public.to_le_bytes());
+            end[507] = 1;
+            end[432..440].copy_from_slice(&private.to_le_bytes());
             end
         }
         "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" | "C_WrapKey" => {
@@ -26559,6 +26623,261 @@ fn key_operation_newsite_edwards_montgomery_unestablished_carries_reason() {
         assert!(
             section["objects"][0][block]["ec_params"]["reason"].is_null(),
             "{block}: a non-Edwards/Montgomery absence carries no curve reason"
+        );
+    }
+}
+
+/// Fix round 4 (t3 I1): a query-only Edwards key — first observed,
+/// its type established by a query, its curve never queried — stays
+/// unlabeled with null curve reasons: the curve reason needs a
+/// created object whose own template was seen. The section stays v1.
+#[test]
+fn key_operation_newsite_query_only_edwards_carries_no_curve_reason() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    const UNQUERIED_KEY: u64 = 0xD1D1_D1D1_D1D1_D1D1;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut query = ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, query_capture());
+    query.input0 = Some((UNQUERIED_KEY, 1));
+    query.getattr_cells = vec![(2u8, 1u8, 0x40)];
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &query,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION,
+        "a query-only key without a curve stays v1"
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 1, "section v1");
+    let object = &committed.objects[0];
+    assert_eq!(object.origin, "first_observed");
+    assert_eq!(object.label, None, "no curve, no label");
+    assert_eq!(object.established.key_type.scalar, Some(0x40));
+    assert_eq!(
+        object.established.key_type.source,
+        Some("query"),
+        "the type came from a query, not a creation"
+    );
+    assert_eq!(object.requested.ec_params.reason, None);
+    assert_eq!(
+        object.established.ec_params.reason, None,
+        "an unqueried curve on a query-only key names no reason"
+    );
+}
+
+/// Fix round 4 (t3 I1): the private half of a `C_GenerateKeyPair`
+/// carries no curve reason — `CKA_EC_PARAMS` lives in the public
+/// template, so its absence from the private half's own template
+/// says nothing about usability. The public half still labels.
+#[test]
+fn key_operation_newsite_generate_pair_private_carries_no_curve_reason() {
+    use crate::key_operation_projection::object_observations_json;
+    use crate::key_operation_projection::producer::commit;
+    use crate::semantics_key_use::KeyUseReducer;
+    const PUBLIC_KEY: u64 = 0xD2D2_D2D2_D2D2_D2D2;
+    const PRIVATE_KEY: u64 = 0xD3D3_D3D3_D3D3_D3D3;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut pair = ShapedS1::shaped("C_GenerateKeyPair", CkRv::OK.0, 0, 0);
+    pair.request_cells = vec![(1u8, 1u8, 2u16), (2u8, 1u8, 0x41), (6u8, 1u8, 4u16)];
+    pair.request_cells_1 = vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x41)];
+    pair.pair_results = Some((PUBLIC_KEY, PRIVATE_KEY));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &pair,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.objects.len(), 2, "both halves project");
+    let public = committed
+        .objects
+        .iter()
+        .find(|row| row.established.class.scalar == Some(2))
+        .expect("the public half projects");
+    assert_eq!(public.origin, "created");
+    assert_eq!(
+        public.label,
+        Some("x25519"),
+        "the public half labels from its own template"
+    );
+    let private = committed
+        .objects
+        .iter()
+        .find(|row| row.established.class.scalar == Some(3))
+        .expect("the private half projects");
+    assert_eq!(private.origin, "created");
+    assert_eq!(private.established.key_type.scalar, Some(0x41));
+    assert_eq!(
+        private.established.key_type.source,
+        Some("creation_success"),
+        "the private half's own template promoted"
+    );
+    assert_eq!(private.label, None, "no curve on the private half");
+    assert_eq!(private.requested.ec_params.reason, None);
+    assert_eq!(
+        private.established.ec_params.reason, None,
+        "the private half names no curve reason"
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6, "the public label trips v6");
+}
+
+/// Fix round 4 (t3 M3): a creation template the probe only partly
+/// read names `template partly read` on its unseen fields — never
+/// the truncation reason (the first eight were not all captured)
+/// and never the curve reason (the template was not seen).
+#[test]
+fn key_operation_newsite_partly_read_template_names_its_reason() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    const PARTLY_READ: &str = "template partly read";
+    // A header failure beside observed cells: the observed facts
+    // promote, the unseen Montgomery curve names the partly-read
+    // reason in both blocks — not the curve reason.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.request_cells = vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x41)];
+    create.request_header_failure = true;
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6,
+        "the partly-read reason trips v6"
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(
+        section["objects"][0]["established"]["key_type"]["value"], 0x41,
+        "the observed type still promotes"
+    );
+    for block in ["requested", "established"] {
+        assert_eq!(
+            section["objects"][0][block]["ec_params"]["status"], "unknown",
+            "{block}: the curve stays unknown"
+        );
+        assert_eq!(
+            section["objects"][0][block]["ec_params"]["reason"], PARTLY_READ,
+            "{block}: the unseen curve names the partly-read reason"
+        );
+    }
+    // A bare invalid span: every field stays unknown with the
+    // partly-read reason.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.request_invalid_span = true;
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6,
+        "the invalid span trips v6"
+    );
+    let section = object_observations_json(&committed);
+    for block in ["requested", "established"] {
+        for field in [
+            "class",
+            "key_type",
+            "token",
+            "value_len",
+            "modulus_bits",
+            "ec_params",
+            "parameter_set",
+        ] {
+            assert_eq!(
+                section["objects"][0][block][field]["reason"], PARTLY_READ,
+                "{block}.{field}: an unread span names the partly-read reason"
+            );
+        }
+    }
+    // Precedence: a truncated template with a header failure names
+    // the partly-read reason on its unseen fields — the truncation
+    // string would claim the first eight were captured.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.request_cells = vec![
+        (1u8, 1u8, 2u16),
+        (2u8, 1u8, 0x41),
+        (3u8, 1u8, 0u16),
+        (4u8, 1u8, 32u16),
+        (6u8, 1u8, 4u16),
+        (7u8, 1u8, 1u16),
+        (1u8, 1u8, 2u16),
+        (2u8, 1u8, 0x41),
+    ];
+    create.request_truncated = true;
+    create.request_header_failure = true;
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&committed);
+    assert!(
+        !section["objects"][0]["label"].is_null(),
+        "the observed cells still label"
+    );
+    for block in ["requested", "established"] {
+        assert_eq!(
+            section["objects"][0][block]["modulus_bits"]["reason"], PARTLY_READ,
+            "{block}: truncation never wins over a read failure"
         );
     }
 }

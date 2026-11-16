@@ -543,6 +543,36 @@ fn key_ops_verbose_names_unusable_curve_reasons() {
     );
 }
 
+/// Fix round 4 (t3 M3): objects whose creation template was only
+/// partly read name the partly-read reason in verbose text with the
+/// same string the unseen fields carry in JSON; concise stays
+/// quiet. Counts only — never object detail.
+#[test]
+fn key_ops_verbose_names_partly_read_templates() {
+    const PARTLY_READ: &str = "template partly read";
+    let mut observations = populated(9);
+    let mut first = object_row(11);
+    first.established.value_len.reason = Some(PARTLY_READ);
+    let mut second = object_row(12);
+    second.requested.ec_params.reason = Some(PARTLY_READ);
+    observations.objects.push(first);
+    observations.objects.push(object_row(13));
+    observations.objects.push(second);
+    let presentation = key_ops_presentation(observations);
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    let expected = format!("  {PARTLY_READ} (2 objects)");
+    assert!(
+        block.contains(&expected.as_str()),
+        "verbose names the partly-read count:\n{verbose}"
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !concise.contains(PARTLY_READ),
+        "concise stays quiet:\n{concise}"
+    );
+}
+
 #[test]
 fn key_ops_line_journal_unavailable_names_tracking_off() {
     let presentation =

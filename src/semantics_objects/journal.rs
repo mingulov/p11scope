@@ -9631,7 +9631,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 27] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 28] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -9668,6 +9668,10 @@ pub(crate) mod tests {
         // F16 residual: requested-only keygen templates reach the
         // joint scene, appended for the same reason.
         "C_GenerateKey",
+        // Fix round 4: the keypair private-half twin drives a full
+        // pair call through the joint scene, appended for the same
+        // reason.
+        "C_GenerateKeyPair",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface
@@ -18256,6 +18260,78 @@ pub(crate) mod tests {
             counts.invalidations >= ROUNDS as usize,
             "every read re-arms one invalidation: {counts:?}"
         );
+    }
+
+    #[test]
+    fn joint_keepup_seal_promoted_creations_count_their_result_term() {
+        use crate::semantics_objects::{MAX_INPUT_HANDLES, MAX_RESULT_HANDLES};
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, OBJECT_ACTION_SET};
+        // R2 promotion arms in-seal creations: a view created during
+        // the seal carries established facts without any `establish`,
+        // so a later cross-session write in the same seal
+        // invalidates it. The invalidation bound counts those
+        // promotions explicitly: one per existing object, one per
+        // input handle (`establish` re-arms) and one per result
+        // handle (creation promotions).
+        const CREATES: u64 = 4;
+        const OTHER: u64 = SESSION ^ 0x0101;
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        for thread in 1..=CREATES {
+            let mut begin = begin_bytes(thread, 1, create, 0);
+            // Requested pair 0: class/private, RSA, 2048 — all
+            // promote to established on the OK return.
+            let cells = [(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)];
+            for (index, (kind, status, value)) in cells.iter().enumerate() {
+                let base = 128 + index * 4;
+                begin[base] = *kind;
+                begin[base + 1] = *status;
+                begin[base + 2..base + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            begin[160] = cells.len() as u8;
+            begin[161] = 1;
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            let end = end_bytes_result(
+                &begin,
+                OBJECT_ACTION_CREATE,
+                0,
+                ENTRY_NS + 50,
+                POPULATED_KEY_BASE + thread,
+            );
+            assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        }
+        let mut proof = scene.attest_calls(CREATES as usize);
+        let mut begin = begin_bytes(CREATES + 1, 1, function_id("C_SetAttributeValue"), 0);
+        put_u64(&mut begin, 80, OTHER);
+        put_u64(&mut begin, 88, POPULATED_KEY_BASE + 1);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let end = end_bytes(&begin, OBJECT_ACTION_SET, 0, ENTRY_NS + 60);
+        assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        proof = scene.attest_session_function(OTHER, "C_SetAttributeValue");
+        scene.prepare_claims();
+        let bootstrap = scene.bootstrap(proof, 0);
+        let calls = scene.adapter.open.len();
+        let (objects, _) = scene.model.audit_loss_record_counts();
+        let bound = super::joint_audit::SealEffectBound::sample(&scene.adapter, &scene.model)
+            .expect("bound");
+        assert_eq!(objects, 0, "no view exists before the seal");
+        assert_eq!(
+            bound.invalidations,
+            objects + calls * MAX_INPUT_HANDLES + calls * MAX_RESULT_HANDLES,
+            "promoted creations count their result term"
+        );
+        let bytes = super::joint_audit::result_storage_bound(&scene.adapter, &scene.model)
+            .expect("byte bound");
+        let success = scene.seal(&bootstrap).expect("creations seal");
+        let counts = assert_effects_within(bound, &success.effects.effects);
+        eprintln!("promotion seal: {counts:?}");
+        assert_eq!(
+            counts.invalidations, CREATES as usize,
+            "the cross-session write invalidates every promoted view: {counts:?}"
+        );
+        let actual = super::joint_audit::outcome_storage(&Ok(success)).expect("sized outcome");
+        assert!(actual <= bytes, "actual {actual} > bound {bytes}");
     }
 
     #[test]

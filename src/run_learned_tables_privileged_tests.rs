@@ -1022,4 +1022,86 @@ mod exact_accounting_tests {
         check_exact_accounting(&report, PROVIDER, &ledgers())
             .expect("a wrong-module row must not disturb the accounting");
     }
+
+    #[test]
+    fn exact_accounting_rejects_an_unregistered_mechanism_surprise() {
+        // The learned-slot probe shape: a mechanism argument read through
+        // a learned slot counts as unregistered while `mechanisms[]` stays
+        // empty. A `mechanisms.is_empty()`-only check passes this silently;
+        // the positive assertion must fail it by name.
+        let mut report = report([Some(0), Some(10), Some(10)]);
+        report["evidence"]["unregistered_mechanisms"] = serde_json::json!(10);
+        let error = check_exact_accounting(&report, PROVIDER, &ledgers())
+            .expect_err("an unregistered mechanism count must fail");
+        assert!(
+            format!("{error:#}").contains("unregistered"),
+            "the failure names the unregistered count: {error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_accounting_rejects_a_gated_standard_layout_mechanism() {
+        // Same surprise through the standard-layout gate: a value outside
+        // the registered CKM_* registry observed through a
+        // standard-layout-only slot counts in
+        // `unregistered_standard_layout_mechanisms`, never publishes.
+        // THIS cell's 12 ordinals carry no mechanism argument, so any such
+        // count fails.
+        let mut report = report([Some(0), Some(10), Some(10)]);
+        report["evidence"]["unregistered_standard_layout_mechanisms"] = serde_json::json!(2);
+        let error = check_exact_accounting(&report, PROVIDER, &ledgers())
+            .expect_err("a gated standard-layout mechanism count must fail");
+        assert!(
+            format!("{error:#}").contains("unregistered"),
+            "the failure names the unregistered count: {error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_accounting_rejects_a_published_mechanism_for_this_non_mechanism_workload() {
+        // THIS cell's 12 ordinals (C_Initialize .. C_OpenSession per
+        // ORDINALS) carry no mechanism argument (kinds::descriptor), so a
+        // published `mechanisms[]` row means the workload changed and the
+        // cell's expectation must be revisited, never silently passed.
+        // Guard: green both before and after the positive assertion.
+        let mut report = report([Some(0), Some(10), Some(10)]);
+        report["mechanisms"] = serde_json::json!([{
+            "mechanism": 0x40,
+            "calls": 1,
+            "errors": 0,
+        }]);
+        check_exact_accounting(&report, PROVIDER, &ledgers())
+            .expect_err("a published mechanism row must fail for this workload");
+    }
+
+    #[test]
+    fn exact_accounting_rejects_a_missing_getter_withheld() {
+        // Getter-only slots stay withheld: `semantic_unverified_slots` must
+        // be positive (the three getters). Zero means the withheld
+        // attribution has no getter basis.
+        let mut report = report([Some(0), Some(10), Some(10)]);
+        report["evidence"]["semantic_unverified_slots"] = serde_json::json!(0);
+        let error = check_exact_accounting(&report, PROVIDER, &ledgers())
+            .expect_err("zero unverified slots must fail");
+        assert!(
+            format!("{error:#}").contains("unverified"),
+            "the failure names the unverified slots: {error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_accounting_rejects_fully_unverified_slots() {
+        // Learned table slots are authorized (decode-allowed), not
+        // count-only: `slots` must exceed `semantic_unverified_slots`.
+        // All-unverified means no learned slot carries authority.
+        let mut report = report([Some(0), Some(10), Some(10)]);
+        report["evidence"]["slots"] = serde_json::json!(3);
+        report["evidence"]["semantic_unverified_slots"] = serde_json::json!(3);
+        let error = check_exact_accounting(&report, PROVIDER, &ledgers())
+            .expect_err("fully unverified slots must fail");
+        assert!(
+            format!("{error:#}").contains("authorized"),
+            "the failure names the missing authorized slot: {error:#}"
+        );
+    }
 }

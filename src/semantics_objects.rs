@@ -1130,6 +1130,11 @@ pub(crate) struct ObjectView {
     /// Unseen fields on such a view stay unknown with the named
     /// truncation reason; never inferred from the tail.
     pub(crate) creation_truncated: bool,
+    /// Per-field presence in the retained creation window: true when
+    /// the kind appeared in the first eight cells, even with an
+    /// unclassifiable value (fix round 3). Seen-but-valueless fields
+    /// name the unsupported reason, never the truncation reason.
+    pub(crate) creation_seen: [bool; METADATA_FIELDS],
 }
 
 /// Cardinalities of retained state.

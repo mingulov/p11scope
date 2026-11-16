@@ -785,7 +785,9 @@ class ObservedRsaTests(unittest.TestCase):
                              ("query", "creation_success"))
             self.assertEqual(tuple(ORACLE.FIELD_REASONS),
                              ("template truncated "
-                              "(first 8 attributes captured)",))
+                              "(first 8 attributes captured)",
+                              "template value outside approved finite set",
+                              "curve unusable for key type"))
         with self.subTest("v6 scalar values"):
             block = defs["metadata_block"]["properties"]
             self.assertEqual(set(ORACLE.METADATA_FIELD_VALUES_V6)
@@ -1002,11 +1004,12 @@ class ObservedRsaTests(unittest.TestCase):
             truncated = copy.deepcopy(section)
             for block in (truncated["objects"][1]["requested"],
                           truncated["objects"][1]["established"]):
-                block["value_len"] = {
-                    "status": "unknown", "value": None,
-                    "source": None,
-                    "reason": ("template truncated "
-                               "(first 8 attributes captured)")}
+                for name in ("value_len", "ec_params", "parameter_set"):
+                    block[name] = {
+                        "status": "unknown", "value": None,
+                        "source": None,
+                        "reason": ("template truncated "
+                                   "(first 8 attributes captured)")}
             ORACLE.check_section(truncated)
         with self.subTest("unlisted reason refused"):
             mutated = copy.deepcopy(section)

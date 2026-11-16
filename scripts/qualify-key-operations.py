@@ -211,10 +211,18 @@ FIELD_KEYS = {"status", "value"}
 # H9 section v6 (keymeta §6/K5): every metadata field carries the
 # per-field `source` beside status/value; the two provenances are
 # the closed vocabulary, null is the only other spelling. Ruling 2
-# adds the per-field `reason`: the one-member truncation vocabulary.
+# adds the per-field `reason`: the three-member vocabulary (fix
+# round 3) — truncation for never-seen fields, unsupported for
+# seen-but-unclassifiable kinds, unusable-curve for
+# mismatched/unestablished Edwards/Montgomery curves.
 FIELD_KEYS_V6 = {"status", "value", "source", "reason"}
 FIELD_SOURCES = ("query", "creation_success")
-FIELD_REASONS = ("template truncated (first 8 attributes captured)",)
+TRUNCATED_TEMPLATE_REASON = "template truncated (first 8 attributes captured)"
+UNSUPPORTED_TEMPLATE_VALUE_REASON = "template value outside approved finite set"
+CURVE_UNUSABLE_REASON = "curve unusable for key type"
+FIELD_REASONS = (TRUNCATED_TEMPLATE_REASON,
+                 UNSUPPORTED_TEMPLATE_VALUE_REASON,
+                 CURVE_UNUSABLE_REASON)
 MECHANISM_ROW_KEYS = {"mechanism", "mechanism_hex", "name", "operations", "calls",
                       "errors", "last_seen_ns", "evidence"}
 MECHANISM_EVIDENCE_KEYS = {"functions", "returns", "truncated"}
@@ -394,6 +402,10 @@ def _metadata_block(block, keys=METADATA_KEYS,
                 continue
             _require(type(reason) is str and reason in FIELD_REASONS,
                      "unexpected metadata reason")
+            if (established and name == "ec_params"
+                    and reason == CURVE_UNUSABLE_REASON
+                    and status == "value"):
+                continue  # mismatched curve names its reason on the valued field
             _require(status == "unknown", "known metadata carries a reason")
 
 
@@ -409,6 +421,34 @@ def _check_sessions(rows):
         ids.add(row["session"])
     _require(sorted(ids) == [row["session"] for row in rows], "session rows out of order")
     return ids
+
+
+def _require_curve_reasons(row, keys):
+    """Completeness for Edwards/Montgomery curves (fix round 3)."""
+    if "ec_params" not in keys or "key_type" not in keys:
+        return
+    if row["label"] is not None:
+        return
+    established_type = row["established"]["key_type"]
+    if established_type["status"] != "value" or established_type["value"] not in (64, 65):
+        return
+    key_type = established_type["value"]
+    established_curve = row["established"]["ec_params"]
+    if established_curve["status"] == "value":
+        curve = established_curve["value"]
+        matched = ((key_type == 64 and curve in ("ed25519", "ed448"))
+                   or (key_type == 65 and curve in ("x25519", "x448")))
+        if not matched:
+            _require(established_curve["reason"] == CURVE_UNUSABLE_REASON,
+                     "mismatched curve carries no reason")
+        return
+    if established_curve["status"] != "unknown":
+        return
+    if row["requested"]["ec_params"]["status"] != "unknown":
+        return
+    if established_curve["reason"] is not None:
+        return  # truncation or unsupported already names the unknown
+    _require(False, "unestablished curve carries no reason")
 
 
 def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
@@ -445,9 +485,39 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
                          "query source without a query")
         if "reason" in fields:
             for name in keys:
-                _require(row["established"][name]["reason"] is None
+                established_reason = row["established"][name]["reason"]
+                if (established_reason == CURVE_UNUSABLE_REASON
+                        and name == "ec_params"):
+                    continue  # mismatch lands on the established valued curve
+                _require(established_reason is None
                          or row["requested"][name]["status"] == "unknown",
                          "established reason on an observed request")
+            for name in keys:
+                _require(row["requested"][name]["reason"] is None
+                         or row["established"][name]["status"] == "unknown",
+                         "requested reason on an observed established")
+            for name in keys:
+                requested_status = row["requested"][name]["status"]
+                established_status = row["established"][name]["status"]
+                if requested_status == "unknown" and established_status == "unknown":
+                    requested_reason = row["requested"][name]["reason"]
+                    established_reason = row["established"][name]["reason"]
+                    if requested_reason is not None or established_reason is not None:
+                        _require(requested_reason is not None
+                                 and established_reason is not None
+                                 and requested_reason == established_reason,
+                                 "incomplete truncation reasons")
+            has_truncated = any(
+                row[block][name]["reason"] == TRUNCATED_TEMPLATE_REASON
+                for block in ("requested", "established") for name in keys)
+            if has_truncated:
+                for name in keys:
+                    if (row["requested"][name]["status"] == "unknown"
+                            and row["established"][name]["status"] == "unknown"):
+                        _require(row["requested"][name]["reason"] is not None
+                                 and row["established"][name]["reason"] is not None,
+                                 "incomplete truncation reasons")
+            _require_curve_reasons(row, keys)
         if row["label"] is not None:
             _label(row["label"], labels, "object metadata")
         _require(_u64(row["successful_references"])
@@ -633,8 +703,34 @@ def check_section(section):
     _require(sorted(pairs) == pairs, "unknown rows out of order")
     gaps = _check_gaps(section["gaps"])
     _check_budgets(section["budgets"], len(order), len(objects), len(unknown))
+    if version == OBSERVATIONS_VERSION_V6:
+        _require_v6_content(section, keys)
     return {"status": status, "reason": reason, "rows": list(tallies.values()),
             "unknown": unknown, "gaps": gaps, "unattributed": unattributed}
+
+
+def _require_v6_content(section, keys):
+    """A v6 section with no visible new-site content and no reasons is a
+    truncated view whose reasons were dropped (fix round 3)."""
+    for row in section["key_operations"]:
+        if row["metadata_at_use"] in NEWSITE_METADATA_LABELS:
+            return
+    for row in section["objects"]:
+        if row["label"] in NEWSITE_METADATA_LABELS:
+            return
+        for block in (row["requested"], row["established"]):
+            if block["key_type"]["value"] == 66:
+                return
+            if block["value_len"]["value"] in (12, 48):
+                return
+            if block["ec_params"]["value"] in ("x25519", "x448", "ed25519", "ed448"):
+                return
+            for name in keys:
+                if block[name].get("source") == "creation_success":
+                    return
+                if block[name].get("reason") is not None:
+                    return
+    _require(False, "incomplete truncation reasons")
 
 
 def _check_mechanism_row(row):

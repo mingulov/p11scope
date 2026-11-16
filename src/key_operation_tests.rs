@@ -25004,8 +25004,12 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
         );
         assert_eq!(
             names(&format!("/$defs/{def}/properties/reason/enum")),
-            vec!["template truncated (first 8 attributes captured)".to_string()],
-            "{def}: the reason enum is exactly the truncation reason"
+            vec![
+                "curve unusable for key type".to_string(),
+                "template truncated (first 8 attributes captured)".to_string(),
+                "template value outside approved finite set".to_string(),
+            ],
+            "{def}: the reason enum is exactly the three fix-round-3 reasons"
         );
         assert_eq!(
             schema
@@ -25014,8 +25018,8 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
                 .as_array()
                 .expect("array")
                 .len(),
-            2,
-            "{def}: the reason enum admits null beside the reason"
+            4,
+            "{def}: the reason enum admits null beside the three reasons"
         );
     }
     // The v6 tables extend their frozen parents by exactly the
@@ -25934,5 +25938,75 @@ fn key_operation_newsite_edwards_montgomery_unestablished_carries_reason() {
             section["objects"][0][block]["ec_params"]["reason"].is_null(),
             "{block}: a non-Edwards/Montgomery absence carries no curve reason"
         );
+    }
+}
+
+/// Fix round 3: a complete template with only an unclassifiable size
+/// still trips v6 via the unsupported reason alone — no promotion,
+/// no label, no source, no truncation. The reason never silently
+/// drops below v6.
+#[test]
+fn key_operation_newsite_unsupported_value_alone_triggers_v6() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    const UNSUPPORTED: &str = "template value outside approved finite set";
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![(4u8, 1u8, 100u16)],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6,
+        "the unsupported reason alone trips v6"
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    assert!(
+        section["objects"][0]["label"].is_null(),
+        "nothing labels without a promoted fact"
+    );
+    for block in ["requested", "established"] {
+        assert_eq!(
+            section["objects"][0][block]["value_len"]["status"], "unknown",
+            "{block}: the unclassifiable size stays unknown"
+        );
+        assert_eq!(
+            section["objects"][0][block]["value_len"]["reason"], UNSUPPORTED,
+            "{block}: the seen size names the unsupported reason"
+        );
+        for field in [
+            "class",
+            "key_type",
+            "token",
+            "modulus_bits",
+            "ec_params",
+            "parameter_set",
+        ] {
+            assert!(
+                section["objects"][0][block][field]["reason"].is_null(),
+                "{block}.{field}: an absent kind on a complete template carries no reason"
+            );
+            assert!(
+                section["objects"][0][block][field]["source"].is_null(),
+                "{block}.{field}: nothing promotes, so no source exists"
+            );
+        }
     }
 }

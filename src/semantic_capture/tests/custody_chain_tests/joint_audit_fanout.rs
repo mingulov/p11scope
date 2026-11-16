@@ -11970,20 +11970,37 @@ fn assert_unclaimable_original_error_return_keeps_fail_closed(name: &str, rv: u6
     );
 }
 
-/// Keyrows follow-up (tier-3 R1): misaligned `C_SignInit` and
-/// `C_GetAttributeValue` originals with a handle error, and one with a
-/// session-handle error, keep the named fail-closed path instead of
-/// being disposed.
+/// Keyrows follow-up (tier-3 R1): a misaligned `C_SignInit` original
+/// with a key-handle error keeps the named fail-closed path.
 #[test]
-fn joint_machine_unclaimable_originals_with_error_returns_keep_named_end() {
+fn joint_machine_misaligned_sign_init_handle_error_keeps_named_end() {
     use pkcs11_types::CkRv;
-    for (name, rv) in [
-        ("C_SignInit", CkRv::KEY_HANDLE_INVALID.0),
-        ("C_GetAttributeValue", CkRv::OBJECT_HANDLE_INVALID.0),
-        ("C_SignInit", CkRv::SESSION_HANDLE_INVALID.0),
-    ] {
-        assert_unclaimable_original_error_return_keeps_fail_closed(name, rv);
-    }
+    assert_unclaimable_original_error_return_keeps_fail_closed(
+        "C_SignInit",
+        CkRv::KEY_HANDLE_INVALID.0,
+    );
+}
+
+/// Keyrows follow-up (tier-3 R1): a misaligned `C_GetAttributeValue`
+/// original with an object-handle error keeps the named fail-closed path.
+#[test]
+fn joint_machine_misaligned_get_attributes_handle_error_keeps_named_end() {
+    use pkcs11_types::CkRv;
+    assert_unclaimable_original_error_return_keeps_fail_closed(
+        "C_GetAttributeValue",
+        CkRv::OBJECT_HANDLE_INVALID.0,
+    );
+}
+
+/// Keyrows follow-up (tier-3 R1): a misaligned original with a
+/// session-handle error keeps the named fail-closed path.
+#[test]
+fn joint_machine_misaligned_session_error_keeps_named_end() {
+    use pkcs11_types::CkRv;
+    assert_unclaimable_original_error_return_keeps_fail_closed(
+        "C_SignInit",
+        CkRv::SESSION_HANDLE_INVALID.0,
+    );
 }
 
 /// Keyrows follow-up (tier-3 I-A): the disposal gate names the removed

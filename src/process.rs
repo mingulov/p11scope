@@ -1836,6 +1836,34 @@ pub(crate) fn process_proven_exited(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Whether the view's whole original thread group provably exited: the
+/// single proof behind every exit-wording and silent-exit decision. It
+/// holds when the retained pidfd reports the group gone, when the
+/// leader and every member are past user mode
+/// ([`PidPin::final_exit_in_progress`]), or when `kill` answers `ESRCH`
+/// ([`process_proven_exited`], hidepid-proof). Pidfd authority only for
+/// the pin arm: a start-time fallback pin's mismatch means the pid was
+/// reused by a live process, which is NOT an exit. A fallback pin with
+/// an unreadable task set, an exhausted proof budget, or a zombie
+/// leader with live members is unproven, never exited.
+///
+/// Silent paths must use this proof, never an empty maps re-read alone:
+/// a zombie-leader group shows empty TGID maps while alive, and a
+/// leader running `exit_mm` empties its TGID maps while members keep
+/// the mm — either would drop gaps for a live group.
+pub(crate) fn whole_group_proven_exited(view: &ProcessView) -> bool {
+    // Pidfd authority only: without it a mismatch is pid reuse.
+    if view.retained_pin().pidfd().is_ok() && view.original_exited() == Ok(true) {
+        return true;
+    }
+    // Leader and every member past user mode. Pidfd only inside: a
+    // fallback pin never qualifies, and an exhausted budget is false.
+    if view.final_exit_in_progress() {
+        return true;
+    }
+    process_proven_exited(view.pid())
+}
+
 /// The whole `/proc/<pid>/stat` in (almost always) one `read`:
 /// `read_to_string` grows from 32 bytes, so it issues ~5 tiny reads per
 /// stat (~13 us vs ~10 us measured, exp-pass-profile). Same bytes on
@@ -3016,6 +3044,63 @@ int main(int argc, char **argv) {
         assert!(generation_dead(pid), "a zombie reads live");
         child.wait().unwrap();
         assert!(generation_dead(pid), "a reaped child reads live");
+    }
+
+    /// The shared whole-group exit proof: a reaped pid proves the end
+    /// under either pin, while a live process, a reused pid and a
+    /// zombie leader with live members stay unproven under either pin.
+    #[test]
+    fn whole_group_proof_covers_reaped_but_not_live_reused_or_zombie_leader() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        let live = std::process::id();
+        let pidfd_live = ProcessView::open(ProcessViewId(90), live).unwrap();
+        assert!(!whole_group_proven_exited(&pidfd_live));
+        let fallback_live =
+            start_time_pinned_process_view_for_test(ProcessViewId(91), live).unwrap();
+        assert!(!whole_group_proven_exited(&fallback_live));
+        let reused = reused_process_view_for_test(ProcessViewId(92), live).unwrap();
+        assert!(
+            !whole_group_proven_exited(&reused),
+            "pid reuse is not an exit"
+        );
+
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let zombie = group.pid();
+        assert!(process_is_zombie(zombie));
+        let pidfd_zombie = ProcessView::open(ProcessViewId(93), zombie).unwrap();
+        assert!(
+            !whole_group_proven_exited(&pidfd_zombie),
+            "a live member keeps the group unproven"
+        );
+        let fallback_zombie =
+            start_time_pinned_process_view_for_test(ProcessViewId(94), zombie).unwrap();
+        assert!(
+            !whole_group_proven_exited(&fallback_zombie),
+            "a fallback pin cannot prove past a zombie leader"
+        );
+        group.call_three();
+
+        for weak in [false, true] {
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .die_with_parent()
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let view = if weak {
+                start_time_pinned_process_view_for_test(ProcessViewId(95), pid).unwrap()
+            } else {
+                ProcessView::open(ProcessViewId(96), pid).unwrap()
+            };
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(process_proven_exited(pid), "the pid names no process");
+            assert!(
+                whole_group_proven_exited(&view),
+                "a reaped pid proves the end (fallback: {weak})"
+            );
+        }
     }
 
     #[test]

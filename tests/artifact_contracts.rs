@@ -13293,6 +13293,14 @@ fn rendered_retry_breakdown_satisfies_the_discovery_retry_consumer() {
     );
     noise.note_skip(
         "capture discovery",
+        "open failed: No such file or directory (os error 2)",
+    );
+    noise.note_skip(
+        "process view",
+        "accepted process generation changed during attach preparation",
+    );
+    noise.note_skip(
+        "capture discovery",
         "a discovery pass ended without a stated cause",
     );
     let rendered: BTreeMap<String, u64> = noise
@@ -13303,10 +13311,12 @@ fn rendered_retry_breakdown_satisfies_the_discovery_retry_consumer() {
     assert_eq!(rendered.get("maps-snapshot"), Some(&1));
     assert_eq!(rendered.get("process-view"), Some(&2));
     assert_eq!(rendered.get("process-ended"), Some(&1));
+    assert_eq!(rendered.get("object-missing"), Some(&1));
+    assert_eq!(rendered.get("stale-view"), Some(&1));
     assert_eq!(rendered.get("other"), Some(&1));
     assert_eq!(
         rendered.len(),
-        4,
+        6,
         "only nonzero classes appear: {rendered:?}"
     );
     let rendered = serde_json::to_value(&rendered).expect("breakdown serializes");
@@ -13386,6 +13396,94 @@ print("accepted")
             "the checker accepted a {mode} discovery_retry_classes object",
         );
     }
+}
+
+/// The six retry labels are one finite vocabulary shared by the Rust
+/// classifier, the v3 schema enum and the checker: every
+/// `DiscoveryNoiseClass` variant must equal both consumers exactly, so a
+/// new label cannot land in one and miss the others. The match below is
+/// exhaustive on purpose — adding a variant breaks it at compile time —
+/// while the set comparison catches a missing or extra arm at run time.
+#[test]
+fn retry_labels_match_the_schema_enum_and_checker_exhaustively() {
+    use p11scope::discovery::noise::DiscoveryNoiseClass;
+    // Exhaustive: a new variant fails this match at compile time.
+    fn expected_label(class: DiscoveryNoiseClass) -> &'static str {
+        match class {
+            DiscoveryNoiseClass::ProcessEnded => "process-ended",
+            DiscoveryNoiseClass::MapsSnapshot => "maps-snapshot",
+            DiscoveryNoiseClass::ObjectMissing => "object-missing",
+            DiscoveryNoiseClass::ProcessView => "process-view",
+            DiscoveryNoiseClass::StaleView => "stale-view",
+            DiscoveryNoiseClass::Other => "other",
+        }
+    }
+    let all = [
+        DiscoveryNoiseClass::ProcessEnded,
+        DiscoveryNoiseClass::MapsSnapshot,
+        DiscoveryNoiseClass::ObjectMissing,
+        DiscoveryNoiseClass::ProcessView,
+        DiscoveryNoiseClass::StaleView,
+        DiscoveryNoiseClass::Other,
+    ];
+    let rust_labels: BTreeSet<&str> = all
+        .iter()
+        .map(|class| {
+            assert_eq!(
+                class.label(),
+                expected_label(*class),
+                "the Rust label drifted from the pinned vocabulary"
+            );
+            class.label()
+        })
+        .collect();
+    assert_eq!(
+        rust_labels.len(),
+        6,
+        "the Rust vocabulary lost a label: {rust_labels:?}"
+    );
+
+    let schema: serde_json::Value =
+        serde_json::from_str(&read("docs/schema/observed-profile-v3.schema.json"))
+            .expect("the v3 schema parses");
+    let schema_labels: BTreeSet<&str> =
+        schema["properties"]["evidence"]["properties"]["discovery_retry_classes"]["propertyNames"]
+            ["enum"]
+            .as_array()
+            .expect("the schema carries a retry-label enum")
+            .iter()
+            .map(|label| label.as_str().expect("every enum entry is a string"))
+            .collect();
+    assert_eq!(
+        rust_labels, schema_labels,
+        "Rust labels drifted from the v3 schema enum"
+    );
+
+    let driver = r#"
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("checker", "scripts/check-capture-evidence.py")
+checker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(checker)
+print(json.dumps(sorted(checker.DISCOVERY_RETRY_CLASSES)))
+"#;
+    let listed = Command::new("python3")
+        .args(["-c", driver])
+        .output()
+        .expect("running python3");
+    assert!(
+        listed.status.success(),
+        "the checker label listing failed:\n{}\n{}",
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let checker_labels: BTreeSet<String> =
+        serde_json::from_str(&String::from_utf8_lossy(&listed.stdout))
+            .expect("the checker label listing parses");
+    let checker_labels: BTreeSet<&str> = checker_labels.iter().map(String::as_str).collect();
+    assert_eq!(
+        rust_labels, checker_labels,
+        "Rust labels drifted from the checker vocabulary"
+    );
 }
 
 /// Task 8 Step 2, "Freeze the consumer map explicitly": metrics and function

@@ -23,7 +23,7 @@ use crate::discovery::overlay_witness::{
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
-use crate::process::leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
+use crate::process::leader_exit::LeaderExitReadBudget;
 use crate::process::{
     MappedOpenError, MountNamespaceId, MountTableCache, PidPin, ProcessView, ProcessViewId,
 };
@@ -4502,23 +4502,16 @@ const ZERO_READ_EXIT_CAUSE: &str = "the process exited during the snapshot";
 
 /// True when `/proc/<pid>/maps` reads empty right now, or the pid is
 /// gone: the TGID's mm reads gone. For a single-threaded target that means
-/// the scanned generation exited or is past running user code, and the scan
-/// only reaches a zero-length read for a group its own maps snapshot
-/// listed — so an empty re-read proves the mapping vanished with its
-/// process. A zombie-leader group with live members is the one exception:
-/// its TGID maps are always empty while the group is alive, so callers must
-/// exclude the proven-live shape (see [`zero_read_names_exit`]) before
-/// naming an exit from this re-read. This catches what the pin
-/// cannot: a start-time fallback pin reads an unreaped zombie as
-/// alive, and even a pidfd pin stays unready while the task runs its
-/// own exit path with the mm already released (state `R`, empty maps
-/// — an easily sampled window, not a microsecond race). A reused pid reads
-/// its new occupant's nonempty maps here, but the caller renames on the
-/// proven exit before consulting this re-read (reuse implies the scanned
-/// generation exited and was reaped). Any other read failure keeps the
-/// established wording. Reads the live file directly, like `still_the_same`:
-/// scripted maps would defeat the purpose — the question is whether the mm
-/// is gone NOW.
+/// the scanned generation exited or is past running user code — but only
+/// for that task. A zombie-leader group with live members always shows
+/// empty TGID maps while alive, and a leader running `exit_mm` empties
+/// its TGID maps while members keep the mm, so an empty re-read alone
+/// never proves a whole-group exit: callers must pair it with the
+/// final-exit proof (see [`zero_read_names_exit`]). A reused pid reads
+/// its new occupant's nonempty maps here. Any other read failure keeps
+/// the established wording. Reads the live file directly, like
+/// `still_the_same`: scripted maps would defeat the purpose — the
+/// question is whether the mm is gone NOW.
 fn target_maps_now_empty(pid: u32) -> bool {
     use std::io::Read as _;
     let mut maps = match std::fs::File::open(format!("/proc/{pid}/maps")) {
@@ -4541,34 +4534,34 @@ fn zero_read_names_exit(view: &ProcessView) -> bool {
 
 /// Test seam for [`zero_read_names_exit`]: the rename decision with the
 /// maps re-read and the exit-proof budget supplied by the caller.
-/// Production passes the live re-read and a fresh proof budget, exactly
-/// as before, so this seam changes no behavior by itself.
+/// Production passes the live re-read and a fresh proof budget.
 ///
-/// Whether a zero-length mapping read names the exit exactly: the pin
-/// proves the scanned generation gone (`original_exited() == Ok(true)`),
-/// or a live re-read shows the mm gone while no live member proves the
-/// group alive. A transient stat failure or missing start time proves
-/// nothing — a live, mapped process keeps the established wording. A
+/// Whether a zero-length mapping read names the exit exactly: the whole
+/// group provably exited
+/// ([`crate::process::whole_group_proven_exited`]), or a live re-read
+/// shows the mm gone while the leader and every member are past user
+/// mode. A transient stat failure or missing start time proves nothing
+/// — a live, mapped process keeps the established wording. A
 /// zombie-leader group with live members always shows empty TGID maps
-/// while alive, so an empty TGID re-read alone never names the exit once
-/// a live non-leader member proves the group alive. A start-time fallback
-/// pin has no member authority and an exhausted read budget proves
-/// nothing, so an unproven pin with empty maps keeps the established
-/// rename: the single-threaded exit window — mm released before the pin
-/// settles — still names its exit, as does a pid reused by a live
-/// process (reuse implies the scanned generation exited and was reaped).
+/// while alive, and a leader running `exit_mm` empties its TGID maps
+/// while members keep the mm, so an empty TGID re-read alone never
+/// names the exit: a start-time fallback pin (no member authority), a
+/// live member, and an exhausted proof budget all keep the read
+/// wording. A pid reused by a live process is not an exit either. The
+/// single-threaded exit window — mm released before the pin settles —
+/// still names its exit through the final-exit proof.
 fn zero_read_names_exit_with(
     view: &ProcessView,
     maps_now_empty: bool,
     work: &mut LeaderExitReadBudget,
 ) -> bool {
-    if view.original_exited() == Ok(true) {
+    if crate::process::whole_group_proven_exited(view) {
         return true;
     }
-    if !maps_now_empty {
-        return false;
-    }
-    view.retained_pin().leader_exit_observation(work) != LeaderExitObservation::LiveNonleader
+    // The second walk runs only for a zero-byte read against empty maps
+    // with no proven exit yet — rare — and reuses the caller's budget so
+    // an exhausted proof keeps the read wording.
+    maps_now_empty && view.final_exit_in_progress_within(work)
 }
 
 /// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A partial read simply
@@ -6056,21 +6049,20 @@ fn cold_exit_churn_message(text: &str) -> bool {
 /// * `ENOENT` proves nothing by itself: a live target whose `/proc`
 ///   visibility changes between the maps read and the mem open (a
 ///   committed setuid under hidepid) surfaces the same errno as a
-///   reaped child. It silences only on a fresh whole-group proof —
-///   the view's pin (`original_exited`) or a `kill` `ESRCH`
-///   (`process_proven_exited`, hidepid-proof).
+///   reaped child. It silences only on the shared whole-group proof
+///   ([`crate::process::whole_group_proven_exited`]).
 /// * Any other errno'd refusal (`EACCES`, `EPERM`, `EIO`, ...) proves
-///   the task existed at open time, so it is proven from the view's
-///   pin first: a dead leader with live members reads `false`,
-///   keeping the live group's refusal loud. Without pidfd authority
-///   (a fallback pin, which cannot see zombies through its
-///   start-time comparison) only a reaped pid silences, never
-///   leader-Z.
+///   the task existed at open time, so it silences only on that same
+///   shared proof: a dead leader with live members reads unproven,
+///   keeping the live group's refusal loud, as does a reused pid.
 /// * A wrapped failure with no errno (a cold-proof error) silences
 ///   only when it names known exit churn (see
 ///   `COLD_EXIT_CHURN_MESSAGES`) and the leader freshly reads dead;
 ///   budget, deadline, metadata I/O, namespace and ambiguity
-///   refusals stay loud and counted with their own reason.
+///   refusals stay loud and counted with their own reason. This arm
+///   keeps its own zombie-aware leader read (`mem_open_exited`):
+///   known churn with a dead leader is the ordinary end of a dying
+///   child, not a whole-group proof.
 ///
 /// Fail-closed: any unproven shape keeps its loud refusal. Callers
 /// run inside `run_while_same`, so a generation change across the
@@ -6080,18 +6072,12 @@ fn mem_open_exited_for_view(view: &ProcessView, pid: u32, error: &std::io::Error
         return true;
     }
     if error.raw_os_error() == Some(libc::ENOENT) {
-        return view.original_exited() == Ok(true) || crate::process::process_proven_exited(pid);
+        return crate::process::whole_group_proven_exited(view);
     }
     if error.raw_os_error().is_none() {
         return cold_exit_churn_message(&error.to_string()) && mem_open_exited(pid, error);
     }
-    if view.original_exited() == Ok(true) {
-        return true;
-    }
-    if view.retained_pin().pidfd().is_err() {
-        return crate::process::process_proven_exited(pid);
-    }
-    false
+    crate::process::whole_group_proven_exited(view)
 }
 
 fn capture_scan_reason(reason: &str) -> bool {
@@ -8361,16 +8347,13 @@ fn scan_view_examined_mode(
         let mut data_stopped_short = false;
         for entry in &data {
             let (bytes, short, exhausted) = read_mapping(mem, entry, budget, &mut operation_bytes);
-            // A zero-length read while the target's mm is gone proves the
-            // target exited mid-snapshot, so the mapping vanished with its
-            // process: name the exit exactly. The byte counts stay — they
-            // say how much went unexamined. The pin alone cannot prove
-            // it: a fallback pin reads an unreaped zombie as alive, and a
-            // pidfd pin stays unready while the task runs its own exit
-            // path with the mm already released — so a proven exit renames
-            // outright, while an unproven pin re-checks the maps, unless
-            // a live member proves the group alive (a zombie leader's TGID
-            // maps are always empty while members live).
+            // A zero-length read against a provably exited group names
+            // the exit exactly: the mapping vanished with its process.
+            // The byte counts stay — they say how much went
+            // unexamined. The proof is whole-group only (see
+            // `zero_read_names_exit`): an unproven group — a fallback
+            // pin, a live member, an exhausted proof budget, a reused
+            // pid — keeps the read wording.
             let short = match short {
                 Some(reason)
                     if !exhausted
@@ -16500,8 +16483,8 @@ mod tests {
 
     /// Tier-3 review I1 helper twin ("leader exiting, member live"): a
     /// pidfd-pinned group whose leader released its mm mid-exit (state R
-    /// + `PF_EXITING`, TGID maps empty) while a member stays live keeps
-    /// the read wording. The old live-member observation needs leader Z,
+    /// with `PF_EXITING`, TGID maps empty) while a member stays live
+    /// keeps the read wording. The old live-member observation needs leader Z,
     /// so it answers Unresolved on this shape and fails open. The scripted
     /// empty maps stand in for the leader's released mm — a live leader
     /// reads the same decision inputs (birth matches, state is not Z) —

@@ -1339,11 +1339,14 @@ pub struct Evidence {
     /// Discovered entries with no attachable target, and why. Also published
     /// per module in `discovery[].skipped`.
     pub skipped: Vec<SkippedOut>,
-    /// Complete per-class discovery retry counts behind the `skipped`
-    /// rows: every skipped discovery view, folded by noise class over the
-    /// whole capture (initial + live). Keyed by the stable class label;
-    /// only nonzero classes appear. Absent — never null — when discovery
-    /// never retried.
+    /// Complete per-class discovery retry counts: every folded
+    /// discovery retry note, by noise class, over the whole capture
+    /// (initial discovery plus live, including merged watch-scan
+    /// races). Notes include transient exits and races that file no
+    /// `skipped` row, so these counts do not reconcile one-to-one with
+    /// `skipped` rows and never feed verdicts. Keyed by the stable
+    /// class label; only nonzero classes appear. Absent — never null —
+    /// when discovery never retried.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub discovery_retry_classes: BTreeMap<String, u64>,
     /// Planned slots whose names are not authorized for semantic
@@ -4660,12 +4663,12 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     )));
                 }
                 if verbose {
-                    let mut items = skipped_item_list(ev);
-                    if let Some(dominant) = dominant_retry_class(ev) {
-                        items.push(dominant);
-                    }
+                    let items = skipped_item_list(ev);
                     if !items.is_empty() {
                         fragments.push(format!("skipped: {}", items.join(", ")));
+                    }
+                    if let Some(dominant) = dominant_retry_class(ev) {
+                        fragments.push(dominant);
                     }
                 }
                 continue;
@@ -5027,11 +5030,27 @@ fn skipped_item_list(ev: &Evidence) -> Vec<String> {
     items
 }
 
-/// The largest discovery retry class behind the `skipped` rows, for the
-/// verbose listing only: generic rows hide thousands of retried views, so
-/// `-v` names the dominant class with its count. Ties break toward the
-/// alphabetically first label; empty when discovery never retried.
-/// Concise output never calls this and stays one line.
+/// User words for a discovery retry label in the verbose coverage
+/// fragment. The `process-view` accumulator label is internal jargon
+/// for a scope member the capture could not retain or scan, so it
+/// renders with the same words the `skipped` rows use. Every other
+/// label reads as-is. The JSON breakdown keeps the stable labels
+/// untouched.
+fn retry_class_user_words(label: &str) -> &str {
+    if label == "process-view" {
+        "process view"
+    } else {
+        label
+    }
+}
+
+/// The largest discovery retry class, for the verbose coverage line
+/// only: the concise line hides thousands of retried views, so `-v`
+/// names the dominant class with its count as its own fragment. Ties
+/// break toward the alphabetically first label; empty when discovery
+/// never retried. Labels render in user words (see
+/// `retry_class_user_words`). Concise output never calls this and stays
+/// one line.
 fn dominant_retry_class(ev: &Evidence) -> Option<String> {
     let mut best: Option<(&String, u64)> = None;
     for (label, count) in &ev.discovery_retry_classes {
@@ -5042,7 +5061,12 @@ fn dominant_retry_class(ev: &Evidence) -> Option<String> {
             best = Some((label, *count));
         }
     }
-    best.map(|(label, count)| format!("dominant retry class: {label} x{count}"))
+    best.map(|(label, count)| {
+        format!(
+            "dominant retry class: {} x{count}",
+            retry_class_user_words(label)
+        )
+    })
 }
 
 /// True for an owned run that never paused while its command ran
@@ -18749,9 +18773,34 @@ pub(crate) mod tests {
             verbose.contains("discovery subject (discovery unavailable) x2"),
             "{verbose}"
         );
+        // Tier-3 review M2: the dominant class is its own fragment, and
+        // the user-facing fragment says "process view", not the
+        // internal accumulator label "process-view".
         assert!(
-            verbose.contains("dominant retry class: process-view x19861"),
+            verbose.contains("dominant retry class: process view x19861"),
             "{verbose}"
+        );
+        assert!(
+            !verbose.contains("process-view"),
+            "the verbose fragment uses user words, not the accumulator label: {verbose}"
+        );
+        // Structural: the dominant class is its own fragment element,
+        // not an item inside the "skipped: ..." list element (fragments
+        // within a group join with ", ", so the joined line alone cannot
+        // tell the two apart).
+        let fragments = cause_fragments(&ev, &["skipped"], true);
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.starts_with("dominant retry class: ")),
+            "the dominant class is its own fragment: {fragments:?}"
+        );
+        assert!(
+            fragments
+                .iter()
+                .filter(|fragment| fragment.starts_with("skipped: "))
+                .all(|fragment| !fragment.contains("dominant retry class")),
+            "the skipped list carries no dominant item: {fragments:?}"
         );
         let line = coverage_line(&ev, false);
         assert!(!line.contains("dominant retry class"), "{line}");

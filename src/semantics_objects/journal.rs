@@ -7213,11 +7213,15 @@ impl JournalAdapter {
         debug_assert!(self.void_wiped.len() <= self.limits.open_calls);
         // The wiped BEGINs' terminals will arrive unmatched: the void
         // deliberately released them, so they are expected-absent, never
-        // new taint evidence. Recorded before the table clears, under
-        // the same open-table cap (past it, terminals promote).
+        // new taint evidence. Calls whose terminal already arrived
+        // (a staged END/ABANDON) expect nothing more, so they stay out:
+        // a re-delivered terminal for them is genuinely duplicative and
+        // still promotes. Recorded before the table clears, under the
+        // same open-table cap (past it, terminals promote).
         let wiped: Vec<((u64, u64), JournalNativeKey)> = self
             .open
             .iter()
+            .filter(|(_, entry)| entry.end.is_none() && entry.abandon.is_none())
             .map(|(key, entry)| (entry.image, *key))
             .collect();
         for (image, key) in wiped {

@@ -3091,6 +3091,22 @@ pub struct ReplacementOutcome {
     pub rebuild: DetachOutcome,
 }
 
+/// The set state of one `SLOT_COUNT_ONLY` cell: userspace only ever
+/// writes 0->1 while the slot's link is live, and the BPF programs
+/// treat any nonzero cell as count-only.
+const SLOT_COUNT_ONLY_SET: u32 = 1;
+
+/// Outcome of one [`Session::downgrade_in_place`] batch: slots now
+/// count-only through their live links, and slots that refused with
+/// their reason and must take today's detach+replace path instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InPlaceDowngradeOutcome {
+    /// Slots whose switch flipped 0->1 with no detach and no new link.
+    pub downgraded: Vec<u32>,
+    /// (slot, reason) for every slot that keeps today's path.
+    pub refused: Vec<(u32, String)>,
+}
+
 /// What one [`Session::detach_slots`] call rebuilt, if anything: per-member
 /// evidence for multi-group survivors plus the gap count. Empty when no
 /// group needed a rebuild (singles detach, whole-bundle detach).
@@ -6660,6 +6676,7 @@ fn load_capture_object_bytes_with_images(
         .map_max_entries("IMAGE_QUERY_REQUESTS", if full_images { 1_024 } else { 1 });
     if let Some(slots) = stats_slots {
         loader.map_max_entries("STATS", slots);
+        loader.map_max_entries("SLOT_COUNT_ONLY", slots);
     }
     loader.load(object)
 }
@@ -9201,6 +9218,59 @@ impl Session {
         if !targets.is_empty() && !self.deferred_group_slots.is_empty() {
             bail!("static attachment refused while a collected group deferral owns removals");
         }
+        // A′ attach rule: a set count-only switch refuses a semantic
+        // attach at that index; count-only (descriptor 0) stays
+        // admitted, so a planner that never re-raises count-only slots
+        // keeps working. Objects without the switch (Inventory,
+        // counter) or with an unreadable one skip the check and keep
+        // today's behavior; an unreadable cell for a present slot
+        // refuses that slot, since a semantic attach over a set
+        // switch would silently run count-only.
+        let mut switch_refused: Vec<(u32, String)> = Vec::new();
+        let gate: Option<Array<_, u32>> = self
+            .ebpf
+            .map("SLOT_COUNT_ONLY")
+            .and_then(|map| Array::try_from(map).ok());
+        if let Some(gate) = gate {
+            for slot in targets {
+                if slot.descriptor_index == 0 {
+                    continue;
+                }
+                match gate.get(&slot.index, 0) {
+                    Ok(0) => {}
+                    Ok(_) => switch_refused.push((
+                        slot.index,
+                        format!(
+                            "slot {} refused: count-only switch is set for a semantic attach",
+                            slot.index
+                        ),
+                    )),
+                    Err(error) => switch_refused.push((
+                        slot.index,
+                        format!(
+                            "slot {} refused: cannot read its count-only switch: {error:#}",
+                            slot.index
+                        ),
+                    )),
+                }
+            }
+        }
+        let switch_targets: Vec<Slot>;
+        let switch_failed: Vec<u32>;
+        let targets: &[Slot] = if switch_refused.is_empty() {
+            switch_failed = Vec::new();
+            targets
+        } else {
+            switch_failed = switch_refused.iter().map(|(index, _)| *index).collect();
+            let refused: BTreeSet<u32> = switch_failed.iter().copied().collect();
+            self.attach_failures.extend(switch_refused);
+            switch_targets = targets
+                .iter()
+                .filter(|slot| !refused.contains(&slot.index))
+                .cloned()
+                .collect();
+            &switch_targets
+        };
         self.pid_pairs.retarget_gap(targets, objects);
         self.global_retirements.select(targets, objects);
         // Quarantined indices fail per slot, with their reason, into the
@@ -9227,6 +9297,7 @@ impl Session {
             quarantined_failed.push(*index);
         }
         if admitted.is_empty() {
+            quarantined_failed.extend(switch_failed);
             return Ok((quarantined_failed, Vec::new()));
         }
         let admitted_set: BTreeSet<u32> = admitted.into_iter().collect();
@@ -9445,6 +9516,7 @@ impl Session {
         );
         self.successful_static.extend(successful);
         let mut failed: Vec<_> = quarantined_failed;
+        failed.extend(switch_failed);
         failed.extend(failures.iter().map(|(slot, _)| *slot));
         // Fix6 A3: exhaustion-unfinished slots wait for a retry — they
         // stay in `failed` (partial links still detach) but out of the
@@ -9639,6 +9711,220 @@ impl Session {
             &mut self.pid_pairs,
         );
         Ok(outcome)
+    }
+
+    /// In-place count-only downgrade (A′): narrows semantic slots to
+    /// count-only on their live links instead of detaching and
+    /// reattaching. Each slot keeps its entry/return links on the same
+    /// object and offset; only its `SLOT_COUNT_ONLY` cell flips 0->1,
+    /// so calls in flight observe no detach/attach window. Every slot
+    /// carries the preconditions (the map is present, the slot has a
+    /// live link on the unchanged entry program, the retained target
+    /// names the same attach key, the old descriptor is semantic and
+    /// the new one is count-only); refused slots report their reason
+    /// and take today's detach+replace path with its named physical
+    /// gap. The switch is written as 1 and read back, and
+    /// `retained_static` follows the new slot. No link is detached,
+    /// no link is attached, and `pid_pairs`/`global_retirements` are
+    /// untouched: there is no physical gap to disclose.
+    pub fn downgrade_in_place(&mut self, slots: &[Slot]) -> InPlaceDowngradeOutcome {
+        let mut outcome = InPlaceDowngradeOutcome::default();
+        let mut eligible: Vec<Slot> = Vec::new();
+        for slot in slots {
+            let Some(retained) = self.retained_static.get(&slot.index) else {
+                outcome.refused.push((
+                    slot.index,
+                    format!("slot {} has no retained static target", slot.index),
+                ));
+                continue;
+            };
+            if slot.descriptor_index != 0 {
+                outcome.refused.push((
+                    slot.index,
+                    format!(
+                        "slot {} new descriptor {} is not count-only",
+                        slot.index, slot.descriptor_index
+                    ),
+                ));
+                continue;
+            }
+            if retained.slot.descriptor_index == 0 {
+                outcome.refused.push((
+                    slot.index,
+                    format!("slot {} old descriptor is already count-only", slot.index),
+                ));
+                continue;
+            }
+            if crate::plan::AttachKey::of(slot) != crate::plan::AttachKey::of(&retained.slot) {
+                outcome.refused.push((
+                    slot.index,
+                    format!("slot {} attach key changed under the live link", slot.index),
+                ));
+                continue;
+            }
+            if !self.has_slot_link(slot.index) {
+                outcome
+                    .refused
+                    .push((slot.index, format!("slot {} has no live link", slot.index)));
+                continue;
+            }
+            // Entry program unchanged: the live entry link is the plain
+            // endpoint (or its journal twin) and the count-only slot
+            // resolves to the same program. Unsafe-decoder builds
+            // (template/ia32 roots) take today's path.
+            if self.embedded_flavor.unsafe_present {
+                outcome.refused.push((
+                    slot.index,
+                    format!(
+                        "slot {} unsafe-decoder build takes today's path",
+                        slot.index
+                    ),
+                ));
+                continue;
+            }
+            let expected_entry = if self.journal {
+                "p11_entry_journal"
+            } else {
+                "p11_entry"
+            };
+            let mut entry_programs = BTreeSet::new();
+            for link in &self.links {
+                if !link.slots().contains(&slot.index) {
+                    continue;
+                }
+                if let ProducerProgram::UProbe(program) = link.producer()
+                    && program.starts_with("p11_entry")
+                {
+                    entry_programs.insert(program);
+                }
+            }
+            if entry_programs.is_empty() {
+                outcome.refused.push((
+                    slot.index,
+                    format!("slot {} has no live entry link", slot.index),
+                ));
+                continue;
+            }
+            if entry_programs.len() != 1 || !entry_programs.contains(expected_entry) {
+                outcome.refused.push((
+                    slot.index,
+                    format!(
+                        "slot {} live entry program is not {expected_entry}",
+                        slot.index
+                    ),
+                ));
+                continue;
+            }
+            let resolved = entry_program(
+                &slot.semantics,
+                self.policy,
+                self.embedded_flavor.unsafe_present,
+                retained.abi,
+            );
+            if resolved != expected_entry {
+                outcome.refused.push((
+                    slot.index,
+                    format!(
+                        "slot {} count-only entry program is {resolved}, not {expected_entry}",
+                        slot.index
+                    ),
+                ));
+                continue;
+            }
+            eligible.push(slot.clone());
+        }
+        if eligible.is_empty() {
+            return outcome;
+        }
+        let mut switch: Array<_, u32> = match self.ebpf.map_mut("SLOT_COUNT_ONLY") {
+            Some(map) => match Array::try_from(map) {
+                Ok(switch) => switch,
+                Err(error) => {
+                    for slot in &eligible {
+                        outcome.refused.push((
+                            slot.index,
+                            format!(
+                                "slot {} switch map has an unexpected shape: {error:#}",
+                                slot.index
+                            ),
+                        ));
+                    }
+                    return outcome;
+                }
+            },
+            None => {
+                for slot in &eligible {
+                    outcome.refused.push((
+                        slot.index,
+                        format!("slot {} session has no SLOT_COUNT_ONLY map", slot.index),
+                    ));
+                }
+                return outcome;
+            }
+        };
+        for slot in &eligible {
+            let current: u32 = match switch.get(&slot.index, 0) {
+                Ok(current) => current,
+                Err(error) => {
+                    outcome.refused.push((
+                        slot.index,
+                        format!(
+                            "slot {} cannot read its count-only switch: {error:#}",
+                            slot.index
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            // Narrowing-only: only 0->1 while the link is live. A set
+            // cell refuses back to today's path instead of writing again.
+            if current != 0 {
+                outcome.refused.push((
+                    slot.index,
+                    format!("slot {} count-only switch already set", slot.index),
+                ));
+                continue;
+            }
+            if let Err(error) = switch.set(slot.index, SLOT_COUNT_ONLY_SET, 0) {
+                outcome.refused.push((
+                    slot.index,
+                    format!(
+                        "slot {} cannot write its count-only switch: {error:#}",
+                        slot.index
+                    ),
+                ));
+                continue;
+            }
+            // Read back the cell: only an exact set state commits the downgrade.
+            let read: u32 = match switch.get(&slot.index, 0) {
+                Ok(read) => read,
+                Err(error) => {
+                    outcome.refused.push((
+                        slot.index,
+                        format!(
+                            "slot {} cannot read back its count-only switch: {error:#}",
+                            slot.index
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            if read != SLOT_COUNT_ONLY_SET {
+                outcome.refused.push((
+                    slot.index,
+                    format!(
+                        "slot {} count-only switch read back {read}, not set",
+                        slot.index
+                    ),
+                ));
+                continue;
+            }
+            if let Some(retained) = self.retained_static.get_mut(&slot.index) {
+                retained.slot = slot.clone();
+            }
+            outcome.downgraded.push(slot.index);
+        }
+        outcome
     }
 
     /// Applies the attachment half of a descriptor downgrade after the caller
@@ -12122,7 +12408,7 @@ mod tests {
     /// untouched: there is no physical gap to disclose.
     #[test]
     fn downgrade_in_place_carries_the_preconditions_and_no_link_mutation() {
-        fn body<'a>(source: &'a str) -> Option<&'a str> {
+        fn body(source: &str) -> Option<&str> {
             source
                 .split_once("    pub fn downgrade_in_place(")
                 .map(|(_, tail)| tail)
@@ -12161,7 +12447,10 @@ mod tests {
         );
         for marker in REQUIRED {
             let start = source.find("    pub fn downgrade_in_place(").unwrap();
-            let tail = source[start..].replacen(marker, "REMOVED", 1);
+            // Full removal: several markers legitimately recur (both key
+            // sides, both program names); the contract must fail only
+            // when the marker is entirely absent.
+            let tail = source[start..].replace(marker, "REMOVED");
             assert!(
                 !contract(&format!("{}{}", &source[..start], tail)),
                 "removed {marker}"
@@ -12175,7 +12464,7 @@ mod tests {
     /// value is read before any write.
     #[test]
     fn count_only_switch_writes_narrow_only_while_a_link_is_live() {
-        fn body<'a>(source: &'a str) -> Option<&'a str> {
+        fn body(source: &str) -> Option<&str> {
             source
                 .split_once("    pub fn downgrade_in_place(")
                 .map(|(_, tail)| tail)
@@ -12211,7 +12500,7 @@ mod tests {
     /// re-raises count-only slots keeps working.
     #[test]
     fn attach_refuses_a_set_switch_unless_the_slot_is_count_only() {
-        fn body<'a>(source: &'a str) -> Option<&'a str> {
+        fn body(source: &str) -> Option<&str> {
             source
                 .split_once("    pub(crate) fn attach_targets(")
                 .map(|(_, tail)| tail)
@@ -12243,7 +12532,7 @@ mod tests {
     /// on the slot universe.
     #[test]
     fn capture_loader_resizes_the_count_only_switch_with_stats() {
-        fn body<'a>(source: &'a str) -> Option<&'a str> {
+        fn body(source: &str) -> Option<&str> {
             source
                 .split_once("fn load_capture_object_bytes_with_images(")
                 .map(|(_, tail)| tail)
@@ -23477,6 +23766,406 @@ mod tests {
             );
         }
         eprintln!("retirement-cell multi: quarantined slot 0 never re-cleared");
+        Ok(())
+    }
+
+    /// Owned tight-loop rig for the in-place downgrade: a provider
+    /// exporting C_Initialize plus a driver running scripted GO/DONE
+    /// bursts with one provider-gated call per burst (see
+    /// `tests/fixtures/downgrade-tight-loop.c`).
+    struct DowngradeTightLoopCell {
+        _directory: tempfile::TempDir,
+        provider: std::path::PathBuf,
+        child: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+        input: std::process::ChildStdin,
+    }
+
+    impl Drop for DowngradeTightLoopCell {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl DowngradeTightLoopCell {
+        fn build() -> anyhow::Result<Self> {
+            use anyhow::Context as _;
+            let directory = tempfile::tempdir()?;
+            let source = directory.path().join("tight-loop-cell.c");
+            std::fs::write(
+                &source,
+                include_str!("../tests/fixtures/downgrade-tight-loop.c"),
+            )?;
+            let provider = directory.path().join("provider.so");
+            let driver = directory.path().join("driver");
+            for is_provider in [true, false] {
+                let mut compiler = std::process::Command::new("cc");
+                compiler.args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-fno-builtin",
+                    "-fno-stack-protector",
+                    "-fno-omit-frame-pointer",
+                ]);
+                if is_provider {
+                    compiler.args(["-fPIC", "-shared", "-DDOWNGRADE_TIGHT_LOOP_PROVIDER"]);
+                } else {
+                    compiler.arg("-ldl");
+                }
+                let output = compiler
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(if is_provider { &provider } else { &driver })
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "owned fixture compilation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let mut child = std::process::Command::new(&driver)
+                .arg(&provider)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .die_with_parent()
+                .spawn()?;
+            let stdout = child.stdout.take().context("fixture output pipe")?;
+            let stdin = child.stdin.take().context("fixture input pipe")?;
+            let mut cell = Self {
+                _directory: directory,
+                provider,
+                child,
+                output: std::io::BufReader::new(stdout),
+                input: stdin,
+            };
+            cell.expect_ready()?;
+            Ok(cell)
+        }
+
+        fn expect_ready(&mut self) -> anyhow::Result<()> {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            self.output.read_line(&mut line)?;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 4 && fields[0] == "READY",
+                "owned driver READY line: {line:?}"
+            );
+            let numbers: Vec<u64> = fields[1..4]
+                .iter()
+                .map(|field| field.parse())
+                .collect::<Result<_, _>>()?;
+            let metadata = std::fs::metadata(&self.provider)?;
+            use std::os::unix::fs::MetadataExt as _;
+            anyhow::ensure!(
+                numbers == [u64::from(self.child.id()), metadata.dev(), metadata.ino()],
+                "READY names this child and provider file: {numbers:?}"
+            );
+            Ok(())
+        }
+
+        fn send_go(&mut self, count: u64) -> anyhow::Result<()> {
+            use std::io::Write as _;
+            writeln!(self.input, "GO {count}")?;
+            self.input.flush()?;
+            Ok(())
+        }
+
+        fn await_held(&mut self) -> anyhow::Result<()> {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            self.output.read_line(&mut line)?;
+            anyhow::ensure!(line.trim_end() == "HELD", "gated call held: {line:?}");
+            Ok(())
+        }
+
+        fn send_continue(&mut self) -> anyhow::Result<()> {
+            use std::io::Write as _;
+            writeln!(self.input, "C")?;
+            self.input.flush()?;
+            Ok(())
+        }
+
+        fn await_done(&mut self, count: u64) -> anyhow::Result<()> {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            self.output.read_line(&mut line)?;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 2 && fields[0] == "DONE",
+                "burst done line: {line:?}"
+            );
+            let done: u64 = fields[1].parse()?;
+            anyhow::ensure!(done == count, "ground truth {done} != requested {count}");
+            Ok(())
+        }
+
+        fn finish(&mut self) -> anyhow::Result<()> {
+            use std::io::Write as _;
+            writeln!(self.input, "F")?;
+            self.input.flush()?;
+            let status = self.child.wait()?;
+            anyhow::ensure!(status.success(), "fixture exit: {status:?}");
+            Ok(())
+        }
+
+        /// Pin the owned provider in the child and plan semantic
+        /// C_Initialize endpoints at the given file offsets.
+        fn pin_and_plan_semantic(
+            &self,
+            offsets: &[u64],
+        ) -> anyhow::Result<(super::PinnedObjects, super::AttachPlan)> {
+            use anyhow::Context as _;
+            use p11scope_manifest::identity::{mapping_file_key, open_object};
+            let view = crate::process::ProcessView::open(
+                crate::process::ProcessViewId(0),
+                self.child.id(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let file = open_object(&self.provider).map_err(anyhow::Error::msg)?;
+            let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+            let elf =
+                p11scope_manifest::elf::ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(elf.abi() == super::ElfAbi::Lp64);
+            let key = p11scope_manifest::maps::ObjectKey {
+                device: p11scope_manifest::maps::Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            };
+            let module = crate::discovery::scan::ScannedModule {
+                key_is_identity: false,
+                module_hint: None,
+                mapped_identity: None,
+                double_loaded: false,
+                same_file_loads: 1,
+                pre_copy_up: None,
+                view: view.id(),
+                mount_namespace: view.mount_namespace(),
+                key,
+                path: self.provider.display().to_string(),
+                tables_scan_finished: false,
+                decoder_abi: None,
+                exports: vec![],
+                tables: vec![],
+                interfaces: vec![],
+            };
+            let (pins, skipped) = crate::discovery::identity::pin_scanned_view_objects(
+                &view,
+                &[module],
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                skipped.is_empty(),
+                "owned physical pin refused: {skipped:?}"
+            );
+            let pinned = pins.pinned().next().context("owned provider pin")?;
+            anyhow::ensure!(pinned.key == key);
+            let (descriptor, ambiguous) =
+                crate::kinds::descriptor_index(&["C_Initialize".to_string()]);
+            anyhow::ensure!(
+                !ambiguous && descriptor != 0,
+                "C_Initialize takes a semantic descriptor"
+            );
+            let semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+            let mut slots = Vec::new();
+            for (index, offset) in offsets.iter().enumerate() {
+                let index = u32::try_from(index)?;
+                anyhow::ensure!(elf.is_executable_offset(*offset));
+                slots.push(super::Slot {
+                    index,
+                    descriptor_index: descriptor,
+                    object: pinned.id,
+                    object_path: self.provider.display().to_string(),
+                    file_offset: *offset,
+                    names: vec!["C_Initialize".into()],
+                    aliased: false,
+                    semantics,
+                    semantic_authorized: true,
+                    semantic_ambiguous: false,
+                    fork_safe: false,
+                    module_ids: vec![],
+                });
+            }
+            let plan = super::AttachPlan::from_slots(slots);
+            Ok((pins, plan))
+        }
+
+        fn provider_init_offset(&self) -> anyhow::Result<u64> {
+            use anyhow::Context as _;
+            use p11scope_manifest::identity::open_object;
+            let file = open_object(&self.provider).map_err(anyhow::Error::msg)?;
+            let elf =
+                p11scope_manifest::elf::ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
+            let symbol = elf
+                .defined_symbol("C_Initialize")
+                .map_err(anyhow::Error::msg)?
+                .context("owned provider function")?;
+            Ok(symbol.file_offset)
+        }
+    }
+
+    fn downgrade_tight_loop_stats(
+        session: &super::Session,
+        slot: u32,
+    ) -> anyhow::Result<(u64, u64)> {
+        use anyhow::Context as _;
+        let stats: aya::maps::PerCpuArray<_, p11scope_ebpf_common::SlotStats> =
+            aya::maps::PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS map")?)?;
+        let per_cpu = stats.get(&slot, 0)?;
+        let mut entered = 0u64;
+        let mut returned = 0u64;
+        for cpu in per_cpu.iter() {
+            entered = entered.saturating_add(cpu.entered);
+            returned = returned.saturating_add(cpu.returned);
+        }
+        Ok((entered, returned))
+    }
+
+    fn downgrade_tight_loop_switch(session: &super::Session, slot: u32) -> anyhow::Result<u32> {
+        use anyhow::Context as _;
+        let gate: aya::maps::Array<_, u32> = aya::maps::Array::try_from(
+            session
+                .ebpf
+                .map("SLOT_COUNT_ONLY")
+                .context("SLOT_COUNT_ONLY map")?,
+        )?;
+        Ok(gate.get(&slot, 0)?)
+    }
+
+    fn downgrade_tight_loop_links(
+        session: &super::Session,
+    ) -> Vec<(Vec<u32>, super::ProducerProgram)> {
+        session
+            .links
+            .iter()
+            .map(|link| (link.slots().to_vec(), link.producer()))
+            .collect()
+    }
+
+    /// In-place downgrade (A′) tight loop: fifty semantic→count-only
+    /// downgrades on one live slot, each landing while a call is
+    /// provably in flight (the burst's gated call holds inside the
+    /// provider). Every round keeps exact accounting (entered ==
+    /// returned == ground truth), the link set never changes (no
+    /// detach, no attach), the switch reads back set and the retained
+    /// slot follows the count-only descriptor. Between rounds a
+    /// white-box reset (switch cell 0, retained slot restored) opens
+    /// the next identical downgrade; the downgrade itself always runs
+    /// the production path.
+    #[ignore = "privileged: in-place count-only downgrade tight loop"]
+    #[test]
+    fn downgrade_in_place_tight_loop_keeps_exact_counts_lp64() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        const ROUNDS: u64 = 50;
+        const CALLS_PER_ROUND: u64 = 500;
+        let mut rig = DowngradeTightLoopCell::build()?;
+        let init = rig.provider_init_offset()?;
+        let (pins, plan) = rig.pin_and_plan_semantic(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(rig.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Multi,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.has_slot_link(0));
+        let original = session
+            .retained_static
+            .get(&0)
+            .context("retained slot 0")?
+            .slot
+            .clone();
+        anyhow::ensure!(original.descriptor_index != 0, "the cell starts semantic");
+        let links_before = downgrade_tight_loop_links(&session);
+        anyhow::ensure!(
+            links_before
+                .iter()
+                .any(|(_, program)| *program == super::ProducerProgram::UProbe("p11_entry")),
+            "the live entry link is the plain endpoint: {links_before:?}"
+        );
+        let (entered_base, returned_base) = downgrade_tight_loop_stats(&session, 0)?;
+        anyhow::ensure!(
+            entered_base == 0 && returned_base == 0,
+            "the idle child made no calls before the first burst: {entered_base}/{returned_base}"
+        );
+        for round in 0..ROUNDS {
+            rig.send_go(CALLS_PER_ROUND)?;
+            rig.await_held()?;
+            let (entered, returned) = downgrade_tight_loop_stats(&session, 0)?;
+            anyhow::ensure!(
+                entered > returned,
+                "round {round}: no call in flight at downgrade time"
+            );
+            let mut narrowed = original.clone();
+            narrowed.descriptor_index = 0;
+            narrowed.semantics = super::SlotSemantics::COUNT_ONLY;
+            let outcome = session.downgrade_in_place(std::slice::from_ref(&narrowed));
+            anyhow::ensure!(
+                outcome.downgraded == vec![0] && outcome.refused.is_empty(),
+                "round {round}: downgrade outcome: {outcome:?}"
+            );
+            anyhow::ensure!(
+                downgrade_tight_loop_links(&session) == links_before,
+                "round {round}: the link set changed across the downgrade"
+            );
+            anyhow::ensure!(
+                downgrade_tight_loop_switch(&session, 0)? == 1,
+                "round {round}: the switch did not read back set"
+            );
+            anyhow::ensure!(
+                session
+                    .retained_static
+                    .get(&0)
+                    .is_some_and(|retained| retained.slot.descriptor_index == 0),
+                "round {round}: retained slot did not follow the downgrade"
+            );
+            rig.send_continue()?;
+            rig.await_done(CALLS_PER_ROUND)?;
+            let (entered, returned) = downgrade_tight_loop_stats(&session, 0)?;
+            let expected = entered_base + (round + 1) * CALLS_PER_ROUND;
+            anyhow::ensure!(
+                entered == expected && returned == expected,
+                "round {round}: entered {entered} returned {returned}, ground truth {expected}"
+            );
+            anyhow::ensure!(
+                session.attach_failures().is_empty(),
+                "round {round}: attach failures: {:?}",
+                session.attach_failures()
+            );
+            // White-box inter-round reset: reopen the identical
+            // semantic pre-state for the next production downgrade.
+            {
+                let switch = session
+                    .ebpf
+                    .map_mut("SLOT_COUNT_ONLY")
+                    .context("switch map")?;
+                let mut gate = aya::maps::Array::<_, u32>::try_from(switch)?;
+                gate.set(0, 0, 0)?;
+                anyhow::ensure!(gate.get(&0, 0)? == 0, "round {round}: reset did not clear");
+            }
+            session
+                .retained_static
+                .get_mut(&0)
+                .context("retained slot 0")?
+                .slot = original.clone();
+        }
+        eprintln!("downgrade tight loop: {ROUNDS} downgrades, exact counts, links unchanged");
+        rig.finish()?;
         Ok(())
     }
 

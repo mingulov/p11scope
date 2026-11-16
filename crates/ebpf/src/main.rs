@@ -254,7 +254,9 @@ static DESCRIPTORS: Array<SlotSemantics> =
 /// link cookie still names the downgraded semantic descriptor. Flags
 /// 0, never frozen: userspace writes it while links are live. Absent
 /// from Inventory and counter/bank-proof objects, which never take a
-/// descriptor downgrade.
+/// descriptor downgrade — except the private image-bank-proof
+/// Detailed object, which carries the map unused (Detailed without
+/// counter-broad; the bank checker tolerates the extra map).
 #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
 #[map]
 static SLOT_COUNT_ONLY: Array<u32> = Array::with_max_entries(MAX_SLOTS, 0);
@@ -3255,7 +3257,12 @@ fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
         return 0;
     };
     // In-place downgrade (A′): the pair continuation narrows with the
-    // same switch the pair entry read.
+    // same switch the pair entry read. This second read is safe only
+    // because downgrade_in_place refuses unsafe-decoder builds (the
+    // sole switch writer): no flip can land between the pair's read
+    // and this one. A future relaxation of that refusal must thread
+    // the pair's effective bit through START instead of re-reading,
+    // or the call splits across the flip.
     let semantics = if slot_count_only(slot) {
         SlotSemantics::COUNT_ONLY
     } else {

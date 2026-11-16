@@ -26,6 +26,31 @@ versioned separately and are opaque, exact dispatch keys.
   object is also memory-scanned for file-backed tables (the `--module`
   search, without narrowing), so a process that fetched its table
   before the capture is counted too.
+- `run` now observes short-lived descendants from their first call.
+  With the pause chain armed (the default), a run member is briefly
+  stopped the first time it maps an executable file the capture has
+  not seen; the observer proves the file, attaches a provider's
+  probes, and resumes it before that file's code runs, so even a
+  descendant that cold-loads the provider is caught. Each distinct
+  file costs one short stop for its first mapper (a hold that cannot
+  attach within 1 s resumes the member and files the learned
+  first-use gap row); a job-control shell in the run tree can see
+  its child briefly stopped. Later mappers of a learned provider
+  file attach by file identity. Measured: ten sequential SoftHSM
+  workers observe 60 of 60 calls in 5 of 5 runs (0 before), and the
+  pkcs11-check smoke suite under plain `run` reaches call recall
+  1.0 (0.81 before). With `--pause never` (or when the kernel
+  refuses the stop object) the first mapper's own early calls can
+  still be missed and stay a named gap. If the observer dies, a
+  small watchdog outside the run cgroup resumes stopped members
+  (see known limitations).
+- Detailed reports name each module's first complete attach instant:
+  the new additive `evidence.discovery[].first_attached_at_ns` keeps
+  the earliest attach stamp per endpoint across replaced probes (the
+  existing `attached_at_ns` follows the current slots, so a probe
+  replaced mid-capture moves it later), with per-endpoint
+  `first_attach_points` showing each endpoint's window. Calls after
+  it are observed unless another disclosed window says otherwise.
 
 ### Fixed
 
@@ -133,6 +158,31 @@ versioned separately and are opaque, exact dispatch keys.
   matches no mapped file is named in text and JSON
   (`unmatched_modules`) while the capture still exits 0, and a
   repeated `--system` is refused as a usage error.
+- A pre-armed module no longer silently loses its attach instant
+  when a named `--pid` original ends: when the retirement of an
+  ended process deactivates a pre-arm declared slot that shares its
+  attach group, the slot's real attach stamp is kept, so the module
+  keeps its `attached_at_ns` and unobserved windows (was: null with
+  no windows and no gap). Only the ended original's disturbed
+  groups retire; kept slots outside them stay linked and active.
+- A stale ingest no longer refuses a whole claim scan: an admission
+  collected in a newer quantum than the supplied ingest, one
+  without a collected origin, or one from another native domain is
+  retained as a plain row with one counted caller-named gap, and
+  the lane keeps capturing. The retained plain-row gap is counted
+  whether or not any feed has entered per-key tracking yet.
+- An owned `run` now finishes its initial arming and endpoint
+  selection before the `p11scope: capturing: ` line (like `--pid`),
+  so a child that waits for that line is counted from its first
+  call with no post-ready window — including the counter
+  `--select-endpoint` detail window, whose selection-time read used
+  to happen only after the child was released. A child that calls
+  without waiting can still leave early calls outside the window.
+- Small output wording fixes: a CBOM conversion of a profile report
+  without a scope note no longer doubles the scope word, the gap
+  for a scan pid that exited before admission loses its doubled
+  prefix and stale advice, the seal line follows the sealed lane,
+  and the forwarding-layer closure line reads as a conditional.
 
 ### Changed
 
@@ -189,6 +239,8 @@ versioned separately and are opaque, exact dispatch keys.
   before the capture started is not counted, and is named when it never
   calls a hooked getter; under `--system`/`--cgroup` the program's exit
   reattaches its getter probes and names that short window.
+  `inventory --manifest` refuses a manifest that names getters
+  (inventory never hooks one).
 - On a busy host, a long `inventory --system --key-operations`
   capture can stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Since
@@ -209,6 +261,16 @@ versioned separately and are opaque, exact dispatch keys.
   operations/s (the independent event reader remains planned for
   0.8.0), and a bound on RSS growth during very long system-wide
   captures (also planned for 0.8.0).
+- `run` member stops interrupt the whole thread group briefly, so a
+  blocking call without restart semantics (such as `epoll_wait` or a
+  socket read under `SO_RCVTIMEO`) may return `EINTR` once after the
+  resume. If the observer is killed, the run watchdog resumes stopped
+  members; only a kill that takes the observer and the watchdog
+  together, or a FUSE-backed provider whose server is itself a
+  stopped member, can leave one stopped — recover with `kill -9` of
+  the observer, or `SIGCONT` to the member. A suspended (Ctrl-Z)
+  observer is not dead: a held member stays stopped until the
+  observer runs again.
 
 ## [0.7.0] - 2026-11-13
 

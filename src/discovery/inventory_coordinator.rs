@@ -3314,6 +3314,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.joint_feeds()
     }
 
+    /// Take queued reseed images for fresh births, clearing the queue.
+    pub(crate) fn drain_joint_reseed_queue(&mut self) -> Vec<p11scope_ebpf_common::ImageIdentity> {
+        self.registry.drain_joint_reseed_queue()
+    }
+
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     #[allow(dead_code)] // Consumed by T12c.

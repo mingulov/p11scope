@@ -1079,6 +1079,30 @@ impl InstanceRouter {
         }
     }
 
+    /// Re-arm the birth retry for every observed file of one voided
+    /// image, so its next continued observation offers one more birth
+    /// for a reseed. Unknown and retired images re-arm nothing.
+    /// Returns how many keys re-armed.
+    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> usize {
+        let key = ImageKey::from(image);
+        if self.image_retired(key) {
+            return 0;
+        }
+        let files: Vec<u32> = self
+            .observed
+            .keys()
+            .filter_map(|(owner, file)| (*owner == key).then_some(*file))
+            .collect();
+        let mut rearmed = 0;
+        for file in files {
+            self.arm_birth_retry((key, file));
+            if self.birth_retry.contains_key(&(key, file)) {
+                rearmed += 1;
+            }
+        }
+        rearmed
+    }
+
     /// Arm the birth retry for a key just sighted `New`. A mint is
     /// always a new incarnation, so an existing entry restarts fresh:
     /// a dead incarnation's first call never spends the new one's

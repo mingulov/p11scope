@@ -1798,6 +1798,14 @@ impl SemanticCapture {
         self.router.evict_for_birth_reoffer(image, file)
     }
 
+    /// Re-arm the birth retry for every observed file of one voided
+    /// image, so its next continued observation offers one more birth
+    /// for a reseed. Only the Joint machine calls this, for the
+    /// coordinator's reseed queue. Returns how many keys re-armed.
+    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> usize {
+        self.router.rearm_image_for_reseed(image)
+    }
+
     /// Count coordinator admissions that found no binding for their
     /// image (diagnostic-only funnel beside the mark counts).
     pub(crate) fn note_admission_binding_misses_for(&mut self, misses: u64) {
@@ -2216,16 +2224,22 @@ impl SemanticCapture {
             Ok(receipt) => receipt,
             Err(crate::semantics_objects::journal::BirthRefusal::NoveltyBroken)
                 if birth == BirthKind::ExecMarker
-                    && adapter.shed_taint_lifted((image.task_cookie, image.exec_id)) =>
+                    && (adapter.shed_taint_lifted((image.task_cookie, image.exec_id))
+                        || adapter.novelty_broken_reseed_eligible((
+                            image.task_cookie,
+                            image.exec_id,
+                        ))) =>
             {
-                // Shed-then-bind (browser-bootstrap): a fresh exec whose
-                // READY marker verified above, but whose pre-bind sheds
-                // were sighted below the cut, can never exec-birth. Its
-                // shed-taint lifted on timely binding, so it births as
-                // attach-observed at the same cut instead; pre-cut
-                // history stays first-observed / not attributed. Only
-                // lifted images fall back; voids, absences and
-                // contradiction taints keep refusing.
+                // Shed-then-bind (browser-bootstrap) or void reseed: a
+                // fresh exec whose READY marker verified above, but whose
+                // pre-cut history was sighted below the cut, can never
+                // exec-birth. Its shed-taint lifted on timely binding, or
+                // its pre-cut history is fenced clean after a void, so it
+                // births as attach-observed at the same cut instead;
+                // pre-cut history stays first-observed / not attributed.
+                // Only lifted or fenced-clean images fall back; unfenced
+                // sheds without a lift, absences and contradiction taints
+                // keep refusing.
                 let fallback =
                     crate::semantics_objects::journal::SessionBirthGrant::issue(ValidatedH0Birth {
                         proof: *proof,

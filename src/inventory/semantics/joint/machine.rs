@@ -4017,6 +4017,15 @@ impl LiveJointMachine {
                         coordinator.disclose_birth_reoffer_exhausted(reoffer);
                     }
                 }
+                // Reseed births for voided feeds: re-arm each queued
+                // image's router retry so its next continued
+                // observation offers one more birth at/above the fence.
+                // Images the lane cannot re-arm (unknown, retired, or
+                // a shell lane with no capture) stay S1Only with
+                // their deferred gap already disclosed.
+                for image in coordinator.drain_joint_reseed_queue() {
+                    lane.rearm_image_for_reseed(image);
+                }
                 (
                     Phase::Staging {
                         original,

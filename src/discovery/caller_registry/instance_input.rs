@@ -263,11 +263,13 @@ impl JointRegistrationPlan<'_> {
         // Any other row that fits nowhere and can no longer
         // upgrade refuses Capacity here: an unheld row past the
         // table limit is genuine capacity pressure, while an
-        // S1Only-held drained row (a call already returned
-        // through it, a trip, a degraded feed) could never
-        // consume the grant its late birth would reserve — its
-        // birth defers for a bounded re-offer instead.
-        if !fits && !self.registry.joint_upgrade_eligible(&input.key) {
+        // S1Only-held drained row that can neither upgrade nor reseed
+        // could never consume the grant its late birth would reserve —
+        // its birth defers for a bounded re-offer instead.
+        if !fits
+            && !self.registry.joint_upgrade_eligible(&input.key)
+            && !self.registry.joint_reseed_eligible(&input.key)
+        {
             // Latch genuine capacity walls only: a held row refuses
             // for drain state (it needs no slot), so it must not
             // occupy the first-arm diagnostic slot and mask a later
@@ -373,10 +375,12 @@ impl JointReceiptReservation<'_> {
         // The exclusive borrow prevents registration/removal while native I/O
         // runs, but keep these actual state checks at the final mutation too.
         // An untouched registered key still accepts its first call's
-        // grant (the drain selects Joint in place); every other
-        // re-install refuses.
+        // grant (the drain selects Joint in place), and a voided key
+        // accepts a fresh grant (the drain reseeds Joint in place);
+        // every other re-install refuses.
         if self.registry.instance_state.by_key.contains_key(&input.key)
             && !self.registry.joint_upgrade_eligible(&input.key)
+            && !self.registry.joint_reseed_eligible(&input.key)
         {
             return Err((self, JointReceiptInstallRefusal::AlreadySelected));
         }
@@ -2123,6 +2127,45 @@ impl CallerRegistry {
         semantics.feed.upgrade_block().map(Into::into)
     }
 
+    /// Whether a later birth's grant may reseed Joint for an
+    /// already-registered key whose feed ended a segment: the record is
+    /// an observed, non-exhausted, bound instance with no blocking
+    /// negative, and its feed is a degraded S1Only feed holding its old
+    /// receipt with drained staging and no watchdog trip. Unlike
+    /// upgrade, reseed allows calls before the birth: the closed
+    /// segment's loss stays counted, and the fresh receipt (same
+    /// incarnation, strictly newer cut, at/above the recorded fence)
+    /// starts a new Joint segment.
+    fn joint_reseed_eligible(&self, key: &InstanceKey) -> bool {
+        let Some(id) = self.instance_state.by_key.get(key).copied() else {
+            return false;
+        };
+        let Some(record) = self.instance_state.records.get(&id) else {
+            return false;
+        };
+        if record.state != InstanceLifecycle::Observed {
+            return false;
+        }
+        if self.retired.contains_key(&record.caller) {
+            return false;
+        }
+        let Some(semantics) = self.instance_state.semantics.get(&id) else {
+            return false;
+        };
+        if semantics.authority_exhausted {
+            return false;
+        }
+        for negative in &self.instance_state.negatives {
+            if !negative.matches(key, semantics.module) {
+                continue;
+            }
+            if negative.authority_exhausted || negative.retirement.is_some() {
+                return false;
+            }
+        }
+        semantics.feed.reseed_eligible()
+    }
+
     fn reserve_joint_receipt_at(
         &mut self,
         input: &AdmittedInstanceCall,
@@ -2134,6 +2177,7 @@ impl CallerRegistry {
             .ok_or(JointReceiptInstallRefusal::SubjectMismatch)?;
         if self.instance_state.by_key.contains_key(&input.key)
             && !self.joint_upgrade_eligible(&input.key)
+            && !self.joint_reseed_eligible(&input.key)
         {
             return Err(JointReceiptInstallRefusal::AlreadySelected);
         }
@@ -2151,9 +2195,10 @@ impl CallerRegistry {
             self.latch_birth_capacity("reserve_identity");
             return Err(JointReceiptInstallRefusal::Capacity);
         }
-        // A registered untouched row already holds its record slot.
+        // A registered untouched or voided row already holds its record slot.
         if self.instance_state.records.len() >= self.instance_state.limit
             && !self.joint_upgrade_eligible(&input.key)
+            && !self.joint_reseed_eligible(&input.key)
         {
             self.latch_birth_capacity("reserve_records");
             return Err(JointReceiptInstallRefusal::Capacity);
@@ -2345,6 +2390,13 @@ impl CallerRegistry {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn joint_feeds(&self) -> usize {
         self.joint_feeds
+    }
+
+    /// Take queued reseed images for fresh births, clearing the queue.
+    /// The Joint machine drains this after births to re-arm their
+    /// router retries.
+    pub(crate) fn drain_joint_reseed_queue(&mut self) -> Vec<p11scope_ebpf_common::ImageIdentity> {
+        std::mem::take(&mut self.joint_reseed_queue)
     }
 
     /// Latch the lane's journal linkage from its drain producers. The
@@ -2713,6 +2765,14 @@ impl CallerRegistry {
                 // carries a cause, so the section's `authority_lost` or
                 // `proof_refused_fallback` never stands without one.
                 self.record_gap(joint_ended_gap(caller, joint_seal_reason(gap, class)));
+                // A fenced void ending this feed queues one reseed birth
+                // for its image; unfenced endings resume without one.
+                if batch.audited().fence().is_some() {
+                    let image = self.instance_state.records[&id].key.image;
+                    if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
+                        self.joint_reseed_queue.push(image);
+                    }
+                }
             }
             if !was_joint && matches!(&outcome, FailureBatchProgress::NegativeDelivered(_)) {
                 // A negative-only history still publishes the canonical
@@ -2761,6 +2821,21 @@ impl CallerRegistry {
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(refused);
         self.after_joint_delivery(id, was_joint, model);
+        // Test-only mirror of the production reseed queue: a fenced
+        // void ending this feed queues one reseed birth for its image.
+        if was_joint
+            && matches!(
+                outcome,
+                crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+                    | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+            )
+            && failure.fence.is_some()
+        {
+            let image = self.instance_state.records[&id].key.image;
+            if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
+                self.joint_reseed_queue.push(image);
+            }
+        }
         outcome
     }
 
@@ -3078,6 +3153,33 @@ impl CallerRegistry {
                     {
                         self.joint_feeds = self.joint_feeds.saturating_add(1);
                         self.joint_accounting = true;
+                    } else if self.joint_reseed_eligible(&input.key) {
+                        // A voided feed reseeds onto the fresh receipt.
+                        if self
+                            .instance_state
+                            .semantics
+                            .get_mut(&id)
+                            .expect("retained edge")
+                            .feed
+                            .reselect_joint(&grant.receipt)
+                        {
+                            self.joint_feeds = self.joint_feeds.saturating_add(1);
+                            self.joint_accounting = true;
+                        } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only
+                        {
+                            // The fresh receipt names another incarnation,
+                            // a below-fence cut, or no progress: it cannot
+                            // reseed this feed, so name the mismatch.
+                            self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                                caller: Some(input.caller),
+                                module: Some(module),
+                                pid: None,
+                                subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                                    .into(),
+                                reason: "joint_birth_original_mismatch".into(),
+                                budget: None,
+                            });
+                        }
                     } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only {
                         // The validated birth cannot select Joint: the
                         // feed keeps S1Only, and the refused birth is

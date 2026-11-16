@@ -568,6 +568,66 @@ impl JointStaging {
         true
     }
 
+    /// Whether this degraded feed may reseed onto a fresh receipt: it
+    /// ended a Joint segment (fallback or loss, fenced or not), still
+    /// holds its old receipt, drained its staging, and never tripped
+    /// the watchdog. The fresh receipt itself (same incarnation, cut
+    /// above the old cut and at/above the recorded fence) is checked
+    /// at [`Self::reselect_joint`]; this gate needs no receipt.
+    pub(crate) fn reseed_eligible(&self) -> bool {
+        self.mode == FeedMode::S1Only
+            && self.selected_receipt.is_some()
+            && self.degraded_window.is_some()
+            && self.staged.is_empty()
+            && !self.watchdog_tripped
+    }
+
+    /// Reseed a voided feed onto a fresh birth receipt at or above its
+    /// recorded fence (Task 3 re-selection): the old below-fence receipt
+    /// never resumes, but a fresh receipt for the same incarnation with
+    /// a strictly newer cut starts a new Joint segment. Only a feed that
+    /// ended a segment (fallback or loss), drained its staging, and never
+    /// tripped may reseed — and never onto another incarnation's receipt
+    /// (wrong-key), a cut at/below the old cut (no progress), or a cut
+    /// below the recorded fence (would certify voided history). A clean
+    /// reseed clears the loss/fallback latches and baselines disposed
+    /// history like [`Self::resume_joint`]: the closed segment stays
+    /// counted, new disposal latches again. Returns whether the mode
+    /// changed.
+    pub(crate) fn reselect_joint(
+        &mut self,
+        receipt: &crate::semantics_objects::journal::BootstrapReceipt,
+    ) -> bool {
+        let Some(old) = self.selected_receipt.as_ref() else {
+            return false;
+        };
+        if !self.reseed_eligible() {
+            return false;
+        }
+        if receipt.domain() != old.domain() {
+            return false;
+        }
+        if receipt.birth_cut() <= old.birth_cut() {
+            return false;
+        }
+        if self
+            .segment_fence
+            .is_some_and(|fence| receipt.birth_cut() < fence)
+        {
+            return false;
+        }
+        self.mode = FeedMode::Joint;
+        self.selected_receipt = Some(*receipt);
+        self.segment_resumable = false;
+        self.segment_fence = None;
+        self.resume_deferral_disclosed = None;
+        self.degraded_window = None;
+        self.degraded_loss = false;
+        self.fell_back = false;
+        self.history_disposed_baseline = self.history_disposed;
+        true
+    }
+
     /// Calls replayed through the one reducer (seal or fallback).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reduced(&self) -> u64 {

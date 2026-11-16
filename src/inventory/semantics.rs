@@ -2280,6 +2280,17 @@ impl AttestedSemanticLane {
             .is_some_and(|live| live.capture.reoffer_birth_for(image, file))
     }
 
+    /// Re-arm the birth retry for every observed file of one voided
+    /// image on the live capture's router. Only the Joint machine
+    /// calls this, for the coordinator's reseed queue. A shell lane
+    /// has no capture and re-arms nothing. Returns how many keys
+    /// re-armed.
+    pub(crate) fn rearm_image_for_reseed(&mut self, image: ImageIdentity) -> usize {
+        self.live
+            .as_mut()
+            .map_or(0, |live| live.capture.rearm_image_for_reseed(image))
+    }
+
     /// Count coordinator admissions that found no binding for their
     /// image. A shell lane stages without a capture and notes
     /// nothing.

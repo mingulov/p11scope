@@ -5051,8 +5051,9 @@ pub(crate) fn startup_exclude_conflict(
 
 /// Why `/proc/<pid>/mem` could not be opened, and whether that is a published
 /// discovery loss. `ESRCH` is proof the process ended — the ordinary end of a
-/// process, already recorded by `scan_unavailable`, and nothing a capture that
-/// keeps running can still read. It would otherwise publish one undeduplicable
+/// process, dropped silently like a pid that exited before discovery (the
+/// exit ledger counts the generation), and nothing a capture that keeps
+/// running can still read. It would otherwise publish one undeduplicable
 /// record per finished subprocess, the pid in both the subject and the message,
 /// on every `--cgroup` capture of a workload that forks per unit of work. Every
 /// refusal — ptrace, Yama, anything unreadable — is a real loss and stays loud.
@@ -5931,6 +5932,30 @@ fn mem_open_exited(pid: u32, error: &std::io::Error) -> bool {
         return true;
     }
     crate::process::generation_dead(pid)
+}
+
+/// Whether a failed `/proc/<pid>/mem` open proves the whole original
+/// process exited, so the scan takes the exited error path instead of
+/// latching a global `scan_unavailable`. `ESRCH`/`ENOENT` prove the
+/// opened task was gone at open time; anything else is proven from
+/// the view's pin first (`original_exited` is pidfd-backed
+/// whole-group authority: a dead leader with live members reads
+/// `false`, keeping the live group's refusal loud). Only a fallback
+/// pin without a pidfd — which cannot see zombies through its
+/// start-time comparison — falls back to the fresh leader read,
+/// leaving the dead-leader-live-member residual for that pin shape.
+/// Fail-closed: any unproven shape keeps its loud refusal.
+fn mem_open_exited_for_view(view: &ProcessView, pid: u32, error: &std::io::Error) -> bool {
+    if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+        return true;
+    }
+    if view.original_exited() == Ok(true) {
+        return true;
+    }
+    if view.retained_pin().pidfd().is_err() {
+        return mem_open_exited(pid, error);
+    }
+    false
 }
 
 fn capture_scan_reason(reason: &str) -> bool {
@@ -7662,17 +7687,18 @@ fn scan_view_examined_mode(
                 )));
             }
         };
-        // A mem open that proves the process is gone takes the exited
-        // error path (the engine drops the view silently, like a pid that
-        // exited before discovery) instead of latching a global
-        // `scan_unavailable`: the ordinary end of a process is already
-        // counted via the exit ledger (descendant gaps), never a
-        // memory-unreadable loss. A short-lived child exiting mid-scan —
-        // reaped (`ENOENT`), zombie (`ESRCH`), or churning through the
-        // cold-filesystem exit states — must not fail a never-mapped
-        // cell, while a live pid's refusal stays loud.
+        // A mem open that proves the whole original process exited
+        // takes the exited error path (the engine drops the view
+        // silently, like a pid that exited before discovery) instead of
+        // latching a global `scan_unavailable`: the ordinary end of a
+        // process is already counted via the exit ledger (descendant
+        // gaps), never a memory-unreadable loss. A short-lived child
+        // exiting mid-scan — reaped (`ENOENT`), zombie (`ESRCH`), or
+        // churning through the cold-filesystem exit states — must not
+        // fail a never-mapped cell, while a live group's refusal stays
+        // loud (the pin proves the group, never just its leader).
         if let Err(error) = &mem
-            && mem_open_exited(pid, error)
+            && mem_open_exited_for_view(view, pid, error)
         {
             return Err(exited_before_discovery(pid));
         }
@@ -11279,12 +11305,13 @@ mod tests {
     }
 
     /// Task 9.2-fix5 item A. A process that has already exited cannot have its
-    /// memory read and cannot read any more of anyone else's: `scan_unavailable`
-    /// records it, and a published skip would carry the pid in both its subject
-    /// and its message, so a `--cgroup` capture of pkcs11-check's
-    /// `--isolation file` shape published one undeduplicable public loss per
-    /// finished subprocess. A refusal is a different thing entirely and stays
-    /// loud.
+    /// memory read and cannot read any more of anyone else's: the scan drops
+    /// it silently like a pid that exited before discovery (the exit ledger
+    /// counts the generation), and a published skip would carry the pid in
+    /// both its subject and its message, so a `--cgroup` capture of
+    /// pkcs11-check's `--isolation file` shape published one undeduplicable
+    /// public loss per finished subprocess. A refusal is a different thing
+    /// entirely and stays loud.
     #[test]
     fn only_a_refusal_to_read_target_memory_is_a_published_loss() {
         use std::io::Error;
@@ -11444,8 +11471,7 @@ mod tests {
             &mut CaptureWorkBudget::default(),
             &mut io,
         );
-        let outcome =
-            result.expect("EACCES mem on a live group must stay loud, not take Err");
+        let outcome = result.expect("EACCES mem on a live group must stay loud, not take Err");
         assert_eq!(
             outcome.unavailable_reason(),
             Some("ptrace"),

@@ -3035,6 +3035,113 @@ mod tests {
     }
 
     #[test]
+    fn joint_resource_tainted_cross_quantum_terminal_grants_nothing_without_refusal() {
+        // KEYROWS-CHURN R2: a tainted image's BEGIN is refused at ingest
+        // and never opens; when its cross-quantum END arrives (a
+        // short-lived process's exit terminal), collection grants no
+        // resource but must NOT refuse. Refusing voids the whole
+        // collection (ResourceUnavailable) for image-local noise the
+        // journal already disposes as expected-absent — under exit
+        // churn this voids every pass and no birth ever seals.
+        use crate::semantics_objects::journal::tests::{
+            COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes_absent, function_id,
+        };
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0xf103);
+        let retained = producers(&events);
+        let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+        let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        adapter.refuse_other_caller_image((COOKIE, EXEC));
+        assert!(adapter.image_refused((COOKIE, EXEC)));
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec()], 1),
+            events.clone(),
+        );
+        let first = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &SteadyFault(Cell::new(None)),
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(!first.resource_refused);
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([end.to_vec()], 1), events);
+        let second = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &SteadyFault(Cell::new(None)),
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(
+            !second.resource_refused,
+            "a tainted image's terminal must not void the collection"
+        );
+        assert_eq!(second.ordinary.len(), 1);
+        assert!(second.ordinary[0].joint_resource.is_none());
+    }
+
+    #[test]
+    fn joint_resource_tainted_cross_quantum_abandon_grants_nothing_without_refusal() {
+        // Sibling site of the tainted-END twin: a tainted image's
+        // cross-quantum ABANDON (a short-lived process's exit abandon)
+        // grants no resource but must NOT refuse either.
+        use crate::semantics_objects::journal::tests::{
+            COOKIE, EXEC, abandon_bytes, begin_bytes, function_id,
+        };
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0xf103);
+        let retained = producers(&events);
+        let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        adapter.refuse_other_caller_image((COOKIE, EXEC));
+        assert!(adapter.image_refused((COOKIE, EXEC)));
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec()], 1),
+            events.clone(),
+        );
+        let first = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &SteadyFault(Cell::new(None)),
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(!first.resource_refused);
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([abandon.to_vec()], 1), events);
+        let second = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &SteadyFault(Cell::new(None)),
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(
+            !second.resource_refused,
+            "a tainted image's abandon must not void the collection"
+        );
+    }
+
+    #[test]
     fn joint_resource_foreign_session_events_and_ledger_refuse_before_mutation() {
         use crate::semantics_objects::journal::tests::{
             ENTRY_NS, begin_bytes, end_bytes_absent, function_id,

@@ -2281,6 +2281,9 @@ _DETAILED_BASE_MAPS = {
         "STACK_GUARD": (3, 4, 4, 1),
         # Task 3 Stage A continuity witness (native instance_epoch.c).
         "WATCHED_FILES": (1, 16, 4, 1_024, 128),
+        # In-place count-only downgrade (A′): one narrowing-only switch
+        # cell per slot, flags 0, never frozen; resized with STATS.
+        "SLOT_COUNT_ONLY": (2, 4, 4, 512),
         "SLOT_FILE": (2, 4, 4, 512, 128),
         "PROC_EPOCH": (29, 4, 152, 0, 1),
         "G_EPOCH": (2, 4, 8, 1_024),
@@ -2323,6 +2326,7 @@ GATE_MAPS = SAFE_MAPS | {
 WIDE_MAPS = _DETAILED_BASE_MAPS | {
     "STATS": map_def(6, 4, 296, 2_112),
     "RV_COUNTS": map_def(5, 16, 8, 8_192),
+    "SLOT_COUNT_ONLY": map_def(2, 4, 4, 2_112),
     "SLOT_FILE": map_def(2, 4, 4, 2_112, 128),
 }
 # The wide release object: wide slot capacities plus the birth-marker
@@ -2423,6 +2427,7 @@ INVENTORY_FORBIDDEN_MAPS = {
     "OBJECT_START", "OBJECT_DESCRIPTORS", "OBJECT_ZERO",
     "SELECTED_DETAIL", "SELECTED_DSTATE", "SELECTED_BCTL",
     "INV_BASELINE_RQ", "INV_BASELINE_CT",
+    "SLOT_COUNT_ONLY",
 }
 INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "ENDPOINT_OBJECT": map_def(2, 4, 8, 1, 128),
@@ -2598,6 +2603,10 @@ def self_test():
     assert "PID_START_TICK" in INVENTORY_FORBIDDEN_MAPS
     assert SAFE_MAPS["OBJECT_DESCRIPTORS"] == map_def(2, 4, 16, 105, 128)
     assert SAFE_MAPS["OBJECT_ZERO"] == map_def(2, 4, 432, 1, 128)
+    assert SAFE_MAPS["SLOT_COUNT_ONLY"] == map_def(2, 4, 4, 512)
+    assert WIDE_MAPS["SLOT_COUNT_ONLY"] == map_def(2, 4, 4, 2_112)
+    assert JOURNAL_WIDE_MAPS["SLOT_COUNT_ONLY"] == map_def(2, 4, 4, 2_112)
+    assert "SLOT_COUNT_ONLY" in INVENTORY_FORBIDDEN_MAPS
     assert INVENTORY_MAPS["STACK_GUARD"] == SAFE_MAPS["STACK_GUARD"]
     assert UNSAFE_MAPS["PAIR_CALLS"] == map_def(3, 4, 4, 1)
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
@@ -2607,19 +2616,19 @@ def self_test():
     assert JOURNAL_MAPS["JOURNAL_CTL"] == map_def(2, 4, 24, 1, 0)
     assert JOURNAL_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)
     assert JOURNAL_MAPS["JOURNAL_CLASSES"] == map_def(2, 4, 4, 105, 128)
-    assert len(SAFE_MAPS) == 45
-    assert len(UNSAFE_MAPS) == 45
-    assert len(WIDE_MAPS) == 43
-    assert len(WIDE_MARKER_MAPS) == 45
+    assert len(SAFE_MAPS) == 46
+    assert len(UNSAFE_MAPS) == 46
+    assert len(WIDE_MAPS) == 44
+    assert len(WIDE_MARKER_MAPS) == 46
     assert WIDE_MARKER_MAPS["JOURNAL_MARKER_CTL"] == SAFE_MAPS["JOURNAL_MARKER_CTL"]
-    assert len(WIDE_UNSAFE_MAPS) == 45
-    assert len(JOURNAL_MAPS) == 48
+    assert len(WIDE_UNSAFE_MAPS) == 46
+    assert len(JOURNAL_MAPS) == 49
     assert JOURNAL_WIDE_MAPS["STATS"] == map_def(6, 4, 296, 2_112)
     assert JOURNAL_WIDE_MAPS["RV_COUNTS"] == map_def(5, 16, 8, 8_192)
     assert JOURNAL_WIDE_MAPS["SLOT_FILE"] == map_def(2, 4, 4, 2_112, 128)
     assert JOURNAL_WIDE_MAPS["JOURNAL_MARKER_CTL"] == JOURNAL_MAPS["JOURNAL_MARKER_CTL"]
     assert JOURNAL_WIDE_MAPS["PID_START_TICK"] == SAFE_MAPS["PID_FILTER"]
-    assert len(JOURNAL_WIDE_MAPS) == 48
+    assert len(JOURNAL_WIDE_MAPS) == 49
     assert len(SAFE_PROGRAMS) == 22
     assert len(UNSAFE_PROGRAMS) == 27
     assert len(JOURNAL_PROGRAMS) == 22
@@ -2697,6 +2706,7 @@ def self_test():
         validate_policy_inventory, good, diagnostic, "wide", "wide-diagnostic"
     ) == [
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "SLOT_COUNT_ONLY.max_entries: object=512 frozen=2112",
         "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
     ]
@@ -2704,6 +2714,7 @@ def self_test():
         validate_policy_inventory, wide, wide_diagnostic, "default", "diagnostic"
     ) == [
         "RV_COUNTS.max_entries: object=8192 frozen=4096",
+        "SLOT_COUNT_ONLY.max_entries: object=2112 frozen=512",
         "SLOT_FILE.max_entries: object=2112 frozen=512",
         "STATS.max_entries: object=2112 frozen=512",
     ]
@@ -2726,11 +2737,13 @@ def self_test():
         "map added: JOURNAL_MARKER_CTL",
         "map added: PID_START_TICK",
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "SLOT_COUNT_ONLY.max_entries: object=512 frozen=2112",
         "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
     ]
     assert rejected(validate_inventory, "wide", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "SLOT_COUNT_ONLY.max_entries: object=512 frozen=2112",
         "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
     ]
@@ -2795,12 +2808,14 @@ def self_test():
     assert rejected(validate_inventory, "journal-wide", JOURNAL_MAPS, JOURNAL_PROGRAMS,
                     {"p11_entry_journal"}) == [
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "SLOT_COUNT_ONLY.max_entries: object=512 frozen=2112",
         "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
     ]
     assert rejected(validate_inventory, "journal", JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS,
                     {"p11_entry_journal"}) == [
         "RV_COUNTS.max_entries: object=8192 frozen=4096",
+        "SLOT_COUNT_ONLY.max_entries: object=2112 frozen=512",
         "SLOT_FILE.max_entries: object=2112 frozen=512",
         "STATS.max_entries: object=2112 frozen=512",
     ]

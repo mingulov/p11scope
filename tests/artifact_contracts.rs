@@ -6395,17 +6395,20 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // The ring cross-check adds the PRODUCED submitted-counter map to
     // every object, so every count below is one above its pre-ringcheck
     // value; the gate count also repairs its birth off-by-one (the
-    // comment always said default plus five, the tuple said 48).
+    // comment always said default plus five, the tuple said 48). The
+    // in-place downgrade adds the SLOT_COUNT_ONLY switch map to every
+    // Detailed/journal object, so every count below is one above its
+    // pre-switch value.
     let (maps, programs) = if gate {
-        (50, 22)
+        (51, 22)
     } else if unsafe_build {
-        (45, 27)
+        (46, 27)
     } else if wide {
-        if marker { (45, 22) } else { (43, 22) }
+        if marker { (46, 22) } else { (44, 22) }
     } else if marker {
-        (45, 22)
+        (46, 22)
     } else {
-        (43, 22)
+        (44, 22)
     };
     let report = run_ok(
         "python3",

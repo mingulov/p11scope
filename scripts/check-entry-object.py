@@ -123,6 +123,15 @@ def narrow(fact, width):
         return fact
     if fact[0] == "list_flags" and width == 8:
         return fact
+    # In-place downgrade (A′): the switch-gated selector narrows by
+    # value (a 0/1 bool survives every width); the raw switch flag is
+    # only meaningful at 32 bits and up (a byte-narrowed flag would
+    # mis-test nonzero cells).
+    if fact[0] == "switch_gated":
+        mask = (1 << width) - 1
+        return ("switch_gated", fact[1] & mask, fact[2] & mask)
+    if fact[0] == "switch_flag" and width >= 32:
+        return fact
     if width == 64 or fact[0] in ("field", "object_field"):
         return fact
     if width == 32:
@@ -3230,6 +3239,205 @@ def operation_contract(consumer, facts, variant, internal_blocks):
     require(maps == expected_maps, name+f": distinct map operation inventory differs: {maps}")
     require(len(keys) == 1 and len(values) == int("begin" in expected_owner), name+": START operation key/seed wiring differs")
     return records
+
+
+class _SwitchConsumer(Consumer):
+    """Must-facts plus the count-only switch state (in-place downgrade A′).
+
+    A set SLOT_COUNT_ONLY cell narrows the call to descriptor 0 although
+    the link cookie still names the downgraded semantic descriptor. The
+    DESCRIPTORS lookups stay keyed by the cookie high word (the existing
+    cookie-key proof covers them); this pass proves they sit on the
+    switch-unset side only: every lookup must carry ("switch", "unset")
+    in the joined must-facts, which holds exactly when no switch-set
+    path reaches it. The set arm's COUNT_ONLY content is reviewed and
+    runtime-tested, not proved here.
+    """
+
+    def __init__(self, section, name, lines, calls, switch_pcs, identity):
+        super().__init__(section, name, lines, calls)
+        self.switch_pcs = switch_pcs
+        self.switch_identity = identity
+        self.flag_branches = {}
+
+    def transfer(self, pc, incoming):
+        state = super().transfer(pc, incoming)
+        if match := LOAD.fullmatch(self.text[pc]):
+            dst, width, base, sign, offset = match.groups()
+            raw = incoming.get("r" + base)
+            if (width == "32" and sign == "+" and offset == "0" and raw
+                    and raw[0] == "result" and raw[1] in self.switch_pcs):
+                state[reg(dst)] = ("switch_flag", self.switch_identity)
+            return state
+        # Bitwise/arithmetic folding over a gated selector distributes
+        # over its set/unset values. The raw flag never folds (a masked
+        # flag would mis-test nonzero cells); only ==/!= 0 refines it.
+        if match := re.fullmatch(
+                r"([rw]\d+) (\+=|<<=|>>=|&=|\|=|\^=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?",
+                self.text[pc]):
+            dst, op, src = match.groups()
+            old, amount = incoming.get(reg(dst)), value(incoming, src)
+            if (old and old[0] == "switch_gated" and amount and amount[0] == "constant"):
+                width = 32 if dst.startswith("w") else 64
+                mask = (1 << width) - 1
+                count = amount[1] & 63 if op in ("<<=", ">>=") else amount[1]
+                if op == "+=":
+                    folded = ((old[1] + count) & mask, (old[2] + count) & mask)
+                elif op == "<<=":
+                    folded = ((old[1] << count) & mask, (old[2] << count) & mask)
+                elif op == ">>=":
+                    folded = ((old[1] % (1 << width)) >> count, (old[2] % (1 << width)) >> count)
+                elif op == "&=":
+                    folded = (old[1] & count, old[2] & count)
+                elif op == "|=":
+                    folded = (old[1] | count, old[2] | count)
+                else:
+                    folded = (old[1] ^ count, old[2] ^ count)
+                state[reg(dst)] = ("switch_gated", folded[0] & mask, folded[1] & mask)
+        return state
+
+    @staticmethod
+    def merge_facts(previous, state):
+        merged = Consumer.merge_facts(previous, state)
+        if previous is None:
+            return merged
+        for key in previous.keys() & state.keys():
+            if key == ("switch",):
+                continue
+            kept = _SwitchConsumer._correlate(
+                previous[key], previous.get(("switch",)),
+                state[key], state.get(("switch",)))
+            if kept is not None:
+                merged[key] = kept
+        # The fixpoint re-delivers refined edges after the accumulated
+        # state already spans both sides: a gated selector grown from
+        # an earlier arrival must survive a re-arriving edge that has
+        # not learned it yet (single-predecessor re-visits), and a
+        # gated selector on a re-arriving edge must land even when the
+        # accumulated state learned it from another edge first. A
+        # conflicting present fact still kills it through _correlate.
+        for key, fact in state.items():
+            if (key not in previous and key != ("switch",)
+                    and isinstance(fact, tuple) and fact and fact[0] == "switch_gated"):
+                merged[key] = fact
+        for key, fact in previous.items():
+            if (key not in state and key != ("switch",)
+                    and isinstance(fact, tuple) and fact and fact[0] == "switch_gated"):
+                merged[key] = fact
+        return merged
+
+    @staticmethod
+    def _correlate(first, first_side, second, second_side):
+        """Keep or build a switch-gated selector across one join.
+
+        A gated selector means "this value on set paths, that value on
+        unset paths". Two constants from opposite switch sides build
+        one; a gated selector meeting a re-arriving constant keeps its
+        correlation when the constant agrees with that side's value
+        (the fixpoint re-delivers refined edges after the accumulated
+        state already spans both sides, so without this the second
+        arrival would kill the correlation). Anything else returns
+        None and the joined fact stands. A gate that no longer
+        discriminates collapses to its constant.
+        """
+        consts = [fact for fact in (first, second)
+                  if isinstance(fact, tuple) and fact and fact[0] == "constant"]
+        gated = [fact for fact in (first, second)
+                 if isinstance(fact, tuple) and fact and fact[0] == "switch_gated"]
+        if len(consts) == 2 and len(gated) == 0:
+            sides = {first_side, second_side}
+            if sides != {("switch", "set"), ("switch", "unset")}:
+                return None
+            values = dict(((first_side, first[1]), (second_side, second[1])))
+            if values[("switch", "set")] == values[("switch", "unset")]:
+                return None
+            return ("switch_gated", values[("switch", "set")], values[("switch", "unset")])
+        if len(gated) == 1 and len(consts) == 1:
+            gate = gated[0]
+            const, side = (first, first_side) if consts[0] is first else (second, second_side)
+            if side == ("switch", "set") and const[1] == gate[1]:
+                return gate
+            if side == ("switch", "unset") and const[1] == gate[2]:
+                return gate
+            if side is None and const[1] in (gate[1], gate[2]):
+                return gate
+            return None
+        return None
+
+    def flow_edges(self, pc, before, after):
+        branch = BRANCH.fullmatch(self.text[pc])
+        if not branch:
+            yield from super().flow_edges(pc, before, after)
+            return
+        left, op, right = value(before, branch[1]), branch[2], value(before, branch[3])
+        taken = D.relative_target(pc, self.text[pc])
+        for successor in self.graph[pc]:
+            state = after.copy()
+            self._refine_switch(state, pc, branch, left, op, right, successor == taken)
+            yield (successor, state)
+
+    def _refine_switch(self, state, pc, branch, left, op, right, is_taken):
+        def set_edge(is_set):
+            state[("switch",)] = ("switch", "set" if is_set else "unset")
+
+        if left and left[0] == "result" and left[1] in self.switch_pcs and right == ("constant", 0):
+            # A failed switch lookup reads as unset (fail open).
+            if op == "==" and is_taken or op == "!=" and not is_taken:
+                set_edge(False)
+            return
+        if left and left[0] == "switch_flag" and right == ("constant", 0) and op in ("==", "!="):
+            is_set = (op == "!=") == is_taken
+            target = D.relative_target(pc, self.text[pc])
+            fall = next(s for s in self.graph[pc] if s != target)
+            self.flag_branches[pc] = (target, fall) if op == "!=" else (fall, target)
+            set_edge(is_set)
+            return
+        if (left and left[0] == "switch_gated" and right and right[0] == "constant"
+                and op in ("==", "!=")):
+            width = 32 if branch[1].startswith("w") else 64
+            sat_set = compare(left[1], op, right[1], width)
+            sat_unset = compare(left[2], op, right[1], width)
+            if sat_set and not sat_unset:
+                set_edge(is_taken)
+            elif sat_unset and not sat_set:
+                set_edge(not is_taken)
+            return
+
+
+def descriptor_source_contract(consumer, variant, blocks, initial=None, outlined=False):
+    """Prove the switch-gated descriptor source of one consumer.
+
+    Every DESCRIPTORS lookup must be keyed by the cookie high word on
+    the switch-unset side only: the joined must-facts at the lookup
+    must carry ("switch", "unset"), which a switch-set path reaching
+    the lookup would kill. Returns the switch inventory the tests pin.
+    """
+    facts0 = consumer.facts(initial)
+    identity = getattr(consumer, "identity", (consumer.section, consumer.name))
+    switches = [pc for pc, text in consumer.insns
+                if pc in consumer.helper and text == "call 0x1"
+                and facts0.get(pc, {}).get("r1") == ("map", "SLOT_COUNT_ONLY")]
+    require(switches, consumer.name + ": descriptor source requires a SLOT_COUNT_ONLY read")
+    for pc in switches:
+        state = facts0.get(pc, {})
+        require(stack_read(state, state.get("r2"), 4) == ("low", identity),
+                consumer.label(pc) + ": SLOT_COUNT_ONLY cookie key")
+    prog = _SwitchConsumer(consumer.section, consumer.name, consumer.lines, consumer.calls,
+                           set(switches), identity)
+    facts = prog.facts(initial)
+    lookups = [pc for pc, text in consumer.insns
+               if pc in consumer.helper and text == "call 0x1"
+               and facts0.get(pc, {}).get("r1") == ("map", "DESCRIPTORS")]
+    require(lookups, consumer.name + ": descriptor source requires a DESCRIPTORS read")
+    for pc in lookups:
+        require(facts.get(pc, {}).get(("switch",)) == ("switch", "unset"),
+                consumer.label(pc) + ": descriptor source joins the count-only arm")
+    exits = {pc for pc, text in consumer.insns if text == "exit"}
+    live_set = [pc for pc, (set_target, _) in prog.flag_branches.items()
+                if exits & D.reachable(consumer.graph, [set_target])]
+    require(live_set, consumer.name + ": descriptor source set arm reaches no exit")
+    return {"descriptor_source": "count_only_gated", "switch_lookups": switches,
+            "flag_branches": sorted(prog.flag_branches), "descriptors_lookups": lookups}
 
 
 def consumer_contract(consumer, variant, internal_blocks, initial=None, outlined=False):

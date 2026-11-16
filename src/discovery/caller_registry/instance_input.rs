@@ -1507,6 +1507,14 @@ pub(crate) struct InstanceSemanticRecord {
     pub(crate) feed: JointStaging,
 }
 
+/// One instance row plus its semantic row, removed for the departed
+/// fold (see [`CallerRegistry::take_instance_for_fold`]).
+pub(crate) struct TakenInstance {
+    pub(crate) record: InstanceRecord,
+    pub(crate) semantic: Option<InstanceSemanticRecord>,
+    pub(crate) settled_live: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum NegativeKind {
@@ -1656,6 +1664,11 @@ pub(super) struct InstanceState {
     /// returns of `apply_instance_call`. Read only by the
     /// conservation check; no report output carries it.
     instance_calls_refused: BTreeMap<CallerId, u64>,
+    /// The same refused-call count for folded departed callers: the
+    /// fold moves each row here and drops the per-caller entry, so
+    /// the conservation sum stays exact without one entry per folded
+    /// caller. Added wherever `instance_calls_refused` is summed.
+    folded_instance_calls_refused: u64,
     /// Callers with at least one refused instance registration: a
     /// registration refused for cause (identity, capacity, ...)
     /// leaves no instance, so without this mark the terminal
@@ -1697,6 +1710,7 @@ impl Default for InstanceState {
             journal_unavailable_disclosed: false,
             joint_backstop_routed: 0,
             instance_calls_refused: BTreeMap::new(),
+            folded_instance_calls_refused: 0,
             registration_refused_callers: BTreeSet::new(),
             first_birth_capacity: None,
         }
@@ -1782,6 +1796,16 @@ impl CallerRegistry {
             .registration_refused_callers
             .contains(&caller)
     }
+
+    /// Take one caller's refused-registration mark for the departed
+    /// fold, reporting whether it was set. The fold carries the mark
+    /// into the terminal refused-admission count, so the terminal
+    /// stays exact without one mark per folded caller.
+    pub(crate) fn take_registration_refused(&mut self, caller: CallerId) -> bool {
+        self.instance_state
+            .registration_refused_callers
+            .remove(&caller)
+    }
     pub(crate) fn instance_semantic_occupied(&self) -> usize {
         self.instance_state.occupied
     }
@@ -1801,7 +1825,8 @@ impl CallerRegistry {
         self.instance_state.negative_exhausted
     }
     pub(crate) fn instance_semantic_unknown_edges(&self) -> usize {
-        self.instance_state
+        let live = self
+            .instance_state
             .semantics
             .values()
             .filter(|s| {
@@ -1809,7 +1834,12 @@ impl CallerRegistry {
                     .as_ref()
                     .is_none_or(|r| r.label() != crate::semantics_edge::SEMANTIC_OBSERVED)
             })
-            .count()
+            .count();
+        self.modules
+            .values()
+            .filter_map(|module| module.departed_use.as_ref())
+            .map(|departed| departed.instance_semantic_unknown_edges as usize)
+            .fold(live, usize::saturating_add)
     }
 
     pub(crate) fn note_instance(&mut self, input: AdmittedInstance) {
@@ -2900,6 +2930,7 @@ impl CallerRegistry {
             .instance_calls_refused
             .values()
             .fold(0u64, |total, count| total.saturating_add(*count))
+            .saturating_add(self.instance_state.folded_instance_calls_refused)
             .saturating_add(self.foreign_unrouted_calls);
         let Some(projection) = self.key_projection.as_ref() else {
             let mut observations = crate::key_operation_projection::ObjectObservations::unavailable(
@@ -3017,6 +3048,51 @@ impl CallerRegistry {
     }
     pub(crate) fn retire_instance(&mut self, input: InstanceRetirement) {
         self.staged.push(Mutation::RetireInstance(input));
+    }
+
+    /// Take one instance row plus its semantic row for the departed
+    /// fold, settlement already applied. A still-live row is torn
+    /// down through [`Self::invalidate_instance`] first (its load
+    /// lifetime ended with its caller, so its reason reads
+    /// `task_retired`); an already-retired row passes through
+    /// untouched. The materialized-occupancy count and the
+    /// per-caller refused-call count move with the row: the latter
+    /// joins the folded counter the key projection sums, so the
+    /// projection stays exact without one entry per folded caller.
+    pub(crate) fn take_instance_for_fold(
+        &mut self,
+        id: RegistryInstanceId,
+    ) -> Option<TakenInstance> {
+        let live = self
+            .instance_state
+            .records
+            .get(&id)
+            .is_some_and(|record| record.state != InstanceLifecycle::Retired);
+        if live {
+            self.invalidate_instance(id, None, InstanceReason::TaskRetired, true, None);
+        }
+        let record = self.instance_state.records.remove(&id)?;
+        self.instance_state.by_key.remove(&record.key);
+        let semantic = self.instance_state.semantics.remove(&id);
+        if semantic.as_ref().is_some_and(|row| row.semantics.is_some()) {
+            debug_assert!(self.instance_state.occupied > 0);
+            self.instance_state.occupied = self.instance_state.occupied.saturating_sub(1);
+        }
+        if let Some(refused) = self
+            .instance_state
+            .instance_calls_refused
+            .remove(&record.caller)
+        {
+            self.instance_state.folded_instance_calls_refused = self
+                .instance_state
+                .folded_instance_calls_refused
+                .saturating_add(refused);
+        }
+        Some(TakenInstance {
+            record,
+            semantic,
+            settled_live: live,
+        })
     }
 
     /// Count one call refused before application for an unproven or

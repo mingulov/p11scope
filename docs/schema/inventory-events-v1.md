@@ -266,6 +266,14 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     for the `ended` line's own length, so it includes a rotation that
     line causes (when `--event-rotate-bytes` is too small for even a
     fresh file to take it) and only that.
+  - Folded edges (additive within v1, v0.8.0): a streamed edge may
+    be absent from the final snapshot `edges[]` when the departed fold
+    removed it after it streamed (every folded edge streamed at least
+    once: the fold waits for the first record). The streamed keys are
+    then a superset of the snapshot, and the missing keys count exactly
+    into `budgets.edges.folded` — never silently lost. Consumers must
+    therefore compare streamed edge keys as a superset of the
+    snapshot, not an equality.
   - Replay guarantee: when `ended.edges_unretained` is 0, the last
     retained `edge_observed` per (`caller`, `module`) equals the
     snapshot's `edges[]` entry (plus the three states and the compact context

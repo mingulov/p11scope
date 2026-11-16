@@ -2553,14 +2553,17 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
     };
     assert!(
         snapshot.contains(&format!(
-            "budgets: callers {}/{} refused {} retired {} late {} | modules {} | edges {} | endpoints {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {} | inventory_attach_modules {} | native_departed pair_rows {} pair_base {} pair_overflow {} exec_overflow {}",
+            "budgets: callers {}/{} refused {} retired {} with_calls {} late {} | modules {} | edges {} folded {} entries {} | endpoints {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {} | inventory_attach_modules {} | native_departed pair_rows {} pair_base {} pair_overflow {} exec_overflow {} | departed_use mech_overflow {} identities_dropped {}",
             budgets["callers"]["occupied"],
             budgets["callers"]["limit"],
             budgets["callers"]["refused"],
             budgets["callers"]["retired"],
+            budgets["callers"]["retired_with_calls"],
             budgets["callers"]["late_refused"],
             row("modules"),
             row("edges"),
+            budgets["edges"]["folded"],
+            budgets["edges"]["folded_entries"],
             row("endpoints"),
             budgets["counters"]["observed_edges"],
             budgets["counters"]["saturated_edges"],
@@ -2578,6 +2581,8 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             budgets["native_departed"]["pair_dropped_base"],
             budgets["native_departed"]["pair_prune_overflow"],
             budgets["native_departed"]["exec_prune_overflow"],
+            budgets["departed_use"]["mech_overflow"],
+            budgets["departed_use"]["identities_dropped"],
         )),
         "snapshot budgets"
     );

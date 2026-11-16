@@ -39,7 +39,10 @@ use crate::process::{
 pub(crate) mod metadata;
 
 use crate::semantics_edge::resources::{SemanticResourceRefusal, SemanticResourceReserver};
-use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+use crate::semantics_edge::{
+    EdgeSemantics, MAX_EDGE_MECHANISMS, MAX_EDGE_PROVENANCE_FUNCTIONS, MAX_EDGE_PROVENANCE_RETURNS,
+    SEMANTIC_OBSERVED, SemanticCall,
+};
 use crate::semantics_objects::journal::ConsumptionOrdinal;
 use crate::semantics_objects::journal::joint_audit::{DisposedJointQuantum, IngestedJointQuantum};
 use crate::semantics_objects::journal::joint_driver::{
@@ -2954,6 +2957,11 @@ pub(crate) struct ModuleRecord {
     /// binder could not bind to a caller incarnation, or bound to one with
     /// no mapping edge. Positive, monotonic, never attributed by pid.
     pub unbound_use: Option<UnboundUse>,
+    /// Exact aggregate of folded departed callers' edges and instances
+    /// at this module: every count summed, every function/rv breakdown
+    /// unioned, every folded caller named up to the shared identity
+    /// bounds. `None` until the first fold.
+    pub departed_use: Option<DepartedUse>,
 }
 
 /// Module-level positive use from native witness rows that no caller edge
@@ -3023,6 +3031,205 @@ pub(crate) struct UnboundPid {
     /// held count at drop, saturating.
     pub calls_at_least: u64,
     pub exe: UnboundExe,
+}
+
+/// Run-wide bound on distinct folded mechanism rows: the per-module
+/// maps (each like one live edge's
+/// [`MAX_EDGE_MECHANISMS`](crate::semantics_edge::MAX_EDGE_MECHANISMS))
+/// share this budget, so vendor mechanism spam cannot grow the
+/// departed aggregate without bound.
+/// Past it a mechanism's calls and errors still fold exactly into
+/// the overflow totals; only its named row is lost, and the
+/// published overflow count says so.
+pub(crate) const MAX_FOLDED_MECHANISMS_GLOBAL: usize = 4096;
+
+/// One folded departed caller identity: the named fields the
+/// `callers[]` row showed, frozen at the fold. Display-only hints
+/// (launcher chain, app hint) and the metadata snapshot do not
+/// survive: the row names the metadata status its snapshot carried.
+/// Historical only, like [`UnboundPid`]: the pid never addresses the
+/// process now holding that number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DepartedIdentity {
+    pub caller: CallerId,
+    pub pid: u32,
+    pub start_time: Option<u64>,
+    pub incarnation: u32,
+    pub exe: Option<ExeIdentity>,
+    pub authority: ImageAuthority,
+    pub lifecycle: CallerLifecycle,
+    pub lifecycle_reason: Option<String>,
+    pub first_seen_ns: u64,
+    pub last_seen_ns: u64,
+    pub exec_observed: bool,
+    pub metadata_status: Option<crate::caller_metadata::presentation::MetadataStatus>,
+}
+
+/// One folded mechanism row: the same meaning as the edge row (calls
+/// and errors summed, operation categories unioned, recency maxed,
+/// function/return provenance unioned under the live per-edge bounds
+/// with the truncated flag ORed).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FoldedMech {
+    pub calls: u64,
+    pub errors: u64,
+    pub ops: BTreeSet<&'static str>,
+    pub last_seen_ns: u64,
+    pub functions: BTreeSet<String>,
+    pub returns: BTreeSet<u64>,
+    pub truncated: bool,
+}
+
+/// Folded operation aggregates: the edge keys summed (unknown includes
+/// the machines the fold settled), the evidence counters summed, and
+/// the settlement itself accounted: every live machine, pending call,
+/// detached async id and open session ends here, counted, with the
+/// settled machines' category/state distribution preserved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FoldedOperations {
+    pub calls: u64,
+    pub started: u64,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub failed: u64,
+    pub unknown: u64,
+    pub orphans: u64,
+    pub dropped: u64,
+    pub last_seen_ns: u64,
+    pub evidence: crate::semantics_edge::EdgeEvidence,
+    pub settled_machines: u64,
+    pub settled_pending: u64,
+    pub settled_detached: u64,
+    pub settled_open: u64,
+    pub settled_active: BTreeMap<(String, &'static str), u64>,
+    pub settled_active_overflow: u64,
+}
+
+/// Per-module exact aggregate of folded departed callers (mirrors
+/// [`UnboundUse`]): every count summed, every function/rv breakdown
+/// unioned, every folded caller named up to the shared identity
+/// bounds. One caller's edges at several modules fold into each
+/// module's row, so per-module caller counts may name one caller
+/// twice; the `budgets.callers` counters count each caller once.
+/// All sums saturate; all maps are bounded (per-module caps plus the
+/// run-wide mechanism/identity budgets) with sticky saturation and
+/// counted overflow, so churn reuses the same memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DepartedUse {
+    /// Earliest fold instant among the rows.
+    pub first_ns: u64,
+    pub callers: u64,
+    pub edges: u64,
+    pub entries: u64,
+    pub entries_saturated: u64,
+    pub entries_observed: u64,
+    pub entries_first_min_ns: Option<u64>,
+    pub entries_last_max_ns: Option<u64>,
+    pub entries_in_flight: u64,
+    pub logical_entries: u64,
+    pub forwarding_entries: u64,
+    pub entry_observation: BTreeMap<&'static str, u64>,
+    pub coverage_counted: u64,
+    pub coverage_witnessed: u64,
+    pub coverage_watched_no_use: u64,
+    pub coverage_lossy: u64,
+    pub coverage_pid_exit: u64,
+    pub coverage_unknown: BTreeMap<&'static str, u64>,
+    pub coverage_since_min_ns: Option<u64>,
+    pub coverage_until_max_ns: Option<u64>,
+    pub coverage_first_min_ns: Option<u64>,
+    pub mapping_mapped: u64,
+    pub mapping_ended: u64,
+    pub mapping_uncertain: u64,
+    pub mapping_deep_scan: u64,
+    pub mapping_maps_match: u64,
+    pub mapping_interruptions: u64,
+    pub mapping_first_min_ns: Option<u64>,
+    pub mapping_last_max_ns: Option<u64>,
+    pub mapping_reasons: BTreeMap<String, u64>,
+    pub mapping_reasons_overflow: u64,
+    pub semantic_labels: BTreeMap<&'static str, u64>,
+    pub semantic_unknown_edges: u64,
+    pub mechs: BTreeMap<u64, FoldedMech>,
+    pub mechs_overflow: u64,
+    pub mechs_overflow_calls: u64,
+    pub mechs_overflow_errors: u64,
+    pub operations: FoldedOperations,
+    /// Some folded edge or instance held claims: exactly when the
+    /// published operations render as an object rather than null.
+    pub has_claims: bool,
+    pub instances_folded: u64,
+    pub instances_observed: u64,
+    pub instances_uncertain: u64,
+    pub instances_retired: u64,
+    pub instances_settled_live: u64,
+    pub instance_reasons: BTreeMap<&'static str, u64>,
+    pub instance_null_reasons: u64,
+    pub instance_first_min_ns: Option<u64>,
+    pub instance_last_max_ns: Option<u64>,
+    pub instance_api_returns: u64,
+    pub instance_api_returns_saturated_rows: u64,
+    pub instance_historical_only_returns: u64,
+    pub instance_lossy_rows: u64,
+    pub instance_loss_reasons: BTreeMap<&'static str, u64>,
+    pub instance_semantic_unknown_edges: u64,
+    pub identities: BTreeMap<CallerId, DepartedIdentity>,
+    pub identities_saturated: bool,
+    pub identities_dropped: u64,
+}
+
+/// One folded edge's contribution, derived by the coordinator from
+/// the live row exactly as the presentation derives it (presented
+/// coverage, its observation, the semantic label): the registry
+/// removes the row first, so the derivation cannot run after.
+pub(crate) struct EdgeFoldFacts {
+    pub coverage: UseCoverage,
+    pub observation: EntryObservation,
+    pub semantic_label: &'static str,
+    pub forwarding: bool,
+}
+
+/// What one folded edge carried: its entries and whether it held
+/// semantic claims. The coordinator counts a folded caller as
+/// with-calls when its folded entries are positive or any folded
+/// row held claims.
+pub(crate) struct EdgeFoldStats {
+    pub entries: u64,
+    pub had_claims: bool,
+}
+
+/// Add one to a distribution count, saturating.
+fn bump_count<K: Ord>(map: &mut BTreeMap<K, u64>, key: K) {
+    let count = map.entry(key).or_insert(0);
+    *count = count.saturating_add(1);
+}
+
+/// Fold an instant into a minimum bound.
+fn min_opt(bound: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *bound = Some(bound.map_or(value, |was| was.min(value)));
+    }
+}
+
+/// Fold an instant into a maximum bound.
+fn max_opt(bound: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *bound = Some(bound.map_or(value, |was| was.max(value)));
+    }
+}
+
+/// Run-wide departed-fold totals, summed over the per-module
+/// aggregates for budgets and layer totals. Per-module caller
+/// counts are NOT summed here (one caller's edges at several
+/// modules fold into each): the coordinator counts each caller
+/// once at the fold.
+pub(crate) struct DepartedTotals {
+    pub edges: u64,
+    pub entries: u64,
+    pub mech_overflow: u64,
+    pub identities_dropped: u64,
+    pub instances_folded: u64,
+    pub has_claims: bool,
 }
 
 /// How one unidentified caller image's executable was named (or why
@@ -3920,6 +4127,14 @@ pub(crate) struct CallerRegistry {
     /// Distinct images (with their host pids) the run-wide bound
     /// turned away, saturating. Sticky.
     unidentified_pids_dropped: u64,
+    /// Distinct folded mechanism rows across all per-module departed
+    /// aggregates: the run-wide [`MAX_FOLDED_MECHANISMS_GLOBAL`]
+    /// budget. Monotonic: folds never leave the aggregate.
+    folded_mechs_global: usize,
+    /// Folded caller identities across all per-module departed sets:
+    /// the run-wide identity budget (mirroring
+    /// [`DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL`]). Monotonic.
+    folded_identities_global: usize,
     /// Pending-count placements the last publication decided, in apply
     /// order (P3): drained by the coordinator after each publish.
     pending_count_decisions: Vec<PendingCountDecision>,
@@ -3937,8 +4152,10 @@ pub(crate) struct CallerRegistry {
     modules_refused: u64,
     edges_refused: u64,
     endpoints_refused: u64,
-    /// Edges with materialized semantic state (monotonic: edges are
-    /// never deleted and state is never withdrawn).
+    /// Live edges with materialized semantic state. The departed fold
+    /// releases it (dropping the reducer refunds its resource charges),
+    /// so freed budget admits new materializations; the folded claims
+    /// survive in the departed aggregate.
     semantic_occupied: usize,
     /// Semantic keys refused: materializations past
     /// `max_semantic_states` plus per-edge keys past the S1 bounds.
@@ -4069,6 +4286,27 @@ impl CallerRegistry {
                 size_of::<(DomainCookie, UnboundPid)>(),
                 HEAP_MODULE_KEY,
             ),
+            // Folded departed identities and mechanism rows, summed
+            // over the per-module aggregates (both bounded; saturation
+            // disclosed on the rows themselves).
+            departed_identities: counter_row(
+                self.modules
+                    .values()
+                    .filter_map(|module| module.departed_use.as_ref())
+                    .map(|departed| departed.identities.len())
+                    .sum(),
+                size_of::<(CallerId, DepartedIdentity)>(),
+                HEAP_MODULE_KEY,
+            ),
+            departed_mechs: counter_row(
+                self.modules
+                    .values()
+                    .filter_map(|module| module.departed_use.as_ref())
+                    .map(|departed| departed.mechs.len())
+                    .sum(),
+                size_of::<(u64, FoldedMech)>(),
+                HEAP_MODULE_KEY,
+            ),
             gap_index: counter_row(
                 self.gap_index.len(),
                 size_of::<(RegistryGap, usize)>(),
@@ -4166,6 +4404,8 @@ impl CallerRegistry {
             unidentified_images: HashMap::new(),
             unidentified_images_saturated: false,
             unidentified_pids_dropped: 0,
+            folded_mechs_global: 0,
+            folded_identities_global: 0,
             pending_count_decisions: Vec::new(),
             demoted_place_growth: HashMap::new(),
             witness_census: BindingCensus::default(),
@@ -4296,6 +4536,7 @@ impl CallerRegistry {
                     lifecycle: ModuleLifecycle::Mapped,
                     unloaded_observed: false,
                     unbound_use: None,
+                    departed_use: None,
                 },
             );
             self.modules_by_key.insert(key, id);
@@ -4365,15 +4606,16 @@ impl CallerRegistry {
     }
 
     /// Whether `caller` still backs a rendered registry fact: an edge,
-    /// a gap, an instance or an instance-semantic row. A retired caller
-    /// with none of these holds no per-caller registry state beyond its
-    /// retirement refusal entry.
+    /// an instance or an instance-semantic row. Gaps name folded
+    /// callers by label (their evidence never pins a row), so a
+    /// gap alone never keeps a caller set entry. A retired caller
+    /// with none of these holds no per-caller registry state beyond
+    /// its retirement refusal entry.
     pub(crate) fn caller_has_rendered_state(&self, caller: CallerId) -> bool {
         self.edges
             .range((caller, ModuleId(0))..=(caller, ModuleId(u32::MAX)))
             .next()
             .is_some()
-            || self.gaps.iter().any(|gap| gap.caller == Some(caller))
             || self.instances().any(|row| row.caller == caller)
             || self
                 .instance_semantic_edges()
@@ -4384,10 +4626,446 @@ impl CallerRegistry {
     /// no rendered rows left. Its `retired` refusal entry stays: late
     /// mapping evidence for the incarnation must still be refused, not
     /// admitted under a dead caller ID.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn compact_retired_caller(&mut self, caller: CallerId) {
         if self.retired.contains(caller) && !self.caller_has_rendered_state(caller) {
             self.callers.remove(&caller);
         }
+    }
+
+    /// Drop a departed-folded caller from the registry's caller set.
+    /// The fold removes every edge, instance and instance-semantic row
+    /// of the caller (instance records and semantics are created and
+    /// removed only as pairs), so no per-candidate scan is needed: the
+    /// retire loop calls this once per forgotten caller instead of
+    /// scanning both instance tables per candidate (item 9). The
+    /// `retired` refusal entry stays. Debug builds assert the
+    /// no-rows-remain invariant on every folded caller.
+    pub(crate) fn compact_folded_caller(&mut self, caller: CallerId) {
+        debug_assert!(
+            !self.caller_has_rendered_state(caller),
+            "a folded caller keeps no rendered rows"
+        );
+        if self.retired.contains(caller) {
+            self.callers.remove(&caller);
+        }
+    }
+
+    /// Fold one departed caller's edge into its module's
+    /// [`DepartedUse`] and remove the row, releasing its semantic
+    /// occupancy and resource charges. Every count, distribution and
+    /// breakdown folds exactly (saturating); the caller-side facts
+    /// arrive derived. Missing rows fold nothing and count nothing.
+    pub(crate) fn fold_caller_edge(
+        &mut self,
+        caller: CallerId,
+        module: ModuleId,
+        facts: EdgeFoldFacts,
+        now_ns: u64,
+    ) -> EdgeFoldStats {
+        let Some(edge) = self.edges.remove(&(caller, module)) else {
+            return EdgeFoldStats {
+                entries: 0,
+                had_claims: false,
+            };
+        };
+        let had_claims = edge
+            .semantics
+            .as_ref()
+            .is_some_and(EdgeSemantics::has_claims);
+        if edge.semantics.is_some() {
+            debug_assert!(self.semantic_occupied > 0);
+            self.semantic_occupied = self.semantic_occupied.saturating_sub(1);
+        }
+        let stats = EdgeFoldStats {
+            entries: edge.entry_count,
+            had_claims,
+        };
+        let module_record = self
+            .modules
+            .get_mut(&module)
+            .expect("folded edge module retained");
+        let departed = module_record
+            .departed_use
+            .get_or_insert_with(DepartedUse::default);
+        if departed.callers == 0 && departed.edges == 0 && departed.instances_folded == 0 {
+            departed.first_ns = now_ns;
+        }
+        departed.edges = departed.edges.saturating_add(1);
+        departed.entries = departed.entries.saturating_add(edge.entry_count);
+        if edge.entry_saturated {
+            departed.entries_saturated = departed.entries_saturated.saturating_add(1);
+        }
+        if edge.entry_count > 0 || edge.entry_in_flight {
+            departed.entries_observed = departed.entries_observed.saturating_add(1);
+        }
+        min_opt(&mut departed.entries_first_min_ns, edge.entry_first_seen_ns);
+        max_opt(&mut departed.entries_last_max_ns, edge.entry_last_seen_ns);
+        if edge.entry_in_flight {
+            departed.entries_in_flight = departed.entries_in_flight.saturating_add(1);
+        }
+        if facts.forwarding {
+            departed.forwarding_entries =
+                departed.forwarding_entries.saturating_add(edge.entry_count);
+        } else {
+            departed.logical_entries = departed.logical_entries.saturating_add(edge.entry_count);
+        }
+        bump_count(&mut departed.entry_observation, facts.observation.label());
+        match &facts.coverage {
+            UseCoverage::Counted {
+                since_ns,
+                lossy,
+                pid_exit,
+            } => {
+                departed.coverage_counted = departed.coverage_counted.saturating_add(1);
+                if *lossy {
+                    departed.coverage_lossy = departed.coverage_lossy.saturating_add(1);
+                }
+                if *pid_exit {
+                    departed.coverage_pid_exit = departed.coverage_pid_exit.saturating_add(1);
+                }
+                min_opt(&mut departed.coverage_since_min_ns, Some(*since_ns));
+            }
+            UseCoverage::Witnessed { first_ns } => {
+                departed.coverage_witnessed = departed.coverage_witnessed.saturating_add(1);
+                min_opt(&mut departed.coverage_first_min_ns, Some(*first_ns));
+            }
+            UseCoverage::WatchedNoUse { since_ns, until_ns } => {
+                departed.coverage_watched_no_use =
+                    departed.coverage_watched_no_use.saturating_add(1);
+                min_opt(&mut departed.coverage_since_min_ns, Some(*since_ns));
+                max_opt(&mut departed.coverage_until_max_ns, *until_ns);
+            }
+            UseCoverage::Unknown(reason) => {
+                bump_count(&mut departed.coverage_unknown, reason.code());
+            }
+        }
+        match edge.mapping {
+            MappingState::Mapped => {
+                departed.mapping_mapped = departed.mapping_mapped.saturating_add(1);
+            }
+            MappingState::Ended => {
+                departed.mapping_ended = departed.mapping_ended.saturating_add(1);
+            }
+            MappingState::Uncertain => {
+                departed.mapping_uncertain = departed.mapping_uncertain.saturating_add(1);
+            }
+        }
+        match edge.mapping_evidence {
+            MappingEvidence::DeepScan => {
+                departed.mapping_deep_scan = departed.mapping_deep_scan.saturating_add(1);
+            }
+            MappingEvidence::MapsMatch => {
+                departed.mapping_maps_match = departed.mapping_maps_match.saturating_add(1);
+            }
+        }
+        departed.mapping_interruptions = departed
+            .mapping_interruptions
+            .saturating_add(edge.mapping_interruptions);
+        min_opt(
+            &mut departed.mapping_first_min_ns,
+            Some(edge.mapping_first_seen_ns),
+        );
+        max_opt(
+            &mut departed.mapping_last_max_ns,
+            Some(edge.mapping_last_seen_ns),
+        );
+        if let Some(reason) = edge.mapping_reason {
+            if let Some(count) = departed.mapping_reasons.get_mut(&reason) {
+                *count = count.saturating_add(1);
+            } else if departed.mapping_reasons.len() < MAX_EDGE_PROVENANCE_RETURNS {
+                departed.mapping_reasons.insert(reason, 1);
+            } else {
+                departed.mapping_reasons_overflow =
+                    departed.mapping_reasons_overflow.saturating_add(1);
+            }
+        }
+        bump_count(&mut departed.semantic_labels, facts.semantic_label);
+        if facts.semantic_label != SEMANTIC_OBSERVED {
+            departed.semantic_unknown_edges = departed.semantic_unknown_edges.saturating_add(1);
+        }
+        if let Some(semantics) = edge.semantics {
+            Self::fold_reducer(departed, &mut self.folded_mechs_global, semantics);
+        }
+        stats
+    }
+
+    /// Fold one owned semantic reducer into the aggregate: live
+    /// machines, pending calls, detached async ids and open sessions
+    /// end here through the retirement path (machines explicitly
+    /// unknown, the rest counted), then every counter, mechanism row
+    /// and evidence field folds. Dropping the reducer refunds its
+    /// resource charges to the shared pool. Edges and instances share
+    /// this path: both own an [`EdgeSemantics`].
+    fn fold_reducer(
+        departed: &mut DepartedUse,
+        mechs_global: &mut usize,
+        mut semantics: EdgeSemantics,
+    ) {
+        let summary = semantics.active_summary();
+        let lens = semantics.memory_lens();
+        semantics.invalidate();
+        let ops = &mut departed.operations;
+        let settled: u64 = summary.iter().map(|(_, _, count)| *count).sum();
+        ops.settled_machines = ops.settled_machines.saturating_add(settled);
+        ops.settled_pending = ops.settled_pending.saturating_add(lens.pending.len);
+        ops.settled_detached = ops.settled_detached.saturating_add(lens.detached.len);
+        ops.settled_open = ops.settled_open.saturating_add(lens.open.len);
+        for (category, state, count) in summary {
+            let key = (category, state.label());
+            if let Some(held) = ops.settled_active.get_mut(&key) {
+                *held = held.saturating_add(count);
+            } else if ops.settled_active.len() < MAX_EDGE_PROVENANCE_FUNCTIONS {
+                ops.settled_active.insert(key, count);
+            } else {
+                ops.settled_active_overflow = ops.settled_active_overflow.saturating_add(count);
+            }
+        }
+        departed.has_claims = departed.has_claims || semantics.has_claims();
+        ops.calls = ops.calls.saturating_add(semantics.calls());
+        ops.started = ops.started.saturating_add(semantics.started());
+        ops.completed = ops.completed.saturating_add(semantics.completed());
+        ops.cancelled = ops.cancelled.saturating_add(semantics.cancelled());
+        ops.failed = ops.failed.saturating_add(semantics.failed());
+        ops.unknown = ops.unknown.saturating_add(semantics.unknown());
+        ops.orphans = ops.orphans.saturating_add(semantics.orphans());
+        ops.dropped = ops.dropped.saturating_add(semantics.dropped());
+        ops.last_seen_ns = ops.last_seen_ns.max(semantics.last_seen_ns());
+        let evidence = semantics.evidence();
+        ops.evidence.state_reconciliations = ops
+            .evidence
+            .state_reconciliations
+            .saturating_add(evidence.state_reconciliations);
+        ops.evidence.session_cancel_ambiguities = ops
+            .evidence
+            .session_cancel_ambiguities
+            .saturating_add(evidence.session_cancel_ambiguities);
+        ops.evidence.session_cancel_unknown_flags = ops
+            .evidence
+            .session_cancel_unknown_flags
+            .saturating_add(evidence.session_cancel_unknown_flags);
+        ops.evidence.operation_state_imports = ops
+            .evidence
+            .operation_state_imports
+            .saturating_add(evidence.operation_state_imports);
+        ops.evidence.auth_state_ambiguities = ops
+            .evidence
+            .auth_state_ambiguities
+            .saturating_add(evidence.auth_state_ambiguities);
+        ops.evidence.semantic_capture_failures = ops
+            .evidence
+            .semantic_capture_failures
+            .saturating_add(evidence.semantic_capture_failures);
+        ops.evidence.async_duplicates = ops
+            .evidence
+            .async_duplicates
+            .saturating_add(evidence.async_duplicates);
+        ops.evidence.async_evictions = ops
+            .evidence
+            .async_evictions
+            .saturating_add(evidence.async_evictions);
+        ops.evidence.unmatched_closes = ops
+            .evidence
+            .unmatched_closes
+            .saturating_add(evidence.unmatched_closes);
+        for (id, stat) in semantics.mechanisms() {
+            if let Some(row) = departed.mechs.get_mut(id) {
+                row.calls = row.calls.saturating_add(stat.calls);
+                row.errors = row.errors.saturating_add(stat.errors);
+                row.ops.extend(stat.ops.iter().copied());
+                row.last_seen_ns = row.last_seen_ns.max(stat.last_seen_ns);
+                for function in &stat.functions {
+                    if !row.functions.contains(function) {
+                        if row.functions.len() >= MAX_EDGE_PROVENANCE_FUNCTIONS {
+                            row.truncated = true;
+                            break;
+                        }
+                        row.functions.insert(function.clone());
+                    }
+                }
+                for rv in &stat.returns {
+                    if !row.returns.contains(rv) {
+                        if row.returns.len() >= MAX_EDGE_PROVENANCE_RETURNS {
+                            row.truncated = true;
+                            break;
+                        }
+                        row.returns.insert(*rv);
+                    }
+                }
+                row.truncated = row.truncated || stat.truncated;
+                continue;
+            }
+            if departed.mechs.len() >= MAX_EDGE_MECHANISMS
+                || *mechs_global >= MAX_FOLDED_MECHANISMS_GLOBAL
+            {
+                departed.mechs_overflow = departed.mechs_overflow.saturating_add(1);
+                departed.mechs_overflow_calls =
+                    departed.mechs_overflow_calls.saturating_add(stat.calls);
+                departed.mechs_overflow_errors =
+                    departed.mechs_overflow_errors.saturating_add(stat.errors);
+                continue;
+            }
+            let mut row = FoldedMech {
+                calls: stat.calls,
+                errors: stat.errors,
+                ops: stat.ops.clone(),
+                last_seen_ns: stat.last_seen_ns,
+                functions: stat.functions.clone(),
+                returns: stat.returns.clone(),
+                truncated: stat.truncated,
+            };
+            while row.functions.len() > MAX_EDGE_PROVENANCE_FUNCTIONS {
+                row.functions.pop_last();
+                row.truncated = true;
+            }
+            while row.returns.len() > MAX_EDGE_PROVENANCE_RETURNS {
+                row.returns.pop_last();
+                row.truncated = true;
+            }
+            departed.mechs.insert(*id, row);
+            *mechs_global = mechs_global.saturating_add(1);
+        }
+    }
+
+    /// Fold one taken instance (see
+    /// [`instance_input::TakenInstance`]) into its module's aggregate:
+    /// the row's state and reason, its API returns, and its S1 rows
+    /// through the shared reducer fold.
+    pub(crate) fn fold_taken_instance(
+        &mut self,
+        taken: instance_input::TakenInstance,
+        now_ns: u64,
+    ) {
+        let module = taken.record.module;
+        let module_record = self
+            .modules
+            .get_mut(&module)
+            .expect("folded instance module retained");
+        let departed = module_record
+            .departed_use
+            .get_or_insert_with(DepartedUse::default);
+        if departed.callers == 0 && departed.edges == 0 && departed.instances_folded == 0 {
+            departed.first_ns = now_ns;
+        }
+        departed.instances_folded = departed.instances_folded.saturating_add(1);
+        match taken.record.state {
+            instance_input::InstanceLifecycle::Observed => {
+                departed.instances_observed = departed.instances_observed.saturating_add(1);
+            }
+            instance_input::InstanceLifecycle::Uncertain => {
+                departed.instances_uncertain = departed.instances_uncertain.saturating_add(1);
+            }
+            instance_input::InstanceLifecycle::Retired => {
+                departed.instances_retired = departed.instances_retired.saturating_add(1);
+            }
+        }
+        if taken.settled_live {
+            departed.instances_settled_live = departed.instances_settled_live.saturating_add(1);
+        }
+        match taken.record.reason {
+            Some(reason) => bump_count(&mut departed.instance_reasons, reason.label()),
+            None => {
+                departed.instance_null_reasons = departed.instance_null_reasons.saturating_add(1);
+            }
+        }
+        min_opt(
+            &mut departed.instance_first_min_ns,
+            Some(taken.record.first_seen_ns),
+        );
+        max_opt(
+            &mut departed.instance_last_max_ns,
+            Some(taken.record.last_seen_ns),
+        );
+        let Some(semantic) = taken.semantic else {
+            return;
+        };
+        departed.instance_api_returns = departed
+            .instance_api_returns
+            .saturating_add(semantic.api_returns.unwrap_or(0));
+        if semantic.saturated {
+            departed.instance_api_returns_saturated_rows = departed
+                .instance_api_returns_saturated_rows
+                .saturating_add(1);
+        }
+        departed.instance_historical_only_returns = departed
+            .instance_historical_only_returns
+            .saturating_add(semantic.historical_only_returns);
+        if semantic.lossy {
+            departed.instance_lossy_rows = departed.instance_lossy_rows.saturating_add(1);
+        }
+        for reason in &semantic.reasons {
+            bump_count(&mut departed.instance_loss_reasons, reason.label());
+        }
+        let unknown = semantic
+            .semantics
+            .as_ref()
+            .is_none_or(|state| state.label() != SEMANTIC_OBSERVED);
+        if unknown {
+            departed.instance_semantic_unknown_edges =
+                departed.instance_semantic_unknown_edges.saturating_add(1);
+        }
+        if let Some(reducer) = semantic.semantics {
+            Self::fold_reducer(departed, &mut self.folded_mechs_global, reducer);
+        }
+    }
+
+    pub(crate) fn departed_totals(&self) -> DepartedTotals {
+        let mut totals = DepartedTotals {
+            edges: 0,
+            entries: 0,
+            mech_overflow: 0,
+            identities_dropped: 0,
+            instances_folded: 0,
+            has_claims: false,
+        };
+        for departed in self
+            .modules
+            .values()
+            .filter_map(|module| module.departed_use.as_ref())
+        {
+            totals.edges = totals.edges.saturating_add(departed.edges);
+            totals.entries = totals.entries.saturating_add(departed.entries);
+            totals.mech_overflow = totals.mech_overflow.saturating_add(departed.mechs_overflow);
+            totals.identities_dropped = totals
+                .identities_dropped
+                .saturating_add(departed.identities_dropped);
+            totals.instances_folded = totals
+                .instances_folded
+                .saturating_add(departed.instances_folded);
+            totals.has_claims = totals.has_claims || departed.has_claims;
+        }
+        totals
+    }
+
+    /// Name one folded caller in its module's bounded identity set,
+    /// mirroring [`Self::insert_unbound_image`]: a known caller keeps
+    /// its first row, a new caller past the per-module or run-wide
+    /// bound saturates and counts as dropped instead of growing.
+    pub(crate) fn insert_departed_identity(
+        &mut self,
+        module: ModuleId,
+        identity: DepartedIdentity,
+    ) {
+        let module_record = self
+            .modules
+            .get_mut(&module)
+            .expect("folded identity module retained");
+        let departed = module_record
+            .departed_use
+            .get_or_insert_with(DepartedUse::default);
+        departed.callers = departed.callers.saturating_add(1);
+        if departed.identities.contains_key(&identity.caller) {
+            return;
+        }
+        if departed.identities.len() < DEFAULT_MAX_UNBOUND_IMAGES_PER_MODULE
+            && self.folded_identities_global < DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL
+        {
+            departed.identities.insert(identity.caller, identity);
+            self.folded_identities_global = self.folded_identities_global.saturating_add(1);
+            return;
+        }
+        departed.identities_saturated = true;
+        departed.identities_dropped = departed.identities_dropped.saturating_add(1);
     }
 
     /// One caller's edges: a range query over the `(caller, module)` key,
@@ -4472,16 +5150,22 @@ impl CallerRegistry {
     /// edges whose feed established no mechanism/operation claim, and
     /// latched same-file double-load edges (retained claims, unknown
     /// label). One predicate with the label, so census and label agree
-    /// (DR-09).
+    /// (DR-09). Run evidence: folded edges stay counted.
     pub(crate) fn semantic_unknown_edges(&self) -> usize {
-        self.edges
+        let live = self
+            .edges
             .values()
             .filter(|edge| {
                 edge.semantics
                     .as_ref()
                     .is_none_or(|state| state.label() != crate::semantics_edge::SEMANTIC_OBSERVED)
             })
-            .count()
+            .count();
+        self.modules
+            .values()
+            .filter_map(|module| module.departed_use.as_ref())
+            .map(|departed| departed.semantic_unknown_edges as usize)
+            .fold(live, usize::saturating_add)
     }
 
     /// Semantic keys refused past budget (the `semantic_state` loss
@@ -4493,15 +5177,24 @@ impl CallerRegistry {
     /// Counter budget census: edges with observed entries (count or
     /// in-flight), and edges whose counter saturated at the cap.
     pub(crate) fn counter_census(&self) -> (usize, usize) {
-        let mut observed = 0;
-        let mut saturated = 0;
+        let mut observed = 0usize;
+        let mut saturated = 0usize;
         for edge in self.edges.values() {
             if edge.entry_count > 0 || edge.entry_in_flight {
-                observed += 1;
+                observed = observed.saturating_add(1);
             }
             if edge.entry_saturated {
-                saturated += 1;
+                saturated = saturated.saturating_add(1);
             }
+        }
+        // Run evidence, not a live census: folded edges stay observed.
+        for departed in self
+            .modules
+            .values()
+            .filter_map(|module| module.departed_use.as_ref())
+        {
+            observed = observed.saturating_add(departed.entries_observed as usize);
+            saturated = saturated.saturating_add(departed.entries_saturated as usize);
         }
         (observed, saturated)
     }
@@ -6227,6 +6920,7 @@ impl CallerRegistry {
                         lifecycle: ModuleLifecycle::Mapped,
                         unloaded_observed: false,
                         unbound_use: None,
+                        departed_use: None,
                     },
                 );
                 self.modules_by_key.insert(info.key.clone(), id);
@@ -9057,6 +9751,33 @@ pub(crate) mod tests {
                 .iter()
                 .any(|gap| gap.subject == "mapping for a retired caller"),
             "the refusal is disclosed, never silent"
+        );
+    }
+
+    #[test]
+    fn folded_caller_compacts_without_a_rendered_state_scan() {
+        // Item 9: the departed fold removes every edge, instance and
+        // instance-semantic row of the caller, so compacting a folded
+        // caller needs no per-candidate scan; the retired refusal
+        // entry stays exactly like the scanning path.
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let caller = CallerId(5);
+        registry.retire_caller(caller, "caller retired".into(), 10);
+        registry.publish();
+        registry.compact_folded_caller(caller);
+        assert_eq!(registry.memory_lens().callers.len, 0);
+        let info = module_info("/opt/late.so", 60, AdmissionState::Admitted);
+        registry.note_mapping(caller, 42, info, 20);
+        registry.publish();
+        assert_eq!(
+            registry.memory_lens().callers.len,
+            0,
+            "late evidence never invents a caller row"
+        );
+        assert_eq!(
+            registry.retired_mapping_refusals(),
+            1,
+            "the refusal is counted"
         );
     }
 

@@ -6955,6 +6955,9 @@ fn round4_empty_catalog(
 /// current-count-ownership refusal, and gets its metadata row.
 #[test]
 fn demotion_retirement_round4_lifetime_callers_exceed_the_retained_budget() {
+    // The metadata worker slot is process-global: serialize with the
+    // stop twins so neither side observes an unavailable lane.
+    let _serial = crate::caller_metadata::runtime::job::test_support::worker_lock();
     let mut limits = RegistryLimits::default_limits();
     limits.max_callers = 2;
     let base = CaptureScene::with_limits(2, limits);
@@ -7018,7 +7021,11 @@ fn demotion_retirement_round4_lifetime_callers_exceed_the_retained_budget() {
         native.scene.coordinator.commit_batch(false).unwrap();
         native.scene.coordinator.note_rendered_callers(&[id]);
         assert_eq!(
-            native.scene.coordinator.retire_rendered_callers(at + 3),
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(at + 3, None)
+                .retired,
             1,
             "the proven-exited rendered caller retires"
         );
@@ -7058,6 +7065,9 @@ fn demotion_retirement_round4_lifetime_callers_exceed_the_retained_budget() {
 /// folded callers.
 #[test]
 fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget() {
+    // The metadata worker slot is process-global: serialize with the
+    // stop twins so neither side observes an unavailable lane.
+    let _serial = crate::caller_metadata::runtime::job::test_support::worker_lock();
     const LIFETIME: usize = 5000;
     const BATCH: usize = 16;
     const ENTRIES: [u64; 4] = [0, 1, 5, 100];
@@ -7080,16 +7090,19 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
     let mut expected_with_calls = 0u64;
     let mut rounds = 0u64;
     for base in (0..LIFETIME).step_by(BATCH) {
-        let at = 1_000_000 + rounds * 10_000;
+        // Small clocks like the other multi-round scenes: rows,
+        // anchors and catalogs stay mutually fresh.
+        let at = 2000 + rounds * 10;
         rounds += 1;
+        let width = BATCH.min(LIFETIME - base);
         let mut members = Vec::new();
-        let mut rows = Vec::new();
-        let mut counts = Vec::new();
         let mut ids = Vec::new();
-        for offset in 0..BATCH {
+        for offset in 0..width {
             let index = base + offset;
             let pid = 50_000 + index as u32;
-            let start = 500_000 + index as u64;
+            // Match the catalog generation the members catalog claims
+            // for every member (like pid 7's own spawn).
+            let start = 500;
             let ticket = 100_000 + index as u64;
             let entries = ENTRIES[index % ENTRIES.len()];
             expected_entries = expected_entries.saturating_add(entries);
@@ -7106,11 +7119,13 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
                 .expect("a churn caller is never refused while folds recycle slots");
             ids.push(id);
             scene.native.scene.project_paths(pid, &[&scene.a], at);
+            scene.native.scene.coordinator.commit_batch(false).unwrap();
             scene.native.answer(pid, start, ticket);
-            let mut row = scene.native.row(ticket, 1, pid, 100, 0);
+            // Rows must postdate admission (like round-2's t0=100 past
+            // admit 80): a row predating admission never binds.
+            let mut row = scene.native.row(ticket, 1, pid, at + 1, 0);
             row.entry_count = entries;
-            rows.push(row);
-            counts.push((ticket, 1, 0, entries));
+            scene.native.witness(vec![row]);
             members.push((pid, id, ticket));
             scene.native.scene.coordinator.registry.record_gap(
                 crate::discovery::caller_registry::RegistryGap {
@@ -7123,12 +7138,11 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
                 },
             );
         }
-        scene.native.scene.coordinator.commit_batch(false).unwrap();
-        scene.native.witness(rows);
-        scene.native.counts_read(Vec::new(), counts);
-        scene.native.scene.coordinator.commit_batch(false).unwrap();
-        scene.apply(members_catalog(&scene, &members, true, at), at);
-        for &(_, id, _) in &members {
+        scene.apply(members_catalog(&scene, &members, true, at + 2), at + 2);
+        // Recovery arming needs repeated reconciliation (bounded
+        // service per round); mirror the round-2 quiet pattern.
+        round2_quiet_ownership(&mut scene);
+        for (k, &(_, id, _)) in members.iter().enumerate() {
             assert!(
                 scene
                     .native
@@ -7140,12 +7154,17 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
                     .is_some(),
                 "batch caller {id:?} holds a mapping edge before it exits"
             );
+            assert_eq!(
+                edge_count(&scene.native, id, "a.so"),
+                ENTRIES[(base + k) % ENTRIES.len()],
+                "batch caller {id:?} places its staged absolute"
+            );
         }
         scene
             .native
             .scene
             .coordinator
-            .synchronize_caller_metadata(at + 1);
+            .synchronize_caller_metadata(at + 3);
         let frame = scene.native.scene.coordinator.metadata_frame();
         for id in &ids {
             assert!(
@@ -7164,7 +7183,7 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
             &mut UnavailableImageGuard,
             &mut scene.native.cookies,
             "test batch exit",
-            at + 2,
+            at + 4,
         );
         scene.native.scene.coordinator.commit_batch(false).unwrap();
         scene.native.scene.coordinator.note_rendered_callers(&ids);
@@ -7173,8 +7192,9 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
                 .native
                 .scene
                 .coordinator
-                .retire_rendered_callers(at + 3),
-            BATCH as u64,
+                .retire_rendered_callers(at + 5, None)
+                .retired,
+            width as u64,
             "every proven-exited batch caller retires"
         );
         // The retained census plateaus: only the never-exiting scene
@@ -7217,15 +7237,28 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
         0,
         "no lifetime caller was refused metadata storage"
     );
+    // Four setup gaps exist beside the batch gaps (the placed row
+    // predating admission, the empty-pass notice, two early ambiguous
+    // endpoints); the batch gaps are counted by subject.
     assert_eq!(
-        coordinator.registry.gaps().len(),
+        coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "test fold gap")
+            .count(),
         LIFETIME,
         "every batch gap is retained"
     );
     // Gaps keep naming the folded callers by label; the rows are gone
     // but the evidence still resolves through the stream and the
     // departed aggregate.
-    for gap in coordinator.registry.gaps() {
+    for gap in coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "test fold gap")
+    {
         assert!(
             gap.caller
                 .is_some_and(|caller| coordinator.adapter.record(caller).is_none()),
@@ -7234,15 +7267,12 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
     }
     let charges_after = coordinator.registry.semantic_resource_snapshot();
     assert_eq!(
-        (
-            charges_after.charged_bytes,
-            charges_after.peak_charged_bytes
-        ),
-        (
-            charges_before.charged_bytes,
-            charges_before.peak_charged_bytes
-        ),
+        charges_after.charged_bytes, charges_before.charged_bytes,
         "folds without semantic state charge nothing"
+    );
+    assert!(
+        charges_after.peak_charged_bytes < charges_before.charged_bytes + 65_536,
+        "peak stays transient (per-batch staging, never per-lifetime growth)"
     );
     let document = crate::inventory::render_json(coordinator, "test", 0, rounds * 10_000, rounds);
     assert_eq!(
@@ -7253,21 +7283,70 @@ fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget()
         document["budgets"]["callers"]["retired_with_calls"], expected_with_calls,
         "the report counts the folded callers that carried calls"
     );
+    // Two edges per caller (the counted a.so edge plus the watched
+    // b.so catalog edge): both fold.
     assert_eq!(
-        document["budgets"]["edges"]["folded"], LIFETIME as u64,
+        document["budgets"]["edges"]["folded"],
+        2 * LIFETIME as u64,
         "the report counts every folded edge"
     );
     assert_eq!(
         document["budgets"]["edges"]["folded_entries"], expected_entries,
         "the report counts every folded entry"
     );
+    // The logical total is folded entries plus the live scene
+    // caller's own edge (the only row left in `edges[]`).
+    let live_entries: u64 = document["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .map(|edge| edge["entries"]["count"].as_u64().expect("count"))
+        .sum();
+    assert_eq!(live_entries, 5, "the live scene caller keeps its 5");
     assert_eq!(
-        document["layer_totals"]["logical_entries"], expected_entries,
+        document["layer_totals"]["logical_entries"]
+            .as_u64()
+            .expect("total"),
+        expected_entries + live_entries,
         "folded entries stay in the logical total"
     );
     assert_eq!(
         document["layer_totals"]["forwarding_entries"], 0,
         "no forwarding layer observed these calls"
+    );
+    // Past the 4096-per-module identity bound the aggregate saturates
+    // honestly: first rows named, the rest counted as dropped.
+    for leaf in ["a.so", "b.so"] {
+        let module = document["modules"]
+            .as_array()
+            .expect("modules array")
+            .iter()
+            .find(|module| {
+                module["paths"].as_array().is_some_and(|paths| {
+                    paths
+                        .iter()
+                        .any(|path| path.as_str().is_some_and(|path| path.ends_with(leaf)))
+                })
+            })
+            .unwrap_or_else(|| panic!("the {leaf} module renders"));
+        assert_eq!(module["departed_use"]["callers"], LIFETIME as u64);
+        assert_eq!(module["departed_use"]["edges"], LIFETIME as u64);
+        assert_eq!(
+            module["departed_use"]["identities"]
+                .as_array()
+                .expect("identity rows")
+                .len(),
+            4096
+        );
+        assert_eq!(module["departed_use"]["identities_saturated"], true);
+        assert_eq!(
+            module["departed_use"]["identities_dropped"],
+            LIFETIME as u64 - 4096
+        );
+    }
+    assert_eq!(
+        document["budgets"]["departed_use"]["identities_dropped"],
+        2 * (LIFETIME as u64 - 4096)
     );
     // The never-exiting scene caller keeps its live row and edge: the
     // fold only retires proven-ended callers.
@@ -7319,8 +7398,7 @@ fn demotion_retirement_round5_folded_edge_semantics_stay_exact() {
             .registry
             .edges_of(caller)
             .next()
-            .expect("the shared scene stages one edge")
-            .clone();
+            .expect("the shared scene stages one edge");
         coordinator
             .registry
             .module(edge.module)
@@ -7328,7 +7406,6 @@ fn demotion_retirement_round5_folded_edge_semantics_stay_exact() {
             .key
             .clone()
     };
-    let charges_before = coordinator.registry.semantic_resource_snapshot();
     // One completed sign, one failed digest, one still-live operation.
     coordinator.registry_mut().observe_semantic(
         caller,
@@ -7394,9 +7471,40 @@ fn demotion_retirement_round5_folded_edge_semantics_stay_exact() {
         .coordinator
         .note_rendered_callers(&[caller]);
     assert_eq!(
-        scene.native.scene.coordinator.retire_rendered_callers(1001),
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
         1,
         "the proven-exited caller with calls retires"
+    );
+    // The suspended pair drops with its staged absolute into the
+    // existing Dropped machinery (revival intact); its held read and
+    // stalled recovery leave with it instead of pinning the caller.
+    // Past the grace the staged absolute reaches the counted totals.
+    assert!(
+        scene.native.scene.coordinator.pair_counts.is_empty(),
+        "no held read survives the fold"
+    );
+    assert!(
+        scene.native.scene.coordinator.recoveries.is_empty(),
+        "no stalled recovery survives the fold"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .prune_departed_native_state(1_000_000_000_000);
+    assert_eq!(
+        scene.native.scene.coordinator.pruned_pair_totals(),
+        (1, 7),
+        "the staged absolute reaches the counted totals"
+    );
+    assert!(
+        scene.native.scene.coordinator.pair_targets.is_empty(),
+        "the dropped pair prunes on schedule"
     );
     let coordinator = &scene.native.scene.coordinator;
     assert!(
@@ -7412,9 +7520,48 @@ fn demotion_retirement_round5_folded_edge_semantics_stay_exact() {
         0,
         "the fold releases the edge's semantic occupancy"
     );
-    let charges_after = coordinator.registry.semantic_resource_snapshot();
+    // The fold refunds the edge's semantic charges exactly: a control
+    // scene folded without any S1 claims ends on the identical charge.
+    // (More would leak; less would refund foreign charges.)
+    let mut control = Scene::shared();
+    let control_caller = control.caller;
+    control.native.scene.source.kill(7);
+    control.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut control.native.cookies,
+        "test control exit",
+        1000,
+    );
+    control
+        .native
+        .scene
+        .coordinator
+        .commit_batch(false)
+        .unwrap();
+    control
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[control_caller]);
     assert_eq!(
-        charges_after.charged_bytes, charges_before.charged_bytes,
+        control
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        1,
+        "the control caller retires"
+    );
+    let charges_after = coordinator.registry.semantic_resource_snapshot();
+    let charges_control = control
+        .native
+        .scene
+        .coordinator
+        .registry
+        .semantic_resource_snapshot();
+    assert_eq!(
+        charges_after.charged_bytes, charges_control.charged_bytes,
         "the fold refunds the edge's semantic charges"
     );
     let folded = crate::inventory::render_json(coordinator, "test", 0, 1001, 2);
@@ -7431,7 +7578,8 @@ fn demotion_retirement_round5_folded_edge_semantics_stay_exact() {
     );
     assert_eq!(folded["budgets"]["callers"]["retired"], 1);
     assert_eq!(folded["budgets"]["callers"]["retired_with_calls"], 1);
-    assert_eq!(folded["budgets"]["edges"]["folded"], 1);
+    // Two edges: the counted a.so edge and the watched b.so edge.
+    assert_eq!(folded["budgets"]["edges"]["folded"], 2);
     assert_eq!(folded["budgets"]["edges"]["folded_entries"], pre_entries);
     assert_eq!(folded["layer_totals"]["logical_entries"], pre_entries);
     let module = folded["modules"]
@@ -7583,6 +7731,23 @@ fn demotion_retirement_round5_folded_edge_semantics_stay_exact() {
     );
     assert_eq!(departed["identities_saturated"], false);
     assert_eq!(departed["identities_dropped"], 0);
+    // The watched b.so edge folds into its own module row with zero
+    // entries; the caller is named under both modules it touched.
+    let other = folded["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .find(|module| {
+            module["paths"].as_array().is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| path.ends_with("b.so")))
+            })
+        })
+        .expect("the b.so module renders");
+    assert_eq!(other["departed_use"]["callers"], 1);
+    assert_eq!(other["departed_use"]["edges"], 1);
+    assert_eq!(other["departed_use"]["entries"]["count"], 0);
 }
 
 /// Item 1: a folded load lifetime survives in the departed aggregate:
@@ -7603,8 +7768,7 @@ fn demotion_retirement_round5_folded_instances_stay_exact() {
             .registry
             .edges_of(caller)
             .next()
-            .expect("the shared scene stages one edge")
-            .clone();
+            .expect("the shared scene stages one edge");
         coordinator
             .registry
             .module(edge.module)
@@ -7696,7 +7860,12 @@ fn demotion_retirement_round5_folded_instances_stay_exact() {
         .coordinator
         .note_rendered_callers(&[caller]);
     assert_eq!(
-        scene.native.scene.coordinator.retire_rendered_callers(1001),
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
         1,
         "the proven-exited caller with an instance retires"
     );
@@ -7813,8 +7982,7 @@ fn demotion_retirement_round5_exec_retired_live_operations_settle_at_fold() {
             .registry
             .edges_of(old)
             .next()
-            .expect("the shared scene stages one edge")
-            .clone();
+            .expect("the shared scene stages one edge");
         coordinator
             .registry
             .module(edge.module)
@@ -7904,16 +8072,22 @@ fn demotion_retirement_round5_exec_retired_live_operations_settle_at_fold() {
         .sum();
     scene.native.scene.coordinator.note_rendered_callers(&[old]);
     assert_eq!(
-        scene.native.scene.coordinator.retire_rendered_callers(501),
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(501, None)
+            .retired,
         1,
         "the proven exec-retired caller with calls retires"
     );
+    // ScopedDenied admits no successor (the next catalog admits the
+    // pid afresh); the fold only needs the retired old caller.
     let coordinator = &scene.native.scene.coordinator;
-    let new = coordinator
-        .adapter
-        .live_id(7)
-        .expect("the exec successor stays live");
-    assert_ne!(new, old, "the successor is a new incarnation");
+    assert!(
+        coordinator.adapter.live_id(7).is_none(),
+        "no successor in the scoped-denied scope"
+    );
     let folded = crate::inventory::render_json(coordinator, "test", 0, 501, 3);
     assert_eq!(folded["budgets"]["callers"]["retired"], 1);
     assert_eq!(folded["budgets"]["callers"]["retired_with_calls"], 1);
@@ -7982,4 +8156,48 @@ fn demotion_retirement_round5_exec_retired_live_operations_settle_at_fold() {
             "operations {key}"
         );
     }
+}
+
+/// Item 1: the `-v` memory line attributes the departed aggregate to
+/// its own rows, so folded state never reads as unattributed growth.
+#[test]
+fn demotion_retirement_round5_folded_state_has_memory_rows() {
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test memory exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        1,
+        "the proven-exited caller retires"
+    );
+    let lens = scene.native.scene.coordinator.registry.memory_lens();
+    assert_eq!(
+        lens.departed_identities.len, 2,
+        "the caller is named under both modules it touched"
+    );
+    assert!(
+        lens.departed_identities.bytes > 0,
+        "the identity row estimates bytes"
+    );
+    assert_eq!(
+        lens.departed_mechs.len, 0,
+        "no mechanism rows folded without claims"
+    );
 }

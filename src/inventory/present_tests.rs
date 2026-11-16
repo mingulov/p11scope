@@ -2921,7 +2921,7 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
             "application f7-app0 [c0 pid 70000 incarnation 0] -> module /scale/m0.so [m0]: At least 34 entries observed\n",
             "application f7-app1 [c1 pid 70001 incarnation 0] -> module /scale/m1.so [m1]: At least 55 entries observed\n",
             "Details: retained paths, identities, states and coverage follow.\n",
-            "budgets: callers 2/2 refused 0 retired 0 late 0 | modules 2/2 refused 0 | edges 2/2 refused 0 | endpoints 8/8 refused 0 | counters observed 2 saturated 0 | semantic_state withheld held 0/4 unknown 2 refused 1 | retained_history 1/4 suppressed 0 | inventory_endpoints 0/8 refused 0 | inventory_attach_modules 0/2 refused 0 | native_departed pair_rows 0 pair_base 0 pair_overflow 0 exec_overflow 0 | semantic 128/4096B peak=256 refused=1 | open=0 active=0 pending=0 detached=0 mechanisms=0 categories=0 functions=0 function_bytes=0 function_capacity=0 returns=0 async_bytes=0 async_capacity=0 origins=0 origin_elements=0 origin_capacity=0\n",
+            "budgets: callers 2/2 refused 0 retired 0 with_calls 0 late 0 | modules 2/2 refused 0 | edges 2/2 refused 0 folded 0 entries 0 | endpoints 8/8 refused 0 | counters observed 2 saturated 0 | semantic_state withheld held 0/4 unknown 2 refused 1 | retained_history 1/4 suppressed 0 | inventory_endpoints 0/8 refused 0 | inventory_attach_modules 0/2 refused 0 | native_departed pair_rows 0 pair_base 0 pair_overflow 0 exec_overflow 0 | departed_use mech_overflow 0 identities_dropped 0 | semantic 128/4096B peak=256 refused=1 | open=0 active=0 pending=0 detached=0 mechanisms=0 categories=0 functions=0 function_bytes=0 function_capacity=0 returns=0 async_bytes=0 async_capacity=0 origins=0 origin_elements=0 origin_capacity=0\n",
             "caller c0 pid 70000 incarnation 0 mapped (/usr/bin/f7-app0)\n",
             "caller c1 pid 70001 incarnation 0 mapped (/usr/bin/f7-app1)\n",
             "module m0 /scale/m0.so mapped (admitted)\n",
@@ -3832,7 +3832,8 @@ fn concise_snapshot_keeps_head_limits_and_hint() {
 }
 
 /// v0.8.0: retired rows left the caller list after they were rendered;
-/// the default headline still accounts for them in plain words.
+/// the default headline still accounts for them in plain words,
+/// split by whether they carried attributed calls.
 #[test]
 fn concise_snapshot_names_callers_retired_without_calls() {
     let harness = varied_harness();
@@ -3840,7 +3841,35 @@ fn concise_snapshot_names_callers_retired_without_calls() {
     presentation.budgets.callers_retired = 7;
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        out.lines().any(|line| line == "7 exited without calls"),
+        out.lines()
+            .any(|line| line == "7 exited without attributed calls"),
+        "{out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.contains("folded with")),
+        "no with-calls line without folded calls: {out}"
+    );
+}
+
+/// v0.8.0: callers folded with attributed calls name their folded
+/// entry total on the headline; the without-calls line counts only
+/// the remainder.
+#[test]
+fn concise_snapshot_names_folded_callers_with_calls() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.budgets.callers_retired = 7;
+    presentation.budgets.callers_retired_with_calls = 5;
+    presentation.budgets.edges_folded_entries = 144;
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.lines()
+            .any(|line| line == "2 exited without attributed calls"),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line == "5 departed callers folded with 144 calls"),
         "{out}"
     );
 }

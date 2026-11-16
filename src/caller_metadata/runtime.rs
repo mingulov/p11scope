@@ -200,11 +200,14 @@ impl MetadataFrame {
     }
 
     pub(crate) fn contains(&self, caller: CallerId) -> bool {
+        // A refusal verdict covers every caller the frame serves (see
+        // `metadata` below): caller IDs are lifetime-monotonic, never
+        // dense, so no ID comparison applies here.
         self.rows.as_ref().is_some_and(|rows| {
             rows.rows
                 .binary_search_by_key(&caller, |row| row.caller)
                 .is_ok()
-        }) || (self.refusal.is_some() && (caller.0 as usize) < self.summary.unknown)
+        }) || self.refusal.is_some()
     }
 
     /// Off has no table, allocations, reads, or caller metadata field.
@@ -424,6 +427,17 @@ impl MetadataRuntime {
         self.free.push(index);
     }
 
+    /// One caller's live snapshot status, if it holds a slot. The
+    /// departed fold reads this before [`Self::forget`] so the folded
+    /// identity names the status its row carried; callers never
+    /// scheduled read `None` and count nothing.
+    pub(crate) fn status(&self, id: CallerId) -> Option<MetadataStatus> {
+        self.index
+            .get(&id)
+            .and_then(|index| self.slots.get(*index)?.as_ref())
+            .map(|slot| slot.metadata.status)
+    }
+
     /// The retained table's fixed slots plus the live ID index, for the
     /// `-v` memory line.
     pub(crate) fn table_row(&self) -> crate::memory_counters::CounterRow {
@@ -622,8 +636,10 @@ impl MetadataRuntime {
         }));
         // Slot allocation no longer matches ID order (a forgotten caller's
         // slot is reused by a higher ID); the frame's binary search needs
-        // caller order.
-        rows.sort_by_key(|row| row.caller);
+        // caller order. Unstable: caller IDs are unique, so no equal
+        // keys exist, and the sort borrows no scratch allocation
+        // outside the table budget.
+        rows.sort_unstable_by_key(|row| row.caller);
         assert_eq!(rows.capacity(), count);
         let rows = Arc::new(FrameRows {
             rows: rows.into_boxed_slice(),

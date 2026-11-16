@@ -329,6 +329,7 @@ fn module_evidence(m: &input::Module) -> ModuleEvidence {
         lifecycle: m.lifecycle.clone(),
         unloaded_observed: m.unloaded_observed,
         unbound_use: m.unbound_use.clone(),
+        departed_use: m.departed_use.clone(),
     }
 }
 fn caller_keys(c: &input::Caller) -> Vec<Vec<u8>> {
@@ -360,7 +361,12 @@ fn module_keys(m: &input::Module) -> Vec<Vec<u8>> {
         encoded(&full.identity),
         encoded(&full.paths),
         encoded(&full.admission),
-        encoded(&(&full.lifecycle, full.unloaded_observed, &full.unbound_use)),
+        encoded(&(
+            &full.lifecycle,
+            full.unloaded_observed,
+            &full.unbound_use,
+            &full.departed_use,
+        )),
         encoded(&(
             &full.identity,
             &full.paths,
@@ -368,6 +374,7 @@ fn module_keys(m: &input::Module) -> Vec<Vec<u8>> {
             &full.lifecycle,
             full.unloaded_observed,
             &full.unbound_use,
+            &full.departed_use,
         )),
     ]
 }

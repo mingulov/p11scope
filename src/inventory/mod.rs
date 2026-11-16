@@ -635,6 +635,12 @@ impl EventLogState {
         self.first_error.as_deref()
     }
 
+    /// Whether pass publications reach a live writer: without one the
+    /// emitters track nothing and every edge counts as streamed.
+    pub(crate) fn emits(&self) -> bool {
+        self.writer.is_some()
+    }
+
     /// The refreshed stdout shed totals, if any lines shed so far.
     pub(crate) fn stdout_loss(&self) -> Option<&str> {
         self.stdout_loss.as_deref()
@@ -1964,7 +1970,7 @@ fn run_with_terminal_budget(
                     let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
                 }
                 drop(presentation);
-                retire_rendered_callers(driver, &stream_state, now_ns);
+                retire_rendered_callers(driver, &stream, &mut stream_state, now_ns);
                 // The pass freed its pin batch and transient view; hand
                 // the peak back now that both are dead (see
                 // `reclaim_pass_heap`).
@@ -8815,14 +8821,45 @@ fn stream_view_guarded(
 /// facts; the coordinator only drops state that no later render can need.
 /// The final view is captured after this, so every caller still present
 /// there keeps its row.
-fn retire_rendered_callers(driver: &mut ClassicDriver<'_>, state: &StreamState, now_ns: u64) {
+fn retire_rendered_callers(
+    driver: &mut ClassicDriver<'_>,
+    stream: &EventLogState,
+    state: &mut StreamState,
+    now_ns: u64,
+) {
     let Some(view) = state.last_stream_view.as_ref() else {
         return;
     };
     let ids: Vec<crate::discovery::caller_registry::CallerId> =
         view.callers.iter().map(|caller| caller.id).collect();
-    driver.coordinator.note_rendered_callers(&ids);
-    driver.coordinator.retire_rendered_callers(now_ns);
+    // Fold only callers whose every edge already streamed (or every
+    // caller when no log runs): a folded-never-streamed edge would
+    // leave the stream silently incomplete. Unstreamed callers wait
+    // for the FIFO to serve them, then fold next pass.
+    let foldable: Vec<crate::discovery::caller_registry::CallerId> = if stream.emits() {
+        ids.into_iter()
+            .filter(|id| {
+                driver
+                    .coordinator
+                    .registry()
+                    .edges_of(*id)
+                    .all(|edge| state.edges.has_record(*id, edge.module))
+            })
+            .collect()
+    } else {
+        ids
+    };
+    driver.coordinator.note_rendered_callers(&foldable);
+    let subset = driver.semantic.as_ref().map(|lane| lane.subset());
+    let receipt = driver.coordinator.retire_rendered_callers(now_ns, subset);
+    // Folded rows left the snapshot: drop their stream digests so the
+    // emitters stay bounded by live rows.
+    for (caller, module) in receipt.folded_edges {
+        state.edges.forget(caller, module);
+    }
+    for instance in receipt.folded_instances {
+        state.instances.forget(instance);
+    }
 }
 
 /// The dashboard pass views: `None` while a publication pends
@@ -9085,7 +9122,7 @@ fn run_dashboard(
                     }
                     display.offer(display_view);
                 }
-                retire_rendered_callers(driver, &stream_state, now_ns);
+                retire_rendered_callers(driver, &stream, &mut stream_state, now_ns);
                 // A0 periodic line: every loop pass publishes through
                 // this arm, so the 60 s check lives here.
                 driver.coordinator.maybe_emit_memory_line();
@@ -9858,6 +9895,187 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
             "status": record.init.status,
             "detail": record.init.detail,
         },
+        // Additive (v1, v0.8.0): this module's folded departed
+        // callers (their edges and instances left the snapshot).
+        // `null` until the first fold.
+        "departed_use": record.departed_use.as_ref().map(departed_use_json),
+    })
+}
+
+/// One module's departed aggregate: per-module truth (one caller's
+/// edges at several modules fold into each, so caller counts may
+/// name one caller twice; budgets count each caller once). Counts
+/// sum, distributions count per variant, mechanism rows keep the
+/// edge-row shape with unioned provenance, operations keep the edge
+/// keys with the settlement accounted, identities name the folded
+/// callers up to the shared bounds.
+fn departed_use_json(
+    departed: &crate::discovery::caller_registry::DepartedUse,
+) -> serde_json::Value {
+    let mechanisms = if departed.mechs.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Array(
+            departed
+                .mechs
+                .iter()
+                .map(|(id, row)| {
+                    serde_json::json!({
+                        "mechanism": id,
+                        "mechanism_hex": format!("0x{id:x}"),
+                        "name": crate::mechanism_names::mechanism_name(*id),
+                        "operations": row.ops.iter().copied().collect::<Vec<_>>(),
+                        "calls": row.calls,
+                        "errors": row.errors,
+                        "last_seen_ns": row.last_seen_ns,
+                        "evidence": {
+                            "functions": row.functions.iter().cloned().collect::<Vec<_>>(),
+                            "returns": row.returns.iter().map(|rv| serde_json::json!({
+                                "rv": rv,
+                                "rv_hex": format!("0x{rv:x}"),
+                                "name": crate::semantics_edge::rv_name(*rv),
+                            })).collect::<Vec<_>>(),
+                            "truncated": row.truncated,
+                        },
+                    })
+                })
+                .collect(),
+        )
+    };
+    let operations = if departed.has_claims {
+        let ops = &departed.operations;
+        serde_json::json!({
+            "calls": ops.calls,
+            "started": ops.started,
+            "completed": ops.completed,
+            "cancelled": ops.cancelled,
+            "failed": ops.failed,
+            "unknown": ops.unknown,
+            "orphans": ops.orphans,
+            "dropped": ops.dropped,
+            "last_seen_ns": ops.last_seen_ns,
+            "active": [],
+            "evidence": {
+                "state_reconciliations": ops.evidence.state_reconciliations,
+                "session_cancel_ambiguities": ops.evidence.session_cancel_ambiguities,
+                "session_cancel_unknown_flags": ops.evidence.session_cancel_unknown_flags,
+                "operation_state_imports": ops.evidence.operation_state_imports,
+                "auth_state_ambiguities": ops.evidence.auth_state_ambiguities,
+                "semantic_capture_failures": ops.evidence.semantic_capture_failures,
+                "async_duplicates": ops.evidence.async_duplicates,
+                "async_evictions": ops.evidence.async_evictions,
+                "unmatched_closes": ops.evidence.unmatched_closes,
+            },
+            "settled_machines": ops.settled_machines,
+            "settled_pending": ops.settled_pending,
+            "settled_detached": ops.settled_detached,
+            "settled_open": ops.settled_open,
+            "settled_active": ops.settled_active.iter().map(|((category, state), count)| {
+                serde_json::json!({
+                    "category": category,
+                    "state": state,
+                    "count": count,
+                })
+            }).collect::<Vec<_>>(),
+            "settled_active_overflow": ops.settled_active_overflow,
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    serde_json::json!({
+        "first_ns": departed.first_ns,
+        "callers": departed.callers,
+        "edges": departed.edges,
+        "entries": {
+            "count": departed.entries,
+            "saturated": departed.entries_saturated,
+            "first_min_ns": departed.entries_first_min_ns,
+            "last_max_ns": departed.entries_last_max_ns,
+            "in_flight": departed.entries_in_flight,
+            "logical": departed.logical_entries,
+            "forwarding": departed.forwarding_entries,
+            "observation": departed.entry_observation.iter().map(|(label, count)| (label.to_string(), serde_json::Value::from(*count))).collect::<serde_json::Map<_, _>>(),
+            "coverage": {
+                "counted": departed.coverage_counted,
+                "witnessed": departed.coverage_witnessed,
+                "watched_no_use": departed.coverage_watched_no_use,
+                "lossy": departed.coverage_lossy,
+                "pid_exit": departed.coverage_pid_exit,
+                "unknown": departed.coverage_unknown.iter().map(|(code, count)| (code.to_string(), serde_json::Value::from(*count))).collect::<serde_json::Map<_, _>>(),
+                "since_min_ns": departed.coverage_since_min_ns,
+                "until_max_ns": departed.coverage_until_max_ns,
+                "first_min_ns": departed.coverage_first_min_ns,
+            },
+        },
+        "mapping": {
+            "state": {
+                "mapped": departed.mapping_mapped,
+                "ended": departed.mapping_ended,
+                "uncertain": departed.mapping_uncertain,
+            },
+            "evidence": {
+                "deep_scan": departed.mapping_deep_scan,
+                "maps_match": departed.mapping_maps_match,
+            },
+            "interruptions": departed.mapping_interruptions,
+            "first_min_ns": departed.mapping_first_min_ns,
+            "last_max_ns": departed.mapping_last_max_ns,
+            "reasons": departed.mapping_reasons.iter().map(|(reason, count)| (reason.clone(), serde_json::Value::from(*count))).collect::<serde_json::Map<_, _>>(),
+            "reasons_overflow": departed.mapping_reasons_overflow,
+        },
+        "semantics": {
+            "labels": departed.semantic_labels.iter().map(|(label, count)| (label.to_string(), serde_json::Value::from(*count))).collect::<serde_json::Map<_, _>>(),
+        },
+        "mechanisms": mechanisms,
+        "mechanisms_overflow": {
+            "mechs": departed.mechs_overflow,
+            "calls": departed.mechs_overflow_calls,
+            "errors": departed.mechs_overflow_errors,
+        },
+        "operations": operations,
+        "instances": {
+            "folded": departed.instances_folded,
+            "observed": departed.instances_observed,
+            "uncertain": departed.instances_uncertain,
+            "retired": departed.instances_retired,
+            "settled_live": departed.instances_settled_live,
+            "reasons": departed.instance_reasons.iter().map(|(reason, count)| (reason.to_string(), serde_json::Value::from(*count))).collect::<serde_json::Map<_, _>>(),
+            "null_reasons": departed.instance_null_reasons,
+            "first_min_ns": departed.instance_first_min_ns,
+            "last_max_ns": departed.instance_last_max_ns,
+            "api_returns": departed.instance_api_returns,
+            "api_returns_saturated_rows": departed.instance_api_returns_saturated_rows,
+            "historical_only_returns": departed.instance_historical_only_returns,
+            "lossy_rows": departed.instance_lossy_rows,
+            "loss_reasons": departed.instance_loss_reasons.iter().map(|(reason, count)| (reason.to_string(), serde_json::Value::from(*count))).collect::<serde_json::Map<_, _>>(),
+        },
+        "identities": departed.identities.values().map(|identity| {
+            let exe = identity.exe.as_ref().map(|exe| {
+                serde_json::json!({
+                    "dev": exe.dev,
+                    "ino": exe.ino,
+                    "mtime_secs": exe.mtime_secs,
+                    "mtime_nanos": exe.mtime_nanos,
+                    "path": exe.path,
+                })
+            });
+            serde_json::json!({
+                "caller": identity.caller.label(),
+                "pid": identity.pid,
+                "start_time": identity.start_time,
+                "incarnation": identity.incarnation,
+                "exe": exe,
+                "authority": identity.authority.label(),
+                "lifecycle": identity.lifecycle.label(),
+                "lifecycle_reason": identity.lifecycle_reason,
+                "first_seen_ns": identity.first_seen_ns,
+                "last_seen_ns": identity.last_seen_ns,
+                "exec_observed": identity.exec_observed,
+                "metadata_status": identity.metadata_status.map(|status| status.label()),
+            })
+        }).collect::<Vec<_>>(),
+        "identities_saturated": departed.identities_saturated,
+        "identities_dropped": departed.identities_dropped,
     })
 }
 
@@ -10231,6 +10449,10 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             // the aggregate, not silently lost; the rows no longer
             // appear in `callers[]`.
             "retired": budgets.callers_retired,
+            // Additive (v1, v0.8.0): of those, rows that folded
+            // attributed calls, counted once per caller. The
+            // remainder exited without attributed calls.
+            "retired_with_calls": budgets.callers_retired_with_calls,
             // Additive (v1, v0.8.0): late mapping notes refused for a
             // retired caller incarnation. Counted, never silently
             // merged into a fresh caller row.
@@ -10245,6 +10467,10 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             "limit": budgets.edges_limit,
             "occupied": budgets.edges_occupied,
             "refused": budgets.edges_refused,
+            // Additive (v1, v0.8.0): edge rows folded into the
+            // per-module departed aggregate with their entries.
+            "folded": budgets.edges_folded,
+            "folded_entries": budgets.edges_folded_entries,
         },
         "endpoints": {
             "limit": budgets.endpoints_limit,
@@ -10279,6 +10505,9 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
         "instances": {
             "limit": budgets.instances_limit, "occupied": budgets.instances_occupied,
             "refused": budgets.instances_refused,
+            // Additive (v1, v0.8.0): instance rows folded into the
+            // per-module departed aggregate.
+            "folded": budgets.instances_folded,
         },
         "instance_semantic_state": {
             "limit": budgets.semantic_limit.min(budgets.instances_limit),
@@ -10345,6 +10574,13 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             "pair_prune_overflow": budgets.native_pair_prune_overflow,
             "exec_prune_overflow": budgets.native_exec_prune_overflow,
         },
+        // Additive (v1, v0.8.0): run-wide departed-fold overflow
+        // totals (the per-module rows carry the detail): mechanism
+        // rows past the row bounds and identities past the sets.
+        "departed_use": {
+            "mech_overflow": budgets.departed_mech_overflow,
+            "identities_dropped": budgets.departed_identities_dropped,
+        },
     })
 }
 
@@ -10390,7 +10626,13 @@ mod tests {
     fn budgets_json_publishes_departed_retention_and_late_refusals() {
         let budgets = crate::inventory_present::BudgetView {
             callers_retired: 7,
+            callers_retired_with_calls: 5,
             callers_late_refused: 3,
+            edges_folded: 9,
+            edges_folded_entries: 144,
+            departed_mech_overflow: 1,
+            departed_identities_dropped: 2,
+            instances_folded: 4,
             native_pair_dropped_rows: 11,
             native_pair_dropped_base: 42,
             native_pair_prune_overflow: 2,
@@ -10399,7 +10641,13 @@ mod tests {
         };
         let json = super::budgets_json(&budgets);
         assert_eq!(json["callers"]["retired"], 7);
+        assert_eq!(json["callers"]["retired_with_calls"], 5);
         assert_eq!(json["callers"]["late_refused"], 3);
+        assert_eq!(json["edges"]["folded"], 9);
+        assert_eq!(json["edges"]["folded_entries"], 144);
+        assert_eq!(json["instances"]["folded"], 4);
+        assert_eq!(json["departed_use"]["mech_overflow"], 1);
+        assert_eq!(json["departed_use"]["identities_dropped"], 2);
         assert_eq!(json["native_departed"]["pair_dropped_rows"], 11);
         assert_eq!(json["native_departed"]["pair_dropped_base"], 42);
         assert_eq!(json["native_departed"]["pair_prune_overflow"], 2);

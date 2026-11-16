@@ -141,6 +141,7 @@ pub(super) struct ModuleEvidence {
     pub lifecycle: input::Label,
     pub unloaded_observed: bool,
     pub unbound_use: Option<input::UnboundUse>,
+    pub departed_use: Option<input::DepartedUse>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct ImageEvidence {

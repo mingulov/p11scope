@@ -1168,6 +1168,15 @@ pub(crate) struct ObjectView {
     /// the public template, so the private half never carries the
     /// curve reason.
     pub(crate) keypair_private: bool,
+    /// The view's creation call is one whose own template is
+    /// expected to carry `CKA_EC_PARAMS` for Edwards/Montgomery
+    /// keys: `C_CreateObject`, or slot 0 (public) of a
+    /// `C_GenerateKeyPair` (fix round 5, controller KEYMETA-T1
+    /// fix4 ruling 2026-11-16): a birth fact, set once at
+    /// promotion, never cleared. Gates the unestablished-curve
+    /// reason; the mismatch reason never needs it (it names
+    /// observed facts).
+    pub(crate) creation_expects_curve_params: bool,
 }
 
 /// Cardinalities of retained state.

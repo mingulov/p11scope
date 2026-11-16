@@ -1817,12 +1817,16 @@ pub(crate) mod producer {
     /// query-only key (fix round 4). A mismatched established curve
     /// names the curve reason on the established curve field only
     /// (the requested curve is merely requested, never a label
-    /// fact); an unestablished curve on a complete template with no
-    /// curve seen names it in both blocks. Truncation keeps
-    /// precedence for unseen curves on truncated templates, and the
-    /// unsupported reason keeps precedence for seen-but-valueless
-    /// curves; matched curves on incompatible classes, conflicts
-    /// and non-Edwards/Montgomery types carry none.
+    /// fact); an unestablished curve names it in both blocks only
+    /// for a `C_CreateObject` or a public-half `C_GenerateKeyPair`
+    /// with a complete template and no curve seen (fix round 5:
+    /// unwrap, copy and pair-private templates never carry
+    /// `CKA_EC_PARAMS`, so their absent curve says nothing).
+    /// Truncation keeps precedence for unseen curves on truncated
+    /// templates, and the unsupported reason keeps precedence for
+    /// seen-but-valueless curves; matched curves on incompatible
+    /// classes, conflicts and non-Edwards/Montgomery types carry
+    /// none.
     fn apply_curve_reason(
         view: &ObjectView,
         requested: &mut MetadataBlock,
@@ -1851,7 +1855,8 @@ pub(crate) mod producer {
                 }
             }
             FieldState::Unknown
-                if !view.creation_truncated
+                if view.creation_expects_curve_params
+                    && !view.creation_truncated
                     && !view.creation_seen[field_index(SafeAttributeKind::EcParams)]
                     && matches!(
                         view.requested.field(SafeAttributeKind::EcParams),

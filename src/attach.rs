@@ -4226,18 +4226,28 @@ impl AttachedSemanticSet {
                     .get(*index as usize)
                     .ok_or(SemanticRefusal::Attachment)?;
                 let actual = retained.get(index).ok_or(SemanticRefusal::Attachment)?;
-                // In-place downgrade (A′): a retained slot narrowed to
-                // count-only on its live link keeps validating while
-                // its SLOT_COUNT_ONLY cell is set — same attach key,
-                // object, path and ABI, descriptor 0 with COUNT_ONLY
-                // semantics (controller ruling 2026-11-16 07:43,
-                // REPLACE-INPLACE I1). Anything else still refuses.
-                let mut narrowed = slot.clone();
-                narrowed.descriptor_index = 0;
-                narrowed.semantics = SlotSemantics::COUNT_ONLY;
+                // In-place downgrade (A′): a set switch with a
+                // retained semantic descriptor is a userspace/BPF
+                // disagreement (a failed read-back without rollback,
+                // an inverted guard, or an outside writer) and
+                // refuses. A retained slot narrowed to count-only on
+                // its live link keeps validating while its
+                // SLOT_COUNT_ONLY cell is set, compared on the ruled
+                // fields only — attach key, object, object path, ABI
+                // pin, descriptor 0, COUNT_ONLY — since the merger
+                // keeps evolving names, owners, aliasing and
+                // ambiguity flags past the stored replace output
+                // (controller rulings 2026-11-16 07:43 REPLACE-INPLACE
+                // I1 and 14:57 t3 B1/I3). Anything else still refuses.
+                if switched.contains(index) && actual.slot.descriptor_index != 0 {
+                    return Err(SemanticRefusal::Attachment);
+                }
                 let downgraded = switched.contains(index)
                     && crate::plan::AttachKey::of(&actual.slot) == crate::plan::AttachKey::of(slot)
-                    && actual.slot == narrowed;
+                    && actual.slot.object == slot.object
+                    && actual.slot.object_path == slot.object_path
+                    && actual.slot.descriptor_index == 0
+                    && actual.slot.semantics == SlotSemantics::COUNT_ONLY;
                 if (!downgraded && actual.slot != *slot)
                     || !owned_sides.contains(&(*index, ProbeSide::Entry))
                     || !owned_sides.contains(&(*index, ProbeSide::Return))
@@ -7716,9 +7726,16 @@ impl Session {
 
     /// Required slots whose `SLOT_COUNT_ONLY` cell reads set: the
     /// attested revalidation admits a retained slot narrowed to
-    /// count-only exactly on these. A missing/unreadable map reads as
-    /// none set — no downgrade could have committed without it — and
-    /// an unreadable cell keeps its strict equality check.
+    /// count-only exactly on these. Only slots whose retained entry
+    /// differs from the plan slot pay the cell read: the sole
+    /// in-tree writer always updates the retained entry with the
+    /// switch, so no committed downgrade hides behind an identical
+    /// entry. A set switch under an identical retained entry is
+    /// reachable only through an out-of-band map write; out-of-band
+    /// switch integrity belongs to Packet 2 with the never-cleared
+    /// switch. A missing/unreadable map reads as none set — no
+    /// downgrade could have committed without it — and an unreadable
+    /// cell keeps its strict equality check.
     fn count_only_switched(&self, attached: &AttachedSemanticSet) -> BTreeSet<u32> {
         let mut switched = BTreeSet::new();
         let gate: Option<Array<_, u32>> = self
@@ -7728,8 +7745,18 @@ impl Session {
         let Some(gate) = gate else {
             return switched;
         };
+        let plan = attached.subset.plan();
         for required in attached.subset.required().values() {
             for index in required {
+                let (Some(retained), Some(slot)) = (
+                    self.retained_static.get(index),
+                    plan.slots.get(*index as usize),
+                ) else {
+                    continue;
+                };
+                if retained.slot == *slot {
+                    continue;
+                }
                 if gate.get(index, 0).is_ok_and(|cell| cell != 0) {
                     switched.insert(*index);
                 }
@@ -9410,10 +9437,21 @@ impl Session {
         // refuses that slot, since a semantic attach over a set
         // switch would silently run count-only.
         let mut switch_refused: Vec<(u32, String)> = Vec::new();
-        let gate: Option<Array<_, u32>> = self
-            .ebpf
-            .map("SLOT_COUNT_ONLY")
-            .and_then(|map| Array::try_from(map).ok());
+        let gate: Option<Array<_, u32>> = match self.ebpf.map("SLOT_COUNT_ONLY") {
+            // Objects without the switch (Inventory, counter, today's
+            // builds): the absent switch map stays open and the attach
+            // keeps today's behavior.
+            None => None,
+            Some(map) => match Array::try_from(map) {
+                Ok(gate) => Some(gate),
+                // A present but wrong-shaped switch map stays open too:
+                // the BPF cell read fails open (unset, so the probes
+                // run the cookie descriptor) and skipping keeps
+                // userspace coherent with what the probes run. Packet 2
+                // owns this gate.
+                Err(_) => None,
+            },
+        };
         if let Some(gate) = gate {
             for slot in targets {
                 if slot.descriptor_index == 0 {

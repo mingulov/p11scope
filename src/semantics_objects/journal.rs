@@ -9513,7 +9513,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 28] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 29] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -9554,6 +9554,9 @@ pub(crate) mod tests {
         // pair call through the joint scene, appended for the same
         // reason.
         "C_GenerateKeyPair",
+        // Fix round 5: the unwrap twin drives a full unwrap call
+        // through the joint scene, appended for the same reason.
+        "C_UnwrapKey",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface

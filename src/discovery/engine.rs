@@ -23022,6 +23022,15 @@ impl Engine {
         }
         let mut module = proof.module.clone();
         module.view = Self::RUN_LEARNED_VIEW_ID;
+        // Generation-local addresses never identify a persistent
+        // table: consecutive provers map the same tables at
+        // different addresses (ASLR), so the raw address would
+        // defeat the union below and stack a copy per prover. The
+        // file offset is the stable identity (attach, merge and
+        // render read only it); the address normalizes to zero.
+        for table in &mut module.tables {
+            table.address = 0;
+        }
         // Mirrors `merge_scanned_module`'s push decision exactly
         // (first 5-tuple match wins; a decoder-ABI mismatch against
         // it files beside, never into), so the cap below holds

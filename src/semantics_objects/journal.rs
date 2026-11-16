@@ -647,8 +647,10 @@ impl JournalDomainProof {
 /// Ordinary records naming proved-irrelevant functions observe the image
 /// without affecting it; a fork sighting of a child image always counts
 /// as affecting (inherited provider state). Consumed-history facts:
-/// voids never clear them, so a voided interval stays unbridgeable and
-/// only genuinely new images birth after a void.
+/// voids never clear them. Exec-marker novelty stays strict (a fenced
+/// past is still a past); the reseed fallback may attach-birth the
+/// same image at/above the fence, and its seal still refuses staged
+/// history the cut does not cover.
 #[derive(Debug, Clone, Copy)]
 struct ImageSighting {
     first_seen: u64,
@@ -1452,18 +1454,21 @@ pub(crate) struct JournalAdapter {
     /// Terminals expected-absent because the journal deliberately
     /// released their BEGIN (JK-19b): (image, native key) pairs whose
     /// BEGIN was refused-due-to-taint, dropped by a taint, disposed
-    /// as an unclaimable original, or wiped by a void. Their terminal
-    /// keeps the
+    /// as an unclaimable original, or wiped by a void — each with
+    /// the released call's function ordinal. Their terminal keeps the
     /// Contradiction disposition and telemetry, but it is the release
     /// working as intended — a bursting shed-tainted image's own later
     /// ENDs — not new evidence, so it never promotes to a permanent
     /// taint. Consumed on arrival: a second terminal for one key is
     /// genuinely duplicative and promotes. Image-scoped, so one
     /// image's refused keys never excuse another image's unmatched
-    /// terminal. Capped at the open-table bound (the same key
-    /// population); past the cap new keys are not recorded and their
-    /// terminals promote (fail closed).
-    derived_absent: BTreeSet<((u64, u64), JournalNativeKey)>,
+    /// terminal. The stored function lets a shed-taint lift purge
+    /// state-changing absences (their terminals must still taint)
+    /// and lets an untainted arrival require an effect-neutral call
+    /// with a clean return. Capped at the open-table bound (the same
+    /// key population); past the cap new keys are not recorded and
+    /// their terminals promote (fail closed).
+    derived_absent: BTreeMap<((u64, u64), JournalNativeKey), u32>,
     /// Shed-taints lifted by timely binding (JK-19b): images whose
     /// pre-bind sheds stay first-observed / not attributed, eligible
     /// for the Exec-to-attach birth fallback. Capped like the taint
@@ -1597,7 +1602,7 @@ impl JournalAdapter {
             tainted_images: BTreeSet::new(),
             taint_overflow: false,
             shed_only_taints: BTreeSet::new(),
-            derived_absent: BTreeSet::new(),
+            derived_absent: BTreeMap::new(),
             lifted_images: BTreeSet::new(),
             contradictions: JournalContradictionDiagnosis::default(),
             sightings: BTreeMap::new(),
@@ -2144,7 +2149,7 @@ impl JournalAdapter {
         if self.is_tainted(image) {
             // Its terminal will arrive unmatched: expected-absent
             // because of this refusal, never a promotion.
-            self.note_derived_absence(image, key);
+            self.note_derived_absence(image, key, function);
             return JournalDisposition::Refused;
         }
         if self.open.contains_key(&key) {
@@ -2265,12 +2270,58 @@ impl JournalAdapter {
     fn ingest_end(&mut self, ordinal: u64, end: ValidatedJournalEnd) -> JournalDisposition {
         let key = (end.thread(), end.sequence());
         let Some(entry) = self.open.get(&key) else {
-            if self.take_derived_absence(end_image(&end), key) {
-                // The journal deliberately released this call's BEGIN
-                // (a taint refusal/drop, an unclaimable-original
-                // disposal, or a void wipe), so its END is
-                // expected-absent: keep the disposition and telemetry,
-                // but do not promote to a permanent taint for it.
+            let image = end_image(&end);
+            if self.is_tainted(image) {
+                // On a tainted image the release is the taint working
+                // as intended (a refused BEGIN or a dropped open of
+                // any function, any return): consume the excuse
+                // without promoting, so exit-churn terminals never
+                // revoke a shed-taint's lift. Without an excuse the
+                // terminal is new evidence and promotes (duplicates,
+                // foreign terminals).
+                if self.take_derived_absence(image, key).is_some() {
+                    self.contradictions.note(TaintCause::Contradiction(
+                        JournalContradiction::TerminalBeforeBegin,
+                    ));
+                    return JournalDisposition::Contradiction(
+                        JournalContradiction::TerminalBeforeBegin,
+                    );
+                }
+                self.taint_image(
+                    image,
+                    TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
+                );
+                return JournalDisposition::Contradiction(
+                    JournalContradiction::TerminalBeforeBegin,
+                );
+            }
+            // On a clean image only an effect-neutral terminal with a
+            // clean return is excused: a state-changing call that
+            // outlived its release (a void wipe, a shed-taint drop
+            // plus lift) is unattributed state change, never the
+            // release working as intended — excusing it could let a
+            // later bind of a reused handle name a destroyed key. The
+            // return classes mirror the unclaimable-original disposal
+            // (Ok, Partial and plain Failed alone); the END passed
+            // wire validation, so malformed reads false exactly as
+            // there. The excuse is consumed either way: a second
+            // terminal for one key still promotes.
+            let excused = self
+                .take_derived_absence(image, key)
+                .is_some_and(|function| {
+                    disposes_unclaimable_original(function)
+                        && matches!(
+                            super::state::return_class(
+                                function,
+                                end.payload_base().event.rv,
+                                false
+                            ),
+                            super::state::Outcome::Ok
+                                | super::state::Outcome::Partial
+                                | super::state::Outcome::Failed
+                        )
+                });
+            if excused {
                 self.contradictions.note(TaintCause::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
                 ));
@@ -2279,7 +2330,7 @@ impl JournalAdapter {
                 );
             }
             self.taint_image(
-                end_image(&end),
+                image,
                 TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
             );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
@@ -2334,10 +2385,13 @@ impl JournalAdapter {
             // accompanying fault independently invalidates. Without a BEGIN
             // the key is unrepresentable, never silently absorbed.
             let image = (abandon.image_cookie(), abandon.image_exec());
-            if self.take_derived_absence(image, key) {
+            if self.take_derived_absence(image, key).is_some() {
                 // The journal deliberately released this call's BEGIN:
                 // keep the disposition and telemetry, but do not
-                // promote to a permanent taint for it.
+                // promote to a permanent taint for it. (Abandons carry
+                // no return, so function safety rests on the
+                // record-time filter and the lift purge, which leave
+                // only neutral absences on a clean image.)
                 self.contradictions.note(TaintCause::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
                 ));
@@ -2620,15 +2674,17 @@ impl JournalAdapter {
         self.note_image_taint(image);
         // Opens dropped by this taint leave their terminals
         // expected-absent: record their keys so the unmatched
-        // terminals do not promote a shed-taint to permanent.
-        let dropped_keys: Vec<JournalNativeKey> = self
+        // terminals do not promote a shed-taint to permanent. The
+        // stored function lets a later lift purge state-changing
+        // absences (their terminals must still taint).
+        let dropped_keys: Vec<(JournalNativeKey, u32)> = self
             .open
             .iter()
             .filter(|(_, entry)| entry.image == image)
-            .map(|(key, _)| *key)
+            .map(|(key, entry)| (*key, entry.function))
             .collect();
-        for key in dropped_keys {
-            self.note_derived_absence(image, key);
+        for (key, function) in dropped_keys {
+            self.note_derived_absence(image, key, function);
         }
         self.remove_open_where(|_, entry| entry.image == image);
         let dropped: Vec<RefusedBegin> = self
@@ -2669,6 +2725,13 @@ impl JournalAdapter {
         self.tainted_images.remove(&image);
         self.shed_only_taints.remove(&image);
         self.lifted_images.insert(image);
+        // The lift keeps neutral absences but purges state-changing
+        // ones: a destroy that outlived the taint is unattributed
+        // state change, so its terminal must still taint (fail
+        // closed) instead of riding the lift into a clean image.
+        self.derived_absent.retain(|(absent_image, _), function| {
+            *absent_image != image || disposes_unclaimable_original(*function)
+        });
         self.claims_prune_dirty = true;
     }
 
@@ -2683,18 +2746,21 @@ impl JournalAdapter {
     /// Record one (image, key) whose terminal is expected-absent
     /// because the journal deliberately released its BEGIN (a taint
     /// refusal/drop, an unclaimable-original disposal, or a void
-    /// wipe). Capped at the open-table bound; past the cap the key is
-    /// not recorded and its terminal promotes (fail closed).
-    fn note_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) {
+    /// wipe), with the released call's function ordinal for the lift
+    /// purge and the arrival gate. Capped at the open-table bound;
+    /// past the cap the key is not recorded and its terminal
+    /// promotes (fail closed).
+    fn note_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey, function: u32) {
         if self.derived_absent.len() < self.limits.open_calls {
-            self.derived_absent.insert((image, key));
+            self.derived_absent.insert((image, key), function);
         }
     }
 
-    /// Consume one expected-absent terminal: true when this image's key
-    /// was recorded derived-absent. A second terminal for one key finds
-    /// nothing and promotes (genuinely duplicative).
-    fn take_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) -> bool {
+    /// Consume one expected-absent terminal: the released call's
+    /// function when this image's key was recorded derived-absent.
+    /// A second terminal for one key finds nothing and promotes
+    /// (genuinely duplicative).
+    fn take_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) -> Option<u32> {
         self.derived_absent.remove(&(image, key))
     }
 
@@ -5484,7 +5550,7 @@ impl JournalAdapter {
         }
         let missing_terminal = entry.end.is_none();
         if missing_terminal {
-            self.note_derived_absence(entry.image, native);
+            self.note_derived_absence(entry.image, native, entry.function);
         }
         let entry = self
             .open
@@ -7213,19 +7279,29 @@ impl JournalAdapter {
         debug_assert!(self.void_wiped.len() <= self.limits.open_calls);
         // The wiped BEGINs' terminals will arrive unmatched: the void
         // deliberately released them, so they are expected-absent, never
-        // new taint evidence. Calls whose terminal already arrived
-        // (a staged END/ABANDON) expect nothing more, so they stay out:
-        // a re-delivered terminal for them is genuinely duplicative and
-        // still promotes. Recorded before the table clears, under the
-        // same open-table cap (past it, terminals promote).
-        let wiped: Vec<((u64, u64), JournalNativeKey)> = self
+        // new taint evidence — but only effect-neutral calls that the
+        // live entry would accept a terminal for. A state-changing
+        // call that outlived its wipe is unattributed state change
+        // (excusing it could name a destroyed key), and a terminal
+        // the live entry would reject as a contradiction (staged
+        // END/ABANDON, NO_END, corroborated return) stays rejected:
+        // those stay out, so their terminals still promote.
+        // Recorded before the table clears, under the same open-table
+        // cap (past it, terminals promote).
+        let wiped: Vec<((u64, u64), JournalNativeKey, u32)> = self
             .open
             .iter()
-            .filter(|(_, entry)| entry.end.is_none() && entry.abandon.is_none())
-            .map(|(key, entry)| (entry.image, *key))
+            .filter(|(_, entry)| {
+                entry.end.is_none()
+                    && entry.abandon.is_none()
+                    && !entry.begin.no_end()
+                    && entry.corroborated_return.is_none()
+                    && disposes_unclaimable_original(entry.function)
+            })
+            .map(|(key, entry)| (entry.image, *key, entry.function))
             .collect();
-        for (image, key) in wiped {
-            self.note_derived_absence(image, key);
+        for (image, key, function) in wiped {
+            self.note_derived_absence(image, key, function);
         }
         self.open.clear();
         self.ledger.release_all_h8open();

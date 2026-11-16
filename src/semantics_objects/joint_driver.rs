@@ -454,7 +454,7 @@ type ResourceContext<'a> = (
     &'a BTreeMap<JournalNativeKey, OpenEntry>,
     &'a SessionDrainProducers,
     &'a BTreeSet<(u64, u64)>,
-    &'a BTreeSet<((u64, u64), JournalNativeKey)>,
+    &'a BTreeMap<((u64, u64), JournalNativeKey), u32>,
 );
 
 /// One bounded original poll. Neither the wire buffer nor its audit establishes
@@ -2166,7 +2166,7 @@ impl RawJointQuantum {
         open: &BTreeMap<JournalNativeKey, OpenEntry>,
         producers: &SessionDrainProducers,
         tainted: &BTreeSet<(u64, u64)>,
-        absent: &BTreeSet<((u64, u64), JournalNativeKey)>,
+        absent: &BTreeMap<((u64, u64), JournalNativeKey), u32>,
         refused: &mut bool,
     ) -> Option<JointResourceOrigin> {
         let key = match record {
@@ -2213,7 +2213,10 @@ impl RawJointQuantum {
                     // would void the whole collection
                     // (ResourceUnavailable) for image-local noise.
                     // Under exit churn that voids every pass and no
-                    // birth ever seals.
+                    // birth ever seals. Which terminals are excused
+                    // is the journal's rule (neutral calls, clean
+                    // returns, lift purge); presence here is the
+                    // whole collection rule.
                     let image = match record {
                         JournalRecord::End(end) => {
                             let base = end.payload_base();
@@ -2226,7 +2229,7 @@ impl RawJointQuantum {
                             unreachable!("begin records return above")
                         }
                     };
-                    if tainted.contains(&image) || absent.contains(&(image, key)) {
+                    if tainted.contains(&image) || absent.contains_key(&(image, key)) {
                         return None;
                     }
                     *refused = true;

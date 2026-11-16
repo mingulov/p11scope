@@ -2234,12 +2234,15 @@ impl SemanticCapture {
                 // fresh exec whose READY marker verified above, but whose
                 // pre-cut history was sighted below the cut, can never
                 // exec-birth. Its shed-taint lifted on timely binding, or
-                // its pre-cut history is fenced clean after a void, so it
-                // births as attach-observed at the same cut instead;
-                // pre-cut history stays first-observed / not attributed.
-                // Only lifted or fenced-clean images fall back; unfenced
-                // sheds without a lift, absences and contradiction taints
-                // keep refusing.
+                // its first affecting call sits at/below the void
+                // watermark, so it births as attach-observed at the same
+                // cut instead; pre-cut history stays first-observed /
+                // not attributed. Only lifted or first-affecting-fenced
+                // images fall back; unfenced sheds without a lift,
+                // absences and contradiction taints keep refusing. The
+                // fallback birth's seal still refuses staged history
+                // the cut does not cover, so a post-void call staged
+                // before the cut cannot certify through the fallback.
                 let fallback =
                     crate::semantics_objects::journal::SessionBirthGrant::issue(ValidatedH0Birth {
                         proof: *proof,

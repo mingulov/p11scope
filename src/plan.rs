@@ -4039,25 +4039,29 @@ impl AttachPlan {
         let prior_keys: BTreeSet<AttachKey> = self.slot_by_key.keys().copied().collect();
         // Exact reuse assignments the extension will apply: migrated and
         // reclaimed keys cost no fresh cell, so they never count toward
-        // what an object must shed.
+        // what an object must shed. Freshness is counted by ownership —
+        // the modules linked to a cell — not by key object, so a module
+        // that only co-owns or forwards shared fresh cells still sheds
+        // them instead of stranding them ownerless.
         let (migrated, reclaimed, _) = self.reuse_assignments(rebuilt);
-        let fresh_of = |object: PinnedObjectId| {
-            rebuilt
-                .slot_by_key
-                .keys()
-                .filter(|key| key.object == object)
-                .filter(|key| {
-                    !prior_keys.contains(key)
-                        && !migrated.contains_key(key)
-                        && !reclaimed.contains_key(key)
-                })
-                .count()
-        };
+        let mut fresh_of: BTreeMap<ModuleId, usize> = BTreeMap::new();
+        for (key, position) in &rebuilt.slot_by_key {
+            if prior_keys.contains(key) || migrated.contains_key(key) || reclaimed.contains_key(key)
+            {
+                continue;
+            }
+            let Some(slot) = rebuilt.slots.get(*position) else {
+                continue;
+            };
+            for id in &slot.module_ids {
+                *fresh_of.entry(*id).or_default() += 1;
+            }
+        }
         rebuilt
             .modules
             .iter()
             .enumerate()
-            .filter(|(_, module)| fresh_of(module.object) > 0)
+            .filter(|(_, module)| fresh_of.get(&module.id).copied().unwrap_or(0) > 0)
             .max_by(|(left_position, left), (right_position, right)| {
                 (
                     Self::fallback_class_rank(left.admission_class),

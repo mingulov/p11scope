@@ -106,7 +106,9 @@ fn switched_calls_decide_begin_through_the_narrowed_arm() {
 /// an affecting (or unknown) class marks its history honestly
 /// incomplete with a scope gap but no semantic-capture-failure
 /// count. An unswitched call keeps today's decision, including the
-/// Gap (with evidence) for a planned descriptor 0.
+/// Gap (with evidence) for a planned descriptor 0 — and a set bit
+/// with descriptor 0 (a planned slot over a stale switch) keeps the
+/// same Gap, since only a downgraded cookie descriptor narrows.
 #[test]
 fn begin_action_narrows_only_switched_slots() {
     use p11scope_ebpf_common::LinuxLayout;
@@ -116,6 +118,11 @@ fn begin_action_narrows_only_switched_slots() {
             root_writers::begin_action(true, 21, 1, layout),
             BeginAction::Skip,
             "a switched proved-irrelevant call skips silently"
+        );
+        assert_eq!(
+            root_writers::begin_action(true, 0, 1, layout),
+            BeginAction::Gap { evidence: true },
+            "a planned descriptor 0 keeps its Gap even with the bit set"
         );
         for configured in [0, 2, 3, 4, u32::MAX] {
             assert_eq!(

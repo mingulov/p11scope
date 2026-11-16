@@ -309,6 +309,10 @@ attach::tests::collected_retirement_stopped_session_q_closes_original_lp64
 attach::tests::revival_probe_clears_a_live_detached_slot_lp64
 attach::tests::revival_probe_never_clears_a_singles_slot_lp64
 attach::tests::revival_probe_skips_a_quarantined_slot_after_a_failed_detach_lp64
+# In-place downgrade (A′): fifty semantic→count-only downgrades on one
+# live slot with a gated call in flight each round; entered == returned
+# == ground truth, links unchanged, no gap row.
+attach::tests::downgrade_in_place_tight_loop_keeps_exact_counts_lp64
 # Installed linked control: a real Session sealed over the loaded journal
 # pair drains linked through the live wiring (behavioral seal-to-drain
 # linkage, 6.06). Same owned fixture Session shape as the retirement

@@ -32,7 +32,7 @@ FORBIDDEN_HELPERS = {4, 25, 112, 114, 115, 130, 131, 132, 133, 134}
 ALLOWED_HELPERS = {1, 2, 3, 5, 12, 14, 37, 80, 156, 158, 174}
 FORBIDDEN_ENDPOINT_MAPS = {
     "EVENTS", "DESCRIPTORS", "MECH_SHAPE", "ATTR_BOOL_BITS", "ASYNC_FUNCTIONS",
-    "TAIL_CALLS", "PAIR_CALLS",
+    "TAIL_CALLS", "PAIR_CALLS", "SLOT_COUNT_ONLY",
 }
 # Aggregate-only endpoints construct START without semantic image/marker
 # seeding. This closed inventory keeps the same physical owner/lease and

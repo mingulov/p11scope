@@ -118,7 +118,7 @@ def consumer_case(variant, suffix, disassembly=None):
     section, name, lines = matches[0]
     text = CHECKER["joined"](split, section) if section == ".text" else CHECKER["joined"](split, section, ".text")
     calls = {pc: target for caller, _, pc, target in CHECKER["D"].internal_call_targets(text) if caller == name and target is not None}
-    outlined = section == ".text" and name.endswith(("ordinary_return", "object_return"))
+    outlined = section == ".text" and name.endswith(("ordinary_return", "object_return", "object_return_ordinary"))
     cls = CHECKER["_ReturnCaller"] if outlined or name == "p11_return" else CHECKER["_SeedCaller"]
     initial = {"r1": ("context", 0), "r2": ("external_key", ("uretprobe", "p11_return"), 0),
         "r3": ("owned", 7, 0), "r4": ("scope_flags", ("uretprobe", "p11_return")),
@@ -2099,11 +2099,12 @@ class EntryObjectTests(unittest.TestCase):
         self.assertIn("descriptor_source_contract", CHECKER,
                       "the entry checker proves the switch-gated descriptor source")
         for variant in OBJECTS:
-            names = ["p11_entry", "ordinary_return", "object_return"] \
+            names = ["p11_entry", "ordinary_return", "object_return_ordinary"] \
                 if variant == "default" else [
                     "p11_entry", "p11_entry_ia32", "p11_entry_template",
                     "p11_entry_template_pair", "p11_entry_template_second",
-                    "p11_entry_template_types", "ordinary_return", "object_return"]
+                    "p11_entry_template_types", "ordinary_return",
+                    "object_return_ordinary"]
             for name in names:
                 with self.subTest(variant=variant, consumer=name):
                     report = descriptor_source_case(variant, name)
@@ -2114,22 +2115,37 @@ class EntryObjectTests(unittest.TestCase):
 
     def test_slot_count_only_removal_rejects_the_descriptor_source(self):
         for variant in OBJECTS:
-            names = ["p11_entry"] if variant == "default" else [
-                "p11_entry", "p11_entry_template_second"]
+            names = ["p11_entry", "ordinary_return", "object_return_ordinary"] \
+                if variant == "default" else [
+                    "p11_entry", "p11_entry_ia32", "p11_entry_template",
+                    "p11_entry_template_pair", "p11_entry_template_second",
+                    "p11_entry_template_types", "ordinary_return",
+                    "object_return_ordinary"]
             for name in names:
-                consumer, _, _, _ = consumer_case(variant, name)
-                facts = consumer.facts()
-                lookups = [pc for pc, text in consumer.insns
-                           if pc in consumer.helper and text == "call 0x1"
-                           and facts.get(pc, {}).get("r1") == ("map", "SLOT_COUNT_ONLY")]
-                self.assertGreaterEqual(len(lookups), 1,
+                report = descriptor_source_case(variant, name)
+                self.assertGreaterEqual(len(report["switch_lookups"]), 1,
                                         f"{variant} {name} reads SLOT_COUNT_ONLY")
-                pc = lookups[0]
-                with self.subTest(variant=variant, consumer=name, control="switch lookup removed"), \
-                        self.assertRaisesRegex(RuntimeError, "descriptor source"):
-                    descriptor_source_case(
-                        variant, name,
-                        mutate(OBJECTS[variant], consumer.name, pc, "call 0x1", "r0 = 0x0"))
+                self.assertGreaterEqual(len(report["flag_branches"]), 1,
+                                        f"{variant} {name} tests the switch flag")
+                consumer, _, _, _ = consumer_case(variant, name)
+                lookup = report["switch_lookups"][0]
+                flag = report["flag_branches"][0]
+                flag_text = consumer.text[flag]
+                self.assertIn("goto", flag_text, f"{variant} {name} flag branch shape")
+                flipped = flag_text.replace("==", "!=", 1) \
+                    if "==" in flag_text else flag_text.replace("!=", "==", 1)
+                self.assertNotEqual(flipped, flag_text)
+                changes = [
+                    ("switch lookup removed", lookup, "call 0x1", "r0 = 0x0"),
+                    ("flag test removed", flag, flag_text, "goto +0x0"),
+                    ("flag polarity flipped", flag, flag_text, flipped),
+                ]
+                for control, pc, old, new in changes:
+                    with self.subTest(variant=variant, consumer=name, control=control), \
+                            self.assertRaisesRegex(RuntimeError, "descriptor source"):
+                        descriptor_source_case(
+                            variant, name,
+                            mutate(OBJECTS[variant], consumer.name, pc, old, new))
 
 
 if __name__ == "__main__":

@@ -22351,6 +22351,601 @@ fn key_operation_at_fence_receipt_resumes() {
     );
 }
 
+/// A voided feed reseeds onto a fresh receipt at or above its recorded
+/// fence: H3 loss ends the segment degraded (history disposed,
+/// `authority_lost`); the old cut-zero receipt never resumes, but a fresh
+/// attach receipt at the fence (or above it) starts a new Joint segment
+/// with the closed segment's loss still counted. Later seals attribute.
+#[test]
+fn key_operation_reseed_after_fenced_h3_loss_succeeds() {
+    for fresh_cut in [1u64, 2u64] {
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        assert_eq!(bootstrap.birth_cut(), 0);
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut edge = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        prepare_call(
+            &mut scene,
+            &mut staging,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        let mut failure = scene.adapter.scripted_failure(
+            JournalGap::H3Loss,
+            &bootstrap,
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+        failure.fence = Some(1);
+        let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+        let (outcome, _) = staging.apply_algorithm_failure_for_test(
+            &failure,
+            &mut h3,
+            &scene.model,
+            scene.adapter.ledger_mut(),
+            &mut edge,
+            &mut keyuse,
+            instance,
+            &mut sink,
+            None,
+        );
+        assert!(
+            matches!(
+                outcome,
+                crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+            ),
+            "H3 loss disposes: {outcome:?}"
+        );
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+        assert!(staging.degraded_loss());
+        assert_eq!(staging.segment_fence_for_test(), Some(1));
+        assert!(
+            !staging.resume_joint(),
+            "the old cut-zero receipt below the fence never resumes"
+        );
+        let fresh = BootstrapReceipt::scripted(
+            bootstrap.proof(),
+            BirthKind::AttachObserved,
+            fresh_cut,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            staging.reselect_joint(&fresh),
+            "a fresh receipt at/above the fence reseeds (cut {fresh_cut})"
+        );
+        assert_eq!(staging.mode(), FeedMode::Joint);
+        assert_eq!(staging.selected_receipt(), Some(&fresh));
+        assert!(!staging.degraded_loss());
+        assert!(!staging.fell_back());
+        assert_eq!(staging.history_disposed(), 1);
+        assert_eq!(staging.history_disposed_since_resume(), 0);
+        prepare_call(
+            &mut scene,
+            &mut staging,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        assert_eq!(staging.staged_len(), 1, "new calls stage Joint again");
+    }
+}
+
+/// A fault-voided feed reseeds too: fault changes never resume onto the
+/// old receipt (no clean point on the fenced segment), but a fresh birth
+/// at the fence starts a new Joint segment. Only a new birth recovers.
+#[test]
+fn key_operation_reseed_after_fenced_fault_change_succeeds() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::FaultChanged,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        ),
+        "fault change disposes: {outcome:?}"
+    );
+    assert!(!staging.resume_joint(), "a faulted segment never resumes");
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        staging.reselect_joint(&fresh),
+        "a fresh birth at the fence reseeds the faulted feed"
+    );
+    assert_eq!(staging.mode(), FeedMode::Joint);
+}
+
+/// A fenced fallback reseeds as well: the ingest-break void replays staged
+/// calls as unknown-key rows and ends the segment; a fresh receipt at the
+/// fence resumes Joint with the replay still counted.
+#[test]
+fn key_operation_reseed_after_fenced_ingest_break_succeeds() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::IngestBreakLoss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 1 }
+        ),
+        "the ingest break replays: {outcome:?}"
+    );
+    assert!(!staging.resume_joint(), "below the fence never resumes");
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        staging.reselect_joint(&fresh),
+        "a fresh receipt at the fence reseeds the fallen-back feed"
+    );
+    assert_eq!(staging.mode(), FeedMode::Joint);
+    assert_eq!(staging.fallback_replayed(), 1);
+}
+
+/// Reseed refusals: a fresh receipt naming another incarnation, a cut
+/// below the fence, a tripped watchdog, an already-Joint feed, a
+/// never-Joint feed, or staged remainder all refuse. The old receipt
+/// stays, the mode stays, and no wrong-key row can follow.
+#[test]
+fn key_operation_reseed_refuses_wrong_receipts_and_states() {
+    // A degraded below-fence feed to reseed from.
+    fn degraded() -> (JointScene, BootstrapReceipt, JointStaging) {
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut edge = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        prepare_call(
+            &mut scene,
+            &mut staging,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        let mut failure = scene.adapter.scripted_failure(
+            JournalGap::H3Loss,
+            &bootstrap,
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+        failure.fence = Some(1);
+        let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+        let (outcome, _) = staging.apply_algorithm_failure_for_test(
+            &failure,
+            &mut h3,
+            &scene.model,
+            scene.adapter.ledger_mut(),
+            &mut edge,
+            &mut keyuse,
+            instance,
+            &mut sink,
+            None,
+        );
+        assert!(matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        ));
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+        (scene, bootstrap, staging)
+    }
+    // Another incarnation's receipt never reseeds this feed.
+    {
+        let (scene, bootstrap, mut staging) = degraded();
+        let other = JointScene::new();
+        assert_ne!(
+            scene.proof, other.proof,
+            "the twin scenes prove distinct incarnations"
+        );
+        let wrong = BootstrapReceipt::scripted(
+            other.proof,
+            BirthKind::AttachObserved,
+            1,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            !staging.reselect_joint(&wrong),
+            "another incarnation never reseeds this feed"
+        );
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+        assert_eq!(staging.selected_receipt(), Some(&bootstrap));
+    }
+    // A cut below the fence would certify voided history.
+    {
+        let (_, bootstrap, mut staging) = degraded();
+        let below = BootstrapReceipt::scripted(
+            bootstrap.proof(),
+            BirthKind::AttachObserved,
+            0,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            !staging.reselect_joint(&below),
+            "a below-fence cut never reseeds"
+        );
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+    }
+    // A tripped watchdog never reseeds.
+    {
+        let (_, bootstrap, mut staging) = degraded();
+        assert!(staging.note_watchdog_trip() || staging.watchdog_tripped());
+        let fresh = BootstrapReceipt::scripted(
+            bootstrap.proof(),
+            BirthKind::AttachObserved,
+            1,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            !staging.reselect_joint(&fresh),
+            "a tripped feed never reseeds"
+        );
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+    }
+    // An already-Joint feed needs no reseed.
+    {
+        let scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let fresh = BootstrapReceipt::scripted(
+            bootstrap.proof(),
+            BirthKind::AttachObserved,
+            1,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            !staging.reselect_joint(&fresh),
+            "an already-Joint feed never reseeds"
+        );
+        assert_eq!(staging.mode(), FeedMode::Joint);
+        assert_eq!(staging.selected_receipt(), Some(&bootstrap));
+    }
+    // A never-Joint feed upgrades, it never reseeds.
+    {
+        let scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_s1_only();
+        assert!(
+            !staging.reselect_joint(&bootstrap),
+            "a never-Joint feed never reseeds"
+        );
+        assert_eq!(staging.mode(), FeedMode::S1Only);
+        assert_eq!(staging.selected_receipt(), None);
+    }
+    // Staged remainder blocks a reseed.
+    {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        prepare_call(
+            &mut scene,
+            &mut staging,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        assert_eq!(staging.staged_len(), 1);
+        let fresh = BootstrapReceipt::scripted(
+            bootstrap.proof(),
+            BirthKind::AttachObserved,
+            0,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            !staging.reselect_joint(&fresh),
+            "staged remainder blocks a reseed"
+        );
+    }
+}
+
+/// A second birth for the same instance after a fenced void reseeds its
+/// feed: the H3 loss ends the Joint segment below the fence, then a fresh
+/// attach receipt at the fence (same incarnation, strictly newer cut)
+/// reselects Joint with the closed loss still counted. Later calls track.
+#[test]
+fn key_operation_second_birth_after_fenced_void_reseeds_feed() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        ),
+        "the void ends the feed degraded: {outcome:?}"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only)
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0);
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), fresh),
+        "a second birth installs for the voided instance"
+    );
+    guarded.registry.note_instance(AdmittedInstance::scripted(
+        joint_key.clone(),
+        guarded.caller,
+    ));
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "the fresh receipt at the fence reseeds Joint"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+}
+
+/// A second birth naming another incarnation never reseeds: the voided
+/// feed keeps its old receipt, stays S1Only with its loss counted, and
+/// no wrong-key row can follow.
+#[test]
+fn key_operation_second_birth_with_wrong_incarnation_never_reseeds() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    let other = JointScene::new();
+    assert_ne!(
+        guarded.scene.proof, other.proof,
+        "the twin scenes prove distinct incarnations"
+    );
+    let wrong = BootstrapReceipt::scripted(
+        other.proof,
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), wrong)
+    );
+    guarded.registry.note_instance(AdmittedInstance::scripted(
+        joint_key.clone(),
+        guarded.caller,
+    ));
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "another incarnation never reseeds this feed"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0);
+}
+
+/// A fenced void ending a Joint feed queues its image for a reseed
+/// birth; an unfenced fallback ending the feed queues nothing (its
+/// clean-point resume still works), and a second void on the already
+/// S1Only feed queues nothing more. Only endings re-arm.
+#[test]
+fn key_operation_fenced_void_ending_feed_queues_reseed_once() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    let queued = guarded.registry.drain_joint_reseed_queue();
+    assert_eq!(queued.len(), 1, "one ending queues one reseed");
+    assert_eq!(
+        (queued[0].task_cookie, queued[0].exec_id),
+        (101, 1),
+        "the queued image is the voided feed's"
+    );
+    // A second void on the already-S1Only feed queues nothing more.
+    let mut again = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    again.fence = Some(2);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let _ = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &again,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(
+        guarded.registry.drain_joint_reseed_queue().is_empty(),
+        "a non-ending void queues nothing"
+    );
+    // An unfenced fallback ending a Joint feed queues nothing: its
+    // clean-point resume (no fence) still works without a new birth.
+    let mut fresh = GuardedScene::new();
+    let bootstrap = fresh.scene.bootstrap();
+    let joint_key = fresh.key(1);
+    assert!(
+        fresh
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = fresh.register(1);
+    let (facts, position) =
+        fresh.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    fresh.observe(&joint_key, position, facts);
+    fresh
+        .registry
+        .publish_with_ledger(fresh.scene.adapter.ledger_mut());
+    let failure = fresh.scene.adapter.scripted_failure(
+        JournalGap::ResourceUnavailable,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    assert!(failure.fence.is_none());
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = fresh.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &fresh.scene.model,
+        fresh.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 1 }
+    ));
+    assert!(
+        fresh.registry.drain_joint_reseed_queue().is_empty(),
+        "an unfenced ending queues nothing"
+    );
+}
+
 /// v0.7.0 issue 3 (fallback twin): a clean resume clears the
 /// `proof_refused_fallback` latch the same way — the replayed calls
 /// stay counted, the section reads populated. JK-22: the pre-resume

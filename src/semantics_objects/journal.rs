@@ -2714,6 +2714,24 @@ impl JournalAdapter {
         self.is_tainted(image)
     }
 
+    /// Whether a novelty-broken birth for this image may fall back to
+    /// attach-observed for a reseed: the image is clean (never tainted)
+    /// and its pre-cut affecting history is fenced (at/below the void
+    /// watermark) or absent. Unfenced pre-cut history (no void yet)
+    /// never reseeds — the shed-then-bind refusal without a lift stays.
+    /// Untracked images never reseed.
+    pub(crate) fn novelty_broken_reseed_eligible(&self, image: (u64, u64)) -> bool {
+        if self.is_tainted(image) {
+            return false;
+        }
+        let Some(sighting) = self.sightings.get(&image) else {
+            return false;
+        };
+        sighting
+            .first_affecting
+            .is_none_or(|at| at <= self.voided_through)
+    }
+
     /// Promote one image's taint to permanent for independent
     /// raw/original-refusal evidence: shed-only lift eligibility is
     /// revoked first, including for an already shed-tainted image,
@@ -13486,6 +13504,79 @@ pub(crate) mod tests {
         .expect("absence at the fence attests");
         let success = scene.seal(&resume).expect("absence at the fence seals");
         assert_eq!(success.prefix.settled().len(), 1);
+    }
+
+    /// A novelty-broken birth reseeds only when its pre-cut history is
+    /// fenced and its image is clean: after an H3 void, the same image
+    /// (old affecting history at/below the fence, never tainted) may
+    /// fall back to attach-observed at a new cut; an untracked image, a
+    /// tainted image, or unfenced pre-cut history (no void yet) never
+    /// reseeds — the shed-then-bind refusal without a lift stays.
+    #[test]
+    fn object_journal_novelty_broken_reseed_needs_fenced_clean_history() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        // Unfenced pre-cut history never reseeds (no void yet).
+        assert!(
+            !scene.adapter.novelty_broken_reseed_eligible((COOKIE, EXEC)),
+            "unfenced pre-cut history never reseeds"
+        );
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        assert_eq!(scene.adapter.consumed_through, 3);
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        // Fenced clean history reseeds: the same image and the shed
+        // image both sit at/below the fence with no taint.
+        assert!(
+            scene.adapter.novelty_broken_reseed_eligible((COOKIE, EXEC)),
+            "fenced clean history reseeds"
+        );
+        assert!(
+            scene
+                .adapter
+                .novelty_broken_reseed_eligible((x_image.task_cookie, x_image.exec_id)),
+            "a fenced shed image reseeds"
+        );
+        // An untracked image never reseeds.
+        assert!(
+            !scene
+                .adapter
+                .novelty_broken_reseed_eligible((COOKIE + 99, EXEC)),
+            "an untracked image never reseeds"
+        );
+        // A tainted image never reseeds, even when fenced.
+        scene.adapter.taint_image_for_test((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.novelty_broken_reseed_eligible((COOKIE, EXEC)),
+            "a tainted image never reseeds"
+        );
     }
 
     #[test]

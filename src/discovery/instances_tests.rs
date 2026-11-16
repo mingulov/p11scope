@@ -675,6 +675,39 @@ mod full_image {
         assert!(!r.birth_retry_armed(bare, FILE));
     }
 
+    /// A voided image re-arms its birth retry for a reseed: after the
+    /// first birth consumed the retry, re-arming offers one more birth
+    /// in a later quantum; unknown and retired images re-arm nothing.
+    #[test]
+    fn reseed_rearms_birth_retry_for_observed_images_only() {
+        use crate::semantics_objects::journal::joint_driver::RawQuantumIdentity as Q;
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        r.end_birth_retry(identity, FILE);
+        assert!(!r.birth_retry_armed(identity, FILE));
+        assert_eq!(r.rearm_image_for_reseed(identity), 1);
+        assert!(r.birth_retry_armed(identity, FILE));
+        assert!(
+            r.note_birth_offer(identity, FILE, Q::scripted(99)),
+            "the re-armed retry offers one more birth"
+        );
+        assert_eq!(
+            r.rearm_image_for_reseed(image(0x99, 0)),
+            0,
+            "an unknown image re-arms nothing"
+        );
+        r.retire_image(identity);
+        assert_eq!(
+            r.rearm_image_for_reseed(identity),
+            0,
+            "a retired image re-arms nothing"
+        );
+    }
+
     /// A key sighted `New` keeps its birth armed across quiet passes
     /// until its first admission, so the pass holding its first call
     /// can still birth it; the outcome itself stays `Continued`. The

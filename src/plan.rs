@@ -4817,7 +4817,10 @@ impl AttachPlan {
         }
         // Stripped cells keep the capture topology's owner: a sole
         // survivor owns its counts again instead of reading the
-        // ambiguity the shed just removed.
+        // ambiguity the shed just removed. A cell owned by one module
+        // again, with unaliased names, sheds the ambiguity mark with
+        // it: the mark named the removed sharing, not the names. Cells
+        // that stay shared, or whose names stay merged, keep it.
         for position in stripped {
             let owner = self
                 .slots
@@ -4825,6 +4828,16 @@ impl AttachPlan {
                 .map(|slot| AggregateOwner::from_module_ids(&slot.module_ids));
             if let (Some(owner), Some(current)) = (owner, self.aggregate_owners.get_mut(position)) {
                 *current = owner;
+            }
+            let sole = matches!(
+                self.aggregate_owners.get(position),
+                Some(AggregateOwner::Sole(_))
+            );
+            if sole
+                && let Some(slot) = self.slots.get_mut(position)
+                && !slot.aliased
+            {
+                slot.semantic_ambiguous = false;
             }
         }
         self.excise_freed_cells(&freed);

@@ -21617,6 +21617,17 @@ fn select_user_pids_lazily_stops_after_limit() {
     assert_eq!(thread_calls, 3, "skipped threads still cost one read each");
 }
 
+/// A table-free proof module for the file-learning tests below:
+/// they prove the file only, so run-table harvest (which needs
+/// decoded tables or interfaces) must not change their behavior.
+fn owned_proof_module_without_tables(key: ObjectKey) -> ScannedModule {
+    let mut module = crate::discovery::identity::test_fixture::module(key);
+    module.tables.clear();
+    module.interfaces.clear();
+    module.exports.clear();
+    module
+}
+
 #[test]
 fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     use crate::discovery::identity::test_fixture::real_scan_pin;
@@ -21624,7 +21635,8 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     let backing = dir.path().join("libprov.so");
     std::fs::write(&backing, "p11scope-fixture:shared-provider-bytes").expect("write backing");
     let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
-    let object = pins.pinned().next().expect("one pin").id;
+    let pin = pins.pinned().next().expect("one pin");
+    let object = pin.id;
     let me = std::process::id();
     let mut sleeper = std::process::Command::new("sleep")
         .arg("30")
@@ -21654,6 +21666,7 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         // below); staging itself is naming-agnostic.
         loader_exe: None,
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: owned_proof_module_without_tables(pin.key),
     }];
     engine.learn_owned_proofs(&pins, &proofs);
     assert_eq!(
@@ -21698,6 +21711,7 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         object,
         loader_exe: None,
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: owned_proof_module_without_tables(pin.key),
     }];
     engine.learn_owned_proofs(&pins, &child_proofs);
     assert!(
@@ -21730,8 +21744,10 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
     .expect("write transient backing");
     let retained_pins = real_scan_pin(&retained_backing, None, 400, &"ab".repeat(32));
     let transient_pins = real_scan_pin(&transient_backing, None, 400, &"cd".repeat(32));
-    let retained_object = retained_pins.pinned().next().expect("one pin").id;
-    let transient_object = transient_pins.pinned().next().expect("one pin").id;
+    let retained_pin = retained_pins.pinned().next().expect("one pin");
+    let transient_pin = transient_pins.pinned().next().expect("one pin");
+    let retained_object = retained_pin.id;
+    let transient_object = transient_pin.id;
     let me = std::process::id();
     let mut sleeper = std::process::Command::new("sleep")
         .arg("30")
@@ -21760,6 +21776,7 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
         object: retained_object,
         loader_exe: None,
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: owned_proof_module_without_tables(retained_pin.key),
     }];
     let transient_proofs = vec![OwnedLearnProof {
         view: ProcessViewId(9),
@@ -21767,6 +21784,7 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
         object: transient_object,
         loader_exe: None,
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: owned_proof_module_without_tables(transient_pin.key),
     }];
     engine.learn_owned_proofs(&retained_pins, &retained_proofs);
     engine.learn_owned_proofs(&transient_pins, &transient_proofs);
@@ -21823,12 +21841,14 @@ fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
     // The capture found the loader gone: the stored naming is the
     // finite unknown, while the loader reads live (a recycled pid's
     // exe link must never leak into the staged file).
+    let pin = pins.pinned().next().expect("one pin");
     let proofs = vec![OwnedLearnProof {
         view: ProcessViewId(7),
         path: backing.to_string_lossy().into_owned(),
         object,
         loader_exe: None,
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: owned_proof_module_without_tables(pin.key),
     }];
     engine.learn_owned_proofs(&pins, &proofs);
     assert_eq!(
@@ -21844,6 +21864,135 @@ fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
         engine.pending_learned[0].loader_unknown_reason,
         Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         "the stored finite unknown travels with the proof"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// E1 table harvest: a transient descendant's scan that decoded
+/// tables (a getter-only provider: three exports, hidden table
+/// functions, the kryoptic/haskoki shape that default `run` leaves
+/// blind) must persist those tables as run-persistent scan inputs,
+/// so the next live candidate attaches the table functions without
+/// waiting for frame admission. Today the proof carries the file
+/// only and the decoded tables are dropped: the candidate has no
+/// table module at all.
+#[test]
+fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let backing = dir.path().join("libgetteronly.so");
+    std::fs::write(&backing, "p11scope-fixture:getter-only-provider-bytes").expect("write backing");
+    let pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
+    let pin = pins.pinned().next().expect("one pin");
+    let key = pin.key;
+    let object = pin.id;
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    // The prover is never admitted (no retained view): the
+    // short-lived-worker shape whose tables must persist anyway.
+    let path = backing.to_string_lossy().into_owned();
+    let mut module = fixture_module(key);
+    module.path = path.clone();
+    module.exports = vec![
+        "C_GetFunctionList".into(),
+        "C_GetInterface".into(),
+        "C_GetInterfaceList".into(),
+    ];
+    module.tables = vec![ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: ["C_Initialize", "C_GetSlotList", "C_OpenSession"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ScannedEntry {
+                name,
+                object: key,
+                object_path: path.clone(),
+                file_offset: 0x1000 + index as u64 * 0x10,
+            })
+            .collect(),
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    module.interfaces = vec![ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table: Some(0),
+    }];
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the scan-proven file still stages"
+    );
+    let candidate = engine
+        .live_candidate_with_pending(
+            engine.pinned.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("a live candidate builds over the learned tables");
+    assert_eq!(
+        candidate.modules.len(),
+        1,
+        "the transient scan's tables persist as a run-persistent scan input"
+    );
+    let harvested = &candidate.modules[0];
+    assert_eq!(
+        harvested.scanned.tables.len(),
+        1,
+        "the harvested table survives the bind"
+    );
+    assert_eq!(
+        harvested.scanned.tables[0]
+            .entries
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["C_Initialize", "C_GetSlotList", "C_OpenSession"],
+        "every in-object entry binds"
+    );
+    assert_eq!(
+        harvested.scanned.interfaces.len(),
+        1,
+        "the harvested interface survives the bind"
+    );
+    assert!(
+        !candidate.plan.slots.is_empty(),
+        "the live plan attaches the harvested table functions"
     );
     sleeper.kill().expect("kill sleeper");
     sleeper.wait().expect("reap sleeper");

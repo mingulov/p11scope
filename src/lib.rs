@@ -231,6 +231,8 @@ mod key_operation_tests;
 #[cfg(test)]
 mod manifest_getter_privileged_tests;
 #[cfg(test)]
+mod run_learned_tables_privileged_tests;
+#[cfg(test)]
 mod s1_tests;
 #[cfg(test)]
 mod s2s3_tests;

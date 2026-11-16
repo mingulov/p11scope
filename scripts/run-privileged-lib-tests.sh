@@ -649,6 +649,10 @@ manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_program_th
 manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly
 manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed
 manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_counts_static_program_exactly
+# Default-run table learning: sequential short-lived workers over a
+# getter-only provider (hidden table functions, the kryoptic shape)
+# must have their table calls counted without a manifest.
+run_learned_tables_privileged_tests::privileged_run_default_learns_tables_for_a_getter_only_provider
 # sudo -o ownership: reports created in an invoker-owned directory are
 # handed to SUDO_UID:SUDO_GID (0600); elsewhere they stay root-owned.
 output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker

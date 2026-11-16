@@ -855,6 +855,19 @@ SLOT_SIZING_KEYS = {
 DEEP_SCAN_SELECTION_KEYS = {
     "processes", "deep_scanned", "shape_covered", "scan_cap",
 }
+# Zero-byte snapshot: the complete per-class discovery retry breakdown
+# (`evidence.discovery_retry_classes`, render.rs `Evidence`). Present if
+# and only if discovery retried at least one view; absent, never null,
+# otherwise. Keys are the six finite noise labels (src/discovery/noise.rs
+# `DiscoveryNoiseClass::label`); values are the saturating u64 counts over
+# the whole capture, strictly positive since only nonzero classes appear.
+# Labels and counts are finite — the stderr first samples that may name
+# target paths never reach this key. Counts only, never verdicts: the
+# paired `skipped` rows carry the cause.
+DISCOVERY_RETRY_CLASSES = {
+    "process-ended", "maps-snapshot", "object-missing",
+    "process-view", "stale-view", "other",
+}
 SLOT_STATS_BYTES = 296
 SLOT_SIZING_RV_ENTRIES = 8192
 SLOT_SIZING_RV_KEY_BYTES = 16
@@ -1346,6 +1359,14 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and "deep_scan_selection" in evidence:
         wanted.add("deep_scan_selection")
         exact_deep_scan_selection(evidence["deep_scan_selection"])
+    # Zero-byte snapshot: the complete per-class retry breakdown (schema
+    # v3 `discovery_retry_classes`): additive in every current lane that
+    # renders it — profile, metrics, owned-run and terminal trace
+    # evidence all flow through here — while retained v2-metrics
+    # documents predate it.
+    if not historical and "discovery_retry_classes" in evidence:
+        wanted.add("discovery_retry_classes")
+        exact_discovery_retry_classes(evidence["discovery_retry_classes"])
     # The refused-pause annotation, additive in every lane that renders
     # it (owned runs only in practice; the key stays absent elsewhere).
     if not historical and "pause_refused" in evidence:
@@ -1597,6 +1618,29 @@ def exact_deep_scan_selection(selection):
         deep_scanned + shape_covered <= processes,
         f"deep_scan_selection counts exceed its processes: {selection!r}",
     )
+
+
+def exact_discovery_retry_classes(breakdown):
+    """The additive retry breakdown (schema v3 `discovery_retry_classes`):
+    a nonempty object mapping each nonzero noise label to its positive
+    u64 count. Present only when discovery retried, so a present-but-empty
+    object — like a null, a non-object, an unknown label, or a
+    non-positive or uncountable value — fails closed. Counts only; it
+    never feeds verdicts by itself — the paired `skipped` rows carry the
+    cause."""
+    require(
+        isinstance(breakdown, dict) and bool(breakdown),
+        f"discovery_retry_classes must be a nonempty object: {breakdown!r}",
+    )
+    require(
+        set(breakdown) <= DISCOVERY_RETRY_CLASSES,
+        f"discovery_retry_classes labels: {breakdown!r}",
+    )
+    for label in sorted(breakdown):
+        require(
+            u64(breakdown[label], positive=True),
+            f"invalid discovery_retry_classes.{label}: {breakdown!r}",
+        )
 
 
 def exact_counter_bank_gaps(gaps):
@@ -5106,6 +5150,46 @@ def self_test():
     lookalike["evidence"]["slot_sizing_note"] = "trimmed"
     rejected(lambda: validate_clean_metrics(lookalike, {"C_Initialize": 1}))
     print("slot_sizing rides the metrics lane unchanged and pins its shape: OK")
+    # Zero-byte snapshot (schema v3 `discovery_retry_classes`): the live
+    # four-class breakdown rides the clean metrics lane. The key is
+    # informational only: completeness is untouched.
+    retried = copy.deepcopy(clean)
+    retried["evidence"]["discovery_retry_classes"] = {
+        "maps-snapshot": 84,
+        "other": 106,
+        "process-ended": 14,
+        "process-view": 13635,
+    }
+    validate_clean_metrics(retried, {"C_Initialize": 1})
+    require(
+        retried["evidence"]["completeness"] == clean["evidence"]["completeness"],
+        "discovery_retry_classes alone must not move completeness",
+    )
+    # ... but the pin stays exact: a present-but-empty object, a null or
+    # non-object value, an unknown label, a zero, negative, boolean,
+    # oversized, string or null count all fail — as does a lookalike
+    # unknown key beside the real one.
+    for mutate in (
+        lambda doc: doc["evidence"].update(discovery_retry_classes={}),
+        lambda doc: doc["evidence"].update(discovery_retry_classes=None),
+        lambda doc: doc["evidence"].update(discovery_retry_classes=[]),
+        lambda doc: doc["evidence"]["discovery_retry_classes"].update(
+            [("bogus-label", 1)]
+        ),
+        lambda doc: doc["evidence"]["discovery_retry_classes"].update(other=0),
+        lambda doc: doc["evidence"]["discovery_retry_classes"].update(other=-1),
+        lambda doc: doc["evidence"]["discovery_retry_classes"].update(other=True),
+        lambda doc: doc["evidence"]["discovery_retry_classes"].update(other=2**64),
+        lambda doc: doc["evidence"]["discovery_retry_classes"].update(other="106"),
+        lambda doc: doc["evidence"]["discovery_retry_classes"].update(other=None),
+    ):
+        bad = copy.deepcopy(retried)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_clean_metrics(bad, {"C_Initialize": 1}))
+    lookalike = copy.deepcopy(clean)
+    lookalike["evidence"]["discovery_retry_class"] = {"other": 1}
+    rejected(lambda: validate_clean_metrics(lookalike, {"C_Initialize": 1}))
+    print("discovery_retry_classes rides the metrics lane unchanged and pins its shape: OK")
     # Retained v2-metrics documents predate the ring cross-check: the
     # historical fixture carries no `ring_accounting` key, and one added
     # back is refused like any other newer base key.

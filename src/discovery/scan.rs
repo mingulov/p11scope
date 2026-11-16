@@ -7645,6 +7645,19 @@ fn scan_view_examined_mode(
                 )));
             }
         };
+        // `ESRCH` from `/proc/<pid>/mem` proves the process exited between
+        // the maps read and the mem open: the pid names no process. That is
+        // the ordinary end of a process — already counted via the exit ledger
+        // (descendant gaps) — never a memory-unreadable loss, so the scan
+        // takes the exited error path (the engine drops the view silently,
+        // like a pid that exited before discovery) instead of latching a
+        // global `scan_unavailable`. A short-lived child exiting mid-scan
+        // must not fail a never-mapped cell.
+        if let Err(error) = &mem
+            && error.raw_os_error() == Some(libc::ESRCH)
+        {
+            return Err(exited_before_discovery(pid));
+        }
         let unavailable = mem.as_ref().err().map(|error| {
             let (class, publishes) = mem_unavailable(error);
             if class == "ptrace" {
@@ -11273,6 +11286,62 @@ mod tests {
         assert_eq!(
             mem_unavailable(&Error::from_raw_os_error(libc::EIO)),
             ("unreadable", true)
+        );
+    }
+
+    /// A child that exits between the maps read and the mem open surfaces
+    /// `ESRCH` from `/proc/<pid>/mem`. That is the ordinary end of a
+    /// process, already counted via the exit ledger (descendant gaps) —
+    /// not a memory-unreadable loss. The scan returns the exited error
+    /// so the engine drops the view silently instead of latching a
+    /// global `scan_unavailable` that would fail never-mapped cells.
+    #[test]
+    fn mem_esrch_mid_scan_takes_the_exited_path_not_unavailable() {
+        struct EsrchMemIo {
+            maps: Vec<u8>,
+        }
+        impl ScanIo for EsrchMemIo {
+            type Memory = File;
+            fn open_maps(
+                &mut self,
+                _: &ProcessView,
+                _: &mut CaptureWorkBudget,
+            ) -> std::io::Result<Box<dyn Read>> {
+                Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
+            }
+            fn open_mem(
+                &mut self,
+                _: &ProcessView,
+                _: &mut CaptureWorkBudget,
+            ) -> std::io::Result<File> {
+                Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+            }
+            fn final_generation(
+                &mut self,
+                view: &ProcessView,
+                _: &mut CaptureWorkBudget,
+            ) -> Result<(), String> {
+                view.run_while_same(|| ())
+            }
+        }
+        let pid = std::process::id();
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("own view opens");
+        let maps = b"00400000-00401000 r--p 00000000 08:01 1234 /bin/true\n".to_vec();
+        let mut io = EsrchMemIo { maps };
+        let result = scan_process_view_with_io(
+            &ScanRequest {
+                pid,
+                hints: &[],
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut io,
+        );
+        let error = result.expect_err("ESRCH mem must take the exited path, not Unavailable");
+        assert!(
+            error.contains(&format!("pid {pid} exited before discovery")),
+            "{error}"
         );
     }
 

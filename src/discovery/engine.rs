@@ -18172,7 +18172,15 @@ impl Engine {
             &self.counters.object_skips,
             &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
         );
-        let views = modules.iter().map(|module| module.scanned.view).collect();
+        // The reserved run-learned owner is not a process
+        // generation: it must never enter generation-currency
+        // checks (admission staleness, attach pre/post-checks), or
+        // every candidate carrying learned tables aborts as stale.
+        let views = modules
+            .iter()
+            .map(|module| module.scanned.view)
+            .filter(|view| *view != Self::RUN_LEARNED_VIEW_ID)
+            .collect();
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "live_merge_tail",

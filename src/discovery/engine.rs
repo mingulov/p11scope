@@ -23546,6 +23546,35 @@ impl Engine {
         self.plan_rebuild_stable = false;
         self.learned_unapplied = true;
         self.learned_frame_owed = true;
+        // A fresh staging proves a provider mapped in-tree right now:
+        // members sitting out a rescan backoff and retained views
+        // scanned before the load get a prompt table-proving scan,
+        // or a fast mapped phase ends first and only the exports
+        // attach. Owned-run scope only; the refresh queue bounds
+        // the burst loudly, and backoff resumes after the prompt
+        // round. No pid is trusted here (a recycled pid is never
+        // named): every unproven member rescans, every retained
+        // view refreshes.
+        if self.owned_run_pid.is_some() && matches!(self.scope, Scope::Cgroup { .. }) {
+            for entry in self.owned_watch_unproven.values_mut() {
+                entry.unproductive = 0;
+                entry.next_eligible_ns = 0;
+            }
+            let now_ns = crate::attach::monotonic_ns();
+            let pids: Vec<u32> = self.views.iter().map(ProcessView::pid).collect();
+            for pid in pids {
+                self.request_refresh(pid, now_ns);
+            }
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: learned provider {} stages {} files; {} watch members and {} views owe a prompt rescan",
+                    candidate.display_path,
+                    fresh,
+                    self.owned_watch_unproven.len(),
+                    pids.len(),
+                );
+            }
+        }
         if crate::run::capture_diagnostics_on() {
             let loader = note
                 .exe

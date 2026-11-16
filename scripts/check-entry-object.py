@@ -2643,6 +2643,7 @@ def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_
 class _ReturnCaller(_SeedCaller):
     """An outlined frame with explicit external key and START parameters."""
     identity = ("uretprobe", "p11_return")
+    tail_boundary = ("event", 0x170)
 
     def transfer(self, pc, incoming):
         state = super().transfer(pc, incoming)
@@ -2709,10 +2710,21 @@ class _ReturnCaller(_SeedCaller):
         # A tail adapter only writes its ObjectCallWire destination. The
         # base event and local snapshot are disjoint from that narrow region.
         if any(target.endswith(suffix) for suffix in ("object_tail_fill", "object_emit_find", "object_emit_get_attributes")):
-            require(incoming.get("r1") == ("event", 0x170), self.label(pc)+": return tail output boundary")
+            if self.tail_boundary is not None:
+                require(incoming.get("r1") == self.tail_boundary, self.label(pc)+": return tail output boundary")
             if ("event_slot",) in incoming:
                 state[("event_slot",)] = incoming[("event_slot",)]
         return state
+
+
+class _JournalReturnCaller(_ReturnCaller):
+    """An outlined journal return frame: return dataflow without the
+    Detailed tail-output pin. The journal END record lays out its tail
+    differently, so the ("event", 0x170) boundary does not apply; the
+    descriptor-source proof needs key/switch flow, not the tail
+    boundary, and uses this subclass only for the journal object."""
+    identity = ("uretprobe", "p11_return_journal")
+    tail_boundary = None
 
 
 class _ReturnRootProof(SinkProof):
@@ -3316,6 +3328,18 @@ class _SwitchConsumer(Consumer):
         # gated selector on a re-arriving edge must land even when the
         # accumulated state learned it from another edge first. A
         # conflicting present fact still kills it through _correlate.
+        # Soundness pin (review F2): these keeps preserve an
+        # already-built correlation across the asymmetric join; they
+        # never build one (only opposite-side constants do, in
+        # _correlate) and never override a conflicting present fact
+        # (that kills the gate and the joined fact stands). The
+        # ("switch",) side facts are excluded here and stay plain
+        # must-join. A gate kept where a stricter join would drop it
+        # can only refine a gated compare the accumulated state
+        # already spans; the entry-root verdicts built on these keeps
+        # were additionally audited consumer by consumer against the
+        # compiled objects, and the removal/polarity mutations pin
+        # that no verdict survives its switch wiring removed.
         for key, fact in state.items():
             if (key not in previous and key != ("switch",)
                     and isinstance(fact, tuple) and fact and fact[0] == "switch_gated"):
@@ -3358,8 +3382,6 @@ class _SwitchConsumer(Consumer):
             if side == ("switch", "set") and const[1] == gate[1]:
                 return gate
             if side == ("switch", "unset") and const[1] == gate[2]:
-                return gate
-            if side is None and const[1] in (gate[1], gate[2]):
                 return gate
             return None
         return None
@@ -3410,7 +3432,12 @@ def descriptor_source_contract(consumer, variant, blocks, initial=None, outlined
     Every DESCRIPTORS lookup must be keyed by the cookie high word on
     the switch-unset side only: the joined must-facts at the lookup
     must carry ("switch", "unset"), which a switch-set path reaching
-    the lookup would kill. Returns the switch inventory the tests pin.
+    the lookup would kill. The object marker joins the same
+    inventory: every object_marker_for call must sit on the unset
+    side too, and every in-consumer OBJECT_DESCRIPTORS lookup is
+    reported and must not be cookie-keyed off the unset side. Code
+    reachable only via a set edge must read no call arguments.
+    Returns the switch inventory the tests pin.
     """
     facts0 = consumer.facts(initial)
     identity = getattr(consumer, "identity", (consumer.section, consumer.name))
@@ -3432,12 +3459,67 @@ def descriptor_source_contract(consumer, variant, blocks, initial=None, outlined
     for pc in lookups:
         require(facts.get(pc, {}).get(("switch",)) == ("switch", "unset"),
                 consumer.label(pc) + ": descriptor source joins the count-only arm")
+    obj_lookups = [pc for pc, text in consumer.insns
+                   if pc in consumer.helper and text == "call 0x1"
+                   and facts0.get(pc, {}).get("r1") == ("map", "OBJECT_DESCRIPTORS")]
+    for pc in obj_lookups:
+        # Object-block internals key OBJECT_DESCRIPTORS by
+        # object-state-derived values under the object_required guard
+        # (dynamically unset-only; the guard's correlation is lost
+        # through the native START round-trip, so the switch proof
+        # cannot place them). A use the proof cannot place must at
+        # least not be keyed by the live cookie: that combination —
+        # cookie-keyed and set-reaching — would bypass the marker.
+        key = stack_read(facts0.get(pc, {}), facts0.get(pc, {}).get("r2"), 4)
+        placed = facts.get(pc, {}).get(("switch",)) == ("switch", "unset")
+        require(placed or key != ("high", identity),
+                consumer.label(pc) + ": descriptor source (OBJECT_DESCRIPTORS) is cookie-keyed off the unset side")
+    marker_calls = [pc for pc, target in consumer.calls.items()
+                    if target.endswith("object_marker_for")]
+    for pc in marker_calls:
+        require(facts.get(pc, {}).get(("switch",)) == ("switch", "unset"),
+                consumer.label(pc) + ": descriptor source (object_marker_for) joins the count-only arm")
     exits = {pc for pc, text in consumer.insns if text == "exit"}
     live_set = [pc for pc, (set_target, _) in prog.flag_branches.items()
                 if exits & D.reachable(consumer.graph, [set_target])]
     require(live_set, consumer.name + ": descriptor source set arm reaches no exit")
+    set_reads = set_arm_argument_reads(consumer, prog)
+    require(not set_reads,
+            consumer.name + ": descriptor source set arm reads arguments: "
+            + ", ".join(f"{pc} {kind} {target}" for pc, kind, target in sorted(set_reads)))
     return {"descriptor_source": "count_only_gated", "switch_lookups": switches,
-            "flag_branches": sorted(prog.flag_branches), "descriptors_lookups": lookups}
+            "flag_branches": sorted(prog.flag_branches), "descriptors_lookups": lookups,
+            "object_marker_lookups": obj_lookups, "object_marker_calls": marker_calls,
+            "set_arm_argument_reads": sorted(set_reads)}
+
+
+ARGUMENT_READER_SUFFIXES = ("capture_scalar", "arg_u64", "read_word", "walk_template",
+                            "decode_params", "object_marker_for")
+USER_READ_HELPERS = ("call 0x70", "call 0x72")
+
+
+def set_arm_argument_reads(consumer, prog):
+    """Inventory argument reads on switch-set-exclusive code.
+
+    For every recorded switch-flag branch, the pcs reachable only via
+    its set edge must hold no argument-reader internal call and no
+    user-memory helper read: post-switch entries materialize COUNT_ONLY
+    constants there, never a call argument. Shared tails are excluded
+    by construction (reachable from the unset edge too); descriptor and
+    marker uses anywhere must additionally pass the unset-side proof
+    above, which a set-reaching use would kill.
+    """
+    reads = set()
+    for _, (set_target, unset_target) in prog.flag_branches.items():
+        set_only = (set(D.reachable(consumer.graph, [set_target]))
+                    - set(D.reachable(consumer.graph, [unset_target])))
+        for pc in set_only:
+            target = consumer.calls.get(pc, "")
+            if any(target.endswith(suffix) for suffix in ARGUMENT_READER_SUFFIXES):
+                reads.add((pc, "internal", target))
+            if pc in consumer.helper and consumer.text[pc] in USER_READ_HELPERS:
+                reads.add((pc, "helper", consumer.text[pc]))
+    return reads
 
 
 def consumer_contract(consumer, variant, internal_blocks, initial=None, outlined=False):

@@ -22413,6 +22413,9 @@ pub(crate) mod tests {
             let mut module = sole_complete_module();
             module.object = PinnedObjectId(pin);
             module.scanned.key = scanned_key(PinnedObjectId(pin));
+            for entry in &mut module.scanned.tables[0].entries {
+                entry.object = scanned_key(PinnedObjectId(pin));
+            }
             module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
             module.forward_verified = vec![vec![false; 68]];
             module

@@ -3201,6 +3201,56 @@ impl PinnedObjects {
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
         }
+        // Pre-6.8 overlay split join, absorb-time twin of the split
+        // pre-arm refile: the kept pre-arm entry's pin-time probe proved
+        // its exact held fd renders at the incoming scan pin's maps key
+        // for the same file, so the scan merges into the kept object
+        // instead of minting a second one. A late second object re-keys
+        // the provider mid-run and retires every attached slot (~1 s
+        // probe outage on run-tree learned shapes). Exactly one proved
+        // match merges; ambiguity or identity mismatch falls through to
+        // the split behavior below (fail closed, as today).
+        if same_key.is_empty() && incoming_scan_only {
+            let matches: Vec<PinnedObjectId> = self
+                .by_id
+                .iter()
+                .filter_map(|(id, known)| {
+                    (known.raw.prearm
+                        && known.probed_maps_key.as_ref() == Some(&key)
+                        && ordinary_identity_equal(known, &entry))
+                    .then_some(*id)
+                })
+                .collect();
+            if let [id] = matches[..]
+                && let Some(kept_path) = self.by_id.get(&id).map(|known| known.path.clone())
+                && let Some(maps_raw) = RawObjectInstance::prearm(key, kept_path)
+                && !self
+                    .raw_to_id
+                    .get(&maps_raw)
+                    .is_some_and(|owner| *owner != id)
+            {
+                if entry.collapsed
+                    && let Some(kept) = self.by_id.get_mut(&id)
+                {
+                    kept.collapsed = true;
+                }
+                if entry.pre_copy_up
+                    && let Some(kept) = self.by_id.get_mut(&id)
+                {
+                    kept.pre_copy_up = true;
+                }
+                // Re-key the kept entry onto the proved maps rendering
+                // (manifest maps-alias contract): retargeting and merges
+                // read the entry, while the fd raw stays as the pre-arm
+                // resolution alias.
+                if let Some(kept) = self.by_id.get_mut(&id) {
+                    kept.raw = maps_raw.clone();
+                }
+                self.raw_to_id.insert(entry.raw, id);
+                self.raw_to_id.insert(maps_raw, id);
+                return Some(id);
+            }
+        }
         // A witness-proven copy-up pair files two objects under one maps
         // key: the plain observation and the pre-copy-up observation
         // whose raw matches except for the proof marker (same mount
@@ -13282,6 +13332,94 @@ mod tests {
                 maps_key.inode
             ),
             "the kept entry answers the proved maps rendering after the merge"
+        );
+    }
+
+    /// A late same-file scan pin joins its split pre-arm object at absorb
+    /// (run-tree learned shapes on pre-6.8 overlayfs): the pre-arm entry
+    /// carries the pin-time maps proof, so the scan's maps key merges into
+    /// the kept object instead of minting a second one — which re-keyed the
+    /// provider mid-run, retired every attached slot and opened a ~1 s
+    /// probe outage while workers kept calling.
+    #[test]
+    fn absorbing_split_scan_pin_merges_into_probed_prearm_object() {
+        use super::test_fixture::{
+            PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        let id = kept
+            .id_for_prearm(fd_key, PATH)
+            .expect("pre-arm files under the fd key");
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut scan, &file);
+        let skipped = kept.absorb(scan);
+        assert!(
+            skipped.is_empty(),
+            "proved same-file merge files no skip: {skipped:?}"
+        );
+        assert_eq!(
+            kept.pinned().count(),
+            1,
+            "one file stays one object across the split"
+        );
+        assert_eq!(
+            kept.id_for_prearm(fd_key, PATH),
+            Some(id),
+            "the fd key still routes to the kept object"
+        );
+        assert!(
+            kept.raw_keys_for(id).contains(&maps_key),
+            "the maps domain resolves on the kept object"
+        );
+        assert_eq!(
+            kept.summary(id).map(|pin| pin.key),
+            Some(maps_key),
+            "the entry re-keys with its raw: retargeting and merges read maps-canonical"
+        );
+    }
+
+    /// Characterization twin: a different file under the same maps device
+    /// keeps today's behavior — two objects, no join. The split merge must
+    /// never fire on the device or the digest alone.
+    #[test]
+    fn absorbing_split_scan_pin_for_a_different_file_keeps_two_objects() {
+        use super::test_fixture::{
+            INODE, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        // Same bytes, same maps device, but its own inode under both the
+        // maps rendering and the opened fd.
+        let other_inode = INODE + 1;
+        let other_maps_key = p11scope_manifest::maps::ObjectKey {
+            device: maps_key.device,
+            inode: other_inode,
+        };
+        let other_fd_key = p11scope_manifest::maps::ObjectKey {
+            device: fd_key.device,
+            inode: other_inode,
+        };
+        let mut scan = split_scan_pin(other_maps_key, other_fd_key, SHA, 1);
+        reback(&mut scan, &other);
+        let skipped = kept.absorb(scan);
+        assert!(
+            skipped.is_empty(),
+            "a clean split files no skip: {skipped:?}"
+        );
+        assert_eq!(
+            kept.pinned().count(),
+            2,
+            "distinct files never join across the split"
         );
     }
 

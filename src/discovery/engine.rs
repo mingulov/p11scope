@@ -18651,6 +18651,20 @@ impl Engine {
             )
         });
         let mut outcome = ApplyOutcome::default();
+        if crate::run::capture_diagnostics_on()
+            && candidate
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID)
+        {
+            eprintln!(
+                "p11scope: apply candidate carries run-learned tables: {} modules, delta +{}/~{}/-{}",
+                candidate.modules.len(),
+                candidate.delta.new.len(),
+                candidate.delta.replace.len(),
+                candidate.delta.retire.len(),
+            );
+        }
         if self.continuity_deferred || self.cancellation_requested() || session.mutation_stopped() {
             *additions_allowed = false;
             // Stop-time newcomers (item 6): the terminal drain runs after
@@ -20555,6 +20569,17 @@ impl Engine {
             && claims_reproduced
             && tables_reproduced
             && Self::pins_match_for_stability(&candidate.pinned, &self.pinned);
+        if crate::run::capture_diagnostics_on()
+            && candidate
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID)
+        {
+            eprintln!(
+                "p11scope: committing candidate with run-learned tables: {} plan slots",
+                candidate.plan.slots.len(),
+            );
+        }
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;

@@ -34,6 +34,35 @@ fn softhsm_path() -> PathBuf {
     panic!("SoftHSM not installed (probed Debian and Fedora paths)");
 }
 
+/// Which provider file a positive cell drives.
+enum ModuleSource {
+    /// The shared system SoftHSM path (pid/cgroup positives and the
+    /// shared-provider twin, unchanged).
+    Shared,
+    /// A unique provider copy (the `--system` exact-count cells: no
+    /// ambient process maps that inode, so ambient same-inode mappings
+    /// cannot enter the ground truth).
+    Isolated,
+}
+
+/// Brand-new provider file for the isolated `--system` cells
+/// (learned-cell precedent): a copy at a cell-private path with
+/// trailing bytes, so both inode and sha256 are unique to the cell
+/// and counts for its sha can only come from the cell's workload.
+fn unique_provider_copy(dir: &Path) -> PathBuf {
+    let copy = dir.join(format!("libisolated-{}-p28.so", std::process::id()));
+    std::fs::copy(softhsm_path(), &copy).expect("copy provider");
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&copy)
+            .expect("open copy for append");
+        file.write_all(&[0u8; 256]).expect("append unseen bytes");
+    }
+    copy
+}
+
 /// Private token dir + config + one initialized token (bench-overhead
 /// precedent); returns the config path. The caller exports it as
 /// `SOFTHSM2_CONF` for the workload child only.
@@ -573,10 +602,19 @@ fn assert_exact_counts(observed: &BTreeMap<String, u64>, ledger: &BTreeMap<Strin
 /// Runs one positive: the workload starts on the ready line, so the
 /// module shows `unobserved_windows: []` and exact ledger counts.
 /// `scope_args` selects `--pid`/`--cgroup`/`--system`; `extra` carries
-/// mode flags (`--mode metrics`) or stays empty.
-fn run_positive(scope: &str, extra: &[&str]) -> (BTreeMap<String, u64>, serde_json::Value) {
+/// mode flags (`--mode metrics`) or stays empty. Returns the ledger,
+/// the profile, and the driven module path (a unique copy for
+/// `Isolated`, for the record lookup).
+fn run_positive(
+    scope: &str,
+    extra: &[&str],
+    source: ModuleSource,
+) -> (BTreeMap<String, u64>, serde_json::Value, PathBuf) {
     let dir = tempfile::tempdir().expect("cell dir");
-    let module = softhsm_path();
+    let module = match source {
+        ModuleSource::Shared => softhsm_path(),
+        ModuleSource::Isolated => unique_provider_copy(dir.path()),
+    };
     let conf = init_token(dir.path());
     let workload = build_workload(dir.path());
     let go = dir.path().join("go");
@@ -615,14 +653,13 @@ fn run_positive(scope: &str, extra: &[&str]) -> (BTreeMap<String, u64>, serde_js
     assert!(status.success(), "capture exits clean");
     let text = std::fs::read_to_string(&out).expect("read profile");
     let profile: serde_json::Value = serde_json::from_str(&text).expect("profile is JSON");
-    (ledger_counts, profile)
+    (ledger_counts, profile, module)
 }
 
 #[test]
 #[ignore = "privileged: witness P2-8 profile --pid positive cell"]
 fn privileged_profile_pid_prearm_clean_exact_counts() {
-    let (ledger, profile) = run_positive("pid", &[]);
-    let module = softhsm_path();
+    let (ledger, profile, module) = run_positive("pid", &[], ModuleSource::Shared);
     let record = module_record(&profile, &module);
     assert_eq!(
         record.get("unobserved_windows"),
@@ -636,8 +673,7 @@ fn privileged_profile_pid_prearm_clean_exact_counts() {
 #[test]
 #[ignore = "privileged: witness P2-8 profile --cgroup positive cell"]
 fn privileged_profile_cgroup_prearm_clean_exact_counts() {
-    let (ledger, profile) = run_positive("cgroup", &[]);
-    let module = softhsm_path();
+    let (ledger, profile, module) = run_positive("cgroup", &[], ModuleSource::Shared);
     let record = module_record(&profile, &module);
     assert_eq!(
         record.get("unobserved_windows"),
@@ -651,8 +687,7 @@ fn privileged_profile_cgroup_prearm_clean_exact_counts() {
 #[test]
 #[ignore = "privileged: witness P2-8 profile --system positive cell"]
 fn privileged_profile_system_prearm_clean_exact_counts() {
-    let (ledger, profile) = run_positive("system", &[]);
-    let module = softhsm_path();
+    let (ledger, profile, module) = run_positive("system", &[], ModuleSource::Isolated);
     let record = module_record(&profile, &module);
     assert_eq!(
         record.get("unobserved_windows"),
@@ -666,8 +701,8 @@ fn privileged_profile_system_prearm_clean_exact_counts() {
 #[test]
 #[ignore = "privileged: witness P2-8 profile --mode metrics positive cell"]
 fn privileged_profile_metrics_system_prearm_clean_exact_counts() {
-    let (ledger, profile) = run_positive("system", &["--mode", "metrics"]);
-    let module = softhsm_path();
+    let (ledger, profile, module) =
+        run_positive("system", &["--mode", "metrics"], ModuleSource::Isolated);
     let record = module_record(&profile, &module);
     assert_eq!(
         record.get("unobserved_windows"),
@@ -773,7 +808,7 @@ fn privileged_profile_pid_prearm_twin_exact_window() {
 #[ignore = "privileged: witness P2-8 trace --system positive cell"]
 fn privileged_trace_system_prearm_clean_exact_counts() {
     let dir = tempfile::tempdir().expect("cell dir");
-    let module = softhsm_path();
+    let module = unique_provider_copy(dir.path());
     let conf = init_token(dir.path());
     let workload = build_workload(dir.path());
     let go = dir.path().join("go");
@@ -875,6 +910,269 @@ fn privileged_trace_system_prearm_clean_exact_counts() {
         Some(&serde_json::Value::Array(vec![])),
         "trace windows empty: {}",
         serde_json::to_string_pretty(record).unwrap_or_default()
+    );
+}
+
+/// Parses one trace event line into (pid, function), across both
+/// executable-label shapes: `Unknown executable (PID n, TID m) FUNC`
+/// and `"base" (PID n, TID m) exe="..." [sess#k] FUNC`. Returns None
+/// for non-event lines (preamble, COUNT_EVIDENCE, EVIDENCE, and the
+/// per-process `(PID n)` summary lines, which carry no TID).
+fn parse_trace_event(line: &str) -> Option<(u32, String)> {
+    let after_pid = line.find("(PID ")? + "(PID ".len();
+    let rest = &line[after_pid..];
+    let comma = rest.find(", TID ")?;
+    let pid: u32 = rest[..comma].parse().ok()?;
+    let after_tid = &rest[comma + ", TID ".len()..];
+    let close = after_tid.find(") ")?;
+    let _: u32 = after_tid[..close].parse().ok()?;
+    let tail = &after_tid[close + ") ".len()..];
+    tail.split_whitespace().find_map(|token| {
+        let name = token.strip_prefix("C_")?;
+        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            Some((pid, token.to_string()))
+        } else {
+            None
+        }
+    })
+}
+
+/// Shared-twin verdict (factored out so its accept/reject table runs
+/// unprivileged): the main workload's per-pid event counts are exactly
+/// its ledger, the pre-attach holder contributed zero counted calls,
+/// and the module carries at least one well-formed named window with
+/// a `pre_attach` window ending exactly at attach.
+fn shared_twin_accepts(
+    main_exact: bool,
+    holder_counted: u64,
+    window_count: usize,
+    windows_wellformed_named: bool,
+    pre_attach_ends_at_attach: bool,
+) -> bool {
+    main_exact
+        && holder_counted == 0
+        && window_count >= 1
+        && windows_wellformed_named
+        && pre_attach_ends_at_attach
+}
+
+/// The parser reads both event shapes and rejects every non-event
+/// line, including the TID-less per-process summary lines.
+#[test]
+fn shared_twin_parser_reads_both_event_shapes() {
+    assert_eq!(
+        parse_trace_event(
+            "00:00:00.000000 Unknown executable (PID 123, TID 456) C_GetInfo -> CKR_OK 3.0us"
+        ),
+        Some((123, "C_GetInfo".to_string()))
+    );
+    assert_eq!(
+        parse_trace_event(
+            "12:00:01.123456 \"p28-workload\" (PID 12345, TID 12401) exe=\"/tmp/x/p28-workload\" sess#7 C_SignInit -> CKR_OK 3.0us"
+        ),
+        Some((12345, "C_SignInit".to_string()))
+    );
+    assert_eq!(
+        parse_trace_event(
+            "00:00:00.000000 \"pkcs11-tool\" (PID 100, TID 1) exe=\"/usr/bin/pkcs11-tool\" C_Initialize -> CKR_OK 1.0us"
+        ),
+        Some((100, "C_Initialize".to_string()))
+    );
+    assert_eq!(
+        parse_trace_event("COUNT_EVIDENCE {\"stats_entered\": 3}"),
+        None
+    );
+    assert_eq!(parse_trace_event("EVIDENCE {\"discovery\": []}"), None);
+    assert_eq!(
+        parse_trace_event(
+            "\"firefox\" (PID 100) exe=\"/usr/bin/firefox\": C_OpenSession: CKR_OK x2"
+        ),
+        None
+    );
+    assert_eq!(parse_trace_event("p11scope: capturing: system"), None);
+}
+
+/// Negative controls for the verdict above: only complete honest
+/// accounting may pass. Each term is load-bearing on its own.
+#[test]
+fn shared_twin_oracle_requires_every_honest_accounting_term() {
+    assert!(shared_twin_accepts(true, 0, 1, true, true));
+    assert!(
+        !shared_twin_accepts(false, 0, 1, true, true),
+        "main counts must be exact"
+    );
+    assert!(
+        !shared_twin_accepts(true, 1, 1, true, true),
+        "holder calls stay in the gap"
+    );
+    assert!(
+        !shared_twin_accepts(true, 0, 0, true, true),
+        "a window must exist"
+    );
+    assert!(
+        !shared_twin_accepts(true, 0, 2, false, true),
+        "every window well-formed and named"
+    );
+    assert!(
+        !shared_twin_accepts(true, 0, 1, true, false),
+        "pre_attach ends at attach"
+    );
+}
+
+/// Shared-provider twin: `trace --system` against the SHARED system
+/// SoftHSM while a holder workload maps it across the whole pre-attach
+/// interval (the busy-home-PC case, deterministic on any host). The
+/// held mapping voids the exactness proof, so the cell asserts honest
+/// accounting instead of emptiness: every main-workload call is
+/// counted and attributed to its pid, the holder's pre-attach calls
+/// are counted zero times (they sit in the named gap), the counters
+/// agree with the parsed events, and every window is well-formed and
+/// named with a `pre_attach` window ending exactly at attach. Never a
+/// skip: it runs unconditionally and fails loudly on any dishonest
+/// accounting.
+#[test]
+#[ignore = "privileged: witness P2-8 trace --system shared-provider honest-accounting twin cell"]
+fn privileged_trace_system_prearm_shared_provider_honest_accounting() {
+    let dir = tempfile::tempdir().expect("cell dir");
+    let module = softhsm_path();
+    let conf = init_token(dir.path());
+    let workload = build_workload(dir.path());
+    // The holder maps and calls the shared module BEFORE the capture
+    // exists and holds the mapping: its calls complete pre-scope (the
+    // ledger wait proves it) and its mapping voids the proof.
+    let holder_go = dir.path().join("holder-go");
+    let holder_ledger = dir.path().join("holder-ledger.txt");
+    let (_holder, holder_pid) = spawn_workload(
+        &workload,
+        &module,
+        &holder_go,
+        &holder_ledger,
+        &conf,
+        true,
+        true,
+    );
+    let holder_counts = read_ledger_file(&holder_ledger);
+    assert!(
+        holder_counts.values().sum::<u64>() > 0,
+        "holder made pre-attach calls"
+    );
+    // The main workload starts on the ready line: every one of its
+    // calls is post-attach and must be counted under its pid.
+    let go = dir.path().join("go");
+    let ledger = dir.path().join("ledger.txt");
+    let out = dir.path().join("out.jsonl");
+    let (_main, main_pid) = spawn_workload(&workload, &module, &go, &ledger, &conf, false, false);
+    let args = vec![
+        "trace".to_string(),
+        "--system".to_string(),
+        "--module".to_string(),
+        module.to_str().expect("utf8 module").to_string(),
+        "--prearm-module".to_string(),
+        module.to_str().expect("utf8 module").to_string(),
+        "--duration".to_string(),
+        "8".to_string(),
+        "--max-events".to_string(),
+        "100000".to_string(),
+        "-o".to_string(),
+        out.to_str().expect("utf8 out").to_string(),
+    ];
+    let mut capture = spawn_capture(&args);
+    wait_ready(&mut capture);
+    std::fs::write(&go, b"go\n").expect("release the workload");
+    let ledger_counts = read_ledger_file(&ledger);
+    let status = capture.wait_expect("capture");
+    assert!(status.success(), "capture exits clean");
+    let text = std::fs::read_to_string(&out).expect("read trace");
+    let mut main_events: BTreeMap<String, u64> = BTreeMap::new();
+    let mut holder_total: u64 = 0;
+    let mut event_total: u64 = 0;
+    let mut count_evidence: Option<serde_json::Value> = None;
+    let mut evidence: Option<serde_json::Value> = None;
+    for line in text.lines() {
+        if let Some(body) = line.strip_prefix("COUNT_EVIDENCE ") {
+            count_evidence = Some(serde_json::from_str(body).expect("count evidence JSON"));
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("EVIDENCE ") {
+            evidence = Some(serde_json::from_str(body).expect("terminal evidence JSON"));
+            continue;
+        }
+        let Some((pid, name)) = parse_trace_event(line) else {
+            continue;
+        };
+        event_total += 1;
+        if pid == main_pid {
+            *main_events.entry(name).or_insert(0) += 1;
+        } else if pid == holder_pid {
+            holder_total += 1;
+        }
+    }
+    // Every main call counted, attributed to the main pid, nothing
+    // else under it.
+    let main_exact = main_events == ledger_counts;
+    // The counter evidence agrees with the parsed events.
+    let count_evidence = count_evidence.expect("COUNT_EVIDENCE line");
+    assert_eq!(
+        count_evidence.get("stats_entered").and_then(|v| v.as_u64()),
+        Some(event_total),
+        "count evidence entered"
+    );
+    assert_eq!(
+        count_evidence
+            .get("stats_returned")
+            .and_then(|v| v.as_u64()),
+        Some(event_total),
+        "count evidence returned"
+    );
+    // Every window well-formed and named; a pre_attach window ends
+    // exactly at attach.
+    let evidence = evidence.expect("EVIDENCE line");
+    let modules = evidence
+        .get("discovery")
+        .and_then(|discovery| discovery.as_array())
+        .expect("terminal discovery records");
+    let want = module.to_str().expect("utf8 module path");
+    let record = modules
+        .iter()
+        .find(|record| record.get("path").and_then(|p| p.as_str()) == Some(want))
+        .expect("trace module record");
+    let windows = record
+        .get("unobserved_windows")
+        .and_then(|windows| windows.as_array())
+        .expect("windows list");
+    let attached_at = record.get("attached_at_ns").expect("attached_at_ns");
+    const KNOWN_REASONS: [&str; 5] = [
+        "pre_attach",
+        "late_discovery",
+        "mapped_unattached",
+        "health_loss",
+        "scope_uncertain",
+    ];
+    let mut wellformed_named = true;
+    let mut pre_attach_ends_at_attach = false;
+    for window in windows {
+        let start_ns = window.get("start_ns").and_then(|s| s.as_u64());
+        let end_ns = window.get("end_ns").and_then(|e| e.as_u64());
+        let reason = window.get("reason").and_then(|r| r.as_str());
+        let wellformed = start_ns.is_some_and(|start| start > 0)
+            && end_ns.is_some_and(|end| start_ns.is_some_and(|start| start < end))
+            && reason.is_some_and(|reason| KNOWN_REASONS.contains(&reason));
+        wellformed_named &= wellformed;
+        if reason == Some("pre_attach") && window.get("end_ns") == Some(attached_at) {
+            pre_attach_ends_at_attach = true;
+        }
+    }
+    assert!(
+        shared_twin_accepts(
+            main_exact,
+            holder_total,
+            windows.len(),
+            wellformed_named,
+            pre_attach_ends_at_attach
+        ),
+        "honest accounting: main {main_pid} events {main_events:?} vs ledger {ledger_counts:?}; \
+         holder {holder_pid} counted {holder_total} (its ledger {holder_counts:?} sits in the gap); \
+         windows {windows:?} attached_at {attached_at}"
     );
 }
 

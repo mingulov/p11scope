@@ -18,7 +18,9 @@ reader-less providers) against one provider in three legs ((a) alone,
   call_recall as the coverage figure when an rv-trace oracle exists);
 - <provider>-default-run-coverage: nonqualifying record of the default
   (no-manifest) leg's attribution and recall, which short-lived suite
-  workers routinely blind;
+  workers routinely blind. Recall counts only named rows owned by the
+  target module; backend-module rows and `names: ["unknown"]` rows are
+  reported separately and never stand in for target coverage;
 - <provider>-inventory-pid: the workload pid is a caller AND the provider
   module carries edge calls, else FAIL as not observed;
 - the discover row (<provider>-discover, or kryoptic-multi-table for
@@ -215,6 +217,99 @@ def judge_run_observed(observed, module_path, oracle=None, capture=None):
     return False, f"not observed: {detail}", recall
 
 
+UNNAMED = "unknown"
+
+
+def target_capture(observed, module_path):
+    """(capture, stats): target-owned named rows only.
+
+    `capture` is {(fn, rv_hex): count} from rows whose module joins the
+    target provider file and whose names are real. Rows owned by other
+    modules (p11-kit's configured backends) are counted separately and
+    never enter target coverage. Rows with names ["unknown"] are
+    attached but unnamed: their calls are counted apart from recall.
+    """
+    sha256, dev, ino = file_identity(module_path)
+    capture = {}
+    stats = {
+        "target_rows": 0, "target_calls": 0,
+        "named_rows": 0, "named_calls": 0,
+        "unnamed_rows": 0, "unnamed_calls": 0,
+        "backend_rows": 0, "backend_calls": 0,
+        "backend_modules": set(),
+        "null_rows": 0, "null_calls": 0,
+    }
+    for function in observed.get("functions", []):
+        calls = int(function.get("calls", 0))
+        owner = function.get("module")
+        if not isinstance(owner, dict):
+            stats["null_rows"] += 1
+            stats["null_calls"] += calls
+            continue
+        if function_owner_matches(function, sha256, dev, ino) is None:
+            stats["backend_rows"] += 1
+            stats["backend_calls"] += calls
+            record = owner.get("sha256")
+            if record is None:
+                record = ("dev-ino", tuple(owner.get("dev") or ()) or None,
+                          owner.get("ino"))
+            stats["backend_modules"].add(record)
+            continue
+        stats["target_rows"] += 1
+        stats["target_calls"] += calls
+        names = [str(name) for name in function.get("names", [])]
+        if not names or names == [UNNAMED]:
+            stats["unnamed_rows"] += 1
+            stats["unnamed_calls"] += calls
+            continue
+        stats["named_rows"] += 1
+        stats["named_calls"] += calls
+        for name in names:
+            for rv_hex, count in function.get("rv_counts", {}).items():
+                key = (name, rv_hex)
+                capture[key] = capture.get(key, 0) + int(count)
+    return capture, stats
+
+
+def judge_default_coverage(observed, module_path, oracle=None):
+    """(detail, recall-or-None) for the informational default leg.
+
+    Recall uses only named rows owned by the target module. Backend
+    modules are reported separately and `names: ["unknown"]` rows are an
+    attached-but-unnamed count, so neither can stand in for target
+    coverage: the p11-kit proxy has real backend rows with the oracle's
+    names while its own row is nearly call-free in default mode.
+    """
+    capture, stats = target_capture(observed, module_path)
+    detail = (f"target rows {stats['target_rows']} / "
+              f"{stats['target_calls']} calls "
+              f"(named {stats['named_rows']} rows / "
+              f"{stats['named_calls']} calls)")
+    if stats["unnamed_rows"]:
+        detail += (f"; attached-but-unnamed {stats['unnamed_rows']} rows / "
+                   f"{stats['unnamed_calls']} calls (names ['unknown'], "
+                   f"not in recall)")
+    if stats["backend_rows"]:
+        detail += (f"; backend rows {stats['backend_rows']} / "
+                   f"{stats['backend_calls']} calls from "
+                   f"{len(stats['backend_modules'])} foreign module(s), "
+                   f"reported separately (not target coverage)")
+    if stats["null_rows"]:
+        detail += (f"; null-module rows {stats['null_rows']} / "
+                   f"{stats['null_calls']} calls (owner unknown)")
+    recall = None
+    if oracle is not None:
+        mismatches, call_recall, pair_recall, total = _BASE.subset_check(
+            oracle, capture)
+        if mismatches is None:
+            detail += "; oracle logged 0 calls (no recall denominator)"
+        else:
+            recall = call_recall
+            detail += (f"; target-only oracle call_recall={call_recall:.4f} "
+                       f"pair_recall={pair_recall:.4f} over {total} calls")
+    return detail, recall
+
+
 def inventory_module_ids(inventory, module_path):
     """(ids, how): module ids joining to the provider file.
 
@@ -409,8 +504,10 @@ def main(argv):
         print(f"identical-results: {'PASS' if identical_ok else 'FAIL'} "
               f"{identical_detail}")
 
-        capture_b, _, observed_b = _BASE.capture_counts(args.observed_b)
-        capture_c, _, observed_c = _BASE.capture_counts(args.observed_c)
+        observed_b = load_json(args.observed_b, "observed profile (leg b)")
+        observed_c = load_json(args.observed_c, "observed profile (leg c)")
+        capture_b, _ = target_capture(observed_b, args.module)
+        capture_c, _ = target_capture(observed_c, args.module)
         schema_b = observed_b.get("schema", "")
         schema_c = observed_c.get("schema", "")
         schema_ok = schema_b == "p11scope/observed-profile/v3" \
@@ -432,8 +529,8 @@ def main(argv):
             oracle_b, oracle_c, capture_b, capture_c = None, None, None, None
         run_ok, run_detail, recall = judge_run_observed(
             observed_c, args.module, oracle_c, capture_c)
-        _, cov_detail, cov_recall = judge_run_observed(
-            observed_b, args.module, oracle_b, capture_b)
+        cov_detail, cov_recall = judge_default_coverage(
+            observed_b, args.module, oracle_b)
         if args.suite == "no":
             run_detail += "; no oracle (tool probe)"
             cov_detail += "; no oracle (tool probe)"

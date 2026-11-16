@@ -47,7 +47,11 @@ successful setup (the file is removed before setup, so nothing leaks
 across cells). The two proxy-config rows share
 `providers/_p11kit_proxy_config.sh` (one configured module, private
 `XDG_CONFIG_HOME` with `user-config: only`, exactly-one-token setup
-assertion); `run-matrix.sh` delivers it with the env files.
+assertion). Every token-owning setup resets its task-dir token
+directory through `providers/_token_dir.sh`, which removes the
+directory recursively (SoftHSM 2.7 stores a token as a directory) and
+refuses any path not named `tokens`, so repeat cells in one task dir
+start clean. `run-matrix.sh` delivers both helpers with the env files.
 
 ## Entry command
 

@@ -102,6 +102,7 @@ cp -p "$HERE/workload-pace.py" "$HERE/remote-cell.sh" "$HERE/pins.sh" \
   "$HERE/static-embed-cell.sh" "$HERE/static_embed_cell_compare.py" \
   "$STAGE/repo/scripts/provider-matrix/" || exit 2
 cp -p "$HERE"/providers/*.env "$HERE"/providers/_p11kit_proxy_config.sh \
+  "$HERE"/providers/_token_dir.sh \
   "$STAGE/repo/scripts/provider-matrix/providers/" || exit 2
 rsync -a "$STAGE/bin/" "user@$HOST:$TASKDIR/bin/" || exit 2
 rsync -a "$STAGE/repo/" "user@$HOST:$TASKDIR/repo/" || exit 2

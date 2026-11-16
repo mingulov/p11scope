@@ -13,6 +13,9 @@
 # cell: $PKCS11_MODULE (the proxy), $PKCS11_TOOL, $P11TEST_PIN and
 # $P11TEST_SO_PIN (throwaway token PINs, never echoed).
 
+# shellcheck disable=SC1090,SC1091  # shipped sibling, delivered with the env files
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_token_dir.sh"
+
 # p11kit_proxy_check_token_list LISTING WANT-LABEL: true iff the
 # pkcs11-tool -L listing names exactly one token and it is WANT-LABEL.
 p11kit_proxy_check_token_list() {
@@ -30,7 +33,7 @@ p11kit_proxy_check_token_list() {
 p11kit_proxy_config_setup() {
   case $2 in yes|no) ;; *) echo "managed flag must be yes or no, got '$2'" >&2; return 2 ;; esac
   dir=$1/$3
-  mkdir -p "$dir/xdg/pkcs11/modules" "$dir/tokens"
+  mkdir -p "$dir/xdg/pkcs11/modules"
   command -v p11-kit >/dev/null 2>&1 || { echo "p11-kit binary missing" >&2; return 1; }
   softhsm=
   for cand in /usr/lib64/pkcs11/libsofthsm2.so /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so; do
@@ -38,7 +41,7 @@ p11kit_proxy_config_setup() {
   done
   [ -n "$softhsm" ] || { echo "no SoftHSM library to serve" >&2; return 1; }
   printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$dir/tokens" >"$dir/softhsm2.conf"
-  rm -f "$dir"/tokens/*
+  reset_task_token_dir "$dir/tokens" || return 1
   SOFTHSM2_CONF=$dir/softhsm2.conf softhsm2-util --init-token --slot 0 \
     --label "p11matrix" --pin "$P11TEST_PIN" --so-pin "$P11TEST_SO_PIN" || return 1
   printf 'user-config: only\n' >"$dir/xdg/pkcs11/pkcs11.conf"

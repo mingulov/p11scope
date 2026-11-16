@@ -236,6 +236,70 @@ class RunObservedTests(unittest.TestCase):
             self.assertIn("dev-ino", detail)
 
 
+class DefaultCoverageTests(unittest.TestCase):
+    def test_backend_rows_are_not_target_coverage(self):
+        # The p11-kit proxy forwards into backend modules whose rows carry
+        # the oracle's function names. Aggregating every module made the
+        # default leg print backend recall as target coverage.
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp, content=b"proxy")
+            backend = make_module(tmp, name="libbackend.so", content=b"backend")
+            rows = [
+                function_row(["C_GetInterface"], module_identity(module), 6),
+                function_row(["C_GetMechanismInfo"],
+                             module_identity(backend), 89),
+                function_row(["C_GetSlotList"], module_identity(backend), 6),
+            ]
+            oracle = {("C_GetMechanismInfo", "0x0000000000000000"): 89,
+                      ("C_GetSlotList", "0x0000000000000000"): 6}
+            detail, recall = _COMPARE.judge_default_coverage(
+                observed_doc(rows), str(module), oracle)
+            self.assertEqual(0.0, recall, detail)
+            self.assertIn("target-only oracle call_recall=0.0000", detail)
+            self.assertIn("backend rows 2 / 95 calls", detail)
+            self.assertIn("not target coverage", detail)
+
+    def test_target_named_rows_supply_the_recall(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp, content=b"proxy")
+            backend = make_module(tmp, name="libbackend.so", content=b"backend")
+            rows = [
+                function_row(["C_Initialize"], module_identity(module), 7,
+                             {"0x0000000000000000": 7}),
+                function_row(["C_Initialize"], module_identity(backend), 100,
+                             {"0x0000000000000000": 100}),
+            ]
+            oracle = {("C_Initialize", "0x0000000000000000"): 7}
+            detail, recall = _COMPARE.judge_default_coverage(
+                observed_doc(rows), str(module), oracle)
+            self.assertEqual(1.0, recall, detail)
+            self.assertIn("target-only oracle call_recall=1.0000", detail)
+            self.assertIn("named 1 rows / 7 calls", detail)
+
+    def test_unknown_names_are_attached_but_not_recalled(self):
+        # p11-kit's proxy rows in default mode can carry correct calls
+        # under names ["unknown"]: attached, but not name-based recall.
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp, content=b"proxy")
+            rows = [function_row(["unknown"], module_identity(module), 276)]
+            oracle = {("C_GetMechanismInfo", "0x0000000000000000"): 89}
+            detail, recall = _COMPARE.judge_default_coverage(
+                observed_doc(rows), str(module), oracle)
+            self.assertEqual(0.0, recall, detail)
+            self.assertIn("attached-but-unnamed 1 rows / 276 calls", detail)
+            self.assertIn("not in recall", detail)
+            self.assertIn("target-only oracle call_recall=0.0000", detail)
+
+    def test_no_backend_rows_stays_quiet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp, content=b"proxy")
+            rows = [function_row(["C_Initialize"], module_identity(module), 1)]
+            detail, _ = _COMPARE.judge_default_coverage(
+                observed_doc(rows), str(module), {})
+            self.assertNotIn("backend rows", detail)
+            self.assertNotIn("attached-but-unnamed", detail)
+
+
 class InventoryPidTests(unittest.TestCase):
     def test_caller_with_edge_calls_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -677,6 +741,43 @@ class MainTests(unittest.TestCase):
             self.assertTrue(by_cell["kryoptic-run-observed"]["pass"])
             self.assertTrue(by_cell["kryoptic-inventory-pid"]["pass"])
 
+    def test_default_coverage_excludes_backend_rows(self):
+        # End-to-end shape of the PM-OBS1 conflation: the oracle pair is
+        # supplied by a backend module row, not the target. The default
+        # coverage row must print 0.0 and name the backend separately.
+        with tempfile.TemporaryDirectory() as tmp:
+            base, args = self.write_cell(tmp)
+            module = Path(args[args.index("--module") + 1])
+            backend = make_module(tmp, name="libbackend.so", content=b"backend")
+            rows_b = [
+                function_row(["C_GetInterface"], module_identity(module), 6),
+                function_row(["C_Initialize"], module_identity(backend), 61,
+                             {"0x0000000000000000": 61}),
+            ]
+            (base / "observed-b.json").write_text(
+                json.dumps(observed_doc(rows_b)), encoding="utf-8")
+            (base / "report-b.jsonl").write_text(
+                json.dumps({
+                    "$report_type": "TestReport", "when": "teardown",
+                    "nodeid": "test_mod.py::test_one",
+                    "user_properties": [["pkcs11_rv_trace",
+                                         [{"fn": "C_Initialize", "rv": 0}]]],
+                }) + "\n", encoding="utf-8")
+            rc = _COMPARE.main(args)
+            self.assertEqual(0, rc)
+            rows = [json.loads(line) for line in
+                    (base / "results.jsonl").read_text(
+                        encoding="utf-8").splitlines()]
+            coverage = next(row for row in rows
+                            if row["cell"] == "kryoptic-default-run-coverage")
+            self.assertTrue(coverage["pass"])
+            self.assertIn("backend rows 1 / 61 calls",
+                          coverage["detail"])
+            self.assertIn("target-only oracle call_recall=0.0000",
+                          coverage["detail"])
+            self.assertIn("default-run-coverage: 0.0000",
+                          (base / "summary.txt").read_text(encoding="utf-8"))
+
 
 PROXY_CONFIG_SNIPPET = (ROOT / "scripts" / "provider-matrix"
                         / "providers" / "_p11kit_proxy_config.sh")
@@ -730,6 +831,192 @@ class P11KitProxyConfigTests(unittest.TestCase):
 
     def test_empty_listing_fails(self):
         self.assertNotEqual(0, self.run_check("Available slots:\n"))
+
+
+TOKEN_RESET = (ROOT / "scripts" / "provider-matrix"
+               / "providers" / "_token_dir.sh")
+# Every provider setup that resets a token directory, including the
+# shared proxy-config setup behind p11kit-managed/unmanaged.
+TOKEN_RESET_SITES = (
+    "freehsm.env", "p11kit-proxy.env", "softhsm2-2.6.env",
+    "softhsm2-2.7.env", "_p11kit_proxy_config.sh",
+)
+
+
+class TokenDirResetTests(unittest.TestCase):
+    def run_reset(self, path):
+        import subprocess
+        script = '. "$1"; reset_task_token_dir "$2"'
+        return subprocess.run(
+            ["bash", "-c", script, "_", str(TOKEN_RESET), str(path)],
+            capture_output=True, text=True, timeout=60)
+
+    def test_recursive_reset_removes_token_directories_in_place(self):
+        # SoftHSM 2.7 stores a token as a directory; repeated cells in
+        # one task dir must start from an empty tokens dir, and nothing
+        # outside that dir may be touched.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            tokens = base / "tokens"
+            token = tokens / "92b5c861-98f9-a410-782a-00eb93148c02"
+            token.mkdir(parents=True)
+            (token / "token.object").write_text("x", encoding="utf-8")
+            (tokens / "plain.file").write_text("x", encoding="utf-8")
+            keep = base / "keep.txt"
+            keep.write_text("keep", encoding="utf-8")
+            proc = self.run_reset(tokens)
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertTrue(tokens.is_dir(), "tokens dir was not recreated")
+            self.assertEqual([], list(tokens.iterdir()))
+            self.assertTrue(keep.is_file(), "reset escaped the token dir")
+
+    def test_reset_refuses_a_path_that_is_not_the_token_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keep = Path(tmp) / "keep"
+            keep.mkdir()
+            (keep / "file").write_text("keep", encoding="utf-8")
+            proc = self.run_reset(keep)
+            self.assertNotEqual(0, proc.returncode)
+            self.assertIn("refusing non-token path", proc.stderr)
+            self.assertTrue((keep / "file").is_file())
+
+    def test_every_token_site_uses_the_shared_reset(self):
+        providers = ROOT / "scripts" / "provider-matrix" / "providers"
+        for name in TOKEN_RESET_SITES:
+            with self.subTest(site=name):
+                text = (providers / name).read_text(encoding="utf-8")
+                self.assertIn("_token_dir.sh", text)
+                self.assertIn('reset_task_token_dir "$dir/tokens"', text)
+                self.assertNotIn('rm -f "$dir"/tokens/*', text)
+
+
+P11KIT_PROXY_ENV = (ROOT / "scripts" / "provider-matrix"
+                    / "providers" / "p11kit-proxy.env")
+
+
+SERVER_ARGV = ("server", "--provider",
+               "/usr/lib64/pkcs11/libsofthsm2.so",
+               "--sh", "pkcs11:token=p11matrix")
+
+
+class P11KitServerLifecycleTests(unittest.TestCase):
+    def fake_proc(self, base, pid, argv):
+        """A fake /proc/<pid>/cmdline the probe can read unchanged."""
+        root = Path(base) / "proc"
+        entry = root / str(pid)
+        entry.mkdir(parents=True)
+        (entry / "cmdline").write_bytes(
+            b"\0".join(arg.encode() for arg in argv) + b"\0")
+        return root
+
+    def run_alive(self, pid, proc_root):
+        import subprocess
+        env = dict(os.environ, P11KIT_SERVER_PROC_ROOT=str(proc_root))
+        return subprocess.run(
+            ["bash", "-c", '. "$1"; p11kit_server_pid_alive "$2"',
+             "_", str(P11KIT_PROXY_ENV), str(pid)],
+            capture_output=True, text=True, env=env, timeout=60)
+
+    def run_teardown(self, task_dir, proc_root, extra=""):
+        import subprocess
+        script = ('. "$1"; ' + extra
+                  + ' p11kit_proxy_teardown "$2"')
+        env = dict(os.environ, P11KIT_SERVER_PROC_ROOT=str(proc_root))
+        return subprocess.run(
+            ["bash", "-c", script, "_", str(P11KIT_PROXY_ENV),
+             str(task_dir)],
+            capture_output=True, text=True, env=env, timeout=120)
+
+    def test_started_server_cmdline_shape_is_alive(self):
+        # The shipped server argv is `server --provider ... --sh ...`;
+        # the old check searched for the literal "p11-kit server".
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.fake_proc(tmp, 4242, SERVER_ARGV)
+            result = self.run_alive(4242, proc)
+            self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_legacy_p11_kit_server_shape_is_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.fake_proc(tmp, 4242, (
+                "p11-kit", "server", "--provider", "/x/lib.so",
+                "--sh", "pkcs11:token=p11matrix"))
+            self.assertEqual(0, self.run_alive(4242, proc).returncode)
+
+    def test_unrelated_process_is_not_the_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.fake_proc(tmp, 4242, ("sleep", "60"))
+            self.assertNotEqual(0, self.run_alive(4242, proc).returncode)
+
+    def test_literal_p11_kit_server_argument_is_not_a_server(self):
+        # The old grep matched this cmdline; the exact argv shape must
+        # not.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.fake_proc(tmp, 4242, ("yes", "p11-kit server"))
+            self.assertNotEqual(0, self.run_alive(4242, proc).returncode)
+
+    def test_missing_or_invalid_pid_is_not_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.fake_proc(tmp, 4242, SERVER_ARGV)
+            self.assertNotEqual(0, self.run_alive(9999, proc).returncode)
+            self.assertNotEqual(0, self.run_alive("4242x", proc).returncode)
+
+    def test_teardown_kills_and_verifies_gone(self):
+        # The shadowed kill records the exact pid and drops the fake
+        # cmdline (the process is gone); teardown must return success.
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp)
+            (task / "p11kit").mkdir()
+            proc = self.fake_proc(tmp, 4242, SERVER_ARGV)
+            (task / "p11kit" / "server.pid").write_text(
+                "4242", encoding="utf-8")
+            log = task / "kill.log"
+            result = self.run_teardown(
+                task, proc,
+                extra=('kill() { printf "%s\\n" "$*" >> "$KILL_LOG"; '
+                       'rm -f "$P11KIT_SERVER_PROC_ROOT/4242/cmdline"; }; '
+                       'sleep() { :; }; export KILL_LOG="' + str(log)
+                       + '";'))
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("4242", log.read_text(encoding="utf-8"))
+            self.assertFalse(
+                (task / "p11kit" / "server.pid").exists(),
+                "successful teardown left the pidfile behind")
+
+    def test_teardown_never_kills_a_reused_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp)
+            (task / "p11kit").mkdir()
+            proc = self.fake_proc(tmp, 4242, ("sleep", "60"))
+            (task / "p11kit" / "server.pid").write_text(
+                "4242", encoding="utf-8")
+            log = task / "kill.log"
+            result = self.run_teardown(
+                task, proc,
+                extra=('kill() { printf "%s\\n" "$*" >> "$KILL_LOG"; }; '
+                       'export KILL_LOG="' + str(log) + '";'))
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertFalse(log.exists(), "teardown killed a reused pid")
+            self.assertFalse(
+                (task / "p11kit" / "server.pid").exists(),
+                "stale pidfile for a non-server pid survived")
+
+    def test_teardown_verifies_a_failed_kill(self):
+        # Kill and sleep are shadowed so the TERM/KILL loops run without
+        # waiting: the server survives, teardown must report that and
+        # keep the pidfile for a later retry.
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp)
+            (task / "p11kit").mkdir()
+            proc = self.fake_proc(tmp, 4242, SERVER_ARGV)
+            (task / "p11kit" / "server.pid").write_text(
+                "4242", encoding="utf-8")
+            result = self.run_teardown(
+                task, proc, extra="kill() { :; }; sleep() { :; };")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("survived SIGKILL", result.stderr)
+            self.assertTrue(
+                (task / "p11kit" / "server.pid").exists(),
+                "failed teardown lost the pidfile")
 
 
 class LegPrepTests(unittest.TestCase):

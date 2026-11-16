@@ -4383,7 +4383,15 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
                 LinuxLayout::Lp64 => 1,
                 LinuxLayout::Ilp32 => 2,
             });
-            core::ptr::addr_of_mut!((*completed).switched).write(u8::from(count_only));
+            // Branch-shaped, not u8::from: the descriptor-source
+            // proof correlates this store through the count_only
+            // branch, and a branchless select hangs its
+            // flipped-polarity control.
+            if count_only {
+                core::ptr::addr_of_mut!((*completed).switched).write(1);
+            } else {
+                core::ptr::addr_of_mut!((*completed).switched).write(0);
+            }
             core::ptr::addr_of_mut!((*completed).reserved).write(0);
             core::ptr::addr_of_mut!((*completed).completed).write(1);
         }

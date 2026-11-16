@@ -433,7 +433,8 @@ def _check_sessions(rows):
 def _require_curve_reasons(row, keys):
     """Completeness for Edwards/Montgomery curves (fix round 3, with
     fix-round-4 soundness: no spurious curve reason, and demands on
-    created rows only)."""
+    created rows only; fix round 5: no unestablished-curve demand on
+    rows whose creation cannot carry CKA_EC_PARAMS)."""
     if "ec_params" not in keys or "key_type" not in keys:
         return
     if row["label"] is not None:
@@ -466,6 +467,19 @@ def _require_curve_reasons(row, keys):
         return
     if established_curve["reason"] is not None:
         return  # truncation, unsupported or partly-read already names the unknown
+    # Fix round 5 (controller KEYMETA-T1 fix4 ruling 2026-11-16): the
+    # producer names the unestablished-curve reason only for
+    # C_CreateObject and the public half of C_GenerateKeyPair. An
+    # unwrap or copy template never carries CKA_EC_PARAMS, and the
+    # private half of a pair (established class 3) keeps its curve
+    # in the public template — all three check reason-free.
+    if row["creation"] in ("unwrap", "copy"):
+        return
+    established_class = row["established"]["class"]
+    if (row["creation"] == "generate_pair"
+            and established_class["status"] == "value"
+            and established_class["value"] == 3):
+        return
     _require(False, "unestablished curve carries no reason")
 
 

@@ -3468,9 +3468,16 @@ impl AttachPlan {
                 // subset of the retired cell's names). Reoccupy the index the
                 // same way the kept path treats `unknown`: keep the old
                 // authorized names, stay count-only, and never inherit the
-                // retired cell's descriptor (the new link carries none).
+                // retired cell's descriptor (the new link carries none). A
+                // retired cell that itself carries no known name has nothing
+                // to restore: keep its transparent `unknown` rather than
+                // strip the last name and leave the display label empty.
                 if slot.descriptor_index == 0
                     && !slot.semantic_authorized
+                    && old_slot
+                        .names
+                        .iter()
+                        .any(|name| name != UNKNOWN_FUNCTION_NAME)
                     && slot
                         .names
                         .iter()

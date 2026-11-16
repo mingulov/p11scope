@@ -94,6 +94,91 @@ versioned separately and are opaque, exact dispatch keys.
   at capture end once every deferred process was rescanned (it stays
   when any rescan is still owed, or when a rescan ran only after the
   process began exiting and excused a refusal).
+- Kernel file-open learning under `--system` no longer reports lost
+  learning on a healthy busy host: the group uses an unlimited kernel
+  queue with an 8 MiB user-space backlog bound, the stop tail is
+  decided from the measured queued-event count on both 24- and 32-byte
+  kernels, FIFO opens and read errors no longer stall the drain, and
+  negative-file ignore marks expire every 30 s. Any real overflow,
+  parse or read loss is counted and attributed to its source.
+- Provider objects are examined without a fixed object-size gate:
+  large mapped providers are read through bounded progress windows
+  instead of being refused by size, while crafted ELF header tables or
+  spans beyond the window are refused with named gaps. A starved scan
+  bracket keeps its already decoded modules and refused rows and names
+  the ceiling plainly.
+- `inventory --system --manifest` captures no longer starve late
+  providers at thousands of endpoints. Library-handle pins for every
+  lane now go through one bounded capture-owned table (1,000
+  concurrent files) with a single acquire step, and count manifests
+  reserve their rows before member scans; waits and refusals are
+  named, one-shot runs name the terminal wait, and deferred learned
+  candidates stay retryable.
+- Per-key tracking re-arms after a transient refusal at the audit
+  step, whether it strikes while a batch is being checked or right
+  after, instead of stopping for the rest of the run. Re-arms are
+  limited to 32 per rolling 2 minutes; a refusal at another step or
+  past the limit still stops the lane, and the stop gap names the step
+  and reason. Verbose output names the audit check and refusal code.
+- Process generations are tracked apart more reliably: fork events
+  carry the kernel timestamp, exit ties drop immediately with a
+  counted outcome, a full exit-tap queue keeps the newest tap for a
+  reused PID, and unmatched exits at the terminal drain drop counted
+  instead of stalling it. Session numbering and retired-session
+  labels survive a leader exit, a reopened handle prints its fresh
+  label, and rows left by late events on exited processes are reaped.
+- `--module` matching now checks every recorded path of a module and
+  tolerates a ` (deleted)` suffix, so a replaced provider admitted
+  from its still-mapped copy is not reported unmatched. An input that
+  matches no mapped file is named in text and JSON
+  (`unmatched_modules`) while the capture still exits 0, and a
+  repeated `--system` is refused as a usage error.
+
+### Changed
+
+- Cgroup inventory passes reuse file-derived facts from the previous
+  pass, keyed and pinned by file identity and change time: an
+  unchanged large object is read once instead of every pass, changed
+  files are re-read, and the single 64 MiB attempted-read window is
+  shared across the pass.
+- Inventory attach work continues on service ticks between passes (up
+  to 64 Singles or 1,024 Multi entries per 10 ms) and the Multi pass
+  bound rises to 32,768 entries, so large providers attach within a
+  run. A stop, `--duration` deadline or cancelled collection prevents
+  new extends, and the post-report Singles detach wait is stated as an
+  upper bound.
+- The deep-scan cap now counts user processes only for both inventory
+  and profile/trace discovery, so kernel threads no longer push a host
+  over it. `inventory --cgroup` pins at most 128 members per
+  transaction, deep-scans 32 by default, and names a clamp gap when a
+  larger cgroup exceeds one transaction.
+- The default stderr no longer prints the routine instant cleanup
+  receipt (`p11scope: cleanup completed, N/N links released, 0 s`);
+  slow, partial or uncertain receipts and receipts after cleanup
+  narrative still print, and `-v` or
+  `P11SCOPE_CAPTURE_DIAGNOSTICS=1` restore every line.
+- `doctor` recognizes Podman containers (`/run/.containerenv`),
+  reports a capability set covered by `CAP_SYS_ADMIN` as sufficient,
+  marks loader rows not applicable without `--pid`, and names the
+  extra `DAC_OVERRIDE`, `CHOWN` and `FOWNER` grants needed for `-o`
+  into a host-owned mount. A proven user namespace is named as the
+  refusal cause instead of suggesting setcap or container grants.
+- `--output-owner UID[:GID]` is now accepted by `-o` for root: it
+  trusts an output directory owned by UID and hands the report to
+  UID:GID (GID defaults to UID), for a container bind mount owned by
+  the host user. Without the flag the existing untrusted-owner
+  refusal is unchanged.
+- Concise text output groups identical proxy-closure refusals once,
+  counts operator exclusions in the empty heading and coverage,
+  singularizes one-file headers, names module content in diff
+  top-changed rows, words folded kernel-thread notes as examinations,
+  and recommends `--manifest` only when observed calls could use one.
+  `run` no longer promises a report when view opening degrades.
+- `-v` captures print one `p11scope: memory {json}` line every 60 s
+  and at the end, with per-structure sizes; reports stay
+  byte-identical. The trace failing-caller roll-up keeps at most 4,096
+  callers and folds the rest into a counted `(other callers)` row with
+  an evidence gap.
 
 ### Known limitations
 
@@ -107,7 +192,7 @@ versioned separately and are opaque, exact dispatch keys.
 - On a busy host, a long `inventory --system --key-operations`
   capture can stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Since
-  0.8.0 the lane continues past a transient interruption at the
+  0.7.1 the lane continues past a transient interruption at the
   audit step, while a batch of calls is being checked or right after
   (up to 32 interruptions per rolling 2 minutes, named once with
   a count):
@@ -116,6 +201,14 @@ versioned separately and are opaque, exact dispatch keys.
   later are tracked. Refusals at other steps still stop the lane,
   with the step and the reason named. Rerun the capture or narrow
   the scope (`--pid`).
+- The v0.7.0 limits not fixed above still apply, including the
+  late-provider admission delay under steady churn (newcomer-priority
+  scheduling remains planned for 0.8.0), silent stderr diagnostics in
+  three cases (different-user terminal, an extremely low open-files
+  limit, a very slow reader), exact per-call rows above 6,250 key
+  operations/s (the independent event reader remains planned for
+  0.8.0), and a bound on RSS growth during very long system-wide
+  captures (also planned for 0.8.0).
 
 ## [0.7.0] - 2026-11-13
 
@@ -426,10 +519,9 @@ The v0.7.0 limits live in
 [docs/known-limitations.md](docs/known-limitations.md#known-limitations-in-070).
 
 - A manifest capture watching around four thousand endpoints or more
-  can shed calls with exact counted causes while per-endpoint detail
-  stays empty, and the run can exit nonzero. This is a known bug in
-  v0.7.0, not a host problem; a fix is planned for 0.8.0. Narrow the
-  scope (`--pid` or `--cgroup`) to avoid it.
+  could shed calls with exact counted causes while per-endpoint detail
+  stayed empty, and the run could exit nonzero. This was a known bug in
+  v0.7.0, not a host problem; it is fixed in 0.7.1.
 - On a busy host, a multi-threaded program that exits during a
   `--system` capture may be counted as one lost library-load link
   (`task_uprobe_link_losses`); the count errs on the side of reporting
@@ -450,10 +542,11 @@ The v0.7.0 limits live in
   reader (some lines dropped without a count). Capture data and the
   report file are unaffected; fixes are planned for 0.8.0.
 - On a busy host, a long `inventory --system --key-operations`
-  capture can stop recording key operations partway through; the
+  capture could stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Rerun
-  the capture or narrow the scope (`--pid`); a fix is planned
-  for 0.8.0.
+  the capture or narrow the scope (`--pid`). The lane continues past
+  transient audit-step interruptions since 0.7.1; see the 0.7.1
+  limitations.
 
 ### Qualification of this release
 

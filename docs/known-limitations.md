@@ -175,16 +175,19 @@ Avoid it with `--prearm-module PATH`, `run`, or a narrower
 `--pid`/`--cgroup` scope. A newcomer-priority scheduling fix is
 planned for 0.8.0.
 
-### Manifest captures at very large endpoint counts may shed calls
+### Manifest captures at very large endpoint counts shed calls in v0.7.0 (fixed in 0.7.1)
 
 An `inventory --system --manifest ...` capture watching around four
 thousand endpoints or more (measured at 4,097 with `--max-endpoints
-8192`) can shed calls with exact counted causes while per-endpoint
-detail stays empty, and the run can exit nonzero. This is a known bug
-in v0.7.0, not a host problem: a late provider at that scale can end
-with zero of its calls joined. The shed counts are exact, never
-silent; smaller scopes are unaffected. Workaround: narrow the scope
-(`--pid` or `--cgroup`). A fix is planned for 0.8.0.
+8192`) could shed calls with exact counted causes while per-endpoint
+detail stayed empty, and the run could exit nonzero. This was a known
+bug in v0.7.0, not a host problem: a late provider at that scale could
+end with zero of its calls joined. The shed counts were exact, never
+silent; smaller scopes were unaffected. Fixed in 0.7.1: library-handle
+pins go through one bounded table per lane with a single acquire step,
+and count manifests reserve their rows before member scans, so a
+capture over its handle budget waits and retries instead of starving
+pins.
 
 ### Observer memory grows under heavy process churn
 
@@ -605,7 +608,7 @@ A long `inventory --system --key-operations` capture on a busy host
 can stop recording key operations partway through (measured on
 v0.7.0: about 5 minutes into a 20-minute capture): later operations
 never get per-key rows, the report reads PARTIAL with the stop named
-as a gap, and a stderr note says coverage is partial. Since 0.8.0
+as a gap, and a stderr note says coverage is partial. Since 0.7.1
 the lane continues past a transient interruption at the audit step,
 whether it strikes while a batch of calls is being checked or right
 after (up to 32 interruptions per rolling 2 minutes, named once
@@ -1661,7 +1664,7 @@ detail during a counter capture (`--select-endpoint`).
 Shipped in 0.7.0 and no longer planned: per-key tracking for
 programs started after a background caller.
 
-Shipped in 0.8.0 and no longer planned: bounded open-handle
+Shipped in 0.7.1 and no longer planned: bounded open-handle
 tables with a single acquire step (one table per lane; inventory
 pins each pass through a per-pass collector table).
 

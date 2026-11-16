@@ -343,6 +343,24 @@
       "cell": "privileged"
     },
     {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_downgrade_in_place_object_straddle_keeps_exact_rows_lp64",
+      "reason": "privileged: in-place downgrade object straddle keeps exact rows",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_reattach_mid_object_call_faults_instead_of_straddling_lp64",
+      "reason": "privileged: reattach across a held object call faults",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_downgrade_in_place_journal_skips_begin_lp64",
+      "reason": "privileged: journal downgrade skips BEGIN without a gap",
+      "cell": "privileged"
+    },
+    {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::detailed_sweep_test!",
       "reason": "root-owned BPF lane; bounded physical Detailed sweep",
@@ -2320,6 +2338,12 @@
       "file": "src/attach.rs",
       "path": "attach::tests::revival_probe_skips_a_quarantined_slot_after_a_failed_detach_lp64",
       "reason": "privileged: real Detailed Session revival probe",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::downgrade_in_place_tight_loop_keeps_exact_counts_lp64",
+      "reason": "privileged: in-place count-only downgrade tight loop",
       "cell": "privileged"
     }
   ]

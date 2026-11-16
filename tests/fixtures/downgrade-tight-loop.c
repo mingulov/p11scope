@@ -7,7 +7,8 @@
  * Line protocol over stdin/stdout (unbuffered reads; no stdio buffering):
  *   driver emits: READY <pid> <dev> <ino>
  *   parent sends: GO <count>
- *   driver calls C_Initialize <count> times (call <count>/2 gates);
+ *   driver calls C_Initialize <count> times (exactly one call per
+ *   burst gates: the call at index <count>/2);
  *   the gated call emits HELD, waits for one continue byte, then returns;
  *   driver emits: DONE <count>
  *   parent sends: F

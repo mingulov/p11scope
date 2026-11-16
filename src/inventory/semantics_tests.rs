@@ -1674,6 +1674,173 @@ fn native_semantic_attached_receipt_admits_a_switched_count_only_slot() {
     );
 }
 
+/// In-place downgrade (A′): the switched arm compares only the ruled
+/// fields (attach key, object, object path, ABI pin, descriptor 0,
+/// COUNT_ONLY), so a retained slot stored from a real ambiguity
+/// merge's `delta.replace` output keeps validating even though the
+/// merger rewrote its names, module list, aliasing and ambiguity
+/// flags. A full-slot comparison would refuse every attested lane
+/// after a real planner downgrade.
+#[test]
+fn native_semantic_attached_receipt_admits_a_real_merge_replace_output() {
+    use crate::plan::{AttachKey, ModuleId};
+    let fixture = ProviderFixture::new();
+    let subset = fixture.subset();
+    let plan = subset.plan().clone();
+    assert!(
+        plan.slots.len() >= 2
+            && plan
+                .slots
+                .iter()
+                .all(|slot| slot.descriptor_index != 0 && slot.module_ids.len() == 1),
+        "the sealed plan starts semantic and single-owned"
+    );
+    assert_eq!(plan.modules.len(), 1, "one owning module");
+    // A rival module claims slot 0's exact target: the rebuilt plan
+    // looks exactly like a real re-scan — every semantic slot still
+    // single-owned — but slot 0 now belongs to a module object the
+    // sealed plan never saw, so the real merger (not a hand-built
+    // slot) produces the downgrade output. The rival names the same
+    // target differently, so the merger also merges names and latches
+    // aliasing.
+    let mut rebuilt = plan.clone();
+    let rival_id = ModuleId(plan.modules.iter().map(|module| module.id.0).max().unwrap() + 1);
+    let mut rival = plan.modules[0].clone();
+    rival.id = rival_id;
+    rival.object = PinnedObjectId(
+        plan.modules
+            .iter()
+            .map(|module| module.object.0)
+            .max()
+            .unwrap()
+            + 1,
+    );
+    rebuilt.modules.push(rival);
+    rebuilt.slots[0].module_ids = vec![rival_id];
+    rebuilt.slots[0].names.push("C_Sign".to_string());
+    let mut merged = plan.clone();
+    let delta = merged.extend_exact(rebuilt).expect("a rival claim merges");
+    assert_eq!(
+        delta.replace.len(),
+        1,
+        "only the rival-claimed slot replaces: {}",
+        delta
+            .replace
+            .iter()
+            .map(|slot| slot.index.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let replace = delta.replace[0].clone();
+    assert_eq!(replace.index, 0);
+    assert_eq!(replace.descriptor_index, 0);
+    assert_eq!(replace.semantics, SlotSemantics::COUNT_ONLY);
+    assert_eq!(AttachKey::of(&replace), AttachKey::of(&plan.slots[0]));
+    // The merger evolved exactly the non-ruled fields a full-slot
+    // comparison would trip on.
+    assert!(
+        replace.semantic_ambiguous,
+        "the merge marks the replaced slot ambiguous"
+    );
+    assert_ne!(
+        replace.module_ids, plan.slots[0].module_ids,
+        "the merge rewrites the owner list"
+    );
+    assert_ne!(
+        replace.names, plan.slots[0].names,
+        "the merge merges rival names"
+    );
+    assert!(
+        replace.aliased && !plan.slots[0].aliased,
+        "the merge latches aliasing"
+    );
+    let (retained, sides) = fixture.inputs(&subset);
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    let receipt = seal_attached_subset_with(
+        subset,
+        domain,
+        CapturePolicy::Allowlisted,
+        Ok(crate::kinds::DESCRIPTORS.to_vec()),
+        &retained,
+        &sides,
+        |id| fixture.watched(id),
+    )
+    .unwrap();
+    let mut narrowed = retained.clone();
+    narrowed.get_mut(&0).unwrap().slot = replace;
+    assert!(
+        receipt
+            .validate_with(
+                domain,
+                CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &narrowed,
+                &sides,
+                |id| fixture.watched(id),
+                &BTreeSet::from([0]),
+            )
+            .is_ok(),
+        "a switched merge-replace output keeps validating on its ruled fields"
+    );
+}
+
+/// In-place downgrade (A′): a slot whose switch reads set while its
+/// retained descriptor is still semantic refuses — userspace and the
+/// narrowed BPF slot disagree (failed read-back without rollback, an
+/// inverted guard, or an outside writer), so the attested receipt
+/// must not admit it.
+#[test]
+fn native_semantic_attached_receipt_refuses_a_switched_semantic_slot() {
+    let fixture = ProviderFixture::new();
+    let subset = fixture.subset();
+    let (retained, sides) = fixture.inputs(&subset);
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    let receipt = seal_attached_subset_with(
+        subset,
+        domain,
+        CapturePolicy::Allowlisted,
+        Ok(crate::kinds::DESCRIPTORS.to_vec()),
+        &retained,
+        &sides,
+        |id| fixture.watched(id),
+    )
+    .unwrap();
+    let index = *retained.keys().next().unwrap();
+    assert_ne!(
+        retained.get(&index).unwrap().slot.descriptor_index,
+        0,
+        "the retained slot stays semantic"
+    );
+    assert!(
+        receipt
+            .validate_with(
+                domain,
+                CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &retained,
+                &sides,
+                |id| fixture.watched(id),
+                &BTreeSet::from([index]),
+            )
+            .is_err(),
+        "a switched slot with a semantic descriptor refuses"
+    );
+    assert!(
+        receipt
+            .validate_with(
+                domain,
+                CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &retained,
+                &sides,
+                |id| fixture.watched(id),
+                &BTreeSet::new(),
+            )
+            .is_ok(),
+        "the same unswitched slot still validates"
+    );
+}
+
 fn publish_frozen_for(
     domain: crate::attach::capture::NativeDomainId,
 ) -> FrozenObjectDescriptors<BTreeMap<u32, ObjectDescriptorWire>> {

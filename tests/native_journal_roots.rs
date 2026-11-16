@@ -57,14 +57,14 @@ fn begin_decision_calls_every_valid_context_and_gaps_the_rest() {
     }
 }
 
-/// In-place downgrade (A′): a count-only journal call (descriptor 0,
-/// planned or downgraded) skips BEGIN without a scope gap and without
-/// semantic-capture-failure evidence — an intended count-only slot is
-/// not a capture failure. The skip sits in `begin()` ahead of the
-/// `begin_decision` call, so the frozen `begin_decision` contract
-/// above (descriptor 0 gaps) stays untouched.
+/// In-place downgrade (A′): only a switched slot's BEGIN decision
+/// consults the narrowed arm — `begin()` takes the slot's switch bit
+/// and decides through the shared pure `begin_action`, so a planned
+/// descriptor-0 call (switch unset) keeps today's Gap path while a
+/// downgraded call never re-enters the capture-failure arm. The
+/// frozen `begin_decision` contract above stays untouched.
 #[test]
-fn count_only_calls_skip_begin_without_a_gap() {
+fn switched_calls_decide_begin_through_the_narrowed_arm() {
     const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
     fn begin_body(source: &str) -> Option<&str> {
         source
@@ -76,22 +76,86 @@ fn count_only_calls_skip_begin_without_a_gap() {
         let Some(text) = begin_body(source) else {
             return false;
         };
-        match (text.find("descriptor == 0"), text.find("begin_decision(")) {
-            (Some(skip), Some(decide)) => skip < decide,
-            _ => false,
-        }
+        text.contains("switched: bool")
+            && text.contains("begin_action(switched,")
+            && text.contains("BeginAction::Skip")
+            && text.contains("BeginAction::Gap")
+            && !text.contains("if descriptor == 0 {")
     }
     assert!(
         contract(SOURCE),
-        "journal begin() must skip descriptor 0 ahead of begin_decision"
+        "journal begin() must gate its narrowed arm on the switch bit"
     );
     let start = SOURCE.find("    pub(crate) fn begin(").unwrap();
-    for marker in ["descriptor == 0", "begin_decision("] {
+    for marker in [
+        "switched: bool",
+        "begin_action(switched,",
+        "BeginAction::Skip",
+        "BeginAction::Gap",
+    ] {
         let tail = SOURCE[start..].replacen(marker, "REMOVED", 1);
         assert!(
             !contract(&format!("{}{}", &SOURCE[..start], tail)),
             "removed {marker}"
         );
+    }
+}
+
+/// In-place downgrade (A′): the shared BEGIN custody decision. A
+/// switched slot skips silently only for a proved-irrelevant class;
+/// an affecting (or unknown) class marks its history honestly
+/// incomplete with a scope gap but no semantic-capture-failure
+/// count. An unswitched call keeps today's decision, including the
+/// Gap (with evidence) for a planned descriptor 0.
+#[test]
+fn begin_action_narrows_only_switched_slots() {
+    use p11scope_ebpf_common::LinuxLayout;
+    use root_writers::{BeginAction, BeginDecision};
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        assert_eq!(
+            root_writers::begin_action(true, 21, 1, layout),
+            BeginAction::Skip,
+            "a switched proved-irrelevant call skips silently"
+        );
+        for configured in [0, 2, 3, 4, u32::MAX] {
+            assert_eq!(
+                root_writers::begin_action(true, 21, configured, layout),
+                BeginAction::Gap { evidence: false },
+                "a switched affecting call gaps without evidence (class {configured})"
+            );
+        }
+        for (configured, normalized) in [(1, 0), (2, 1), (3, 2)] {
+            let BeginAction::Call(context) =
+                root_writers::begin_action(false, 21, configured, layout)
+            else {
+                panic!("unswitched configured {configured} must decide Call");
+            };
+            assert_eq!(context.descriptor, 21);
+            assert_eq!(context.class_bits, normalized);
+        }
+        for (descriptor, configured) in [(0, 1), (0, 2), (21, 0), (21, 4), (u32::MAX, 2)] {
+            assert_eq!(
+                root_writers::begin_action(false, descriptor, configured, layout),
+                BeginAction::Gap { evidence: true },
+                "unswitched descriptor {descriptor} class {configured} keeps Gap with evidence"
+            );
+        }
+        // The unswitched arm is exactly the frozen decision: Call maps
+        // to Call, Gap maps to Gap with evidence.
+        for descriptor in [0, 1, 21] {
+            for configured in [0, 1, 2, 3, 4] {
+                match root_writers::begin_decision(descriptor, configured, layout) {
+                    BeginDecision::Call(expected) => assert_eq!(
+                        root_writers::begin_action(false, descriptor, configured, layout),
+                        BeginAction::Call(expected),
+                    ),
+                    BeginDecision::Gap => assert_eq!(
+                        root_writers::begin_action(false, descriptor, configured, layout),
+                        BeginAction::Gap { evidence: true },
+                    ),
+                }
+            }
+        }
     }
 }
 

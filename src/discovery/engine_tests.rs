@@ -22265,6 +22265,66 @@ fn learned_table_bind_loss_files_the_dedicated_counted_row() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// A learned module whose scan-time decoder ABI disagrees with its
+/// retained pinned identity files the same dedicated counted row as
+/// total identity loss: its tables bind nothing either, and a
+/// path-carrying skip would collapse to the generic discovery row.
+#[test]
+fn learned_table_abi_mismatch_files_the_dedicated_counted_row() {
+    let (_dir, mut sleeper, mut engine, _key, _path) =
+        learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "baseline: the learned module binds before the ABI disagrees"
+    );
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "the store holds the one learned module to disagree"
+    );
+    // The retained pins stay Lp64; only the module's scan-time
+    // decoder ABI flips, as after a re-pinned or replaced object.
+    engine.run_learned_modules[0].decoder_abi = Some(p11scope_manifest::elf::ElfAbi::Ilp32);
+    let candidate = engine
+        .live_candidate_with_pending(
+            engine.pinned.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("a live candidate builds over the ABI-mismatched learned tables");
+    assert!(
+        candidate.modules.is_empty(),
+        "the ABI-mismatched learned module binds nothing"
+    );
+    let row = crate::discovery::scan::Skipped {
+        subject: "learned provider file".into(),
+        reason:
+            "a learned provider's tables lost their pinned identity; its calls were not observed"
+                .into(),
+    };
+    assert!(
+        engine.counters.object_skips.contains(&row),
+        "the ABI bind loss is counted: {:?}",
+        engine.counters.object_skips,
+    );
+    assert!(
+        candidate.plan.skipped.contains(&row),
+        "the ABI bind loss publishes into the candidate plan: {:?}",
+        candidate.plan.skipped,
+    );
+    let projected = crate::render::capture_skipped_out(&row);
+    assert_eq!(projected.name, "learned provider file");
+    assert_eq!(
+        projected.reason,
+        "a learned provider's tables lost their pinned identity; its calls were not observed"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// The table-harvest cap refuses loudly: past 32 learned table
 /// modules the refusal counts in `learned_cap_skipped` and names the
 /// table cap, not the file cap. The store fills directly so the file

@@ -4573,7 +4573,9 @@ impl AttachPlan {
     /// module on them and omits only its fresh cells as a counted growth
     /// gap. Solely-owned fresh cells go back and the snapshot is
     /// renumbered; shared fresh cells stay for their surviving owners
-    /// with the victim stripped from them.
+    /// with the victim stripped from them — and re-owned from their
+    /// remaining module ids, so a sole survivor reads sole-owned
+    /// instead of ambiguous.
     fn shed_overflow_victim(&mut self, prior: &Self, object: PinnedObjectId, marker: &str) {
         let prior_keys: BTreeSet<AttachKey> = prior.slot_by_key.keys().copied().collect();
         let (migrated, reclaimed, _) = prior.reuse_assignments(self);
@@ -4668,6 +4670,7 @@ impl AttachPlan {
                     || class == AdmissionClass::ClosureArray.label()
         );
         let reserve = (leaves_reserve && (shared || churn)).then(|| shared_scope_reserve(capacity));
+        let mut stripped: Vec<usize> = Vec::new();
         if kept == 0 {
             let holders = slot_holders(&holding, &paths);
             let mut reason = CapacityRefusal {
@@ -4694,8 +4697,12 @@ impl AttachPlan {
             self.refused_module_objects
                 .push((object, skipped.clone(), RefusalKind::CapacityWhole));
             self.modules_skipped.push(skipped);
-            for slot in &mut self.slots {
+            for (position, slot) in self.slots.iter_mut().enumerate() {
+                if !slot.module_ids.iter().any(|id| victim_ids.contains(id)) {
+                    continue;
+                }
                 slot.module_ids.retain(|id| !victim_ids.contains(id));
+                stripped.push(position);
             }
             // Merge-refused groups contribute no skips or surfaces: the
             // victim's own records go with its module. Plan skips
@@ -4772,8 +4779,26 @@ impl AttachPlan {
             // keep the module.
             for position in &disclaimed {
                 if let Some(slot) = self.slots.get_mut(*position) {
+                    if !slot.module_ids.iter().any(|id| victim_ids.contains(id)) {
+                        continue;
+                    }
                     slot.module_ids.retain(|id| !victim_ids.contains(id));
+                    stripped.push(*position);
                 }
+            }
+        }
+        // Stripped cells keep the capture topology's owner: a sole
+        // survivor owns its counts again instead of reading the
+        // ambiguity the shed just removed.
+        for position in stripped {
+            let owner = self
+                .slots
+                .get(position)
+                .map(|slot| AggregateOwner::from_module_ids(&slot.module_ids));
+            if let (Some(owner), Some(current)) =
+                (owner, self.aggregate_owners.get_mut(position))
+            {
+                *current = owner;
             }
         }
         self.excise_freed_cells(&freed);

@@ -714,10 +714,13 @@ only the value-length fact (source `creation_success`, e.g. the
 32-octet ChaCha20 key length) and never a label. The use-side
 family for such keys still comes from the §4.2
 `chacha20`/`poly1305` mechanism sets on successful operations.
-Twins (§12.1, Task 1): a `0x33` creation promotes the value-length
-fact with no label; a `0x34` creation likewise; a `0x33`-created
-key used under `CKM_CHACHA20` infers family `chacha20` while its
-established block stays label-free.
+Twins (§12.1): a `0x33` creation promotes the value-length fact
+with no label (Task 1); a `0x34` creation likewise (Task 1); a
+`0x33`-created key used under `CKM_CHACHA20` counts the use
+without labeling while its established block stays label-free
+(Task 1 negative), and infers family `chacha20` once the §4
+engine exists (Task 3 positive, at the reducer seam — `ObjectView`
+carries no family field).
 
 R2's measured non-yield (R2-doc §7.3: derive results never retained,
 session pooling vs (session,handle) bindings) is re-proven on the
@@ -1647,7 +1650,9 @@ refused, P0 refuses the flag; a replayed length trailer with
 the flag off drops unclassified (§9).
 R2 port (§6): RED→GREEN twins + finite-set twins on the new base;
 generic unlisted-type twins (`0x33`/`0x34` promote the
-value-length fact with no label; use-side family still infers).
+value-length fact with no label; the use under `CKM_CHACHA20`
+counts without labeling in Task 1, and use-side family inference
+lands with the §4 engine in Task 3).
 
 ### 12.2 Canaries (proving no payload/key bytes captured)
 

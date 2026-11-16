@@ -15,11 +15,10 @@ use crate::semantics_objects::{
     AffectedScope, AttrObservation, AttributeList, Attribution, Birth, CallKey, CallToken,
     CompleteInputPrefix, CompletedFact, CreationFamily, FieldSource, FieldState, FieldValue,
     FindResult, HandleInput, KeyLabel, Lifetime, LostOutcome, MAX_ACCESS_RELATIONS,
-    MechanismEvidence,
-    ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits,
-    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, OutputEvidence, PqcCode,
-    QueryStatus, RefCut, ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin,
-    SessionState, SlotScope, ViewOrigin,
+    MechanismEvidence, ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle,
+    ObjectId, ObjectLimits, ObjectProjection, ObjectSemantics, ObjectView, OriginFact,
+    OutputEvidence, PqcCode, QueryStatus, RefCut, ResultSlot, SessionEnd, SessionHandle,
+    SessionIncarnation, SessionOrigin, SessionState, SlotScope, ViewOrigin,
 };
 use p11scope_ebpf_common::LinuxLayout;
 use p11scope_ebpf_common::capture;
@@ -5070,10 +5069,7 @@ fn newsite_created_chacha20_key_promotes_value_len_without_label() {
         scalar_field(32),
         "the finite value length still promotes"
     );
-    assert_eq!(
-        v.key_uses, 1,
-        "the use under CKM_CHACHA20 still counts"
-    );
+    assert_eq!(v.key_uses, 1, "the use under CKM_CHACHA20 still counts");
     assert_eq!(v.label, None, "a size alone never labels");
 }
 
@@ -5334,17 +5330,15 @@ fn newsite_created_edwards_montgomery_label_with_matching_curve() {
     }
 }
 
-// Keymeta §6 pending-ruling pin (owner/design ruling outstanding):
-// a nine-slot creation template promotes from the retained first
-// eight cells only — the wire TRUNCATED flag (a template beyond
-// eight slots) is dropped before promotion (`AttributeList::new`
-// keeps the first eight; the journal `attribute_list` never reads
-// the flag and `AttributeList::truncated` has no consumer), so a
-// conflicting finite tail is unobserved, never a conflict. Here
-// the ninth slot carries CKA_VALUE_LEN 48 against an in-window
-// 32: the first-eight facts establish, the view labels AES-128,
-// and no conflict is claimed. Flip this twin if the ruling
-// refuses promotion (or records a reason) on truncation.
+// Keymeta truncated creation templates (controller KEYMETA-T1
+// rulings 2026-11-16, ruling 2): a nine-slot creation template
+// promotes from the retained first eight cells only, and the
+// truncation itself is recorded on the view. Here the ninth slot
+// carries CKA_VALUE_LEN 48 against an in-window 32: the
+// first-eight facts establish (the size in slot 3 is a fact), the
+// view labels AES-128, the conflicting tail size is unobserved
+// (never a conflict), and the view records the truncation so
+// unseen fields carry the named reason downstream.
 #[test]
 fn newsite_created_nine_slot_template_promotes_first_eight_only() {
     let mut h = Hist::qualified();
@@ -5402,6 +5396,59 @@ fn newsite_created_nine_slot_template_promotes_first_eight_only() {
         Some(KeyLabel::Aes { value_len: 32 }),
         "the first-eight triple labels without a query"
     );
+    assert!(
+        v.creation_truncated,
+        "the nine-slot template records its truncation on the view"
+    );
+}
+
+// Keymeta truncated creation templates (controller KEYMETA-T1
+// rulings 2026-11-16, ruling 2): a finite attribute past the
+// eighth slot is unobserved — the size in slot 9 stays unknown
+// (never a default, never an absence claim) while the observed
+// class and key type still promote. The view records the
+// truncation so the unseen size carries the named reason
+// downstream; without the size the view stays unlabeled.
+#[test]
+fn newsite_created_nine_slot_template_tail_size_stays_unknown() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_TOKEN, 1),
+        scalar(CKA_MODULUS_BITS, 2048),
+        AttrObservation::curve(CKA_EC_PARAMS, &SECP256R1, LinuxLayout::Lp64),
+        scalar(CKA_PARAMETER_SET, 1),
+        scalar(CKA_ID, 7),
+        scalar(CKA_ID, 9),
+        scalar(CKA_VALUE_LEN, 32),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::Class),
+        scalar_field(4),
+        "creation result establishes the observed class"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        scalar_field(0x1f),
+        "creation result establishes the observed key type"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        FieldState::Unknown,
+        "the tail size stays unknown: nothing inferred past slot 8"
+    );
+    assert!(
+        v.creation_truncated,
+        "the nine-slot template records its truncation on the view"
+    );
+    assert_eq!(v.label, None, "an AES key without its size never labels");
 }
 
 // Keymeta §6/K5 source twin: a promoted fact never keeps its source
@@ -5455,12 +5502,7 @@ fn newsite_promoted_fields_invalidated_by_set_attributes_clear_sources() {
         scalar(CKA_VALUE_LEN, 32),
     ]);
     let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
-    h.run(
-        5,
-        call("C_SetAttributeValue").on(SA).input(0, H1),
-        6,
-        ok(),
-    );
+    h.run(5, call("C_SetAttributeValue").on(SA).input(0, H1), 6, ok());
     let e = h.settle(6);
     let id = created(&e, x, 0).unwrap();
     let p = h.project();
@@ -5471,10 +5513,7 @@ fn newsite_promoted_fields_invalidated_by_set_attributes_clear_sources() {
         SafeAttributeKind::ValueLen,
     ] {
         assert!(
-            matches!(
-                v.established.field(kind),
-                FieldState::Invalidated(_)
-            ),
+            matches!(v.established.field(kind), FieldState::Invalidated(_)),
             "{kind:?}: the mutation invalidates the promoted fact"
         );
         assert_eq!(
@@ -5551,12 +5590,7 @@ fn newsite_created_data_object_stays_unlabeled() {
             scalar(CKA_KEY_TYPE, u64::from(key_type)),
             scalar(size_selector, size),
         ]);
-        let x = h.run(
-            3,
-            create(SA).request(0, template),
-            4,
-            ok().result(0, H1),
-        );
+        let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
         let e = h.settle(4);
         let id = created(&e, x, 0).unwrap();
         let p = h.project();

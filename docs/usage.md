@@ -1710,7 +1710,10 @@ Limits that matter in pods:
   ("Returned errors" are calls that returned an error, never observer
   failures.) With `-v`, each provider line pairs its machine instance
   label in parentheses; rows no provider can be proved for read under
-  `unknown keys` instead. Proved post-quantum uses are spotlighted per
+  `unknown keys` instead. With `-v`, objects created from templates
+  beyond eight slots are counted on their own line (`  template
+  truncated (first 8 attributes captured) (N objects)`); `--json`
+  carries the same reason on each unseen metadata field. Proved post-quantum uses are spotlighted per
   parameter set on their own line after the provider lines (for example
   `  pqc keys: ML-DSA-65 sign: 12`), with failed/active terminals
   under `-v`; `--json` carries the matching `metadata_at_use` label

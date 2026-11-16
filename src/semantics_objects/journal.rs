@@ -3528,7 +3528,11 @@ fn mechanism_evidence(capture_word: u32, mechanism: u64) -> MechanismEvidence {
 
 /// One validated 36-byte attribute list to model requested facts: absent
 /// (all zero) and uninspected lists carry no facts; an inspected list maps
-/// each cell within its inspected count.
+/// each cell within its inspected count. The wire TRUNCATED bit (a
+/// template beyond eight slots) rides beside the retained first eight
+/// cells (controller KEYMETA-T1 rulings 2026-11-16, ruling 2); the
+/// validator already pins the honest shape (bit set only at eight
+/// inspected cells).
 fn attribute_list(list: &[u8; 36]) -> Option<AttributeList> {
     if list.iter().all(|byte| *byte == 0) {
         return None;
@@ -3545,7 +3549,8 @@ fn attribute_list(list: &[u8; 36]) -> Option<AttributeList> {
             u16::from_le_bytes([cell[2], cell[3]]),
         ));
     }
-    Some(AttributeList::new(&observations))
+    let truncated = list[33] & p11scope_ebpf_common::object_capture::attr_list_flag::TRUNCATED != 0;
+    Some(AttributeList::with_truncated(&observations, truncated))
 }
 
 /// One validated attribute cell to a model observation. Values re-check
@@ -14253,6 +14258,35 @@ pub(crate) mod tests {
             attribute_cell(6, 1, 8).status(),
             QueryStatus::Unsupported,
             "an out-of-range curve code retains nothing"
+        );
+    }
+
+    /// Controller KEYMETA-T1 rulings 2026-11-16, ruling 2: the
+    /// journal carries the wire TRUNCATED bit beside the retained
+    /// first eight cells, so promotion records a template beyond
+    /// eight slots. Without the bit the list decodes untruncated.
+    #[test]
+    fn object_journal_attribute_list_carries_wire_truncated_bit() {
+        fn list(flags: u8) -> [u8; 36] {
+            let mut list = [0u8; 36];
+            for index in 0..8 {
+                list[4 * index] = 1;
+                list[4 * index + 1] = 1;
+                list[4 * index + 2] = 4;
+            }
+            list[32] = 8;
+            list[33] = flags;
+            list
+        }
+        let complete = attribute_list(&list(0x01)).expect("inspected list decodes");
+        assert!(
+            !complete.truncated(),
+            "no truncation bit, no truncation recorded"
+        );
+        let truncated = attribute_list(&list(0x03)).expect("inspected list decodes");
+        assert!(
+            truncated.truncated(),
+            "the wire TRUNCATED bit is carried to promotion"
         );
     }
 

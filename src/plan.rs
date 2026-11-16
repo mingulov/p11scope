@@ -16181,6 +16181,74 @@ pub(crate) mod tests {
         assert!(plan.validate_slot_index().is_ok());
     }
 
+    /// Seed path (tier-3 review of port3 fix2): a new pin's
+    /// `C_GetFunctionList` seed forward-flips onto another pin's
+    /// retired semantic cell of the same file — the seed-path side of
+    /// the cross-pin forward flip. The retired cell carries exactly
+    /// `C_GetFunctionList` under the merge-decoded nonzero descriptor
+    /// (its semantics still read count-only); the seed reoccupies
+    /// index 0 count-only, clears the retirement, and stays
+    /// sole-owned and valid. Without the flip the seed burns a fresh
+    /// index 1.
+    #[test]
+    fn provisional_seed_forward_flips_onto_a_retired_semantic_cell() {
+        let old = PinnedObjectId(7);
+        let new = PinnedObjectId(9);
+        let seed = |object| ProvisionalGetFunctionList {
+            module: ModuleId(0),
+            object,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x10,
+        };
+        let identity = test_identity(7, "sha-seed-flip");
+        let mut plan = provisional_plan(old);
+        plan.object_identities.insert(old, identity.clone());
+        let first = plan
+            .add_provisional_get_function_list(seed(old))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.index, 0);
+        // Promote the seed cell to the shape merge builds for an
+        // authorized published `C_GetFunctionList`: the decoded
+        // descriptor is nonzero even though its semantics read
+        // count-only, so the retirement below is a semantic one.
+        let (descriptor, ambiguous) =
+            crate::kinds::descriptor_index(&["C_GetFunctionList".to_string()]);
+        assert_ne!(descriptor, 0, "the decoded descriptor is semantic-shaped");
+        assert!(!ambiguous);
+        let slot = &mut plan.slots[0];
+        slot.descriptor_index = descriptor;
+        slot.semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+        slot.semantic_authorized = true;
+        plan.deactivate(0);
+        assert_eq!(plan.slot_index_for_key(AttachKey::of(&first)), None);
+        plan.revivable.clone_from(&plan.retired_keys);
+        plan.modules[0].object = new;
+        plan.modules[0].key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 9,
+        };
+        plan.object_identities.insert(new, identity);
+        let revived = plan
+            .add_provisional_get_function_list(seed(new))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            revived.index, 0,
+            "the seed forward-flips onto the retired semantic cell"
+        );
+        assert_eq!(revived.descriptor_index, 0);
+        assert!(!revived.semantic_authorized);
+        assert_eq!(revived.names, ["C_GetFunctionList"]);
+        assert_eq!(plan.slots.len(), 1, "no fresh cell burns");
+        assert_eq!(plan.slot_index_for_key(AttachKey::of(&revived)), Some(0));
+        assert!(!plan.retired_slots().contains(&0));
+        assert_eq!(plan.module_of_slot(0), Some(ModuleId(0)));
+        assert_eq!(plan.module_ambiguous, 0);
+        assert_eq!(plan.provisional_get_function_list.len(), 1);
+        assert!(plan.validate_slot_index().is_ok());
+    }
+
     #[test]
     fn tableless_rebuild_carries_provisional_without_attach_delta() {
         let object = PinnedObjectId(42);

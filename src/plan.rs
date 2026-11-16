@@ -3380,12 +3380,14 @@ impl AttachPlan {
     }
 
     /// Bounds capture-lifetime metadata to the cells the plan still holds:
-    /// only live and retired slots (and live modules) keep ordinals and
-    /// object identities. A reclaimed position transfers the old key's
-    /// ordinals to the returning key first, so no history is lost.
+    /// only live and retired slots (and live modules) keep ordinals,
+    /// unnamed reasons and object identities. A reclaimed position
+    /// transfers the old key's ordinals and reasons to the returning key
+    /// first, so no history is lost.
     fn prune_capture_memory(&mut self) {
         let live_keys: BTreeSet<AttachKey> = self.slots.iter().map(AttachKey::of).collect();
         self.slot_ordinals.retain(|key, _| live_keys.contains(key));
+        self.slot_unnamed_reasons.retain(|key, _| live_keys.contains(key));
         let live_objects: BTreeSet<PinnedObjectId> = self
             .slots
             .iter()
@@ -3693,6 +3695,15 @@ impl AttachPlan {
                         .or_default()
                         .extend(ordinals);
                 }
+                // The superseded key's reasons follow the migrated key
+                // like its ordinals, so the union below keeps what the
+                // old pin's row proved, not just the returning claim.
+                if let Some(reasons) = self.slot_unnamed_reasons.remove(key) {
+                    self.slot_unnamed_reasons
+                        .entry(new_key)
+                        .or_default()
+                        .extend(reasons);
+                }
                 slots[*position] = updated;
                 slot_by_key.remove(key);
                 slot_by_key.insert(new_key, *position);
@@ -3908,6 +3919,14 @@ impl AttachPlan {
                 let old_key = AttachKey::of(&slots[position]);
                 if let Some(ordinals) = self.slot_ordinals.remove(&old_key) {
                     self.slot_ordinals.entry(key).or_default().extend(ordinals);
+                }
+                // A reclaim onto a retired unknown row merges its
+                // reasons into the returning key, never replaces them.
+                if let Some(reasons) = self.slot_unnamed_reasons.remove(&old_key) {
+                    self.slot_unnamed_reasons
+                        .entry(key)
+                        .or_default()
+                        .extend(reasons);
                 }
                 slots[position] = updated.clone();
                 slot_by_key.insert(key, position);

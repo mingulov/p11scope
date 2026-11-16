@@ -1206,6 +1206,10 @@ pub struct AttachPlan {
     counter_consumed_end: u32,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    // Build input for refusal text: a metrics capture without an explicit
+    // `--counter-mode` names that remedy in provider-refusal reasons. Set
+    // once per build; every derivation of the plan carries it.
+    counter_hint: bool,
     // Objects present in the capture's first plan input (PA-5 C1): a proxy
     // closure array gets its heuristic prefix only when here (the late-start
     // case); a closure first mapped during the capture admits only its
@@ -1937,6 +1941,7 @@ impl AttachPlan {
             .map(|(key, value)| (*key, value.clone()))
             .collect();
         subset.object_identities = self.object_identities.clone();
+        subset.counter_hint = self.counter_hint;
         subset.standard_layout_slots = subset
             .slots
             .iter()
@@ -2018,6 +2023,7 @@ impl AttachPlan {
             counter_consumed_end: 0,
             admission_policy,
             admission_scope: AdmissionScope::Named,
+            counter_hint: false,
             slot_ordinals: BTreeMap::new(),
             slot_unnamed_reasons: BTreeMap::new(),
             object_identities: BTreeMap::new(),
@@ -4111,19 +4117,69 @@ impl AttachPlan {
         let capacity = self.admission_policy.endpoint_limit();
         let in_use = prior.slots.len();
         let retired = prior.retired_slots.len();
-        let path = self
-            .modules
-            .iter()
-            .find(|module| module.object == object)
+        let victim_module = self.modules.iter().find(|module| module.object == object);
+        let path = victim_module
             .map(|module| module.path.clone())
             .unwrap_or_else(|| format!("object {object:?}"));
+        let victim_class = victim_module.and_then(|module| module.admission_class);
+        // Refusal holders mirror merge: active endpoints by owner object,
+        // never the victim's own.
+        let object_of: BTreeMap<ModuleId, PinnedObjectId> = self
+            .modules
+            .iter()
+            .map(|module| (module.id, module.object))
+            .collect();
+        let mut holding: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
+        for slot in &self.slots {
+            if !self.is_active(slot.index) {
+                continue;
+            }
+            for id in &slot.module_ids {
+                if let Some(owner) = object_of.get(id) {
+                    *holding.entry(*owner).or_default() += 1;
+                }
+            }
+        }
+        holding.remove(&object);
+        let paths: BTreeMap<PinnedObjectId, &str> = self
+            .modules
+            .iter()
+            .filter(|module| module.object != object)
+            .map(|module| (module.object, module.path.as_str()))
+            .collect();
+        // Reserve mirror of merge's Detailed rule: heuristic and closure
+        // victims name the reserve in a shared scope, or once churn has
+        // retired slots the snapshot no longer lists.
+        let shared = self.admission_scope == AdmissionScope::Shared;
+        let churn = prior
+            .retired_keys
+            .keys()
+            .any(|key| !self.slot_by_key.contains_key(key));
+        let leaves_reserve = matches!(
+            victim_class,
+            Some(class)
+                if class == AdmissionClass::Heuristic.label()
+                    || class == AdmissionClass::ClosureArray.label()
+        );
+        let reserve = (leaves_reserve && (shared || churn)).then(|| shared_scope_reserve(capacity));
         if kept == 0 {
-            let reason = format!(
-                "module needs {fresh} more; only {capacity} attach slots are available; {} - \
-                 refusing to attach a prefix; to capture one provider, name it with --module \
-                 <path>; to free slots, exclude an unneeded module with --exclude-module <name>",
-                slot_use(in_use, retired, &[])
-            );
+            let holders = slot_holders(&holding, &paths);
+            let reason = CapacityRefusal {
+                policy: self.admission_policy,
+                needed: fresh,
+                capacity,
+                in_use,
+                retired,
+                holders,
+                reserve,
+                closure_tables: None,
+                aim_hint: shared,
+                naming_hint: false,
+                counter_hint: self.counter_hint,
+                unpublished: false,
+                broad_admit: false,
+            }
+            .reason();
             let skipped = Skipped {
                 subject: path,
                 reason,
@@ -4134,12 +4190,55 @@ impl AttachPlan {
             for slot in &mut self.slots {
                 slot.module_ids.retain(|id| !victim_ids.contains(id));
             }
+            // Merge-refused groups contribute no skips or surfaces: the
+            // victim's own records go with its module. Plan skips
+            // partition by contributing module ahead of an orphaned tail;
+            // on any other shape the records stay (evidence is kept,
+            // never dropped). Scan-table surfaces are attributable by
+            // path; interface and manifest surfaces carry none and stay,
+            // as does a path a surviving module still owns.
+            let merge_skips: Vec<Skipped> = self
+                .modules
+                .iter()
+                .flat_map(|module| module.skipped.iter().cloned())
+                .collect();
+            let dropped_paths: Vec<String> = self
+                .modules
+                .iter()
+                .filter(|module| module.object == object)
+                .map(|module| module.path.clone())
+                .collect();
             self.modules.retain(|module| module.object != object);
-        } else {
-            let is_closure = self.modules.iter().any(|module| {
-                module.object == object
-                    && module.admission_class == Some(AdmissionClass::ClosureArray.label())
+            debug_assert!(
+                self.skipped.starts_with(&merge_skips),
+                "plan skips partition by contributing module"
+            );
+            if self.skipped.starts_with(&merge_skips) {
+                let orphaned = self.skipped[merge_skips.len()..].to_vec();
+                let mut surviving: Vec<Skipped> = self
+                    .modules
+                    .iter()
+                    .flat_map(|module| module.skipped.iter().cloned())
+                    .collect();
+                surviving.extend(orphaned);
+                self.skipped = surviving;
+            }
+            let surviving_paths: BTreeSet<String> = self
+                .modules
+                .iter()
+                .map(|module| module.path.clone())
+                .collect();
+            self.surfaces.retain(|surface| {
+                !dropped_paths.iter().any(|path| {
+                    !surviving_paths.contains(path)
+                        && surface.source.len() > path.len()
+                        && surface.source.starts_with(path.as_str())
+                        && surface.source[path.len()..].starts_with(" table ")
+                })
             });
+        } else {
+            let is_closure = victim_class == Some(AdmissionClass::ClosureArray.label());
+            let holders = slot_holders(&holding, &paths);
             let omission = Skipped {
                 subject: path,
                 reason: growth_omission_reason(&GrowthOmission {
@@ -4149,9 +4248,9 @@ impl AttachPlan {
                     retired,
                     kept,
                     policy: self.admission_policy,
-                    holders: &[],
+                    holders: &holders,
                     provider_remedies: !is_closure,
-                    counter_hint: false,
+                    counter_hint: self.counter_hint,
                 }),
             };
             self.refused_module_objects.push((
@@ -6531,6 +6630,7 @@ fn merge(
     plan.vendor_interfaces = vendor_interfaces;
     plan.interface_list = interface_list;
     plan.admission_scope = admission_scope;
+    plan.counter_hint = counter_hint;
     plan.first_plan_objects = match allocated.first_plan {
         Some(first) => first.clone(),
         None => paths.keys().copied().collect(),
@@ -9800,6 +9900,7 @@ impl ConservativePlanCursor {
         out.vendor_interfaces = old.vendor_interfaces;
         out.interface_list = old.interface_list.clone();
         out.counter_consumed_end = old.counter_consumed_end;
+        out.counter_hint = old.counter_hint;
         out.first_plan_objects = old.first_plan_objects.clone();
         out.first_plan_had_provider = old.first_plan_had_provider;
         out.uncorroborated_candidates = if self.broad_admit {

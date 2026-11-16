@@ -3249,12 +3249,19 @@ impl AttachPlan {
         rebuilt.validate_slot_index()?;
         let mut rebuilt = rebuilt;
         if let Err(error) = self.validate_extension_capacity(&rebuilt) {
-            // Growth omission at true capacity: a whole new module object
-            // that cannot fit is dropped and recorded as a counted named
-            // refusal instead of aborting the capture. Retirement,
-            // replacement and every kept/active cell stay. If no new object
-            // can free a cell, the original capacity error stands.
-            if rebuilt.drop_overflowing_new_modules(self) == 0 {
+            // Growth omission at true capacity: shed overflowing demand one
+            // object at a time — a module with nothing to keep is refused
+            // whole, an object that keeps cells keeps them and omits only
+            // its fresh cells as a counted growth gap — instead of aborting
+            // the capture. Retirement, replacement and every kept/active
+            // cell stay. Only kept and reused demand without a fresh cell
+            // to shed still errors, which cannot fit under any repair.
+            if !rebuilt.repair_overflowing_extension(self) {
+                let (_, _, additions) = self.reuse_assignments(&rebuilt);
+                debug_assert!(
+                    additions == 0,
+                    "kept+reused alone exceed capacity: {additions} fresh additions with no owning module to shed"
+                );
                 return Err(error);
             }
             self.validate_extension_capacity(&rebuilt)?;
@@ -3974,120 +3981,201 @@ impl AttachPlan {
         old_to_new
     }
 
-    /// Growth omission at true capacity: drop every whole new module object
-    /// whose fresh cells keep the extension over budget, record each as a
-    /// counted, named capacity refusal, and return how many objects were
-    /// dropped. Retirement, replacement and every kept/active cell are
-    /// untouched: only active cells that are fresh to `prior` and owned
-    /// exclusively by new objects are given back. Returns 0, changing
-    /// nothing, when no new object can free a cell, so the caller reports
+    /// Extension fallback: shed overflowing demand one object at a time, in
+    /// reverse admission order, re-validating after each step and stopping
+    /// as soon as the extension fits. An object with no kept or reused cell
+    /// is refused whole; an object that keeps cells — an existing module's
+    /// growth, or a new pin continuing on migrated or reclaimed cells —
+    /// keeps its module on those cells and omits only its fresh cells as a
+    /// counted growth gap. Retirement, replacement and every kept/active
+    /// cell stay. Returns whether the extension fits now; when no module
+    /// owns a fresh cell to shed, nothing changes and the caller reports
     /// the original capacity error instead of hiding it.
-    fn drop_overflowing_new_modules(&mut self, prior: &Self) -> usize {
+    fn repair_overflowing_extension(&mut self, prior: &Self) -> bool {
         if !matches!(self.admission_policy, AdmissionPolicy::Detailed(_))
             || !matches!(prior.admission_policy, AdmissionPolicy::Detailed(_))
         {
-            return 0;
+            return false;
         }
-        let prior_objects: BTreeSet<PinnedObjectId> =
-            prior.modules.iter().map(|module| module.object).collect();
-        let prior_keys: BTreeSet<AttachKey> = prior.slot_by_key.keys().copied().collect();
+        loop {
+            if prior.validate_extension_capacity(self).is_ok() {
+                return true;
+            }
+            let Some(victim) = prior.overflow_victim(self) else {
+                return false;
+            };
+            self.shed_overflow_victim(prior, victim);
+        }
+    }
+
+    /// The next fallback victim: the last-admitted object holding a fresh
+    /// cell, by admission class (closures and heuristics decide last),
+    /// then object key, then snapshot position. The within-class demand
+    /// order merge admits by is not retained on the plan, so key order
+    /// breaks those ties; equal demands always order by key.
+    fn overflow_victim(&self, rebuilt: &Self) -> Option<PinnedObjectId> {
+        let prior_keys: BTreeSet<AttachKey> = self.slot_by_key.keys().copied().collect();
         // Exact reuse assignments the extension will apply: migrated and
-        // reclaimed keys cost no fresh cell, so they are never "overflowing"
-        // and dropping their owner would lose an in-place reuse.
-        let (migrated, reclaimed, _) = prior.reuse_assignments(self);
-        let object_of: BTreeMap<ModuleId, PinnedObjectId> = self
+        // reclaimed keys cost no fresh cell, so they never count toward
+        // what an object must shed.
+        let (migrated, reclaimed, _) = self.reuse_assignments(rebuilt);
+        let fresh_of = |object: PinnedObjectId| {
+            rebuilt
+                .slot_by_key
+                .keys()
+                .filter(|key| key.object == object)
+                .filter(|key| {
+                    !prior_keys.contains(key)
+                        && !migrated.contains_key(key)
+                        && !reclaimed.contains_key(key)
+                })
+                .count()
+        };
+        rebuilt
             .modules
             .iter()
-            .map(|module| (module.id, module.object))
-            .collect();
-        let new_ids: BTreeSet<ModuleId> = self
-            .modules
-            .iter()
-            .filter(|module| !prior_objects.contains(&module.object))
-            .map(|module| module.id)
-            .collect();
-        if new_ids.is_empty() {
-            return 0;
-        }
-        // Fresh cells owned only by new objects: their keys were not active
-        // in the prior plan and take no reuse assignment, so giving them
-        // back returns room the extension would otherwise need.
-        let freed: BTreeSet<usize> = self
-            .slot_by_key
-            .values()
-            .copied()
-            .filter(|position| {
-                let Some(slot) = self.slots.get(*position) else {
-                    return false;
-                };
-                let key = AttachKey::of(slot);
-                !prior_keys.contains(&key)
-                    && !migrated.contains_key(&key)
-                    && !reclaimed.contains_key(&key)
-                    && !slot.module_ids.is_empty()
-                    && slot.module_ids.iter().all(|id| new_ids.contains(id))
+            .enumerate()
+            .filter(|(_, module)| fresh_of(module.object) > 0)
+            .max_by(|(left_position, left), (right_position, right)| {
+                (
+                    Self::fallback_class_rank(left.admission_class),
+                    left.key,
+                    left_position,
+                )
+                    .cmp(&(
+                        Self::fallback_class_rank(right.admission_class),
+                        right.key,
+                        right_position,
+                    ))
             })
-            .collect();
-        if freed.is_empty() {
-            return 0;
+            .map(|(_, module)| module.object)
+    }
+
+    /// Admission-class rank for fallback victim order. Mirrors
+    /// [`AdmissionClass`] admission order; unclassified modules shed last.
+    fn fallback_class_rank(class: Option<&str>) -> u8 {
+        if class == Some(AdmissionClass::ClosureArray.label()) {
+            3
+        } else if class == Some(AdmissionClass::Heuristic.label()) {
+            2
+        } else if class == Some(AdmissionClass::Corroborated.label()) {
+            1
+        } else {
+            0
         }
-        // Drop every new object that owns a freeable cell; a new object that
-        // only reoccupies retired cells, or that shares all its fresh cells
-        // with an existing module, is not overflowing and stays.
-        let dropped_objects: BTreeSet<PinnedObjectId> = freed
-            .iter()
-            .filter_map(|position| self.slots.get(*position))
-            .flat_map(|slot| slot.module_ids.iter())
-            .filter_map(|id| object_of.get(id).copied())
-            .collect();
-        let dropped_ids: BTreeSet<ModuleId> = self
+    }
+
+    /// Sheds one fallback victim. An object with no kept or reused cell is
+    /// dropped whole and refused; an object that keeps cells keeps its
+    /// module on them and omits only its fresh cells as a counted growth
+    /// gap. Solely-owned fresh cells go back and the snapshot is
+    /// renumbered; shared fresh cells stay for their surviving owners
+    /// with the victim stripped from them.
+    fn shed_overflow_victim(&mut self, prior: &Self, object: PinnedObjectId) {
+        let prior_keys: BTreeSet<AttachKey> = prior.slot_by_key.keys().copied().collect();
+        let (migrated, reclaimed, _) = prior.reuse_assignments(self);
+        let victim_ids: BTreeSet<ModuleId> = self
             .modules
             .iter()
-            .filter(|module| dropped_objects.contains(&module.object))
+            .filter(|module| module.object == object)
             .map(|module| module.id)
             .collect();
-        if dropped_ids.is_empty() {
-            return 0;
+        // The victim's demand: owned rebuilt-active cells that are fresh
+        // (neither kept nor reused) versus kept-or-reused ones. Solely
+        // owned fresh cells are freed; shared ones are disclaimed.
+        let mut fresh = 0usize;
+        let mut kept = 0usize;
+        let mut freed: BTreeSet<usize> = BTreeSet::new();
+        let mut disclaimed: BTreeSet<usize> = BTreeSet::new();
+        for (key, position) in &self.slot_by_key {
+            let Some(slot) = self.slots.get(*position) else {
+                continue;
+            };
+            if !slot.module_ids.iter().any(|id| victim_ids.contains(id)) {
+                continue;
+            }
+            if prior_keys.contains(key) || migrated.contains_key(key) || reclaimed.contains_key(key)
+            {
+                kept += 1;
+                continue;
+            }
+            fresh += 1;
+            if !slot.module_ids.is_empty()
+                && slot.module_ids.iter().all(|id| victim_ids.contains(id))
+            {
+                freed.insert(*position);
+            } else {
+                disclaimed.insert(*position);
+            }
         }
         let capacity = self.admission_policy.endpoint_limit();
         let in_use = prior.slots.len();
         let retired = prior.retired_slots.len();
-        for module in &self.modules {
-            if !dropped_ids.contains(&module.id) {
-                continue;
-            }
-            let needed = self
-                .slot_by_key
-                .iter()
-                .filter(|(key, _)| {
-                    key.object == module.object
-                        && !prior_keys.contains(key)
-                        && !migrated.contains_key(key)
-                        && !reclaimed.contains_key(key)
-                })
-                .count();
+        let path = self
+            .modules
+            .iter()
+            .find(|module| module.object == object)
+            .map(|module| module.path.clone())
+            .unwrap_or_else(|| format!("object {object:?}"));
+        if kept == 0 {
             let reason = format!(
-                "module needs {needed} more; only {capacity} attach slots are available; {} - \
+                "module needs {fresh} more; only {capacity} attach slots are available; {} - \
                  refusing to attach a prefix; to capture one provider, name it with --module \
                  <path>; to free slots, exclude an unneeded module with --exclude-module <name>",
                 slot_use(in_use, retired, &[])
             );
             let skipped = Skipped {
-                subject: module.path.clone(),
+                subject: path,
                 reason,
             };
-            self.refused_module_objects.push((
-                module.object,
-                skipped.clone(),
-                RefusalKind::CapacityWhole,
-            ));
+            self.refused_module_objects
+                .push((object, skipped.clone(), RefusalKind::CapacityWhole));
             self.modules_skipped.push(skipped);
+            for slot in &mut self.slots {
+                slot.module_ids.retain(|id| !victim_ids.contains(id));
+            }
+            self.modules.retain(|module| module.object != object);
+        } else {
+            let is_closure = self.modules.iter().any(|module| {
+                module.object == object
+                    && module.admission_class == Some(AdmissionClass::ClosureArray.label())
+            });
+            let omission = Skipped {
+                subject: path,
+                reason: growth_omission_reason(&GrowthOmission {
+                    omitted: fresh,
+                    capacity,
+                    in_use,
+                    retired,
+                    kept,
+                    policy: self.admission_policy,
+                    holders: &[],
+                    provider_remedies: !is_closure,
+                    counter_hint: false,
+                }),
+            };
+            self.refused_module_objects.push((
+                object,
+                omission.clone(),
+                RefusalKind::GrowthOmission,
+            ));
+            self.modules_skipped.push(omission);
+            // Disclaim the shared fresh cells; the kept and reused cells
+            // keep the module.
+            for position in &disclaimed {
+                if let Some(slot) = self.slots.get_mut(*position) {
+                    slot.module_ids.retain(|id| !victim_ids.contains(id));
+                }
+            }
         }
-        for slot in &mut self.slots {
-            slot.module_ids.retain(|id| !dropped_ids.contains(id));
-        }
-        self.modules
-            .retain(|module| !dropped_ids.contains(&module.id));
+        self.excise_freed_cells(&freed);
+    }
+
+    /// Gives freed cells back and renumbers the snapshot: slots, owners,
+    /// retired and layout sets, revival memory and the attach index all
+    /// follow the compaction, and capture memory is pruned to the cells
+    /// the snapshot still holds.
+    fn excise_freed_cells(&mut self, freed: &BTreeSet<usize>) {
         // Give the now-ownerless fresh cells back and renumber the snapshot.
         let old_len = self.slots.len();
         let mut old_to_new = vec![u32::MAX; old_len];
@@ -4165,7 +4253,6 @@ impl AttachPlan {
             .count();
         self.mutations.bump();
         self.prune_capture_memory();
-        dropped_ids.len()
     }
 
     pub(crate) fn validate_slot_index(&self) -> Result<(), String> {
@@ -21746,16 +21833,16 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
-    /// Growth-omission RED twin: an object dropped whole at capacity must
-    /// not also drop the endpoints it reuses in place. The prior plan sits
-    /// at MAX_SLOTS (2,044 filler cells + 68 gen1 cells, pin 82,
+    /// Growth-omission twin: an object that reuses cells in place is
+    /// continuing growth, not a whole refusal. The prior plan sits at
+    /// MAX_SLOTS (2,044 filler cells + 68 gen1 cells, pin 82,
     /// `sha-migrate`); gen2 is the same file at pin 83 with the same 68
     /// offsets plus 40 fresh targets, so the extension overflows by exactly
-    /// the fresh 40. The defensive drop gives those 40 back and refuses
-    /// gen2 whole, but the 68 in-place migrations must stay active: they
-    /// are not overflowing fresh cells and must not be counted as freeable.
+    /// the fresh 40. The fallback gives those 40 back as a counted growth
+    /// gap and keeps gen2's module on the 68 in-place migrations: they
+    /// stay active, owned and attributed, never ownerless.
     #[test]
-    fn extend_at_capacity_keeps_in_place_migrations_of_a_dropped_module() {
+    fn extend_at_capacity_keeps_in_place_migrations_of_an_omitted_module() {
         let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
         let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
         let mut plan = scoped_plan(&[filler, gen1], AdmissionScope::Shared);
@@ -21805,26 +21892,49 @@ pub(crate) mod tests {
                 .map(|slot| (slot.index, slot.file_offset))
                 .collect::<Vec<_>>()
         );
-        for position in gen1_positions {
+        for position in &gen1_positions {
             assert!(
-                plan.is_active(position as u32),
-                "gen1 position {position} must stay active through the drop"
+                plan.is_active(*position as u32),
+                "gen1 position {position} must stay active through the omission"
             );
-            assert_eq!(plan.slots[position].object, PinnedObjectId(83));
-            assert!(gen1_offsets.contains(&plan.slots[position].file_offset));
+            assert_eq!(plan.slots[*position].object, PinnedObjectId(83));
+            assert!(gen1_offsets.contains(&plan.slots[*position].file_offset));
         }
         let refusals: Vec<_> = plan.refused_modules_typed().collect();
         assert_eq!(refusals.len(), 1, "{refusals:?}");
         let (object, skipped, kind) = refusals[0];
         assert_eq!(object, PinnedObjectId(83));
         assert_eq!(skipped.subject, "/opt/libsofthsm2.so");
-        assert_eq!(kind, RefusalKind::CapacityWhole);
+        assert_eq!(kind, RefusalKind::GrowthOmission);
         assert_eq!(
-            whole_refusal_needed_count(&skipped.reason),
+            growth_omitted_count(&skipped.reason),
             Some(40),
-            "the refusal counts the fresh cells only, never the in-place reuses: {}",
+            "the gap counts the fresh cells only, never the in-place reuses: {}",
             skipped.reason
         );
+        assert!(
+            skipped.reason.contains("kept its 68 attached"),
+            "the gap names the kept cells: {}",
+            skipped.reason
+        );
+        let module = plan
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(83))
+            .expect("the continuing module stays admitted")
+            .id;
+        for position in gen1_positions {
+            assert_eq!(
+                plan.slots[position].module_ids,
+                [module],
+                "no ownerless active cell at {position}"
+            );
+            assert_eq!(
+                plan.module_of_slot(position as u32),
+                Some(module),
+                "the migrated cell keeps its attribution at {position}"
+            );
+        }
         plan.validate_slot_index()
             .expect("the partial topology stays clean");
     }

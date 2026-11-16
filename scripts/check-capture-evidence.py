@@ -692,6 +692,14 @@ LEARNED_CAP_REASON = (
     "file learning reached its 32-file per-capture cap; "
     "further provider files were not learned"
 )
+LEARNED_TABLE_CAP_REASON = (
+    "table learning reached its 32-module per-capture cap; "
+    "further provider tables were not learned"
+)
+LEARNED_TABLE_UNBOUND_REASON = (
+    "a learned provider's tables lost their pinned identity; "
+    "its calls were not observed"
+)
 LEARNED_UNAVAILABLE_REASON = (
     "file learning was unavailable; short-lived first loads "
     "of new provider files were not learned"
@@ -717,6 +725,8 @@ LEARNED_SKIP_REASONS = {
     LEARNED_FIRST_RUN_REASON,
     LEARNED_OVERFLOW_REASON,
     LEARNED_CAP_REASON,
+    LEARNED_TABLE_CAP_REASON,
+    LEARNED_TABLE_UNBOUND_REASON,
     LEARNED_UNAVAILABLE_REASON,
     LEARNED_REPLACED_DELETED_REASON,
     LEARNED_DISABLED_REASON,

@@ -433,6 +433,24 @@ pub(crate) enum RefusalKind {
     ProviderPartial,
     /// A G-03 growth omission (`admitted module needs N more; ...`).
     GrowthOmission,
+    /// An at-capacity semantic lowering (`N semantic endpoints attached
+    /// count-only for capacity; ...`): the module attached on reoccupied
+    /// count-only cells because no room for fresh semantic cells remained.
+    /// Partial coverage, never a whole refusal.
+    #[cfg_attr(not(test), allow(dead_code))]
+    CapacityLowering,
+}
+
+/// The stable head of an at-capacity semantic-lowering record: the module
+/// attached, but its semantic endpoints were lowered to count-only for
+/// capacity. Stored captures keep classifying under it. The tail (past the
+/// endpoint count) is the stable part: the count phrase itself inflects.
+const CAPACITY_LOWERING_HEAD: &str = "attached count-only for capacity";
+
+/// Whether a `modules_skipped` reason records an at-capacity semantic
+/// lowering rather than a refusal or an omission.
+pub(crate) fn is_capacity_lowering(reason: &str) -> bool {
+    reason.contains(CAPACITY_LOWERING_HEAD)
 }
 
 /// Whether a `modules_skipped` reason records a Part 0 prefix-admitted
@@ -476,6 +494,7 @@ pub(crate) fn is_partial_coverage(reason: &str) -> bool {
         || is_closure_array_prefix(reason)
         || is_provider_prefix(reason)
         || is_provider_partial(reason)
+        || is_capacity_lowering(reason)
 }
 
 /// Operation-closed importance tier for function-level partial
@@ -22600,12 +22619,16 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
-    /// Reclaim flip, both orders: a semantic generation that retires
-    /// count-only and returns semantic reoccupies its own retired cells —
-    /// as count-only, the way the kept path treats a count-only cell —
-    /// instead of burning 68 fresh slots per alternation.
+    /// Reclaim flip, both orders (tier-3 review of port3, option (b)): a
+    /// key remembers one count-only and one semantic retired generation,
+    /// and an exact-shape return reoccupies its own generation first — so
+    /// semantic legs stay semantic while the key never holds more than two
+    /// generations (136 slots). The first count-only leg forward-flips onto
+    /// the retired semantic cells; the first semantic leg back takes fresh
+    /// cells while the budget has room, and every later leg reoccupies its
+    /// exact retired generation instead of burning fresh slots.
     #[test]
-    fn alternating_semantic_and_count_only_returns_reuse_one_generation() {
+    fn alternating_semantic_and_count_only_returns_reuse_two_generations() {
         let semantic = sole_complete_module();
         let count_only = count_only_copy(&semantic, false);
         let mut plan = scoped_plan(std::slice::from_ref(&semantic), AdmissionScope::Shared);
@@ -22636,24 +22659,73 @@ pub(crate) mod tests {
                 panic!("cycle {cycle}: a same-key return must not refuse: {error}")
             });
             assert_eq!(delta.new.len(), 68, "cycle {cycle}: new links attach");
-            assert!(
-                delta.new.iter().all(|slot| (slot.index as usize) < 68),
-                "cycle {cycle}: reoccupied, never fresh"
-            );
-            if cycle % 2 == 1 {
+            let returning_semantic = cycle % 2 == 1;
+            if cycle == 0 {
+                assert!(
+                    delta.new.iter().all(|slot| (slot.index as usize) < 68),
+                    "cycle {cycle}: the first count-only leg forward-flips onto the retired semantic cells"
+                );
                 assert!(
                     delta
                         .new
                         .iter()
                         .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
-                    "cycle {cycle}: a semantic return onto count-only cells attaches count-only"
+                    "cycle {cycle}: a count-only return stays count-only"
+                );
+                assert_eq!(
+                    plan.slots.len(),
+                    68,
+                    "cycle {cycle}: the forward flip burns no fresh slot"
+                );
+            } else if cycle == 1 {
+                assert!(
+                    delta.new.iter().all(|slot| (slot.index as usize) >= 68),
+                    "cycle {cycle}: the first semantic leg back takes fresh cells while the budget has room"
+                );
+                assert!(
+                    delta
+                        .new
+                        .iter()
+                        .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+                    "cycle {cycle}: a semantic return with room stays semantic"
+                );
+                assert_eq!(
+                    plan.slots.len(),
+                    136,
+                    "cycle {cycle}: the second generation lands"
+                );
+            } else {
+                assert!(
+                    delta.new.iter().all(|slot| (slot.index as usize) < 136),
+                    "cycle {cycle}: reoccupied, never fresh"
+                );
+                if returning_semantic {
+                    assert!(
+                        delta
+                            .new
+                            .iter()
+                            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+                        "cycle {cycle}: a semantic return onto its exact retired generation stays semantic"
+                    );
+                } else {
+                    assert!(
+                        delta
+                            .new
+                            .iter()
+                            .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+                        "cycle {cycle}: a count-only return onto its exact retired generation stays count-only"
+                    );
+                }
+                assert_eq!(
+                    plan.slots.len(),
+                    136,
+                    "cycle {cycle}: bounded at two generations"
                 );
             }
-            assert_eq!(plan.slots.len(), 68, "cycle {cycle}: bounded");
             assert_eq!(plan.active_slot_count(), 68, "cycle {cycle}");
             assert!(
                 plan.modules_skipped.is_empty(),
-                "cycle {cycle}: no refusal: {:?}",
+                "cycle {cycle}: no refusal and no lowering with room: {:?}",
                 plan.modules_skipped
             );
         }
@@ -22661,12 +22733,13 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
-    /// Reclaim across workers: the first of 32 sequential same-file
-    /// workers is downgraded to count-only while active by a transient
-    /// co-claimant and then retired; every later semantic worker
-    /// reoccupies that count-only generation instead of burning 68 fresh
-    /// slots. Without the count-only reoccupy each worker burns a fresh
-    /// generation and the thirtieth exhausts the budget.
+    /// Reclaim across workers (tier-3 review of port3, option (b)): the
+    /// first of 32 sequential same-file workers is downgraded to
+    /// count-only while active by a transient co-claimant and then
+    /// retired; the next semantic worker takes fresh cells while the
+    /// budget has room, and every later one reoccupies that exact
+    /// semantic generation — so all 32 stay semantic within 136 slots
+    /// (two generations) and nothing refuses.
     #[test]
     fn thirty_two_sequential_workers_stay_bounded_without_refusal() {
         let identity = test_identity(7, "sha-thirty-two-workers");
@@ -22714,9 +22787,20 @@ pub(crate) mod tests {
                     delta
                         .new
                         .iter()
-                        .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
-                    "worker {nurse}: the return onto count-only cells attaches count-only"
+                        .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+                    "worker {nurse}: a semantic return with room stays semantic"
                 );
+                if nurse == 1 {
+                    assert!(
+                        delta.new.iter().all(|slot| (slot.index as usize) >= 68),
+                        "worker {nurse}: the first return past the count-only generation takes fresh cells"
+                    );
+                } else {
+                    assert!(
+                        delta.new.iter().all(|slot| (slot.index as usize) < 136),
+                        "worker {nurse}: later returns reoccupy the semantic generation"
+                    );
+                }
             }
             assert!(
                 plan.modules_skipped.is_empty(),
@@ -22763,11 +22847,305 @@ pub(crate) mod tests {
             let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
             plan.extend_exact(rebuilt)
                 .unwrap_or_else(|error| panic!("worker {nurse} exit must not refuse: {error}"));
-            assert_eq!(plan.retired_slots.len(), 68, "worker {nurse}");
+            assert_eq!(
+                plan.retired_slots.len(),
+                if nurse == 0 { 68 } else { 136 },
+                "worker {nurse}: the retired generations stay retired"
+            );
             plan.revivable.clone_from(&plan.retired_keys);
         }
-        assert_eq!(plan.slots.len(), 68);
+        assert_eq!(
+            plan.slots.len(),
+            136,
+            "two generations: the retired count-only first worker and the rotating semantic one"
+        );
+        assert_eq!(plan.retired_slots.len(), 136);
+        assert_eq!(plan.active_slot_count(), 0);
         assert!(plan.modules_skipped.is_empty());
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// RV-ST6 (tier-3 review of port3): a provider that first attaches
+    /// count-only (export names known, scan unfinished) and retires, then
+    /// returns fully semantic with room to spare, attaches semantic on
+    /// fresh cells — it never downgrades onto its own retired count-only
+    /// generation. Only true capacity may lower a semantic return.
+    #[test]
+    fn count_only_first_semantic_return_with_room_stays_semantic() {
+        let semantic = sole_complete_module();
+        let count_only = count_only_copy(&semantic, false);
+        let mut plan = scoped_plan(std::slice::from_ref(&count_only), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+            "the first generation attaches count-only"
+        );
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 68);
+        plan.revivable.clone_from(&plan.retired_keys);
+        let rebuilt = plan.rebuild_from_sources(
+            std::slice::from_ref(&semantic),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "merge tickets the reverse flip"
+        );
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("a same-key return must not refuse: {error}"));
+        assert_eq!(delta.new.len(), 68, "new links attach");
+        assert!(
+            delta.new.iter().all(|slot| (slot.index as usize) >= 68),
+            "the semantic return takes fresh cells, never its retired count-only ones: {:?}",
+            delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>()
+        );
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+            "the return stays semantic"
+        );
+        assert_eq!(plan.slots.len(), 136);
+        assert_eq!(plan.active_slot_count(), 68);
+        assert_eq!(
+            plan.retired_slots.len(),
+            68,
+            "the count-only generation stays retired"
+        );
+        assert!(
+            plan.modules_skipped.is_empty(),
+            "no refusal and no lowering with room: {:?}",
+            plan.modules_skipped
+        );
+        assert_eq!(
+            plan.slots
+                .iter()
+                .filter(|slot| plan.is_active(slot.index) && !slot.semantic_authorized)
+                .count(),
+            0,
+            "no active cell is left unverified"
+        );
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// At-capacity reverse flip (tier-3 review of port3): with the
+    /// lifetime budget full and no exact-shape retired generation, a
+    /// returning semantic provider reoccupies its retired count-only
+    /// cells instead of refusing — and the lowering is recorded as one
+    /// counted capacity lowering, never as an "unverified" gap.
+    #[test]
+    fn semantic_return_at_capacity_reoccupies_count_only_with_a_counted_lowering() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
+        let count_only = count_only_copy(&sole_complete_module(), false);
+        let mut plan = scoped_plan(&[filler.clone(), count_only], AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 68);
+        plan.revivable.clone_from(&plan.retired_keys);
+        let semantic = sole_complete_module();
+        let rebuilt = plan.rebuild_from_sources(&[filler, semantic], &[], &PinnedObjects::empty());
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "merge tickets the reverse flip"
+        );
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "the ticketed return is admitted: {:?}",
+            rebuilt.modules_skipped
+        );
+        let retired: Vec<usize> = plan.retired_slots.iter().copied().collect();
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("the at-capacity flip must not refuse: {error}"));
+        assert_eq!(delta.new.len(), 68, "new links attach");
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| retired.contains(&(slot.index as usize))),
+            "the return reoccupies its retired cells, never fresh ones"
+        );
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+            "at capacity the flip attaches count-only"
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
+        assert!(plan.retired_slots.is_empty());
+        assert_eq!(plan.modules_skipped.len(), 1, "one counted lowering");
+        let record = &plan.modules_skipped[0];
+        assert_eq!(record.subject, "/opt/p11.so");
+        assert!(
+            is_capacity_lowering(&record.reason),
+            "the record names the capacity lowering: {}",
+            record.reason
+        );
+        assert!(
+            record.reason.contains("68 semantic endpoints"),
+            "the record counts the lowered cells: {}",
+            record.reason
+        );
+        assert!(
+            is_partial_coverage(&record.reason),
+            "partial coverage, never a whole refusal: {}",
+            record.reason
+        );
+        let kinds: Vec<RefusalKind> = plan
+            .refused_modules_typed()
+            .map(|(_, _, kind)| kind)
+            .collect();
+        assert_eq!(kinds, [RefusalKind::CapacityLowering]);
+        assert_eq!(whole_refusal_needed_count(&record.reason), None);
+        assert!(!is_growth_omission(&record.reason));
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Cross-ID reverse flip without latched ambiguity (tier-3 review of
+    /// port3, option (b)): the first of three same-file workers attaches
+    /// count-only and retires; the next semantic worker takes fresh cells
+    /// while the budget has room, and the third reoccupies that exact
+    /// semantic generation. No co-claimant is involved, so no aggregate
+    /// owner latches ambiguous anywhere — the flip-flop is pinned purely.
+    #[test]
+    fn cross_id_semantic_return_with_room_stays_semantic_without_ambiguity() {
+        let identity = test_identity(7, "sha-cross-id-flip");
+        let worker = |pin: u32| {
+            let mut module = sole_complete_module();
+            module.object = PinnedObjectId(pin);
+            module.scanned.key = scanned_key(PinnedObjectId(pin));
+            for entry in &mut module.scanned.tables[0].entries {
+                entry.object = scanned_key(PinnedObjectId(pin));
+            }
+            module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
+            module.forward_verified = vec![vec![false; 68]];
+            module
+        };
+        let mut plan = scoped_plan(&[], AdmissionScope::Named);
+        // Worker 0 arrives count-only and retires.
+        let first = count_only_copy(&worker(100), false);
+        let identities = BTreeMap::from([(PinnedObjectId(100), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&first),
+            &[],
+            &identities,
+        );
+        assert!(rebuilt.reclaimed.is_empty(), "the first worker is fresh");
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("worker 0 arrival must not refuse: {error}"));
+        assert_eq!(delta.new.len(), 68, "worker 0");
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+            "worker 0 attaches count-only"
+        );
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("worker 0 exit must not refuse: {error}"));
+        assert_eq!(plan.retired_slots.len(), 68, "worker 0");
+        plan.revivable.clone_from(&plan.retired_keys);
+        // Worker 1 returns semantic with room: fresh cells, still semantic.
+        let identities = BTreeMap::from([(PinnedObjectId(101), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&worker(101)),
+            &[],
+            &identities,
+        );
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "worker 1: merge tickets the cross-ID reverse flip"
+        );
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("worker 1 arrival must not refuse: {error}"));
+        assert_eq!(delta.new.len(), 68, "worker 1");
+        assert!(
+            delta.new.iter().all(|slot| (slot.index as usize) >= 68),
+            "worker 1 takes fresh cells: {:?}",
+            delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>()
+        );
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+            "worker 1 stays semantic"
+        );
+        assert_eq!(plan.slots.len(), 136, "worker 1");
+        assert!(
+            plan.modules_skipped.is_empty(),
+            "worker 1: no refusal: {:?}",
+            plan.modules_skipped
+        );
+        // Worker 1 retires; worker 2 reoccupies its exact semantic generation.
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("worker 1 exit must not refuse: {error}"));
+        plan.revivable.clone_from(&plan.retired_keys);
+        let identities = BTreeMap::from([(PinnedObjectId(102), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&worker(102)),
+            &[],
+            &identities,
+        );
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "worker 2: merge tickets the cross-ID exact return"
+        );
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("worker 2 arrival must not refuse: {error}"));
+        assert_eq!(delta.new.len(), 68, "worker 2");
+        assert!(
+            delta.new.iter().all(|slot| (slot.index as usize) < 136),
+            "worker 2 reoccupies the semantic generation: {:?}",
+            delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>()
+        );
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+            "worker 2 stays semantic"
+        );
+        assert_eq!(plan.slots.len(), 136, "worker 2");
+        assert!(
+            plan.modules_skipped.is_empty(),
+            "worker 2: no refusal: {:?}",
+            plan.modules_skipped
+        );
+        assert!(
+            plan.aggregate_owners
+                .iter()
+                .all(|owner| !matches!(owner, AggregateOwner::Ambiguous)),
+            "no cell latches ambiguous: {:?}",
+            plan.aggregate_owners
+        );
+        for slot in &plan.slots {
+            assert!(
+                !slot.semantic_ambiguous,
+                "slot {} reports no ambiguity",
+                slot.index
+            );
+        }
         plan.validate_slot_index()
             .expect("the partial topology stays clean");
     }

@@ -22909,14 +22909,24 @@ impl Engine {
         }
         let mut module = proof.module.clone();
         module.view = Self::RUN_LEARNED_VIEW_ID;
-        let already_stored = self.run_learned_modules.iter().any(|known| {
+        // Mirrors `merge_scanned_module`'s push decision exactly
+        // (first 5-tuple match wins; a decoder-ABI mismatch against
+        // it files beside, never into), so the cap below holds
+        // without exceptions.
+        let will_push = match self.run_learned_modules.iter().find(|known| {
             known.view == module.view
                 && known.mount_namespace == module.mount_namespace
                 && known.key == module.key
                 && known.path == module.path
                 && known.pre_copy_up == module.pre_copy_up
-        });
-        if !already_stored
+        }) {
+            None => true,
+            Some(existing) => matches!(
+                (existing.decoder_abi, module.decoder_abi),
+                (Some(known), Some(incoming)) if known != incoming
+            ),
+        };
+        if will_push
             && self.run_learned_modules.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
         {
             self.mark_partial(

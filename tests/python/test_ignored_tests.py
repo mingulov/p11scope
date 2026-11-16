@@ -119,6 +119,7 @@ INTEGRATION_EXPECTED = [
     "tests/prearm_witness_cli.rs:privileged_profile_pid_prearm_twin_exact_window",
     "tests/prearm_witness_cli.rs:privileged_trace_system_prearm_clean_exact_counts",
     "tests/prearm_witness_cli.rs:privileged_profile_system_learned_provider_second_round_catches_oneshots",
+    "tests/prearm_witness_cli.rs:privileged_trace_system_prearm_shared_provider_honest_accounting",
 ]
 
 # The revived opt-in groups, pinned literally so a dropped or renamed
@@ -1916,7 +1917,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",
             "DISCOVER_BTRFS_SUBVOL_TESTS=1",
-            "INTEGRATION_TESTS=28",
+            "INTEGRATION_TESTS=29",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, result.stdout)
@@ -2073,7 +2074,8 @@ class IgnoredTestsTests(unittest.TestCase):
                  "privileged_profile_metrics_system_prearm_clean_exact_counts",
                  "privileged_profile_pid_prearm_twin_exact_window",
                  "privileged_trace_system_prearm_clean_exact_counts",
-                 "privileged_profile_system_learned_provider_second_round_catches_oneshots"])
+                 "privileged_profile_system_learned_provider_second_round_catches_oneshots",
+                 "privileged_trace_system_prearm_shared_provider_honest_accounting"])
             write_fake_integration_binary(
                 deps, "run_tree",
                 ["privileged_run_tree_shell_wrapper_shows_grandchild_calls",
@@ -2091,11 +2093,11 @@ class IgnoredTestsTests(unittest.TestCase):
             result = run_runner("--list-integration", str(deps))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        self.assertIn("integration (28)", result.stdout)
+        self.assertIn("integration (29)", result.stdout)
         for entry in INTEGRATION_EXPECTED:
             self.assertIn(entry, result.stdout)
         self.assertIn("verify: integration curation selects exactly one "
-                      "test per entry (28 entries)", result.stdout)
+                      "test per entry (29 entries)", result.stdout)
 
     def test_integration_list_mode_refuses_zero_selection(self):
         # The inventory_identity binary below is missing one of its two

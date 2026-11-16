@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """The P2-8 witness CLI executor scripts: exact cells, judging, exits.
 
-tests/prearm_witness_cli.rs holds the 6 P2-8 cells; scripts/ci/run-witness-cli.sh
+tests/prearm_witness_cli.rs holds the 8 P2-8 cells; scripts/ci/run-witness-cli.sh
 runs them on the current machine with exact-positive judging, and
 scripts/ci/witness-cli-vng.sh runs that runner inside one virtme-ng guest.
 This suite pins the executed set to the curated INTEGRATION_TESTS entries,
@@ -38,6 +38,7 @@ EXPECTED_CELLS = [
     "privileged_profile_metrics_system_prearm_clean_exact_counts",
     "privileged_profile_pid_prearm_twin_exact_window",
     "privileged_trace_system_prearm_clean_exact_counts",
+    "privileged_trace_system_prearm_shared_provider_honest_accounting",
     ]
 
 # A canned guest: parses --run/--rwdir from the script's vng invocation
@@ -152,7 +153,7 @@ class WitnessCliScriptTests(unittest.TestCase):
                               timeout=120, env=env), out
 
     def test_cells_are_exact_and_curated(self):
-        self.assertEqual(len(EXPECTED_CELLS), 7)
+        self.assertEqual(len(EXPECTED_CELLS), 8)
         curated = integration_witness_cells(CURATION.read_text(encoding="utf-8"))
         self.assertEqual(curated, EXPECTED_CELLS,
                          "the executed set must equal the curated INTEGRATION_TESTS entries")
@@ -198,11 +199,11 @@ class WitnessCliScriptTests(unittest.TestCase):
         for pin in ("vng --run", "--user root", "mount -t tmpfs",
                     'TMPDIR="$T"', "run-witness-cli.sh",
                     "cells-done witness_exit=", '"$OUT/uname.txt"',
-                    "row set is not exactly the seven cells"):
+                    "row set is not exactly the eight cells"):
             with self.subTest(pin=pin):
                 self.assertIn(pin, self.script_text)
 
-    def test_all_pass_writes_seven_qualified_rows_and_exits_zero(self):
+    def test_all_pass_writes_eight_qualified_rows_and_exits_zero(self):
         result, out = self.run_script("v6.6.157")
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = [json.loads(line) for line in
@@ -220,7 +221,7 @@ class WitnessCliScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         rows = [json.loads(line) for line in
                 (out / "cells/results.jsonl").read_text().splitlines()]
-        self.assertEqual(len(rows), 7)
+        self.assertEqual(len(rows), 8)
         failed = [row for row in rows if not row["pass"]]
         self.assertEqual([row["cell"] for row in failed], [EXPECTED_CELLS[3]])
         self.assertEqual(failed[0]["qualification"], "failed")

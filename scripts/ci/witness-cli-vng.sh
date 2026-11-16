@@ -5,7 +5,7 @@
 # cells as root inside one virtme-ng guest booted on KERNEL (a mainline
 # tag such as v6.6.157, or a release candidate such as v7.4-rc1) via
 # scripts/ci/run-witness-cli.sh, and judge the
-# rows exactly like the host leg (exit 0 plus seven qualified rows).
+# rows exactly like the host leg (exit 0 plus eight qualified rows).
 #
 # The guest shares the host rootfs read-only and hides /tmp and /var/tmp,
 # so TESTBIN and OUTDIR must live under /home. Inside the guest the cells
@@ -142,7 +142,7 @@ if [ ! -s "$OUT/cells/results.jsonl" ] || [ ! -s "$OUT/cells/summary.txt" ]; the
     echo "witness-cli-vng.sh: guest produced no cell results on $KERNEL" >&2
     exit 2
 fi
-# The rows must be exactly the seven cells: a truncated or
+# The rows must be exactly the eight cells: a truncated or
 # hand-edited file is a harness error, never a partial pass.
 if ! python3 -I - "$OUT/cells/results.jsonl" <<'PY'
 import json,sys
@@ -153,10 +153,11 @@ want={'privileged_profile_pid_prearm_clean_exact_counts',
       'privileged_profile_metrics_system_prearm_clean_exact_counts',
       'privileged_profile_pid_prearm_twin_exact_window',
       'privileged_trace_system_prearm_clean_exact_counts',
-      'privileged_profile_system_learned_provider_second_round_catches_oneshots'}
+      'privileged_profile_system_learned_provider_second_round_catches_oneshots',
+      'privileged_trace_system_prearm_shared_provider_honest_accounting'}
 ids=[row['cell'] for row in rows]
 if len(ids) != len(set(ids)) or set(ids) != want:
-    sys.exit('row set is not exactly the seven cells')
+    sys.exit('row set is not exactly the eight cells')
 PY
 then
     echo "witness-cli-vng.sh: bad row set on $KERNEL (see $OUT/cells/results.jsonl)" >&2

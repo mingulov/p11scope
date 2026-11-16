@@ -2160,6 +2160,12 @@
       "cell": "live-kernel"
     },
     {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_trace_system_prearm_shared_provider_honest_accounting",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
       "file": "src/discovery/d4_overlay_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_witness_budget_exhaustion_refuses",
       "reason": "root: loop overlay mounts drive the production original-file witness",

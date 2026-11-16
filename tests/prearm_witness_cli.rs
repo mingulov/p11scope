@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const READY_LINE: &str = "p11scope: capturing:";
@@ -46,10 +47,14 @@ enum ModuleSource {
 }
 
 /// Brand-new provider file for the isolated `--system` cells
-/// (learned-cell precedent): a copy at a cell-private path with
-/// trailing bytes, so both inode and sha256 are unique to the cell
-/// and counts for its sha can only come from the cell's workload.
+/// (learned-cell precedent): a copy at a cell-private path with a
+/// per-copy trailing nonce, so inode and sha256 are unique to the cell
+/// and counts for its sha can only come from the cell's workload. The
+/// counter (plus pid) keeps the sha strictly unique per copy even
+/// under parallel test execution, where the pid alone repeats within
+/// one process.
 fn unique_provider_copy(dir: &Path) -> PathBuf {
+    static COPY_NONCE: AtomicU64 = AtomicU64::new(0);
     let copy = dir.join(format!("libisolated-{}-p28.so", std::process::id()));
     std::fs::copy(softhsm_path(), &copy).expect("copy provider");
     {
@@ -58,7 +63,11 @@ fn unique_provider_copy(dir: &Path) -> PathBuf {
             .append(true)
             .open(&copy)
             .expect("open copy for append");
-        file.write_all(&[0u8; 256]).expect("append unseen bytes");
+        let mut trailer = [0u8; 256];
+        let nonce = COPY_NONCE.fetch_add(1, Ordering::Relaxed);
+        trailer[..8].copy_from_slice(&nonce.to_le_bytes());
+        trailer[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+        file.write_all(&trailer).expect("append unseen bytes");
     }
     copy
 }
@@ -1017,6 +1026,23 @@ fn shared_twin_oracle_requires_every_honest_accounting_term() {
         !shared_twin_accepts(true, 0, 1, true, false),
         "pre_attach ends at attach"
     );
+}
+
+/// Nonce control for the isolated provider copies: two copies made in
+/// one process (separate cell dirs, as the cells use) must carry
+/// distinct trailing bytes, so their sha256 differ even under parallel
+/// test execution, where the pid alone repeats within one process.
+#[test]
+fn unique_provider_copies_carry_distinct_trailing_bytes() {
+    let left_dir = tempfile::tempdir().expect("left cell dir");
+    let right_dir = tempfile::tempdir().expect("right cell dir");
+    let left = unique_provider_copy(left_dir.path());
+    let right = unique_provider_copy(right_dir.path());
+    let tail = |path: &Path| {
+        let bytes = std::fs::read(path).expect("read provider copy");
+        bytes[bytes.len() - 256..].to_vec()
+    };
+    assert_ne!(tail(&left), tail(&right));
 }
 
 /// Shared-provider twin: `trace --system` against the SHARED system

@@ -4,7 +4,7 @@
 # run-witness-cli.sh TESTBIN OUTDIR
 # run-witness-cli.sh --self-test
 #
-# Runs the 7 pre-arm witness / learned-provider CLI cells (tests/prearm_witness_cli.rs)
+# Runs the 8 pre-arm witness / learned-provider CLI cells (tests/prearm_witness_cli.rs)
 # as root with exact-positive judging: every cell drives the real
 # command line against SoftHSM and must exit 0 with exactly one passed
 # test. The witness-cli CI job calls this on the host leg directly and
@@ -18,6 +18,7 @@
 #   privileged_profile_metrics_system_prearm_clean_exact_counts
 #   privileged_profile_pid_prearm_twin_exact_window
 #   privileged_trace_system_prearm_clean_exact_counts
+#   privileged_trace_system_prearm_shared_provider_honest_accounting
 #   #
 # Each results.jsonl row carries exactly cell/pass/qualification/detail
 # (the shared cell-result contract). A zero exit alone is not a pass:
@@ -54,6 +55,7 @@ privileged_profile_system_learned_provider_second_round_catches_oneshots
 privileged_profile_metrics_system_prearm_clean_exact_counts
 privileged_profile_pid_prearm_twin_exact_window
 privileged_trace_system_prearm_clean_exact_counts
+privileged_trace_system_prearm_shared_provider_honest_accounting
 )
 
 # One results.jsonl row: exactly cell/pass/qualification/detail.
@@ -140,7 +142,7 @@ run_self_test() {
     POSITIVE='test one ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'
     # Every curated cell passes on the healthy shape (this also pins the
-    # seven names: a dropped or renamed cell fails here, not silently).
+    # eight names: a dropped or renamed cell fails here, not silently).
     for cell in "${CELLS[@]}"; do
         LOG_BODY=$POSITIVE
         check "$cell" 0 0 True qualified 'rc=0 42ms ok'

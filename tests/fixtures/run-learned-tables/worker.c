@@ -3,15 +3,23 @@
 /* A short-lived pkcs11-check-shaped worker: dlopens the provider,
  * negotiates the 3.0 interface through C_GetInterfaceList +
  * C_GetInterface (like the kryoptic/haskoki matrix legs), calls
- * three table functions per round, prints a DONE ledger line, and
+ * table functions per round, prints a DONE ledger line, and
  * exits. An optional linger keeps the provider mapped for about a
  * second first, matching the matrix unit workers' lifetime (fast
  * workers would exit between observer ticks and prove nothing
  * about table learning).
  *
- * Usage: worker <provider.so> <rounds> [linger_ms]
- * Prints: DONE worker=<pid> table_calls=<n>
- * (table_calls counts table calls only, never the getter calls).
+ * Usage: worker <provider.so> <rounds> [linger_ms] [ordinal]
+ * Without an ordinal the worker calls three table functions per
+ * round (C_Initialize, C_GetSlotList, C_LoginUser). With one it
+ * calls only that 3.0-table slot per round, so each sequential
+ * worker's calls are distinguishable in the observed profile and
+ * the cell can pin every miss to its worker's burst window.
+ * Prints: DONE worker=<pid> table_calls=<n> burst_start_ns=<t0>
+ *   burst_end_ns=<t1> ordinal=<o>
+ * (table_calls counts table calls only, never the getter calls;
+ * the burst stamps are CLOCK_MONOTONIC nanoseconds around the call
+ * loop; ordinal is -1 without the ordinal argument).
  */
 #define _POSIX_C_SOURCE 200809L
 #include <dlfcn.h>
@@ -47,8 +55,8 @@ static void *slot(void *table, unsigned index) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3 && argc != 4) {
-        fprintf(stderr, "usage: worker <provider.so> <rounds> [linger_ms]\n");
+    if (argc < 3 || argc > 5) {
+        fprintf(stderr, "usage: worker <provider.so> <rounds> [linger_ms] [ordinal]\n");
         return 2;
     }
     char *end = NULL;
@@ -57,9 +65,16 @@ int main(int argc, char **argv) {
         return 2;
     }
     long linger_ms = 0;
-    if (argc == 4) {
+    if (argc >= 4) {
         linger_ms = strtol(argv[3], &end, 10);
         if (end == argv[3] || *end != '\0' || linger_ms < 0 || linger_ms > 60000) {
+            return 2;
+        }
+    }
+    long ordinal = -1;
+    if (argc == 5) {
+        ordinal = strtol(argv[4], &end, 10);
+        if (end == argv[4] || *end != '\0' || ordinal < 0 || ordinal >= 92) {
             return 2;
         }
     }
@@ -84,8 +99,19 @@ int main(int argc, char **argv) {
         return 4;
     }
     void *table = interface->functions;
+    struct timespec burst_start;
+    if (clock_gettime(CLOCK_MONOTONIC, &burst_start) != 0) {
+        return 6;
+    }
     long table_calls = 0;
     for (long round = 0; round < rounds; round++) {
+        if (ordinal >= 0) {
+            if (((StubFn)slot(table, (unsigned)ordinal))() != CKR_OK) {
+                return 5;
+            }
+            table_calls++;
+            continue;
+        }
         /* C_Initialize (0), C_GetSlotList (4), C_LoginUser (70). */
         if (((StubFn)slot(table, 0))() != CKR_OK) {
             return 5;
@@ -100,6 +126,10 @@ int main(int argc, char **argv) {
         }
         table_calls++;
     }
+    struct timespec burst_end;
+    if (clock_gettime(CLOCK_MONOTONIC, &burst_end) != 0) {
+        return 6;
+    }
     if (linger_ms > 0) {
         struct timespec linger = {
             .tv_sec = linger_ms / 1000,
@@ -107,7 +137,17 @@ int main(int argc, char **argv) {
         };
         nanosleep(&linger, NULL);
     }
-    printf("DONE worker=%ld table_calls=%ld\n", (long)getpid(), table_calls);
+    unsigned long long start_ns =
+        (unsigned long long)burst_start.tv_sec * 1000000000ULL + (unsigned long long)burst_start.tv_nsec;
+    unsigned long long end_ns =
+        (unsigned long long)burst_end.tv_sec * 1000000000ULL + (unsigned long long)burst_end.tv_nsec;
+    printf(
+        "DONE worker=%ld table_calls=%ld burst_start_ns=%llu burst_end_ns=%llu ordinal=%ld\n",
+        (long)getpid(),
+        table_calls,
+        start_ns,
+        end_ns,
+        ordinal);
     fflush(stdout);
     return 0;
 }

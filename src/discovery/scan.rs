@@ -4529,6 +4529,21 @@ fn target_maps_now_empty(pid: u32) -> bool {
     matches!(maps.read(&mut first), Ok(0))
 }
 
+/// Whether a zero-length mapping read names the exit exactly, against
+/// the live maps re-read and a fresh exit-proof budget.
+fn zero_read_names_exit(view: &ProcessView) -> bool {
+    zero_read_names_exit_with(
+        view,
+        target_maps_now_empty(view.pid()),
+        &mut LeaderExitReadBudget::for_final_exit_proof(),
+    )
+}
+
+/// Test seam for [`zero_read_names_exit`]: the rename decision with the
+/// maps re-read and the exit-proof budget supplied by the caller.
+/// Production passes the live re-read and a fresh proof budget, exactly
+/// as before, so this seam changes no behavior by itself.
+///
 /// Whether a zero-length mapping read names the exit exactly: the pin
 /// proves the scanned generation gone (`original_exited() == Ok(true)`),
 /// or a live re-read shows the mm gone while no live member proves the
@@ -4542,24 +4557,18 @@ fn target_maps_now_empty(pid: u32) -> bool {
 /// rename: the single-threaded exit window — mm released before the pin
 /// settles — still names its exit, as does a pid reused by a live
 /// process (reuse implies the scanned generation exited and was reaped).
-fn zero_read_names_exit(view: &ProcessView) -> bool {
+fn zero_read_names_exit_with(
+    view: &ProcessView,
+    maps_now_empty: bool,
+    work: &mut LeaderExitReadBudget,
+) -> bool {
     if view.original_exited() == Ok(true) {
         return true;
     }
-    if !target_maps_now_empty(view.pid()) {
+    if !maps_now_empty {
         return false;
     }
-    !group_has_proven_live_member(view)
-}
-
-/// Whether a live non-leader member positively proves the view's group
-/// alive (the zombie-leader shape). Pidfd authority only: a start-time
-/// fallback pin, an unreadable task set, or an exhausted read budget all
-/// answer unknown, never alive.
-fn group_has_proven_live_member(view: &ProcessView) -> bool {
-    view.retained_pin()
-        .leader_exit_observation(&mut LeaderExitReadBudget::for_final_exit_proof())
-        == LeaderExitObservation::LiveNonleader
+    view.retained_pin().leader_exit_observation(work) != LeaderExitObservation::LiveNonleader
 }
 
 /// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A partial read simply
@@ -11982,6 +11991,109 @@ mod tests {
         );
     }
 
+    /// Equivalence: `ENOENT` on a fallback-pinned reaped pid takes the
+    /// exited path before and after the exit-proof consolidation — the
+    /// reap proves the end.
+    #[test]
+    fn mem_enoent_on_a_fallback_pinned_reaped_pid_takes_the_exited_path() {
+        use crate::fixture_guard::DieWithParent as _;
+        use std::process::Command;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .expect("a sleeper spawns");
+        let pid = child.id();
+        let view = crate::process::start_time_pinned_process_view_for_test(ProcessViewId(83), pid)
+            .expect("a fallback view opens on the live child");
+        child.kill().expect("the child dies on demand");
+        child.wait().expect("the child is reaped");
+        assert!(
+            crate::process::process_proven_exited(pid),
+            "fixture precondition: the pid names no process"
+        );
+        assert_eq!(
+            view.original_exited(),
+            Ok(true),
+            "fixture precondition: the pin reads the reap as exited"
+        );
+        assert!(
+            mem_open_exited_for_view(&view, pid, &std::io::Error::from_raw_os_error(libc::ENOENT)),
+            "ENOENT after a proven reap takes the exited path"
+        );
+    }
+
+    /// Equivalence: `ENOENT` on a fallback-pinned live process stays loud
+    /// before and after the consolidation — nothing proves an exit.
+    #[test]
+    fn mem_enoent_on_a_fallback_pinned_live_process_stays_unavailable() {
+        let pid = std::process::id();
+        let view = crate::process::start_time_pinned_process_view_for_test(ProcessViewId(84), pid)
+            .expect("a fallback view opens on the live process");
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "fixture precondition: the pin proves the process alive"
+        );
+        assert!(
+            !mem_open_exited_for_view(&view, pid, &std::io::Error::from_raw_os_error(libc::ENOENT)),
+            "ENOENT on a live fallback view stays loud"
+        );
+    }
+
+    /// Equivalence: an errno'd refusal on a fallback-pinned reaped pid
+    /// takes the exited path before and after the consolidation — the
+    /// reap proves the end.
+    #[test]
+    fn mem_eacces_on_a_fallback_pinned_reaped_pid_takes_the_exited_path() {
+        use crate::fixture_guard::DieWithParent as _;
+        use std::process::Command;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .expect("a sleeper spawns");
+        let pid = child.id();
+        let view = crate::process::start_time_pinned_process_view_for_test(ProcessViewId(85), pid)
+            .expect("a fallback view opens on the live child");
+        child.kill().expect("the child dies on demand");
+        child.wait().expect("the child is reaped");
+        assert!(
+            crate::process::process_proven_exited(pid),
+            "fixture precondition: the pid names no process"
+        );
+        assert!(
+            mem_open_exited_for_view(&view, pid, &std::io::Error::from_raw_os_error(libc::EACCES)),
+            "EACCES after a proven reap takes the exited path"
+        );
+    }
+
+    /// Tier-3 review I2: pid reuse (a start-time mismatch) is NOT an
+    /// exit — the current occupant is live, so `ENOENT` stays loud.
+    #[test]
+    fn mem_enoent_on_a_reused_pid_stays_unavailable() {
+        let pid = std::process::id();
+        let view = crate::process::reused_process_view_for_test(ProcessViewId(86), pid)
+            .expect("a reused view builds on the live process");
+        assert_eq!(
+            view.original_exited(),
+            Ok(true),
+            "a start-time mismatch reads exited through the pin"
+        );
+        assert!(
+            !crate::process::process_proven_exited(pid),
+            "the current occupant is live"
+        );
+        assert!(
+            !mem_open_exited_for_view(&view, pid, &std::io::Error::from_raw_os_error(libc::ENOENT)),
+            "ENOENT on a reused pid stays loud"
+        );
+    }
+
     /// The whole group can still exit between the mem open and the
     /// post-check: that race takes the generation-change refusal,
     /// never the silent exited path and never a global latch.
@@ -16323,11 +16435,14 @@ mod tests {
     }
 
     /// Fallback-pin twin: the target exits mid-scan under a start-time
-    /// fallback pin, which reads the unreaped zombie as alive — the
-    /// zero-byte snapshots still name the exit exactly via the emptied
-    /// maps, with no vacuous no-table row.
+    /// fallback pin, which reads the unreaped zombie as alive. Tier-3
+    /// review I1 (`opus-rv-zero-byte-snapshot-t3`): a fallback pin cannot
+    /// prove a whole-group exit — a zombie leader with live members reads
+    /// identically — so the zero-byte snapshots keep the read wording
+    /// instead of naming an exit they cannot prove. No vacuous no-table
+    /// row either way.
     #[test]
-    fn zero_byte_snapshot_of_a_fallback_pinned_zombie_names_the_exit() {
+    fn zero_byte_snapshot_of_a_fallback_pinned_zombie_keeps_the_read_wording() {
         let (mut fixture, view) = ExitMidScanFixture::new(true);
         let hooks = HookRegistry::builtin();
         let hints = [fixture.path.clone()];
@@ -16365,16 +16480,194 @@ mod tests {
             "both data mappings name their zero-byte snapshot: {reasons:?}"
         );
         assert!(
+            reasons.iter().any(|reason| reason.contains("read 0 of")
+                && reason.contains("the read returned no bytes")),
+            "the unproven exit keeps the read wording: {reasons:?}"
+        );
+        assert!(
             reasons
                 .iter()
-                .any(|reason| reason.contains("the process exited during the snapshot")),
-            "the exit is named exactly: {reasons:?}"
+                .all(|reason| !reason.contains("the process exited during the snapshot")),
+            "a fallback pin never names an exit it cannot prove: {reasons:?}"
         );
         assert!(
             reasons
                 .iter()
                 .all(|reason| !reason.contains(NO_TABLE_FOUND_MARKER)),
             "zero examined bytes claim no verified absence: {reasons:?}"
+        );
+    }
+
+    /// Tier-3 review I1 helper twin ("leader exiting, member live"): a
+    /// pidfd-pinned group whose leader released its mm mid-exit (state R
+    /// + `PF_EXITING`, TGID maps empty) while a member stays live keeps
+    /// the read wording. The old live-member observation needs leader Z,
+    /// so it answers Unresolved on this shape and fails open. The scripted
+    /// empty maps stand in for the leader's released mm — a live leader
+    /// reads the same decision inputs (birth matches, state is not Z) —
+    /// while the pidfd pin, the retained birth and the live member are
+    /// real.
+    #[test]
+    fn zero_byte_snapshot_of_an_exiting_leader_with_a_live_member_keeps_the_read_wording() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        use crate::process::leader_exit::LeaderExitReadBudget;
+        let group = ColdLeaderSubject::spawn(1);
+        let pid = group.pid();
+        let worker = group.tids[0];
+        assert!(
+            !crate::process::process_is_zombie(pid),
+            "the leader is still alive"
+        );
+        assert!(
+            std::fs::metadata(format!("/proc/{pid}/task/{worker}")).is_ok(),
+            "the member is live"
+        );
+        assert!(
+            !std::fs::read_to_string(format!("/proc/{pid}/maps"))
+                .expect("TGID maps are readable")
+                .is_empty(),
+            "a live leader shows nonempty TGID maps: the emptiness below is scripted"
+        );
+        let view =
+            ProcessView::open(ProcessViewId(76), pid).expect("a view opens on the live group");
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "the pin proves the group alive"
+        );
+        assert!(
+            view.retained_pin().pidfd().is_ok(),
+            "a pidfd-backed pin, not the fallback"
+        );
+        assert!(
+            !zero_read_names_exit_with(
+                &view,
+                true,
+                &mut LeaderExitReadBudget::for_final_exit_proof()
+            ),
+            "an exiting leader with a live member keeps the read wording"
+        );
+    }
+
+    /// Tier-3 review I1 helper twin ("exhausted budget"): an exhausted
+    /// exit-proof budget answers Unresolved — never alive, never exited —
+    /// so the zero-byte read keeps the read wording ("Exhaustion never
+    /// proves absence"). The old observation fails open here too. Zombie
+    /// leader, empty TGID maps and the live member are real; only the
+    /// budget is scripted.
+    #[test]
+    fn zero_byte_snapshot_with_an_exhausted_exit_budget_keeps_the_read_wording() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        use crate::process::leader_exit::LeaderExitReadBudget;
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pid = group.pid();
+        assert!(
+            crate::process::process_is_zombie(pid),
+            "the leader really exited"
+        );
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/maps"))
+                .expect("TGID maps are readable")
+                .is_empty(),
+            "a zombie-leader group shows empty TGID maps while alive"
+        );
+        let view = ProcessView::open(ProcessViewId(77), pid)
+            .expect("a cold view opens through the live survivor");
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "the pin proves the group alive"
+        );
+        assert!(
+            view.retained_pin().pidfd().is_ok(),
+            "a pidfd-backed pin, not the fallback"
+        );
+        assert!(
+            !zero_read_names_exit_with(&view, true, &mut LeaderExitReadBudget::for_test(0)),
+            "an exhausted exit budget keeps the read wording"
+        );
+        group.call_three();
+    }
+
+    /// Equivalence: a reaped pid under a pidfd pin names the exit before
+    /// and after the exit-proof consolidation — the pin proves the end.
+    #[test]
+    fn zero_byte_snapshot_of_a_pidfd_pinned_reaped_process_names_the_exit() {
+        use crate::fixture_guard::DieWithParent as _;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .expect("a sleeper spawns");
+        let pid = child.id();
+        let view =
+            ProcessView::open(ProcessViewId(78), pid).expect("a view opens on the live child");
+        child.kill().expect("the child dies on demand");
+        child.wait().expect("the child is reaped");
+        assert!(
+            crate::process::process_proven_exited(pid),
+            "fixture precondition: the pid names no process"
+        );
+        assert_eq!(
+            view.original_exited(),
+            Ok(true),
+            "fixture precondition: the pin proves the original exited"
+        );
+        assert!(zero_read_names_exit(&view), "a proven reap names the exit");
+    }
+
+    /// Equivalence: a reaped pid under a fallback pin names the exit
+    /// before and after the consolidation — the reap proves the end.
+    #[test]
+    fn zero_byte_snapshot_of_a_fallback_pinned_reaped_process_names_the_exit() {
+        use crate::fixture_guard::DieWithParent as _;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .expect("a sleeper spawns");
+        let pid = child.id();
+        let view = crate::process::start_time_pinned_process_view_for_test(ProcessViewId(79), pid)
+            .expect("a fallback view opens on the live child");
+        child.kill().expect("the child dies on demand");
+        child.wait().expect("the child is reaped");
+        assert!(
+            crate::process::process_proven_exited(pid),
+            "fixture precondition: the pid names no process"
+        );
+        assert_eq!(
+            view.original_exited(),
+            Ok(true),
+            "fixture precondition: the pin reads the reap as exited"
+        );
+        assert!(zero_read_names_exit(&view), "a proven reap names the exit");
+    }
+
+    /// Tier-3 review I2: pid reuse (a start-time mismatch) is NOT an
+    /// exit — the current occupant is live, so the zero-byte read keeps
+    /// the read wording.
+    #[test]
+    fn zero_byte_snapshot_of_a_reused_pid_keeps_the_read_wording() {
+        let pid = std::process::id();
+        let view = crate::process::reused_process_view_for_test(ProcessViewId(80), pid)
+            .expect("a reused view builds on the live process");
+        assert_eq!(
+            view.original_exited(),
+            Ok(true),
+            "a start-time mismatch reads exited through the pin"
+        );
+        assert!(
+            !crate::process::process_proven_exited(pid),
+            "the current occupant is live"
+        );
+        assert!(
+            !zero_read_names_exit(&view),
+            "a reused pid never names an exit"
         );
     }
 

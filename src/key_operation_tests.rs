@@ -539,7 +539,7 @@ use p11scope_ebpf_common::object_journal::{
 use p11scope_ebpf_common::object_wire::{
     OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, OBJECT_ACTION_CREATE, OBJECT_ACTION_DECAPSULATE,
     OBJECT_ACTION_DESTROY, OBJECT_ACTION_ENCAPSULATE, OBJECT_ACTION_FIND, OBJECT_ACTION_GENERATE,
-    OBJECT_ACTION_PAIR, ObjectDescriptorWire, publish_object_descriptors,
+    OBJECT_ACTION_PAIR, OBJECT_ACTION_UNWRAP, ObjectDescriptorWire, publish_object_descriptors,
     verify_object_descriptors,
 };
 use p11scope_ebpf_common::{Event, ImageIdentity, InstanceStamp, MAX_DESCRIPTORS};
@@ -725,6 +725,9 @@ struct ShapedS1 {
     /// COPY result word override (`None` = unknown output, status 7;
     /// `Some(word)` = valid VALUE result slot 0).
     copy_result: Option<u64>,
+    /// UNWRAP result word override (`None` = unknown output, status 7;
+    /// `Some(word)` = valid VALUE result slot 0).
+    unwrap_result: Option<u64>,
     /// FIND handles override (`None` = unknown output; `Some((words,
     /// truncated))` = valid Find section with the given handle words).
     find_handles: Option<(Vec<u64>, bool)>,
@@ -777,6 +780,7 @@ impl ShapedS1 {
             input1: None,
             result: None,
             copy_result: None,
+            unwrap_result: None,
             find_handles: None,
             getattr_cells: Vec::new(),
             request_cells: Vec::new(),
@@ -972,6 +976,21 @@ fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
             match call.copy_result {
                 Some(word) => {
                     assert_ne!(word, 0, "valid COPY result is nonzero");
+                    end[506] = 1;
+                    end[424..432].copy_from_slice(&word.to_le_bytes());
+                }
+                None => {
+                    end[506] = 7;
+                }
+            }
+            end
+        }
+        "C_UnwrapKey" => {
+            let mut end = end_bytes(begin, OBJECT_ACTION_UNWRAP, call.rv, ENTRY_NS + 50);
+            // Tail result slot 0: record[392 + 114]; word at +32.
+            match call.unwrap_result {
+                Some(word) => {
+                    assert_ne!(word, 0, "valid UNWRAP result is nonzero");
                     end[506] = 1;
                     end[424..432].copy_from_slice(&word.to_le_bytes());
                 }
@@ -26743,6 +26762,148 @@ fn key_operation_newsite_generate_pair_private_carries_no_curve_reason() {
     );
     let section = object_observations_json(&committed);
     assert_eq!(section["version"], 6, "the public label trips v6");
+}
+
+/// Fix round 5 (I1 residual): a `C_UnwrapKey` creation carries no
+/// unestablished-curve reason — unwrap templates for
+/// Edwards/Montgomery private keys carry `CKA_KEY_TYPE` but must
+/// not carry `CKA_EC_PARAMS`, so the absent curve says nothing
+/// about usability (controller KEYMETA-T1 fix4 ruling 2026-11-16:
+/// the reason is for `C_CreateObject` and the public half of
+/// `C_GenerateKeyPair` only).
+#[test]
+fn key_operation_newsite_unwrap_carries_no_unestablished_curve_reason() {
+    use crate::key_operation_projection::object_observations_json;
+    use crate::key_operation_projection::producer::commit;
+    use crate::semantics_key_use::KeyUseReducer;
+    const UNWRAPPED_KEY: u64 = 0xD4D4_D4D4_D4D4_D4D4;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut unwrap = ShapedS1::shaped("C_UnwrapKey", CkRv::OK.0, 0, 0);
+    unwrap.input0 = Some((CREATED_KEY, 1));
+    unwrap.request_cells = vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x41)];
+    unwrap.unwrap_result = Some(UNWRAPPED_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &unwrap,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let unwrapped = committed
+        .objects
+        .iter()
+        .find(|row| row.creation == Some("unwrap"))
+        .expect("the unwrapped key projects");
+    assert_eq!(unwrapped.origin, "created");
+    assert_eq!(unwrapped.established.key_type.scalar, Some(0x41));
+    assert_eq!(
+        unwrapped.established.key_type.source,
+        Some("creation_success"),
+        "the unwrap template promoted its type"
+    );
+    assert_eq!(unwrapped.label, None, "no curve, no label");
+    assert_eq!(unwrapped.requested.ec_params.reason, None);
+    assert_eq!(
+        unwrapped.established.ec_params.reason, None,
+        "an unwrap template must not carry CKA_EC_PARAMS"
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(
+        section["version"], 6,
+        "the promoted creation_success source trips v6"
+    );
+}
+
+/// Fix round 5 (I1 residual): a `C_CopyObject` creation carries no
+/// unestablished-curve reason — copy templates can only change
+/// modifiable attributes, so the curve's absence from the copy's
+/// own template says nothing about usability even once a query
+/// establishes an Edwards/Montgomery type (controller KEYMETA-T1
+/// fix4 ruling 2026-11-16).
+#[test]
+fn key_operation_newsite_copy_carries_no_unestablished_curve_reason() {
+    use crate::key_operation_projection::object_observations_json;
+    use crate::key_operation_projection::producer::commit;
+    use crate::semantics_key_use::KeyUseReducer;
+    const COPIED_KEY: u64 = 0xD5D5_D5D5_D5D5_D5D5;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut copy = ShapedS1::shaped("C_CopyObject", CkRv::OK.0, 0, 0);
+    copy.input0 = Some((CREATED_KEY, 1));
+    copy.request_cells = vec![(3u8, 1u8, 0u16)];
+    copy.copy_result = Some(COPIED_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &copy,
+    );
+    let mut query = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x41)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    query.input0 = Some((COPIED_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &query,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let copied = committed
+        .objects
+        .iter()
+        .find(|row| row.creation == Some("copy"))
+        .expect("the copied key projects");
+    assert_eq!(copied.origin, "created");
+    assert_eq!(copied.established.key_type.scalar, Some(0x41));
+    assert_eq!(
+        copied.established.key_type.source,
+        Some("query"),
+        "the type came from a query, not the copy template"
+    );
+    assert_eq!(copied.label, None, "no curve, no label");
+    assert_eq!(copied.requested.ec_params.reason, None);
+    assert_eq!(
+        copied.established.ec_params.reason, None,
+        "a copy template cannot carry CKA_EC_PARAMS"
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(
+        section["version"], 1,
+        "a query-established type without a curve stays v1"
+    );
 }
 
 /// Fix round 4 (t3 M3): a creation template the probe only partly

@@ -14,7 +14,7 @@ New to p11scope? Start here:
 - [Troubleshooting](troubleshooting.md) — what a refusal or an empty capture means, and the fix.
 - [Known limitations](known-limitations.md) — what this release does not do, before relying on a capture.
 
-> **Status: v0.7.0.** This source provides `doctor`,
+> **Status: v0.7.1.** This source provides `doctor`,
 > `inspect`, `profile` (including `--mode metrics`),
 > `trace`, `run` and `inventory` (with PID, cgroup and system scopes, offline `diff`
 > comparison and diagnostics, streaming `--event-log -` output, and opt-in live key operations), with memory-scan discovery,

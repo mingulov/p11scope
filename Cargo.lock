@@ -592,7 +592,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "p11scope"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "aya",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "p11scope-discover"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cryptoki-sys",
  "libc",

@@ -240,6 +240,107 @@ fn native_additions_are_validated_when_present() {
     }
 }
 
+fn departed_fixture() -> serde_json::Value {
+    json!({
+        "first_ns": 100, "callers": 2, "edges": 3,
+        "entries": {
+            "count": 144, "saturated": 1, "first_min_ns": 101, "last_max_ns": 202,
+            "in_flight": 0, "logical": 100, "forwarding": 44,
+            "observation": {"observed": 3},
+            "coverage": {
+                "counted": 2, "witnessed": 1, "watched_no_use": 0,
+                "lossy": 0, "pid_exit": 0, "unknown": {},
+                "since_min_ns": 101, "until_max_ns": null, "first_min_ns": 150,
+            },
+        },
+        "mapping": {
+            "state": {"mapped": 0, "ended": 3, "uncertain": 0},
+            "evidence": {"deep_scan": 3, "maps_match": 0},
+            "interruptions": 1, "first_min_ns": 101, "last_max_ns": 202,
+            "reasons": {"process exited (pid names no live process)": 3},
+            "reasons_overflow": 0,
+        },
+        "semantics": {"labels": {"observed": 2, "unknown (count-only slot)": 1}},
+        "mechanisms": [{
+            "mechanism": 13, "mechanism_hex": "0xd", "name": "CKM_RSA_PKCS_PSS",
+            "operations": ["sign"], "calls": 10, "errors": 1, "last_seen_ns": 202,
+            "evidence": {
+                "functions": ["C_Sign", "C_SignInit"],
+                "returns": [{"rv": 0, "rv_hex": "0x0", "name": "CKR_OK"}],
+                "truncated": false,
+            },
+        }],
+        "mechanisms_overflow": {"mechs": 0, "calls": 0, "errors": 0},
+        "operations": {
+            "calls": 10, "started": 5, "completed": 4, "cancelled": 0,
+            "failed": 1, "unknown": 2, "orphans": 0, "dropped": 0,
+            "last_seen_ns": 202, "active": [],
+            "evidence": {"state_reconciliations": 1, "async_duplicates": 2},
+            "settled_machines": 1, "settled_pending": 0,
+            "settled_detached": 0, "settled_open": 0,
+            "settled_active": [{"category": "sign", "state": "started", "count": 1}],
+            "settled_active_overflow": 0,
+        },
+        "instances": {
+            "folded": 1, "observed": 0, "uncertain": 0, "retired": 1,
+            "settled_live": 0, "reasons": {"instance_retired": 1},
+            "null_reasons": 0, "first_min_ns": 101, "last_max_ns": 202,
+            "api_returns": 7, "api_returns_saturated_rows": 0,
+            "historical_only_returns": 0, "lossy_rows": 0, "loss_reasons": {},
+        },
+        "identities": [{
+            "caller": "c0", "pid": 4242, "start_time": 999, "incarnation": 0,
+            "exe": {"dev": 37, "ino": 49669, "mtime_secs": 1, "mtime_nanos": 2, "path": "/usr/bin/x"},
+            "authority": "scan_pinned", "lifecycle": "exited",
+            "lifecycle_reason": "process exited (pid names no live process)",
+            "first_seen_ns": 101, "last_seen_ns": 202,
+            "exec_observed": true, "metadata_status": "historical",
+        }],
+        "identities_saturated": false, "identities_dropped": 0,
+    })
+}
+
+#[test]
+fn departed_use_is_carried_when_present() {
+    let mut v = fixture();
+    v["modules"][0]["departed_use"] = departed_fixture();
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let departed = snapshot.modules[0].departed_use.as_ref().unwrap();
+    assert_eq!((departed.callers, departed.edges), (2, 3));
+    assert_eq!(departed.entries.count, 144);
+    assert_eq!(departed.entries.logical, 100);
+    assert_eq!(departed.mapping.ended, 3);
+    assert_eq!(departed.mechanisms.len(), 1);
+    assert_eq!(departed.mechanisms[0].calls, 10);
+    assert_eq!(
+        departed.mechanisms[0].functions,
+        vec!["C_Sign".to_string(), "C_SignInit".to_string()]
+    );
+    let operations = departed.operations.as_ref().unwrap();
+    assert_eq!(operations.completed, 4);
+    assert_eq!(operations.settled_machines, 1);
+    assert_eq!(departed.instances.folded, 1);
+    assert_eq!(departed.instances.api_returns, 7);
+    assert_eq!(departed.identities.len(), 1);
+    assert_eq!(departed.identities[0].pid, 4242);
+    assert_eq!(
+        departed.identities[0].metadata_status.as_deref(),
+        Some("historical")
+    );
+}
+
+#[test]
+fn departed_use_absent_for_old_captures() {
+    let v = fixture();
+    assert!(v.pointer("/modules/0/departed_use").is_none());
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    assert!(snapshot.modules[0].departed_use.is_none());
+    let mut nulled = v.clone();
+    nulled["modules"][0]["departed_use"] = json!(null);
+    let snapshot = parse_snapshot(&bytes(&nulled)).unwrap();
+    assert!(snapshot.modules[0].departed_use.is_none());
+}
+
 #[test]
 fn unbound_use_entries_are_carried_when_present() {
     let mut v = fixture();

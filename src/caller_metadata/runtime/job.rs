@@ -94,6 +94,16 @@ impl MetadataLane {
             active.runtime.forget(id);
         }
     }
+    /// One caller's live snapshot status, if it holds a slot. The
+    /// departed fold reads this before [`Self::forget`].
+    pub(crate) fn status(
+        &self,
+        id: crate::discovery::caller_registry::CallerId,
+    ) -> Option<crate::caller_metadata::presentation::MetadataStatus> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.runtime.status(id))
+    }
     /// The retained table itself (occupied slots and fixed storage).
     pub(crate) fn table_row(&self) -> crate::memory_counters::CounterRow {
         self.active.as_ref().map_or(

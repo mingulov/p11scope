@@ -63,11 +63,30 @@ pub(crate) const HEAP_R11_CALLER: usize = 192;
 /// R11 (function, rv) row: function-name string.
 pub(crate) const HEAP_R11_ROW: usize = 96;
 
-/// One counter row: entry count and estimated bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// One counter row: entry count and estimated bytes. Serializes as a
+/// compact `[len, bytes]` pair: at budget caps the object form needs
+/// ~4.5 KB per line, past the 4096-byte atomic pipe-write limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CounterRow {
     pub len: u64,
     pub bytes: u64,
+}
+
+impl Serialize for CounterRow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element(&self.len)?;
+        tuple.serialize_element(&self.bytes)?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CounterRow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (len, bytes) = <(u64, u64)>::deserialize(deserializer)?;
+        Ok(CounterRow { len, bytes })
+    }
 }
 
 /// `len * (entry + heap)`, saturating. `entry_bytes` is the owner's
@@ -146,6 +165,8 @@ pub(crate) struct RegistryLens {
     pub gap_index: CounterRow,
     pub unbound_images: CounterRow,
     pub unbound_module_images: CounterRow,
+    pub departed_identities: CounterRow,
+    pub departed_mechs: CounterRow,
     pub edge: EdgeLens,
     pub mech_pool_used_bytes: u64,
 }
@@ -379,6 +400,8 @@ pub(crate) struct MemorySnapshot {
     r2_gap_index: Option<CounterRow>,
     r2_registry_unbound_images: Option<CounterRow>,
     r2_registry_unbound_module_images: Option<CounterRow>,
+    r2_registry_departed_identities: Option<CounterRow>,
+    r2_registry_departed_mechs: Option<CounterRow>,
     r3_edge_open: Option<CounterRow>,
     r3_edge_active: Option<CounterRow>,
     r3_edge_mechs: Option<CounterRow>,
@@ -556,6 +579,8 @@ impl MemorySnapshot {
             r2_gap_index: None,
             r2_registry_unbound_images: None,
             r2_registry_unbound_module_images: None,
+            r2_registry_departed_identities: None,
+            r2_registry_departed_mechs: None,
             r3_edge_open: None,
             r3_edge_active: None,
             r3_edge_mechs: None,
@@ -662,6 +687,8 @@ impl MemorySnapshot {
             r2_gap_index: Some(lens.registry.gap_index),
             r2_registry_unbound_images: Some(lens.registry.unbound_images),
             r2_registry_unbound_module_images: Some(lens.registry.unbound_module_images),
+            r2_registry_departed_identities: Some(lens.registry.departed_identities),
+            r2_registry_departed_mechs: Some(lens.registry.departed_mechs),
             r3_edge_open: Some(lens.registry.edge.open),
             r3_edge_active: Some(lens.registry.edge.active),
             r3_edge_mechs: Some(lens.registry.edge.mechs),
@@ -1014,6 +1041,8 @@ mod tests {
                 gap_index: row(8),
                 unbound_images: row(37),
                 unbound_module_images: row(38),
+                departed_identities: row(49),
+                departed_mechs: row(50),
                 edge: EdgeLens {
                     open: row(7),
                     active: row(8),
@@ -1377,6 +1406,11 @@ mod tests {
                 unbound_module_images: cap(
                     DEFAULT_MAX_MODULES * DEFAULT_MAX_UNBOUND_IMAGES_PER_MODULE,
                     304,
+                ),
+                departed_identities: cap(DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL, 280),
+                departed_mechs: cap(
+                    crate::discovery::caller_registry::MAX_FOLDED_MECHANISMS_GLOBAL,
+                    3000,
                 ),
                 edge: EdgeLens {
                     // Pool-consistent worst: the five maps share the

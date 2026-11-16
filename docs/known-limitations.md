@@ -2763,8 +2763,25 @@ The old bounds are measurements, not a product startup SLA.
   as long as the domain lives; the cap and grace are unchanged.
 - Caller, incarnation and pair state stays bounded: a proven-exited
   caller row is retired only after a published presentation rendered it,
-  into the exact `budgets.callers.retired` aggregate; a row still backing
-  an edge, a gap, an instance or pending work keeps its facts. Retired
+  into the exact `budgets.callers.retired` aggregate; rows that carried
+  attributed calls fold their edges and instances into the exact
+  per-module `modules[].departed_use` aggregate first (every count
+  summed, every function/rv breakdown unioned, every folded caller
+  named up to the shared identity bounds), counted in
+  `budgets.callers.retired_with_calls`, so churn alone never fills the
+  4096-caller budget. Gaps keep naming folded callers by label, and
+  live pair targets drop into the Dropped machinery with their staged
+  absolute. A row still referenced by pending work, an owner, a
+  handoff, a pending binder row or the capture target keeps its facts
+  until that consumer releases it. The fold drops display-only launcher
+  chains, app hints and
+  metadata snapshots (only the metadata status survives per folded
+  identity) and coverage unknown-reason details (their gaps keep
+  them); per-module caller counts may name one multi-module caller
+  twice while budgets count each caller once. Semantic-lane custody
+  (`admission_images`) and Joint-terminal counts for callers folded
+  before the lane seated are the remaining S1-lane remainders, not
+  the caller budget. Retired
   caller IDs stay refused as bounded contiguous ID ranges (caller IDs are
   never reused), so late mapping evidence can never invent a caller with
   no row: it is refused and counted in `budgets.callers.late_refused`,

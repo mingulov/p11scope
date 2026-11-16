@@ -1978,6 +1978,49 @@ fn instance_s1_additive_details_do_not_change_physical_diff() {
 }
 
 #[test]
+fn departed_use_differences_change_the_module_diff() {
+    let old = document();
+    let before = old.clone();
+    let mut after = old.clone();
+    after["modules"][0]["departed_use"] = json!({
+        "first_ns": 100, "callers": 1, "edges": 1,
+        "entries": {
+            "count": 9, "saturated": 0, "first_min_ns": 101, "last_max_ns": 102,
+            "in_flight": 0, "logical": 9, "forwarding": 0,
+            "observation": {"observed": 1},
+            "coverage": {
+                "counted": 1, "witnessed": 0, "watched_no_use": 0,
+                "lossy": 0, "pid_exit": 0, "unknown": {},
+                "since_min_ns": 101, "until_max_ns": null, "first_min_ns": null,
+            },
+        },
+        "mapping": {
+            "state": {"mapped": 0, "ended": 1, "uncertain": 0},
+            "evidence": {"deep_scan": 1, "maps_match": 0},
+            "interruptions": 0, "first_min_ns": 101, "last_max_ns": 102,
+            "reasons": {}, "reasons_overflow": 0,
+        },
+        "semantics": {"labels": {"observed": 1}},
+        "mechanisms": [], "mechanisms_overflow": {"mechs": 0, "calls": 0, "errors": 0},
+        "operations": null,
+        "instances": {
+            "folded": 0, "observed": 0, "uncertain": 0, "retired": 0,
+            "settled_live": 0, "reasons": {}, "null_reasons": 0,
+            "first_min_ns": null, "last_max_ns": null, "api_returns": 0,
+            "api_returns_saturated_rows": 0, "historical_only_returns": 0,
+            "lossy_rows": 0, "loss_reasons": {},
+        },
+        "identities": [], "identities_saturated": false, "identities_dropped": 0,
+    });
+    let same = serde_json::to_value(compare(&snapshot(&before), &snapshot(&before))).unwrap();
+    let changed = serde_json::to_value(compare(&snapshot(&before), &snapshot(&after))).unwrap();
+    assert_ne!(same, changed, "a folded module reads changed");
+    let changed_back =
+        serde_json::to_value(compare(&snapshot(&after), &snapshot(&before))).unwrap();
+    assert_ne!(same, changed_back, "symmetric");
+}
+
+#[test]
 fn native_semantic_resource_budgets_do_not_change_physical_diff() {
     let old = document();
     let mut charged = old.clone();

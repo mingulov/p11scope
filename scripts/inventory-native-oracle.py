@@ -1310,9 +1310,21 @@ def check_streams(view, res):
     for e in edge_events:
         ev = e.get("event") if isinstance(e.get("event"), dict) else {}
         last[(ev.get("caller"), ev.get("module"))] = ev
+    # A streamed edge may be absent from the final snapshot when the
+    # departed fold removed it after it was shown: the missing stream
+    # keys must then count exactly into budgets.edges.folded (each
+    # folded edge streamed at least its birth record). Anything else
+    # missing is a silent loss.
+    folded_budget = ((doc.get("budgets") or {}).get("edges") or {}).get("folded", 0)
+    streamed_missing = sorted(set(last) - set(view.edges))
     bad = []
+    if streamed_missing and not (
+            type(folded_budget) is int and len(streamed_missing) == folded_budget):
+        bad.append(("*", f"{len(streamed_missing)} streamed edges are absent from the snapshot "
+                         f"but budgets.edges.folded is {folded_budget!r}"))
     for key, ev in last.items():
-        bad.extend(edge_payload_problems(view, key, ev))
+        if key in view.edges:
+            bad.extend(edge_payload_problems(view, key, ev))
     missing = sorted(set(view.edges) - set(last))
     if missing:
         bad.append((missing[:4], f"{len(missing)} snapshot edges have no edge_observed"))

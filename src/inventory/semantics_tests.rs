@@ -7171,6 +7171,68 @@ fn retired_subset_edged_callers_without_instances_count_as_never_admitted() {
     );
 }
 
+/// Terminal never-admitted disclosure across the departed fold: a
+/// retired subset-edged caller folded before the terminal call still
+/// counts exactly once through its carried contribution.
+#[test]
+fn folded_callers_still_count_as_never_admitted_at_terminal() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    scene.coordinator.note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .coordinator
+            .retire_rendered_callers(301, Some(lane.subset()))
+            .retired,
+        1,
+        "the retired caller folds before the terminal call"
+    );
+    assert!(
+        scene.coordinator.adapter().record(caller).is_none(),
+        "no adapter row survives the fold"
+    );
+    assert!(scene.coordinator.note_callers_never_admitted(&lane));
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let found = gaps
+        .iter()
+        .find(|gap| {
+            gap.subject
+                == crate::discovery::engine::inventory_coordinator::CALLERS_NEVER_ADMITTED_SUBJECT
+        })
+        .expect("the terminal call discloses the counted gap");
+    assert!(
+        found.reason.contains("1 caller(s)"),
+        "the gap counts the folded caller: {}",
+        found.reason
+    );
+}
+
 /// A retired subset-edged caller with a registered instance was
 /// admitted: the never-admitted disclosure stays silent.
 #[test]

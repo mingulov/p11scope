@@ -39,12 +39,13 @@ use crate::attach::capture::{
 use crate::capacity::InventoryBudget;
 #[cfg(test)]
 use crate::discovery::caller_registry::DEFAULT_MAX_GAPS;
+use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 use crate::discovery::caller_registry::{
     AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
-    CallerLifecycle, CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity,
-    ExeResolution, ImageAuthority, MappingState, ModuleId, ModuleInfo, ModuleKey,
-    PendingCountOutcome, PendingRejection, ProcessSource, RegistryGap, RegistryLimits,
-    ScopedOwnerProof, UnboundExe, UnboundImage, UnknownReason, UseCoverage,
+    CallerLifecycle, CallerRegistry, CountPublication, CoverageNote, DepartedIdentity,
+    EdgeFoldFacts, EdgeRecord, ExeIdentity, ExeResolution, ImageAuthority, MappingState, ModuleId,
+    ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection, ProcessSource, RegistryGap,
+    RegistryLimits, ScopedOwnerProof, UnboundExe, UnboundImage, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, DecisionLog, ENDPOINT_RESOURCE,
@@ -70,7 +71,7 @@ use crate::inventory_diagnostics::{
     DiagnosticReason, DiagnosticRecord, Eligibility, FinishedDiagnostics, InitError, NativePairKey,
     ReadOrigin, Recorder,
 };
-use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
+use crate::inventory_semantics::{AttestedSemanticLane, AttestedSubset, SemanticBatch};
 use crate::process::PidPin;
 use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, CollectionControl};
 use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
@@ -653,12 +654,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// EXEC records shed past the stash cap (sticky): the shed
     /// record may be an image's EXEC, so the domain latches loss.
     exec_exe_shed: u64,
-    /// EXEC stashes pruned after their process departed, bounded: a
-    /// later row for the image reads `exec_record_lost` (the record
-    /// existed and the observer discarded it), never `no_exec_record`.
-    /// Past the bound the domain latches loss and
-    /// `exec_pruned_overflow` counts it.
-    exec_pruned: HashSet<DomainCookie>,
+    /// EXEC stashes pruned after their process departed, bounded, each
+    /// with its prune instant: a later row for the image reads
+    /// `exec_record_lost` (the record existed and the observer
+    /// discarded it), never `no_exec_record`. Past the bound the
+    /// domain latches loss and `exec_pruned_overflow` counts it. A
+    /// completed gap-free sweep expires only the tombstones pruned
+    /// before the sweep began (no older row can still arrive; a sweep
+    /// with gaps proves nothing).
+    exec_pruned: HashMap<DomainCookie, u64>,
     exec_pruned_cap: usize,
     exec_pruned_overflow: u64,
     /// Domains with EXEC evidence loss (binder loss or stash shed):
@@ -719,6 +723,19 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Proven-exited caller rows retired into the counted aggregate
     /// (monotonic, saturating).
     retired_caller_rows: u64,
+    /// Of those, rows that folded attributed calls (edges with
+    /// entries or semantic claims). Each caller counts once no
+    /// matter how many modules its edges folded into.
+    retired_with_calls: u64,
+    /// Joint-terminal contributions of folded callers, evaluated at
+    /// the fold under the seated lane subset (which never changes
+    /// afterwards): the never-admitted, refused-admission and
+    /// without-joins terminal counts add these to the live rows so
+    /// folding never silences them. Callers folded before any lane
+    /// seated contribute nothing (disclosed).
+    folded_terminal_missed: u64,
+    folded_terminal_refused: u64,
+    folded_terminal_without_joins: u64,
     /// Held exec handoffs (H6 slice 2): at most one per ended caller, keyed
     /// by it — no new unbounded table, one entry per retired caller
     /// reservation at most. Unscoped handoffs commit immediately; scoped
@@ -1184,6 +1201,35 @@ impl JointAuditSubjectDiagnosis {
     }
 }
 
+/// Per-call departed-fold indexes: instance owners, edges with claimed
+/// instance children, forwarding-layer modules, and the terminal
+/// subset modules. Built lazily on the first foldable caller.
+struct FoldContext {
+    instances_by_caller: HashMap<CallerId, Vec<RegistryInstanceId>>,
+    claimed_children: BTreeSet<(CallerId, ModuleId)>,
+    forwarding: BTreeSet<ModuleId>,
+    subset_modules: Option<BTreeSet<ModuleId>>,
+}
+
+/// What one caller's fold removed: whether it carried attributed
+/// calls plus the folded row keys (the seam drops their stream
+/// digests so the emitters stay bounded by live rows).
+#[derive(Default)]
+struct FoldedCaller {
+    with_calls: bool,
+    edges: Vec<(CallerId, ModuleId)>,
+    instances: Vec<RegistryInstanceId>,
+}
+
+/// One retirement pass's result: how many rows retired plus every
+/// folded row key.
+#[derive(Default)]
+pub(crate) struct FoldReceipt {
+    pub retired: u64,
+    pub folded_edges: Vec<(CallerId, ModuleId)>,
+    pub folded_instances: Vec<RegistryInstanceId>,
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     // Retain the default constructor for existing internal harness callers;
     // the public runtime always supplies its already-resolved budget.
@@ -1290,7 +1336,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             exec_exe: HashMap::new(),
             exec_exe_cap: DEFAULT_MAX_EXEC_EXE_STASH,
             exec_exe_shed: 0,
-            exec_pruned: HashSet::new(),
+            exec_pruned: HashMap::new(),
             exec_pruned_cap: MAX_PRUNED_EXEC_TOMBSTONES,
             exec_pruned_overflow: 0,
             exec_loss_domains: HashSet::new(),
@@ -1314,6 +1360,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_owners: BTreeMap::new(),
             rendered_callers: BTreeSet::new(),
             retired_caller_rows: 0,
+            retired_with_calls: 0,
+            folded_terminal_missed: 0,
+            folded_terminal_refused: 0,
+            folded_terminal_without_joins: 0,
             pending_successors: BTreeMap::new(),
             leader_link_loss_noted: BTreeSet::new(),
             pending_leader_exits: BTreeMap::new(),
@@ -4346,7 +4396,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ),
             exec_pruned: counter_row(
                 self.exec_pruned.len(),
-                size_of::<DomainCookie>(),
+                size_of::<(DomainCookie, u64)>(),
                 HEAP_MAP_ENTRY,
             ),
             exec_loss_domains: counter_row(
@@ -5383,7 +5433,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             keep
         });
         for cookie in pruned {
-            self.note_exec_pruned(cookie);
+            self.note_exec_pruned(cookie, now_ns);
         }
         // H0 image proofs are read only for a live binding ticket:
         // dropping proofs whose ticket no longer has a binding keeps the
@@ -5399,9 +5449,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The bounded tombstone set keeps the distinction exact; past the
     /// bound the domain latches EXEC loss (conservative for every
     /// unjoined image there) and the overflow is counted.
-    fn note_exec_pruned(&mut self, cookie: DomainCookie) {
+    fn note_exec_pruned(&mut self, cookie: DomainCookie, now_ns: u64) {
         if self.exec_pruned.len() < self.exec_pruned_cap {
-            self.exec_pruned.insert(cookie);
+            self.exec_pruned.insert(cookie, now_ns);
             return;
         }
         self.exec_pruned_overflow = self.exec_pruned_overflow.saturating_add(1);
@@ -5452,6 +5502,45 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .insert(key, PrunedPairBase { base, base_since });
             } else {
                 self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
+            }
+        }
+    }
+
+    /// Drop one departed caller's live pair targets (bound, pending or
+    /// suspended) into the existing Dropped machinery: the staged
+    /// absolute lands in the base exactly like a rejected drop, the
+    /// held read and the stalled recovery leave with it, and the
+    /// grace prune plus tombstones take it from there (late rows
+    /// revive past the base; the tombstone names no caller). Without
+    /// this a suspended pair pins its exited caller forever: nothing
+    /// else resolves a dead caller's placement. Routine churn work,
+    /// not a count decision, so no diagnostic record.
+    fn drop_caller_pairs_for_fold(&mut self, id: CallerId) {
+        let keys: Vec<PairKey> = self
+            .pair_targets
+            .iter()
+            .filter(|(_, target)| match target {
+                PairTarget::Bound { caller, .. }
+                | PairTarget::Pending { caller, .. }
+                | PairTarget::Suspended { caller, .. } => *caller == id,
+                PairTarget::Dropped { .. } => false,
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            let (base, base_since) = self.pair_drop_base(&key);
+            let _ = self.take_pruned_pair_base(&key);
+            self.pair_targets
+                .insert(key, PairTarget::Dropped { base, base_since });
+            self.pair_counts.remove(&key);
+            self.recoveries.remove(&key);
+            self.placement_generations.remove(&key);
+            if let Some(pos) = self.recovery_order.iter().position(|keyed| *keyed == key) {
+                self.recovery_order.swap_remove(pos);
+                if self.recovery_cursor > pos {
+                    self.recovery_cursor -= 1;
+                }
+                self.recovery_cursor %= self.recovery_order.len().max(1);
             }
         }
     }
@@ -5569,21 +5658,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Retire rendered caller rows whose process is proven ended into the
-    /// counted aggregate. A row referenced by a pending row, an owner,
-    /// a handoff, a pair target or any rendered registry fact keeps its
-    /// facts. Returns how many rows retired.
-    pub(crate) fn retire_rendered_callers(&mut self, _now_ns: u64) -> u64 {
+    /// counted aggregates. A row referenced by a pending row, an owner,
+    /// a handoff, a pending binder row or the capture target keeps its
+    /// facts; edges, instances, pairs and recoveries fold instead
+    /// (counts, breakdowns and identities survive in the departed
+    /// aggregate, staged absolutes in the dropped-pair machinery) and
+    /// gaps keep naming the folded caller by label. `subset` is the
+    /// seated lane's attested subset, if any: folded callers'
+    /// Joint-terminal contributions evaluate under it (it never
+    /// changes afterwards). Returns how many rows retired and what
+    /// folded.
+    pub(crate) fn retire_rendered_callers(
+        &mut self,
+        now_ns: u64,
+        subset: Option<&AttestedSubset>,
+    ) -> FoldReceipt {
         let rendered = std::mem::take(&mut self.rendered_callers);
         if rendered.is_empty() {
-            return 0;
+            return FoldReceipt::default();
         }
         // One referenced-caller set per call, not one scan per candidate:
         // steady state can render the whole caller budget every pass.
         let referenced = self.referenced_callers();
-        let mut retired = 0;
+        // The fold indexes build lazily on the first foldable caller:
+        // most passes retire nothing.
+        let mut folded: Option<FoldContext> = None;
+        let mut receipt = FoldReceipt::default();
         for id in rendered {
-            let Some(record) = self.adapter.record(id) else {
-                continue;
+            let record = match self.adapter.record(id) {
+                Some(record) => record.clone(),
+                None => continue,
             };
             if !record.retired
                 || !matches!(
@@ -5593,7 +5697,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 continue;
             }
-            if self.caller_row_referenced(id, &referenced) {
+            if referenced.contains(&id) {
                 continue;
             }
             // A pending binder row still needs its incarnation snapshot;
@@ -5601,29 +5705,299 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if !self.binder.release_retired_caller(id) {
                 continue;
             }
+            if folded.is_none() {
+                folded = Some(self.fold_context(subset));
+            }
+            let folded_caller =
+                self.fold_caller_rendered_state(id, &record, folded.as_ref(), now_ns);
             if self.adapter.forget_caller(id) {
                 self.count_ownership.forget_caller(id);
                 if let Some(metadata) = self.caller_metadata.as_mut() {
                     metadata.forget(id);
                 }
-                self.registry.compact_retired_caller(id);
+                self.registry.compact_folded_caller(id);
                 self.leader_link_loss_noted.remove(&id);
                 self.staged_retirements.remove(&id);
                 self.retired_caller_rows = self.retired_caller_rows.saturating_add(1);
-                retired += 1;
+                if folded_caller.with_calls {
+                    self.retired_with_calls = self.retired_with_calls.saturating_add(1);
+                }
+                receipt.retired += 1;
+                receipt.folded_edges.extend(folded_caller.edges);
+                receipt.folded_instances.extend(folded_caller.instances);
             }
         }
         // Every forgotten row releases its pid's incarnation counter;
         // the map then tracks only retained rows (bounded by the caller
         // budget), never every pid the capture ever met.
         self.adapter.prune_incarnations();
-        retired
+        receipt
+    }
+
+    /// Caller rows retired into the counted aggregates with attributed
+    /// calls (folded edges with entries or claims, counted once per
+    /// caller no matter how many modules its edges folded into).
+    pub(crate) fn retired_with_calls(&self) -> u64 {
+        self.retired_with_calls
+    }
+
+    /// Modules of the seated lane subset (mirrors the terminal
+    /// computation): provider modules the subset's required objects
+    /// prove. Shared by the terminal counts and the fold's carried
+    /// contributions so both judge the same set.
+    fn subset_module_ids(&self, subset: &AttestedSubset) -> BTreeSet<ModuleId> {
+        let required = subset.required();
+        if required.is_empty() {
+            return BTreeSet::new();
+        }
+        self.registry
+            .modules()
+            .filter(|module| {
+                required
+                    .keys()
+                    .any(|object| subset.proves_provider_module(*object, &module.key))
+            })
+            .map(|module| module.id)
+            .collect()
+    }
+
+    /// Per-call fold indexes, built lazily on the first foldable
+    /// caller: instance owners (no per-candidate scan), edges with
+    /// claimed instance children (for edge labels), forwarding-layer
+    /// modules (for the entries split), and the terminal subset
+    /// modules (for carried Joint-terminal contributions, when a lane
+    /// is seated).
+    fn fold_context(&self, subset: Option<&AttestedSubset>) -> FoldContext {
+        let mut instances_by_caller: HashMap<CallerId, Vec<RegistryInstanceId>> = HashMap::new();
+        for record in self.registry.instances() {
+            instances_by_caller
+                .entry(record.caller)
+                .or_default()
+                .push(record.id);
+        }
+        let claimed_children: BTreeSet<(CallerId, ModuleId)> = self
+            .registry
+            .instance_semantic_edges()
+            .filter(|row| {
+                row.semantics
+                    .as_ref()
+                    .is_some_and(crate::semantics_edge::EdgeSemantics::has_claims)
+            })
+            .map(|row| (row.caller, row.module))
+            .collect();
+        let module_keys: Vec<(ModuleId, String, (u64, u64), u64)> = self
+            .registry
+            .modules()
+            .map(|module| {
+                let (major, minor, ino) = match &module.key {
+                    ModuleKey::Physical {
+                        dev_major,
+                        dev_minor,
+                        ino,
+                        ..
+                    } => (*dev_major, *dev_minor, *ino),
+                    ModuleKey::Unidentified { .. } => (0, 0, 0),
+                };
+                (
+                    module.id,
+                    module.paths.iter().next().cloned().unwrap_or_default(),
+                    (major, minor),
+                    ino,
+                )
+            })
+            .collect();
+        let (forwarding_declared, _) =
+            crate::render::match_forwarding_inputs(self.forwarding_inputs(), &module_keys);
+        let mut forwarding: BTreeSet<ModuleId> = forwarding_declared.into_iter().collect();
+        forwarding.extend(self.registry.modules().filter_map(|module| {
+            matches!(
+                module.admission_class.as_deref(),
+                Some("closure_array" | "closure-array")
+            )
+            .then_some(module.id)
+        }));
+        let subset_modules = subset.map(|subset| self.subset_module_ids(subset));
+        FoldContext {
+            instances_by_caller,
+            claimed_children,
+            forwarding,
+            subset_modules,
+        }
+    }
+
+    /// Fold one proven-ended caller's edges and instances into their
+    /// modules' departed aggregates and carry its Joint-terminal
+    /// contributions. Returns what folded (for the receipt) and whether
+    /// the caller carried attributed calls (folded entries or claims).
+    /// The caller row itself is forgotten by the caller afterwards.
+    fn fold_caller_rendered_state(
+        &mut self,
+        id: CallerId,
+        record: &crate::discovery::caller_registry::CallerRecord,
+        folded: Option<&FoldContext>,
+        now_ns: u64,
+    ) -> FoldedCaller {
+        let Some(ctx) = folded else {
+            return FoldedCaller::default();
+        };
+        // The caller's live pair targets drop first: staged absolutes
+        // land in the dropped-pair machinery (revival intact), so no
+        // suspended pair pins the exited caller afterwards.
+        self.drop_caller_pairs_for_fold(id);
+        // The layer split reads the frozen exited state: provider
+        // activity and refused backends from this caller's own edges,
+        // exactly like the live presentation reads them.
+        let mut active = false;
+        let mut refused_backend = false;
+        for edge in self.registry.edges_of(id) {
+            if ctx.forwarding.contains(&edge.module) {
+                continue;
+            }
+            if edge.entry_count > 0 {
+                active = true;
+            }
+            if self
+                .registry
+                .module(edge.module)
+                .is_some_and(|module| module.admission == AdmissionState::Refused)
+            {
+                refused_backend = true;
+            }
+        }
+        let active_set: BTreeSet<CallerId> = active.then_some(id).into_iter().collect();
+        let refused_set: BTreeSet<CallerId> = refused_backend.then_some(id).into_iter().collect();
+        let edge_keys: Vec<(CallerId, ModuleId)> = self
+            .registry
+            .edges_of(id)
+            .map(|edge| (edge.caller, edge.module))
+            .collect();
+        let mut entries = 0u64;
+        let mut had_claims = false;
+        let mut edge_modules = BTreeSet::new();
+        let mut folded_edges = Vec::new();
+        for (caller, module) in edge_keys {
+            let Some(edge) = self.registry.edge(caller, module) else {
+                continue;
+            };
+            let coverage = self.presented_coverage(edge);
+            let observation = self.registry.entry_observation_for(edge, &coverage);
+            let semantic_label = crate::inventory_present::edge_semantic_label(
+                edge.semantics.as_ref(),
+                ctx.claimed_children.contains(&(caller, module)),
+            );
+            let forwarding = crate::inventory_present::edge_layer_is_forwarding(
+                module,
+                caller,
+                &ctx.forwarding,
+                &active_set,
+                &refused_set,
+            );
+            let stats = self.registry.fold_caller_edge(
+                caller,
+                module,
+                EdgeFoldFacts {
+                    coverage,
+                    observation,
+                    semantic_label,
+                    forwarding,
+                },
+                now_ns,
+            );
+            entries = entries.saturating_add(stats.entries);
+            had_claims = had_claims || stats.had_claims;
+            edge_modules.insert(module);
+            folded_edges.push((caller, module));
+        }
+        let instance_ids: Vec<RegistryInstanceId> = ctx
+            .instances_by_caller
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        let mut instance_modules = BTreeSet::new();
+        let mut folded_instances = Vec::new();
+        let mut joined = false;
+        for instance in instance_ids {
+            let Some(taken) = self.registry.take_instance_for_fold(instance) else {
+                continue;
+            };
+            instance_modules.insert(taken.record.module);
+            folded_instances.push(instance);
+            if taken
+                .semantic
+                .as_ref()
+                .is_some_and(|row| row.api_returns.unwrap_or(0) > 0)
+            {
+                joined = true;
+            }
+            had_claims = had_claims
+                || taken
+                    .semantic
+                    .as_ref()
+                    .and_then(|row| row.semantics.as_ref())
+                    .is_some_and(crate::semantics_edge::EdgeSemantics::has_claims);
+            self.registry.fold_taken_instance(taken, now_ns);
+        }
+        // Joint-terminal contributions, evaluated under the seated
+        // subset exactly like the terminal evaluates live rows.
+        let refused_mark = self.registry.take_registration_refused(id);
+        if let Some(subset_modules) = ctx.subset_modules.as_ref() {
+            let subset_edge = edge_modules
+                .iter()
+                .any(|module| subset_modules.contains(module));
+            let subset_instanced = instance_modules
+                .iter()
+                .any(|module| subset_modules.contains(module));
+            if subset_edge && !subset_instanced && !refused_mark {
+                self.folded_terminal_missed = self.folded_terminal_missed.saturating_add(1);
+            }
+            if subset_edge && !subset_instanced && refused_mark {
+                self.folded_terminal_refused = self.folded_terminal_refused.saturating_add(1);
+            }
+            if subset_instanced && !joined {
+                self.folded_terminal_without_joins =
+                    self.folded_terminal_without_joins.saturating_add(1);
+            }
+        }
+        // The identity folds into every module the caller touched; a
+        // row-less caller (no edges, no instances) counts on without
+        // naming anything, exactly like before.
+        if !edge_modules.is_empty() || !instance_modules.is_empty() {
+            let status = self
+                .caller_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.status(id));
+            for module in edge_modules.union(&instance_modules) {
+                self.registry.insert_departed_identity(
+                    *module,
+                    DepartedIdentity {
+                        caller: id,
+                        pid: record.pid,
+                        start_time: record.start_time,
+                        incarnation: record.incarnation,
+                        exe: record.exe.clone(),
+                        authority: record.authority,
+                        lifecycle: record.lifecycle,
+                        lifecycle_reason: record.lifecycle_reason.clone(),
+                        first_seen_ns: record.first_seen_ns,
+                        last_seen_ns: record.last_seen_ns,
+                        exec_observed: record.exec_observed,
+                        metadata_status: status,
+                    },
+                );
+            }
+        }
+        FoldedCaller {
+            with_calls: entries > 0 || had_claims,
+            edges: folded_edges,
+            instances: folded_instances,
+        }
     }
 
     /// Callers still referenced by pending work or a capture target, in
-    /// one pass over those tables. The registry's own rendered state is
-    /// checked per candidate (its edge range is cheap and its remaining
-    /// rows are bounded by retained evidence).
+    /// one pass over those tables. Edges, instances, pairs and
+    /// recoveries fold instead of pinning (their facts move to the
+    /// departed aggregate and the dropped-pair machinery); gaps name
+    /// folded callers by label and never pin either.
     fn referenced_callers(&self) -> BTreeSet<CallerId> {
         let mut referenced = BTreeSet::new();
         if let Some(capture) = self.capture.as_ref()
@@ -5635,28 +6009,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         referenced.extend(self.pending_successors.keys().copied());
         referenced.extend(self.pending_leader_exits.keys().copied());
         referenced.extend(self.pending_adjudication.keys().copied());
-        referenced.extend(self.recoveries.values().map(|recovery| recovery.caller));
-        referenced.extend(
-            self.pair_targets
-                .values()
-                .filter_map(|target| match target {
-                    PairTarget::Bound { caller, .. }
-                    | PairTarget::Pending { caller, .. }
-                    | PairTarget::Suspended { caller, .. } => Some(*caller),
-                    PairTarget::Dropped { .. } => None,
-                }),
-        );
         referenced.extend(self.pending_ids.values().map(|pending| pending.caller));
         referenced
-    }
-
-    /// Whether a caller row still backs a rendered fact or pending work.
-    /// Such a row must keep its facts until that consumer releases it.
-    fn caller_row_referenced(&self, id: CallerId, referenced: &BTreeSet<CallerId>) -> bool {
-        if self.registry.edges_of(id).next().is_some() {
-            return true;
-        }
-        referenced.contains(&id) || self.registry.caller_has_rendered_state(id)
     }
 
     /// Caller rows retired into the counted aggregate.
@@ -7452,10 +7806,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // A completed witness sweep proves no older row for its domain is
         // still in flight; a Finish means no later evidence at all. Both
         // release departed tombstones only after this batch's decisions
-        // are staged below.
+        // are staged below. The sweep's beginning is read before staging
+        // (staging clears it on completion): only tombstones pruned
+        // before it began expire, and only on a gap-free sweep.
         let tombstone_cleanup = match &batch {
-            NativeBatch::Witness(batch) if batch.sweep_completed => Some((batch.domain, false)),
-            NativeBatch::Finish { domain } => Some((*domain, true)),
+            NativeBatch::Witness(batch) if batch.sweep_completed => Some((
+                batch.domain,
+                false,
+                self.capture
+                    .as_ref()
+                    .and_then(|capture| capture.sweep_began_ns)
+                    .unwrap_or(batch.health_read_ns),
+                !batch.sweep_gaps,
+            )),
+            NativeBatch::Finish { domain } => Some((*domain, true, 0, true)),
             _ => None,
         };
         let mut hook_events = Vec::new();
@@ -7517,8 +7881,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut receipt = self.stage_binder_output(identity, now_ns);
         receipt.events.extend(hook_events);
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
-        if let Some((domain, finished)) = tombstone_cleanup {
-            self.expire_exec_tombstones(domain);
+        if let Some((domain, finished, began_ns, gap_free)) = tombstone_cleanup {
+            self.expire_exec_tombstones(domain, began_ns, gap_free);
             if finished {
                 self.finish_native_domain(domain);
             }
@@ -7526,16 +7890,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         receipt
     }
 
-    /// No row older than a completed sweep can still arrive: EXEC stashes
-    /// pruned before it need no tombstone, unless a row for that cookie is
-    /// still pending and will resolve its unbound image later.
-    fn expire_exec_tombstones(&mut self, domain: NativeDomainId) {
-        if self.exec_pruned.is_empty() {
+    /// No row older than a completed sweep began can still arrive: EXEC
+    /// stashes pruned before it need no tombstone, unless a row for
+    /// that cookie is still pending and will resolve its unbound image
+    /// later. Tombstones pruned after the sweep began wait for a later
+    /// sweep that proves them.
+    fn expire_exec_tombstones(&mut self, domain: NativeDomainId, began_ns: u64, gap_free: bool) {
+        // A sweep with gaps proves nothing about the rows it skipped
+        // (see `WitnessBatch.sweep_gaps`); only a gap-free sweep
+        // expires, and only tombstones pruned before it began.
+        if !gap_free || self.exec_pruned.is_empty() {
             return;
         }
         let pending = self.binder.pending_cookies(domain);
-        self.exec_pruned
-            .retain(|cookie| cookie.domain() != domain || pending.contains(cookie));
+        self.exec_pruned.retain(|cookie, pruned_ns| {
+            cookie.domain() != domain || pending.contains(cookie) || *pruned_ns >= began_ns
+        });
     }
 
     /// The domain will produce no more evidence: drop its departed
@@ -7543,7 +7913,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// and its EXEC-loss latch. Pair totals stay: they are the exact
     /// counted aggregate, not per-pair revival state.
     fn finish_native_domain(&mut self, domain: NativeDomainId) {
-        self.exec_pruned.retain(|cookie| cookie.domain() != domain);
+        self.exec_pruned
+            .retain(|cookie, _| cookie.domain() != domain);
         self.exec_loss_domains.remove(&domain);
         self.pair_dropped_tombstones
             .retain(|key, _| key.image.domain() != domain);
@@ -9721,18 +10092,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// remembers the held absolute, so a later row rebinds past it
     /// instead of attributing pre-drop calls to a new owner (round 4,
     /// rebind).
-    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) -> u64 {
-        let key = PairKey::of(row);
-        let (base, base_since) = self
-            .pair_counts
-            .get(&key)
+    /// One pair's staged absolute for a drop: the held read, else a
+    /// pruned tombstone, else the target itself. Shared by count
+    /// rejection and the departed fold so both land the same base.
+    fn pair_drop_base(&self, key: &PairKey) -> (u64, u64) {
+        self.pair_counts
+            .get(key)
             .map(|count| (count.count, count.anchor_ns))
             .or_else(|| {
                 self.pair_dropped_tombstones
-                    .get(&key)
+                    .get(key)
                     .map(|pruned| (pruned.base, pruned.base_since))
             })
-            .or_else(|| match self.pair_targets.get(&key) {
+            .or_else(|| match self.pair_targets.get(key) {
                 Some(
                     PairTarget::Pending {
                         base, base_since, ..
@@ -9747,7 +10119,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ) => Some((*base, *base_since)),
                 None => None,
             })
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0))
+    }
+
+    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) -> u64 {
+        let key = PairKey::of(row);
+        let (base, base_since) = self.pair_drop_base(&key);
         if let Some(recorder) = &mut self.diagnostics {
             let held = self.pair_counts.get(&key).map(|held| held.read);
             let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
@@ -9823,7 +10200,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         });
                         self.resolve_unbound_exe(stashed, learned, all_learned)
                     }
-                    None if self.exec_pruned.contains(&cookie)
+                    None if self.exec_pruned.contains_key(&cookie)
                         || self.exec_evidence_lost(cookie.domain()) =>
                     {
                         UnboundExe {
@@ -10940,20 +11317,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return false;
         }
         self.reported_callers_never_admitted = true;
-        let required = lane.subset().required();
-        if required.is_empty() {
-            return false;
-        }
-        let subset_modules: BTreeSet<ModuleId> = self
-            .registry
-            .modules()
-            .filter(|module| {
-                required
-                    .keys()
-                    .any(|object| lane.subset().proves_provider_module(*object, &module.key))
-            })
-            .map(|module| module.id)
-            .collect();
+        let subset_modules = self.subset_module_ids(lane.subset());
         if subset_modules.is_empty() {
             return false;
         }
@@ -10979,6 +11343,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 missed = missed.saturating_add(1);
             }
         }
+        // Folded callers left the adapter records above; their carried
+        // contributions (evaluated under this same subset at the fold)
+        // join the live rows so the total stays exact.
+        missed = missed.saturating_add(self.folded_terminal_missed);
         if missed == 0 {
             return false;
         }
@@ -11010,20 +11378,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return false;
         }
         self.reported_admitted_without_joins = true;
-        let required = lane.subset().required();
-        if required.is_empty() {
-            return false;
-        }
-        let subset_modules: BTreeSet<ModuleId> = self
-            .registry
-            .modules()
-            .filter(|module| {
-                required
-                    .keys()
-                    .any(|object| lane.subset().proves_provider_module(*object, &module.key))
-            })
-            .map(|module| module.id)
-            .collect();
+        let subset_modules = self.subset_module_ids(lane.subset());
         if subset_modules.is_empty() {
             return false;
         }
@@ -11044,6 +11399,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             missed = missed.saturating_add(1);
         }
+        missed = missed.saturating_add(self.folded_terminal_without_joins);
         if missed == 0 {
             return false;
         }
@@ -11069,20 +11425,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return false;
         }
         self.reported_callers_refused_admission = true;
-        let required = lane.subset().required();
-        if required.is_empty() {
-            return false;
-        }
-        let subset_modules: BTreeSet<ModuleId> = self
-            .registry
-            .modules()
-            .filter(|module| {
-                required
-                    .keys()
-                    .any(|object| lane.subset().proves_provider_module(*object, &module.key))
-            })
-            .map(|module| module.id)
-            .collect();
+        let subset_modules = self.subset_module_ids(lane.subset());
         if subset_modules.is_empty() {
             return false;
         }
@@ -11108,6 +11451,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 refused = refused.saturating_add(1);
             }
         }
+        refused = refused.saturating_add(self.folded_terminal_refused);
         if refused == 0 {
             return false;
         }
@@ -13023,37 +13367,39 @@ pub(crate) mod tests {
         let snapshot = coordinator.memory_snapshot(61);
         let line = snapshot.format_line();
         // The wire shape pins the assembly: command, owned rows
-        // present, unowned rows N/A.
+        // present, unowned rows N/A. Rows are compact `[len, bytes]`
+        // tuples (item 4: the object form exceeds the 4096-byte
+        // pipe atomic-write limit at budget caps).
         let json = line
             .strip_prefix(crate::memory_counters::MEMORY_LINE_PREFIX)
             .expect("memory prefix");
         let value: serde_json::Value = serde_json::from_str(json).expect("valid json");
         assert_eq!(value["command"], "inventory");
         assert_eq!(value["elapsed_secs"], 61);
-        assert_eq!(value["r1_adapter_callers"]["len"], 1);
-        assert_eq!(value["r1_adapter_incarnations"]["len"], 1);
-        assert_eq!(value["r1_adapter_live_by_pid"]["len"], 1);
+        assert_eq!(value["r1_adapter_callers"][0], 1);
+        assert_eq!(value["r1_adapter_incarnations"][0], 1);
+        assert_eq!(value["r1_adapter_live_by_pid"][0], 1);
         // The admission has not published: the R2 tables are present
         // but empty (R2 movement is pinned in the registry tests).
-        assert_eq!(value["r2_registry_callers"]["len"], 0);
-        assert!(value["r6"]["losses"]["len"].is_number());
-        assert!(value["r2_modules_by_key"]["len"].is_number());
-        assert!(value["r2_gap_index"]["len"].is_number());
-        assert!(value["r3_edge_detached"]["len"].is_number());
+        assert_eq!(value["r2_registry_callers"][0], 0);
+        assert!(value["r6"]["losses"][0].is_number());
+        assert!(value["r2_modules_by_key"][0].is_number());
+        assert!(value["r2_gap_index"][0].is_number());
+        assert!(value["r3_edge_detached"][0].is_number());
         assert!(value["r3_mech_pool_used_bytes"].is_number());
-        assert!(value["r4_model_sessions"]["len"].is_number());
-        assert!(value["r4_domains"]["len"].is_number());
-        assert!(value["r4_instances"]["len"].is_number());
-        assert!(value["r4_deferred_pending"]["len"].is_number());
-        assert!(value["r4_deferred_detached"]["len"].is_number());
-        assert!(value["r4_deferred_releases"]["len"].is_number());
-        assert!(value["r4_recently_pruned"]["len"].is_number());
-        assert!(value["r4_gaps"]["len"].is_number());
-        assert!(value["r6"]["selection_inventory"]["len"].is_number());
-        assert!(value["r6"]["selection_surfaces"]["len"].is_number());
-        assert!(value["r6"]["manifest_selection_ordinals"]["len"].is_number());
-        assert!(value["r6"]["selections"]["len"].is_number());
-        assert!(value["r6"]["standard_exports"]["len"].is_number());
+        assert!(value["r4_model_sessions"][0].is_number());
+        assert!(value["r4_domains"][0].is_number());
+        assert!(value["r4_instances"][0].is_number());
+        assert!(value["r4_deferred_pending"][0].is_number());
+        assert!(value["r4_deferred_detached"][0].is_number());
+        assert!(value["r4_deferred_releases"][0].is_number());
+        assert!(value["r4_recently_pruned"][0].is_number());
+        assert!(value["r4_gaps"][0].is_number());
+        assert!(value["r6"]["selection_inventory"][0].is_number());
+        assert!(value["r6"]["selection_surfaces"][0].is_number());
+        assert!(value["r6"]["manifest_selection_ordinals"][0].is_number());
+        assert!(value["r6"]["selections"][0].is_number());
+        assert!(value["r6"]["standard_exports"][0].is_number());
         assert!(value["floor_discovery_baseline_kb"].is_number());
         assert!(value["r5_seal_value_bytes"].is_null());
         assert!(value["r7_param_combos"].is_null());
@@ -23658,8 +24004,9 @@ exit 0
     }
 
     /// A rendered, proven-exited caller row retires into counted
-    /// aggregates; a row not yet rendered keeps its facts, and a live
-    /// row is never retired.
+    /// aggregates; a row not yet rendered keeps its facts, a live row
+    /// is never retired, and an exec-retired row backing an edge folds
+    /// that edge into the departed aggregate exactly.
     #[test]
     fn rendered_exited_caller_rows_retire_into_counted_aggregates() {
         let (mut native, live) = NativeScene::new();
@@ -23688,7 +24035,11 @@ exit 0
                 .is_some_and(|record| record.retired)
         );
         assert_eq!(
-            native.scene.coordinator.retire_rendered_callers(300),
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
             0,
             "an unrendered row keeps its facts"
         );
@@ -23712,7 +24063,11 @@ exit 0
             .coordinator
             .note_rendered_callers(&[exited, live, fresh]);
         assert_eq!(
-            native.scene.coordinator.retire_rendered_callers(400),
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
             1,
             "only the proven-exited rendered row retires"
         );
@@ -23733,20 +24088,68 @@ exit 0
             1,
             "the retirement is counted, never silent"
         );
-        // A rendered caller that still backs an edge keeps its facts:
-        // the edge row resolves it in every later presentation.
+        // An exec-retired caller that still backs an edge retires by
+        // folding: the edge row's facts move into the per-module
+        // departed aggregate exactly (controller ruling: exited
+        // callers with attributed calls must not hold a retained
+        // slot forever).
+        let live_edges: Vec<_> = native
+            .scene
+            .coordinator
+            .registry
+            .edges_of(live)
+            .map(|edge| (edge.module, edge.entry_count))
+            .collect();
+        assert!(
+            !live_edges.is_empty(),
+            "the scene stages an edge for the live caller"
+        );
+        let before = native.scene.coordinator.registry.departed_totals();
+        assert_eq!(
+            before.edges, 0,
+            "the edgeless first retirement folded no edge"
+        );
         native
             .scene
             .coordinator
             .adapter
             .exec_transition_scoped(live, 500);
         native.scene.coordinator.note_rendered_callers(&[live]);
+        let receipt = native.scene.coordinator.retire_rendered_callers(600, None);
         assert_eq!(
-            native.scene.coordinator.retire_rendered_callers(600),
-            0,
-            "a caller backing a rendered edge is not retired"
+            receipt.retired, 1,
+            "an exec-retired caller backing a rendered edge folds"
         );
-        assert!(native.scene.coordinator.adapter.record(live).is_some());
+        assert!(
+            native.scene.coordinator.adapter.record(live).is_none(),
+            "the folded row leaves the adapter"
+        );
+        assert_eq!(
+            receipt.folded_edges.len() as u64,
+            live_edges.len() as u64,
+            "every backed edge folds"
+        );
+        let after = native.scene.coordinator.registry.departed_totals();
+        assert_eq!(
+            after.edges - before.edges,
+            live_edges.len() as u64,
+            "the folded edges land in the departed aggregate"
+        );
+        assert_eq!(
+            after.entries - before.entries,
+            live_edges.iter().map(|(_, entries)| entries).sum::<u64>(),
+            "the folded entries land in the departed aggregate"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry.edges_of(live).count(),
+            0,
+            "no edge row survives its caller's fold"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_caller_rows_for_test(),
+            2,
+            "both retirements are counted, never silent"
+        );
     }
 
     /// Twin: an exec newcomer the next pass enumerates and admits is
@@ -33983,7 +34386,18 @@ int main(void) {
             .coordinator
             .prune_departed_native_state(at + 1 + EXEC_STATE_GRACE_NS);
         assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 1);
-        native.read(Vec::new());
+        // The sweep must begin after the prune (its health read dates
+        // it): only tombstones pruned before the sweep began expire.
+        let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, Vec::new()) else {
+            unreachable!()
+        };
+        batch.sweep_completed = true;
+        batch.sweep_gaps = false;
+        batch.health_read_ns = at + 1 + EXEC_STATE_GRACE_NS + 1_000;
+        batch.rows_anchor_ns = batch.health_read_ns;
+        batch.rows_read_ns = batch.health_read_ns;
+        batch.counts_read_ns = batch.health_read_ns;
+        native.stage(NativeBatch::Witness(batch));
         assert_eq!(
             native.scene.coordinator.exec_pruned_for_test(),
             0,
@@ -34043,6 +34457,12 @@ int main(void) {
     fn sweep_expires_only_tombstones_pruned_before_it_began() {
         let (mut native, _) = NativeScene::new();
         native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        // Production always begins coverage at startup; the sweep's
+        // beginning latches there.
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         let at = native.stamps.tick();
         native.execs(vec![exec_record(41, 9, at, 8, 99)]);
         native.scene.coordinator.prune_departed_native_state(at + 1);
@@ -34058,6 +34478,9 @@ int main(void) {
         };
         first.sweep_completed = false;
         first.health_read_ns = pruned_old + 1_000;
+        first.rows_anchor_ns = first.health_read_ns;
+        first.rows_read_ns = first.health_read_ns;
+        first.counts_read_ns = first.health_read_ns;
         native.stage(NativeBatch::Witness(first));
         // ... and the young prune lands after the sweep began.
         native.execs(vec![exec_record(42, 10, pruned_old + 2_000, 8, 100)]);
@@ -34085,23 +34508,22 @@ int main(void) {
         native.witness(vec![native.row(42, 1, 10, 220, 0)]);
         let exes = scene_unbound_exe(&native);
         assert_eq!(exes.len(), 2);
-        let old = exes
-            .iter()
-            .find(|exe| (exe.dev, exe.ino) == (8, 99))
-            .expect("the old image reads back");
+        // The young tombstone still names its record lost; the expired
+        // image has no record at all. (A lost record names no
+        // identity: the prune discarded it with the stash.)
         assert_eq!(
-            old.resolution,
-            ExeResolution::NoExecRecord,
-            "the expired image has no record at all"
-        );
-        let young = exes
-            .iter()
-            .find(|exe| (exe.dev, exe.ino) == (8, 100))
-            .expect("the young image reads back");
-        assert_eq!(
-            young.resolution,
-            ExeResolution::ExecRecordLost,
+            exes.iter()
+                .filter(|exe| exe.resolution == ExeResolution::ExecRecordLost)
+                .count(),
+            1,
             "the young tombstone still names its record lost"
+        );
+        assert_eq!(
+            exes.iter()
+                .filter(|exe| exe.resolution == ExeResolution::NoExecRecord)
+                .count(),
+            1,
+            "the expired image has no record at all"
         );
     }
 
@@ -34111,7 +34533,7 @@ int main(void) {
     fn finishing_a_domain_drops_its_departed_tombstones() {
         let (mut native, _caller) = NativeScene::new();
         let cookie = DomainCookie::scripted(native.domain, 41);
-        native.scene.coordinator.exec_pruned.insert(cookie);
+        native.scene.coordinator.exec_pruned.insert(cookie, 1_000);
         native
             .scene
             .coordinator

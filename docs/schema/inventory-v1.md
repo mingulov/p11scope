@@ -235,11 +235,17 @@ and never proves an app identity. See the app identity rows of
   keeps its row until a published presentation has rendered it; the
   coordinator then folds the row into the exact
   `budgets.callers.retired` aggregate (additive within v1) and removes
-  it; the retired ID stays refused as a bounded ID range
-  (`budgets.callers.late_refused` counts late evidence), so a late
-  mapping never invents a caller with no row. A row that still backs an
-  edge, a gap, an instance or pending native work keeps its facts until
-  that consumer releases it. `image.authority` is `native_exact`
+  it; rows that carried attributed calls fold their edges and instances
+  into the per-module `departed_use` aggregate first (additive within
+  v1, v0.8.0; counted in `budgets.callers.retired_with_calls`), so a
+  busy host never fills the caller budget with churn. The retired ID
+  stays refused as a bounded ID range (`budgets.callers.late_refused`
+  counts late evidence), so a late mapping never invents a caller with
+  no row, and gaps keep naming the folded caller by label, while live
+  pair targets drop into the Dropped machinery with their staged
+  absolute. A row still referenced by pending work, an owner, a
+  handoff, a pending binder row or the capture target keeps its facts
+  until that consumer releases it. `image.authority` is `native_exact`
   (BPF task-cookie/exec-ID identity) or `scan_pinned` (pidfd/start-time
   pin with exe-identity exec detection); `exec_observed` is false when
   the exe identity was unreadable and exec changes were undetectable.
@@ -426,6 +432,41 @@ and never proves an app identity. See the app identity rows of
   Witness gaps never carry a `pid`; the sole published tgid of an
   unbound row is its image's historical `pid_host` in `pids` above —
   the incarnation behind it is still what could not be identified.
+  `departed_use` (additive within v1, v0.8.0) is `null`, or this
+  module's exact aggregate of folded departed callers: proven-exited
+  caller rows whose edges and instances left the snapshot after a
+  presentation rendered them. One caller's edges at several modules
+  fold into each, so per-module caller counts may name one caller
+  twice; `budgets.callers` counts each caller once. `first_ns` is the
+  earliest fold instant, `callers`/`edges` the folded rows,
+  `entries` the exact sums (`count`, `saturated` and `in_flight`
+  rows, `first_min_ns`/`last_max_ns` bounds, `logical`/`forwarding`
+  split as classified at the fold, per-observation counts and the
+  coverage distribution with its instant bounds), `mapping` the
+  state/evidence distributions with interruptions, instant bounds and
+  the bounded distinct-reason set (`reasons_overflow` past 32),
+  `semantics.labels` the per-label counts, `mechanisms` one row per
+  folded mechanism id in the edge-row shape (calls/errors summed,
+  operation categories unioned, recency maxed, function/return
+  provenance unioned under the live per-edge bounds with `truncated`
+  ORed; `null` while no folded row held one), `mechanisms_overflow`
+  the rows past the 256-per-module / 4096 run-wide bounds (their
+  calls and errors still folded), `operations` the edge keys summed
+  with the settlement accounted (`settled_machines/pending/detached/
+  open` end here; `settled_active` keeps the machines'
+  category/state distribution under a 64-row bound with its
+  overflow; `null` while no folded row held claims),
+  `instances` the folded load lifetimes (state distribution,
+  `settled_live` rows torn down at the fold, reason distribution,
+  instant bounds, API-return sums, lossy rows and loss reasons),
+  and `identities` the folded callers' named rows
+  (`caller`/`pid`/`start_time`/`incarnation`/`exe`/`authority`/
+  `lifecycle`/`lifecycle_reason`/instants/`exec_observed`/
+  `metadata_status`) up to the 4096-per-module / 16384 run-wide
+  bounds (`identities_saturated`, `identities_dropped` past them).
+  Launcher chains, app hints and metadata snapshots do not survive
+  the fold (only the metadata status); coverage unknown-reason
+  details stay in their gaps.
   `initialize` (additive within v1) is the per-module `C_Initialize`
   roll-up `{calls, ok, already_initialized, last_error_rv, status,
   detail}` over observed init returns since the semantic lane sealed,
@@ -949,9 +990,13 @@ and never proves an app identity. See the app identity rows of
 - `budgets`: every budgeted resource with its own limit, occupancy
   source, and loss counter — `callers` (additive within v1:
   `retired` counts proven-ended caller rows removed after rendering;
-  `occupied` is the retained census, so `occupied + retired` is every
-  caller incarnation the capture ever admitted), `modules` (physical module
-  instances), `edges` (caller relationships), `endpoints` (the
+  `retired_with_calls` (v0.8.0) counts those that folded attributed
+  calls; `occupied` is the retained census, so `occupied + retired`
+  is every caller incarnation the capture ever admitted), `modules`
+  (physical module instances), `edges` (caller relationships;
+  additive within v1, v0.8.0: `folded`/`folded_entries` count the
+  edge rows and entries folded into the departed aggregate),
+  `endpoints` (the
   retained attach-endpoint census: the sum of admitted per-module
   endpoint counts), `inventory_endpoints` (additive within v1:
   `{limit, occupied}` — the run's Inventory attach set, whose
@@ -1063,10 +1108,22 @@ Additive budgets are:
 
 - `callers.retired`: proven-ended caller-incarnation rows retired into the
   counted aggregate after a presentation rendered them (see `callers[]`).
+- `callers.retired_with_calls` (v0.8.0): of those, rows that folded
+  attributed calls into `modules[].departed_use`, counted once per
+  caller. The remainder exited without attributed calls.
 - `callers.late_refused`: late mapping notes refused for a retired caller
   incarnation. Counted, never merged into a fresh `callers[]` row; the
   refusal is retained as bounded caller-ID ranges, so a long capture still
   refuses every retired ID exactly without one entry per retired caller.
+- `edges.folded`, `edges.folded_entries` (v0.8.0): edge rows folded
+  into the departed aggregate and their summed entry counts. A
+  streamed edge missing from the final snapshot is folded, never
+  lost, exactly when these count it.
+- `instances.folded` (v0.8.0): instance rows folded into the
+  departed aggregate.
+- `departed_use` (v0.8.0): `{mech_overflow, identities_dropped}` —
+  run-wide departed-fold overflow totals (the per-module rows carry
+  the detail).
 - `native_departed`: `{pair_dropped_rows, pair_dropped_base,
   pair_prune_overflow, exec_prune_overflow}` — departed native retention
   accounting. `pair_dropped_rows`/`pair_dropped_base` are the exact
@@ -1474,7 +1531,9 @@ entry observed at both layers counts once, on its provider edge.
 `modules[].admission.class` names the forwarding layers (`closure_array`);
 consumers that sum entry counts must skip those modules' edges to count
 logical entries once, except for callers with no entries at any non-closure
-module, whose edges never split out. Layer-self-answered entries appear
+module, whose edges never split out. Folded edges keep the class the
+fold classified from their frozen exited state, so both totals stay
+exact across the fold. Layer-self-answered entries appear
 only in the forwarding split, and one layer entry reaching several providers
 counts at each.
 

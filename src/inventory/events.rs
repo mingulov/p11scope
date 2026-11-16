@@ -1462,6 +1462,27 @@ impl EdgeEmitter {
         self.carried_bytes
     }
 
+    /// Whether this edge has a written record: digests insert on
+    /// write, so membership proves the stream carried it at least
+    /// once. The departed fold only folds streamed edges, so a
+    /// folded edge is never stream-silent.
+    pub(crate) fn has_record(&self, caller: CallerId, module: ModuleId) -> bool {
+        self.digests.contains_key(&(caller, module))
+    }
+
+    /// Drop a folded edge's digest and queued keys: its rows left the
+    /// snapshot, so no later emission may reference it and its bytes
+    /// leave the retention bound. Queued keys drop silently (their
+    /// emission would have skipped the missing row anyway).
+    pub(crate) fn forget(&mut self, caller: CallerId, module: ModuleId) {
+        if let Some(digest) = self.digests.remove(&(caller, module)) {
+            self.carried_bytes = self.carried_bytes.saturating_sub(digest.bytes);
+        }
+        if self.queued.remove(&(caller, module)) {
+            self.queue.retain(|key| *key != (caller, module));
+        }
+    }
+
     /// The largest edge record line written so far.
     pub(crate) fn largest_line(&self) -> u64 {
         self.largest_line
@@ -1841,6 +1862,25 @@ impl InstanceEmitter {
     /// Tracked instances (the combined retention dump's slack bound).
     pub(crate) fn tracked_len(&self) -> usize {
         self.digests.len()
+    }
+
+    /// Drop a folded instance's digest and queued keys: its rows left
+    /// the snapshot, so no later emission may reference it and its
+    /// bytes leave the retention bound.
+    pub(crate) fn forget(&mut self, id: RegistryInstanceId) {
+        if let Some(digest) = self.digests.remove(&id) {
+            let bytes = digest
+                .instance
+                .as_ref()
+                .map_or(0, |row| row.bytes)
+                .saturating_add(digest.edge.as_ref().map_or(0, |row| row.bytes));
+            self.carried_bytes = self.carried_bytes.saturating_sub(bytes);
+        }
+        for kind in [InstanceKind::Instance, InstanceKind::Edge] {
+            if self.queued.remove(&(id, kind)) {
+                self.queue.retain(|key| *key != (id, kind));
+            }
+        }
     }
 
     fn digest(&self, payload: &serde_json::Value) -> (u64, u64) {

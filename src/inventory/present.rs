@@ -285,6 +285,10 @@ pub(crate) struct ModuleView {
     pub unloaded_observed: bool,
     /// Natively witnessed use no caller edge carries (Task 6 C4).
     pub unbound_use: Option<crate::discovery::caller_registry::UnboundUse>,
+    /// Exact aggregate of this module's folded departed callers (their
+    /// edges and instances left the snapshot; every count, breakdown
+    /// and named identity survives here).
+    pub departed_use: Option<crate::discovery::caller_registry::DepartedUse>,
     /// Observed `C_Initialize` returns since the semantic lane
     /// sealed, with the judged verdict.
     pub init: ModuleInitView,
@@ -479,6 +483,10 @@ pub(crate) struct BudgetView {
     /// Proven-exited caller rows retired after they were rendered into
     /// the counted aggregate (their `callers[]` row no longer appears).
     pub callers_retired: u64,
+    /// Of those, rows that folded attributed calls (edges with entries
+    /// or claims), counted once per caller. The remainder exited
+    /// without attributed calls.
+    pub callers_retired_with_calls: u64,
     /// Late mapping notes refused for a retired caller incarnation
     /// (counted; they never invent a fresh caller row).
     pub callers_late_refused: u64,
@@ -488,6 +496,16 @@ pub(crate) struct BudgetView {
     pub edges_limit: usize,
     pub edges_occupied: usize,
     pub edges_refused: u64,
+    /// Edge rows folded into the departed aggregate with their entries
+    /// (each counted once, when it leaves the map).
+    pub edges_folded: u64,
+    pub edges_folded_entries: u64,
+    /// Folded mechanisms past the per-module and run-wide row bounds
+    /// (calls and errors still folded; only named rows lost).
+    pub departed_mech_overflow: u64,
+    /// Folded caller identities past the per-module and run-wide sets
+    /// (counted; the calls still folded).
+    pub departed_identities_dropped: u64,
     pub endpoints_limit: usize,
     pub endpoints_occupied: usize,
     pub endpoints_refused: u64,
@@ -509,9 +527,15 @@ pub(crate) struct BudgetView {
     pub semantic_occupied: usize,
     pub semantic_unknown_edges: usize,
     pub semantic_refused: u64,
+    /// Some folded edge or instance held semantic claims: the feed ran
+    /// even when no live edge holds state anymore.
+    pub semantic_folded_claims: bool,
     pub instances_limit: usize,
     pub instances_occupied: usize,
     pub instances_refused: u64,
+    /// Instance rows folded into the departed aggregate (each counted
+    /// once, when it leaves the map).
+    pub instances_folded: u64,
     pub instance_semantic_occupied: usize,
     pub instance_semantic_unknown_edges: usize,
     pub instance_semantic_refused: u64,
@@ -839,6 +863,7 @@ impl Presentation {
                 lifecycle: record.lifecycle,
                 unloaded_observed: record.unloaded_observed,
                 unbound_use: record.unbound_use.clone(),
+                departed_use: record.departed_use.clone(),
                 init: ModuleInitView::capture(registry, *id),
                 operator_forwarding: false,
             });
@@ -981,6 +1006,7 @@ impl Presentation {
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
         let dropped_pairs = coordinator.pruned_pair_totals();
+        let departed = registry.departed_totals();
         let render_index = PresentationRenderIndex::build(&instances, &semantic_edges);
         let (excluded_modules, unmatched_excludes) = coordinator.excluded_snapshot();
         let module_keys: Vec<(ModuleId, String, (u64, u64), u64)> = modules
@@ -1052,6 +1078,7 @@ impl Presentation {
                     .admit_refused()
                     .saturating_add(registry.callers_refused()),
                 callers_retired: coordinator.retired_callers(),
+                callers_retired_with_calls: coordinator.retired_with_calls(),
                 callers_late_refused: registry.retired_mapping_refusals(),
                 modules_limit: limits.max_modules,
                 modules_occupied: registry.module_count(),
@@ -1059,6 +1086,10 @@ impl Presentation {
                 edges_limit: limits.max_edges,
                 edges_occupied: registry.edge_count(),
                 edges_refused: registry.edges_refused(),
+                edges_folded: departed.edges,
+                edges_folded_entries: departed.entries,
+                departed_mech_overflow: departed.mech_overflow,
+                departed_identities_dropped: departed.identities_dropped,
                 endpoints_limit: limits.max_endpoints,
                 endpoints_occupied: registry.endpoints_total(),
                 endpoints_refused: registry.endpoints_refused(),
@@ -1080,9 +1111,11 @@ impl Presentation {
                 semantic_occupied: registry.semantic_occupied(),
                 semantic_unknown_edges: registry.semantic_unknown_edges(),
                 semantic_refused: registry.semantic_refused(),
+                semantic_folded_claims: departed.has_claims,
                 instances_limit: registry.instance_limit(),
                 instances_occupied: registry.instances().count(),
                 instances_refused: registry.instance_refused(),
+                instances_folded: departed.instances_folded,
                 instance_semantic_occupied: registry.instance_semantic_occupied(),
                 instance_semantic_unknown_edges: registry.instance_semantic_unknown_edges(),
                 instance_semantic_refused: registry.instance_semantic_refused(),
@@ -1129,6 +1162,26 @@ impl Presentation {
 const SEMANTIC_WITHHELD_WITH_CLAIMED_CHILDREN: &str =
     "unknown (per-edge summary withheld; see semantic children)";
 
+/// One edge's semantic label: the reducer's own label when state is
+/// materialized, else the withheld rendering (naming claimed instance
+/// children when the edge has any). Shared by the view builder and
+/// the departed fold so folded labels read exactly like live rows.
+pub(crate) fn edge_semantic_label(
+    state: Option<&EdgeSemantics>,
+    claimed_children: bool,
+) -> &'static str {
+    match state {
+        None => {
+            if claimed_children {
+                SEMANTIC_WITHHELD_WITH_CLAIMED_CHILDREN
+            } else {
+                SEMANTIC_UNKNOWN
+            }
+        }
+        Some(state) => state.label(),
+    }
+}
+
 /// Project one edge's semantic state into its owned view: the label
 /// always, the mechanism rows and operation aggregates iff the edge
 /// holds claims. Withheld edges keep the exact U0 unknown rendering,
@@ -1136,16 +1189,12 @@ const SEMANTIC_WITHHELD_WITH_CLAIMED_CHILDREN: &str =
 fn semantics_view(state: Option<&EdgeSemantics>, claimed_children: bool) -> EdgeSemanticsView {
     let Some(state) = state else {
         return EdgeSemanticsView {
-            label: if claimed_children {
-                SEMANTIC_WITHHELD_WITH_CLAIMED_CHILDREN
-            } else {
-                SEMANTIC_UNKNOWN
-            },
+            label: edge_semantic_label(None, claimed_children),
             mechanisms: Vec::new(),
             operations: None,
         };
     };
-    let label = state.label();
+    let label = edge_semantic_label(Some(state), claimed_children);
     if !state.has_claims() {
         return EdgeSemanticsView {
             label,
@@ -1367,10 +1416,11 @@ pub(crate) fn admission_history_label_at(history: &[AdmissionChange], now_ns: u6
 }
 
 /// Semantic budget status: `withheld` while no edge holds semantic
-/// state, `observed` once any does. ONE computation shared by the JSON
-/// document, pager snapshots, and dashboard headers.
+/// state and none ever folded claims, `observed` once any does. ONE
+/// computation shared by the JSON document, pager snapshots, and
+/// dashboard headers.
 pub(crate) fn semantic_status(budgets: &BudgetView) -> &'static str {
-    if budgets.semantic_occupied > 0 {
+    if budgets.semantic_occupied > 0 || budgets.semantic_folded_claims {
         "observed"
     } else {
         "withheld"
@@ -2239,6 +2289,22 @@ fn refused_backend_callers(
 /// True when an edge's entries are forwarding-layer observations: the
 /// edge sits at a closure-array module, its caller also entered a watched
 /// provider (whose edge is the logical count), and the caller has no
+/// refused backend (which keeps the layer logical). Shared by the layer
+/// totals and the departed fold so a folded edge keeps the class the
+/// live row showed; the fold classifies from the frozen exited state.
+pub(crate) fn edge_layer_is_forwarding(
+    module: ModuleId,
+    caller: CallerId,
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    active: &std::collections::BTreeSet<CallerId>,
+    refused: &std::collections::BTreeSet<CallerId>,
+) -> bool {
+    forwarding.contains(&module) && active.contains(&caller) && !refused.contains(&caller)
+}
+
+/// True when an edge's entries are forwarding-layer observations: the
+/// edge sits at a closure-array module, its caller also entered a watched
+/// provider (whose edge is the logical count), and the caller has no
 /// refused backend (which keeps the layer logical).
 fn edge_is_forwarding(
     edge: &EdgeView,
@@ -2246,9 +2312,7 @@ fn edge_is_forwarding(
     active: &std::collections::BTreeSet<CallerId>,
     refused: &std::collections::BTreeSet<CallerId>,
 ) -> bool {
-    forwarding.contains(&edge.module)
-        && active.contains(&edge.caller)
-        && !refused.contains(&edge.caller)
+    edge_layer_is_forwarding(edge.module, edge.caller, forwarding, active, refused)
 }
 
 /// Forwarding-layer (closure-array admission) modules with entries on
@@ -2274,7 +2338,13 @@ pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(Strin
                         && edge_is_forwarding(edge, &forwarding, &active, &refused)
                 })
                 .map(|edge| edge.entry_count)
-                .fold(0u64, u64::saturating_add);
+                .fold(0u64, u64::saturating_add)
+                .saturating_add(
+                    module
+                        .departed_use
+                        .as_ref()
+                        .map_or(0, |departed| departed.forwarding_entries),
+                );
             let path = module
                 .paths
                 .first()
@@ -2372,6 +2442,14 @@ pub(crate) fn layer_entry_totals(presentation: &Presentation) -> (u64, u64) {
             forwarding_entries = forwarding_entries.saturating_add(edge.entry_count);
         } else {
             logical = logical.saturating_add(edge.entry_count);
+        }
+    }
+    // Folded edges keep the class the fold classified from their frozen
+    // exited state, so the totals stay exact across the fold.
+    for module in &presentation.modules {
+        if let Some(departed) = module.departed_use.as_ref() {
+            logical = logical.saturating_add(departed.logical_entries);
+            forwarding_entries = forwarding_entries.saturating_add(departed.forwarding_entries);
         }
     }
     (logical, forwarding_entries)
@@ -3977,9 +4055,21 @@ fn render_snapshot_inner(
     );
     // Proven-exited rows retired after they were rendered no longer
     // appear in callers[]; name them so the headline is not read as the
-    // capture's lifetime caller count.
-    if budgets.callers_retired > 0 {
-        let _ = writeln!(out, "{} exited without calls", budgets.callers_retired);
+    // capture's lifetime caller count. Rows that carried attributed
+    // calls folded into the departed aggregate with their counts; the
+    // rest exited without attributed calls.
+    let without_calls = budgets
+        .callers_retired
+        .saturating_sub(budgets.callers_retired_with_calls);
+    if without_calls > 0 {
+        let _ = writeln!(out, "{without_calls} exited without attributed calls");
+    }
+    if budgets.callers_retired_with_calls > 0 {
+        let _ = writeln!(
+            out,
+            "{} departed callers folded with {} calls",
+            budgets.callers_retired_with_calls, budgets.edges_folded_entries,
+        );
     }
     // One coverage format everywhere (profile, inspect, inventory):
     // `coverage: complete`, or `coverage: partial` with the nonzero
@@ -4520,11 +4610,12 @@ fn render_snapshot_inner(
     );
     let _ = writeln!(
         out,
-        "budgets: callers {}/{} refused {} retired {} late {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {} | native_departed pair_rows {} pair_base {} pair_overflow {} exec_overflow {} | {}",
+        "budgets: callers {}/{} refused {} retired {} with_calls {} late {} | modules {}/{} refused {} | edges {}/{} refused {} folded {} entries {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {} | native_departed pair_rows {} pair_base {} pair_overflow {} exec_overflow {} | departed_use mech_overflow {} identities_dropped {} | {}",
         budgets.callers_occupied,
         budgets.callers_limit,
         budgets.callers_refused,
         budgets.callers_retired,
+        budgets.callers_retired_with_calls,
         budgets.callers_late_refused,
         budgets.modules_occupied,
         budgets.modules_limit,
@@ -4532,6 +4623,8 @@ fn render_snapshot_inner(
         budgets.edges_occupied,
         budgets.edges_limit,
         budgets.edges_refused,
+        budgets.edges_folded,
+        budgets.edges_folded_entries,
         budgets.endpoints_occupied,
         budgets.endpoints_limit,
         budgets.endpoints_refused,
@@ -4555,6 +4648,8 @@ fn render_snapshot_inner(
         budgets.native_pair_dropped_base,
         budgets.native_pair_prune_overflow,
         budgets.native_exec_prune_overflow,
+        budgets.departed_mech_overflow,
+        budgets.departed_identities_dropped,
         semantic_resource_line(&budgets.instance_semantic_resources),
     );
     if presentation.caller_metadata.summary.enabled {
@@ -4745,6 +4840,35 @@ fn render_snapshot_inner(
                     }
                 }
             }
+        }
+        // A module with folded departed callers names the aggregate
+        // in plain words: every folded edge and entry counts once.
+        // Identities past the bound stay counted, never named; JSON
+        // keeps the full record either way.
+        if let Some(departed) = &module.departed_use {
+            let mut tail = String::new();
+            if departed.identities_dropped > 0 {
+                tail.push_str(&format!(
+                    " (+{} identities past the bound)",
+                    departed.identities_dropped
+                ));
+            }
+            if departed.mechs_overflow > 0 {
+                tail.push_str(&format!(
+                    " (+{} mechanisms past the row bound)",
+                    departed.mechs_overflow
+                ));
+            }
+            let _ = writeln!(
+                out,
+                "  departed use: {} caller{} folded with {} entr{} ({} edge{}){tail}",
+                departed.callers,
+                if departed.callers == 1 { "" } else { "s" },
+                departed.entries,
+                if departed.entries == 1 { "y" } else { "ies" },
+                departed.edges,
+                if departed.edges == 1 { "" } else { "s" },
+            );
         }
         // A module with observed `C_Initialize` evidence names its
         // init verdict on its own detail line. Quiet modules print

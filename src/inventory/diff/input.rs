@@ -235,6 +235,114 @@ pub(super) struct UnboundExe {
     pub calls_at_least: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DepartedEntries {
+    pub count: u64,
+    pub saturated: u64,
+    pub in_flight: u64,
+    pub logical: u64,
+    pub forwarding: u64,
+    pub observation: BTreeMap<String, u64>,
+    pub counted: u64,
+    pub witnessed: u64,
+    pub watched_no_use: u64,
+    pub lossy: u64,
+    pub pid_exit: u64,
+    pub unknown: BTreeMap<String, u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DepartedMapping {
+    pub mapped: u64,
+    pub ended: u64,
+    pub uncertain: u64,
+    pub deep_scan: u64,
+    pub maps_match: u64,
+    pub interruptions: u64,
+    pub reasons: BTreeMap<String, u64>,
+    pub reasons_overflow: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DepartedMech {
+    pub mechanism: u64,
+    pub name: Option<String>,
+    pub operations: Vec<String>,
+    pub calls: u64,
+    pub errors: u64,
+    pub functions: Vec<String>,
+    pub returns: Vec<u64>,
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DepartedOperations {
+    pub calls: u64,
+    pub started: u64,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub failed: u64,
+    pub unknown: u64,
+    pub orphans: u64,
+    pub dropped: u64,
+    pub evidence: BTreeMap<String, u64>,
+    pub settled_machines: u64,
+    pub settled_pending: u64,
+    pub settled_detached: u64,
+    pub settled_open: u64,
+    pub settled_active: Vec<DepartedSettled>,
+    pub settled_active_overflow: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DepartedSettled {
+    pub category: String,
+    pub state: String,
+    pub count: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DepartedInstances {
+    pub folded: u64,
+    pub observed: u64,
+    pub uncertain: u64,
+    pub retired: u64,
+    pub settled_live: u64,
+    pub reasons: BTreeMap<String, u64>,
+    pub null_reasons: u64,
+    pub api_returns: u64,
+    pub api_returns_saturated_rows: u64,
+    pub historical_only_returns: u64,
+    pub lossy_rows: u64,
+    pub loss_reasons: BTreeMap<String, u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DepartedIdentity {
+    pub caller: String,
+    pub pid: u32,
+    pub start_time: Option<u64>,
+    pub incarnation: u64,
+    pub exe_dev: Option<u64>,
+    pub exe_ino: Option<u64>,
+    pub exe_path: Option<String>,
+    pub authority: String,
+    pub lifecycle: String,
+    pub lifecycle_reason: Option<String>,
+    pub exec_observed: bool,
+    pub metadata_status: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DepartedUse {
+    pub callers: u64,
+    pub edges: u64,
+    pub entries: DepartedEntries,
+    pub mapping: DepartedMapping,
+    pub semantic_labels: BTreeMap<String, u64>,
+    pub mechanisms: Vec<DepartedMech>,
+    pub mechs_overflow: u64,
+    pub mechs_overflow_calls: u64,
+    pub mechs_overflow_errors: u64,
+    pub operations: Option<DepartedOperations>,
+    pub instances: DepartedInstances,
+    pub identities: Vec<DepartedIdentity>,
+    pub identities_saturated: bool,
+    pub identities_dropped: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Module {
     pub paths: Vec<String>,
     pub device_major: u32,
@@ -247,6 +355,7 @@ pub(super) struct Module {
     pub lifecycle: Label,
     pub unloaded_observed: bool,
     pub unbound_use: Option<UnboundUse>,
+    pub departed_use: Option<DepartedUse>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Mapping {
@@ -716,12 +825,15 @@ impl<'a> Object<'a> {
     }
     fn u64_map(&self, key: &str) -> Result<BTreeMap<String, u64>> {
         let o = self.object(key)?;
-        o.fields
+        o.u64_map_fields()
+    }
+    fn u64_map_fields(&self) -> Result<BTreeMap<String, u64>> {
+        self.fields
             .iter()
             .map(|(k, v)| {
                 v.as_u64()
                     .map(|n| (k.clone(), n))
-                    .with_context(|| format!("{}: expected u64 values", o.path))
+                    .with_context(|| format!("{}: expected u64 values", self.path))
             })
             .collect()
     }
@@ -1063,7 +1175,173 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
         lifecycle: o.label("lifecycle", &["mapped", "unloaded", "unknown"])?,
         unloaded_observed: o.boolean("unloaded_observed")?,
         unbound_use,
+        departed_use: parse_departed_use(o)?,
     })
+}
+
+/// The per-module departed aggregate (additive within v1): absent or
+/// null in captures without a fold. Instants are not compared (times
+/// are not identity); every count, distribution, breakdown row and
+/// named identity is.
+fn parse_departed_use(o: &Object<'_>) -> Result<Option<DepartedUse>> {
+    let Some(d) = o.optional_object("departed_use", true)? else {
+        return Ok(None);
+    };
+    let entries = d.object("entries")?;
+    let coverage = entries.object("coverage")?;
+    let mapping = d.object("mapping")?;
+    let mapping_state = mapping.object("state")?;
+    let mapping_evidence = mapping.object("evidence")?;
+    let semantics = d.object("semantics")?;
+    let mechanisms = match d.fields.get("mechanisms") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(_) => d
+            .array("mechanisms")?
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let m = Object::new(v, format!("{}.mechanisms[{i}]", d.path))?;
+                let evidence = m.object("evidence")?;
+                Ok::<_, anyhow::Error>(DepartedMech {
+                    mechanism: m.uint("mechanism")?,
+                    name: m.text_null("name")?,
+                    operations: m.strings("operations")?,
+                    calls: m.uint("calls")?,
+                    errors: m.uint("errors")?,
+                    functions: evidence.strings("functions")?,
+                    returns: evidence
+                        .array("returns")?
+                        .iter()
+                        .enumerate()
+                        .map(|(j, rv)| {
+                            Object::new(rv, format!("{}.returns[{j}]", d.path))?.uint("rv")
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    truncated: evidence.boolean("truncated")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+    let overflow = d.object("mechanisms_overflow")?;
+    let operations = d
+        .optional_object("operations", true)?
+        .map(|o| {
+            let evidence = o.object("evidence")?;
+            let mut settled_active = o
+                .array("settled_active")?
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let s = Object::new(v, format!("{}.settled_active[{i}]", d.path))?;
+                    Ok::<_, anyhow::Error>(DepartedSettled {
+                        category: s.text("category")?,
+                        state: s.text("state")?,
+                        count: s.uint("count")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            settled_active.sort_by(|a, b| (&a.category, &a.state).cmp(&(&b.category, &b.state)));
+            Ok::<_, anyhow::Error>(DepartedOperations {
+                calls: o.uint("calls")?,
+                started: o.uint("started")?,
+                completed: o.uint("completed")?,
+                cancelled: o.uint("cancelled")?,
+                failed: o.uint("failed")?,
+                unknown: o.uint("unknown")?,
+                orphans: o.uint("orphans")?,
+                dropped: o.uint("dropped")?,
+                evidence: evidence.u64_map_fields()?,
+                settled_machines: o.uint("settled_machines")?,
+                settled_pending: o.uint("settled_pending")?,
+                settled_detached: o.uint("settled_detached")?,
+                settled_open: o.uint("settled_open")?,
+                settled_active,
+                settled_active_overflow: o.uint("settled_active_overflow")?,
+            })
+        })
+        .transpose()?;
+    let instances = d.object("instances")?;
+    let identities = d
+        .array("identities")?
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let p = Object::new(v, format!("{}.identities[{i}]", d.path))?;
+            let (exe_dev, exe_ino, exe_path) = match p.optional_object("exe", true)? {
+                None => (None, None, None),
+                Some(exe) => (
+                    Some(exe.uint("dev")?),
+                    Some(exe.uint("ino")?),
+                    exe.text_null("path")?,
+                ),
+            };
+            Ok::<_, anyhow::Error>(DepartedIdentity {
+                caller: p.text("caller")?,
+                pid: p.uint32("pid")?,
+                start_time: p.uint_null("start_time")?,
+                incarnation: p.uint("incarnation")?,
+                exe_dev,
+                exe_ino,
+                exe_path,
+                authority: p.text("authority")?,
+                lifecycle: p.text("lifecycle")?,
+                lifecycle_reason: p.text_null("lifecycle_reason")?,
+                exec_observed: p.boolean("exec_observed")?,
+                metadata_status: p.text_null("metadata_status")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(DepartedUse {
+        callers: d.uint("callers")?,
+        edges: d.uint("edges")?,
+        entries: DepartedEntries {
+            count: entries.uint("count")?,
+            saturated: entries.uint("saturated")?,
+            in_flight: entries.uint("in_flight")?,
+            logical: entries.uint("logical")?,
+            forwarding: entries.uint("forwarding")?,
+            observation: entries.u64_map("observation")?,
+            counted: coverage.uint("counted")?,
+            witnessed: coverage.uint("witnessed")?,
+            watched_no_use: coverage.uint("watched_no_use")?,
+            lossy: coverage.uint("lossy")?,
+            pid_exit: coverage.uint("pid_exit")?,
+            unknown: coverage.u64_map("unknown")?,
+        },
+        mapping: DepartedMapping {
+            mapped: mapping_state.uint("mapped")?,
+            ended: mapping_state.uint("ended")?,
+            uncertain: mapping_state.uint("uncertain")?,
+            deep_scan: mapping_evidence.uint("deep_scan")?,
+            maps_match: mapping_evidence.uint("maps_match")?,
+            interruptions: mapping.uint("interruptions")?,
+            reasons: mapping.u64_map("reasons")?,
+            reasons_overflow: mapping.uint("reasons_overflow")?,
+        },
+        semantic_labels: semantics.u64_map("labels")?,
+        mechanisms,
+        mechs_overflow: overflow.uint("mechs")?,
+        mechs_overflow_calls: overflow.uint("calls")?,
+        mechs_overflow_errors: overflow.uint("errors")?,
+        operations,
+        instances: DepartedInstances {
+            folded: instances.uint("folded")?,
+            observed: instances.uint("observed")?,
+            uncertain: instances.uint("uncertain")?,
+            retired: instances.uint("retired")?,
+            settled_live: instances.uint("settled_live")?,
+            reasons: instances.u64_map("reasons")?,
+            null_reasons: instances.uint("null_reasons")?,
+            api_returns: instances.uint("api_returns")?,
+            api_returns_saturated_rows: instances.uint("api_returns_saturated_rows")?,
+            historical_only_returns: instances.uint("historical_only_returns")?,
+            lossy_rows: instances.uint("lossy_rows")?,
+            loss_reasons: instances.u64_map("loss_reasons")?,
+        },
+        identities,
+        identities_saturated: d.boolean("identities_saturated")?,
+        identities_dropped: d.uint("identities_dropped")?,
+    }))
 }
 fn parse_edge(o: &Object<'_>, caller: usize, module: usize) -> Result<Edge> {
     let m = o.object("mapping")?;

@@ -23714,6 +23714,82 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
+    /// I-B (tier-3 review of port3 fix1, rv1 m2): after a fallback whole
+    /// refusal, a surviving sole-owner cell reads sole-owned again. The
+    /// provider's 60 cells are shared with a forwarder in the snapshot;
+    /// the extension needs 110 cells with 100 free, so the fallback
+    /// refuses the forwarder whole and strips its ids — and must
+    /// recompute the survivors' owners from their remaining module ids
+    /// instead of copying the shared-cell ambiguity forward.
+    #[test]
+    fn fallback_shed_recomputes_surviving_owners_after_a_whole_refusal() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1952, true);
+        let old = provider_with_tables(53, "/opt/old.so", 1, 60, true);
+        let mut plan = scoped_plan(&[filler, old], AdmissionScope::Named);
+        assert_eq!(plan.slots.len(), 2012, "100 lifetime slots free");
+        let provider = provider_with_tables(60, "/opt/p.so", 1, 60, true);
+        let mut forwarding = provider_with_tables(61, "/opt/f.so", 2, 50, true);
+        let targets: Vec<(&'static str, u32, u64)> = (0..60u64)
+            .map(|index| ("C_Sign", 60, index * 8))
+            .collect();
+        replace_table_targets(&mut forwarding, 1, &targets);
+        // Fresh snapshot: 110 slots fit on their own; only the lifetime
+        // prior makes the 110-addition extension overflow by 10.
+        let rebuilt = scoped_plan(&[provider, forwarding], AdmissionScope::Named);
+        assert_eq!(rebuilt.slots.len(), 110);
+        assert!(
+            rebuilt.slots.iter().filter(|slot| slot.module_ids.len() == 2).count() == 60,
+            "the provider cells are shared with the forwarder"
+        );
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("the surviving provider must admit, not abort: {error}"));
+        let refused = refusal_of(&plan, "/opt/f.so").expect("F is a counted refusal");
+        let kinds: Vec<RefusalKind> = plan
+            .refused_modules_typed()
+            .filter(|(object, _, _)| *object == PinnedObjectId(61))
+            .map(|(_, _, kind)| kind)
+            .collect();
+        assert_eq!(kinds, [RefusalKind::CapacityWhole]);
+        assert_eq!(
+            whole_refusal_needed_count(&refused.reason),
+            Some(110),
+            "the refusal counts the forwarder demand: {}",
+            refused.reason
+        );
+        assert_eq!(
+            slots_of(&plan, 60),
+            60,
+            "the surviving provider keeps its cells"
+        );
+        let module = plan
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(60))
+            .expect("the surviving provider stays admitted")
+            .id;
+        for slot in plan.slots.iter().filter(|slot| slot.object == PinnedObjectId(60)) {
+            assert_eq!(
+                slot.module_ids,
+                [module],
+                "cell {} is sole-owned after the shed",
+                slot.index
+            );
+            assert_eq!(
+                plan.module_of_slot(slot.index),
+                Some(module),
+                "cell {} reads sole-owned, not ambiguous",
+                slot.index
+            );
+        }
+        assert_eq!(
+            plan.module_ambiguous, 0,
+            "no surviving cell latches ambiguity"
+        );
+        assert_eq!(plan.active_slot_count(), 60);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
     /// Extension fallback, refusal quality: the fallback refusal of a
     /// heuristic provider at capacity uses the shared capacity reason —
     /// reserve clause, counter hint, counted demand — and drops the

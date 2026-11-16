@@ -21712,8 +21712,7 @@ pub(crate) mod tests {
     /// are not overflowing fresh cells and must not be counted as freeable.
     #[test]
     fn extend_at_capacity_keeps_in_place_migrations_of_a_dropped_module() {
-        let filler =
-            provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
         let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
         let mut plan = scoped_plan(&[filler, gen1], AdmissionScope::Shared);
         assert_eq!(plan.slots.len(), MAX_SLOTS as usize);

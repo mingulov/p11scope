@@ -18999,9 +18999,9 @@ impl Engine {
                             // is cleared for same-target revival on its
                             // own index, so the next rebuild re-derives
                             // the key into its own hole instead of
-                            // burning a fresh cell per attempt. Same-key
-                            // revival reuses the identical cookie for the
-                            // identical endpoint, and withholding needed
+                            // burning a fresh cell per attempt. The key
+                            // reoccupies its own retired index after
+                            // clean detach — and withholding needed
                             // clean detach — so the clearance is sound
                             // without the two-tick proof. No static
                             // failure: every withheld slot pends.
@@ -28784,10 +28784,10 @@ impl Engine {
             // View-collapse fix8 F1: withheld cells the post-attach
             // excision could not safely reclaim retry in place. Re-clear
             // each seed whose key is still retired at its remembered
-            // position with the same slot — same-key revival reuses the
-            // identical cookie for the identical endpoint after clean
-            // detach, so the clearance is sound without the two-tick
-            // proof. Anything else fails closed (and prunes below).
+            // position with the same slot — the key reoccupies its own
+            // retired index after clean detach, so the clearance is
+            // sound without the two-tick proof. Anything else fails
+            // closed (and prunes below).
             for (key, position) in &self.withheld_revivable {
                 if self.plan.retired_keys().get(key) == Some(position)
                     && self.plan.retired_slots().contains(position)

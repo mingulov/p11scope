@@ -3103,6 +3103,26 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// A non-leader TID is not a process scope: opening a view on it is
+    /// refused, so the kill arm can never prove a thread gone while its
+    /// group lives. The TID scope stays unsupported; the helper only
+    /// ever sees TGID views.
+    #[test]
+    fn process_view_open_on_a_non_leader_tid_is_refused() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        let group = ColdLeaderSubject::spawn(1);
+        let tid = group.tids[0];
+        assert_ne!(tid, group.pid(), "the fixture names a real member tid");
+        assert!(
+            std::fs::metadata(format!("/proc/{}/task/{tid}", group.pid())).is_ok(),
+            "the member thread is live"
+        );
+        assert!(
+            ProcessView::open(ProcessViewId(97), tid).is_err(),
+            "a non-leader TID view is refused"
+        );
+    }
+
     #[test]
     fn dead_states_cover_zombie_and_dead_only() {
         for dead in ["Z", "X", "x"] {

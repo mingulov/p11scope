@@ -653,6 +653,7 @@ mod tests {
         reused_leader_after_walk: bool,
         leader_reads: usize,
         late_member: Option<u32>,
+        reused_member: Option<(u32, ExitingTask)>,
         listings: usize,
     }
     impl FinalExitIo for ScriptedFinalExit {
@@ -680,6 +681,15 @@ mod tests {
         fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()> {
             if tid == 7 {
                 return Ok(Some(self.leader));
+            }
+            // A tid recycled between the two listings: the first walk
+            // reads the old past member, the closing re-read sees the
+            // live new thread under the same tid.
+            if self.listings > 1
+                && let Some((reused, fresh)) = self.reused_member
+                && tid == reused
+            {
+                return Ok(Some(fresh));
             }
             self.members
                 .iter()
@@ -709,6 +719,7 @@ mod tests {
             reused_leader_after_walk: false,
             leader_reads: 0,
             late_member: None,
+            reused_member: None,
             listings: 0,
         }
     }
@@ -787,6 +798,29 @@ mod tests {
             parse_exiting_task("7 (x").is_err(),
             "a torn stat is not proof"
         );
+    }
+    #[test]
+    fn reused_member_tid_backed_by_a_live_thread_never_proves_final_exit() {
+        // A member tid released after its past read and recycled by a
+        // live new thread before the closing listing: the tid is
+        // already in the seen set, but the birth changed and the new
+        // thread runs user code, so the proof must fail.
+        let mut reused = dying_group();
+        reused.reused_member = Some((
+            8,
+            ExitingTask {
+                stat: TaskStat {
+                    birth: 501,
+                    state: b'S',
+                    flags: 0,
+                },
+            },
+        ));
+        assert!(
+            !final_exit(&mut reused),
+            "a recycled member tid with a live new thread keeps the group unproven"
+        );
+        assert_eq!(reused.listings, 2, "the task list is read twice");
     }
     #[test]
     fn real_live_group_is_not_in_final_exit_until_it_exits() {

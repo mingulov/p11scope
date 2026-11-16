@@ -12077,6 +12077,359 @@ mod tests {
         );
     }
 
+    /// `ESRCH` from the mem open proves only that the leader's mm is
+    /// gone (the leader completed `exit_mm`); with a live member the
+    /// group can still run user code, so the refusal stays loud.
+    #[test]
+    fn mem_esrch_on_dead_leader_with_live_member_stays_unavailable() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pid = group.pid();
+        assert!(
+            crate::process::process_is_zombie(pid),
+            "the leader really exited"
+        );
+        let worker = group.tids[0];
+        assert!(
+            std::fs::metadata(format!("/proc/{pid}/task/{worker}")).is_ok(),
+            "the member is live"
+        );
+        let view = ProcessView::open(ProcessViewId(87), pid)
+            .expect("a cold view opens through the live survivor");
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "the pin proves the group alive"
+        );
+        assert!(
+            view.retained_pin().pidfd().is_ok(),
+            "a pidfd-backed pin, not the fallback"
+        );
+        assert!(
+            !crate::process::whole_group_proven_exited(&view),
+            "a live member keeps the group unproven"
+        );
+        assert!(
+            !mem_open_exited_for_view(&view, pid, &std::io::Error::from_raw_os_error(libc::ESRCH)),
+            "ESRCH on a dead-leader/live-member group stays loud"
+        );
+        group.call_three();
+    }
+
+    /// Scan-level positive for the final-exit arm: a traced group with
+    /// every thread past user mode (a zombie leader, the last worker
+    /// an unreaped traced zombie) keeps its pidfd unready, yet the
+    /// /proc walk proves the end — so a zero-byte read names the exit
+    /// and errno'd mem refusals take the silent path. Every wait is
+    /// bounded; the drop guard reaps the traced group on any failure.
+    #[test]
+    fn final_exit_without_pidfd_ready_renames_zero_reads_and_silences_mem_refusals() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::io::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+
+        fn wait_tid_within(tid: libc::pid_t, within: Duration, what: &str) -> libc::c_int {
+            let deadline = Instant::now() + within;
+            loop {
+                let mut status: libc::c_int = 0;
+                // SAFETY: a writable status word; `tid` is our traced task.
+                let rc =
+                    unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+                if rc == tid {
+                    return status;
+                }
+                if rc < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    panic!("waitpid({tid}) for {what} failed: {error}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no wait status from {tid} for {what} within {within:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        #[cfg(any(target_env = "gnu", target_env = "uclibc"))]
+        type PtraceRequest = libc::c_uint;
+        #[cfg(not(any(target_env = "gnu", target_env = "uclibc")))]
+        type PtraceRequest = libc::c_int;
+
+        fn ptrace_op(request: PtraceRequest, tid: libc::pid_t, data: usize) {
+            // SAFETY: `tid` is stopped under our ptrace; `data` is valid
+            // for the request (a flag word or a writable `c_ulong`).
+            let rc = unsafe { libc::ptrace(request, tid, 0usize, data) };
+            assert!(
+                rc >= 0,
+                "ptrace({request}, {tid}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        fn wait_exit_event(tid: libc::pid_t, event: libc::c_int, what: &str) {
+            let status = wait_tid_within(tid, Duration::from_secs(10), what);
+            assert!(
+                libc::WIFSTOPPED(status)
+                    && libc::WSTOPSIG(status) == libc::SIGTRAP
+                    && (status >> 16) & 0xffff == event,
+                "{what}: unexpected wait status {status:#x} from {tid}"
+            );
+        }
+
+        struct TracedGroup {
+            leader: libc::pid_t,
+            tids: Vec<libc::pid_t>,
+            child: Option<std::process::Child>,
+        }
+        impl Drop for TracedGroup {
+            fn drop(&mut self) {
+                let Some(mut child) = self.child.take() else {
+                    return;
+                };
+                // SAFETY: signalling our own child's thread group.
+                unsafe { libc::kill(self.leader, libc::SIGKILL) };
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let leader = self.leader;
+                for tid in self.tids.drain(..).chain(std::iter::once(leader)) {
+                    loop {
+                        let mut status: libc::c_int = 0;
+                        // SAFETY: a writable status word; reaping our tracee.
+                        let rc = unsafe {
+                            libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG)
+                        };
+                        let exited = libc::WIFEXITED(status) || libc::WIFSIGNALED(status);
+                        if rc < 0 || (rc == tid && exited) || Instant::now() >= deadline {
+                            break;
+                        }
+                        if rc == tid {
+                            // SAFETY: `tid` is stopped under our ptrace.
+                            unsafe { libc::ptrace(libc::PTRACE_CONT, tid, 0usize, 0usize) };
+                            continue;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+
+        const MT_EXIT_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+static unsigned ready = 0;
+
+static void *worker(void *arg) {
+    int fd = *(int *)arg;
+    if (pthread_mutex_lock(&gate)) _exit(10);
+    ready++;
+    if (pthread_cond_broadcast(&changed)) _exit(11);
+    if (pthread_mutex_unlock(&gate)) _exit(12);
+    char byte;
+    if (read(fd, &byte, 1) != 1) _exit(13);
+    syscall(SYS_exit, 0);
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    static int fds[2];
+    fds[0] = atoi(argv[1]);
+    fds[1] = atoi(argv[2]);
+    pthread_t t0, t1;
+    if (pthread_create(&t0, NULL, worker, &fds[0])) return 3;
+    if (pthread_create(&t1, NULL, worker, &fds[1])) return 4;
+    if (pthread_mutex_lock(&gate)) return 5;
+    while (ready != 2)
+        if (pthread_cond_wait(&changed, &gate)) return 6;
+    if (pthread_mutex_unlock(&gate)) return 7;
+    if (write(STDOUT_FILENO, "R", 1) != 1) return 8;
+    pthread_exit(NULL);
+}
+"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("mt-exit.c");
+        let executable = dir.path().join("mt-exit");
+        std::fs::write(&source, MT_EXIT_SOURCE).unwrap();
+        let built = std::process::Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-O1"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(built.success(), "fixture build failed: {built}");
+
+        let (r0, mut w0) = std::io::pipe().unwrap();
+        let (r1, mut w1) = std::io::pipe().unwrap();
+        let (r0_raw, r1_raw) = (r0.as_raw_fd(), r1.as_raw_fd());
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args([r0_raw.to_string(), r1_raw.to_string()])
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: only async-signal-safe prctl/fcntl/ptrace before exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0
+                    || libc::fcntl(r0_raw, libc::F_SETFD, 0) != 0
+                    || libc::fcntl(r1_raw, libc::F_SETFD, 0) != 0
+                    || libc::ptrace(libc::PTRACE_TRACEME, 0, 0usize, 0usize) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop((r0, r1));
+        let leader = child.id() as libc::pid_t;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut group = TracedGroup {
+            leader,
+            tids: Vec::new(),
+            child: Some(child),
+        };
+
+        let exec_stop = wait_tid_within(leader, Duration::from_secs(10), "the exec stop");
+        assert!(
+            libc::WIFSTOPPED(exec_stop) && libc::WSTOPSIG(exec_stop) == libc::SIGTRAP,
+            "exec stop {exec_stop:#x}"
+        );
+        ptrace_op(
+            libc::PTRACE_SETOPTIONS,
+            leader,
+            (libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_EXITKILL)
+                as usize,
+        );
+        ptrace_op(libc::PTRACE_CONT, leader, 0);
+        for _ in 0..2 {
+            wait_exit_event(leader, libc::PTRACE_EVENT_CLONE, "a worker clone");
+            let mut new_tid: libc::c_ulong = 0;
+            ptrace_op(
+                libc::PTRACE_GETEVENTMSG,
+                leader,
+                std::ptr::from_mut(&mut new_tid) as usize,
+            );
+            let tid = new_tid as libc::pid_t;
+            group.tids.push(tid);
+            let stop = wait_tid_within(tid, Duration::from_secs(10), "the worker start stop");
+            assert!(
+                libc::WIFSTOPPED(stop) && libc::WSTOPSIG(stop) == libc::SIGSTOP,
+                "worker start {stop:#x}"
+            );
+            ptrace_op(libc::PTRACE_CONT, tid, 0);
+            ptrace_op(libc::PTRACE_CONT, leader, 0);
+        }
+        let (tid0, tid1) = (group.tids[0], group.tids[1]);
+
+        let mut poll = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 10_000) }, 1, "ready byte");
+        let mut ready = [0u8; 1];
+        stdout.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, *b"R");
+
+        // The scan view opens while the group is live; its pin retains
+        // the pidfd and the leader birth across the exits below.
+        let pid = leader as u32;
+        let view = ProcessView::open(ProcessViewId(88), pid)
+            .expect("a view opens on the live traced group");
+        assert!(view.retained_pin().pidfd().is_ok(), "a pidfd-backed pin");
+
+        wait_exit_event(leader, libc::PTRACE_EVENT_EXIT, "the leader exit");
+        ptrace_op(libc::PTRACE_CONT, leader, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !crate::process::process_is_zombie(pid) {
+            assert!(Instant::now() < deadline, "the leader never became a zombie");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        w0.write_all(&[1]).unwrap();
+        wait_exit_event(tid0, libc::PTRACE_EVENT_EXIT, "worker 0 exit");
+        ptrace_op(libc::PTRACE_CONT, tid0, 0);
+        let status0 = wait_tid_within(tid0, Duration::from_secs(10), "worker 0 reap");
+        assert!(libc::WIFEXITED(status0), "worker 0 {status0:#x}");
+        group.tids.retain(|tid| *tid != tid0);
+
+        // The last worker runs on to an unreaped traced zombie: past
+        // user mode, still on the thread list, pidfd still unready.
+        w1.write_all(&[1]).unwrap();
+        wait_exit_event(tid1, libc::PTRACE_EVENT_EXIT, "worker 1 exit");
+        ptrace_op(libc::PTRACE_CONT, tid1, 0);
+        let stat = format!("/proc/{pid}/task/{tid1}/stat");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(&stat).unwrap_or_default();
+            let state = text
+                .rfind(')')
+                .and_then(|end| text[end + 1..].split_whitespace().next())
+                .unwrap_or("");
+            if state == "Z" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker 1 never became a zombie: {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "an unreaped worker keeps the pidfd unready"
+        );
+        assert!(
+            crate::process::whole_group_proven_exited(&view),
+            "the /proc walk proves the final exit before the pidfd is ready"
+        );
+        assert!(
+            zero_read_names_exit(&view),
+            "a proven final exit names the exit"
+        );
+        for (name, errno) in [
+            ("EACCES", libc::EACCES),
+            ("ENOENT", libc::ENOENT),
+            ("ESRCH", libc::ESRCH),
+        ] {
+            assert!(
+                mem_open_exited_for_view(&view, pid, &std::io::Error::from_raw_os_error(errno)),
+                "{name} in proven final exit takes the exited path"
+            );
+        }
+
+        let status1 = wait_tid_within(tid1, Duration::from_secs(10), "worker 1 reap");
+        assert!(libc::WIFEXITED(status1), "worker 1 {status1:#x}");
+        group.tids.clear();
+        let mut child = group.child.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the leader was never reapable");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(status.success(), "{status}");
+        assert_eq!(view.original_exited(), Ok(true));
+    }
+
     /// The whole group can still exit between the mem open and the
     /// post-check: that race takes the generation-change refusal,
     /// never the silent exited path and never a global latch.

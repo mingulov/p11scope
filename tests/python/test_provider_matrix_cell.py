@@ -290,6 +290,21 @@ class DefaultCoverageTests(unittest.TestCase):
             self.assertIn("not in recall", detail)
             self.assertIn("target-only oracle call_recall=0.0000", detail)
 
+    def test_empty_names_are_attached_but_not_recalled(self):
+        # names [] (no name attribution at all) counts as
+        # attached-but-unnamed like ["unknown"]: recall-neutral even
+        # when the row carries rv counts.
+        with tempfile.TemporaryDirectory() as tmp:
+            module = make_module(tmp, content=b"proxy")
+            rows = [function_row([], module_identity(module), 42,
+                                 {"0x0000000000000000": 42})]
+            oracle = {("C_Initialize", "0x0000000000000000"): 42}
+            detail, recall = _COMPARE.judge_default_coverage(
+                observed_doc(rows), str(module), oracle)
+            self.assertEqual(0.0, recall, detail)
+            self.assertIn("attached-but-unnamed 1 rows / 42 calls", detail)
+            self.assertIn("not in recall", detail)
+
     def test_no_backend_rows_stays_quiet(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = make_module(tmp, content=b"proxy")
@@ -880,6 +895,33 @@ class TokenDirResetTests(unittest.TestCase):
             self.assertIn("refusing non-token path", proc.stderr)
             self.assertTrue((keep / "file").is_file())
 
+    def test_reset_refuses_shallow_relative_and_dotdot_token_paths(self):
+        # The guard requires an absolute path at least two levels deep
+        # ending in /tokens and rejects any .. component: /tokens, a
+        # relative tokens dir and a .. path are all refused with no rm
+        # or mkdir call.
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            for path in ("/tokens", "rel/dir/tokens", "/a/../../tokens"):
+                with self.subTest(path=path):
+                    log = Path(tmp) / "rm.log"
+                    if log.exists():
+                        log.unlink()
+                    script = (
+                        'rm() { printf "rm %s\\n" "$*" >> "$RM_LOG"; }; '
+                        'mkdir() { printf "mkdir %s\\n" "$*" >> "$RM_LOG"; }; '
+                        f'export RM_LOG="{log}"; '
+                        '. "$1"; reset_task_token_dir "$2"')
+                    proc = subprocess.run(
+                        ["bash", "-c", script, "_", str(TOKEN_RESET), path],
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(2, proc.returncode,
+                                     f"accepted {path}: {proc.stderr}")
+                    self.assertIn("refusing", proc.stderr)
+                    self.assertFalse(
+                        log.exists(),
+                        f"rm/mkdir ran for refused path {path}")
+
     def test_every_token_site_uses_the_shared_reset(self):
         providers = ROOT / "scripts" / "provider-matrix" / "providers"
         for name in TOKEN_RESET_SITES:
@@ -897,6 +939,21 @@ P11KIT_PROXY_ENV = (ROOT / "scripts" / "provider-matrix"
 SERVER_ARGV = ("server", "--provider",
                "/usr/lib64/pkcs11/libsofthsm2.so",
                "--sh", "pkcs11:token=p11matrix")
+
+
+def setup_verify_source():
+    """The shipped setup pid-verification block plus a wrapper."""
+    text = P11KIT_PROXY_ENV.read_text(encoding="utf-8")
+    matches = re.findall(
+        r'(?ms)^  p11kit_server_pid_alive "\$P11_KIT_SERVER_PID" \|\| \{$\n'
+        r"(.*?)\n^  \}$", text)
+    assert len(matches) == 1, (
+        f"expected exactly one setup pid check in {P11KIT_PROXY_ENV}, "
+        f"found {len(matches)}; the setup-refusal test cannot run "
+        "against a refactored script")
+    return ('setup_verify() {\n'
+            '  p11kit_server_pid_alive "$P11_KIT_SERVER_PID" || {\n'
+            + matches[0] + '\n  }\n}')
 
 
 class P11KitServerLifecycleTests(unittest.TestCase):
@@ -1017,6 +1074,33 @@ class P11KitServerLifecycleTests(unittest.TestCase):
             self.assertTrue(
                 (task / "p11kit" / "server.pid").exists(),
                 "failed teardown lost the pidfile")
+
+    def test_setup_refuses_a_mismatched_pid_without_signalling_it(self):
+        # Setup verifies the pid it just started before writing the
+        # pidfile. A mismatched pid (dead and reused, or a lying
+        # server.sh) is refused -- and never signalled: the check just
+        # proved it is not the server this cell started.
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.fake_proc(tmp, 4242, ("sleep", "60"))
+            log = Path(tmp) / "kill.log"
+            script = (
+                setup_verify_source()
+                + '\nP11_KIT_SERVER_PID=4242\n'
+                + 'kill() { printf "%s\\n" "$*" >> "$KILL_LOG"; };\n'
+                + f'export KILL_LOG="{log}";\n'
+                + 'setup_verify\n')
+            env = dict(os.environ,
+                       P11KIT_SERVER_PROC_ROOT=str(proc))
+            result = subprocess.run(
+                ["bash", "-c", '. "$1"; ' + script,
+                 "_", str(P11KIT_PROXY_ENV)],
+                capture_output=True, text=True, env=env, timeout=60)
+            self.assertNotEqual(0, result.returncode,
+                                "setup accepted a mismatched pid")
+            self.assertIn("is not the server we started", result.stderr)
+            self.assertFalse(log.exists(),
+                             "setup signalled a pid it proved is not ours")
 
 
 class LegPrepTests(unittest.TestCase):

@@ -21695,6 +21695,134 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
+    /// Growth-omission RED twin: an object dropped whole at capacity must
+    /// not also drop the endpoints it reuses in place. The prior plan sits
+    /// at MAX_SLOTS (2,044 filler cells + 68 gen1 cells, pin 82,
+    /// `sha-migrate`); gen2 is the same file at pin 83 with the same 68
+    /// offsets plus 40 fresh targets, so the extension overflows by exactly
+    /// the fresh 40. The defensive drop gives those 40 back and refuses
+    /// gen2 whole, but the 68 in-place migrations must stay active: they
+    /// are not overflowing fresh cells and must not be counted as freeable.
+    #[test]
+    fn extend_at_capacity_keeps_in_place_migrations_of_a_dropped_module() {
+        let filler =
+            provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
+        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut plan = scoped_plan(&[filler, gen1], AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize);
+        plan.object_identities
+            .insert(PinnedObjectId(82), test_identity(82, "sha-migrate"));
+        let gen1_offsets: BTreeSet<u64> = (0..68).map(|entry| entry * 8).collect();
+        let gen1_positions: Vec<usize> = plan
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.object == PinnedObjectId(82) && gen1_offsets.contains(&slot.file_offset)
+            })
+            .map(|(position, _)| position)
+            .collect();
+        assert_eq!(gen1_positions.len(), 68);
+        let mut gen2 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 108, true);
+        gen2.object = PinnedObjectId(83);
+        gen2.entry_objects = vec![vec![PinnedObjectId(83); 108]];
+        // The rebuilt snapshot fits on its own (108 <= 2,112): only the
+        // capture-lifetime prior allocation makes the extension overflow.
+        let mut rebuilt = scoped_plan(std::slice::from_ref(&gen2), AdmissionScope::Shared);
+        assert_eq!(rebuilt.slots.len(), 108);
+        rebuilt
+            .object_identities
+            .insert(PinnedObjectId(83), test_identity(82, "sha-migrate"));
+        let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+            panic!("the at-capacity drop must not abort the extension: {error}")
+        });
+        assert_eq!(
+            delta.retire.len(),
+            MAX_SLOTS as usize - 68,
+            "only the filler retires; the 68 in-place gen1 cells do not"
+        );
+        assert!(
+            delta.retire.iter().all(|slot| {
+                slot.object_path != "/opt/libsofthsm2.so"
+                    || !gen1_offsets.contains(&slot.file_offset)
+            }),
+            "a migrated gen1 cell retired with the dropped object: {:?}",
+            delta
+                .retire
+                .iter()
+                .filter(|slot| slot.object_path == "/opt/libsofthsm2.so")
+                .map(|slot| (slot.index, slot.file_offset))
+                .collect::<Vec<_>>()
+        );
+        for position in gen1_positions {
+            assert!(
+                plan.is_active(position as u32),
+                "gen1 position {position} must stay active through the drop"
+            );
+            assert_eq!(plan.slots[position].object, PinnedObjectId(83));
+            assert!(gen1_offsets.contains(&plan.slots[position].file_offset));
+        }
+        let refusals: Vec<_> = plan.refused_modules_typed().collect();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        let (object, skipped, kind) = refusals[0];
+        assert_eq!(object, PinnedObjectId(83));
+        assert_eq!(skipped.subject, "/opt/libsofthsm2.so");
+        assert_eq!(kind, RefusalKind::CapacityWhole);
+        assert_eq!(
+            whole_refusal_needed_count(&skipped.reason),
+            Some(40),
+            "the refusal counts the fresh cells only, never the in-place reuses: {}",
+            skipped.reason
+        );
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Exact-shape count-only reclaim keeps its `[unknown]` name: when the
+    /// retired cell carried no naming witness either, restoring its names
+    /// over the returning `unknown` must not strip the last name and leave
+    /// the display label empty.
+    #[test]
+    fn slot_reclaim_unknown_only_restore_keeps_the_unnamed_label() {
+        let count_only = count_only_copy(&sole_complete_module(), true);
+        let mut plan = scoped_plan(std::slice::from_ref(&count_only), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME]),
+            "the count-only generation carries no name witness"
+        );
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 68);
+        plan.revivable.clone_from(&plan.retired_keys);
+        let rebuilt = plan.rebuild_from_sources(
+            std::slice::from_ref(&count_only),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(rebuilt.reclaimed.len(), 68);
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.new.len(), 68);
+        for slot in &plan.slots {
+            assert_eq!(
+                slot.names,
+                [UNKNOWN_FUNCTION_NAME],
+                "the reclaim keeps the transparent unknown rather than emptying names"
+            );
+            assert_eq!(slot.descriptor_index, 0);
+            assert!(!slot.semantic_authorized);
+            let label = plan.label_of(slot);
+            assert!(
+                label.ends_with("(unnamed)"),
+                "slot {} must read as an unnamed function, not an empty name: {label:?}",
+                slot.index
+            );
+        }
+    }
+
     /// B1: an ambiguous ticketed reclaim must reserve the room later
     /// mandatory fresh additions need. The plan holds 2,044 of the 2,112
     /// slots with 68 retired semantic cells; the same file returns with a

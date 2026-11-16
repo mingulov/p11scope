@@ -41,22 +41,28 @@ versioned separately and are opaque, exact dispatch keys.
   per-key detail, and tracking continues.
 - A call whose retained journal original can no longer be certified
   at its claim step (a replayed or duplicate row, an original removed
-  by an image taint, or a tainted original still present) now degrades
-  the same way instead of stopping per-key tracking for the rest of
-  the run: the call stays a plain row with one counted gap that names
-  its caller, and the gap names a void only when that exact original
-  was recorded wiped by one. When the call is effect-neutral, a key
-  use or GetAttributes and its exact original is still unclaimed, the
-  original is disposed with the call so the following calls keep
-  per-key tracking; if the caller already had calls waiting for a
-  seal, its feed falls back and names a second
-  `joint_fallback_stashed_admission` gap. Other functions (create,
-  copy, generate, generate-pair, derive, unwrap, destroy, find,
-  set-attributes and the session/login/finalize lifecycle) keep the
-  named end of per-key tracking instead, because a disposed original
-  could make a later call name the wrong key. A claimed, converted,
-  abandon-staged, S1Only-marked or ledger-mismatched original also
-  refuses disposal and keeps that fail-closed path.
+  by an image taint, or a tainted original still present) can now
+  degrade instead of always ending per-key tracking, but only within
+  strict limits. Per-key tracking continues only when all of the
+  following hold: the call only uses an existing key, does not create,
+  destroy or rebind objects, or reads attributes; its own observed
+  return is success, a partial attribute result or an ordinary
+  failure (a handle or session error, a pending return or an ambiguous
+  failure does not qualify); and its exact original is still
+  unclaimed. The original is then disposed with the call. Every other
+  case keeps the earlier fail-closed path where the next seal ends
+  per-key tracking for that image with the named `claim_unmatched`
+  gap: every other function (create, copy, generate, generate-pair,
+  derive, unwrap, destroy, find including C_FindObjectsInit and
+  C_FindObjectsFinal, set-attributes, key encapsulation and
+  decapsulation, C_Initialize, and the session/login/finalize
+  lifecycle), and an original that is already claimed or converted,
+  carries a staged give-up, is reserved for plain counting, or has a
+  bookkeeping disagreement. The degraded call itself stays a plain
+  row with one counted gap that names its caller, and the gap names a
+  void only when that exact original was recorded wiped by one. If
+  the caller already had calls waiting for a seal, its feed falls
+  back and names a second `joint_fallback_stashed_admission` gap.
 - System and cgroup captures no longer file a `pid_descendant_gaps`
   gap for a tracked process that exits but lingers unreaped: a
   still-listed whole-group zombie (`Z` with no live threads) is the

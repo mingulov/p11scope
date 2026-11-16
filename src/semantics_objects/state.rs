@@ -135,7 +135,7 @@ enum CallKind {
 
 /// Terminal outcome classes. Never one overloaded "failure".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Outcome {
+pub(crate) enum Outcome {
     Ok,
     /// GetAttributeValue's partial-result return codes.
     Partial,
@@ -200,6 +200,17 @@ fn classify(rv: u64, kind: CallKind, malformed: bool) -> Outcome {
         return Outcome::Ambiguous;
     }
     Outcome::Failed
+}
+
+/// Classify one observed return for the given catalog function. This is
+/// the single mapping both settlement and the journal's unclaimable
+/// original disposal gate read: an unknown function is never assumed
+/// harmless, and `malformed` stays the caller's exact evidence.
+pub(crate) fn return_class(function: u32, rv: u64, malformed: bool) -> Outcome {
+    match call_kind(function) {
+        Some(kind) => classify(rv, kind, malformed),
+        None => Outcome::Ambiguous,
+    }
 }
 
 /// Whether the model accepts a canonical function ordinal at all
@@ -356,7 +367,7 @@ impl PendingCall {
     fn outcome(&self) -> Option<Outcome> {
         self.completion
             .as_ref()
-            .map(|c| classify(c.rv, self.kind, c.malformed))
+            .map(|c| return_class(self.function, c.rv, c.malformed))
     }
 
     fn end_cut(&self) -> Option<u64> {
@@ -385,7 +396,7 @@ impl PendingCall {
     /// unknown (unreadable, pending, ambiguous, protocol unavailable).
     fn known_outputs(&self) -> Option<Vec<ObjectHandle>> {
         let completion = self.completion.as_ref()?;
-        if classify(completion.rv, self.kind, completion.malformed) != Outcome::Ok {
+        if return_class(self.function, completion.rv, completion.malformed) != Outcome::Ok {
             return None;
         }
         let slots = self.authorized_slots(completion)?;
@@ -1515,7 +1526,7 @@ impl ModelState {
             call.clone()
         };
         let completion = call.completion.clone().expect("applied completion");
-        let outcome = classify(completion.rv, call.kind, completion.malformed);
+        let outcome = return_class(call.function, completion.rv, completion.malformed);
         let rv = CkRv(completion.rv);
 
         // The module was finalized by a call this capture never saw. Like

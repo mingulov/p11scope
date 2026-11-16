@@ -10,7 +10,8 @@ use crate::semantics_objects::journal::joint_driver::{
     IngestedRaw, RawJointQuantum, RawQuantumRefusal,
 };
 use crate::semantics_objects::journal::tests::{
-    ENTRY_NS, KeepupRng, begin_bytes_shaped, end_bytes, end_bytes_absent, function_id,
+    ENTRY_NS, KeepupRng, begin_bytes_shaped, end_bytes, end_bytes_absent, end_bytes_getattr,
+    function_id,
 };
 use crate::semantics_objects::journal::{
     AttestationRefusal, H3DispositionEvidence, JournalDomainProof, SessionDrainGrant,
@@ -511,6 +512,15 @@ impl JointScene {
         self.drain.source_mut().push_record(end.to_vec());
     }
 
+    /// One original pair for a modeled object function carrying an
+    /// explicit return code. The disposal return-class negatives pose
+    /// handle and session errors here.
+    fn push_object_with_rv(&mut self, pid: u32, file: u32, name: &str, sequence: u64, rv: u64) {
+        let (begin, end) = self.encoded_with_rv(pid, file, name, sequence, rv);
+        self.drain.source_mut().push_record(begin.to_vec());
+        self.drain.source_mut().push_record(end.to_vec());
+    }
+
     /// One original physical pair; future-END tests retain these bytes only
     /// on the fixture stack until the same cursor actually receives END.
     ///
@@ -523,6 +533,17 @@ impl JointScene {
     /// `capture_return_facts`: the mechanism VALUE, `SESSION_NONE` for a
     /// sessionless call and the returned `C_OpenSession` handle.
     fn encoded(&self, pid: u32, file: u32, name: &str, sequence: u64) -> ([u8; 224], [u8; 632]) {
+        self.encoded_with_rv(pid, file, name, sequence, 0)
+    }
+
+    fn encoded_with_rv(
+        &self,
+        pid: u32,
+        file: u32,
+        name: &str,
+        sequence: u64,
+        rv: u64,
+    ) -> ([u8; 224], [u8; 632]) {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_PAIR;
         use p11scope_ebpf_common::{MECH_NONE, SESSION_NONE};
         let held = self.real.h0.0.borrow();
@@ -533,6 +554,11 @@ impl JointScene {
         let (base, epoch, _) = io.scan_input(file);
         let init = name == "C_SignInit";
         let pair = name == "C_GenerateKeyPair";
+        let input0 = match name {
+            "C_SignInit" => Some((9, 1)),
+            "C_GetAttributeValue" => Some((0x6161, 1)),
+            _ => None,
+        };
         // The mechanism read at return (CKM_RSA_PKCS_KEY_PAIR_GEN is 0).
         let returned_mechanism = match name {
             "C_SignInit" => Some(0x000d_u64),
@@ -556,7 +582,7 @@ impl JointScene {
                 0
             },
             capture::OUTPUT_NON_NULL | capture::MECHANISM_NONE,
-            init.then_some((9, 1)),
+            input0,
             None,
             0,
         );
@@ -577,37 +603,43 @@ impl JointScene {
             end_bytes(
                 &begin,
                 p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE,
-                0,
+                rv,
                 ENTRY_NS + 10,
             )
         } else if init {
-            end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 10)
+            end_bytes(&begin, OBJECT_ACTION_ACCESS, rv, ENTRY_NS + 10)
         } else if pair {
-            let mut end = end_bytes(&begin, OBJECT_ACTION_PAIR, 0, ENTRY_NS + 10);
+            let mut end = end_bytes(&begin, OBJECT_ACTION_PAIR, rv, ENTRY_NS + 10);
             // Two VALUE result handles (public, private), distinct per call.
             end[424..432].copy_from_slice(&(0x9100 + 2 * sequence).to_le_bytes());
             end[432..440].copy_from_slice(&(0x9101 + 2 * sequence).to_le_bytes());
             end[506] = 1;
             end[507] = 1;
             end
+        } else if name == "C_GetAttributeValue" {
+            end_bytes_getattr(&begin, rv, ENTRY_NS + 10, &[])
         } else {
-            end_bytes_absent(&begin, 0, ENTRY_NS + 10)
+            end_bytes_absent(&begin, rv, ENTRY_NS + 10)
         };
         // The return rewrites at the END event's session (24 + 32),
-        // mechanism (24 + 48) and capture (24 + 280) offsets.
+        // mechanism (24 + 48) and capture (24 + 280) offsets. A failed
+        // return cannot gain the mechanism value.
         let mut end = end;
-        if let Some(mechanism) = returned_mechanism {
+        if let Some(mechanism) = returned_mechanism
+            && p11scope_ebpf_common::return_allows_mechanism(rv)
+        {
             end[72..80].copy_from_slice(&mechanism.to_le_bytes());
             end[304..308].copy_from_slice(
                 &(capture::OUTPUT_NON_NULL | capture::MECHANISM_VALUE).to_le_bytes(),
             );
         }
         if sessionless {
-            let returned = if name == "C_OpenSession" {
-                7
-            } else {
-                SESSION_NONE
-            };
+            let returned =
+                if name == "C_OpenSession" && p11scope_ebpf_common::return_allows_mechanism(rv) {
+                    7
+                } else {
+                    SESSION_NONE
+                };
             end[56..64].copy_from_slice(&returned.to_le_bytes());
         }
         (begin, end)

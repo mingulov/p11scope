@@ -11807,6 +11807,247 @@ fn joint_machine_restricted_unclaimable_originals_keep_named_end() {
     }
 }
 
+/// Keyrows follow-up (tier-3 R1): an unclaimable original whose own
+/// observed return is a handle or session error is never disposed. Those
+/// classes can leave the binding behind at a reused handle or in a closed
+/// session, so the original stays, the next seal ends with the named
+/// `ClaimUnmatched` gap and the following use gets no per-key row.
+fn assert_unclaimable_original_error_return_keeps_fail_closed(name: &str, rv: u64) {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::SealFailureDisposition;
+    let functions: &[&str] = if name == "C_SignInit" {
+        &["C_CreateObject", "C_SignInit"]
+    } else {
+        &["C_CreateObject", name, "C_SignInit"]
+    };
+    let mut fixture = MachineScene::with_initial_files_and_functions(1, &[0], functions, false);
+    fixture.prime(1);
+    let api_before = fixture.api_returns_total();
+    let direct_before = fixture.direct_fallback_total();
+    let reduced_before = fixture.reduced_for(0);
+    let caller = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .expect("the prime retained one feed")
+        .caller;
+    fixture
+        .scene
+        .push_object_with_rv(std::process::id(), 0, name, 2, rv);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    fixture.reach_phase("Claiming");
+    let victim = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .find(|input| input.s1_facts().function == name)
+        .expect("the second call is prepared")
+        .clone();
+    assert_eq!(
+        victim.s1_facts().rv,
+        rv,
+        "{name}: the admission carries the posed return"
+    );
+    let invocation = victim
+        .joint_resource_origin()
+        .expect("the collected call names its H8 original")
+        .invocation();
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        assert!(
+            adapter
+                .retained_starts_for_test()
+                .iter()
+                .any(|(thread, sequence, _)| (*thread, *sequence) == invocation),
+            "{name} (rv {rv:#x}): precondition: the misaligned call's original is still retained"
+        );
+        assert!(
+            !adapter.dispose_unclaimable_original(&victim),
+            "{name} (rv {rv:#x}): a handle or session error return never disposes its unclaimable original"
+        );
+        assert!(
+            adapter
+                .retained_starts_for_test()
+                .iter()
+                .any(|(thread, sequence, _)| (*thread, *sequence) == invocation),
+            "{name} (rv {rv:#x}): the refused disposal keeps the original"
+        );
+    }
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .misalign_next_prepared_ordinal_for_test();
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    assert_eq!(
+        fixture.api_returns_total(),
+        api_before + 3,
+        "{name} (rv {rv:#x}): the misaligned call and its following uses stay counted"
+    );
+    assert_eq!(
+        fixture.direct_fallback_total(),
+        direct_before + 1,
+        "{name} (rv {rv:#x}): the unclaimable call reduces S1-direct without Joint evidence"
+    );
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced_before,
+        "{name} (rv {rv:#x}): neither call carries a key identity"
+    );
+    assert_eq!(
+        fixture
+            .machine
+            .diagnostic_audit_for_test()
+            .expect("the seal audit keeps its named failure")
+            .0,
+        Some(crate::semantics_objects::journal::JournalGap::ClaimUnmatched),
+        "{name} (rv {rv:#x}): the next seal ends with the named ClaimUnmatched gap"
+    );
+    let image = fixture.scene.real.h0.0.borrow().io.targets[&std::process::id()].1;
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test((image.task_cookie, image.exec_id)),
+        "{name} (rv {rv:#x}): per-key tracking ends for the image"
+    );
+    {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let staged = registry.staged_gaps_for_test();
+        let retained: Vec<_> = registry
+            .gaps()
+            .iter()
+            .chain(staged.iter())
+            .filter(|gap| gap.reason == "joint_unclaimable_claim_history_loss")
+            .collect();
+        assert_eq!(
+            retained.len(),
+            1,
+            "{name} (rv {rv:#x}): one counted retained-S1 gap names the call"
+        );
+        assert_eq!(
+            retained[0].caller,
+            Some(caller),
+            "{name} (rv {rv:#x}): the gap names the tracked caller"
+        );
+    }
+    assert_eq!(
+        crate::semantics_key_use::disposition_of(
+            crate::semantics_objects::journal::JournalGap::ClaimUnmatched
+        ),
+        SealFailureDisposition::Fallback,
+        "{name} (rv {rv:#x}): the named end is the fallback class"
+    );
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced_before,
+        "{name} (rv {rv:#x}): the following use gets no per-key row after the named end"
+    );
+}
+
+/// Keyrows follow-up (tier-3 R1): misaligned `C_SignInit` and
+/// `C_GetAttributeValue` originals with a handle error, and one with a
+/// session-handle error, keep the named fail-closed path instead of
+/// being disposed.
+#[test]
+fn joint_machine_unclaimable_originals_with_error_returns_keep_named_end() {
+    use pkcs11_types::CkRv;
+    for (name, rv) in [
+        ("C_SignInit", CkRv::KEY_HANDLE_INVALID.0),
+        ("C_GetAttributeValue", CkRv::OBJECT_HANDLE_INVALID.0),
+        ("C_SignInit", CkRv::SESSION_HANDLE_INVALID.0),
+    ] {
+        assert_unclaimable_original_error_return_keeps_fail_closed(name, rv);
+    }
+}
+
+/// Keyrows follow-up (tier-3 I-A): the disposal gate names the removed
+/// entry's own function. An admission and its retained original must
+/// agree; a disagreement refuses disposal instead of removing another
+/// call's identity.
+#[test]
+fn joint_unclaimable_original_disposal_refuses_a_function_mismatch() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.reach_phase("Claiming");
+    let victim = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .next()
+        .expect("the second call is prepared")
+        .clone();
+    let invocation = victim
+        .joint_resource_origin()
+        .expect("the collected call names its H8 original")
+        .invocation();
+    let admitted_function = victim
+        .journal_call_fingerprint()
+        .expect("the admission names its call")
+        .function;
+    assert_eq!(
+        admitted_function,
+        crate::semantics_objects::journal::tests::function_id("C_SignInit"),
+        "precondition: the admission names C_SignInit"
+    );
+    let adapter = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut();
+    assert!(
+        adapter.replace_open_function_for_test(
+            invocation,
+            crate::semantics_objects::journal::tests::function_id("C_GetAttributeValue"),
+        ),
+        "the retained original exists before the function change"
+    );
+    assert!(
+        !adapter.dispose_unclaimable_original(&victim),
+        "an original whose own function differs from the admission's is not disposed"
+    );
+    assert!(
+        adapter
+            .retained_starts_for_test()
+            .iter()
+            .any(|(thread, sequence, _)| (*thread, *sequence) == invocation),
+        "the refused disposal keeps the mismatched original"
+    );
+}
+
 /// Keyrows follow-up (tier-3 M2): disposal requires the admission's
 /// collected origin to equal the retained original's own. A misaligned
 /// admission naming a different origin leaves the still-allowed

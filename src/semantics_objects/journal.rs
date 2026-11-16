@@ -107,9 +107,19 @@ pub(crate) fn is_neutral_function(function: u32) -> bool {
 /// S1 operations, key uses (`Access`, `OperationImport`) and
 /// `GetAttributes` read a binding without creating, destroying,
 /// converting or rebinding it. Every other modeled function — creation,
-/// destruction, lookup, attribute writes and session/login lifecycle —
-/// keeps the named `ClaimUnmatched` fallback, because the retained
-/// original still owns the identity its later calls may resolve through.
+/// destruction, lookup, attribute writes, KEM, initialization and
+/// session/login lifecycle — keeps the named `ClaimUnmatched` fallback,
+/// because the retained original still owns the identity its later calls
+/// may resolve through.
+///
+/// The function alone is not enough: the original's own return-code
+/// class must also prove no effect is left behind. `Ok`, `Partial`
+/// (`GetAttributes`) and plain `Failed` qualify. `InvalidHandle` and
+/// `SessionInvalid` may have cleared or closed what a later call reuses,
+/// and `Pending`/`Ambiguous` could still change state, so all four keep
+/// the retained original. The class comes from the model's single
+/// `state::return_class` mapping, never a local copy of the return-code
+/// rules.
 fn disposes_unclaimable_original(function: u32) -> bool {
     if is_neutral_function(function) {
         return true;
@@ -1771,6 +1781,21 @@ impl JournalAdapter {
             return false;
         };
         entry.collected_origin = origin;
+        true
+    }
+
+    /// Tests-only disagreement: change one open original's function so
+    /// the entry-versus-admission function checks can be exercised.
+    #[cfg(test)]
+    pub(crate) fn replace_open_function_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        function: u32,
+    ) -> bool {
+        let Some(entry) = self.open.get_mut(&native) else {
+            return false;
+        };
+        entry.function = function;
         true
     }
 
@@ -5366,14 +5391,18 @@ impl JournalAdapter {
     /// reduction; dropping the staged original here keeps the key's next
     /// seal from finding an unmatched entry and ending per-key tracking
     /// for the whole image. Only the exact unclaimed H8 original of an
-    /// effect-neutral call, a key use or `GetAttributes` is removed:
-    /// other functions could later name the disposed identity (a reused
-    /// handle, an unknown created key or a stale session), so they keep
-    /// the named fail-closed path. A claim, conversion, refusal marker,
-    /// S1Only subject, mismatched collected origin or ledger mismatch
-    /// also refuses disposal. A terminal that arrives after the BEGIN was
-    /// disposed is recorded as an expected-absent one, so it cannot taint
-    /// a stream whose original this path deliberately released.
+    /// effect-neutral call, a key use or `GetAttributes` whose own
+    /// observed return is `Ok`, `Partial` or a plain `Failed` is removed:
+    /// other functions and handle/session/pending/ambiguous returns could
+    /// later name the disposed identity (a reused handle, an unknown
+    /// created key or a stale session), so they keep the named
+    /// fail-closed path. The admission and the removed entry must name
+    /// the same function; a disagreement refuses disposal. A claim,
+    /// conversion, refusal marker, S1Only subject, mismatched collected
+    /// origin or ledger mismatch also refuses disposal. A terminal that
+    /// arrives after the BEGIN was disposed is recorded as an
+    /// expected-absent one, so it cannot taint a stream whose original
+    /// this path deliberately released.
     pub(crate) fn dispose_unclaimable_original(&mut self, admitted: &AdmittedInstanceCall) -> bool {
         let (Some(origin), Some(resource), Some(fingerprint)) = (
             admitted.collected_origin(),
@@ -5382,9 +5411,6 @@ impl JournalAdapter {
         ) else {
             return false;
         };
-        if !disposes_unclaimable_original(fingerprint.function) {
-            return false;
-        }
         if !self
             .resource_producers
             .as_ref()
@@ -5396,6 +5422,18 @@ impl JournalAdapter {
         let Some(entry) = self.open.get(&native) else {
             return false;
         };
+        if entry.function != fingerprint.function || !disposes_unclaimable_original(entry.function)
+        {
+            return false;
+        }
+        if !matches!(
+            super::state::return_class(entry.function, admitted.s1_facts().rv, false),
+            super::state::Outcome::Ok
+                | super::state::Outcome::Partial
+                | super::state::Outcome::Failed
+        ) {
+            return false;
+        }
         let (_, image, _, _) = admitted.journal_binding();
         if entry.image != (image.task_cookie, image.exec_id)
             || entry.collected_origin != Some(origin)

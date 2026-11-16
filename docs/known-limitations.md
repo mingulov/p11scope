@@ -645,18 +645,24 @@ an original removed by an image taint, or a tainted original still
 present), the call is kept the same way as a plain row with a
 counted gap naming the caller. The gap names a void only when that
 exact original was recorded wiped by one; otherwise its reason is
-cause-neutral. Tracking continues for this process only when the
-call is effect-neutral, a key use (Access or OperationImport) or
-GetAttributes and its exact original is still unclaimed: that
-original is then disposed with the call, so the key's next seal
-keeps the following calls. Every other function (create, copy,
-generate, generate-pair, derive, unwrap, destroy, find,
-set-attributes and the session/login/finalize lifecycle) keeps the
-older fail-closed path: its original stays and the next seal ends
-per-key tracking for the image with a named `claim_unmatched` gap.
-A disposal also refuses a claimed, converted, abandon-staged,
-S1Only-marked or ledger-mismatched original and keeps that same
-path. If the caller already had calls waiting for a seal, the plain
+cause-neutral. Tracking continues for this process only when all of
+the following hold: the call only uses an existing key, does not
+create, destroy or rebind objects, or reads attributes; its own
+observed return is success, a partial attribute result or an
+ordinary failure (a handle or session error, a pending return or an
+ambiguous failure does not qualify); and its exact original is
+still unclaimed. That original is then disposed with the call, so
+the key's next seal keeps the following calls. Everything else
+keeps the older fail-closed path: the original stays and the next
+seal ends per-key tracking for the image with a named
+`claim_unmatched` gap. This covers every other function (create,
+copy, generate, generate-pair, derive, unwrap, destroy, find
+including C_FindObjectsInit and C_FindObjectsFinal, set-attributes,
+key encapsulation and decapsulation, C_Initialize, and the
+session/login/finalize lifecycle), and also an original that is
+already claimed or converted, carries a staged give-up, is reserved
+for plain counting, or has a bookkeeping disagreement. If the
+caller already had calls waiting for a seal, the plain
 row cannot reduce in order without overtaking them: the feed falls
 back first, so the capture also names a
 `joint_fallback_stashed_admission` gap and the counted gap is not

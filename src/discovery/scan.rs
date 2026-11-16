@@ -11400,6 +11400,68 @@ mod tests {
         );
     }
 
+    /// A dead leader with a live member must not silence the live
+    /// group's errno'd mem refusal. Leader-Z proves only the leader
+    /// dead; the whole-group pin proof keeps the refusal loud and
+    /// counted.
+    #[test]
+    fn mem_eacces_on_dead_leader_with_live_member_stays_unavailable() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        let mut group = ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let pid = group.pid();
+        assert!(
+            crate::process::process_is_zombie(pid),
+            "fixture precondition: the leader is Z"
+        );
+        assert!(
+            crate::process::generation_dead(pid),
+            "fixture precondition: leader-Z reads dead via the bare pid"
+        );
+        let view = ProcessView::open(ProcessViewId(77), pid)
+            .expect("a cold view opens through the live survivor");
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "fixture precondition: the whole group still runs via the pin"
+        );
+        assert!(
+            view.retained_pin().pidfd().is_ok(),
+            "fixture precondition: a pidfd-backed pin, not the fallback"
+        );
+        let maps = b"00400000-00401000 r--p 00000000 08:01 1234 /bin/true\n".to_vec();
+        let mut io = MemErrnoFixture {
+            maps,
+            mem_errno: libc::EACCES,
+        };
+        let result = scan_process_view_with_io(
+            &ScanRequest {
+                pid,
+                hints: &[],
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut io,
+        );
+        let outcome =
+            result.expect("EACCES mem on a live group must stay loud, not take Err");
+        assert_eq!(
+            outcome.unavailable_reason(),
+            Some("ptrace"),
+            "dead leader + live member refusal stays loud: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == format!("/proc/{pid}/mem")),
+            "dead leader + live member refusal stays counted: {:?}",
+            outcome.skipped()
+        );
+        group.call_three();
+    }
+
     /// `mem_open_exited` decides from the strongest proof available: the
     /// open errno first, then a fresh pid read. `u32::MAX` never names a
     /// process, so it stands in for a dead pid deterministically.

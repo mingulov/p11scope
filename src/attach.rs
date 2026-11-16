@@ -9437,21 +9437,16 @@ impl Session {
         // refuses that slot, since a semantic attach over a set
         // switch would silently run count-only.
         let mut switch_refused: Vec<(u32, String)> = Vec::new();
-        let gate: Option<Array<_, u32>> = match self.ebpf.map("SLOT_COUNT_ONLY") {
-            // Objects without the switch (Inventory, counter, today's
-            // builds): the absent switch map stays open and the attach
-            // keeps today's behavior.
-            None => None,
-            Some(map) => match Array::try_from(map) {
-                Ok(gate) => Some(gate),
-                // A present but wrong-shaped switch map stays open too:
-                // the BPF cell read fails open (unset, so the probes
-                // run the cookie descriptor) and skipping keeps
-                // userspace coherent with what the probes run. Packet 2
-                // owns this gate.
-                Err(_) => None,
-            },
-        };
+        // Objects without the switch (Inventory, counter, today's
+        // builds): the absent switch map stays open and the attach
+        // keeps today's behavior. A wrong-shaped switch map stays open
+        // too: the BPF cell read fails open (unset, so the probes run
+        // the cookie descriptor) and skipping keeps userspace coherent
+        // with what the probes run. Packet 2 owns this gate.
+        let gate: Option<Array<_, u32>> = self
+            .ebpf
+            .map("SLOT_COUNT_ONLY")
+            .and_then(|map| Array::try_from(map).ok());
         if let Some(gate) = gate {
             for slot in targets {
                 if slot.descriptor_index == 0 {

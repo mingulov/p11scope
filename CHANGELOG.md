@@ -169,8 +169,9 @@ versioned separately and are opaque, exact dispatch keys.
   observer runs again.
 - On a busy host, a system-wide capture can report a few `discovery
   unavailable` skips when short-lived processes exit in the middle
-  of a scan; call counts stay exact and nothing is lost — the report
-  still reads `PARTIAL` because those scans never completed.
+  of a scan; when the provider is already attached, call counts
+  stay exact and nothing is lost — the report still reads `PARTIAL`
+  because those scans never completed.
 
 ## [0.7.0] - 2026-11-13
 

@@ -993,9 +993,13 @@ not just its file: when a short-lived descendant maps a getter-only
 provider (hidden table symbols, nothing to pre-arm), the owned-tree
 watch scans it and the decoded tables persist as run inputs, so
 later mappers' table calls attach without waiting for frame
-admission. Those per-function counts are standard-layout names, not
-proven: attribution stays withheld and nothing is decoded from the
-tables (no mechanisms, no arguments). Calls made before the tables
+admission. Those per-function counts carry standard-layout names from
+two evidences: getter-only tables stay names-only and unproven
+(attribution withheld, never decoded), while file-scanned learned tables
+with interface-linkage standard-layout evidence are semantic-authorized
+under the standard-layout scan policy and may decode their mechanism
+arguments (mechanism types are approved v3 data; values outside the
+registered registry count only, never publish). Calls made before the tables
 attach stay missing inside the module's disclosed
 `late_discovery`/`mapped_unattached` window. The learned-table store
 holds 32 modules beside the 32 learned files; past either cap the

@@ -3180,7 +3180,6 @@ pub enum InPlaceDowngradeRefusal {
 
 impl std::fmt::Display for InPlaceDowngradeRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use std::fmt::Write as _;
         match self {
             Self::NoRetainedTarget => write!(f, "has no retained static target"),
             Self::NewDescriptorNotCountOnly(descriptor) => {
@@ -4190,6 +4189,7 @@ impl AttachedSemanticSet {
     /// set: a retained slot narrowed to count-only on its live link
     /// keeps validating exactly on those. Seal-time callers pass an
     /// empty set (no downgrade could have committed before the seal).
+    #[allow(clippy::too_many_arguments)]
     fn validate_with(
         &self,
         domain: crate::attach::capture::NativeDomainId,

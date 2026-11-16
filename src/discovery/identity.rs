@@ -3222,11 +3222,9 @@ impl PinnedObjects {
                 })
                 .collect();
             if let [id] = matches[..]
-                && let Some(kept_path) = self.by_id.get(&id).map(|known| known.path.clone())
-                && let Some(maps_raw) = RawObjectInstance::prearm(key, kept_path)
                 && !self
                     .raw_to_id
-                    .get(&maps_raw)
+                    .get(&entry.raw)
                     .is_some_and(|owner| *owner != id)
             {
                 if entry.collapsed
@@ -3239,15 +3237,18 @@ impl PinnedObjects {
                 {
                     kept.pre_copy_up = true;
                 }
-                // Re-key the kept entry onto the proved maps rendering
-                // (manifest maps-alias contract): retargeting and merges
-                // read the entry, while the fd raw stays as the pre-arm
-                // resolution alias.
+                // Re-key the kept entry onto the incoming scan raw
+                // (maps-canonical, as the split refile leaves it):
+                // retargeting and merges read the entry, while the fd raw
+                // stays as the sole pre-arm resolution alias. No synthetic
+                // pre-arm raw is minted: a second pre-arm raw per path
+                // would make the refile refuse its repair (two aliases)
+                // and would let a later divergent scan nuke the merged
+                // object instead of refusing only the newcomer.
                 if let Some(kept) = self.by_id.get_mut(&id) {
-                    kept.raw = maps_raw.clone();
+                    kept.raw = entry.raw.clone();
                 }
                 self.raw_to_id.insert(entry.raw, id);
-                self.raw_to_id.insert(maps_raw, id);
                 return Some(id);
             }
         }
@@ -13420,6 +13421,293 @@ mod tests {
             kept.pinned().count(),
             2,
             "distinct files never join across the split"
+        );
+    }
+
+    /// Guard twin (F1): same proved maps key, distinct file — the
+    /// `ordinary_identity_equal` conjunct must refuse the join. Without it
+    /// the arm would alias two overlay instances rendering one key.
+    #[test]
+    fn absorbing_split_scan_pin_with_same_maps_key_but_different_file_keeps_two_objects() {
+        use super::test_fixture::{
+            INODE, PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        let kept_id = kept
+            .id_for_prearm(fd_key, PATH)
+            .expect("pre-arm files under the fd key");
+        // Same maps key as the kept proof, but a different kernel file
+        // (own inode under the opened fd, same bytes).
+        let other_fd_key = p11scope_manifest::maps::ObjectKey {
+            device: fd_key.device,
+            inode: INODE + 1,
+        };
+        let mut scan = split_scan_pin(maps_key, other_fd_key, SHA, 1);
+        reback(&mut scan, &other);
+        let skipped = kept.absorb(scan);
+        assert!(
+            skipped.is_empty(),
+            "a clean split files no skip: {skipped:?}"
+        );
+        assert_eq!(
+            kept.pinned().count(),
+            2,
+            "distinct files never join even under one proved maps key"
+        );
+        assert_eq!(
+            kept.summary(kept_id).map(|pin| pin.key),
+            Some(fd_key),
+            "the kept entry stays fd-keyed when identity refuses"
+        );
+    }
+
+    /// Guard twin: same proved maps key and same file, but a different
+    /// digest — the digest conjunct must refuse the join.
+    #[test]
+    fn absorbing_split_scan_pin_with_same_maps_key_but_different_digest_keeps_two_objects() {
+        use super::test_fixture::{
+            PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        let kept_id = kept
+            .id_for_prearm(fd_key, PATH)
+            .expect("pre-arm files under the fd key");
+        let mut scan = split_scan_pin(maps_key, fd_key, "deadbeef", 1);
+        reback(&mut scan, &file);
+        let skipped = kept.absorb(scan);
+        assert!(
+            skipped.is_empty(),
+            "a clean split files no skip: {skipped:?}"
+        );
+        assert_eq!(
+            kept.pinned().count(),
+            2,
+            "a digest mismatch never joins even under one proved maps key"
+        );
+        assert_eq!(
+            kept.summary(kept_id).map(|pin| pin.key),
+            Some(fd_key),
+            "the kept entry stays fd-keyed when the digest refuses"
+        );
+    }
+
+    /// Guard twin: same proved maps key and same file, but a different pin
+    /// (ctime) — the pin conjunct must refuse the join.
+    #[test]
+    fn absorbing_split_scan_pin_with_same_maps_key_but_different_pin_keeps_two_objects() {
+        use super::test_fixture::{
+            PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        let kept_id = kept
+            .id_for_prearm(fd_key, PATH)
+            .expect("pre-arm files under the fd key");
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 2);
+        reback(&mut scan, &file);
+        let skipped = kept.absorb(scan);
+        assert!(
+            skipped.is_empty(),
+            "a clean split files no skip: {skipped:?}"
+        );
+        assert_eq!(
+            kept.pinned().count(),
+            2,
+            "a pin mismatch never joins even under one proved maps key"
+        );
+        assert_eq!(
+            kept.summary(kept_id).map(|pin| pin.key),
+            Some(fd_key),
+            "the kept entry stays fd-keyed when the pin refuses"
+        );
+    }
+
+    /// Guard twin: same proved maps key and same file, but a different
+    /// held-fd device — the fd_dev conjunct must refuse the join.
+    #[test]
+    fn absorbing_split_scan_pin_with_same_maps_key_but_different_fd_dev_keeps_two_objects() {
+        use super::test_fixture::{
+            PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        let kept_id = kept
+            .id_for_prearm(fd_key, PATH)
+            .expect("pre-arm files under the fd key");
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut scan, &file);
+        for entry in scan.by_id.values_mut() {
+            entry.fd_dev = entry.fd_dev.wrapping_add(1);
+        }
+        let skipped = kept.absorb(scan);
+        assert!(
+            skipped.is_empty(),
+            "a clean split files no skip: {skipped:?}"
+        );
+        assert_eq!(
+            kept.pinned().count(),
+            2,
+            "an fd_dev mismatch never joins even under one proved maps key"
+        );
+        assert_eq!(
+            kept.summary(kept_id).map(|pin| pin.key),
+            Some(fd_key),
+            "the kept entry stays fd-keyed when fd_dev refuses"
+        );
+    }
+
+    /// Ambiguity twin: two pre-arm entries proving the same maps key for
+    /// the same file — the exactly-one-match arm must abstain and keep
+    /// the split (fail closed), filing the scan as a third object.
+    #[test]
+    fn absorbing_split_scan_pin_with_two_matching_prearm_entries_keeps_split() {
+        use super::test_fixture::{
+            SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let other_fd_key = overlay(42);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        let mut second = split_prearm_pin(other_fd_key, maps_key, SHA, 1);
+        reback(&mut second, &file);
+        // Same complete opened-file identity as the first pre-arm entry
+        // (same mapping, pin, digest, device): both prove the maps key
+        // for the scan, so the arm faces genuine ambiguity.
+        for entry in second.by_id.values_mut() {
+            entry.mapping.device_major = fd_key.device.major;
+            entry.mapping.device_minor = fd_key.device.minor;
+            entry.mapping.inode = fd_key.inode;
+        }
+        assert!(
+            kept.absorb(second).is_empty(),
+            "two fd keys file two pre-arm objects"
+        );
+        assert_eq!(kept.pinned().count(), 2, "two proved pre-arm entries");
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut scan, &file);
+        let skipped = kept.absorb(scan);
+        assert!(
+            skipped.is_empty(),
+            "ambiguity falls through to the split, filing no skip: {skipped:?}"
+        );
+        assert_eq!(
+            kept.pinned().count(),
+            3,
+            "ambiguous proofs never join: the scan files beside both"
+        );
+    }
+
+    /// Idempotency twin (B1): after the split merge, re-absorbing the
+    /// same pre-arm pin and re-filing must leave one object with one
+    /// pre-arm raw per path. Live learned staging re-absorbs pinned
+    /// pre-arm pins on every candidate; a second pre-arm raw would make
+    /// the refile refuse the repair.
+    #[test]
+    fn absorbing_split_merge_reabsorbs_prearm_idempotently() {
+        use super::test_fixture::{
+            PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        let id = kept
+            .id_for_prearm(fd_key, PATH)
+            .expect("pre-arm files under the fd key");
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut scan, &file);
+        assert!(kept.absorb(scan).is_empty());
+        assert_eq!(kept.pinned().count(), 1, "the split merges once");
+        let prearm_count = kept
+            .raw_to_id
+            .iter()
+            .filter(|(raw, _)| raw.mount_namespace.is_none() && raw.prearm && raw.path == PATH)
+            .count();
+        assert_eq!(prearm_count, 1, "one pre-arm raw per path after the merge");
+        let mut again = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut again, &file);
+        let _ = kept.absorb(again);
+        kept.refile_split_prearm_alias(PATH);
+        assert_eq!(
+            kept.pinned().count(),
+            1,
+            "re-absorb plus refile stays one object"
+        );
+        assert_eq!(
+            kept.id_for_prearm(fd_key, PATH),
+            Some(id),
+            "the fd key still routes to the kept object"
+        );
+    }
+
+    /// Divergence twin (B1): after the split merge, a later divergent
+    /// same-maps-key scan (different digest/file) is refused without
+    /// disturbing the merged pre-arm object.
+    #[test]
+    fn absorbing_divergent_scan_after_split_merge_keeps_merged_object() {
+        use super::test_fixture::{
+            INODE, PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let mut kept = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut kept, &file);
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut scan, &file);
+        assert!(kept.absorb(scan).is_empty());
+        assert_eq!(kept.pinned().count(), 1, "the split merges once");
+        let id = kept
+            .id_for_prearm(fd_key, PATH)
+            .expect("the merged object keeps its fd alias");
+        let other_fd_key = p11scope_manifest::maps::ObjectKey {
+            device: fd_key.device,
+            inode: INODE + 1,
+        };
+        let mut divergent = split_scan_pin(maps_key, other_fd_key, "deadbeef", 1);
+        reback(&mut divergent, &other);
+        let skipped = kept.absorb(divergent);
+        assert_eq!(
+            kept.pinned().count(),
+            1,
+            "a divergent scan never nukes the merged object"
+        );
+        assert_eq!(
+            kept.id_for_prearm(fd_key, PATH),
+            Some(id),
+            "the merged object keeps its fd alias after the refusal"
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|skip| skip.reason.contains("already names a hashed observation")),
+            "the divergent observation is refused, not merged: {skipped:?}"
         );
     }
 

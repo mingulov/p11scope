@@ -88243,6 +88243,390 @@ fn mid_scan_proven_exit_keeps_non_exit_refusals_loud() {
     );
 }
 
+/// Whether `/proc/<tgid>/maps` reads empty right now (or the pid is gone):
+/// the test-side re-read of the TGID mm state. A zombie-leader group shows
+/// empty maps while its members are alive.
+fn proc_tgid_maps_is_empty(pid: u32) -> bool {
+    use std::io::Read as _;
+    let mut maps = match std::fs::File::open(format!("/proc/{pid}/maps")) {
+        Ok(maps) => maps,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+    };
+    let mut first = [0u8; 1];
+    matches!(maps.read(&mut first), Ok(0))
+}
+
+/// A fallback-pinned zombie leader with live members stays loud: the pin
+/// still matches its retained start time, the member walk is unresolved
+/// without pidfd authority, and the TGID maps read empty while a member
+/// runs user code — the exact shape where an empty-maps re-read would
+/// claim an exit. The whole-group proof consults neither the maps nor the
+/// unresolved observation, so every exit race keeps its record.
+#[test]
+fn mid_scan_exit_race_with_fallback_pinned_zombie_leader_stays_loud() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    use crate::process::cold_view_tests::ColdLeaderSubject;
+    use crate::process::leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
+
+    let mut group = ColdLeaderSubject::spawn(1);
+    group.leave_leader();
+    let pid = group.pid();
+    assert!(
+        crate::process::process_is_zombie(pid),
+        "the leader is a real zombie"
+    );
+    group.call_three();
+    let view =
+        crate::process::start_time_pinned_process_view_for_test(ProcessViewId(718), pid).unwrap();
+    assert!(
+        view.retained_pin().pidfd().is_err(),
+        "the view carries a start-time fallback pin"
+    );
+    assert!(
+        proc_tgid_maps_is_empty(pid),
+        "a zombie leader shows empty TGID maps while alive"
+    );
+    assert_eq!(
+        view.retained_pin()
+            .leader_exit_observation(&mut LeaderExitReadBudget::for_final_exit_proof()),
+        LeaderExitObservation::Unresolved,
+        "a fallback pin never resolves the member walk"
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(false),
+        "the zombie still matches its retained start time"
+    );
+    assert!(
+        !mid_scan_exit_proven(&view),
+        "no positive proof fires on a live group"
+    );
+    let counters = scan_view_with_outcome_skips(&view, mid_scan_exit_race_skips(), || {}, true);
+    for reason in mid_scan_exit_race_reasons() {
+        assert!(
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason),
+            "a fallback-pinned zombie leader keeps its named skip for: {reason}; kept: {:?}",
+            counters.object_skips
+        );
+    }
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::MapsSnapshot),
+        7,
+        "loud races keep their class count"
+    );
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::ProcessEnded),
+        3,
+        "loud races keep their class count"
+    );
+    assert_eq!(
+        counters.ending_suppressed_skips, 0,
+        "the scan-start excuse claimed nothing"
+    );
+    group.call_three();
+}
+
+/// A pidfd-pinned zombie leader with live members stays loud: its pidfd
+/// still reads the generation running, the member walk proves a live
+/// non-leader, and neither the final-exit walk nor `kill` ESRCH fires — a
+/// zombie leader is not an exited group.
+#[test]
+fn mid_scan_exit_race_with_pidfd_pinned_zombie_leader_stays_loud() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    use crate::process::cold_view_tests::ColdLeaderSubject;
+    use crate::process::leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
+
+    let mut group = ColdLeaderSubject::spawn(1);
+    group.leave_leader();
+    let pid = group.pid();
+    assert!(
+        crate::process::process_is_zombie(pid),
+        "the leader is a real zombie"
+    );
+    group.call_three();
+    let view = ProcessView::open(ProcessViewId(719), pid).unwrap();
+    assert!(
+        view.retained_pin().pidfd().is_ok(),
+        "the view carries pidfd authority"
+    );
+    assert_eq!(
+        view.retained_pin()
+            .leader_exit_observation(&mut LeaderExitReadBudget::for_final_exit_proof()),
+        LeaderExitObservation::LiveNonleader,
+        "the member walk proves the group alive"
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(false),
+        "the pidfd generation still runs"
+    );
+    assert!(
+        !view.final_exit_in_progress(),
+        "a live member fails the final-exit walk"
+    );
+    assert!(
+        !crate::process::process_proven_exited(pid),
+        "a zombie leader answers kill"
+    );
+    assert!(
+        !mid_scan_exit_proven(&view),
+        "no positive proof fires on a live group"
+    );
+    let counters = scan_view_with_outcome_skips(&view, mid_scan_exit_race_skips(), || {}, true);
+    for reason in mid_scan_exit_race_reasons() {
+        assert!(
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason),
+            "a pidfd-pinned zombie leader keeps its named skip for: {reason}; kept: {:?}",
+            counters.object_skips
+        );
+    }
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::MapsSnapshot),
+        7,
+        "loud races keep their class count"
+    );
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::ProcessEnded),
+        3,
+        "loud races keep their class count"
+    );
+    assert_eq!(
+        counters.ending_suppressed_skips, 0,
+        "the scan-start excuse claimed nothing"
+    );
+    group.call_three();
+}
+
+/// Whether the task `tid` of `pid` is present with a live, non-exiting
+/// state word: the command-free liveness check for a group whose leader
+/// must keep running (the fixture only serves commands past leader exit).
+fn proc_task_is_live(pid: u32, tid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")) else {
+        return false;
+    };
+    let Some(end) = stat.rfind(')') else {
+        return false;
+    };
+    stat[end + 1..]
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| matches!(state, "R" | "S" | "D" | "I"))
+}
+
+/// A live leader with a live member stays loud: the member-walk observation
+/// is unresolved (only a zombie leader resolves it) while the group runs.
+/// A leader inside its own exit path shares this unresolved observation —
+/// its state is not `Z` either — and differs from the staged shape only in
+/// task state the proof never consults: every arm is lifetime-based (pidfd
+/// readiness, all-members-past-user-mode, `kill` liveness), and each reads
+/// false while a member is live. The zombie-leader endpoint of that exit
+/// window is pinned by the pidfd twin above.
+#[test]
+fn mid_scan_exit_race_with_live_leader_and_member_stays_loud() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    use crate::process::cold_view_tests::ColdLeaderSubject;
+    use crate::process::leader_exit::{LeaderExitObservation, LeaderExitReadBudget};
+
+    let group = ColdLeaderSubject::spawn(1);
+    let pid = group.pid();
+    let member = group.tids[0];
+    assert!(
+        !crate::process::process_is_zombie(pid),
+        "the leader is running"
+    );
+    assert!(
+        proc_task_is_live(pid, member),
+        "the member thread is live"
+    );
+    let view = ProcessView::open(ProcessViewId(720), pid).unwrap();
+    assert!(
+        !proc_tgid_maps_is_empty(pid),
+        "a running leader holds its maps"
+    );
+    assert_eq!(
+        view.retained_pin()
+            .leader_exit_observation(&mut LeaderExitReadBudget::for_final_exit_proof()),
+        LeaderExitObservation::Unresolved,
+        "a non-zombie leader never resolves the member walk"
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(false),
+        "the live group proves nothing exited"
+    );
+    assert!(
+        !view.final_exit_in_progress(),
+        "a running leader fails the final-exit walk"
+    );
+    assert!(
+        !crate::process::process_proven_exited(pid),
+        "a live group answers kill"
+    );
+    assert!(
+        !mid_scan_exit_proven(&view),
+        "no positive proof fires on a live group"
+    );
+    let counters = scan_view_with_outcome_skips(&view, mid_scan_exit_race_skips(), || {}, true);
+    for reason in mid_scan_exit_race_reasons() {
+        assert!(
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason),
+            "a live leader with a live member keeps its named skip for: {reason}; kept: {:?}",
+            counters.object_skips
+        );
+    }
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::MapsSnapshot),
+        7,
+        "loud races keep their class count"
+    );
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::ProcessEnded),
+        3,
+        "loud races keep their class count"
+    );
+    assert_eq!(
+        counters.ending_suppressed_skips, 0,
+        "the scan-start excuse claimed nothing"
+    );
+    assert!(
+        !crate::process::process_is_zombie(pid) && proc_task_is_live(pid, member),
+        "leader and member are still live at the verdict"
+    );
+}
+
+/// An exhausted proof budget proves nothing: the same reaped pidfd-pinned
+/// group reads exited under a fresh budget and unproven under an exhausted
+/// one, and a live group reads unproven under an exhausted budget too.
+/// Both exhaustion channels (units and deadline) share the `spend` gate,
+/// so a zero-unit budget pins the gate itself.
+#[test]
+fn mid_scan_exit_proof_exhausted_budget_proves_nothing() {
+    use crate::process::leader_exit::LeaderExitReadBudget;
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(721), pid).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        view.original_exited(),
+        Ok(true),
+        "the reaped group is gone by its pidfd"
+    );
+    assert!(
+        view.final_exit_in_progress_within(&mut LeaderExitReadBudget::for_final_exit_proof()),
+        "a fresh budget proves the reaped exit (control)"
+    );
+    assert!(
+        !view.final_exit_in_progress_within(&mut LeaderExitReadBudget::for_test(0)),
+        "an exhausted budget never proves an exit, even a real one"
+    );
+
+    let mut live = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let live_view = ProcessView::open(ProcessViewId(722), live.id()).unwrap();
+    assert!(
+        !live_view.final_exit_in_progress_within(&mut LeaderExitReadBudget::for_test(0)),
+        "an exhausted budget reads unproven on a live group"
+    );
+    assert!(
+        !mid_scan_exit_proven(&live_view),
+        "no positive proof fires on a live group"
+    );
+    live.kill().unwrap();
+    live.wait().unwrap();
+}
+
+/// A group that was live at scan start but is an unreaped zombie by the
+/// failed validation takes the silent exited path with no reap required:
+/// the pidfd reports the memberless group gone once its last task is a
+/// zombie (a zombie leader with live members still reads running — see the
+/// pidfd twin above), and the final-exit walk agrees, since the leader and
+/// its sole member are past user mode. Counts stay exact and the
+/// scan-start excuse (evaluated while live) claims nothing.
+#[test]
+fn mid_scan_exit_race_with_unreaped_exit_goes_silent_but_counted() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    use std::time::{Duration, Instant};
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(723), pid).unwrap();
+    assert!(view.still_the_same(), "the group is live at scan start");
+    let counters = scan_view_with_outcome_skips(
+        &view,
+        mid_scan_exit_race_skips(),
+        || {
+            child.kill().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !crate::process::process_is_zombie(pid) {
+                assert!(Instant::now() < deadline, "the victim did not reach Z");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        },
+        false,
+    );
+    assert!(
+        crate::process::process_is_zombie(pid),
+        "the group is an unreaped zombie at the verdict"
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(true),
+        "pidfd: a zombie with no live members is a gone group"
+    );
+    assert!(
+        view.final_exit_in_progress(),
+        "leader and sole member past user mode prove the final exit"
+    );
+    for reason in mid_scan_exit_race_reasons() {
+        assert!(
+            !counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason),
+            "an unreaped exit files no record for: {reason}; kept: {:?}",
+            counters.object_skips
+        );
+    }
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::MapsSnapshot),
+        7,
+        "the validation-bracket races count in their class"
+    );
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::ProcessEnded),
+        3,
+        "the acquisition races count in their class"
+    );
+    assert_eq!(counters.noise.total(), 10, "every race counts exactly once");
+    assert_eq!(
+        counters.ending_suppressed_skips, 0,
+        "the mid-scan path silenced these, not the scan-start excuse"
+    );
+    child.wait().unwrap();
+}
+
 /// Defers view 0 of a fresh fixture with a zero quantum, then rescans it
 /// with `prepare` applied and the group forced ending (or not) at scan
 /// start. Returns the fixture after capture-end withdrawal and the

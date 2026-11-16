@@ -15317,6 +15317,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_void_staged_end_duplicate_still_taints() {
+        // A call whose END was already staged before the void has no
+        // terminal still to arrive: the void must not record it
+        // expected-absent, so re-ingesting the same END after the void
+        // still promotes the image (duplicates still promote, also on
+        // the void path).
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        scene.adapter.void_staged();
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a duplicate terminal after a void still promotes"
+        );
+    }
+
+    #[test]
     fn review2_localized_raw_refusal_during_shed_grace_stays_refused() {
         // Round-2 F1: a localized raw refusal during shed grace is
         // independent invalidation evidence. It must revoke shed-only

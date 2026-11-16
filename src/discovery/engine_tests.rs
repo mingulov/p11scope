@@ -22014,6 +22014,484 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// Fix-round-1 twin helper: an owned-run engine whose E1 watch scan
+/// (proving view 9, never admitted) decoded kryoptic-shaped tables
+/// and staged them as run-persistent learned inputs. Unlike the
+/// first twin's pins, the proof pins carry production per-view pin
+/// ownership (scan pins always file their proving view's ownership
+/// rows); without them view retirement is a no-op and the pin
+/// lifetime below is untestable. Returns the backing dir (kept
+/// alive), the sleeper (reaped by the caller), the engine, the
+/// proof's key and the provider path.
+fn learned_tables_engine_with(
+    decoder_abi: Option<p11scope_manifest::elf::ElfAbi>,
+) -> (
+    tempfile::TempDir,
+    std::process::Child,
+    Engine,
+    ObjectKey,
+    String,
+) {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let backing = dir.path().join("libgetteronly.so");
+    std::fs::write(&backing, "p11scope-fixture:getter-only-provider-bytes").expect("write backing");
+    let mut pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
+    let pin = pins.pinned().next().expect("one pin");
+    let key = pin.key;
+    let object = pin.id;
+    let path = backing.to_string_lossy().into_owned();
+    record_scan_ownership(&mut pins, ProcessViewId(9), key, &path);
+    let me = std::process::id();
+    let sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(9);
+    module.decoder_abi = decoder_abi;
+    module.path = path.clone();
+    module.exports = vec![
+        "C_GetFunctionList".into(),
+        "C_GetInterface".into(),
+        "C_GetInterfaceList".into(),
+    ];
+    module.tables = vec![ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: ["C_Initialize", "C_GetSlotList", "C_OpenSession"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ScannedEntry {
+                name,
+                object: key,
+                object_path: path.clone(),
+                file_offset: 0x1000 + index as u64 * 0x10,
+            })
+            .collect(),
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    module.interfaces = vec![ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table: Some(0),
+    }];
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the scan-proven file still stages"
+    );
+    (dir, sleeper, engine, key, path)
+}
+
+/// Builds one live candidate over `engine`'s committed pins and
+/// learned store and returns its bound module count.
+fn learned_candidate_module_count(engine: &mut Engine) -> usize {
+    engine
+        .live_candidate_with_pending(
+            engine.pinned.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("a live candidate builds over the learned tables")
+        .modules
+        .len()
+}
+
+/// A run-persistent learned module keeps its own bindable pins after
+/// its transient proving view retires: the harvested pins must not
+/// be owned by the proving view id.
+#[test]
+fn learned_tables_survive_proving_view_retirement() {
+    let (_dir, mut sleeper, mut engine, _key, _path) =
+        learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "baseline: the learned module binds before retirement"
+    );
+    assert!(
+        engine.pinned.remove_view(ProcessViewId(9)).is_some(),
+        "the proving view owned pins to retire"
+    );
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "the learned module re-binds after its proving view retires"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// The recycled-id shape: the released proving view id is reused by
+/// an unrelated file's scan pins and then retired. The learned
+/// module's pins must not retire with the reused id.
+#[test]
+fn learned_tables_survive_proving_view_reuse_and_retirement() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let (dir, mut sleeper, mut engine, _key, _path) =
+        learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "baseline: the learned module binds before reuse"
+    );
+    let other = dir.path().join("libunrelated.so");
+    std::fs::write(&other, "p11scope-fixture:unrelated-provider-bytes").expect("write other");
+    let mut pins = real_scan_pin(&other, None, 400, &"cd".repeat(32));
+    let other_key = pins.pinned().next().expect("one pin").key;
+    let other_path = other.to_string_lossy().into_owned();
+    record_scan_ownership(&mut pins, ProcessViewId(9), other_key, &other_path);
+    let _ = engine.pinned.absorb(pins);
+    assert!(
+        engine.pinned.remove_view(ProcessViewId(9)).is_some(),
+        "the reused view owned pins to retire"
+    );
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "the learned module re-binds after its proving view id is reused and retired"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// The refresh shape: the proving view id is reused and its pins
+/// replaced by a scan that maps nothing of the learned file. The
+/// learned module must still re-bind.
+#[test]
+fn learned_tables_survive_proving_view_refresh() {
+    let (_dir, mut sleeper, mut engine, _key, _path) =
+        learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "baseline: the learned module binds before the refresh"
+    );
+    let _ = engine
+        .pinned
+        .replace_view_pins(ProcessViewId(9), PinnedObjects::empty(), &[]);
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "the learned module re-binds after its proving view refreshes without it"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// A learned module that cannot bind files the dedicated finite
+/// learned-tables row (named, counted, surviving projection), not a
+/// path-carrying skip that collapses to the generic discovery row.
+#[test]
+fn learned_table_bind_loss_files_the_dedicated_counted_row() {
+    let (_dir, mut sleeper, mut engine, _key, _path) =
+        learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "baseline: the learned module binds before identity loss"
+    );
+    // Catastrophic identity loss: every committed pin is gone, so the
+    // learned module cannot bind whatever the pin lifetime does.
+    engine.pinned = PinnedObjects::empty();
+    let candidate = engine
+        .live_candidate_with_pending(
+            engine.pinned.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("a live candidate builds over the unbound learned tables");
+    assert!(
+        candidate.modules.is_empty(),
+        "the pin-less learned module binds nothing"
+    );
+    let row = crate::discovery::scan::Skipped {
+        subject: "learned provider file".into(),
+        reason:
+            "a learned provider's tables lost their pinned identity; its calls were not observed"
+                .into(),
+    };
+    assert!(
+        engine.counters.object_skips.contains(&row),
+        "the bind loss is counted: {:?}",
+        engine.counters.object_skips,
+    );
+    assert!(
+        candidate.plan.skipped.contains(&row),
+        "the bind loss publishes into the candidate plan: {:?}",
+        candidate.plan.skipped,
+    );
+    let projected = crate::render::capture_skipped_out(&row);
+    assert_eq!(projected.name, "learned provider file");
+    assert_eq!(
+        projected.reason,
+        "a learned provider's tables lost their pinned identity; its calls were not observed"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// The table-harvest cap refuses loudly: past 32 learned table
+/// modules the refusal counts in `learned_cap_skipped` and names the
+/// table cap, not the file cap. The store fills directly so the file
+/// queue stays short: the file path must not refuse (and must still
+/// stage) while the tables refuse.
+#[test]
+fn run_learned_table_harvest_cap_refusal_is_counted_and_named() {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    let (dir, mut sleeper, mut engine, _key, _path) =
+        learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
+    assert_eq!(engine.run_learned_modules.len(), 1);
+    let cap = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP;
+    for index in 1..cap {
+        let mut filler = fixture_module(engine.run_learned_modules[0].key);
+        filler.key.inode += index as u64;
+        filler.path = format!("/tmp/cap-fill-{index}.so");
+        filler.view = Engine::RUN_LEARNED_VIEW_ID;
+        engine.run_learned_modules.push(filler);
+    }
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        cap,
+        "the store fills to its cap"
+    );
+    assert_eq!(
+        engine.learned_cap_skipped_for_test(),
+        0,
+        "no refusal below the cap"
+    );
+    let backing = dir.path().join("libcapover.so");
+    std::fs::write(&backing, "p11scope-fixture:cap-over").expect("write over-cap backing");
+    let pins = real_scan_pin(&backing, None, 400, &"12".repeat(32));
+    let pin = pins.pinned().next().expect("one pin");
+    let key = pin.key;
+    let object = pin.id;
+    let path = backing.to_string_lossy().into_owned();
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(99);
+    module.path = path.clone();
+    module.tables = vec![ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_Initialize",
+            object: key,
+            object_path: path.clone(),
+            file_offset: 0x1000,
+        }],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(99),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        cap,
+        "the over-cap tables do not grow the store"
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        2,
+        "the refused tables do not block the file: it still stages"
+    );
+    assert_eq!(
+        engine.learned_cap_skipped_for_test(),
+        1,
+        "the table-cap refusal counts like the file cap"
+    );
+    let row = crate::discovery::scan::Skipped {
+        subject: "learned provider file".into(),
+        reason: "table learning reached its 32-module per-capture cap; further provider tables were not learned"
+            .into(),
+    };
+    assert!(
+        engine.counters.object_skips.contains(&row),
+        "the refusal names the table cap, not the file cap: {:?}",
+        engine.counters.object_skips,
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// A harvest that changes only union flags (here: the decoder ABI
+/// filling in) still owes the expedited frame and the learned
+/// apply: counts alone cannot decide "nothing changed".
+#[test]
+fn run_learned_harvest_dirties_flag_only_union_changes() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let (dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    assert_eq!(engine.run_learned_modules.len(), 1);
+    assert_eq!(engine.run_learned_modules[0].decoder_abi, None);
+    engine.learned_unapplied = false;
+    engine.learned_frame_owed = false;
+    engine.plan_rebuild_stable = true;
+    let backing = dir.path().join("libgetteronly.so");
+    let pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
+    let object = pins.pinned().next().expect("one pin").id;
+    let mut module = engine.run_learned_modules[0].clone();
+    module.view = ProcessViewId(11);
+    module.decoder_abi = Some(p11scope_manifest::elf::ElfAbi::Lp64);
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(11),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.run_learned_modules[0].decoder_abi,
+        Some(p11scope_manifest::elf::ElfAbi::Lp64),
+        "the union fills the ABI in"
+    );
+    assert!(
+        engine.learned_unapplied && engine.learned_frame_owed && !engine.plan_rebuild_stable,
+        "a flag-only union change still owes the frame and the apply"
+    );
+    let _ = key;
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Fresh learned staging owes prompt table-proving scans: every
+/// unproven watch member's backoff resets and every retained view
+/// gets a refresh queued, instead of waiting for the polling
+/// backstop.
+#[test]
+fn learned_staging_rescans_owned_members_and_views_promptly() {
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let c = dir.path().join("prompt.c");
+    let so = dir.path().join("libprompt.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .expect("write prompt source");
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .expect("run gcc")
+            .success(),
+        "the prompt fixture must compile"
+    );
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let retained_pid = sleeper.id();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(5), retained_pid).expect("retained view opens"));
+    const WATCH_PID: u32 = 424242;
+    engine.owned_watch_unproven.insert(
+        WATCH_PID,
+        OwnedWatchEntry {
+            scans: 3,
+            unproductive: 7,
+            next_eligible_ns: u64::MAX,
+            image: None,
+        },
+    );
+    let file = std::fs::File::open(&so).expect("open prompt fixture");
+    let (dev, ino) = crate::fanotify::file_identity(&file).expect("fixture identity");
+    engine.stage_learned_candidate(crate::fanotify::LearnedCandidate {
+        file,
+        dev,
+        ino,
+        display_path: so.to_string_lossy().into_owned(),
+        loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+        loader_unknown_reason: None,
+        run_learned: true,
+        proving_retained: false,
+    });
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the candidate staged (the prompt path runs past fresh == 0)"
+    );
+    let entry = engine
+        .owned_watch_unproven
+        .get(&WATCH_PID)
+        .expect("the watch member is still tracked");
+    assert_eq!(
+        entry.unproductive, 0,
+        "fresh staging resets the rescan backoff"
+    );
+    assert_eq!(
+        entry.next_eligible_ns, 0,
+        "the member rescans at once, not at its backoff deadline"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&retained_pid),
+        "every retained view owes a prompt refresh: {:?}",
+        engine.refresh_requested.keys().collect::<Vec<_>>(),
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// A still-live loader is named through the proving view's pidfd
 /// bracket: the live twin of the exited case below.
 #[test]

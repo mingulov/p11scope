@@ -137,8 +137,13 @@ fn privileged_run_default_learns_tables_for_a_getter_only_provider() -> Result<(
     let report = dir.path().join("run.json");
     let log = dir.path().join("observer.log");
     let log_file = std::fs::File::create(&log)?;
+    // `--user root`: the fixtures live in a root-only tempdir, and
+    // `run` otherwise drops the child to the sudo invoker (covered
+    // by its own cells), which could not execute them.
     let mut child = Command::new(&observer)
         .arg("run")
+        .arg("--user")
+        .arg("root")
         .arg("-o")
         .arg(&report)
         .arg("--")

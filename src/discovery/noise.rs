@@ -64,6 +64,7 @@ pub fn classify_discovery_noise(subject: &str, reason: &str) -> DiscoveryNoiseCl
         || reason.contains("os error 3")
         || reason.contains("exited before discovery")
         || reason.contains("exited before mutation")
+        || reason.contains("exited during the snapshot")
         || reason.contains("generation changed")
         || reason.contains("ESRCH")
     {

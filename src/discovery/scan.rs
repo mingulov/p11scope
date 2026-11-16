@@ -4487,6 +4487,18 @@ fn read_name(
     Ok(None)
 }
 
+/// Cause recorded when a mapping read returns zero bytes. Against a live
+/// pin this is a short file-backed read; against a dead pin the snapshot
+/// loop below renames it to [`ZERO_READ_EXIT_CAUSE`] — a zero-length read
+/// from `/proc/<pid>/mem` proves the target's mm is gone (an unmapped VMA
+/// in a live process fails with EIO instead).
+const ZERO_READ_CAUSE: &str = "the read returned no bytes";
+/// Exact cause for a zero-length mapping read against a dead pin: the
+/// target exited mid-snapshot, so the mapping vanished with its process.
+/// Keeps the `partial snapshot` prefix (and its byte counts) so the gap
+/// still truncates the scan it came from.
+const ZERO_READ_EXIT_CAUSE: &str = "the process exited during the snapshot";
+
 /// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A partial read simply
 /// advances and retries; only a failed or zero-length read ends the mapping, keeping
 /// what was read so far. The second return says why it stopped short — everything past
@@ -4529,7 +4541,7 @@ fn read_mapping(
                 // Addresses stay out of the reason: it is published in the capture
                 // document, which does not carry a target's runtime layout. The
                 // byte counts say exactly how much of the mapping went unexamined.
-                short = Some("the read returned no bytes".to_string());
+                short = Some(ZERO_READ_CAUSE.to_string());
                 break;
             }
             Err(error) => {
@@ -8276,6 +8288,19 @@ fn scan_view_examined_mode(
         let mut io_exhausted = false;
         for entry in &data {
             let (bytes, short, exhausted) = read_mapping(mem, entry, budget, &mut operation_bytes);
+            // A zero-length read against a dead pin proves the target exited
+            // mid-snapshot, so the mapping vanished with its process: name
+            // the exit exactly while the pin still proves it. The byte
+            // counts stay — they say how much went unexamined — and a live
+            // pin keeps the established read wording below.
+            let short = match short {
+                Some(reason)
+                    if !exhausted && reason.contains(ZERO_READ_CAUSE) && !view.still_the_same() =>
+                {
+                    Some(reason.replace(ZERO_READ_CAUSE, ZERO_READ_EXIT_CAUSE))
+                }
+                short => short,
+            };
             // Bytes past a failed read were never examined; saying nothing here would
             // present a partial decode as a complete one.
             if let Some(reason) = short {
@@ -8370,14 +8395,24 @@ fn scan_view_examined_mode(
         // or the scan stopped mid-module — the counted gap below names the
         // file (data-always) — matching the stop-break site above. Only
         // the genuine no-table row needs an unstopped scan: a stop proves
-        // no absence.
+        // no absence. It also needs examined bytes: when data mappings
+        // exist but every snapshot read zero bytes, the per-mapping
+        // partial rows above already name each failure, and the no-table
+        // marker would claim a verified absence from zero evidence.
+        // A module with no data mappings at all keeps its row — all zero
+        // bytes of its file-backed data were examined.
+        let snapshot_bytes: usize = snapshots.iter().map(|(_, bytes)| bytes.len()).sum();
         if module.tables.is_empty() {
             if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
                 skipped.push(Skipped {
                     subject: module.path.clone(),
                     reason: undecoded_file_reason(budget),
                 });
-            } else if !io_exhausted && !budget.scan_stopped() && !(getter_object && !hinted) {
+            } else if !io_exhausted
+                && !budget.scan_stopped()
+                && !(getter_object && !hinted)
+                && (data.is_empty() || snapshot_bytes > 0)
+            {
                 // A getter manifest's program object with no file-backed
                 // table is no loss: its getter hooks publish a runtime
                 // table, and an unreturned getter names its own cause.

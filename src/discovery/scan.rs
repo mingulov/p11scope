@@ -16242,6 +16242,41 @@ mod tests {
         );
     }
 
+    /// No-table suppression, data-empty arm: a module with only executable
+    /// mappings (no data pages to snapshot) keeps its no-table row — there
+    /// are no per-mapping rows to carry the gap.
+    #[test]
+    fn module_with_only_executable_mappings_keeps_its_no_table_row() {
+        let mut f = BracketFixture::new(8, false);
+        let executable_only: String = f
+            .maps_a
+            .lines()
+            .filter(|line| line.contains(" r-xp "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(
+            executable_only.contains("provider.so"),
+            "the filtered maps still name the provider: {executable_only:?}"
+        );
+        assert!(
+            !executable_only.contains(" r--p ") && !executable_only.contains(" rw-p "),
+            "the filtered maps carry no data pages: {executable_only:?}"
+        );
+        f.maps_a = executable_only.clone();
+        f.maps_b = executable_only;
+        let outcome = f
+            .run(&mut CaptureWorkBudget::default())
+            .expect("an r-xp-only scan completes");
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains(NO_TABLE_FOUND_MARKER)),
+            "the data-empty module keeps its no-table row: {:?}",
+            outcome.skipped()
+        );
+    }
+
     /// Fallback-pin twin: the target exits mid-scan under a start-time
     /// fallback pin, which reads the unreaped zombie as alive — the
     /// zero-byte snapshots still name the exit exactly via the emptied
@@ -16289,6 +16324,80 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("the process exited during the snapshot")),
             "the exit is named exactly: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains(NO_TABLE_FOUND_MARKER)),
+            "zero examined bytes claim no verified absence: {reasons:?}"
+        );
+    }
+
+    /// Cold-view twin: a dead leader with an exited member and a live member
+    /// shows empty TGID maps while the group is alive, so zero reads keep
+    /// the established wording — never the exit naming. The scripted zero
+    /// mem stands in for the exited member's per-tid reads; the pin, the
+    /// empty TGID maps and the live member are real.
+    #[test]
+    fn zero_byte_snapshot_of_a_live_group_with_an_exited_member_keeps_the_read_wording() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        let mut group = ColdLeaderSubject::spawn(2);
+        group.leave_leader();
+        group.exit_one_worker();
+        let pid = group.pid();
+        assert!(
+            crate::process::process_is_zombie(pid),
+            "the leader really exited"
+        );
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/maps"))
+                .expect("TGID maps are readable")
+                .is_empty(),
+            "a zombie-leader group shows empty TGID maps while alive"
+        );
+        let view =
+            ProcessView::open(ProcessViewId(76), pid).expect("a cold view opens on the live group");
+        assert!(view.still_the_same(), "the pin reads the live group");
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "the pin proves the group alive"
+        );
+        let mut fixture = BracketFixture::new(8, false);
+        fixture.mem.set_len(0).unwrap();
+        let identity = crate::discovery::identity::FileIdentity { dev: 37, ino: 9 };
+        fixture.mapped = Some((identity, identity));
+        let hooks = HookRegistry::builtin();
+        let hints = [fixture.path.clone()];
+        let (outcome, _, _, _) = scan_view_with_examined(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+            true,
+        )
+        .expect("a live-group scan names its gaps, it does not error");
+        assert!(view.still_the_same(), "the group is still alive");
+        group.call_three();
+        let reasons: Vec<&str> = outcome
+            .skipped()
+            .iter()
+            .map(|skip| skip.reason.as_str())
+            .collect();
+        assert!(
+            reasons.iter().any(|reason| reason.contains("read 0 of")
+                && reason.contains("the read returned no bytes")),
+            "the live-group zero-byte read keeps its wording: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains("the process exited during the snapshot")),
+            "a live group is never exit-worded: {reasons:?}"
         );
         assert!(
             reasons

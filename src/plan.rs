@@ -23926,6 +23926,232 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
+    /// m-c (tier-3 review of port3 fix2): after a fallback whole
+    /// refusal, a surviving sole-owner cell with unaliased names sheds
+    /// the ambiguity the shed removed with the co-owner. The shared
+    /// snapshot cells carry the mark (unauthorized scan tables, so
+    /// every reader refuses on authorization first — the stale mark is
+    /// unobservable there); the shed clears it alongside the owner
+    /// recompute instead of leaving it stale.
+    #[test]
+    fn fallback_shed_clears_ambiguity_on_single_owner_unaliased_cells() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1952, true);
+        let old = provider_with_tables(53, "/opt/old.so", 1, 60, true);
+        let mut plan = scoped_plan(&[filler, old], AdmissionScope::Named);
+        assert_eq!(plan.slots.len(), 2012, "100 lifetime slots free");
+        let provider = provider_with_tables(60, "/opt/p.so", 1, 60, true);
+        let mut forwarding = provider_with_tables(61, "/opt/f.so", 2, 50, true);
+        let targets: Vec<(&'static str, u32, u64)> =
+            (0..60u64).map(|index| ("C_Sign", 60, index * 8)).collect();
+        replace_table_targets(&mut forwarding, 1, &targets);
+        let rebuilt = scoped_plan(&[provider, forwarding], AdmissionScope::Named);
+        assert_eq!(rebuilt.slots.len(), 110);
+        let shared: Vec<_> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.module_ids.len() == 2)
+            .collect();
+        assert_eq!(
+            shared.len(),
+            60,
+            "the provider cells are shared with the forwarder"
+        );
+        for slot in &shared {
+            assert!(
+                slot.semantic_ambiguous,
+                "cell {} carries the shared mark",
+                slot.index
+            );
+            assert!(!slot.aliased, "cell {} names one function", slot.index);
+            assert_eq!(slot.names, ["C_Sign"]);
+        }
+        plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+            panic!("the surviving provider must admit, not abort: {error}")
+        });
+        let kinds: Vec<RefusalKind> = plan
+            .refused_modules_typed()
+            .filter(|(object, _, _)| *object == PinnedObjectId(61))
+            .map(|(_, _, kind)| kind)
+            .collect();
+        assert_eq!(kinds, [RefusalKind::CapacityWhole]);
+        let module = plan
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(60))
+            .expect("the surviving provider stays admitted")
+            .id;
+        let survivors: Vec<_> = plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == PinnedObjectId(60))
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            60,
+            "the surviving provider keeps its cells"
+        );
+        for slot in &survivors {
+            assert_eq!(
+                slot.module_ids,
+                [module],
+                "cell {} is sole-owned after the shed",
+                slot.index
+            );
+            assert_eq!(
+                plan.module_of_slot(slot.index),
+                Some(module),
+                "cell {} reads sole-owned, not ambiguous",
+                slot.index
+            );
+            assert!(!slot.aliased, "cell {} names one function", slot.index);
+            assert!(
+                !slot.semantic_ambiguous,
+                "cell {} sheds the removed sharing's mark",
+                slot.index
+            );
+        }
+        assert_eq!(
+            plan.module_ambiguous, 0,
+            "no surviving cell latches ambiguity"
+        );
+        assert_eq!(plan.active_slot_count(), 60);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// m-c companion: the shed keeps the ambiguity mark where the
+    /// ambiguity survives — on cells the shed leaves co-owned, and on
+    /// sole-owned cells whose names stay aliased. The companion shares
+    /// the provider's first 30 cells under the same name; the refused
+    /// forwarder shares all 60, rival-naming the last 30. The
+    /// forwarder carries the largest key, so it sheds first and alone.
+    #[test]
+    fn fallback_shed_keeps_ambiguity_on_shared_and_aliased_cells() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1952, true);
+        let old = provider_with_tables(53, "/opt/old.so", 1, 60, true);
+        let mut plan = scoped_plan(&[filler, old], AdmissionScope::Named);
+        assert_eq!(plan.slots.len(), 2012, "100 lifetime slots free");
+        let provider = provider_with_tables(60, "/opt/p.so", 1, 60, true);
+        let mut companion = provider_with_tables(61, "/opt/g.so", 1, 30, true);
+        let same: Vec<(&'static str, u32, u64)> =
+            (0..30u64).map(|index| ("C_Sign", 60, index * 8)).collect();
+        replace_table_targets(&mut companion, 0, &same);
+        let mut forwarding = provider_with_tables(62, "/opt/f.so", 2, 50, true);
+        let mut targets = same;
+        targets.extend((30..60u64).map(|index| ("C_Verify", 60, index * 8)));
+        replace_table_targets(&mut forwarding, 1, &targets);
+        let rebuilt = scoped_plan(&[provider, companion, forwarding], AdmissionScope::Named);
+        assert_eq!(rebuilt.slots.len(), 110, "the companion adds no new key");
+        let first: Vec<_> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.object == PinnedObjectId(60) && slot.file_offset < 30 * 8)
+            .collect();
+        let second: Vec<_> = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| slot.object == PinnedObjectId(60) && slot.file_offset >= 30 * 8)
+            .collect();
+        assert_eq!(first.len(), 30);
+        assert_eq!(second.len(), 30);
+        for slot in &first {
+            assert_eq!(
+                slot.module_ids.len(),
+                3,
+                "cell {} is shared three ways",
+                slot.index
+            );
+            assert!(slot.semantic_ambiguous);
+            assert!(!slot.aliased);
+            assert_eq!(slot.names, ["C_Sign"]);
+        }
+        for slot in &second {
+            assert_eq!(
+                slot.module_ids.len(),
+                2,
+                "cell {} is shared two ways",
+                slot.index
+            );
+            assert!(slot.semantic_ambiguous);
+            assert!(slot.aliased, "cell {} names two functions", slot.index);
+            let mut names = slot.names.clone();
+            names.sort();
+            assert_eq!(names, ["C_Sign", "C_Verify"]);
+        }
+        plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+            panic!("the surviving providers must admit, not abort: {error}")
+        });
+        let kinds: Vec<RefusalKind> = plan
+            .refused_modules_typed()
+            .filter(|(object, _, _)| *object == PinnedObjectId(62))
+            .map(|(_, _, kind)| kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [RefusalKind::CapacityWhole],
+            "only the forwarder sheds"
+        );
+        assert!(
+            plan.modules
+                .iter()
+                .any(|module| module.object == PinnedObjectId(61)),
+            "the companion stays admitted"
+        );
+        let owner_of = |object: u32| {
+            plan.modules
+                .iter()
+                .find(|module| module.object == PinnedObjectId(object))
+                .unwrap_or_else(|| panic!("object {object} stays admitted"))
+                .id
+        };
+        let provider_id = owner_of(60);
+        let companion_id = owner_of(61);
+        for slot in plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == PinnedObjectId(60) && slot.file_offset < 30 * 8)
+        {
+            assert_eq!(
+                slot.module_ids.iter().collect::<BTreeSet<_>>(),
+                BTreeSet::from([&provider_id, &companion_id]),
+                "cell {} stays co-owned",
+                slot.index
+            );
+            assert_eq!(plan.module_of_slot(slot.index), None);
+            assert!(
+                slot.semantic_ambiguous,
+                "cell {} keeps the surviving sharing's mark",
+                slot.index
+            );
+        }
+        for slot in plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == PinnedObjectId(60) && slot.file_offset >= 30 * 8)
+        {
+            assert_eq!(
+                slot.module_ids,
+                [provider_id],
+                "cell {} is sole-owned after the shed",
+                slot.index
+            );
+            assert_eq!(plan.module_of_slot(slot.index), Some(provider_id));
+            assert!(slot.aliased, "cell {} names stay merged", slot.index);
+            assert!(
+                slot.semantic_ambiguous,
+                "cell {} keeps the surviving names' mark",
+                slot.index
+            );
+        }
+        assert_eq!(
+            plan.module_ambiguous, 30,
+            "the co-owned half latches ambiguity"
+        );
+        assert_eq!(plan.active_slot_count(), 60);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
     /// Re-admit cost fixture (tier-3 review of port3 fix1): twenty small
     /// new providers past 100 free slots — the fallback refuses nineteen
     /// whole and admits the first, and every refused victim gets one

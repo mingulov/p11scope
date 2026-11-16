@@ -100,6 +100,12 @@ fn build_fixtures(dir: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((library, worker))
 }
 
+fn head(log: &Path) -> String {
+    std::fs::read_to_string(log)
+        .map(|text| text.chars().take(1500).collect::<String>())
+        .unwrap_or_default()
+}
+
 fn tail(log: &Path) -> String {
     std::fs::read_to_string(log)
         .map(|text| {
@@ -148,6 +154,9 @@ fn privileged_run_default_learns_tables_for_a_getter_only_provider() -> Result<(
     let mut ledger_calls: u64 = 0;
     let mut ledger_workers: usize = 0;
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if line.starts_with("WORKER_FAIL") {
+            println!("TABLE_CELL {tag} {line}");
+        }
         if let Some(rest) = line.strip_prefix("DONE worker=") {
             let mut calls: Option<u64> = None;
             for field in rest.split_whitespace() {
@@ -179,7 +188,12 @@ fn privileged_run_default_learns_tables_for_a_getter_only_provider() -> Result<(
     println!(
         "TABLE_CELL {tag} ledger workers={ledger_workers}/{WORKERS} table_calls={ledger_calls}"
     );
-    ensure!(status.success(), "run exited {status}: {}", tail(&log));
+    ensure!(
+        status.success(),
+        "run exited {status}; log head: {}; log tail: {}",
+        head(&log),
+        tail(&log)
+    );
     ensure!(
         ledger_workers == WORKERS,
         "only {ledger_workers}/{WORKERS} workers reported; observer log: {}",

@@ -542,7 +542,8 @@ fn run_cell_with(
     let report = dir.path().join("profile.json");
     let log = dir.path().join("observer.log");
     let log_file = std::fs::File::create(&log)?;
-    let mut child = Command::new(&observer)
+    let mut command = Command::new(&observer);
+    command
         .arg("profile")
         .args(&target)
         .arg("--manifest")
@@ -552,14 +553,32 @@ fn run_cell_with(
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
-        .die_with_parent()
-        .spawn()
-        .context("spawning the observer")?;
+        .die_with_parent();
+    if scope == CellScope::DynamicCgroup {
+        // The hook-attach receipts the cgroup cell gates on print only
+        // under capture diagnostics.
+        command.env("P11SCOPE_CAPTURE_DIAGNOSTICS", "1");
+    }
+    let mut child = command.spawn().context("spawning the observer")?;
     let result = (|| -> Result<serde_json::Value> {
         wait_for_text(&log, "p11scope: capturing:", &mut child)?;
         // Every hooked getter is probed before the program calls one: a
         // cgroup capture attaches them only after its loader armed.
         wait_for_breakpoints(pid, &getter_addresses, &mut child, &log)?;
+        if scope == CellScope::DynamicCgroup {
+            // The fdinfo small-cookie count cannot tell a count-only
+            // static slot from the getter hook at the same offset, and
+            // the hooks attach past `capturing`: wait for the engine's
+            // per-offset attach receipts, so the calls below cannot run
+            // ahead of the hooks that must observe them.
+            for offset in &getter_offsets {
+                wait_for_text(
+                    &log,
+                    &format!("dynamic export attached file_offset={offset:#x}"),
+                    &mut child,
+                )?;
+            }
+        }
         wait_for_getter_hooks(&mut child, &app_path, &getter_offsets, &log)?;
         let published = match &prefetched {
             Some(published) => published.clone(),

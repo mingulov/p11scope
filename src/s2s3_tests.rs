@@ -13,8 +13,9 @@ use crate::semantics_edge::{EdgeSemantics, SemanticCall};
 use crate::semantics_objects::journal::StagingLedger;
 use crate::semantics_objects::{
     AffectedScope, AttrObservation, AttributeList, Attribution, Birth, CallKey, CallToken,
-    CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
-    HandleInput, KeyLabel, Lifetime, LostOutcome, MAX_ACCESS_RELATIONS, MechanismEvidence,
+    CompleteInputPrefix, CompletedFact, CreationFamily, FieldSource, FieldState, FieldValue,
+    FindResult, HandleInput, KeyLabel, Lifetime, LostOutcome, MAX_ACCESS_RELATIONS,
+    MechanismEvidence,
     ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits,
     ObjectProjection, ObjectSemantics, ObjectView, OriginFact, OutputEvidence, PqcCode,
     QueryStatus, RefCut, ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin,
@@ -53,6 +54,7 @@ const ECDH1: u64 = 0x1050;
 const SHA256_DERIVE: u64 = 0x393;
 const SSL3_KEY_MATERIAL: u64 = 0x372;
 const ECDSA: u64 = 0x1041;
+const CKM_CHACHA20: u64 = 0x1226;
 
 const CKA_CLASS: u64 = 0x0000;
 const CKA_TOKEN: u64 = 0x0001;
@@ -5033,9 +5035,11 @@ fn newsite_derived_hkdf_key_establishes_and_labels() {
 // Keymeta §6 generic unlisted-type twin: a creation template carrying
 // an unlisted key type (`CKK_CHACHA20`, 0x33) promotes only the
 // value-length fact — the key type stays unknown and the view never
-// labels. A later use still counts without labeling (no
-// mechanism-derived fact; the use-side family inference arrives with
-// Task 3).
+// labels. The key is then used under `CKM_CHACHA20`: the use counts
+// (`key_uses` 1) without labeling and without establishing any
+// mechanism-derived fact; the positive use-side family inference is
+// Task 3's §4 engine (a reducer-seam twin beside the source twins in
+// `key_operation_tests.rs`, since `ObjectView` carries no family).
 #[test]
 fn newsite_created_chacha20_key_promotes_value_len_without_label() {
     let mut h = Hist::qualified();
@@ -5046,7 +5050,12 @@ fn newsite_created_chacha20_key_promotes_value_len_without_label() {
         scalar(CKA_VALUE_LEN, 32),
     ]);
     let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
-    h.run(5, sign_init(SA, H1), 6, ok());
+    h.run(
+        5,
+        sign_init(SA, H1),
+        6,
+        ok().mech(MechanismEvidence::Value(CKM_CHACHA20)),
+    );
     let e = h.settle(6);
     let id = created(&e, x, 0).unwrap();
     let p = h.project();
@@ -5060,6 +5069,10 @@ fn newsite_created_chacha20_key_promotes_value_len_without_label() {
         v.established.field(SafeAttributeKind::ValueLen),
         scalar_field(32),
         "the finite value length still promotes"
+    );
+    assert_eq!(
+        v.key_uses, 1,
+        "the use under CKM_CHACHA20 still counts"
     );
     assert_eq!(v.label, None, "a size alone never labels");
 }
@@ -5149,54 +5162,175 @@ fn newsite_created_poly1305_key_promotes_value_len_without_label() {
     assert_eq!(v.label, None, "a size alone never labels");
 }
 
-// Keymeta §6 pending-ruling pin (owner/design ruling outstanding):
-// 0x40 (CKK_EC_EDWARDS) and 0x41 (CKK_EC_MONTGOMERY) with an
-// established matching curve stay unlabeled — the closed label
-// vocabulary defines no Edwards/Montgomery join, so `label()`
-// falls through to `_ => None` (R2 port-exact). The established
-// facts themselves (key type, curve) still publish. A mismatched
-// family (0x40 + X25519) stays unlabeled too. Flip this twin if
-// the ruling adds 0x40/0x41 label arms.
+// Keymeta §6 Edwards/Montgomery join (controller KEYMETA-T1 rulings
+// 2026-11-16, ruling 1): 0x40 (CKK_EC_EDWARDS) with an established
+// ed25519/ed448 curve, and 0x41 (CKK_EC_MONTGOMERY) with an
+// established x25519/x448 curve, from the same key's template label
+// (both facts are already-captured approved reads; the label is a
+// projection). A mismatched curve (Edwards + Montgomery curve, or an
+// Edwards/Montgomery type + secp curve), an unestablished curve, or
+// an incompatible class (Edwards/Montgomery keys need public_key or
+// private_key, like RSA/EC) stays unlabeled while the underlying
+// facts keep their established states. The 0x03 + X25519 leg pins
+// the unchanged R2 join (any established curve labels under CKK_EC);
+// flip it only under a new ruling.
 #[test]
-fn newsite_created_edwards_montgomery_with_curve_stay_unlabeled() {
+fn newsite_created_edwards_montgomery_label_with_matching_curve() {
     const ED25519: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x70];
+    const ED448: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x71];
     const X25519: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x6e];
-    for (key_type, params, curve, case) in [
-        (0x40, &ED25519, SafeCurve::Ed25519, "edwards + ed25519"),
-        (0x41, &X25519, SafeCurve::X25519, "montgomery + x25519"),
+    const X448: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x6f];
+    let edwards_25519 = Some(KeyLabel::Ec {
+        curve: SafeCurve::Ed25519,
+    });
+    let edwards_448 = Some(KeyLabel::Ec {
+        curve: SafeCurve::Ed448,
+    });
+    let montgomery_25519 = Some(KeyLabel::Ec {
+        curve: SafeCurve::X25519,
+    });
+    let montgomery_448 = Some(KeyLabel::Ec {
+        curve: SafeCurve::X448,
+    });
+    for (key_type, class, params, curve, expected, case) in [
         (
-            0x40,
-            &X25519,
-            SafeCurve::X25519,
-            "edwards + x25519 (mismatch)",
+            0x40u8,
+            3u64,
+            Some(ED25519.as_slice()),
+            Some(SafeCurve::Ed25519),
+            edwards_25519,
+            "edwards + ed25519 labels",
+        ),
+        (
+            0x40u8,
+            2u64,
+            Some(ED448.as_slice()),
+            Some(SafeCurve::Ed448),
+            edwards_448,
+            "edwards + ed448 labels",
+        ),
+        (
+            0x41u8,
+            3u64,
+            Some(X25519.as_slice()),
+            Some(SafeCurve::X25519),
+            montgomery_25519,
+            "montgomery + x25519 labels",
+        ),
+        (
+            0x41u8,
+            2u64,
+            Some(X448.as_slice()),
+            Some(SafeCurve::X448),
+            montgomery_448,
+            "montgomery + x448 labels",
+        ),
+        (
+            0x40u8,
+            3u64,
+            Some(X25519.as_slice()),
+            Some(SafeCurve::X25519),
+            None,
+            "edwards + x25519 (mismatch) stays unlabeled",
+        ),
+        (
+            0x41u8,
+            3u64,
+            Some(ED25519.as_slice()),
+            Some(SafeCurve::Ed25519),
+            None,
+            "montgomery + ed25519 (mismatch) stays unlabeled",
+        ),
+        (
+            0x40u8,
+            3u64,
+            Some(SECP256R1.as_slice()),
+            Some(SafeCurve::Secp256r1),
+            None,
+            "edwards + secp256r1 (mismatch) stays unlabeled",
+        ),
+        (
+            0x40u8,
+            3u64,
+            None,
+            None,
+            None,
+            "edwards without a curve (unestablished) stays unlabeled",
+        ),
+        (
+            0x41u8,
+            3u64,
+            None,
+            None,
+            None,
+            "montgomery without a curve (unestablished) stays unlabeled",
+        ),
+        (
+            0x40u8,
+            4u64,
+            Some(ED25519.as_slice()),
+            Some(SafeCurve::Ed25519),
+            None,
+            "edwards + ed25519 on a secret_key class stays unlabeled",
+        ),
+        (
+            0x41u8,
+            4u64,
+            Some(X25519.as_slice()),
+            Some(SafeCurve::X25519),
+            None,
+            "montgomery + x25519 on a secret_key class stays unlabeled",
+        ),
+        (
+            0x03u8,
+            3u64,
+            Some(X25519.as_slice()),
+            Some(SafeCurve::X25519),
+            montgomery_25519,
+            "ec + x25519 keeps the R2 label",
         ),
     ] {
         let mut h = Hist::qualified();
         h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
-        let template = attrs(&[
-            scalar(CKA_CLASS, 3),
+        let mut cells = vec![
+            scalar(CKA_CLASS, class),
             scalar(CKA_KEY_TYPE, u64::from(key_type)),
-            AttrObservation::curve(CKA_EC_PARAMS, params, LinuxLayout::Lp64),
-        ]);
-        let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+        ];
+        if let Some(params) = params {
+            cells.push(AttrObservation::curve(
+                CKA_EC_PARAMS,
+                params,
+                LinuxLayout::Lp64,
+            ));
+        }
+        let x = h.run(
+            3,
+            create(SA).request(0, attrs(&cells)),
+            4,
+            ok().result(0, H1),
+        );
         let e = h.settle(4);
         let id = created(&e, x, 0).unwrap();
         let p = h.project();
         let v = view(&p, id);
         assert_eq!(
             v.established.field(SafeAttributeKind::KeyType),
-            scalar_field(key_type),
+            scalar_field(u16::from(key_type)),
             "{case}: creation result establishes the requested key type"
         );
-        assert_eq!(
-            v.established.field(SafeAttributeKind::EcParams),
-            FieldState::Value(FieldValue::Curve(curve)),
-            "{case}: creation result establishes the requested curve"
-        );
-        assert_eq!(
-            v.label, None,
-            "{case}: no Edwards/Montgomery label (pending ruling)"
-        );
+        match curve {
+            Some(curve) => assert_eq!(
+                v.established.field(SafeAttributeKind::EcParams),
+                FieldState::Value(FieldValue::Curve(curve)),
+                "{case}: creation result establishes the requested curve"
+            ),
+            None => assert_eq!(
+                v.established.field(SafeAttributeKind::EcParams),
+                FieldState::Unknown,
+                "{case}: no curve fact without a curve attribute"
+            ),
+        }
+        assert_eq!(v.label, expected, "{case}");
     }
 }
 
@@ -5268,4 +5402,180 @@ fn newsite_created_nine_slot_template_promotes_first_eight_only() {
         Some(KeyLabel::Aes { value_len: 32 }),
         "the first-eight triple labels without a query"
     );
+}
+
+// Keymeta §6/K5 source twin: a promoted fact never keeps its source
+// past a conflict. The AES size promotes with `creation_success`; a
+// later query disagreeing on the size conflicts the field, and the
+// contradicted value's provenance clears (fail-closed state, never
+// a stale `Some` behind the render mask).
+#[test]
+fn newsite_promoted_field_conflicting_query_clears_source() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 32),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    h.run(
+        5,
+        get_attrs(SA, H1),
+        6,
+        ok().attrs(attrs(&[scalar(CKA_VALUE_LEN, 16)])),
+    );
+    let e = h.settle(6);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        FieldState::Conflict(Some(FieldValue::Scalar(32))),
+        "the disagreeing query conflicts the promoted size"
+    );
+    assert_eq!(
+        v.established.source(SafeAttributeKind::ValueLen),
+        None,
+        "a conflicted field carries no source"
+    );
+}
+
+// Keymeta §6/K5 source twin: invalidation clears every promoted
+// source. A `C_SetAttributeValue` success invalidates the view's
+// established facts, and no invalidated slot keeps pointing at its
+// old proof.
+#[test]
+fn newsite_promoted_fields_invalidated_by_set_attributes_clear_sources() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 32),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    h.run(
+        5,
+        call("C_SetAttributeValue").on(SA).input(0, H1),
+        6,
+        ok(),
+    );
+    let e = h.settle(6);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    for kind in [
+        SafeAttributeKind::Class,
+        SafeAttributeKind::KeyType,
+        SafeAttributeKind::ValueLen,
+    ] {
+        assert!(
+            matches!(
+                v.established.field(kind),
+                FieldState::Invalidated(_)
+            ),
+            "{kind:?}: the mutation invalidates the promoted fact"
+        );
+        assert_eq!(
+            v.established.source(kind),
+            None,
+            "{kind:?}: an invalidated field carries no source"
+        );
+    }
+}
+
+// Keymeta §6/K5 source twin: a confirming query keeps the first
+// establisher. The AES size promotes with `creation_success`; a
+// later query agreeing on the size leaves the value — and its
+// promotion source — untouched (a fact never changes source
+// silently).
+#[test]
+fn newsite_confirming_query_keeps_first_establisher_source() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 32),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    h.run(
+        5,
+        get_attrs(SA, H1),
+        6,
+        ok().attrs(attrs(&[scalar(CKA_VALUE_LEN, 32)])),
+    );
+    let e = h.settle(6);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        scalar_field(32),
+        "the agreeing query keeps the promoted size"
+    );
+    assert_eq!(
+        v.established.source(SafeAttributeKind::ValueLen),
+        Some(FieldSource::CreationSuccess),
+        "the agreeing query keeps the promotion source"
+    );
+}
+
+// Keymeta §6 negative twin: a class-0 data object never labels. The
+// finite template facts still establish (class, type, size), but no
+// label joins under the data class — for a secret-key type as for
+// an asymmetric type.
+#[test]
+fn newsite_created_data_object_stays_unlabeled() {
+    for (key_type, size_selector, size, size_kind, case) in [
+        (
+            0x1fu16,
+            CKA_VALUE_LEN,
+            32u64,
+            SafeAttributeKind::ValueLen,
+            "data object with an AES triple",
+        ),
+        (
+            0x00u16,
+            CKA_MODULUS_BITS,
+            2048u64,
+            SafeAttributeKind::ModulusBits,
+            "data object with an RSA triple",
+        ),
+    ] {
+        let mut h = Hist::qualified();
+        h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+        let template = attrs(&[
+            scalar(CKA_CLASS, 0),
+            scalar(CKA_KEY_TYPE, u64::from(key_type)),
+            scalar(size_selector, size),
+        ]);
+        let x = h.run(
+            3,
+            create(SA).request(0, template),
+            4,
+            ok().result(0, H1),
+        );
+        let e = h.settle(4);
+        let id = created(&e, x, 0).unwrap();
+        let p = h.project();
+        let v = view(&p, id);
+        assert_eq!(
+            v.established.field(SafeAttributeKind::Class),
+            scalar_field(0),
+            "{case}: creation result establishes the data class"
+        );
+        assert_eq!(
+            v.established.field(SafeAttributeKind::KeyType),
+            scalar_field(key_type),
+            "{case}: creation result establishes the key type"
+        );
+        assert_eq!(
+            v.established.field(size_kind),
+            scalar_field(size as u16),
+            "{case}: creation result establishes the size"
+        );
+        assert_eq!(v.label, None, "{case}: a data object never labels");
+    }
 }

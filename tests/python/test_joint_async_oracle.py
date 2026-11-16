@@ -1773,6 +1773,32 @@ class AsyncVersionDispatchTwins(unittest.TestCase):
         completed = self.run_cli(joint, single, joint_stream, single_stream)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_cli_v6_superset_content_accepted(self):
+        require_oracle(self)
+        oracle = ORACLE
+        collision, joint, single = paired(oracle, "poll_msg")
+        joint["version"] = 6
+        joint["unattributed"] = []
+        single["version"] = 6
+        single["unattributed"] = []
+        joint_stream = healthy_stream(collision, joint)
+        for line in joint_stream:
+            # v6 rows carrying v1 content validate (superset tables);
+            # the marker version rides along.
+            if line["kind"] in ("object_observed",
+                                "key_operations_observed"):
+                line["event"]["version"] = 6
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 6
+        single_stream = healthy_s1only_stream(collision, single)
+        for line in single_stream:
+            if line["kind"] == "key_operations_observed":
+                line["event"]["version"] = 6
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 6
+        completed = self.run_cli(joint, single, joint_stream, single_stream)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
 
 class AsyncV5PqcTwins(unittest.TestCase):
     """H9 section version 5 through the async oracle, direct calls."""
@@ -1848,6 +1874,86 @@ class AsyncV5PqcTwins(unittest.TestCase):
         with self.subTest("PQC object label on a v4 row refused"
                           " from stream authority"):
             collision, joint, stream = pqc_pair(5, 4)
+            oracle.validate_snapshot(joint, "joint")
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+
+
+class AsyncV6NewsiteTwins(unittest.TestCase):
+    """H9 section version 6 through the async oracle, direct calls."""
+
+    def test_v6_newsite_snapshot_validates_and_v5_refuses(self):
+        oracle = require_oracle(self)
+        _collision, joint, _single = paired(oracle, "poll_msg")
+        key_label = joint["key_operations"][0]["metadata_at_use"]
+        obj_label = joint["objects"][0]["label"]
+        with self.subTest("v6 newsite key and object labels validate"):
+            joint["version"] = 6
+            joint["unattributed"] = []
+            joint["key_operations"][0]["metadata_at_use"] = "hkdf_384"
+            joint["objects"][0]["label"] = "hkdf_384"
+            oracle.validate_snapshot(joint, "joint")
+        with self.subTest("newsite key label before v6 refused"):
+            joint["version"] = 5
+            joint["objects"][0]["label"] = obj_label
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.validate_snapshot(joint, "joint")
+        with self.subTest("newsite object label before v6 refused"):
+            joint["key_operations"][0]["metadata_at_use"] = key_label
+            joint["objects"][0]["label"] = "hkdf_384"
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.validate_snapshot(joint, "joint")
+
+    def test_v6_newsite_stream_dispatch(self):
+        oracle = require_oracle(self)
+
+        def newsite_pair(key_version, object_version):
+            """Fresh pair with one newsite row pair, at row versions."""
+            collision, joint, _single = paired(oracle, "poll_msg")
+            stream = healthy_stream(collision, joint)
+            target = joint["key_operations"][0]
+            old_key = (target["instance"], target["object"],
+                       target["category"], target["role"],
+                       target["metadata_at_use"])
+            target["metadata_at_use"] = "hkdf_384"
+            obj_row = next(row for row in joint["objects"]
+                           if row["object"] == target["object"])
+            obj_row["label"] = "hkdf_384"
+            joint["version"] = 6
+            joint["unattributed"] = []
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    if line["event"]["row"]["object"] == target["object"]:
+                        line["event"]["row"]["label"] = "hkdf_384"
+                    line["event"]["version"] = object_version
+                elif line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if line["event"]["bucket"] == "known" and (
+                            row["instance"], row["object"], row["category"],
+                            row["role"], row["metadata_at_use"]) == old_key:
+                        row["metadata_at_use"] = "hkdf_384"
+                    line["event"]["version"] = key_version
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 6
+            return collision, joint, stream
+
+        with self.subTest("v6 newsite stream validates"):
+            collision, joint, stream = newsite_pair(6, 6)
+            oracle.validate_snapshot(joint, "joint")
+            oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("newsite key label on a v5 row refused"
+                          " from stream authority"):
+            collision, joint, stream = newsite_pair(5, 6)
+            oracle.validate_snapshot(joint, "joint")
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("newsite object label on a v5 row refused"
+                          " from stream authority"):
+            collision, joint, stream = newsite_pair(6, 5)
             oracle.validate_snapshot(joint, "joint")
             with self.assertRaisesRegex(oracle.LedgerError,
                                         "object label invalid"):

@@ -2322,6 +2322,111 @@ mod tests {
         }
     }
 
+    // R2 new-site: the BPF return decode of the three new derive
+    // codes is exact — 5 authorizes only CKM_HKDF_DERIVE, 6 only
+    // CKM_HKDF_DATA, 7 only CKM_CONCATENATE_BASE_AND_KEY. A matched
+    // pair reads the retained result cell; a swapped pair authorizes
+    // nothing (protocol-unavailable, zero reads).
+    #[test]
+    fn derive_return_decodes_newsite_mechanism_codes_exactly() {
+        use crate::capture::MECHANISM_VALUE;
+        use crate::object_capture::handle_status as hst;
+        use crate::object_wire::{
+            OBJECT_DERIVE_CONCAT_BASE_AND_KEY, OBJECT_DERIVE_HKDF_DATA,
+            OBJECT_DERIVE_HKDF_DERIVE,
+        };
+        let descriptor = 23u32;
+        let row = ObjectDescriptorWire {
+            function: descriptor.wrapping_sub(1),
+            input_args: [ARG_NONE; 2],
+            result_args: [5, ARG_NONE],
+            template_args: [ARG_NONE; 4],
+            find_capacity_arg: ARG_NONE,
+            find_count_arg: ARG_NONE,
+            action: OBJECT_ACTION_DERIVE,
+            guard: OBJECT_GUARD_SCALAR_DERIVE,
+        };
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for (code, mechanism, name) in [
+                (OBJECT_DERIVE_HKDF_DERIVE, 0x402au64, "hkdf_derive"),
+                (OBJECT_DERIVE_HKDF_DATA, 0x402bu64, "hkdf_data"),
+                (
+                    OBJECT_DERIVE_CONCAT_BASE_AND_KEY,
+                    0x360u64,
+                    "concat_base_and_key",
+                ),
+            ] {
+                let mut side = ObjectStart {
+                    descriptor_index: descriptor,
+                    phase: 2,
+                    derive: code,
+                    result_ptrs: [0x7000, 0],
+                    ..ObjectStart::default()
+                };
+                let reads = core::cell::Cell::new(0u32);
+                let ok = adapter_fill_return(
+                    Some(&mut side),
+                    descriptor,
+                    Some(&row),
+                    0,
+                    layout,
+                    MECHANISM_VALUE,
+                    mechanism,
+                    true,
+                    crate::FnReader(|address, _| {
+                        reads.set(reads.get() + 1);
+                        assert_eq!(address, 0x7000);
+                        Ok(0x777)
+                    }),
+                );
+                assert!(ok, "{layout:?} {name}: matched fill succeeds");
+                assert_eq!(reads.get(), 1, "{layout:?} {name}: one result read");
+                assert_eq!(
+                    side.result_statuses,
+                    [hst::VALUE, hst::ABSENT],
+                    "{layout:?} {name}: the matched mechanism authorizes the read"
+                );
+            }
+            // A swapped pair authorizes nothing: entry code 5 (HKDF
+            // derive) against a 0x402b return mechanism refuses with
+            // zero reads, and vice versa.
+            for (code, mechanism, name) in [
+                (OBJECT_DERIVE_HKDF_DERIVE, 0x402bu64, "hkdf_derive/0x402b"),
+                (OBJECT_DERIVE_HKDF_DATA, 0x402au64, "hkdf_data/0x402a"),
+            ] {
+                let mut side = ObjectStart {
+                    descriptor_index: descriptor,
+                    phase: 2,
+                    derive: code,
+                    result_ptrs: [0x7000, 0],
+                    ..ObjectStart::default()
+                };
+                let reads = core::cell::Cell::new(0u32);
+                let ok = adapter_fill_return(
+                    Some(&mut side),
+                    descriptor,
+                    Some(&row),
+                    0,
+                    layout,
+                    MECHANISM_VALUE,
+                    mechanism,
+                    true,
+                    crate::FnReader(|_, _| {
+                        reads.set(reads.get() + 1);
+                        Ok(0x777)
+                    }),
+                );
+                assert!(ok, "{layout:?} {name}: refused fill still succeeds");
+                assert_eq!(reads.get(), 0, "{layout:?} {name}: zero reads");
+                assert_eq!(
+                    side.result_statuses,
+                    [hst::PROTOCOL_UNAVAILABLE, hst::ABSENT],
+                    "{layout:?} {name}: the swapped mechanism authorizes nothing"
+                );
+            }
+        }
+    }
+
     // Mutation caught (M01): a KEM entry that never reaches READY
     // through the production transaction. Real native ENTRY binding
     // -> actual entry adapter -> required-side query predicate ->

@@ -24745,11 +24745,13 @@ impl Engine {
     /// attached, so the startup completion can tell whether it added
     /// coverage.
     ///
-    /// A committed attach also receipts itself on stderr under capture
-    /// diagnostics ([`Self::note_dynamic_export_attached`]): the getter
-    /// cells gate their programs on those per-offset lines, since an
-    /// fdinfo small-cookie count cannot tell a count-only static slot
-    /// from the getter hook at the same offset.
+    /// An attach that linked also receipts itself on stderr under
+    /// capture diagnostics ([`Self::note_dynamic_export_attached`]):
+    /// committed, or generation-lost-but-linked, including idempotent
+    /// re-attaches. The getter cells gate their programs on those
+    /// per-offset lines, since an fdinfo small-cookie count cannot
+    /// tell a count-only static slot from the getter hook at the same
+    /// offset.
     ///
     /// No identity rides the line: the ABI plus the file offset cannot
     /// name a process, a path, or a proof.

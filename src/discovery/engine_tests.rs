@@ -30144,6 +30144,169 @@ fn live_extension_at_capacity_refuses_a_whole_new_module_without_aborting() {
     assert_eq!(engine.plan.modules_skipped[0].subject, new.path);
 }
 
+/// Existing growth at capacity, live path: an already-admitted provider
+/// that grows past the lifetime budget omits its fresh endpoints as a
+/// counted growth gap through `live_candidate` and the tick apply —
+/// never the fatal capacity branch.
+#[test]
+fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
+    let capacity = p11scope_ebpf_common::MAX_SLOTS;
+    let mut raw = overlay_module(overlay_key(70));
+    raw.tables[0].live_return = true;
+    let full = with_endpoints(raw.clone(), capacity - 100);
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&full), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut engine = Engine::empty();
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
+    assert_eq!(engine.plan.active_slot_count(), capacity as usize - 100);
+    // Retire 68 cells: the lifetime budget stays spent while the live set
+    // shrinks.
+    let smaller = with_endpoints(raw.clone(), capacity - 100 - 68);
+    let candidate = engine
+        .live_candidate(engine.pinned.clone(), vec![smaller], Vec::new())
+        .unwrap();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            candidate,
+            &mut additions_allowed,
+            false,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        capacity as usize - 100 - 68
+    );
+    // Grow 101 endpoints past the lifetime budget: merge admits the
+    // 2,045-slot snapshot, the extension omits the fresh growth.
+    let grown = with_endpoints(raw.clone(), capacity - 100 - 68 + 101);
+    let candidate = engine
+        .live_candidate(engine.pinned.clone(), vec![grown], Vec::new())
+        .unwrap_or_else(|error| {
+            panic!("existing growth is a counted omission, not an abort: {error}")
+        });
+    assert_eq!(
+        candidate.plan.modules_skipped.len(),
+        1,
+        "{:?}",
+        candidate.plan.modules_skipped
+    );
+    let omission = &candidate.plan.modules_skipped[0];
+    assert!(
+        plan::is_growth_omission(&omission.reason),
+        "existing growth omits: {}",
+        omission.reason
+    );
+    assert_eq!(
+        plan::growth_omitted_count(&omission.reason),
+        Some(101),
+        "the gap counts the fresh cells: {}",
+        omission.reason
+    );
+    assert!(
+        omission.reason.contains("kept its 1944 attached"),
+        "the gap names the kept cells: {}",
+        omission.reason
+    );
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            candidate,
+            &mut additions_allowed,
+            false,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        capacity as usize - 100 - 68
+    );
+}
+
+/// Whole new module at capacity, tick path: the `live_candidate` plus
+/// apply twin of the direct-extension capacity test — a rebuilt snapshot
+/// whose whole new module would push lifetime allocation past the budget
+/// returns a counted named refusal from the tick, never an abort.
+#[test]
+fn tick_refuses_a_whole_new_module_at_capacity_without_aborting() {
+    let capacity = p11scope_ebpf_common::MAX_SLOTS;
+    let (mut engine, raw) = engine_admitting_overlay(70, capacity - 100);
+    let kept = with_endpoints(raw.clone(), 512);
+    let new = with_endpoints(overlay_module(overlay_key(71)), 101);
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(overlay_pins(&[(new.key, OVERLAY_SHA, 1)]));
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let candidate = engine
+        .live_candidate(pins, vec![kept, new.clone()], skipped)
+        .unwrap_or_else(|error| {
+            panic!("at capacity a whole new module is a counted refusal, not an abort: {error}")
+        });
+    assert_eq!(
+        candidate.delta.retire.len(),
+        capacity as usize - 100 - 512,
+        "the prior cells outside the rebuilt snapshot retire"
+    );
+    assert!(
+        candidate.delta.new.is_empty(),
+        "the overflowing new object is dropped whole"
+    );
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            candidate,
+            &mut additions_allowed,
+            false,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
+    assert_eq!(engine.plan.active_slot_count(), 512);
+    let new_object = engine
+        .pinned
+        .id_for_scanned(&new, new.key, &new.path)
+        .expect("the new module is pinned");
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|slot| slot.object != new_object),
+        "the new object owns no cell"
+    );
+    let refusals: Vec<_> = engine.plan.refused_modules_typed().collect();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    let (object, refused, kind) = refusals[0];
+    assert_eq!(object, new_object);
+    assert_eq!(refused.subject, new.path);
+    assert_eq!(kind, plan::RefusalKind::CapacityWhole);
+    assert_eq!(
+        plan::whole_refusal_needed_count(&refused.reason),
+        Some(101),
+        "the refusal carries its counted demand: {}",
+        refused.reason
+    );
+    assert_eq!(engine.plan.modules_skipped.len(), 1);
+    assert_eq!(engine.plan.modules_skipped[0].subject, new.path);
+}
+
 #[test]
 fn post_mutation_generation_loss_never_owns_the_cell_it_allocated() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();

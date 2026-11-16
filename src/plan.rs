@@ -21365,6 +21365,20 @@ pub(crate) mod tests {
         );
         assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "no capacity growth");
         assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize);
+        for slot in &delta.new {
+            assert!(
+                !slot.semantic_authorized,
+                "a lowered reclaim clears semantic authority: {slot:?}"
+            );
+            assert!(
+                !plan.is_standard_layout_slot(slot.index),
+                "a lowered reclaim keeps no standard-layout basis: {slot:?}"
+            );
+            assert!(
+                !plan.slots[slot.index as usize].semantic_authorized,
+                "the committed cell clears semantic authority: {slot:?}"
+            );
+        }
     }
 
     /// A count-only copy of a semantic provider: the same exact targets
@@ -22121,6 +22135,515 @@ pub(crate) mod tests {
             .expect("every active cell stays reachable exactly once");
     }
 
+    /// Extension fallback, reused cells: a new pin of the same file that
+    /// reclaims 68 retired cells but also lists 10 fresh ones past the
+    /// lifetime budget keeps its module on the 68 reused cells and omits
+    /// only the 10 fresh cells as a counted growth gap. The reused cells
+    /// stay owned — no ownerless new link — and no attribution is lost.
+    #[test]
+    fn fallback_keeps_reused_cells_owned_and_omits_only_fresh_growth() {
+        use crate::discovery::scan::ScannedEntry;
+
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1970, true);
+        let old_b = provider_with_tables(53, "/opt/oldb.so", 1, 68, true);
+        let mut plan = scoped_plan(
+            &[filler.clone(), sole_complete_module(), old_b],
+            AdmissionScope::Named,
+        );
+        assert_eq!(plan.slots.len(), 2106);
+        plan.object_identities
+            .insert(PinnedObjectId(42), test_identity(42, "sha-reused-kept"));
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 136);
+        plan.revivable.clone_from(&plan.retired_keys);
+        // The returning pin lists the same 68 targets (reclaimed) plus 10
+        // fresh ones: a 2,048-slot snapshot fits, but 2,106 + 10 lifetime
+        // slots do not.
+        let mut returning = sole_complete_module();
+        returning.object = PinnedObjectId(90);
+        let fresh: Vec<ScannedEntry> = (0..10u64)
+            .map(|entry| ScannedEntry {
+                name: "C_Sign",
+                object: returning.scanned.key,
+                object_path: returning.scanned.path.clone(),
+                file_offset: 0x1000 + 68 * 8 + entry * 8,
+            })
+            .collect();
+        returning.scanned.tables[0].entries.extend(fresh);
+        returning.entry_objects = vec![vec![PinnedObjectId(90); 78]];
+        returning.forward_verified = vec![vec![false; 78]];
+        let identities =
+            BTreeMap::from([(PinnedObjectId(90), test_identity(42, "sha-reused-kept"))]);
+        let rebuilt =
+            plan.rebuild_from_sources_with_identities(&[filler, returning], &[], &identities);
+        assert_eq!(rebuilt.slots.len(), 2048);
+        assert_eq!(rebuilt.reclaimed.len(), 68);
+        let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+            panic!("a reused-cell module must omit its fresh growth, not abort: {error}")
+        });
+        assert_eq!(plan.slots.len(), 2106, "no capacity growth");
+        assert_eq!(delta.new.len(), 68, "only the reclaimed cells attach");
+        let module = plan
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(90))
+            .expect("the returning module stays admitted")
+            .id;
+        for slot in &delta.new {
+            assert_eq!(slot.module_ids, [module], "no ownerless new link: {slot:?}");
+            assert_eq!(
+                plan.module_of_slot(slot.index),
+                Some(module),
+                "the reclaimed cell keeps its attribution: {slot:?}"
+            );
+        }
+        let omission = refusal_of(&plan, "/opt/p11.so").expect("the fresh growth is a counted gap");
+        assert!(
+            is_growth_omission(&omission.reason),
+            "continuing growth omits, never refuses whole: {}",
+            omission.reason
+        );
+        assert_eq!(
+            growth_omitted_count(&omission.reason),
+            Some(10),
+            "the gap counts the fresh cells only: {}",
+            omission.reason
+        );
+        assert!(
+            omission.reason.contains("kept its 68 attached"),
+            "the gap names the kept cells: {}",
+            omission.reason
+        );
+        assert_eq!(plan.modules_skipped.len(), 1);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Extension fallback, minimal drop: with 100 lifetime slots free and
+    /// two new 60-endpoint providers past them, the fallback refuses only
+    /// the last-admitted one and admits the other. Refusing both would
+    /// drop a provider that fits.
+    #[test]
+    fn fallback_refuses_only_the_last_admitted_new_module_when_it_fits() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1952, true);
+        let old = provider_with_tables(53, "/opt/old.so", 1, 60, true);
+        let mut plan = scoped_plan(&[filler.clone(), old], AdmissionScope::Named);
+        assert_eq!(plan.slots.len(), 2012);
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 60);
+        let a = provider_with_tables(60, "/opt/a.so", 1, 60, true);
+        let b = provider_with_tables(61, "/opt/b.so", 1, 60, true);
+        let rebuilt = plan.rebuild_from_sources(&[filler, a, b], &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.slots.len(), 2072);
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("one fitting provider must admit, not abort: {error}"));
+        assert_eq!(plan.slots.len(), 2072);
+        assert_eq!(plan.active_slot_count(), 2012);
+        assert_eq!(
+            slots_of(&plan, 60),
+            60,
+            "the first-admitted provider fits and stays"
+        );
+        assert_eq!(
+            slots_of(&plan, 61),
+            0,
+            "the last-admitted provider is refused"
+        );
+        assert!(refusal_of(&plan, "/opt/a.so").is_none());
+        let refused = refusal_of(&plan, "/opt/b.so").expect("B is a counted refusal");
+        let kinds: Vec<RefusalKind> = plan
+            .refused_modules_typed()
+            .filter(|(object, _, _)| *object == PinnedObjectId(61))
+            .map(|(_, _, kind)| kind)
+            .collect();
+        assert_eq!(kinds, [RefusalKind::CapacityWhole]);
+        assert_eq!(
+            whole_refusal_needed_count(&refused.reason),
+            Some(60),
+            "the refusal counts its demand: {}",
+            refused.reason
+        );
+        assert_eq!(plan.modules_skipped.len(), 1);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Extension fallback, existing growth: a provider already admitted
+    /// on 1,000 endpoints that grows to 1,101 past the lifetime budget
+    /// keeps its 1,000 attached cells and omits the 101 fresh ones as a
+    /// counted growth gap. The extension never aborts for a capacity
+    /// shortfall.
+    #[test]
+    fn extension_omits_an_existing_module_s_growth_instead_of_aborting() {
+        use crate::discovery::scan::ScannedEntry;
+
+        let others = provider_with_tables(50, "/opt/others.so", 1, 944, true);
+        let grown = provider_with_tables(52, "/opt/grown.so", 1, 1000, true);
+        let retired = provider_with_tables(53, "/opt/retired.so", 1, 68, true);
+        let mut plan = scoped_plan(
+            &[others.clone(), grown.clone(), retired],
+            AdmissionScope::Named,
+        );
+        assert_eq!(plan.slots.len(), 2012);
+        let rebuilt = plan.rebuild_from_sources(
+            &[others.clone(), grown.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 68);
+        let mut grown_plus = grown;
+        let fresh: Vec<ScannedEntry> = (0..101u64)
+            .map(|entry| ScannedEntry {
+                name: "C_Sign",
+                object: grown_plus.scanned.key,
+                object_path: grown_plus.scanned.path.clone(),
+                file_offset: 1000 * 8 + entry * 8,
+            })
+            .collect();
+        grown_plus.scanned.tables[0].entries.extend(fresh);
+        grown_plus.entry_objects = vec![vec![grown_plus.object; 1101]];
+        grown_plus.forward_verified = vec![vec![false; 1101]];
+        let rebuilt =
+            plan.rebuild_from_sources(&[others, grown_plus], &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.slots.len(), 2045);
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("existing growth must omit, never abort: {error}"));
+        assert!(delta.new.is_empty(), "no fresh cell attaches: {delta:?}");
+        assert_eq!(plan.slots.len(), 2012, "no capacity growth");
+        assert_eq!(
+            slots_of(&plan, 52),
+            1000,
+            "the grown module keeps its cells"
+        );
+        let omission = refusal_of(&plan, "/opt/grown.so").expect("the growth is a counted gap");
+        assert!(
+            is_growth_omission(&omission.reason),
+            "existing growth omits, never refuses whole: {}",
+            omission.reason
+        );
+        assert_eq!(
+            growth_omitted_count(&omission.reason),
+            Some(101),
+            "the gap counts the fresh cells: {}",
+            omission.reason
+        );
+        assert!(
+            omission.reason.contains("kept its 1000 attached"),
+            "the gap names the kept cells: {}",
+            omission.reason
+        );
+        assert_eq!(plan.modules_skipped.len(), 1);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Reclaim flip, both orders: a semantic generation that retires
+    /// count-only and returns semantic reoccupies its own retired cells —
+    /// as count-only, the way the kept path treats a count-only cell —
+    /// instead of burning 68 fresh slots per alternation.
+    #[test]
+    fn alternating_semantic_and_count_only_returns_reuse_one_generation() {
+        let semantic = sole_complete_module();
+        let count_only = count_only_copy(&semantic, false);
+        let mut plan = scoped_plan(std::slice::from_ref(&semantic), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68);
+        let legs = [
+            &count_only,
+            &semantic,
+            &count_only,
+            &semantic,
+            &count_only,
+            &semantic,
+        ];
+        for (cycle, returning) in legs.into_iter().enumerate() {
+            let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan.extend_exact(rebuilt).unwrap();
+            plan.revivable.clone_from(&plan.retired_keys);
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(returning),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            assert_eq!(
+                rebuilt.reclaimed.len(),
+                68,
+                "cycle {cycle}: merge tickets the return"
+            );
+            let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+                panic!("cycle {cycle}: a same-key return must not refuse: {error}")
+            });
+            assert_eq!(delta.new.len(), 68, "cycle {cycle}: new links attach");
+            assert!(
+                delta.new.iter().all(|slot| (slot.index as usize) < 68),
+                "cycle {cycle}: reoccupied, never fresh"
+            );
+            if cycle % 2 == 1 {
+                assert!(
+                    delta
+                        .new
+                        .iter()
+                        .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+                    "cycle {cycle}: a semantic return onto count-only cells attaches count-only"
+                );
+            }
+            assert_eq!(plan.slots.len(), 68, "cycle {cycle}: bounded");
+            assert_eq!(plan.active_slot_count(), 68, "cycle {cycle}");
+            assert!(
+                plan.modules_skipped.is_empty(),
+                "cycle {cycle}: no refusal: {:?}",
+                plan.modules_skipped
+            );
+        }
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Reclaim across workers: 32 sequential same-file workers, each
+    /// downgraded to count-only while active and then retired, stay on
+    /// one 68-cell generation with no refusal and no abort. Without the
+    /// count-only reoccupy each worker burns 68 fresh slots and the
+    /// thirtieth exhausts the budget.
+    #[test]
+    fn thirty_two_sequential_workers_stay_bounded_without_refusal() {
+        let identity = test_identity(7, "sha-thirty-two-workers");
+        let worker = |pin: u32| {
+            let mut module = sole_complete_module();
+            module.object = PinnedObjectId(pin);
+            module.scanned.key = scanned_key(PinnedObjectId(pin));
+            module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
+            module.forward_verified = vec![vec![false; 68]];
+            module
+        };
+        let mut plan = scoped_plan(&[], AdmissionScope::Named);
+        for nurse in 0..32u32 {
+            let pin = 100 + nurse;
+            let generation = worker(pin);
+            // Arrive semantic.
+            let identities = BTreeMap::from([(PinnedObjectId(pin), identity.clone())]);
+            let rebuilt = plan.rebuild_from_sources_with_identities(
+                std::slice::from_ref(&generation),
+                &[],
+                &identities,
+            );
+            if nurse == 0 {
+                assert!(rebuilt.reclaimed.is_empty(), "the first worker is fresh");
+            } else {
+                assert_eq!(
+                    rebuilt.reclaimed.len(),
+                    68,
+                    "worker {nurse}: merge tickets the return"
+                );
+            }
+            let delta = plan
+                .extend_exact(rebuilt)
+                .unwrap_or_else(|error| panic!("worker {nurse} arrival must not refuse: {error}"));
+            assert_eq!(delta.new.len(), 68, "worker {nurse}");
+            assert!(
+                plan.modules_skipped.is_empty(),
+                "worker {nurse}: no refusal: {:?}",
+                plan.modules_skipped
+            );
+            assert!(
+                plan.slots.len() <= 136,
+                "worker {nurse}: bounded, got {}",
+                plan.slots.len()
+            );
+            assert_eq!(plan.module_ambiguous, 0, "worker {nurse}: one owner");
+            // Downgraded to count-only while active.
+            let downgraded = count_only_copy(&generation, true);
+            let rebuilt = plan.rebuild_from_sources(
+                std::slice::from_ref(&downgraded),
+                &[],
+                &PinnedObjects::empty(),
+            );
+            let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+                panic!("worker {nurse} downgrade must not refuse: {error}")
+            });
+            if nurse == 0 {
+                assert_eq!(
+                    delta.replace.len(),
+                    68,
+                    "the active semantic generation lowers"
+                );
+            } else {
+                assert!(
+                    delta.replace.is_empty(),
+                    "worker {nurse}: already count-only"
+                );
+            }
+            assert!(
+                plan.slots.iter().all(|slot| slot.descriptor_index == 0),
+                "worker {nurse}: every cell is count-only"
+            );
+            // Exit.
+            let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan.extend_exact(rebuilt)
+                .unwrap_or_else(|error| panic!("worker {nurse} exit must not refuse: {error}"));
+            assert_eq!(plan.retired_slots.len(), 68, "worker {nurse}");
+            plan.revivable.clone_from(&plan.retired_keys);
+        }
+        assert_eq!(plan.slots.len(), 68);
+        assert!(plan.modules_skipped.is_empty());
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Extension fallback, refusal quality: the fallback refusal of a
+    /// heuristic provider at capacity uses the shared capacity reason —
+    /// reserve clause, counter hint, counted demand — and drops the
+    /// module's own skips, surfaces and ordinals with its slots, like a
+    /// merge-time refusal. Survivors keep theirs.
+    #[test]
+    fn fallback_refusal_names_hints_and_drops_module_evidence() {
+        use crate::discovery::scan::Skipped;
+
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1400, true);
+        let retired = provider_with_tables(53, "/opt/retired.so", 1, 650, true);
+        let mut plan =
+            scoped_plan_with_counter_hint(&[filler.clone(), retired], AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 2050);
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 650);
+        let mut a = provider_with_tables(60, "/opt/a.so", 1, 60, false);
+        a.scanned.tables[0].unpinned = vec![Skipped {
+            subject: "C_A".into(),
+            reason: "holder-a exited".into(),
+        }];
+        let mut b = provider_with_tables(61, "/opt/b.so", 1, 60, false);
+        b.scanned.tables[0].unpinned = vec![Skipped {
+            subject: "C_B".into(),
+            reason: "holder-b exited".into(),
+        }];
+        let rebuilt = plan.rebuild_from_sources_with(
+            &[filler, a, b],
+            &[],
+            &[],
+            |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+            |_, _| true,
+            None,
+            false,
+            plan.admission_policy,
+            true,
+        );
+        assert_eq!(rebuilt.slots.len(), 1520);
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("one fitting provider must admit, not abort: {error}"));
+        assert_eq!(slots_of(&plan, 60), 60, "the survivor keeps its cells");
+        assert_eq!(slots_of(&plan, 61), 0, "the refused module owns no cell");
+        let refused = refusal_of(&plan, "/opt/b.so").expect("B is a counted refusal");
+        assert!(
+            refused
+                .reason
+                .contains("reserved for providers with a corroborated function table"),
+            "the refusal names the reserve: {}",
+            refused.reason
+        );
+        assert!(
+            refused.reason.contains("--counter-mode counts"),
+            "the refusal names the counter remedy: {}",
+            refused.reason
+        );
+        assert_eq!(
+            whole_refusal_needed_count(&refused.reason),
+            Some(60),
+            "the refusal counts its demand: {}",
+            refused.reason
+        );
+        assert_eq!(plan.modules_skipped.len(), 1);
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|skip| skip.reason == "holder-a exited"),
+            "the survivor keeps its skips: {:?}",
+            plan.skipped
+        );
+        assert!(
+            !plan
+                .skipped
+                .iter()
+                .any(|skip| skip.reason == "holder-b exited"),
+            "the refused module drops its skips: {:?}",
+            plan.skipped
+        );
+        assert!(
+            plan.surfaces
+                .iter()
+                .any(|surface| surface.source.starts_with("/opt/a.so table ")),
+            "the survivor keeps its surfaces: {:?}",
+            plan.surfaces
+        );
+        assert!(
+            !plan
+                .surfaces
+                .iter()
+                .any(|surface| surface.source.starts_with("/opt/b.so table ")),
+            "the refused module drops its surfaces: {:?}",
+            plan.surfaces
+        );
+        assert!(
+            plan.slot_ordinals
+                .keys()
+                .any(|key| key.object == PinnedObjectId(60)),
+            "the survivor keeps its ordinals"
+        );
+        assert!(
+            !plan
+                .slot_ordinals
+                .keys()
+                .any(|key| key.object == PinnedObjectId(61)),
+            "the refused module drops its ordinals"
+        );
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Extension fallback, visibility: when the fallback fires, its gap
+    /// record says so and names what merge charged against what the
+    /// extension needs, so a merge/extend disagreement reads as a
+    /// diagnosed fallback instead of an ordinary whole refusal.
+    #[test]
+    fn extension_fallback_marks_its_gaps_with_merge_and_extend_charges() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1952, true);
+        let old = provider_with_tables(53, "/opt/old.so", 1, 60, true);
+        let mut plan = scoped_plan(&[filler.clone(), old], AdmissionScope::Named);
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        let a = provider_with_tables(60, "/opt/a.so", 1, 60, true);
+        let b = provider_with_tables(61, "/opt/b.so", 1, 60, true);
+        let rebuilt = plan.rebuild_from_sources(&[filler, a, b], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("one fitting provider must admit, not abort: {error}"));
+        let refused = refusal_of(&plan, "/opt/b.so").expect("B is a counted refusal");
+        assert!(
+            refused.reason.contains("extend fallback fired"),
+            "the gap says the fallback fired: {}",
+            refused.reason
+        );
+        assert!(
+            refused
+                .reason
+                .contains("merge charged 120 additions in a 2072-slot snapshot"),
+            "the gap names the merge charge: {}",
+            refused.reason
+        );
+        assert!(
+            refused
+                .reason
+                .contains("extend needs 120 additions in 2132 of 2112 lifetime slots"),
+            "the gap names the extend need: {}",
+            refused.reason
+        );
+    }
+
     /// Property-style matrix over the reclaim disagreements that used to
     /// surface at capacity: retired shape (heuristic count-only or semantic),
     /// returning shape (heuristic same-key or semantic cross-ID), a second
@@ -22245,6 +22768,8 @@ pub(crate) mod tests {
                             .iter()
                             .map(|slot| slot.descriptor_index)
                             .collect();
+                        let skipped_before = rebuilt.modules_skipped.clone();
+                        let refused_before = rebuilt.refused_module_objects.clone();
                         let delta = plan.extend_exact_with_stable_module_ids(rebuilt).unwrap_or_else(
                             |error| {
                                 panic!(
@@ -22257,6 +22782,16 @@ pub(crate) mod tests {
                         assert!(
                             plan.slots.len() <= MAX_SLOTS as usize,
                             "semantic {semantic}, co_claim {co_claim}: capacity grew"
+                        );
+                        assert_eq!(
+                            plan.modules_skipped, skipped_before,
+                            "semantic {semantic}, co_claim {co_claim}, rival {rival_module}, room {room}: \
+                             extend adds no refusal"
+                        );
+                        assert_eq!(
+                            plan.refused_module_objects, refused_before,
+                            "semantic {semantic}, co_claim {co_claim}, rival {rival_module}, room {room}: \
+                             extend adds no typed refusal"
                         );
                         for (index, old) in before.iter().enumerate() {
                             if *old != 0 && plan.slots[index].descriptor_index == 0 {
@@ -22522,6 +23057,8 @@ pub(crate) mod tests {
                 .iter()
                 .map(|slot| slot.descriptor_index)
                 .collect();
+            let skipped_before = rebuilt.modules_skipped.clone();
+            let refused_before = rebuilt.refused_module_objects.clone();
             let delta = plan
                 .extend_exact_with_stable_module_ids(rebuilt)
                 .unwrap_or_else(|error| {
@@ -22532,6 +23069,14 @@ pub(crate) mod tests {
             assert!(
                 plan.slots.len() <= MAX_SLOTS as usize,
                 "{label}: capacity grew"
+            );
+            assert_eq!(
+                plan.modules_skipped, skipped_before,
+                "{label}: extend adds no refusal"
+            );
+            assert_eq!(
+                plan.refused_module_objects, refused_before,
+                "{label}: extend adds no typed refusal"
             );
             for (index, old) in before.iter().enumerate() {
                 if *old != 0 && plan.slots[index].descriptor_index == 0 {

@@ -4549,6 +4549,236 @@ fn a_later_provider_prefix_replaces_the_earlier_whole_refusal() {
     );
 }
 
+/// I-A (tier-3 review of port3 fix1): a capacity lowering and a growth
+/// omission for one module keep separate high-water entries — neither
+/// replaces nor blocks the other, in either arrival order. Both plans
+/// below are real planner outputs for the same provider: one tick
+/// lowers its returning semantics at capacity, another omits its
+/// fresh growth; the capture history must count both gaps either way.
+#[test]
+fn capacity_lowering_and_growth_omission_keep_separate_high_water_marks() {
+    use plan::AdmissionScope;
+    let a_key = overlay_key(66);
+    let filler_key = overlay_key(67);
+    let mut pins = overlay_pins(&[(a_key, OVERLAY_SHA, 1), (filler_key, OVERLAY_SHA, 1)]);
+    let pristine_a = overlay_module(a_key);
+    let pristine_filler = overlay_module(filler_key);
+    let a_obj = pins
+        .id_for_scanned(&pristine_a, a_key, OVERLAY_PATH)
+        .expect("the provider pin resolves");
+    let filler_obj = pins
+        .id_for_scanned(&pristine_filler, filler_key, OVERLAY_PATH)
+        .expect("the filler pin resolves");
+    let sole_complete = |scan: ScannedModule, object: PinnedObjectId| {
+        let names: Vec<&str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        assert_eq!(names.len(), 68);
+        let entries: Vec<ScannedEntry> = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ScannedEntry {
+                name,
+                object: scan.key,
+                object_path: scan.path.clone(),
+                file_offset: 0x1000 + index as u64 * 8,
+            })
+            .collect();
+        let exports: std::sync::Arc<[(String, u64)]> = std::sync::Arc::from(
+            entries
+                .iter()
+                .map(|entry| (entry.name.to_string(), entry.file_offset))
+                .collect::<Vec<_>>(),
+        );
+        ReconciledModule {
+            exports,
+            getter_present: false,
+            witness_fault: false,
+            object,
+            entry_objects: vec![vec![object; entries.len()]],
+            forward_verified: vec![vec![false; entries.len()]],
+            scanned: ScannedModule {
+                tables_scan_finished: true,
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries,
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                    file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
+                    extension_impossible: false,
+                }],
+                ..scan
+            },
+        }
+    };
+    let provider = |scan: ScannedModule, object: PinnedObjectId, entries: usize| {
+        let table_entries: Vec<ScannedEntry> = (0..entries)
+            .map(|entry| ScannedEntry {
+                name: "C_Sign",
+                object: scan.key,
+                object_path: scan.path.clone(),
+                file_offset: entry as u64 * 8,
+            })
+            .collect();
+        ReconciledModule {
+            exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
+            object,
+            entry_objects: vec![vec![object; entries]],
+            forward_verified: vec![vec![false; entries]],
+            scanned: ScannedModule {
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries: table_entries,
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x10_0000,
+                    file_offset: Some(0),
+                    live_return: true,
+                    manifest_supported: false,
+                    extension_impossible: false,
+                }],
+                ..scan
+            },
+        }
+    };
+    let count_only_copy = |module: &ReconciledModule| {
+        let mut copy = module.clone();
+        copy.scanned.tables_scan_finished = false;
+        for table in &mut copy.scanned.tables {
+            table.live_return = false;
+            table.manifest_supported = false;
+        }
+        copy
+    };
+    let empty = PinnedObjects::empty();
+    let build = |modules: &[ReconciledModule]| {
+        plan::build_from_sources_scoped(modules, &[], &empty, false, AdmissionScope::Named, false)
+    };
+    let filler = provider(
+        pristine_filler.clone(),
+        filler_obj,
+        p11scope_ebpf_common::MAX_SLOTS as usize - 68,
+    );
+    let a_sem = sole_complete(pristine_a.clone(), a_obj);
+    // One tick lowers the provider's returning semantics at capacity.
+    let mut plan_lower = build(&[filler.clone(), count_only_copy(&a_sem)]);
+    assert_eq!(
+        plan_lower.slots.len(),
+        p11scope_ebpf_common::MAX_SLOTS as usize
+    );
+    let retired = plan_lower.rebuild_from_sources(std::slice::from_ref(&filler), &[], &empty);
+    plan_lower.extend_exact(retired).unwrap();
+    assert_eq!(plan_lower.retired_slots().len(), 68);
+    let remembered = plan_lower.retired_keys().clone();
+    plan_lower.set_revivable(remembered);
+    let rebuilt =
+        plan_lower.rebuild_from_sources(&[filler.clone(), a_sem.clone()], &[], &empty);
+    plan_lower.extend_exact(rebuilt).unwrap();
+    let lower_records: Vec<_> = plan_lower.refused_modules_typed().collect();
+    assert_eq!(lower_records.len(), 1, "{lower_records:?}");
+    assert_eq!(lower_records[0].0, a_obj);
+    assert_eq!(lower_records[0].2, plan::RefusalKind::CapacityLowering);
+    assert!(
+        plan::is_capacity_lowering(&lower_records[0].1.reason),
+        "real lowering record: {}",
+        lower_records[0].1.reason
+    );
+    // Another tick omits the same provider's fresh growth instead.
+    let mut a_grown = a_sem.clone();
+    a_grown.scanned.tables[0]
+        .entries
+        .extend((68..108u64).map(|index| ScannedEntry {
+            name: "C_Sign",
+            object: a_key,
+            object_path: OVERLAY_PATH.into(),
+            file_offset: 0x1000 + index * 8,
+        }));
+    a_grown.entry_objects[0].extend([a_obj; 40]);
+    a_grown.forward_verified[0].extend([false; 40]);
+    let mut plan_omit = build(&[filler, a_sem]);
+    assert_eq!(
+        plan_omit.slots.len(),
+        p11scope_ebpf_common::MAX_SLOTS as usize
+    );
+    let snapshot = build(std::slice::from_ref(&a_grown));
+    plan_omit.extend_exact(snapshot).unwrap();
+    let omit_records: Vec<_> = plan_omit.refused_modules_typed().collect();
+    assert_eq!(omit_records.len(), 1, "{omit_records:?}");
+    assert_eq!(omit_records[0].0, a_obj);
+    assert_eq!(omit_records[0].2, plan::RefusalKind::GrowthOmission);
+    assert_eq!(
+        plan::growth_omitted_count(&omit_records[0].1.reason),
+        Some(40),
+        "real omission record: {}",
+        omit_records[0].1.reason
+    );
+    // Both orders: the lowering never replaces or blocks the omission.
+    let timing = pins.owned_timing_key(a_obj).unwrap();
+    for (label, first, second) in [
+        ("lowering first", &plan_lower, &plan_omit),
+        ("omission first", &plan_omit, &plan_lower),
+    ] {
+        let mut facts = CaptureFacts::default();
+        facts.resolve_module_id(&timing).unwrap();
+        let counters = DiscoveryCounters::default();
+        let merge = |facts: &mut CaptureFacts, plan: &plan::AttachPlan| {
+            facts
+                .merge_current(
+                    plan,
+                    &pins,
+                    &[],
+                    &[],
+                    &[],
+                    &counters,
+                    &crate::prearm_module::PrearmState::empty(),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+        };
+        merge(&mut facts, first);
+        merge(&mut facts, second);
+        let mut published = plan::build_from_reconciled_modules(&[]);
+        facts.apply_to_plan(&mut published);
+        let reasons: Vec<&str> = published
+            .modules_skipped
+            .iter()
+            .map(|skipped| skipped.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons.len(),
+            2,
+            "{label}: both gaps are counted: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| plan::is_growth_omission(reason)),
+            "{label}: the omission survives: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| plan::is_capacity_lowering(reason)),
+            "{label}: the lowering survives: {reasons:?}"
+        );
+        let kinds: Vec<plan::RefusalKind> = facts
+            .history
+            .refusals
+            .values()
+            .map(|(_, kind)| *kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [plan::RefusalKind::GrowthOmission],
+            "{label}: the refusal entry keeps the omission"
+        );
+    }
+}
+
 /// Revival refresh: a retired slot clears for revival only after the
 /// session reports it physically detached on two consecutive refreshes
 /// and proves its counts final — the drain barrier, scripted.

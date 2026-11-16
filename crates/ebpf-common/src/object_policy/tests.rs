@@ -801,3 +801,87 @@ fn pqc_parameter_set_selector_and_key_type_scalars() {
         );
     }
 }
+
+// R2 new-site RED: Montgomery/Edwards curve encodings classify.
+// Existing-API only (byte slices in, Option out): compiles before
+// GREEN, fails on the membership assertions. The closed CURVES
+// table gains the reviewed rows with GREEN.
+#[test]
+fn newsite_montgomery_edwards_curve_encodings_classify() {
+    // Measured (gdb oracle, Playwright Firefox 1555, new TLS site):
+    // NSS passes the draft-josefsson Curve25519 OID (11 bytes) in the
+    // ephemeral X25519 keypair template.
+    const X25519_DRAFT: &[u8] = &[
+        0x06, 0x09, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01,
+    ];
+    assert!(
+        classify_ec_params(X25519_DRAFT).is_some(),
+        "measured X25519 params classify"
+    );
+    // RFC 8410 5-byte OID forms.
+    for oid in [
+        [0x06, 0x03, 0x2b, 0x65, 0x6e], // X25519 1.3.101.110
+        [0x06, 0x03, 0x2b, 0x65, 0x6f], // X448 1.3.101.111
+        [0x06, 0x03, 0x2b, 0x65, 0x70], // Ed25519 1.3.101.112
+        [0x06, 0x03, 0x2b, 0x65, 0x71], // Ed448 1.3.101.113
+    ] {
+        assert!(
+            classify_ec_params(&oid).is_some(),
+            "RFC 8410 params classify: {oid:02x?}"
+        );
+    }
+}
+
+// R2 new-site RED: the HKDF key type and the measured HKDF/AES value
+// lengths classify. Compiles before GREEN, fails on membership.
+#[test]
+fn newsite_hkdf_type_and_value_lens_classify() {
+    assert_eq!(
+        classify_attribute_scalar(SafeAttributeKind::KeyType, 0x42),
+        Some(0x42),
+        "CKK_HKDF classifies"
+    );
+    for len in [12u64, 48] {
+        assert_eq!(
+            classify_attribute_scalar(SafeAttributeKind::ValueLen, len),
+            Some(len as u16),
+            "value len {len} classifies"
+        );
+    }
+}
+
+// R2 new-site RED: EC parameter reads cover the 5-byte RFC 8410 and
+// 11-byte draft encodings. Compiles before GREEN, fails on the
+// length guards.
+#[test]
+fn newsite_ecparams_lengths_cover_montgomery_edwards() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        assert!(
+            valid_safe_attribute_length(SafeAttributeKind::EcParams, 5, layout),
+            "{layout:?}: 5-byte params read"
+        );
+        assert!(
+            valid_safe_attribute_length(SafeAttributeKind::EcParams, 11, layout),
+            "{layout:?}: 11-byte params read"
+        );
+    }
+}
+
+// R2 new-site RED: HKDF/concat derives authorize their scalar result
+// handle. Compiles before GREEN, fails on the closed mechanism set.
+#[test]
+fn newsite_hkdf_derive_result_protocol_is_authorized() {
+    let id = function_id("C_DeriveKey");
+    for mechanism in [0x402au64, 0x402b, 0x360] {
+        assert_ne!(
+            derive_result_protocol(mechanism),
+            DeriveResultProtocol::Unavailable,
+            "mechanism {mechanism:#x} authorizes its result"
+        );
+        assert_eq!(
+            authorized_result_pointer_args(id, Some(mechanism)),
+            [5, N],
+            "mechanism {mechanism:#x} retains arg 5"
+        );
+    }
+}

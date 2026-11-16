@@ -1513,3 +1513,66 @@ fn file_streams_carry_no_stdout_loss_object() {
         );
     }
 }
+
+/// Fix round 6, folded instances: the stream gate needs a record check
+/// mirroring edges. Digests insert on track (queued, not written), so
+/// membership alone proves nothing — only carried slots prove the
+/// stream carried both rows at least once.
+#[test]
+fn instance_emitter_has_record_needs_both_carried_slots() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut emitter = InstanceEmitter::with_cap(10);
+    let id = RegistryInstanceId::from_raw(1);
+    let other = RegistryInstanceId::from_raw(2);
+    assert!(
+        !emitter.has_record(id),
+        "a never-tracked instance has no record"
+    );
+    // Queued but unwritten: a digest exists, yet no slot is carried.
+    emitter.mark(id, InstanceKind::Instance, true, 10);
+    assert!(
+        !emitter.has_record(id),
+        "a queued-but-unwritten instance has no record"
+    );
+    // One of two rows streamed: still incomplete.
+    emitter
+        .write(
+            &mut writer,
+            id,
+            InstanceKind::Instance,
+            serde_json::json!({"instance": 1}),
+            10,
+            1000,
+        )
+        .unwrap();
+    assert!(
+        !emitter.has_record(id),
+        "a partially streamed instance has no record until both rows stream"
+    );
+    emitter
+        .write(
+            &mut writer,
+            id,
+            InstanceKind::Edge,
+            serde_json::json!({"edge": 1}),
+            10,
+            1001,
+        )
+        .unwrap();
+    assert!(
+        emitter.has_record(id),
+        "both rows streamed at least once is a record"
+    );
+    assert!(
+        !emitter.has_record(other),
+        "an untracked instance still has no record"
+    );
+    emitter.forget(id);
+    assert!(
+        !emitter.has_record(id),
+        "a forgotten instance has no record"
+    );
+}

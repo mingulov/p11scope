@@ -1864,6 +1864,17 @@ impl InstanceEmitter {
         self.digests.len()
     }
 
+    /// Whether this instance has a written record of both rows: digests
+    /// insert on track (queued, not written), so only carried slots
+    /// prove the stream carried each row at least once. The departed
+    /// fold only folds streamed instances, so a folded instance is
+    /// never stream-silent.
+    pub(crate) fn has_record(&self, id: RegistryInstanceId) -> bool {
+        self.digests
+            .get(&id)
+            .is_some_and(|digest| digest.instance.is_some() && digest.edge.is_some())
+    }
+
     /// Drop a folded instance's digest and queued keys: its rows left
     /// the snapshot, so no later emission may reference it and its
     /// bytes leave the retention bound.

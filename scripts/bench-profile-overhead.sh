@@ -262,7 +262,9 @@ cleanup_sample() {
 # fails, as does an exact stale key (r12_live_processes,
 # r12_dead_processes). The stale check runs on parsed keys, never on
 # substrings: "r10_r12_live_processes" contains "r12_live_processes".
-# Fails loudly (nonzero + message); run_sample refuses the sample.
+# Rows are the compact item-4 `[len, bytes]` tuples; the pre-item-4
+# `{"len":n,"bytes":n}` objects still parse for old logs. Anything
+# else fails loudly (nonzero + message); run_sample refuses the sample.
 parse_mem_line() {
     python3 -I - "$1" <<'EOF'
 import json, sys
@@ -292,6 +294,14 @@ dead_keys = ("r10_reduced_dead", "r12_open_dead", "r12_active_ops_dead",
 rows = bytes_ = 0
 for key in dead_keys:
     row = obj.get(key)
+    if isinstance(row, list) and len(row) == 2:
+        length, nbytes = row
+        if (isinstance(length, bool) or not isinstance(length, int) or length < 0
+                or isinstance(nbytes, bool) or not isinstance(nbytes, int) or nbytes < 0):
+            sys.exit(f"parse_mem_line: {key} is not a row ({row!r})")
+        rows += length
+        bytes_ += nbytes
+        continue
     if not isinstance(row, dict):
         sys.exit(f"parse_mem_line: {key} is not a row ({row!r})")
     for field in ("len", "bytes"):
@@ -512,17 +522,22 @@ EOF
     mixed_out=$(analyze "$tmp/mixed" 2>/dev/null) || rc=$?
     [ "$rc" -eq 3 ] || { echo "self-test: mixed log analyzed (rc=$rc, must refuse): $mixed_out" >&2; return 1; }
     # Round 5: the end memory line parses against the round-4 keys.
-    mem_json='{"command":"profile","elapsed_secs":210,"r10_r12_live_processes":3,"r10_r12_dead_processes":12,"r10_reduced_dead":{"len":1,"bytes":10},"r12_open_dead":{"len":2,"bytes":20},"r12_active_ops_dead":{"len":3,"bytes":30},"r12_next_pseudonym_dead":{"len":4,"bytes":40},"r12_find_active_dead":{"len":5,"bytes":50},"r12_pending_dead":{"len":6,"bytes":60},"r12_detached_dead":{"len":7,"bytes":70},"r12_inherited_ambiguous_dead":{"len":8,"bytes":80},"sample_us":456}'
+    # Rows are item-4 tuples on the wire; the object shape stays valid
+    # for old logs.
+    mem_json='{"command":"profile","elapsed_secs":210,"r10_r12_live_processes":3,"r10_r12_dead_processes":12,"r10_reduced_dead":[1,10],"r12_open_dead":[2,20],"r12_active_ops_dead":[3,30],"r12_next_pseudonym_dead":[4,40],"r12_find_active_dead":[5,50],"r12_pending_dead":[6,60],"r12_detached_dead":[7,70],"r12_inherited_ambiguous_dead":[8,80],"sample_us":456}'
     [ "$(parse_mem_line "$mem_json")" = "mem_live=3 mem_dead=12 mem_dead_rows=36 mem_dead_bytes=360 mem_sample_us=456" ] \
         || { echo "self-test: mem line parsed wrong" >&2; return 1; }
+    legacy_json='{"r10_r12_live_processes":3,"r10_r12_dead_processes":12,"r10_reduced_dead":{"len":1,"bytes":10},"r12_open_dead":{"len":2,"bytes":20},"r12_active_ops_dead":{"len":3,"bytes":30},"r12_next_pseudonym_dead":{"len":4,"bytes":40},"r12_find_active_dead":{"len":5,"bytes":50},"r12_pending_dead":{"len":6,"bytes":60},"r12_detached_dead":{"len":7,"bytes":70},"r12_inherited_ambiguous_dead":{"len":8,"bytes":80},"sample_us":456}'
+    [ "$(parse_mem_line "$legacy_json")" = "mem_live=3 mem_dead=12 mem_dead_rows=36 mem_dead_bytes=360 mem_sample_us=456" ] \
+        || { echo "self-test: legacy object rows parsed wrong" >&2; return 1; }
     # Stale key names (pre-round-4) fail even on an otherwise valid line;
     # the exact-key check must not trip on the "r10_r12_" prefix.
-    stale_json='{"r10_r12_live_processes":3,"r10_r12_dead_processes":12,"r12_live_processes":3,"r12_dead_processes":12,"r10_reduced_dead":{"len":0,"bytes":0},"r12_open_dead":{"len":0,"bytes":0},"r12_active_ops_dead":{"len":0,"bytes":0},"r12_next_pseudonym_dead":{"len":0,"bytes":0},"r12_find_active_dead":{"len":0,"bytes":0},"r12_pending_dead":{"len":0,"bytes":0},"r12_detached_dead":{"len":0,"bytes":0},"r12_inherited_ambiguous_dead":{"len":0,"bytes":0},"sample_us":1}'
+    stale_json='{"r10_r12_live_processes":3,"r10_r12_dead_processes":12,"r12_live_processes":3,"r12_dead_processes":12,"r10_reduced_dead":[0,0],"r12_open_dead":[0,0],"r12_active_ops_dead":[0,0],"r12_next_pseudonym_dead":[0,0],"r12_find_active_dead":[0,0],"r12_pending_dead":[0,0],"r12_detached_dead":[0,0],"r12_inherited_ambiguous_dead":[0,0],"sample_us":1}'
     if parse_mem_line "$stale_json" >/dev/null 2>&1; then
         echo "self-test: stale keys parsed (must fail)" >&2; return 1
     fi
-    # Null, short, and truncated shapes fail too.
-    null_json='{"r10_r12_live_processes":3,"r10_r12_dead_processes":0,"r10_reduced_dead":{"len":0,"bytes":0},"r12_open_dead":{"len":0,"bytes":0},"r12_active_ops_dead":{"len":0,"bytes":0},"r12_next_pseudonym_dead":{"len":0,"bytes":0},"r12_find_active_dead":{"len":0,"bytes":0},"r12_pending_dead":{"len":0,"bytes":0},"r12_detached_dead":{"len":0,"bytes":0},"r12_inherited_ambiguous_dead":{"len":0,"bytes":0},"sample_us":null}'
+    # Null, short, truncated, and malformed-row shapes fail too.
+    null_json='{"r10_r12_live_processes":3,"r10_r12_dead_processes":0,"r10_reduced_dead":[0,0],"r12_open_dead":[0,0],"r12_active_ops_dead":[0,0],"r12_next_pseudonym_dead":[0,0],"r12_find_active_dead":[0,0],"r12_pending_dead":[0,0],"r12_detached_dead":[0,0],"r12_inherited_ambiguous_dead":[0,0],"sample_us":null}'
     if parse_mem_line "$null_json" >/dev/null 2>&1; then
         echo "self-test: null sample_us parsed (must fail)" >&2; return 1
     fi
@@ -531,6 +546,14 @@ EOF
     fi
     if parse_mem_line '{"r10_r12_live_processes": 3' >/dev/null 2>&1; then
         echo "self-test: truncated JSON parsed (must fail)" >&2; return 1
+    fi
+    bad_row='{"r10_r12_live_processes":3,"r10_r12_dead_processes":0,"r10_reduced_dead":[1],"r12_open_dead":[0,0],"r12_active_ops_dead":[0,0],"r12_next_pseudonym_dead":[0,0],"r12_find_active_dead":[0,0],"r12_pending_dead":[0,0],"r12_detached_dead":[0,0],"r12_inherited_ambiguous_dead":[0,0],"sample_us":1}'
+    if parse_mem_line "$bad_row" >/dev/null 2>&1; then
+        echo "self-test: short tuple row parsed (must fail)" >&2; return 1
+    fi
+    bad_row='{"r10_r12_live_processes":3,"r10_r12_dead_processes":0,"r10_reduced_dead":{"len":1},"r12_open_dead":[0,0],"r12_active_ops_dead":[0,0],"r12_next_pseudonym_dead":[0,0],"r12_find_active_dead":[0,0],"r12_pending_dead":[0,0],"r12_detached_dead":[0,0],"r12_inherited_ambiguous_dead":[0,0],"sample_us":1}'
+    if parse_mem_line "$bad_row" >/dev/null 2>&1; then
+        echo "self-test: short object row parsed (must fail)" >&2; return 1
     fi
     [ "$(round_arms 1)" = "base cand cand base" ] || return 1
     [ "$(round_arms 2)" = "cand base base cand" ] || return 1

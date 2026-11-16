@@ -317,7 +317,14 @@ impl ExitingTask {
     /// `SIGKILL` does not count: a task running in user mode can execute
     /// a little more user code before the kernel takes the signal.
     fn past_user_mode(self) -> bool {
-        matches!(self.stat.state, b'Z' | b'X' | b'x') || self.stat.flags & PF_EXITING != 0
+        self.dead() || self.stat.flags & PF_EXITING != 0
+    }
+
+    /// A zombie or dead state. Unlike `PF_EXITING` (the flags word is
+    /// printed after the thread count), the state field is read before
+    /// the count in the same `stat` read.
+    fn dead(self) -> bool {
+        matches!(self.stat.state, b'Z' | b'X' | b'x')
     }
 }
 
@@ -327,15 +334,19 @@ trait FinalExitIo {
     fn group_exited(&mut self) -> Result<bool, ()>;
     fn leader(&mut self) -> Result<ExitingTask, ()>;
     fn tasks(&mut self) -> Result<Self::Tasks, ()>;
-    /// Open the member's `task/<tid>` directory, holding the tid
-    /// against reuse: an open task directory pins the struct pid, so
-    /// the number cannot be recycled while the handle lives. `Ok(None)`
-    /// only when the member is provably gone between the listing and
-    /// this open (`ENOENT`/`ESRCH`); any other failure is `Err`.
+    /// Open the member's `task/<tid>` directory and hold it. The handle
+    /// pins the struct pid object, not the number (`free_pid` frees the
+    /// number when the task detaches) and not the task: reads resolve
+    /// the struct pid's task at read time, so a released member's reads
+    /// fail, and a non-leader `exec` moves the leader's struct pid to
+    /// the execing thread. `Ok(None)` only when the member is provably
+    /// gone between the listing and this open (`ENOENT`/`ESRCH`); any
+    /// other failure is `Err`.
     fn open_member(&mut self, tid: u32) -> Result<Option<Self::Member>, ()>;
-    /// Read the held member's stat through its directory: the same
-    /// thread the open pinned, never a recycled occupant. Any failure,
-    /// including a release after the open, is `Err` and fails closed.
+    /// Read the held member's stat through its directory: whatever task
+    /// owns the held struct pid now, never a recycled number's occupant.
+    /// Any failure, including a release after the open, is `Err` and
+    /// fails closed.
     fn member(&mut self, member: &Self::Member) -> Result<ExitingTask, ()>;
     /// The held member's `Tgid` through the same directory, so the stat
     /// and membership reads cannot straddle a reuse. Any failure is
@@ -352,28 +363,42 @@ trait FinalExitIo {
 /// a creator that is not yet exiting, and the new thread is linked into
 /// the group before `clone` returns to it.
 ///
-/// Identity is pinned, not re-read by number: the first walk opens each
-/// listed member's `task/<tid>` directory and holds it, which pins the
-/// struct pid so the tid cannot be recycled while the handle lives; the
-/// stat and `Tgid` reads go through the held directory, so a recycled
-/// number, a same-tick birth collision, or a stat/status straddle cannot
-/// substitute a live thread. A member gone between the first listing and
-/// its open stays out of the proven set: a tid listed in the closing
-/// walk without a held handle is a new thread and fails.
+/// The first walk opens each listed member's `task/<tid>` directory and
+/// holds it; stat and `Tgid` are read through the held directory, so a
+/// recycled number reads as a failure, never as a live occupant, and a
+/// stat/status straddle cannot mix two threads. A member gone between
+/// the first listing and its open stays out of the proven set: a tid
+/// listed in the closing walk without a held handle fails.
 ///
-/// The task list is read a second time after every member was proven,
-/// and every thread it lists must have a held handle with the same
-/// birth, still past user mode, still in this group (`Tgid == pid`). A
-/// thread listed but gone at its closing re-read fails: it may have
-/// created a child after the listing that neither walk lists. An `exec`
-/// kill leaves the execing thread live, so it never qualifies. Any
-/// unreadable member, a reused leader, or an exhausted budget answers
-/// false: only a positive proof counts.
+/// The held directories alone do not prove the end: a non-leader `exec`
+/// (`fs/exec.c` `de_thread`) moves the leader's struct pid to the
+/// execing thread and copies the leader's start time into it, so the
+/// held leader directory can describe a new, live task with the same
+/// birth that creates a thread after the closing listing and then leaves
+/// by a thread exit. Neither listing names that thread.
 ///
-/// The proof assumes a task listing names every thread present when it
-/// starts; a thread created after the closing listing started would need
-/// a live creator outside the proven past set, which the closing walk
-/// would have listed as a new tid.
+/// The closing step is therefore a thread census. The closing listing
+/// is taken whole, then one leader `stat` read must show the original
+/// birth, a zombie or dead state, and the group's unreleased thread count
+/// `n` (read under the leader's `siglock`, after its state field, in the
+/// same read; 0 when the leader was released mid-read). Every closing
+/// tid is then re-read through its held handle after that count: same
+/// birth, past user mode, `Tgid == pid`; a tid without a handle, or one
+/// gone at its re-read, fails. A distinct non-leader member present
+/// after the count was unreleased when it was taken, and every counted
+/// thread is past user mode: the dead leader, and members proven past
+/// in the first walk (past user mode is irreversible, and only the
+/// leader's struct pid can change tasks, by an `exec` that a past task
+/// cannot perform). So when those members number exactly `n - 1`, the
+/// group had no live thread at the count and none can appear later:
+/// thread creation and `exec` need a live thread in the group.
+///
+/// A leader still in `do_exit` (not yet a zombie) never proves the
+/// census, because its `PF_EXITING` flag is printed after the count; the
+/// pidfd proves such a group once the leader is a zombie and alone. Any
+/// unreadable member, a reused leader, a count the members do not
+/// account for, or an exhausted budget answers false: only a positive
+/// proof counts.
 fn final_exit_with<Io: FinalExitIo>(
     io: &mut Io,
     pid: u32,
@@ -399,11 +424,9 @@ fn final_exit_with<Io: FinalExitIo>(
         return false;
     };
     // Every proven member by tid, with its birth and its held task
-    // directory: the open pins the struct pid, so the number cannot be
-    // recycled under the closing re-read. A member already gone between
-    // the listing and its open is left out: a tid that reappears in the
-    // closing listing without a handle is a new thread, never the
-    // released one.
+    // directory. A member already gone between the listing and its open
+    // is left out: a tid that reappears in the closing listing without a
+    // handle fails.
     let mut seen = std::collections::BTreeMap::new();
     for entry in tasks {
         if !work.spend(3) {
@@ -424,25 +447,45 @@ fn final_exit_with<Io: FinalExitIo>(
             Ok(_) | Err(()) => return false,
         }
     }
-    // Re-validate every thread the closing listing carries through its
-    // held directory: a new tid, a recycled number (which would need a
-    // handle the first walk never opened), a recovered member, or a
-    // member that left this group all fail the proof. A thread gone
-    // between the closing listing and its re-read fails too: it may have
-    // created a child after the listing that neither walk lists.
+    // The closing listing, taken whole before the census count so every
+    // re-read below happens after it.
     if !work.spend(1) {
         return false;
     }
     let Ok(again) = io.tasks() else {
         return false;
     };
+    let mut closing = Vec::new();
     for entry in again {
-        if !work.spend(3) {
+        if !work.spend(1) {
             return false;
         }
         let Ok(tid) = entry else {
             return false;
         };
+        closing.push(tid);
+    }
+    // The census count: one leader read with the original birth, a dead
+    // state (read before the count) and the unreleased thread count.
+    if !work.spend(1) {
+        return false;
+    }
+    let threads = match io.leader() {
+        Ok(leader) if leader.stat.birth == retained_birth && leader.dead() => leader.threads,
+        Ok(_) | Err(()) => None,
+    };
+    let Some(threads) = threads.filter(|threads| *threads > 0) else {
+        return false;
+    };
+    // Re-validate every closing tid through its held directory after the
+    // count: a new tid, a recycled number, a recovered member, a member
+    // that left this group, or a member gone at its re-read all fail.
+    // Distinct non-leader members are counted once each.
+    let mut counted = std::collections::BTreeSet::new();
+    for tid in closing {
+        if !work.spend(2) {
+            return false;
+        }
         let Some((first, held)) = seen.get(&tid) else {
             return false;
         };
@@ -455,6 +498,14 @@ fn final_exit_with<Io: FinalExitIo>(
         if io.task_tgid(held) != Ok(pid) {
             return false;
         }
+        if tid != pid {
+            counted.insert(tid);
+        }
+    }
+    // Every thread the count names is accounted for: the dead leader and
+    // `n - 1` distinct members proven past.
+    if counted.len() as u64 + 1 != u64::from(threads) {
+        return false;
     }
     // Close the walk on the same original leader: a reused or recovered
     // leader never inherits the proof.
@@ -892,8 +943,13 @@ mod tests {
         assert!(final_exit(&mut dying_group()));
         let mut single = dying_group();
         single.members.clear();
+        single.leader_threads = 1;
+        single.leader = task(b'Z', PF_EXITING);
+        assert!(final_exit(&mut single), "a single zombie leader");
+        // A single task still in do_exit is not a census proof (see
+        // `a_leader_not_yet_a_zombie_never_proves_the_census`).
         single.leader = task(b'R', PF_EXITING);
-        assert!(final_exit(&mut single), "a single task already in do_exit");
+        assert!(!final_exit(&mut single), "a single task still in do_exit");
         let mut exited = dying_group();
         exited.exited = true;
         exited.leader = task(b'S', 0);
@@ -1092,7 +1148,9 @@ mod tests {
             parse_exiting_task("7 (x) Z 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 3 0 500 0 0")
                 .unwrap();
         assert_eq!(parsed.threads, Some(3), "stat field 20");
-        let torn = parse_exiting_task("7 (x) Z 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 x").unwrap();
+        let torn =
+            parse_exiting_task("7 (x) Z 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 x 0 500 0 0")
+                .unwrap();
         assert_eq!(torn.threads, None, "a malformed count is no count");
     }
 

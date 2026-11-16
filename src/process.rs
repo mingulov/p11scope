@@ -1863,10 +1863,12 @@ pub(crate) fn process_proven_exited(pid: u32) -> bool {
 /// the proof behind the zero-byte exit wording and the errno'd
 /// mem-open silent path. It holds when the retained pidfd reports the
 /// group gone, when the leader and every member are past user mode
-/// ([`PidPin::final_exit_in_progress`], holding each member's task
-/// directory against tid reuse, with per-member birth and `Tgid`
-/// re-validation through the held handle, failing closed on a
-/// listed-but-gone member), or when `kill` answers `ESRCH`
+/// ([`PidPin::final_exit_in_progress`]: held member task directories
+/// with birth and `Tgid` re-validation, failing closed on a
+/// listed-but-gone member, closed by a thread census — a zombie leader
+/// whose unreleased thread count is exactly accounted for by proven
+/// members, so a non-leader `exec` that hands the leader's pid and start
+/// time to a live thread cannot pass), or when `kill` answers `ESRCH`
 /// ([`process_proven_exited`], hidepid-proof). Pidfd authority only for
 /// the pin arm: a start-time fallback pin's mismatch means the pid was
 /// reused by a live process, which is NOT an exit. A fallback pin with

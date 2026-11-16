@@ -11613,9 +11613,10 @@ mod tests {
     }
 
     /// A child that exits between the maps read and the mem open surfaces
-    /// `ESRCH` from `/proc/<pid>/mem`. That is the ordinary end of a
-    /// process, already counted via the exit ledger (descendant gaps) —
-    /// not a memory-unreadable loss. The scan returns the exited error
+    /// `ESRCH` from `/proc/<pid>/mem`. On a proven whole-group exit that
+    /// is the ordinary end of a process, not a memory-unreadable loss
+    /// (its per-class count on the silent path is owned by the engine
+    /// exit-scan work and not implemented here). The scan returns the exited error
     /// so the engine drops the view silently instead of latching a
     /// global `scan_unavailable` that would fail never-mapped cells.
     ///

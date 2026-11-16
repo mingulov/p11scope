@@ -192,6 +192,12 @@
             "scan_cap": {"type": "integer", "minimum": 0}
           }
         },
+        "discovery_retry_classes": {
+          "type": "object",
+          "propertyNames": {"enum": ["process-ended", "maps-snapshot", "object-missing", "process-view", "stale-view", "other"]},
+          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+          "minProperties": 1
+        },
         "drain_proven": {"type": "boolean"},
         "stop_quiescence": {
           "type": "object",

@@ -346,10 +346,22 @@ fn departed_exec_instants_prune_within_the_grace_but_keep_live_tasks() {
     }
     assert_eq!(run.binder.exec_instants_for_test(), 32);
     let live = 100u32;
+    // M6: the grace starts at the first exit sighting, not at the old
+    // EXEC instant: every EXEC here is older than the grace when its
+    // exit is first observed, so the first prune keeps all of them and
+    // the prune one grace later clears the departed ones.
+    let first_sight = run.clock + 180_000_000_000 + 1_000;
+    run.binder
+        .prune_departed(|pid| pid != live, |_| false, first_sight, 180_000_000_000);
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        32,
+        "the first exit sighting starts the grace, however old the EXEC"
+    );
     run.binder.prune_departed(
         |pid| pid != live,
         |_| false,
-        run.clock + 180_000_000_000,
+        first_sight + 180_000_000_000,
         180_000_000_000,
     );
     assert_eq!(
@@ -378,8 +390,11 @@ fn prune_keeps_live_tasks_and_gone_processes_within_the_grace() {
         32,
         "a live task and gone entries younger than the grace survive"
     );
+    // The grace is anchored at the first exit sighting (the prune
+    // above), not at the EXEC instant: the gone entries prune one
+    // grace after that sighting.
     run.binder
-        .prune_departed(|pid| pid != 100, |_| false, at + GRACE, GRACE);
+        .prune_departed(|pid| pid != 100, |_| false, at + GRACE - 1 + GRACE, GRACE);
     assert_eq!(
         run.binder.exec_instants_for_test(),
         1,
@@ -449,8 +464,24 @@ fn prune_clears_unbound_departed_state_past_the_grace() {
     run.settle();
     assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
     assert_eq!(run.binder.cookie_sequences_for_test(), 1);
+    // M6: the EXEC is older than the grace when the exit is first
+    // observed, so the first prune keeps the instant and the sequence;
+    // both prune one grace later.
+    let first_sight = 1_000 + GRACE + 1_000;
     run.binder
-        .prune_departed(|_| true, |_| false, 1_000 + GRACE, GRACE);
+        .prune_departed(|_| true, |_| false, first_sight, GRACE);
+    assert_eq!(
+        run.binder.exec_instants_for_test(),
+        1,
+        "the first exit sighting starts the grace, however old the EXEC"
+    );
+    assert_eq!(
+        run.binder.cookie_sequences_for_test(),
+        1,
+        "the first exit sighting starts the sequence grace too"
+    );
+    run.binder
+        .prune_departed(|_| true, |_| false, first_sight + GRACE, GRACE);
     assert_eq!(
         run.binder.exec_instants_for_test(),
         0,
@@ -460,6 +491,38 @@ fn prune_clears_unbound_departed_state_past_the_grace() {
         run.binder.cookie_sequences_for_test(),
         0,
         "an unbound departed image sequence prunes"
+    );
+}
+
+/// M6 for the cookie closure on its own: with no EXEC record the tgid
+/// has no exec instant, so the shared gone map cannot mask the
+/// sequence's own grace anchor. The last row is older than the grace
+/// when the exit is first observed: kept that prune, gone one grace
+/// later.
+#[test]
+fn prune_exec_less_sequence_grace_starts_at_first_exit_sight() {
+    const GRACE: u64 = 180_000_000_000;
+    let mut run = Run::new();
+    let domain = run.domain;
+    run.read(vec![row(domain, 7, 1, T, 900)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
+    assert_eq!(run.binder.exec_instants_for_test(), 0);
+    assert_eq!(run.binder.cookie_sequences_for_test(), 1);
+    let first_sight = 900 + GRACE + 1_000;
+    run.binder
+        .prune_departed(|_| true, |_| false, first_sight, GRACE);
+    assert_eq!(
+        run.binder.cookie_sequences_for_test(),
+        1,
+        "the first exit sighting starts the sequence grace, however old the row"
+    );
+    run.binder
+        .prune_departed(|_| true, |_| false, first_sight + GRACE, GRACE);
+    assert_eq!(
+        run.binder.cookie_sequences_for_test(),
+        0,
+        "an exec-less departed image sequence prunes past the grace"
     );
 }
 

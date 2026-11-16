@@ -1317,6 +1317,131 @@ mod tests {
         assert_eq!((live, dead), (0, 0));
     }
 
+    /// Item 4: the inventory stderr line stays below the 4096-byte
+    /// atomic pipe-write limit with every owned row at its bound. Real
+    /// soak lines already reach ~4025 bytes; at caps the object form
+    /// needs ~4.4 KB, so the rows stay compact. `len` is each row's
+    /// true bound (imported where the constant is shared); `bytes`
+    /// uses soak-measured per-entry sizes (r4) or the estimator order.
+    #[test]
+    fn memory_line_stays_below_pipe_atomic_limit_at_caps() {
+        use crate::caller_metadata::presentation::MAX_CALLER_METADATA_RECORDS;
+        use crate::discovery::caller_registry::instance_input::MAX_REGISTRY_INSTANCES;
+        use crate::discovery::caller_registry::{
+            DEFAULT_MAX_CALLERS, DEFAULT_MAX_EDGES, DEFAULT_MAX_GAPS, DEFAULT_MAX_MODULES,
+            DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL, DEFAULT_MAX_UNBOUND_IMAGES_PER_MODULE,
+        };
+        use crate::discovery::native_binding::DEFAULT_BINDER_LIMIT;
+        use crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT;
+        fn cap(len: usize, each: u64) -> CounterRow {
+            CounterRow {
+                len: len as u64,
+                bytes: (len as u64).saturating_mul(each),
+            }
+        }
+        let lens = InventoryLens {
+            adapter: AdapterLens {
+                // Soak-measured ~1.9 KB/row (r4: 3.47 MiB/1958).
+                callers: cap(DEFAULT_MAX_CALLERS, 1900),
+                incarnations: cap(DEFAULT_MAX_CALLERS, 48),
+                live_by_pid: cap(DEFAULT_MAX_CALLERS, 48),
+            },
+            native: NativeRetentionLens {
+                exec_exe: cap(16_384, 96),
+                exec_pruned: cap(65_536, 80),
+                exec_loss_domains: cap(64, 48),
+                pair_targets: cap(65_536, 192),
+                pair_counts: cap(65_536, 128),
+                pair_tombstones: cap(65_536, 48),
+                pair_totals: cap(1024, 64),
+                preadmission: cap(4096, 112),
+                pending_ids: cap(65_536, 128),
+                placement_generations: cap(65_536, 64),
+                recoveries: cap(4096, 256),
+                rendered_callers: cap(DEFAULT_MAX_CALLERS, 16),
+                ever_enumerated: cap(65_536, 64),
+                scan_freshness: cap(65_536, 64),
+                proven_images: cap(16_384, 96),
+                exe_probe_cache: cap(4096, 128),
+                binder: cap(DEFAULT_BINDER_LIMIT * 2, 128),
+            },
+            registry: RegistryLens {
+                callers: cap(DEFAULT_MAX_CALLERS, 64),
+                retired: cap(DEFAULT_MAX_CALLERS, 32),
+                modules: cap(DEFAULT_MAX_MODULES, 512),
+                // Soak-measured ~4.1 KB/row (r4: 6.25 MiB/1585).
+                edges: cap(DEFAULT_MAX_EDGES, 4130),
+                modules_by_key: cap(DEFAULT_MAX_MODULES, 128),
+                gap_index: cap(DEFAULT_MAX_GAPS, 64),
+                unbound_images: cap(DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL, 304),
+                unbound_module_images: cap(
+                    DEFAULT_MAX_MODULES * DEFAULT_MAX_UNBOUND_IMAGES_PER_MODULE,
+                    304,
+                ),
+                edge: EdgeLens {
+                    // Pool-consistent worst: the five maps share the
+                    // 160 MiB semantic pool.
+                    open: cap(200_000, 120),
+                    active: cap(200_000, 256),
+                    mechs: cap(50_000, 1500),
+                    pending: cap(200_000, 160),
+                    detached: cap(200_000, 160),
+                },
+                mech_pool_used_bytes: SEMANTIC_RESOURCE_LIMIT as u64,
+            },
+            history: HistoryLens {
+                rows: HistoryRows {
+                    modules: cap(4096, 256),
+                    decoded: cap(65_536, 64),
+                    surfaces: cap(65_536, 64),
+                    tables: cap(65_536, 64),
+                    skips: cap(65_536, 32),
+                    losses: cap(65_536, 32),
+                    refusals: cap(65_536, 32),
+                    fallbacks: cap(65_536, 32),
+                    recorroborated: cap(65_536, 32),
+                    conflicted: cap(65_536, 32),
+                    scan_gap_tombstones: cap(65_536, 32),
+                    corroboration_tombstones: cap(65_536, 32),
+                    fallback_tombstones: cap(65_536, 32),
+                    selection_inventory: cap(4096, 64),
+                    selection_surfaces: cap(65_536, 64),
+                    manifest_selection_ordinals: cap(65_536, 16),
+                    selections: cap(4096, 64),
+                    standard_exports: cap(4096, 64),
+                },
+            },
+            model: ModelLens {
+                sessions: cap(100_000, 128),
+                objects: cap(100_000, 128),
+                pending: cap(100_000, 128),
+                pruned_sessions: u64::MAX,
+                pruned_objects: u64::MAX,
+                domains: cap(1024, 256),
+                instances: cap(MAX_REGISTRY_INSTANCES, 512),
+                deferred_pending: cap(100_000, 128),
+                deferred_detached: cap(100_000, 128),
+                deferred_releases: cap(100_000, 64),
+                recently_pruned: cap(65_536, 32),
+                gaps: cap(DEFAULT_MAX_GAPS, 256),
+            },
+            ownership: cap(DEFAULT_MAX_EDGES, 128),
+            metadata_rows: Some(cap(MAX_CALLER_METADATA_RECORDS, 720)),
+            metadata_table: Some(cap(MAX_CALLER_METADATA_RECORDS, 700)),
+            baseline_rss_kb: Some(9_999_999),
+        };
+        let snapshot = MemorySnapshot::for_inventory(9_999_999, lens, u32::MAX);
+        let line = snapshot.format_line();
+        assert!(
+            line.len() < 4096,
+            "memory line {} bytes at caps, must stay below 4096",
+            line.len()
+        );
+        // The compact rows still round-trip through the parser twin.
+        let back = MemorySnapshot::parse_line(&line).expect("the capped line parses");
+        assert_eq!(back, snapshot);
+    }
+
     /// Minor 7: the stderr line stays well below the 4096-byte atomic
     /// pipe-write limit, even at large counter values. Future keys
     /// must keep this margin (split or trim before growing past it).

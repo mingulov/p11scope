@@ -7026,6 +7026,18 @@ fn demotion_retirement_round4_lifetime_callers_exceed_the_retained_budget() {
             native.scene.coordinator.adapter.record(id).is_none(),
             "the retired caller row is forgotten"
         );
+        // M2: retirement releases the metadata slot too; without the
+        // coordinator's `metadata.forget(id)` the lifetime table fills
+        // and later callers read a storage refusal.
+        let frame = native.scene.coordinator.metadata_frame();
+        assert!(
+            !frame.contains(id),
+            "caller {id:?} (lifetime {index}) released its metadata row"
+        );
+        assert_eq!(
+            frame.summary.budget_refusals, 0,
+            "no lifetime caller is refused metadata storage after a retirement"
+        );
     }
     assert_eq!(
         ids.len(),
@@ -7037,4 +7049,937 @@ fn demotion_retirement_round4_lifetime_callers_exceed_the_retained_budget() {
         0,
         "each forgotten caller released its ownership header"
     );
+}
+
+/// Item 1: exited callers WITH attributed calls fold into the exact
+/// per-module departed aggregate instead of holding caller slots: 5000
+/// lifetime callers (past the 4096 budget) retire with zero refusals,
+/// exact totals, a flat retained census, and gaps that keep naming the
+/// folded callers.
+#[test]
+fn demotion_retirement_round5_lifetime_callers_with_calls_fold_past_the_budget() {
+    const LIFETIME: usize = 5000;
+    const BATCH: usize = 16;
+    const ENTRIES: [u64; 4] = [0, 1, 5, 100];
+    let mut scene = Scene::placed();
+    scene
+        .native
+        .scene
+        .coordinator
+        .enable_caller_metadata(1)
+        .unwrap();
+    let live_caller = scene.caller;
+    let live_edges = scene.native.scene.coordinator.registry.edge_count();
+    let charges_before = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .semantic_resource_snapshot();
+    let mut expected_entries = 0u64;
+    let mut expected_with_calls = 0u64;
+    let mut rounds = 0u64;
+    for base in (0..LIFETIME).step_by(BATCH) {
+        let at = 1_000_000 + rounds * 10_000;
+        rounds += 1;
+        let mut members = Vec::new();
+        let mut rows = Vec::new();
+        let mut counts = Vec::new();
+        let mut ids = Vec::new();
+        for offset in 0..BATCH {
+            let index = base + offset;
+            let pid = 50_000 + index as u32;
+            let start = 500_000 + index as u64;
+            let ticket = 100_000 + index as u64;
+            let entries = ENTRIES[index % ENTRIES.len()];
+            expected_entries = expected_entries.saturating_add(entries);
+            if entries > 0 {
+                expected_with_calls += 1;
+            }
+            scene.native.scene.source.spawn(pid, start);
+            let id = scene
+                .native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, at)
+                .expect("a churn caller is never refused while folds recycle slots");
+            ids.push(id);
+            scene.native.scene.project_paths(pid, &[&scene.a], at);
+            scene.native.answer(pid, start, ticket);
+            let mut row = scene.native.row(ticket, 1, pid, 100, 0);
+            row.entry_count = entries;
+            rows.push(row);
+            counts.push((ticket, 1, 0, entries));
+            members.push((pid, id, ticket));
+            scene.native.scene.coordinator.registry.record_gap(
+                crate::discovery::caller_registry::RegistryGap {
+                    caller: Some(id),
+                    module: None,
+                    pid: Some(pid),
+                    subject: "test fold gap".into(),
+                    reason: "names a caller the fold retires".into(),
+                    budget: None,
+                },
+            );
+        }
+        scene.native.scene.coordinator.commit_batch(false).unwrap();
+        scene.native.witness(rows);
+        scene.native.counts_read(Vec::new(), counts);
+        scene.native.scene.coordinator.commit_batch(false).unwrap();
+        scene.apply(members_catalog(&scene, &members, true, at), at);
+        for &(_, id, _) in &members {
+            assert!(
+                scene
+                    .native
+                    .scene
+                    .coordinator
+                    .registry
+                    .edges_of(id)
+                    .next()
+                    .is_some(),
+                "batch caller {id:?} holds a mapping edge before it exits"
+            );
+        }
+        scene
+            .native
+            .scene
+            .coordinator
+            .synchronize_caller_metadata(at + 1);
+        let frame = scene.native.scene.coordinator.metadata_frame();
+        for id in &ids {
+            assert!(
+                frame.contains(*id),
+                "live batch caller {id:?} has a metadata row"
+            );
+        }
+        assert_eq!(
+            frame.summary.budget_refusals, 0,
+            "no batch caller is refused metadata storage"
+        );
+        for (pid, _, _) in &members {
+            scene.native.scene.source.kill(*pid);
+        }
+        scene.native.scene.coordinator.observe_empty_pass(
+            &mut UnavailableImageGuard,
+            &mut scene.native.cookies,
+            "test batch exit",
+            at + 2,
+        );
+        scene.native.scene.coordinator.commit_batch(false).unwrap();
+        scene.native.scene.coordinator.note_rendered_callers(&ids);
+        assert_eq!(
+            scene
+                .native
+                .scene
+                .coordinator
+                .retire_rendered_callers(at + 3),
+            BATCH as u64,
+            "every proven-exited batch caller retires"
+        );
+        // The retained census plateaus: only the never-exiting scene
+        // caller and its edges stay; churn leaves no slot behind.
+        assert_eq!(
+            scene.native.scene.coordinator.adapter().len(),
+            1,
+            "only the live scene caller stays admitted"
+        );
+        assert_eq!(
+            scene.native.scene.coordinator.registry.edge_count(),
+            live_edges,
+            "only the live scene caller's edges stay"
+        );
+        let frame = scene.native.scene.coordinator.metadata_frame();
+        for id in &ids {
+            assert!(
+                scene.native.scene.coordinator.adapter.record(*id).is_none(),
+                "folded caller {id:?} holds no adapter row"
+            );
+            assert!(
+                !frame.contains(*id),
+                "folded caller {id:?} holds no metadata row"
+            );
+        }
+    }
+    let coordinator = &scene.native.scene.coordinator;
+    assert_eq!(
+        coordinator.retired_callers(),
+        LIFETIME as u64,
+        "every lifetime caller folded exactly once"
+    );
+    assert_eq!(
+        coordinator.adapter().admit_refused() + coordinator.registry.callers_refused(),
+        0,
+        "no lifetime caller was refused a caller slot"
+    );
+    assert_eq!(
+        coordinator.metadata_frame().summary.budget_refusals,
+        0,
+        "no lifetime caller was refused metadata storage"
+    );
+    assert_eq!(
+        coordinator.registry.gaps().len(),
+        LIFETIME,
+        "every batch gap is retained"
+    );
+    // Gaps keep naming the folded callers by label; the rows are gone
+    // but the evidence still resolves through the stream and the
+    // departed aggregate.
+    for gap in coordinator.registry.gaps() {
+        assert!(
+            gap.caller
+                .is_some_and(|caller| coordinator.adapter.record(caller).is_none()),
+            "a retained gap names its folded caller"
+        );
+    }
+    let charges_after = coordinator.registry.semantic_resource_snapshot();
+    assert_eq!(
+        (
+            charges_after.charged_bytes,
+            charges_after.peak_charged_bytes
+        ),
+        (
+            charges_before.charged_bytes,
+            charges_before.peak_charged_bytes
+        ),
+        "folds without semantic state charge nothing"
+    );
+    let document = crate::inventory::render_json(coordinator, "test", 0, rounds * 10_000, rounds);
+    assert_eq!(
+        document["budgets"]["callers"]["retired"], LIFETIME as u64,
+        "the report counts every folded caller"
+    );
+    assert_eq!(
+        document["budgets"]["callers"]["retired_with_calls"], expected_with_calls,
+        "the report counts the folded callers that carried calls"
+    );
+    assert_eq!(
+        document["budgets"]["edges"]["folded"], LIFETIME as u64,
+        "the report counts every folded edge"
+    );
+    assert_eq!(
+        document["budgets"]["edges"]["folded_entries"], expected_entries,
+        "the report counts every folded entry"
+    );
+    assert_eq!(
+        document["layer_totals"]["logical_entries"], expected_entries,
+        "folded entries stay in the logical total"
+    );
+    assert_eq!(
+        document["layer_totals"]["forwarding_entries"], 0,
+        "no forwarding layer observed these calls"
+    );
+    // The never-exiting scene caller keeps its live row and edge: the
+    // fold only retires proven-ended callers.
+    let live = coordinator
+        .adapter
+        .record(live_caller)
+        .expect("the live scene caller stays admitted");
+    assert_eq!(live.lifecycle, CallerLifecycle::Mapped);
+    assert!(
+        coordinator.registry.edges_of(live_caller).next().is_some(),
+        "the live scene caller keeps its edge"
+    );
+}
+
+/// Item 1: a folded edge's counts, function/rv breakdown and identity
+/// survive in the departed aggregate row-for-row: the module's
+/// `departed_use` carries exactly what the edge showed before the fold.
+#[test]
+fn demotion_retirement_round5_folded_edge_semantics_stay_exact() {
+    use crate::semantics_edge::SemanticCall;
+    use p11scope_ebpf_common::capture;
+    use pkcs11_types::CkRv;
+    const MECH_SIGN: u64 = 0x0d;
+    const MECH_DIGEST: u64 = 0x250;
+    fn init(function: &str, session: u64, mechanism: u64, ts_ns: u64) -> SemanticCall {
+        SemanticCall {
+            function: function.into(),
+            session,
+            mechanism,
+            capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+    fn op(function: &str, session: u64, ts_ns: u64) -> SemanticCall {
+        SemanticCall {
+            function: function.into(),
+            session,
+            capture: capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let coordinator = &mut scene.native.scene.coordinator;
+    let module_key = {
+        let edge = coordinator
+            .registry
+            .edges_of(caller)
+            .next()
+            .expect("the shared scene stages one edge")
+            .clone();
+        coordinator
+            .registry
+            .module(edge.module)
+            .expect("the edge module is retained")
+            .key
+            .clone()
+    };
+    let charges_before = coordinator.registry.semantic_resource_snapshot();
+    // One completed sign, one failed digest, one still-live operation.
+    coordinator.registry_mut().observe_semantic(
+        caller,
+        &module_key,
+        init("C_SignInit", 7, MECH_SIGN, 300),
+    );
+    coordinator
+        .registry_mut()
+        .observe_semantic(caller, &module_key, op("C_Sign", 7, 310));
+    coordinator.registry_mut().observe_semantic(
+        caller,
+        &module_key,
+        init("C_DigestInit", 9, MECH_DIGEST, 320),
+    );
+    let mut failing = op("C_Digest", 9, 330);
+    failing.rv = CkRv::GENERAL_ERROR.0;
+    coordinator
+        .registry_mut()
+        .observe_semantic(caller, &module_key, failing);
+    coordinator.registry_mut().observe_semantic(
+        caller,
+        &module_key,
+        init("C_EncryptInit", 11, MECH_SIGN, 340),
+    );
+    coordinator.commit_batch(false).unwrap();
+    // The fold input: the retired edge row, rendered after the exit.
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test s1 exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let coordinator = &scene.native.scene.coordinator;
+    let retired = crate::inventory::render_json(coordinator, "test", 0, 1000, 1);
+    let edge = retired["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .find(|edge| edge["caller"] == caller.label())
+        .expect("the retired edge still renders before the fold")
+        .clone();
+    let caller_row = retired["callers"]
+        .as_array()
+        .expect("callers array")
+        .iter()
+        .find(|row| row["id"] == caller.label())
+        .expect("the retired caller still renders before the fold")
+        .clone();
+    assert_eq!(edge["semantics"], "observed");
+    assert_eq!(
+        edge["mechanisms"].as_array().expect("mechanism rows").len(),
+        2,
+        "both mechanisms are claimed before the fold"
+    );
+    assert_eq!(caller_row["retired"], true);
+    assert_eq!(caller_row["lifecycle"], "exited");
+    let pre_entries = edge["entries"]["count"].as_u64().expect("entry count");
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene.native.scene.coordinator.retire_rendered_callers(1001),
+        1,
+        "the proven-exited caller with calls retires"
+    );
+    let coordinator = &scene.native.scene.coordinator;
+    assert!(
+        coordinator.adapter.record(caller).is_none(),
+        "the folded caller holds no adapter row"
+    );
+    assert!(
+        coordinator.registry.edges_of(caller).next().is_none(),
+        "the folded edge leaves the registry"
+    );
+    assert_eq!(
+        coordinator.registry.semantic_occupied(),
+        0,
+        "the fold releases the edge's semantic occupancy"
+    );
+    let charges_after = coordinator.registry.semantic_resource_snapshot();
+    assert_eq!(
+        charges_after.charged_bytes, charges_before.charged_bytes,
+        "the fold refunds the edge's semantic charges"
+    );
+    let folded = crate::inventory::render_json(coordinator, "test", 0, 1001, 2);
+    assert!(
+        folded["edges"].as_array().expect("edges array").is_empty(),
+        "no edge row survives the fold"
+    );
+    assert!(
+        folded["callers"]
+            .as_array()
+            .expect("callers array")
+            .is_empty(),
+        "no caller row survives the fold"
+    );
+    assert_eq!(folded["budgets"]["callers"]["retired"], 1);
+    assert_eq!(folded["budgets"]["callers"]["retired_with_calls"], 1);
+    assert_eq!(folded["budgets"]["edges"]["folded"], 1);
+    assert_eq!(folded["budgets"]["edges"]["folded_entries"], pre_entries);
+    assert_eq!(folded["layer_totals"]["logical_entries"], pre_entries);
+    let module = folded["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .find(|module| {
+            module["paths"].as_array().is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| path.ends_with("a.so")))
+            })
+        })
+        .expect("the provider module renders")
+        .clone();
+    // One folded edge: every distribution holds exactly the edge row's
+    // own values, so the aggregate row reads identically in meaning.
+    let departed = &module["departed_use"];
+    assert_eq!(departed["callers"], 1);
+    assert_eq!(departed["edges"], 1);
+    assert_eq!(departed["entries"]["count"], pre_entries);
+    assert_eq!(
+        departed["entries"]["saturated"],
+        u64::from(edge["entries"]["saturated"].as_bool().expect("saturated")),
+    );
+    assert_eq!(
+        departed["entries"]["first_min_ns"],
+        edge["entries"]["first_seen_ns"],
+    );
+    assert_eq!(
+        departed["entries"]["last_max_ns"],
+        edge["entries"]["last_seen_ns"]
+    );
+    assert_eq!(departed["entries"]["in_flight"], 0);
+    assert_eq!(departed["entries"]["logical"], pre_entries);
+    assert_eq!(departed["entries"]["forwarding"], 0);
+    let observation = edge["entries"]["observation"]
+        .as_str()
+        .expect("observation");
+    assert_eq!(departed["entries"]["observation"][observation], 1);
+    let coverage = &edge["entries"]["coverage"];
+    let state = coverage["state"].as_str().expect("coverage state");
+    for (key, want) in [
+        ("counted", u64::from(state == "counted")),
+        ("witnessed", u64::from(state == "witnessed")),
+        ("watched_no_use", u64::from(state == "watched_no_use")),
+    ] {
+        assert_eq!(departed["entries"]["coverage"][key], want, "coverage {key}");
+    }
+    assert_eq!(
+        departed["entries"]["coverage"]["since_min_ns"],
+        coverage["since_ns"],
+    );
+    assert_eq!(
+        departed["entries"]["coverage"]["until_max_ns"],
+        coverage["until_ns"],
+    );
+    assert_eq!(
+        departed["entries"]["coverage"]["first_min_ns"],
+        coverage["first_ns"],
+    );
+    let mapping = &edge["mapping"];
+    for (key, want) in [
+        ("mapped", u64::from(mapping["state"] == "mapped")),
+        ("ended", u64::from(mapping["state"] == "ended")),
+        ("uncertain", u64::from(mapping["state"] == "uncertain")),
+    ] {
+        assert_eq!(departed["mapping"]["state"][key], want, "mapping {key}");
+    }
+    let evidence = mapping["evidence"].as_str().expect("mapping evidence");
+    assert_eq!(departed["mapping"]["evidence"][evidence], 1);
+    assert_eq!(
+        departed["mapping"]["interruptions"],
+        mapping["interruptions"]
+    );
+    assert_eq!(
+        departed["mapping"]["first_min_ns"],
+        mapping["first_seen_ns"]
+    );
+    assert_eq!(departed["mapping"]["last_max_ns"], mapping["last_seen_ns"]);
+    assert_eq!(departed["mapping"]["reasons_overflow"], 0);
+    if let Some(reason) = mapping["reason"].as_str() {
+        assert_eq!(departed["mapping"]["reasons"][reason], 1);
+    }
+    let label = edge["semantics"].as_str().expect("semantic label");
+    assert_eq!(departed["semantics"]["labels"][label], 1);
+    assert_eq!(
+        departed["mechanisms"], edge["mechanisms"],
+        "every mechanism row survives with its function/rv breakdown"
+    );
+    assert_eq!(departed["mechanisms_overflow"]["mechs"], 0);
+    assert_eq!(departed["mechanisms_overflow"]["calls"], 0);
+    assert_eq!(departed["mechanisms_overflow"]["errors"], 0);
+    let operations = &edge["operations"];
+    for key in [
+        "calls",
+        "started",
+        "completed",
+        "cancelled",
+        "failed",
+        "unknown",
+        "orphans",
+        "dropped",
+        "last_seen_ns",
+    ] {
+        assert_eq!(
+            departed["operations"][key], operations[key],
+            "operations {key}"
+        );
+    }
+    assert_eq!(departed["operations"]["evidence"], operations["evidence"]);
+    assert!(
+        departed["operations"]["active"]
+            .as_array()
+            .expect("active array")
+            .is_empty(),
+        "no live machine survives the fold"
+    );
+    // The exit retired the edge before the fold, so its live operation
+    // already ended unknown there: the fold itself settles nothing.
+    assert_eq!(departed["operations"]["settled_machines"], 0);
+    assert_eq!(departed["operations"]["settled_pending"], 0);
+    assert_eq!(departed["operations"]["settled_detached"], 0);
+    assert_eq!(departed["operations"]["settled_open"], 0);
+    assert!(
+        departed["operations"]["settled_active"]
+            .as_array()
+            .expect("settled array")
+            .is_empty()
+    );
+    assert_eq!(departed["operations"]["settled_active_overflow"], 0);
+    assert_eq!(departed["instances"]["folded"], 0);
+    let identities = departed["identities"].as_array().expect("identity rows");
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0]["caller"], caller_row["id"]);
+    assert_eq!(identities[0]["pid"], caller_row["pid"]);
+    assert_eq!(identities[0]["start_time"], caller_row["start_time"]);
+    assert_eq!(identities[0]["incarnation"], caller_row["incarnation"]);
+    assert_eq!(identities[0]["exe"], caller_row["image"]["exe"]);
+    assert_eq!(identities[0]["authority"], caller_row["image"]["authority"]);
+    assert_eq!(identities[0]["lifecycle"], caller_row["lifecycle"]);
+    assert_eq!(
+        identities[0]["lifecycle_reason"],
+        caller_row["lifecycle_reason"]
+    );
+    assert_eq!(
+        identities[0]["exec_observed"],
+        caller_row["image"]["exec_observed"]
+    );
+    assert_eq!(departed["identities_saturated"], false);
+    assert_eq!(departed["identities_dropped"], 0);
+}
+
+/// Item 1: a folded load lifetime survives in the departed aggregate:
+/// the instance row's state and reason, its API returns, and its S1
+/// rows fold exactly, including a lossy history.
+#[test]
+fn demotion_retirement_round5_folded_instances_stay_exact() {
+    use crate::discovery::caller_registry::instance_input::{
+        AdmittedInstance, AdmittedInstanceCall, InstanceKey,
+    };
+    use crate::semantics_edge::SemanticCall;
+    use p11scope_ebpf_common::{ImageIdentity, capture};
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let coordinator = &mut scene.native.scene.coordinator;
+    let module_key = {
+        let edge = coordinator
+            .registry
+            .edges_of(caller)
+            .next()
+            .expect("the shared scene stages one edge")
+            .clone();
+        coordinator
+            .registry
+            .module(edge.module)
+            .expect("the edge module is retained")
+            .key
+            .clone()
+    };
+    let key = InstanceKey::scripted(
+        scene.native.domain,
+        ImageIdentity {
+            task_cookie: 41,
+            exec_id: 1,
+        },
+        crate::discovery::instances::InstanceId::from_raw(3),
+        module_key,
+    );
+    coordinator
+        .registry_mut()
+        .note_instance(AdmittedInstance::scripted(key.clone(), caller));
+    coordinator.commit_batch(false).unwrap();
+    let facts = |function: &str, ts_ns: u64| SemanticCall {
+        function: function.into(),
+        session: 7,
+        mechanism: 0x40,
+        capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+        ts_ns,
+        ..SemanticCall::default()
+    };
+    coordinator
+        .registry_mut()
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            key.clone(),
+            caller,
+            1,
+            facts("C_SignInit", 300),
+        ));
+    coordinator
+        .registry_mut()
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            key.clone(),
+            caller,
+            2,
+            facts("C_Sign", 310),
+        ));
+    coordinator.commit_batch(false).unwrap();
+    // One more call under an unproven mapping: the history goes lossy
+    // with its reason kept.
+    coordinator.registry_mut().note_member_unscanned(caller);
+    coordinator.commit_batch(false).unwrap();
+    coordinator
+        .registry_mut()
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            key.clone(),
+            caller,
+            3,
+            facts("C_Sign", 320),
+        ));
+    coordinator.commit_batch(false).unwrap();
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test instance exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let coordinator = &scene.native.scene.coordinator;
+    let retired = crate::inventory::render_json(coordinator, "test", 0, 1000, 1);
+    let instance = retired["instances"]
+        .as_array()
+        .expect("instances array")
+        .iter()
+        .find(|row| row["caller"] == caller.label())
+        .expect("the retired instance still renders before the fold")
+        .clone();
+    assert_eq!(instance["state"], "retired");
+    let child = retired["semantic_edges"]
+        .as_array()
+        .expect("semantic edges array")
+        .iter()
+        .find(|row| row["caller"] == caller.label())
+        .expect("the retired semantic row still renders before the fold")
+        .clone();
+    assert_eq!(child["api_returns"]["count"], 3);
+    assert!(child["coverage"]["lossy"].as_bool().expect("lossy"));
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene.native.scene.coordinator.retire_rendered_callers(1001),
+        1,
+        "the proven-exited caller with an instance retires"
+    );
+    let coordinator = &scene.native.scene.coordinator;
+    assert!(
+        coordinator
+            .registry
+            .instances()
+            .all(|row| row.caller != caller),
+        "the folded instance leaves the registry"
+    );
+    let folded = crate::inventory::render_json(coordinator, "test", 0, 1001, 2);
+    assert!(
+        folded["instances"]
+            .as_array()
+            .expect("instances array")
+            .is_empty(),
+        "no instance row survives the fold"
+    );
+    assert!(
+        folded["semantic_edges"]
+            .as_array()
+            .expect("semantic edges array")
+            .is_empty(),
+        "no semantic row survives the fold"
+    );
+    assert_eq!(folded["budgets"]["instances"]["folded"], 1);
+    let module = folded["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .find(|module| {
+            module["paths"].as_array().is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| path.ends_with("a.so")))
+            })
+        })
+        .expect("the provider module renders")
+        .clone();
+    let departed = &module["departed_use"];
+    let folded_instances = &departed["instances"];
+    assert_eq!(folded_instances["folded"], 1);
+    assert_eq!(folded_instances["retired"], 1);
+    assert_eq!(folded_instances["observed"], 0);
+    assert_eq!(folded_instances["uncertain"], 0);
+    assert_eq!(folded_instances["settled_live"], 0);
+    let reason = instance["reason"].as_str().expect("instance reason");
+    assert_eq!(folded_instances["reasons"][reason], 1);
+    assert_eq!(folded_instances["first_min_ns"], instance["first_seen_ns"]);
+    assert_eq!(folded_instances["last_max_ns"], instance["last_seen_ns"]);
+    assert_eq!(
+        folded_instances["api_returns"],
+        child["api_returns"]["count"]
+    );
+    assert_eq!(
+        folded_instances["api_returns_saturated_rows"],
+        u64::from(
+            child["api_returns"]["saturated"]
+                .as_bool()
+                .expect("saturated")
+        ),
+    );
+    assert_eq!(
+        folded_instances["historical_only_returns"],
+        child["api_returns"]["historical_only_returns"]
+    );
+    assert_eq!(
+        folded_instances["lossy_rows"],
+        u64::from(child["coverage"]["lossy"].as_bool().expect("lossy")),
+    );
+    for reason in child["coverage"]["reasons"]
+        .as_array()
+        .expect("loss reasons")
+    {
+        let reason = reason.as_str().expect("reason code");
+        assert_eq!(
+            folded_instances["loss_reasons"][reason], 1,
+            "loss reason {reason}"
+        );
+    }
+    // The instance's own S1 rows fold through the same aggregate as
+    // the edge's: mechanisms identical, operations identical.
+    assert_eq!(departed["mechanisms"], child["mechanisms"]);
+    let operations = child["operations"].as_object().expect("operations");
+    for (key, value) in operations {
+        if key == "active" {
+            continue;
+        }
+        assert_eq!(
+            departed["operations"][key.as_str()],
+            *value,
+            "instance operations {key}"
+        );
+    }
+    assert_eq!(departed["operations"]["settled_machines"], 0);
+    assert_eq!(departed["operations"]["settled_pending"], 0);
+    assert_eq!(departed["operations"]["settled_detached"], 0);
+    assert_eq!(departed["operations"]["settled_open"], 0);
+}
+
+/// Item 1: an exec-retired caller with calls folds exactly, and live
+/// operations still open at the fold end unknown with explicit
+/// accounting — never silently completed, never silently dropped.
+#[test]
+fn demotion_retirement_round5_exec_retired_live_operations_settle_at_fold() {
+    use crate::semantics_edge::SemanticCall;
+    use p11scope_ebpf_common::capture;
+    let mut scene = Scene::shared();
+    let old = scene.caller;
+    let coordinator = &mut scene.native.scene.coordinator;
+    let module_key = {
+        let edge = coordinator
+            .registry
+            .edges_of(old)
+            .next()
+            .expect("the shared scene stages one edge")
+            .clone();
+        coordinator
+            .registry
+            .module(edge.module)
+            .expect("the edge module is retained")
+            .key
+            .clone()
+    };
+    coordinator.registry_mut().observe_semantic(
+        old,
+        &module_key,
+        SemanticCall {
+            function: "C_SignInit".into(),
+            session: 7,
+            mechanism: 0x0d,
+            capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+            ts_ns: 300,
+            ..SemanticCall::default()
+        },
+    );
+    coordinator.registry_mut().observe_semantic(
+        old,
+        &module_key,
+        SemanticCall {
+            function: "C_Sign".into(),
+            session: 7,
+            capture: capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL,
+            ts_ns: 310,
+            ..SemanticCall::default()
+        },
+    );
+    // Still open when the image execs away: no completion can follow.
+    coordinator.registry_mut().observe_semantic(
+        old,
+        &module_key,
+        SemanticCall {
+            function: "C_DigestInit".into(),
+            session: 9,
+            mechanism: 0x250,
+            capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+            ts_ns: 320,
+            ..SemanticCall::default()
+        },
+    );
+    coordinator.commit_batch(false).unwrap();
+    let live = crate::inventory::render_json(coordinator, "test", 0, 400, 1);
+    let live_edge = live["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .find(|edge| edge["caller"] == old.label())
+        .expect("the live edge renders")
+        .clone();
+    assert_eq!(
+        live_edge["operations"]["active"]
+            .as_array()
+            .expect("active machines")
+            .len(),
+        1,
+        "one operation is still open before the exec"
+    );
+    let events = scene
+        .native
+        .scene
+        .coordinator
+        .adapter
+        .exec_transition_scoped(old, 500);
+    scene
+        .native
+        .scene
+        .coordinator
+        .apply_reconcile_events(&events, 500);
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let coordinator = &scene.native.scene.coordinator;
+    let retired = crate::inventory::render_json(coordinator, "test", 0, 500, 2);
+    let edge = retired["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .find(|edge| edge["caller"] == old.label())
+        .expect("the exec-retired edge still renders before the fold")
+        .clone();
+    let live_at_fold: u64 = edge["operations"]["active"]
+        .as_array()
+        .expect("active machines")
+        .iter()
+        .map(|machine| machine["count"].as_u64().expect("machine count"))
+        .sum();
+    scene.native.scene.coordinator.note_rendered_callers(&[old]);
+    assert_eq!(
+        scene.native.scene.coordinator.retire_rendered_callers(501),
+        1,
+        "the proven exec-retired caller with calls retires"
+    );
+    let coordinator = &scene.native.scene.coordinator;
+    let new = coordinator
+        .adapter
+        .live_id(7)
+        .expect("the exec successor stays live");
+    assert_ne!(new, old, "the successor is a new incarnation");
+    let folded = crate::inventory::render_json(coordinator, "test", 0, 501, 3);
+    assert_eq!(folded["budgets"]["callers"]["retired"], 1);
+    assert_eq!(folded["budgets"]["callers"]["retired_with_calls"], 1);
+    let module = folded["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .find(|module| {
+            module["paths"].as_array().is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| path.ends_with("a.so")))
+            })
+        })
+        .expect("the provider module renders")
+        .clone();
+    let departed = &module["departed_use"];
+    assert_eq!(departed["callers"], 1);
+    assert_eq!(departed["edges"], 1);
+    // Exactly the machines still open at the fold end unknown there;
+    // their category/state distribution is preserved, not dropped.
+    assert_eq!(departed["operations"]["settled_machines"], live_at_fold);
+    assert_eq!(
+        departed["operations"]["unknown"].as_u64().expect("unknown"),
+        edge["operations"]["unknown"].as_u64().expect("unknown") + live_at_fold,
+    );
+    let mut settled: Vec<(String, String, u64)> = departed["operations"]["settled_active"]
+        .as_array()
+        .expect("settled array")
+        .iter()
+        .map(|machine| {
+            (
+                machine["category"].as_str().expect("category").to_string(),
+                machine["state"].as_str().expect("state").to_string(),
+                machine["count"].as_u64().expect("count"),
+            )
+        })
+        .collect();
+    settled.sort();
+    let mut open: Vec<(String, String, u64)> = edge["operations"]["active"]
+        .as_array()
+        .expect("active array")
+        .iter()
+        .map(|machine| {
+            (
+                machine["category"].as_str().expect("category").to_string(),
+                machine["state"].as_str().expect("state").to_string(),
+                machine["count"].as_u64().expect("count"),
+            )
+        })
+        .collect();
+    open.sort();
+    assert_eq!(settled, open);
+    for key in [
+        "calls",
+        "started",
+        "completed",
+        "cancelled",
+        "failed",
+        "orphans",
+        "dropped",
+        "last_seen_ns",
+    ] {
+        assert_eq!(
+            departed["operations"][key], edge["operations"][key],
+            "operations {key}"
+        );
+    }
 }

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://p11scope/inventory/v1-object-observations-v6.schema.json",
   "title": "p11scope/inventory/v1 object_observations section (H9, version 6)",
-  "description": "Consumer contract for H9 section version 6: identical to version 5 except the section version constant (6), the per-field source key on every metadata field (query, creation_success or null), the sixteen new-site metadata_labels (x25519/x448/ed25519/ed448, hkdf_96/128/192/256/384/other, generic_96/128/192/256/384/other), the CKK_HKDF key-type code (66) in metadata_field_key_type, the 12/48 sizes in metadata_field_value_len, and the four curve names in metadata_field_curve. Version 6 is emitted exactly when new-site content is present (a new-site label, the HKDF key-type scalar, a 12/48 value length, or a new curve name). Versions 1-5 stay frozen; consumers dispatch on the section version and refuse unknown versions. Frozen consumer contract for the H9 operation/key delivery and presentation section of p11scope/inventory/v1 documents (Task 4, H9 section 3). Every object is closed: additionalProperties is false at every level, and every enum is exact. Consumers (JSON readers, JSONL reconstructors, the dashboard) must read only this contract, never reducer internals or friendly labels. Row counters are cumulative within their row: repeated cumulative JSONL snapshots (kinds object_observed and key_operations_observed) replace rows by (bucket, row key, revision) and must never be summed as deltas. A row is keyed by its full key tuple; a greater revision replaces an older one; rows never delete (retained history is immutable). A row event's revision is its last change: the emitter sends only changed rows per revision, so unchanged rows persist client-side below the pass marker's object_revision. status names object authority, not S1 health: unavailable/partial/stale never imply S1 loss. Unknown-key summaries never carry started (starts are never fabricated into the unknown bucket). No raw handles, pointers, native keys, epochs, PIDs/TIDs, address-derived hashes or arbitrary attribute bytes appear anywhere in this section.",
+  "description": "Consumer contract for H9 section version 6: identical to version 5 except the section version constant (6), the per-field source key on every metadata field (query, creation_success or null), the sixteen new-site metadata_labels (x25519/x448/ed25519/ed448, hkdf_96/128/192/256/384/other, generic_96/128/192/256/384/other), the CKK_HKDF key-type code (66) in metadata_field_key_type, the 12/48 sizes in metadata_field_value_len, and the four curve names in metadata_field_curve. Version 6 is emitted exactly when new-site content is present (a new-site label, the HKDF key-type scalar, a 12/48 value length, a new curve name, or an established field with a non-`query` source). Versions 1-5 stay frozen; consumers dispatch on the section version and refuse unknown versions. Frozen consumer contract for the H9 operation/key delivery and presentation section of p11scope/inventory/v1 documents (Task 4, H9 section 3). Every object is closed: additionalProperties is false at every level, and every enum is exact. Consumers (JSON readers, JSONL reconstructors, the dashboard) must read only this contract, never reducer internals or friendly labels. Row counters are cumulative within their row: repeated cumulative JSONL snapshots (kinds object_observed and key_operations_observed) replace rows by (bucket, row key, revision) and must never be summed as deltas. A row is keyed by its full key tuple; a greater revision replaces an older one; rows never delete (retained history is immutable). A row event's revision is its last change: the emitter sends only changed rows per revision, so unchanged rows persist client-side below the pass marker's object_revision. status names object authority, not S1 health: unavailable/partial/stale never imply S1 loss. Unknown-key summaries never carry started (starts are never fabricated into the unknown bucket). No raw handles, pointers, native keys, epochs, PIDs/TIDs, address-derived hashes or arbitrary attribute bytes appear anywhere in this section.",
   "type": "object",
   "required": [
     "version",
@@ -248,7 +248,7 @@
             "creation_success",
             null
           ],
-          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). Null unless status is value; requested blocks always carry null."
+          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). An established value always carries query or creation_success; requested blocks and every non-value status carry null."
         }
       }
     },
@@ -294,7 +294,7 @@
             "creation_success",
             null
           ],
-          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). Null unless status is value; requested blocks always carry null."
+          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). An established value always carries query or creation_success; requested blocks and every non-value status carry null."
         }
       }
     },
@@ -329,7 +329,7 @@
             "creation_success",
             null
           ],
-          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). Null unless status is value; requested blocks always carry null."
+          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). An established value always carries query or creation_success; requested blocks and every non-value status carry null."
         }
       }
     },
@@ -367,7 +367,7 @@
             "creation_success",
             null
           ],
-          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). Null unless status is value; requested blocks always carry null."
+          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). An established value always carries query or creation_success; requested blocks and every non-value status carry null."
         }
       }
     },
@@ -405,7 +405,7 @@
             "creation_success",
             null
           ],
-          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). Null unless status is value; requested blocks always carry null."
+          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). An established value always carries query or creation_success; requested blocks and every non-value status carry null."
         }
       }
     },
@@ -444,7 +444,7 @@
             "creation_success",
             null
           ],
-          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). Null unless status is value; requested blocks always carry null."
+          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). An established value always carries query or creation_success; requested blocks and every non-value status carry null."
         }
       }
     },
@@ -489,7 +489,7 @@
             "creation_success",
             null
           ],
-          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). Null unless status is value; requested blocks always carry null."
+          "description": "How this field was established: a provider attribute-result read (query) or a successful creation return promoting its own finite template (creation_success). An established value always carries query or creation_success; requested blocks and every non-value status carry null."
         }
       }
     },

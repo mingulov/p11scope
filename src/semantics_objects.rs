@@ -615,6 +615,15 @@ impl AttrObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttributeList {
     items: [Option<AttrObservation>; MAX_TEMPLATE_ATTRIBUTES],
+    /// Pending owner/design ruling: the wire TRUNCATED flag (a
+    /// template beyond eight slots) is not plumbed into this
+    /// field — `AttributeList::new` derives it from the slice
+    /// length instead, and no production logic consumes it
+    /// (only the derived equality/debug impls observe it).
+    /// Promotion reads the retained first eight cells only.
+    /// Pinned by the nine-slot s2s3 twin; plumbing the flag or
+    /// refusing promotion on truncation must flip that twin.
+    /// Kept (not removed) so the ruling has a field to attach to.
     truncated: bool,
 }
 

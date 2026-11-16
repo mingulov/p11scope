@@ -556,6 +556,13 @@ impl ViewRecord {
                 FieldState::Value(FieldValue::Scalar(set)) => KeyLabel::pqc(key_type, set),
                 _ => None,
             },
+            // Pending owner/design ruling: 0x40 (CKK_EC_EDWARDS) and
+            // 0x41 (CKK_EC_MONTGOMERY) fall through here even with an
+            // established matching curve (ed25519/ed448, x25519/x448)
+            // — the closed label vocabulary defines no
+            // Edwards/Montgomery join, so the view stays unlabeled.
+            // Pinned by the 0x40/0x41 s2s3 twin; adding label arms
+            // must flip that twin.
             _ => None,
         }
     }

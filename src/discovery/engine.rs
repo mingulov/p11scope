@@ -7616,14 +7616,26 @@ fn skip_is_mid_scan_exit_refusal(skip: &Skipped) -> bool {
 }
 
 /// Whether the view's original thread group provably exited during its
-/// scan with no live reuse of its pid: the pin proves the original gone
-/// and a fresh read proves the pid names no live process now. A reused
-/// pid (live new occupant), an exec (same process alive), a live member,
-/// a transient check failure and an unprovable pin all read false and
-/// stay loud; so does a fallback-pinned zombie, whose start time still
-/// matches (fail closed, like the mem-open proof).
+/// scan: a positive whole-group proof only — the retained pidfd reports
+/// the group gone, the leader and every member are past user mode, or
+/// `kill` answers `ESRCH` for the pid. Pidfd authority only for the pin
+/// arm: a start-time fallback pin's mismatch means the pid was reused by
+/// a live process, which is not an exit. A reused pid, an exec, live
+/// members, an unresolved member walk, an exhausted proof budget, a
+/// transient check failure and an unprovable pin all read false and stay
+/// loud. Empty `/proc` maps never prove an exit here: a zombie leader
+/// shows empty maps while its members are alive.
 fn mid_scan_exit_proven(view: &ProcessView) -> bool {
-    view.original_exited() == Ok(true) && process::generation_dead(view.pid())
+    // Pidfd authority only: without it a mismatch is pid reuse.
+    if view.retained_pin().pidfd().is_ok() && view.original_exited() == Ok(true) {
+        return true;
+    }
+    // Leader and every member past user mode. Pidfd only inside: a
+    // fallback pin never qualifies, and an exhausted budget is false.
+    if view.final_exit_in_progress() {
+        return true;
+    }
+    process::process_proven_exited(view.pid())
 }
 
 /// One scan plus its pins plus its shape proof: the modules, the pins,

@@ -17874,6 +17874,11 @@ impl Engine {
         // exactly like frame-scan tables. The reserved owner view
         // is never retired, so their slots persist for the run and
         // later mappers' calls attach without frame admission.
+        // Committed run-learned copies drop out here: the store
+        // below is the canonical source, so without this every
+        // commit would stack another copy onto the previous ones
+        // and the plan inputs would grow without bound.
+        raw_modules.retain(|module| module.view != Self::RUN_LEARNED_VIEW_ID);
         let raw_before_learned = raw_modules.len();
         raw_modules.extend(self.run_learned_modules.iter().cloned());
         let raw_with_learned = raw_modules.len();

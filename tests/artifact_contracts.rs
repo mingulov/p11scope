@@ -6263,6 +6263,32 @@ fn immutable_policy_maps() {
     }
 }
 
+/// In-place count-only downgrade (A′): the Detailed/journal object
+/// carries a per-slot `SLOT_COUNT_ONLY` switch the entry/return
+/// programs read. It is a plain `Array<u32>` over the slot universe,
+/// flags 0, never frozen: userspace flips 0->1 while the slot's link
+/// is live instead of detaching and reattaching.
+#[test]
+fn slot_count_only_switch_is_a_never_frozen_u32_array() {
+    const BPF_MAP_TYPE_ARRAY: u32 = 2;
+    const ENTRIES: usize = 3;
+    const FLAGS: usize = 4;
+    let definitions = embedded_map_definitions();
+    let wide = cfg!(feature = "wide-detailed-2112");
+    let switch = definitions
+        .get("SLOT_COUNT_ONLY")
+        .expect("the Detailed/journal object carries SLOT_COUNT_ONLY");
+    assert_eq!(switch[0], BPF_MAP_TYPE_ARRAY, "map type");
+    assert_eq!(switch[1], 4, "key size");
+    assert_eq!(switch[2], 4, "value size");
+    assert_eq!(
+        switch[ENTRIES],
+        if wide { 2_112 } else { 512 },
+        "one cell per slot"
+    );
+    assert_eq!(switch[FLAGS], 0, "never frozen");
+}
+
 /// Independent marker expectation from the switch requests and the build
 /// inputs, never from the build's own output.
 fn artifact_expected_marker_enabled() -> bool {

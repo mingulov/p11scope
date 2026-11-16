@@ -131,6 +131,11 @@ def consumer_contract(variant, suffix, disassembly=None):
     return CHECKER["consumer_contract"](consumer, variant, blocks, initial, outlined)
 
 
+def descriptor_source_case(variant, suffix, disassembly=None):
+    consumer, initial, blocks, outlined = consumer_case(variant, suffix, disassembly)
+    return CHECKER["descriptor_source_contract"](consumer, variant, blocks, initial, outlined)
+
+
 def object_return_proof(variant, disassembly=None):
     """Run the actual outlined CFG, including its refused ordinary-base arm."""
     consumer, initial, _, _ = consumer_case(variant, "object_return", disassembly)
@@ -2081,6 +2086,50 @@ class EntryObjectTests(unittest.TestCase):
                 outlined.step(pc, {"r1": destination, ("live", 7): True})
         self.assertEqual(outlined.step(pc, {"r1": ("constant", 0), ("live", 7): True})["r0"],
                          ("constant", 0), "a missing side cannot invent emission success")
+
+    def test_slot_count_only_gates_every_entry_descriptor_source(self):
+        """Every entry/return descriptor use reads the count-only switch.
+
+        In-place downgrade (A'): a slot whose SLOT_COUNT_ONLY cell is
+        set observes descriptor 0 (COUNT_ONLY) although its link cookie
+        still names the downgraded semantic descriptor. The checker
+        proves, per consumer, that the DESCRIPTORS key is that gated
+        effective descriptor, never the raw cookie alone.
+        """
+        self.assertIn("descriptor_source_contract", CHECKER,
+                      "the entry checker proves the switch-gated descriptor source")
+        for variant in OBJECTS:
+            names = ["p11_entry", "ordinary_return", "object_return"] \
+                if variant == "default" else [
+                    "p11_entry", "p11_entry_ia32", "p11_entry_template",
+                    "p11_entry_template_pair", "p11_entry_template_second",
+                    "p11_entry_template_types", "ordinary_return", "object_return"]
+            for name in names:
+                with self.subTest(variant=variant, consumer=name):
+                    report = descriptor_source_case(variant, name)
+                    self.assertEqual(report["descriptor_source"], "count_only_gated",
+                                     f"{name} keys DESCRIPTORS by the switch-gated descriptor")
+                    self.assertGreaterEqual(len(report["switch_lookups"]), 1,
+                                            f"{name} reads SLOT_COUNT_ONLY")
+
+    def test_slot_count_only_removal_rejects_the_descriptor_source(self):
+        for variant in OBJECTS:
+            names = ["p11_entry"] if variant == "default" else [
+                "p11_entry", "p11_entry_template_second"]
+            for name in names:
+                consumer, _, _, _ = consumer_case(variant, name)
+                facts = consumer.facts()
+                lookups = [pc for pc, text in consumer.insns
+                           if pc in consumer.helper and text == "call 0x1"
+                           and facts.get(pc, {}).get("r1") == ("map", "SLOT_COUNT_ONLY")]
+                self.assertGreaterEqual(len(lookups), 1,
+                                        f"{variant} {name} reads SLOT_COUNT_ONLY")
+                pc = lookups[0]
+                with self.subTest(variant=variant, consumer=name, control="switch lookup removed"), \
+                        self.assertRaisesRegex(RuntimeError, "descriptor source"):
+                    descriptor_source_case(
+                        variant, name,
+                        mutate(OBJECTS[variant], consumer.name, pc, "call 0x1", "r0 = 0x0"))
 
 
 if __name__ == "__main__":

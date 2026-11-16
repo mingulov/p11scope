@@ -12106,6 +12106,179 @@ mod tests {
             None
         );
     }
+
+    /// In-place count-only downgrade (A′): a planner replace that only
+    /// narrows a semantic slot to count-only on the same object+offset
+    /// flips the slot's `SLOT_COUNT_ONLY` switch instead of detaching
+    /// the old link and attaching a new one, so no call falls into a
+    /// detach/attach window. The downgrade carries every precondition:
+    /// the map is present, the slot has a live link, the retained
+    /// target names the same attach key, the old descriptor is
+    /// semantic and the new one is count-only, and the entry program
+    /// is unchanged (unsafe-decoder/ia32 builds take today's
+    /// detach+replace path). The switch is written as 1 and read back;
+    /// `retained_static` follows the new slot. No link is detached, no
+    /// link is attached, and `pid_pairs`/`global_retirements` are
+    /// untouched: there is no physical gap to disclose.
+    #[test]
+    fn downgrade_in_place_carries_the_preconditions_and_no_link_mutation() {
+        fn body<'a>(source: &'a str) -> Option<&'a str> {
+            source
+                .split_once("    pub fn downgrade_in_place(")
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+        }
+        const REQUIRED: [&str; 10] = [
+            "\"SLOT_COUNT_ONLY\"",
+            "has_slot_link",
+            "AttachKey::of",
+            "descriptor_index != 0",
+            "descriptor_index == 0",
+            "\"p11_entry\"",
+            "unsafe_present",
+            "SLOT_COUNT_ONLY_SET",
+            "read back",
+            "retained_static",
+        ];
+        const FORBIDDEN: [&str; 5] = [
+            "detach_slots",
+            "attach_targets",
+            "pid_pairs",
+            "global_retirements",
+            "replace_targets",
+        ];
+        fn contract(source: &str) -> bool {
+            let Some(text) = body(source) else {
+                return false;
+            };
+            REQUIRED.iter().all(|marker| text.contains(marker))
+                && FORBIDDEN.iter().all(|marker| !text.contains(marker))
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "downgrade_in_place must carry every precondition with no link mutation"
+        );
+        for marker in REQUIRED {
+            let start = source.find("    pub fn downgrade_in_place(").unwrap();
+            let tail = source[start..].replacen(marker, "REMOVED", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed {marker}"
+            );
+        }
+    }
+
+    /// Narrowing-only switch: only a 0->1 write while the slot's link
+    /// is live. A slot whose switch is already set is refused back to
+    /// today's path instead of being written again, and the current
+    /// value is read before any write.
+    #[test]
+    fn count_only_switch_writes_narrow_only_while_a_link_is_live() {
+        fn body<'a>(source: &'a str) -> Option<&'a str> {
+            source
+                .split_once("    pub fn downgrade_in_place(")
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+        }
+        fn contract(source: &str) -> bool {
+            let Some(text) = body(source) else {
+                return false;
+            };
+            match (text.find("already set"), text.find(".set(")) {
+                (Some(read), Some(write)) => read < write,
+                _ => false,
+            }
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "downgrade_in_place must read the switch before its narrowing write"
+        );
+        let start = source.find("    pub fn downgrade_in_place(").unwrap();
+        for marker in ["already set", ".set("] {
+            let tail = source[start..].replacen(marker, "REMOVED", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed {marker}"
+            );
+        }
+    }
+
+    /// Attach-time narrowing guard: a slot whose count-only switch is
+    /// set refuses a semantic attach at that index; count-only
+    /// (descriptor 0) stays admitted, so a planner that never
+    /// re-raises count-only slots keeps working.
+    #[test]
+    fn attach_refuses_a_set_switch_unless_the_slot_is_count_only() {
+        fn body<'a>(source: &'a str) -> Option<&'a str> {
+            source
+                .split_once("    pub(crate) fn attach_targets(")
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+        }
+        fn contract(source: &str) -> bool {
+            let Some(text) = body(source) else {
+                return false;
+            };
+            text.contains("\"SLOT_COUNT_ONLY\"") && text.contains("count-only switch is set")
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "attach_targets must refuse a set switch for a semantic slot"
+        );
+        let start = source.find("    pub(crate) fn attach_targets(").unwrap();
+        for marker in ["\"SLOT_COUNT_ONLY\"", "count-only switch is set"] {
+            let tail = source[start..].replacen(marker, "REMOVED", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed {marker}"
+            );
+        }
+    }
+
+    /// Loader parity: the capture loader resizes the count-only switch
+    /// beside STATS, so a sized Detailed session and the switch agree
+    /// on the slot universe.
+    #[test]
+    fn capture_loader_resizes_the_count_only_switch_with_stats() {
+        fn body<'a>(source: &'a str) -> Option<&'a str> {
+            source
+                .split_once("fn load_capture_object_bytes_with_images(")
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once("\n}\n").map(|(text, _)| text))
+        }
+        fn contract(source: &str) -> bool {
+            let Some(text) = body(source) else {
+                return false;
+            };
+            match (
+                text.find("loader.map_max_entries(\"STATS\", slots);"),
+                text.find("loader.map_max_entries(\"SLOT_COUNT_ONLY\", slots);"),
+            ) {
+                (Some(stats), Some(switch)) => stats < switch,
+                _ => false,
+            }
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "the capture loader must resize SLOT_COUNT_ONLY beside STATS"
+        );
+        let start = source
+            .find("fn load_capture_object_bytes_with_images(")
+            .unwrap();
+        let tail = source[start..].replacen(
+            "loader.map_max_entries(\"SLOT_COUNT_ONLY\", slots);",
+            "loader.map_max_entries(\"SLOT_COUNT_ONLY\", 1);",
+            1,
+        );
+        assert!(
+            !contract(&format!("{}{}", &source[..start], tail)),
+            "a fixed switch size must not satisfy the STATS parity"
+        );
+    }
     use p11scope_ebpf_common::object_wire::{
         OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, ObjectDescriptorWire, none_object_wire,
         publish_object_descriptors,

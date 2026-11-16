@@ -754,6 +754,101 @@ mod exact_accounting_tests {
     }
 
     #[test]
+    fn exact_accounting_rejects_a_zero_after_a_partial() {
+        // Worker 0 partially observed, worker 1 missed, worker 2
+        // full: the zero sits after an attach boundary, a
+        // post-attach loss, never a run prefix.
+        let report = report([Some(4), Some(0), Some(10)]);
+        let error = check_exact_accounting(&report, PROVIDER, &ledgers())
+            .expect_err("a zero after a partial must fail");
+        assert!(
+            format!("{error:#}").contains("mid-capture"),
+            "the failure names the mid-capture loss: {error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_accounting_rejects_a_hole_between_two_windows() {
+        // Two disclosed table windows with a gap between them; the
+        // missed burst sits in the gap (before the latest end): the
+        // miss is inside no single disclosed window.
+        let mut report = report([Some(0), Some(10), Some(10)]);
+        report["evidence"]["discovery"][0]["unobserved_windows"] = serde_json::json!([
+            {"start_ns": 100, "end_ns": 200, "reason": "mapped_unattached"},
+            {"start_ns": 500, "end_ns": 1000, "reason": "mapped_unattached"},
+        ]);
+        let workers = vec![
+            worker(0, 300, 400),
+            worker(1, 1100, 1200),
+            worker(2, 1300, 1400),
+        ];
+        let error = check_exact_accounting(&report, PROVIDER, &workers)
+            .expect_err("a miss between two windows must fail");
+        assert!(
+            format!("{error:#}").contains("window"),
+            "the failure names the window: {error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_accounting_accepts_a_miss_before_its_own_endpoint_attach() {
+        // The missed burst sits past every disclosed window but ends
+        // before its own endpoint's first attach began: the attach
+        // point discloses the miss.
+        let mut report = report([Some(0), Some(10), Some(10)]);
+        report["evidence"]["discovery"][0]["unobserved_windows"] = serde_json::json!([
+            {"start_ns": 100, "end_ns": 150, "reason": "mapped_unattached"},
+        ]);
+        report["evidence"]["discovery"][0]["first_attach_points"] = serde_json::json!([
+            {"file_offset": 0x1000, "began_ns": 500, "attached_ns": 520},
+        ]);
+        report["functions"][0]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1000,
+        });
+        let workers = vec![
+            worker(0, 300, 400),
+            worker(1, 1100, 1200),
+            worker(2, 1300, 1400),
+        ];
+        check_exact_accounting(&report, PROVIDER, &workers)
+            .expect("a miss before its own endpoint attach passes");
+    }
+
+    #[test]
+    fn exact_accounting_accepts_a_partial_straddling_its_own_endpoint_attach() {
+        // The partial's burst starts past every disclosed window but
+        // its own endpoint's first attach began mid-burst: the attach
+        // landed inside the burst.
+        let mut report = report([Some(0), Some(4), Some(10)]);
+        report["evidence"]["discovery"][0]["unobserved_windows"] = serde_json::json!([
+            {"start_ns": 100, "end_ns": 150, "reason": "mapped_unattached"},
+        ]);
+        report["evidence"]["discovery"][0]["first_attach_points"] = serde_json::json!([
+            {"file_offset": 0x1010, "began_ns": 420, "attached_ns": 430},
+        ]);
+        report["functions"][1]["target"] = serde_json::json!({
+            "object": {"dev": [DEV.0, DEV.1], "ino": INO, "sha256": SHA},
+            "file_offset": 0x1010,
+        });
+        let workers = vec![
+            worker(0, 100, 120),
+            worker(1, 400, 450),
+            worker(2, 1300, 1400),
+        ];
+        check_exact_accounting(&report, PROVIDER, &workers)
+            .expect("a partial straddling its own endpoint attach passes");
+    }
+
+    #[test]
+    fn exact_accounting_accepts_a_leading_partial() {
+        // No zero prefix at all: the first worker straddles the
+        // attach boundary and everything after is fully observed.
+        let report = report([Some(4), Some(10), Some(10)]);
+        check_exact_accounting(&report, PROVIDER, &ledgers()).expect("a leading partial passes");
+    }
+
+    #[test]
     fn exact_accounting_rejects_a_late_partial() {
         // Worker 2 partially observed although its burst ran fully
         // after the disclosed window closed: post-attach loss.

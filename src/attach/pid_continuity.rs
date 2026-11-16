@@ -2001,21 +2001,37 @@ pub(crate) mod engine_fixture {
         }
         pub(crate) fn group_all(&mut self) {
             let members: Vec<_> = self.retained.keys().copied().collect();
+            self.group_by(&[members]);
+        }
+
+        /// Relinks the retained slots as disjoint multi groups, one entry
+        /// and one return bundle per group, in the order given. Every
+        /// retained slot must be in exactly one group.
+        pub(crate) fn group_by(&mut self, groups: &[Vec<u32>]) {
+            let members: Vec<_> = self.retained.keys().copied().collect();
+            let mut grouped: Vec<u32> = groups.iter().flatten().copied().collect();
+            grouped.sort_unstable();
+            assert_eq!(
+                grouped, members,
+                "every retained slot is in exactly one group"
+            );
             self.links.clear();
             self.book.invalidate_all();
             let mut timing = RoundClock::default();
-            for program in ["p11_return", "p11_entry"] {
-                let attempt = NativeAttempt::run(comparable_monotonic_ns, || {
-                    self.native_attach_calls += 1;
-                    std::fs::File::open("/dev/null")
-                });
-                timing.observe_call(attempt.started_ns);
-                self.links.push(RegisteredLink::MultiUProbe {
-                    program,
-                    slots: members.clone(),
-                    fds: vec![attempt.result.unwrap().into()],
-                    registration: self.book.register(),
-                });
+            for group in groups {
+                for program in ["p11_return", "p11_entry"] {
+                    let attempt = NativeAttempt::run(comparable_monotonic_ns, || {
+                        self.native_attach_calls += 1;
+                        std::fs::File::open("/dev/null")
+                    });
+                    timing.observe_call(attempt.started_ns);
+                    self.links.push(RegisteredLink::MultiUProbe {
+                        program,
+                        slots: group.clone(),
+                        fds: vec![attempt.result.unwrap().into()],
+                        registration: self.book.register(),
+                    });
+                }
             }
             self.health_phases.push("attach");
             let loss = self.read_health();

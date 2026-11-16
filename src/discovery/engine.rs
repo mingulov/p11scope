@@ -18733,6 +18733,16 @@ impl Engine {
         let detach_failed = match detach_slots_outcome {
             Ok(report) => {
                 for index in ended_kept {
+                    // A pre-arm declared key keeps its real attach stamp:
+                    // deactivation unresolves the key in the plan, and the
+                    // ended original can run nothing after this instant,
+                    // so its attach time and windows stand as they were.
+                    if let Some(slot) = candidate.plan.slots.iter().find(|slot| slot.index == index)
+                        && let Some(stamp) = session.slot_attached_at(index)
+                    {
+                        self.prearm
+                            .note_ended_pid_deactivation(plan::AttachKey::of(slot), stamp);
+                    }
                     candidate.plan.deactivate(index);
                 }
                 self.apply_group_rebuild(&mut candidate.plan, &timing_owners, report, &mut outcome);

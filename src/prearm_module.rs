@@ -470,6 +470,12 @@ pub(crate) struct PrearmState {
     watches: BTreeMap<PinnedObjectId, PrearmWatch>,
     scope_start_ns: Option<u64>,
     initial_module_objects: BTreeSet<PinnedObjectId>,
+    /// Real attach-complete stamps of declared keys whose slot an ended
+    /// `--pid` original's group retirement deactivated mid-capture (a kept
+    /// group mate of slots that really retired). Deactivation unresolves
+    /// the key in the plan; the stamp stays a historical fact, so the
+    /// declared set keeps its attach instant and windows at assembly.
+    ended_pid_stamps: BTreeMap<AttachKey, u64>,
 }
 
 impl PrearmState {
@@ -541,6 +547,28 @@ impl PrearmState {
     #[cfg(test)]
     pub(crate) fn install_watch_for_test(&mut self, id: PinnedObjectId, watch: PrearmWatch) {
         self.watches.insert(id, watch);
+    }
+
+    /// Whether any watch declares `key`.
+    pub(crate) fn declares(&self, key: AttachKey) -> bool {
+        self.watches
+            .values()
+            .any(|watch| watch.declared.contains(&key))
+    }
+
+    /// Keeps a declared key's real attach stamp across its slot's
+    /// deactivation by an ended `--pid` original's group retirement (see
+    /// `ended_pid_stamps`). The first stamp wins, as the session's does.
+    pub(crate) fn note_ended_pid_deactivation(&mut self, key: AttachKey, stamp: u64) {
+        if self.declares(key) {
+            self.ended_pid_stamps.entry(key).or_insert(stamp);
+        }
+    }
+
+    /// The kept stamp of a declared key deactivated by an ended `--pid`
+    /// group retirement, if any.
+    pub(crate) fn ended_pid_stamp(&self, key: AttachKey) -> Option<u64> {
+        self.ended_pid_stamps.get(&key).copied()
     }
 
     /// Ends every watch's tracking exactly once (scope end / stop driver).
@@ -615,10 +643,14 @@ impl PrearmState {
                 Some(watch) => {
                     let mut latest: Option<u64> = None;
                     for key in watch.declared.iter() {
-                        let Some(stamped_at) = plan
-                            .slot_index_for_key(*key)
-                            .and_then(|index| attached.get(&index).copied())
-                        else {
+                        // A key the plan still resolves reads its current
+                        // slot; one an ended-pid group retirement
+                        // deactivated reads the stamp kept for it.
+                        let stamped_at = match plan.slot_index_for_key(*key) {
+                            Some(index) => attached.get(&index).copied(),
+                            None => self.ended_pid_stamp(*key),
+                        };
+                        let Some(stamped_at) = stamped_at else {
                             latest = None;
                             break;
                         };
@@ -1100,6 +1132,58 @@ mod tests {
                 reason: UnobservedReason::PreAttach,
             }]),
         );
+    }
+
+    /// A declared key whose slot an ended `--pid` group retirement
+    /// deactivated keeps its real stamp: the declared set still reads its
+    /// attach instant and pre-attach window (twin: without the kept stamp
+    /// the unresolved key leaves the instant unknown and no window).
+    #[test]
+    fn assembly_reads_a_declared_key_deactivated_by_an_ended_pid_retirement() {
+        let assemble = |kept: bool| {
+            let mut plan = crate::plan::AttachPlan::from_slots(vec![
+                slot(0, 7, 0x1000, 3),
+                slot(1, 7, 0x2000, 3),
+            ]);
+            plan.modules = vec![module(3, 7)];
+            plan.deactivate(1);
+            let mut state = PrearmState::empty();
+            state.set_scope_start_ns(Some(50));
+            state.record_initial_modules([PinnedObjectId(7)]);
+            state.install_watch_for_test(
+                PinnedObjectId(7),
+                watched(BTreeSet::from([key(7, 0x1000), key(7, 0x2000)])),
+            );
+            // Undeclared keys are never kept.
+            state.note_ended_pid_deactivation(key(7, 0x3000), 1);
+            if kept {
+                state.note_ended_pid_deactivation(key(7, 0x2000), 950);
+                state.note_ended_pid_deactivation(key(7, 0x2000), 990);
+            }
+            assert_eq!(state.ended_pid_stamp(key(7, 0x3000)), None);
+            let mut records = vec![record(3, vec!["scan", "prearm"])];
+            state.assemble(
+                &mut records,
+                &plan,
+                &BTreeMap::from([(0, 900), (1, 950)]),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
+            records.remove(0)
+        };
+        let record = assemble(true);
+        assert_eq!(record.attached_at_ns, Some(Some(950)));
+        assert_eq!(
+            record.unobserved_windows,
+            Some(vec![UnobservedWindow {
+                start_ns: 50,
+                end_ns: 950,
+                reason: UnobservedReason::PreAttach,
+            }]),
+        );
+        let record = assemble(false);
+        assert_eq!(record.attached_at_ns, Some(None));
+        assert_eq!(record.unobserved_windows, None);
     }
 
     /// A probe replaced mid-capture (a new slot at the same attach point)

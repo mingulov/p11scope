@@ -34058,6 +34058,112 @@ fn an_ended_pid_retirement_keeping_a_grouped_slot_deactivates_it() {
     assert_eq!(session.physical_gap_summary().episodes, 0);
 }
 
+/// Two disjoint attach groups: retiring part of group A closes over A
+/// only. A's kept mate is deactivated with it and, being pre-arm
+/// declared, keeps its real attach stamp for assembly; group B stays
+/// linked and active, and no physical gap opens.
+#[test]
+fn an_ended_pid_retirement_closes_over_the_disturbed_group_only() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let slots = engine.plan.slots.clone();
+    assert!(
+        slots.len() >= 3,
+        "the route needs two groups and a kept mate"
+    );
+    let mate = slots[0].clone();
+    let retired = vec![slots[1].clone()];
+    let group_a = vec![mate.index, slots[1].index];
+    let group_b: Vec<u32> = slots[2..].iter().map(|slot| slot.index).collect();
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .group_by(&[group_a.clone(), group_b.clone()]);
+    let mate_key = plan::AttachKey::of(&mate);
+    let b_key = plan::AttachKey::of(&slots[2]);
+    engine.prearm.install_watch_for_test(
+        mate.object,
+        crate::prearm_module::PrearmWatch::new(BTreeSet::from([mate_key, b_key])),
+    );
+    session.scripted_stamps.insert(mate.index, 4242);
+    session.scripted_stamps.insert(slots[2].index, 4343);
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let owner = engine.views.remove(0);
+    assert!(
+        session
+            .prepare_ended_pid_retirement(&owner, &retired)
+            .is_none(),
+        "premise: a grouped subset has no narrowed proof"
+    );
+    let proof = session
+        .prepare_ended_pid_retirement(&owner, &slots)
+        .unwrap();
+    let closure: Vec<u32> = proof
+        .group_closure(&retired)
+        .expect("the retired slot is in the proof")
+        .iter()
+        .map(|slot| slot.index)
+        .collect();
+    assert_eq!(closure, group_a, "the closure is group A only");
+    let ended = PendingEndedPidRetirement { owner, proof };
+    let mut plan = engine.plan.clone();
+    plan.deactivate(slots[1].index);
+    let candidate = LiveCandidate {
+        pinned: std::mem::replace(&mut engine.pinned, PinnedObjects::empty()),
+        modules: Vec::new(),
+        plan,
+        delta: plan::AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: retired,
+        },
+        views: BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    };
+    let outcome = engine
+        .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
+        .unwrap();
+    assert!(!outcome.detach_failed);
+    assert!(
+        !engine.plan.is_active(mate.index),
+        "A's kept mate is deactivated"
+    );
+    for index in &group_b {
+        assert!(
+            engine.plan.is_active(*index),
+            "group B slot {index} stays active"
+        );
+        assert!(
+            session.has_slot_link(*index),
+            "group B slot {index} stays linked"
+        );
+    }
+    assert!(!session.has_slot_link(mate.index), "group A detached whole");
+    assert_eq!(
+        engine.prearm.ended_pid_stamp(mate_key),
+        Some(4242),
+        "the deactivated declared mate keeps its attach stamp"
+    );
+    assert_eq!(
+        engine.prearm.ended_pid_stamp(b_key),
+        None,
+        "a slot still active keeps reading its current stamp"
+    );
+    assert_eq!(session.physical_gap_summary().episodes, 0);
+}
+
 /// Twin: an ended original whose candidate retires nothing (a pre-arm
 /// watch keeps every grouped slot) detaches nothing and keeps every slot
 /// active, so the watch's declared keys keep their attach stamps for

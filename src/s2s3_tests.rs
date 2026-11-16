@@ -5451,6 +5451,80 @@ fn newsite_created_nine_slot_template_tail_size_stays_unknown() {
     assert_eq!(v.label, None, "an AES key without its size never labels");
 }
 
+// Fix round 3: per-kind presence in the retained window is recorded
+// even for unclassifiable values. A nine-slot template with
+// CKA_VALUE_LEN 100 in-window records the kind as seen (so
+// projection names the unsupported reason, never the truncation);
+// a complete template with the same cell records seen without
+// truncation.
+#[test]
+fn newsite_created_template_records_seen_kinds_despite_values() {
+    use crate::semantics_objects::field_index;
+    use p11scope_ebpf_common::object_policy::SafeAttributeKind;
+    // Truncated: ValueLen 100 in-window, modulus in the tail.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 100),
+        scalar(CKA_TOKEN, 1),
+        AttrObservation::curve(CKA_EC_PARAMS, &SECP256R1, LinuxLayout::Lp64),
+        scalar(CKA_PARAMETER_SET, 1),
+        scalar(CKA_ID, 7),
+        scalar(CKA_ID, 9),
+        scalar(CKA_MODULUS_BITS, 2048),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert!(
+        v.creation_truncated,
+        "the nine-slot template records its truncation"
+    );
+    assert!(
+        v.creation_seen[field_index(SafeAttributeKind::ValueLen)],
+        "the in-window unsupported size records as seen"
+    );
+    assert!(
+        !v.creation_seen[field_index(SafeAttributeKind::ModulusBits)],
+        "the tail modulus records as never seen"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        FieldState::Unknown,
+        "the unclassifiable size never establishes"
+    );
+    // Complete: the same unsupported cell without truncation.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x1f),
+        scalar(CKA_VALUE_LEN, 100),
+    ]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert!(
+        !v.creation_truncated,
+        "the complete template records no truncation"
+    );
+    assert!(
+        v.creation_seen[field_index(SafeAttributeKind::ValueLen)],
+        "the unsupported size records as seen on a complete template"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        FieldState::Unknown,
+        "the unclassifiable size never establishes"
+    );
+}
+
 // Keymeta §6/K5 source twin: a promoted fact never keeps its source
 // past a conflict. The AES size promotes with `creation_success`; a
 // later query disagreeing on the size conflicts the field, and the

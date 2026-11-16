@@ -4321,6 +4321,27 @@ fn render_snapshot_inner(
                     if truncated_objects == 1 { "" } else { "s" },
                 );
             }
+            // Fix round 3, ruling 1: Edwards/Montgomery objects whose
+            // curve is mismatched or unestablished name the curve
+            // reason here (verbose only) with the same string the
+            // curve field carries in JSON. Counts only.
+            let unusable_curve_objects = observations
+                .objects
+                .iter()
+                .filter(|row| {
+                    row.established.ec_params.reason
+                        == Some(crate::key_operation_projection::CURVE_UNUSABLE_REASON)
+                })
+                .count();
+            if verbose && unusable_curve_objects > 0 {
+                let _ = writeln!(
+                    out,
+                    "  {} ({} object{})",
+                    crate::key_operation_projection::CURVE_UNUSABLE_REASON,
+                    unusable_curve_objects,
+                    if unusable_curve_objects == 1 { "" } else { "s" },
+                );
+            }
         }
     }
     {

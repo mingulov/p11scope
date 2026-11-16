@@ -489,6 +489,9 @@ struct ViewRecord {
     /// cells (controller KEYMETA-T1 rulings 2026-11-16, ruling 2):
     /// a birth fact, set once at promotion, never cleared.
     creation_truncated: bool,
+    /// Per-field presence in the retained creation window (fix round
+    /// 3): a birth fact, set once at promotion, never cleared.
+    creation_seen: [bool; METADATA_FIELDS],
 }
 
 impl ViewRecord {
@@ -2239,6 +2242,7 @@ impl ModelState {
                 established_source: [None; METADATA_FIELDS],
                 queries: [QueryStatus::NotQueried; METADATA_FIELDS],
                 creation_truncated: false,
+                creation_seen: [false; METADATA_FIELDS],
             },
         );
         self.instances
@@ -3278,6 +3282,7 @@ impl ModelState {
                         view.creation_truncated = call.requested[template]
                             .as_ref()
                             .is_some_and(AttributeList::truncated);
+                        view.creation_seen = requested_seen(call.requested[template].as_ref());
                         for kind in [
                             SafeAttributeKind::Class,
                             SafeAttributeKind::KeyType,
@@ -4672,6 +4677,7 @@ impl ModelState {
                 label: self.resolved_label(*id),
                 accessing_sessions: relations.get(id).copied().unwrap_or(0),
                 creation_truncated: v.creation_truncated,
+                creation_seen: v.creation_seen,
             })
             .collect();
         ObjectProjection {
@@ -4820,6 +4826,22 @@ fn requested_fields(list: Option<&AttributeList>) -> [FieldState; METADATA_FIELD
         };
     }
     fields
+}
+
+/// Per-kind presence in the retained window, regardless of value: true
+/// when the kind appeared in the first eight cells, even with an
+/// unclassifiable value (fix round 3). Excluded selectors mark nothing.
+fn requested_seen(list: Option<&AttributeList>) -> [bool; METADATA_FIELDS] {
+    let mut seen = [false; METADATA_FIELDS];
+    let Some(list) = list else {
+        return seen;
+    };
+    for observation in list.observations() {
+        if let Some(kind) = observation.kind {
+            seen[field_index(kind)] = true;
+        }
+    }
+    seen
 }
 
 #[cfg(test)]
@@ -5044,6 +5066,7 @@ mod tests {
             established_source: [None; METADATA_FIELDS],
             queries: [QueryStatus::NotQueried; METADATA_FIELDS],
             creation_truncated: false,
+            creation_seen: [false; METADATA_FIELDS],
         }
     }
 

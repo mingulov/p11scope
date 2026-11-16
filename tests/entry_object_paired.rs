@@ -23,7 +23,7 @@ use support::DieWithParent as _;
 mod support;
 
 /// The suite's test count; update with the suite (it proves selection).
-const EXPECTED_TESTS: u32 = 47;
+const EXPECTED_TESTS: u32 = 50;
 
 fn target_dir(var: &str, kind: &str) -> PathBuf {
     let dir = std::env::var_os(var)

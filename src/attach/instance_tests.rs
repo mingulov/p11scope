@@ -737,6 +737,38 @@ fn object_call_evidence(session: &Session) -> Result<(u64, u64, u64)> {
     ))
 }
 
+/// In-place downgrade (A′) cell readers: exact per-slot call counts,
+/// the narrowing switch cell, and the link inventory.
+fn downgrade_slot_stats(session: &Session, slot: u32) -> Result<(u64, u64)> {
+    let stats: PerCpuArray<_, p11scope_ebpf_common::SlotStats> =
+        PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS")?)?;
+    let mut entered = 0u64;
+    let mut returned = 0u64;
+    for cpu in stats.get(&slot, 0)?.iter() {
+        entered = entered.saturating_add(cpu.entered);
+        returned = returned.saturating_add(cpu.returned);
+    }
+    Ok((entered, returned))
+}
+
+fn downgrade_switch_cell(session: &Session, slot: u32) -> Result<u32> {
+    let gate: aya::maps::Array<_, u32> = aya::maps::Array::try_from(
+        session
+            .ebpf
+            .map("SLOT_COUNT_ONLY")
+            .context("SLOT_COUNT_ONLY")?,
+    )?;
+    Ok(gate.get(&slot, 0)?)
+}
+
+fn downgrade_session_links(session: &Session) -> Vec<(Vec<u32>, ProducerProgram)> {
+    session
+        .links
+        .iter()
+        .map(|link| (link.slots().to_vec(), link.producer()))
+        .collect()
+}
+
 /// Default FULL, real Multi/native hooks, with one exact owned continuity
 /// entry removed while its object-arm call is held inside the provider.
 /// Separate sessions keep the refused call's fault out of the healthy twin.
@@ -924,6 +956,424 @@ fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
             "S1 object twin missing_entry={missing_entry}: collected=1 route={route:?} shed={shed} wire_bytes={expected_bytes}"
         );
     }
+    Ok(())
+}
+
+/// In-place downgrade (A′) object straddle: one object-required call
+/// enters semantic, the slot downgrades while the call is held, then
+/// the call returns. The return keys off the START-bound object
+/// descriptor, so the straddler keeps its exact object rows with no
+/// fault and no physical gap — the live discriminator against
+/// detach+reattach, which the companion control below shows faulting
+/// instead.
+#[test]
+#[ignore = "privileged: in-place downgrade object straddle keeps exact rows"]
+fn privileged_downgrade_in_place_object_straddle_keeps_exact_rows_lp64() -> Result<()> {
+    use p11scope_ebpf_common::object_flow::continuity_joins;
+    use p11scope_ebpf_common::{CallStart, StartKey};
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _) = pin_and_plan(pid, &provider, &["C_SignInit"])?;
+    let mut harness = Harness::start_with_backend(&plan, pid, &pins, BackendSelection::Multi)?;
+    ensure!(harness.session.static_multi_attached());
+    ensure!(harness.session.backend_fallback().is_none());
+    ensure!(
+        harness.session.attach_failures().is_empty(),
+        "attach failures: {:?}",
+        harness.session.attach_failures()
+    );
+    ensure!(harness.session.has_slot_link(0));
+    let links_before = downgrade_session_links(&harness.session);
+    ensure!(
+        links_before
+            .iter()
+            .any(|(_, program)| *program == ProducerProgram::UProbe("p11_entry")),
+        "the live entry link is the plain endpoint: {links_before:?}"
+    );
+    harness.pump(&target)?;
+    ensure!(harness.events == 0 && harness.routed.is_empty());
+    let evidence_before = object_call_evidence(&harness.session)?;
+    let fault_before = harness.session.instance_maps().fault()?;
+    ensure!(harness.session.physical_gap_summary().episodes == 0);
+    let (entered_before, returned_before) = downgrade_slot_stats(&harness.session, 0)?;
+    ensure!(
+        entered_before == 0 && returned_before == 0,
+        "the idle child made no calls before the held call: {entered_before}/{returned_before}"
+    );
+    // The call enters semantic while the slot is still semantic.
+    let tid = held_object_tid(&mut target)?;
+    let key = StartKey {
+        pid_tgid: (u64::from(pid) << 32) | u64::from(tid),
+        slot: 0,
+        _pad: 0,
+    };
+    {
+        let starts: HashMap<_, StartKey, CallStart> =
+            HashMap::try_from(harness.session.ebpf.map("START").context("START")?)?;
+        ensure!(
+            starts.get(&key, 0)?.object_required == u64::from(plan.slots[0].descriptor_index) + 1,
+            "the held call entered with its semantic object marker"
+        );
+    }
+    // Flip while held: semantic entry, count-only return.
+    let mut narrowed = plan.slots[0].clone();
+    narrowed.descriptor_index = 0;
+    narrowed.semantics = SlotSemantics::COUNT_ONLY;
+    let outcome = harness
+        .session
+        .downgrade_in_place(std::slice::from_ref(&narrowed));
+    ensure!(
+        outcome.downgraded == vec![0] && outcome.refused.is_empty(),
+        "downgrade outcome: {outcome:?}"
+    );
+    ensure!(
+        downgrade_session_links(&harness.session) == links_before,
+        "the link set changed across the downgrade"
+    );
+    ensure!(
+        downgrade_switch_cell(&harness.session, 0)? == 1,
+        "the switch did not read back set"
+    );
+    ensure!(
+        harness
+            .session
+            .retained_static
+            .get(&0)
+            .is_some_and(|retained| retained.slot.descriptor_index == 0),
+        "retained slot did not follow the downgrade"
+    );
+    ensure!(target.command(b'u')? == "UNHELD 0 0");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut collected = 0;
+    let mut shed = 0u64;
+    let mut calls = Vec::new();
+    loop {
+        let report = harness
+            .capture
+            .tick(&mut harness.session, std::slice::from_ref(&target.pin))?;
+        collected += report.collected_calls;
+        let outcomes = report.into_outcomes();
+        shed += crate::semantic_capture::unjoined_shed_counts(&outcomes)
+            .values()
+            .sum::<u64>();
+        for outcome in outcomes {
+            if let TickOutcome::Call(call) = outcome {
+                ensure!(call.joint_resource().is_none());
+                calls.push((*call.record(), call.route(), call.into_object_tail()));
+            }
+        }
+        let positions = crate::events::event_drain_positions(harness.session.event_drain()?);
+        if !calls.is_empty()
+            && positions.consumer == positions.producer
+            && harness.capture.router().pending_len() == 0
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "collected={collected}, routed={}",
+            calls.len()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ensure!(
+        collected == 1 && calls.len() == 1,
+        "one straddling call must conserve one collected/routed outcome"
+    );
+    ensure!(harness.session.event_drain()?.malformed() == 0);
+    let (record, route, object) = calls.pop().unwrap();
+    ensure!(record.event.event_type == event_type::CALL && record.event.slot == 0);
+    ensure!(record.event.pid_tgid == key.pid_tgid && record.event.rv == 0);
+    ensure!(continuity_joins(&record.continuity));
+    ensure!(
+        matches!(route, Route::Joined(_)),
+        "healthy route: {route:?}"
+    );
+    ensure!(shed == 0);
+    ensure!(
+        object.is_none(),
+        "ordinary S1 grants no semantic object tail"
+    );
+    let (entered, returned) = downgrade_slot_stats(&harness.session, 0)?;
+    ensure!(
+        entered == 1 && returned == 1,
+        "entered {entered} returned {returned}, ground truth 1"
+    );
+    let evidence_after = object_call_evidence(&harness.session)?;
+    ensure!(
+        evidence_after == evidence_before,
+        "no ring loss, unmatched return or capture failure across the straddle: \
+         {evidence_before:?} -> {evidence_after:?}"
+    );
+    ensure!(
+        harness.session.instance_maps().fault()? == fault_before,
+        "no instance fault across the straddle"
+    );
+    ensure!(
+        harness.session.physical_gap_summary().episodes == 0,
+        "no physical gap across the straddle"
+    );
+    eprintln!(
+        "in-place object straddle: entered=1 returned=1 route={route:?} evidence={evidence_after:?}"
+    );
+    Ok(())
+}
+
+/// Negative control for the straddle cell: today's detach+reattach
+/// fallback across a held object-required call is observably lossy.
+/// The return-side object lookup keys off the live (reattached
+/// count-only) cookie, misses the semantic side row, and faults, so
+/// the completion never emits and returned never bumps. In-place
+/// downgrade must show none of this.
+#[test]
+#[ignore = "privileged: reattach across a held object call faults"]
+fn privileged_reattach_mid_object_call_faults_instead_of_straddling_lp64() -> Result<()> {
+    use p11scope_ebpf_common::{CallStart, StartKey};
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _) = pin_and_plan(pid, &provider, &["C_SignInit"])?;
+    let mut harness = Harness::start_with_backend(&plan, pid, &pins, BackendSelection::Multi)?;
+    ensure!(harness.session.static_multi_attached());
+    ensure!(harness.session.backend_fallback().is_none());
+    ensure!(harness.session.attach_failures().is_empty());
+    ensure!(harness.session.has_slot_link(0));
+    harness.pump(&target)?;
+    ensure!(harness.events == 0 && harness.routed.is_empty());
+    let evidence_before = object_call_evidence(&harness.session)?;
+    let tid = held_object_tid(&mut target)?;
+    let key = StartKey {
+        pid_tgid: (u64::from(pid) << 32) | u64::from(tid),
+        slot: 0,
+        _pad: 0,
+    };
+    {
+        let starts: HashMap<_, StartKey, CallStart> =
+            HashMap::try_from(harness.session.ebpf.map("START").context("START")?)?;
+        ensure!(
+            starts.get(&key, 0)?.object_required == u64::from(plan.slots[0].descriptor_index) + 1,
+            "the held call entered with its semantic object marker"
+        );
+    }
+    // Today's fallback: detach the semantic link and reattach
+    // count-only while the call is held.
+    let detached = harness.session.detach_slots(&plan.slots)?;
+    eprintln!("reattach control: detach outcome: {detached:?}");
+    let mut narrowed = plan.slots[0].clone();
+    narrowed.descriptor_index = 0;
+    narrowed.semantics = SlotSemantics::COUNT_ONLY;
+    let (failed, completed) =
+        harness
+            .session
+            .attach_targets(std::slice::from_ref(&narrowed), &pins, &BTreeSet::new())?;
+    ensure!(
+        failed.is_empty() && completed.iter().any(|(slot, _)| *slot == 0),
+        "the count-only reattach completed slot 0: failed={failed:?} \
+         completed={completed:?} failures: {:?}",
+        harness.session.attach_failures()
+    );
+    ensure!(target.command(b'u')? == "UNHELD 0 0");
+    // The faulted completion never emits: pump a bounded window and
+    // require silence, not a routed call.
+    let mut collected = 0;
+    let mut calls = 0;
+    for _ in 0..40 {
+        let report = harness
+            .capture
+            .tick(&mut harness.session, std::slice::from_ref(&target.pin))?;
+        collected += report.collected_calls;
+        for outcome in report.into_outcomes() {
+            calls += usize::from(matches!(outcome, TickOutcome::Call(_)));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (entered, returned) = downgrade_slot_stats(&harness.session, 0)?;
+    let evidence_after = object_call_evidence(&harness.session)?;
+    eprintln!(
+        "reattach control: entered={entered} returned={returned} collected={collected} \
+         routed={calls} evidence={evidence_before:?} -> {evidence_after:?}"
+    );
+    ensure!(
+        entered == 1 && returned == 0,
+        "the faulted completion counts its entry but never its return: {entered}/{returned}"
+    );
+    ensure!(
+        evidence_after.1 > evidence_before.1,
+        "the cookie mismatch faults an unmatched return: {evidence_before:?} -> {evidence_after:?}"
+    );
+    ensure!(
+        collected == 0 && calls == 0,
+        "the faulted completion emits no call: collected={collected} routed={calls}"
+    );
+    Ok(())
+}
+
+/// In-place downgrade (A′) on a journal session: the narrowed slot
+/// resolves `p11_entry_journal`, and post-flip calls skip BEGIN
+/// without a scope gap or evidence — an intended count-only slot is
+/// not a capture failure. Phase A (pre-flip) proves the instruments:
+/// the held call begins (BEGIN+END on the ring). Phase B (post-flip):
+/// the held call never begins (one END only) while counts stay exact.
+/// On builds that omit the journal the cell asserts the finite
+/// refusal instead.
+#[test]
+#[ignore = "privileged: journal downgrade skips BEGIN without a gap"]
+fn privileged_downgrade_in_place_journal_skips_begin_lp64() -> Result<()> {
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        ensure!(
+            crate::EBPF_JOURNAL_OBJECT.is_empty(),
+            "an omitted build must embed no journal bytes"
+        );
+        let spec = super::journal::JournalSpec;
+        let error = spec
+            .prepare()
+            .err()
+            .context("the omitted build refuses journal preparation")?;
+        ensure!(
+            format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+            "the omitted build refuses with its finite reason: {error:#}"
+        );
+        eprintln!("JOURNAL_DOWNGRADE journal=inapplicable");
+        return Ok(());
+    }
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_BEGIN_RING_BYTES, JOURNAL_END_FULL_RING_BYTES,
+    };
+    use p11scope_ebpf_common::{CallStart, StartKey};
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _) = pin_and_plan(pid, &provider, &["C_SignInit"])?;
+    let mut harness = Harness::start_journal(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.attach_failures().is_empty(),
+        "attach failures: {:?}",
+        harness.session.attach_failures()
+    );
+    ensure!(harness.session.has_slot_link(0));
+    let links_before = downgrade_session_links(&harness.session);
+    ensure!(
+        links_before
+            .iter()
+            .any(|(_, program)| *program == ProducerProgram::UProbe("p11_entry_journal")),
+        "the live entry link is the journal endpoint: {links_before:?}"
+    );
+    let evidence_before = object_call_evidence(&harness.session)?;
+    let (entered_before, returned_before) = downgrade_slot_stats(&harness.session, 0)?;
+    ensure!(
+        entered_before == 0 && returned_before == 0,
+        "the idle child made no calls before phase A: {entered_before}/{returned_before}"
+    );
+    // Phase A: a semantic held call begins (BEGIN+END on the ring).
+    // The ring window opens before the entry: BEGIN publishes at entry.
+    let ring_before = crate::events::event_drain_positions(harness.session.event_drain()?);
+    let tid = held_object_tid(&mut target)?;
+    let key = StartKey {
+        pid_tgid: (u64::from(pid) << 32) | u64::from(tid),
+        slot: 0,
+        _pad: 0,
+    };
+    {
+        let starts: HashMap<_, StartKey, CallStart> =
+            HashMap::try_from(harness.session.ebpf.map("START").context("START")?)?;
+        ensure!(
+            starts.get(&key, 0)?.object_required == u64::from(plan.slots[0].descriptor_index) + 1,
+            "phase A entered with its semantic object marker"
+        );
+    }
+    ensure!(target.command(b'u')? == "UNHELD 0 0");
+    let ring_after = crate::events::event_drain_positions(harness.session.event_drain()?);
+    let evidence_phase_a = object_call_evidence(&harness.session)?;
+    eprintln!(
+        "journal downgrade phase A: ring_bytes={} evidence={evidence_before:?} -> {evidence_phase_a:?} marker={}",
+        ring_after.producer.saturating_sub(ring_before.producer),
+        marker_summary(&proc_record_of(&harness, &target)?),
+    );
+    ensure!(
+        ring_after.producer.checked_sub(ring_before.producer)
+            == Some(JOURNAL_BEGIN_RING_BYTES + JOURNAL_END_FULL_RING_BYTES),
+        "phase A journals BEGIN+END: {} ring bytes",
+        ring_after.producer.saturating_sub(ring_before.producer)
+    );
+    // Phase B: downgrade, then a held call skips BEGIN (one END only).
+    let mut narrowed = plan.slots[0].clone();
+    narrowed.descriptor_index = 0;
+    narrowed.semantics = SlotSemantics::COUNT_ONLY;
+    let outcome = harness
+        .session
+        .downgrade_in_place(std::slice::from_ref(&narrowed));
+    ensure!(
+        outcome.downgraded == vec![0] && outcome.refused.is_empty(),
+        "journal downgrade outcome: {outcome:?}"
+    );
+    ensure!(
+        downgrade_session_links(&harness.session) == links_before,
+        "the link set changed across the journal downgrade"
+    );
+    ensure!(
+        downgrade_switch_cell(&harness.session, 0)? == 1,
+        "the journal switch did not read back set"
+    );
+    ensure!(
+        harness
+            .session
+            .retained_static
+            .get(&0)
+            .is_some_and(|retained| retained.slot.descriptor_index == 0),
+        "retained slot did not follow the journal downgrade"
+    );
+    let ring_before = crate::events::event_drain_positions(harness.session.event_drain()?);
+    let tid = held_object_tid(&mut target)?;
+    let key = StartKey {
+        pid_tgid: (u64::from(pid) << 32) | u64::from(tid),
+        slot: 0,
+        _pad: 0,
+    };
+    {
+        let starts: HashMap<_, StartKey, CallStart> =
+            HashMap::try_from(harness.session.ebpf.map("START").context("START")?)?;
+        ensure!(
+            starts.get(&key, 0)?.object_required == 0,
+            "phase B entered count-only with no object marker"
+        );
+    }
+    ensure!(target.command(b'u')? == "UNHELD 0 0");
+    let ring_after = crate::events::event_drain_positions(harness.session.event_drain()?);
+    ensure!(
+        ring_after.producer.checked_sub(ring_before.producer) == Some(JOURNAL_END_FULL_RING_BYTES),
+        "phase B journals one END and no BEGIN: {} ring bytes",
+        ring_after.producer.saturating_sub(ring_before.producer)
+    );
+    let (entered, returned) = downgrade_slot_stats(&harness.session, 0)?;
+    ensure!(
+        entered == 2 && returned == 2,
+        "entered {entered} returned {returned}, ground truth 2"
+    );
+    let evidence_after = object_call_evidence(&harness.session)?;
+    ensure!(
+        evidence_after == evidence_before,
+        "no ring loss, unmatched return or capture failure across the journal downgrade: \
+         {evidence_before:?} -> {evidence_after:?}"
+    );
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) != journal_marker::MARKER_DIRTY,
+        "no scope gap across the journal downgrade"
+    );
+    ensure!(
+        harness.session.physical_gap_summary().episodes == 0,
+        "no physical gap across the journal downgrade"
+    );
+    eprintln!("journal downgrade: entered=2 returned=2 evidence={evidence_after:?}");
     Ok(())
 }
 

@@ -636,16 +636,22 @@ impl PrearmState {
             record.attached_at_ns = Some(attached_at);
             let endpoints = module_endpoints(plan, record.id, watch);
             record.first_attached_at_ns = first_attached_at(&endpoints, first_attached);
-            // Each endpoint's first attach is the earliest over every slot
-            // of the module at that file offset: a watch declares one
-            // object's keys, but the module's undeclared slots on another
-            // pinned identity of the same file (the same inode under a
-            // second device) may have attached, and counted, first.
+            // Each endpoint's first attach is the earliest stamp at its file
+            // offset over the endpoint keys plus every plan slot of the
+            // module at that offset: a watch declares one object's keys,
+            // but the module's undeclared slots on another pinned identity
+            // of the same file (the same inode under a second device) may
+            // have attached, and counted, first. Only endpoint offsets get
+            // a point, so no point follows the module's first attach
+            // (`first_attached_at_ns`, the latest endpoint stamp).
+            let endpoint_offsets: BTreeSet<u64> =
+                endpoints.iter().map(|key| key.file_offset).collect();
             let mut earliest: BTreeMap<u64, (Option<u64>, u64)> = BTreeMap::new();
             let module_keys = plan
                 .slots
                 .iter()
                 .filter(|slot| slot.module_ids.contains(&record.id))
+                .filter(|slot| endpoint_offsets.contains(&slot.file_offset))
                 .map(AttachKey::of);
             for key in endpoints.iter().copied().chain(module_keys) {
                 if let Some(&(began_ns, attached_ns)) = first_attached.get(&key) {
@@ -1273,14 +1279,18 @@ mod tests {
     /// later object's keys while the module's undeclared slots on the
     /// first object attached earlier at the same file offsets and counted
     /// the calls in between. Each endpoint's first attach is the earliest
-    /// over every slot of the module at that offset, never the declared
-    /// object's later stamp alone; the module's declared-set instant is
-    /// unchanged.
+    /// over the endpoint keys plus every slot of the module at that
+    /// offset, never the declared object's later stamp alone; the module's
+    /// declared-set instant is unchanged, and an undeclared offset gets no
+    /// point.
     #[test]
     fn assembly_takes_each_endpoints_first_attach_over_every_module_slot() {
         let declared = key(8, 0x1000);
-        let mut plan =
-            crate::plan::AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 8, 0x1000, 3)]);
+        let mut plan = crate::plan::AttachPlan::from_slots(vec![
+            slot(0, 7, 0x1000, 3),
+            slot(1, 8, 0x1000, 3),
+            slot(2, 7, 0x5000, 3),
+        ]);
         plan.modules = vec![module(3, 8)];
         let mut state = PrearmState::empty();
         state.set_scope_start_ns(Some(50));
@@ -1290,12 +1300,16 @@ mod tests {
         let first = BTreeMap::from([
             (key(7, 0x1000), (Some(90), 100)),
             (declared, (Some(800), 900)),
+            // An undeclared offset is no endpoint: its later attach is the
+            // `mapped_unattached` window's, never a point past the module's
+            // first attach.
+            (key(7, 0x5000), (Some(1100), 1200)),
         ]);
         let mut records = vec![record(3, vec!["scan", "prearm"])];
         state.assemble(
             &mut records,
             &plan,
-            &BTreeMap::from([(0, 100), (1, 900)]),
+            &BTreeMap::from([(0, 100), (1, 900), (2, 1200)]),
             &first,
             &BTreeMap::new(),
         );

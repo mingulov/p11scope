@@ -2708,8 +2708,11 @@ def exact_prearm_keys(module):
     `unobserved_windows`, plus the additive first-attach keys
     `first_attached_at_ns` and `first_attach_points` and the learned
     `first_loaded_by`. `watch` is pre-arm-only; present keys must match
-    their frozen shapes, and the first-attach instant must be the maximum
-    of the points and never follow a known current attach."""
+    their frozen shapes. The first-attach instant keeps its declared-set
+    meaning (the latest endpoint's first attach) and never follows a known
+    current attach; each point is the earliest stamp at its endpoint's file
+    offset over the endpoint keys plus every slot of the module there, so
+    the instant needs the points and no point follows it."""
     if "watch" in module:
         watch = module["watch"]
         require(
@@ -2816,16 +2819,18 @@ def exact_prearm_keys(module):
                 f"invalid first attach point: {module}",
             )
     if "first_attached_at_ns" in module:
-        # Assembled together: the module instant is the maximum over its
-        # endpoints' first attaches, so it needs the points and equals
-        # their latest completion (and, with the check above, no point
-        # follows a known current attach).
+        # Assembled together: the module instant is the latest endpoint's
+        # first attach and each point the earliest stamp at an endpoint
+        # offset (a second pinned identity of the same file may attach
+        # first), so the instant needs the points and no point follows it
+        # (nor, with the check above, a known current attach). It may
+        # exceed every point.
         points = module.get("first_attach_points")
         require(
             isinstance(points, list)
             and points
-            and module["first_attached_at_ns"] == max(point["attached_ns"] for point in points),
-            f"first_attached_at_ns is not the maximum of first_attach_points: {module}",
+            and max(point["attached_ns"] for point in points) <= module["first_attached_at_ns"],
+            f"a first attach point follows first_attached_at_ns: {module}",
         )
     if "unobserved_windows" in module:
         windows = module["unobserved_windows"]
@@ -5158,17 +5163,28 @@ def self_test():
         {"attached_at_ns": None, "first_attached_at_ns": 120, "first_attach_points": points},
         # An endpoint never attached: no module instant, the points stand.
         {"attached_at_ns": None, "first_attach_points": points},
+        # The declared endpoint's own first attach (900) came after the
+        # module's undeclared slot on a second identity of the same file
+        # at that offset (100): the instant keeps its declared-set meaning
+        # above every point. The old equality rule rejected this shape.
+        {
+            "attached_at_ns": 900,
+            "first_attached_at_ns": 900,
+            "first_attach_points": [{"file_offset": 4096, "began_ns": 90, "attached_ns": 100}],
+        },
+        {"attached_at_ns": 900, "first_attached_at_ns": 130, "first_attach_points": points},
     ):
         exact_prearm_keys(dict(attach_module, **good))
     for bad in (
-        # The module instant is the maximum over its endpoints' first
-        # attaches, assembled together with the points: one without the
-        # points, or one that is not their maximum, is a producer bug.
+        # The module instant is assembled together with the points: one
+        # without the points, or one that a point follows, is a producer
+        # bug.
         {"attached_at_ns": None, "first_attached_at_ns": 120},
-        {"attached_at_ns": 900, "first_attached_at_ns": 130, "first_attach_points": points},
         {"attached_at_ns": 900, "first_attached_at_ns": 100, "first_attach_points": points},
-        # A point never follows a known current attach (via the maximum).
+        {"attached_at_ns": None, "first_attached_at_ns": 119, "first_attach_points": points},
+        # Neither the instant nor a point follows a known current attach.
         {"attached_at_ns": 110, "first_attached_at_ns": 120, "first_attach_points": points},
+        {"attached_at_ns": 110, "first_attached_at_ns": 110, "first_attach_points": points},
         {"attached_at_ns": 100, "first_attached_at_ns": 120},
         {"first_attached_at_ns": -1},
         {"first_attached_at_ns": None},

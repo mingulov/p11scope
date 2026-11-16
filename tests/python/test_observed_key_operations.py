@@ -769,7 +769,7 @@ class ObservedRsaTests(unittest.TestCase):
         with self.subTest("FIELD_KEYS_V6"):
             self.assertEqual(set(ORACLE.FIELD_KEYS), {"status", "value"})
             self.assertEqual(set(ORACLE.FIELD_KEYS_V6),
-                             {"status", "value", "source"})
+                             {"status", "value", "source", "reason"})
             for name in ("metadata_field_class", "metadata_field_key_type",
                          "metadata_field_token", "metadata_field_value_len",
                          "metadata_field_modulus_bits", "metadata_field_curve",
@@ -779,8 +779,13 @@ class ObservedRsaTests(unittest.TestCase):
                                  set(ORACLE.FIELD_KEYS_V6), name)
                 self.assertEqual(set(cell["properties"]["source"]["enum"]),
                                  set(ORACLE.FIELD_SOURCES) | {None}, name)
+                self.assertEqual(set(cell["properties"]["reason"]["enum"]),
+                                 set(ORACLE.FIELD_REASONS) | {None}, name)
             self.assertEqual(tuple(ORACLE.FIELD_SOURCES),
                              ("query", "creation_success"))
+            self.assertEqual(tuple(ORACLE.FIELD_REASONS),
+                             ("template truncated "
+                              "(first 8 attributes captured)",))
         with self.subTest("v6 scalar values"):
             block = defs["metadata_block"]["properties"]
             self.assertEqual(set(ORACLE.METADATA_FIELD_VALUES_V6)
@@ -913,7 +918,8 @@ class ObservedRsaTests(unittest.TestCase):
             for name, block in (("requested", row["requested"]),
                                 ("established", row["established"])):
                 block["parameter_set"] = {"status": "unknown",
-                                          "value": None, "source": None}
+                                          "value": None, "source": None,
+                                          "reason": None}
                 for cell_name, cell in block.items():
                     if cell_name == "parameter_set":
                         continue
@@ -921,14 +927,17 @@ class ObservedRsaTests(unittest.TestCase):
                         cell["source"] = "query"
                     else:
                         cell["source"] = None
+                    cell["reason"] = None
             row["queries"]["parameter_set"] = "not_queried"
         promoted = section["objects"][0]
         promoted["established"]["key_type"] = {"status": "value",
                                                "value": 66,
-                                               "source": "creation_success"}
+                                               "source": "creation_success",
+                                               "reason": None}
         promoted["established"]["value_len"] = {"status": "value",
                                                 "value": 48,
-                                                "source": "creation_success"}
+                                                "source": "creation_success",
+                                                "reason": None}
         promoted["queries"]["key_type"] = "not_queried"
         promoted["queries"]["value_len"] = "not_queried"
         promoted["label"] = "hkdf_384"
@@ -989,6 +998,44 @@ class ObservedRsaTests(unittest.TestCase):
             with self.assertRaisesRegex(ORACLE.OracleRefusal,
                                         "query source without a query"):
                 ORACLE.check_section(mutated)
+        with self.subTest("truncated unknown fields check"):
+            truncated = copy.deepcopy(section)
+            for block in (truncated["objects"][1]["requested"],
+                          truncated["objects"][1]["established"]):
+                block["value_len"] = {
+                    "status": "unknown", "value": None,
+                    "source": None,
+                    "reason": ("template truncated "
+                               "(first 8 attributes captured)")}
+            ORACLE.check_section(truncated)
+        with self.subTest("unlisted reason refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][0]["established"]["ec_params"]["reason"] = \
+                "truncated"
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "unexpected metadata reason"):
+                ORACLE.check_section(mutated)
+        with self.subTest("reason on a known field refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][0]["established"]["class"]["reason"] = \
+                ("template truncated (first 8 attributes captured)")
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "known metadata carries a reason"):
+                ORACLE.check_section(mutated)
+        with self.subTest("established reason on an observed request refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][1]["requested"]["value_len"] = {
+                "status": "value", "value": 32,
+                "source": None, "reason": None}
+            mutated["objects"][1]["established"]["value_len"] = {
+                "status": "unknown", "value": None,
+                "source": None,
+                "reason": ("template truncated "
+                           "(first 8 attributes captured)")}
+            with self.assertRaisesRegex(
+                    ORACLE.OracleRefusal,
+                    "established reason on an observed request"):
+                ORACLE.check_section(mutated)
         with self.subTest("HKDF key type below v6 refused"):
             mutated = copy.deepcopy(section)
             mutated["version"] = 5
@@ -996,6 +1043,7 @@ class ObservedRsaTests(unittest.TestCase):
                 for block in (row["requested"], row["established"]):
                     for cell in block.values():
                         del cell["source"]
+                        del cell["reason"]
             with self.assertRaisesRegex(ORACLE.OracleRefusal,
                                         "invalid metadata scalar"):
                 ORACLE.check_section(mutated)
@@ -1003,13 +1051,16 @@ class ObservedRsaTests(unittest.TestCase):
             mutated = copy.deepcopy(section)
             mutated["version"] = 5
             mutated["objects"][0]["established"]["key_type"] = {
-                "status": "value", "value": 0x1f, "source": None}
+                "status": "value", "value": 0x1f, "source": None,
+                "reason": None}
             mutated["objects"][0]["established"]["value_len"] = {
-                "status": "value", "value": 32, "source": None}
+                "status": "value", "value": 32, "source": None,
+                "reason": None}
             for row in mutated["objects"]:
                 for block in (row["requested"], row["established"]):
                     for cell in block.values():
                         del cell["source"]
+                        del cell["reason"]
             with self.assertRaisesRegex(ORACLE.OracleRefusal,
                                         "unexpected object metadata label"):
                 ORACLE.check_section(mutated)

@@ -102,7 +102,10 @@ fn build_fixtures(dir: &Path) -> Result<(PathBuf, PathBuf)> {
 
 fn tail(log: &Path) -> String {
     std::fs::read_to_string(log)
-        .map(|text| text.chars().rev().take(2000).collect::<String>())
+        .map(|text| {
+            let start = text.len().saturating_sub(2000);
+            text[start..].to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -121,7 +124,7 @@ fn privileged_run_default_learns_tables_for_a_getter_only_provider() -> Result<(
     const ROUNDS_EACH: usize = 10;
     const CALLS_PER_ROUND: usize = 3;
     let script = format!(
-        "for i in $(seq 1 {WORKERS}); do '{}' '{}' {ROUNDS_EACH} || exit 1; done",
+        "for i in $(seq 1 {WORKERS}); do '{}' '{}' {ROUNDS_EACH} || {{ echo \"WORKER_FAIL i=$i rc=$?\"; exit 1; }}; done",
         worker.display(),
         library.display()
     );
@@ -173,6 +176,9 @@ fn privileged_run_default_learns_tables_for_a_getter_only_provider() -> Result<(
         std::thread::sleep(Duration::from_millis(50));
     };
     println!("TABLE_CELL {tag} observer {status}");
+    println!(
+        "TABLE_CELL {tag} ledger workers={ledger_workers}/{WORKERS} table_calls={ledger_calls}"
+    );
     ensure!(status.success(), "run exited {status}: {}", tail(&log));
     ensure!(
         ledger_workers == WORKERS,

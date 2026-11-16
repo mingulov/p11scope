@@ -48,7 +48,7 @@ versioned separately and are opaque, exact dispatch keys.
   creates, destroys nor rebinds objects, or an attribute read; its
   own observed return is success, a partial attribute result or an
   ordinary failure (a handle or session error, a pending return or
-  an ambiguous failure does not qualify); and its exact original is
+  a general or device error does not qualify); and its exact original is
   still unclaimed. The original is then disposed with the call. Every other
   case keeps the earlier fail-closed path where the next seal ends
   per-key tracking for that image with the named `claim_unmatched`

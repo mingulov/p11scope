@@ -649,8 +649,8 @@ cause-neutral. Tracking continues for this process only when all of
 the following hold: the call is a key use, an operation that neither
 creates, destroys nor rebinds objects, or an attribute read; its own
 observed return is success, a partial attribute result or an
-ordinary failure (a handle or session error, a pending return or an
-ambiguous failure does not qualify); and its exact original is
+ordinary failure (a handle or session error, a pending return or a
+general or device error does not qualify); and its exact original is
 still unclaimed. That original is then disposed with the call, so
 the key's next seal keeps the following calls. Everything else
 keeps the older fail-closed path: the original stays and the next

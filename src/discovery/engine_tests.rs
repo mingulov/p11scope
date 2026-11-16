@@ -87938,6 +87938,311 @@ fn ending_scan_keeps_pin_wait_skips() {
     }
 }
 
+/// One scripted scan of `view` reporting `skips` with no modules,
+/// running `before` inside the scan (after the scan-start excuse was
+/// evaluated, before the outcome is filed) so the test controls whether
+/// the group exits mid-scan. A dead or recycled view fails the pin phase
+/// exactly like production; the engine files the scan counters on both
+/// arms, so the filing assertions hold either way and `expect_ok` pins
+/// which arm the shape takes.
+fn scan_view_with_outcome_skips(
+    view: &ProcessView,
+    skips: Vec<Skipped>,
+    before: impl FnOnce(),
+    expect_ok: bool,
+) -> DiscoveryCounters {
+    let mut counters = DiscoveryCounters::default();
+    let result = scan_and_pin_with(
+        view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        |_, _, _| {
+            before();
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: skips,
+                scan_ms: 0,
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    );
+    assert_eq!(
+        result.is_ok(),
+        expect_ok,
+        "the scripted scan takes its expected arm"
+    );
+    counters
+}
+
+/// Every exit-shaped memory-scan refusal: the initial acquisition, the
+/// mem-open gate and the final validation/generation bracket, each with
+/// the generation wording the failing check files, plus the warm
+/// filesystem-identification wording (the same `original_exited` check
+/// through the mount-namespace path).
+fn mid_scan_exit_race_reasons() -> Vec<String> {
+    vec![
+        "memory scan refused: final mapping validation unavailable: process generation changed before target access"
+            .into(),
+        "memory scan refused: final mapping validation unavailable: process generation changed during target access"
+            .into(),
+        "memory scan refused: process generation changed during acquisition: original process exited before proc acquisition"
+            .into(),
+        "memory scan refused: initial mapping validation unavailable: process generation changed before target access"
+            .into(),
+        "memory scan refused: initial mapping validation unavailable: process generation changed during target access"
+            .into(),
+        "memory scan refused: initial mapping validation unavailable: memory scan refused: process generation changed during acquisition: process generation changed during target access"
+            .into(),
+        "memory scan refused: process generation changed during acquisition: original process exited during proc acquisition"
+            .into(),
+        "memory scan refused: process generation changed during acquisition: original process exited while proc identity was read"
+            .into(),
+        "memory scan refused: initial mapping validation unavailable: original process exited while its filesystem was identified"
+            .into(),
+        "memory scan refused: final mapping validation unavailable: original process exited while its filesystem was identified"
+            .into(),
+    ]
+}
+
+fn mid_scan_exit_race_skips() -> Vec<Skipped> {
+    mid_scan_exit_race_reasons()
+        .into_iter()
+        .map(|reason| Skipped {
+            subject: "capture discovery".into(),
+            reason,
+        })
+        .collect()
+}
+
+/// MT-SYSTEM ruling: a group that was live at scan start and provably
+/// exited by the failed validation files no record for its exit race —
+/// an exit is not undisclosed loss — but every race still counts in its
+/// retry class. The scan-start excuse must not claim these: the group
+/// was live when it was evaluated.
+#[test]
+fn mid_scan_exit_race_goes_silent_but_counted() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(714), pid).unwrap();
+    assert!(view.still_the_same(), "the group is live at scan start");
+    let counters = scan_view_with_outcome_skips(
+        &view,
+        mid_scan_exit_race_skips(),
+        || {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        },
+        false,
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(true),
+        "the pin proves the original group exited"
+    );
+    assert!(
+        crate::process::generation_dead(pid),
+        "the pid names no live reuse"
+    );
+    for reason in mid_scan_exit_race_reasons() {
+        assert!(
+            !counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason),
+            "proven exit files no record for: {reason}; kept: {:?}",
+            counters.object_skips
+        );
+    }
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::MapsSnapshot),
+        7,
+        "the validation-bracket races count in their class"
+    );
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::ProcessEnded),
+        3,
+        "the acquisition races count in their class"
+    );
+    assert_eq!(counters.noise.total(), 10, "every race counts exactly once");
+    assert_eq!(
+        counters.ending_suppressed_skips, 0,
+        "the mid-scan path silenced these, not the scan-start excuse"
+    );
+}
+
+/// A generation change with a live group stays a loud named skip: the
+/// pin disagrees (a transient read, a failed check), so the failure is
+/// unexplained, never an exit.
+#[test]
+fn mid_scan_exit_race_with_live_group_stays_loud() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(715), child.id()).unwrap();
+    assert!(view.still_the_same(), "the group is live at scan start");
+    let counters = scan_view_with_outcome_skips(&view, mid_scan_exit_race_skips(), || {}, true);
+    assert_eq!(
+        view.original_exited(),
+        Ok(false),
+        "the live group proves nothing exited"
+    );
+    for reason in mid_scan_exit_race_reasons() {
+        assert!(
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason),
+            "a live group keeps its named skip for: {reason}; kept: {:?}",
+            counters.object_skips
+        );
+    }
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::MapsSnapshot),
+        7,
+        "loud races keep their class count"
+    );
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::ProcessEnded),
+        3,
+        "loud races keep their class count"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// A reused pid stays a loud named skip even though the pin reads the
+/// original gone: a live process holds the pid now, and it was never
+/// scanned. The stale start-time pin is the reuse shape (pin-says-gone,
+/// pid-live); the silence proof must exclude it.
+#[test]
+fn mid_scan_exit_race_with_reused_pid_stays_loud() {
+    use crate::discovery::noise::DiscoveryNoiseClass;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let view = crate::process::reused_process_view_for_test(ProcessViewId(716), pid).unwrap();
+    assert!(
+        !view.still_the_same(),
+        "the stale pin reads the original gone"
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(true),
+        "the stale pin alone would claim an exit"
+    );
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the pid names a live process"
+    );
+    let counters = scan_view_with_outcome_skips(&view, mid_scan_exit_race_skips(), || {}, false);
+    for reason in mid_scan_exit_race_reasons() {
+        assert!(
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == reason),
+            "a reused pid keeps its named skip for: {reason}; kept: {:?}",
+            counters.object_skips
+        );
+    }
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::MapsSnapshot),
+        7,
+        "loud races keep their class count"
+    );
+    assert_eq!(
+        counters.noise.count(DiscoveryNoiseClass::ProcessEnded),
+        3,
+        "loud races keep their class count"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// A proven exit excuses only exit-shaped refusals: a proven reuse
+/// crossing, a mapping change, a budget stop and an empty snapshot all
+/// stay loud with their own reasons.
+#[test]
+fn mid_scan_proven_exit_keeps_non_exit_refusals_loud() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(717), pid).unwrap();
+    let reasons = vec![
+        "memory scan refused: process generation changed during acquisition: proc acquisition crossed a process generation change"
+            .to_string(),
+        crate::discovery::scan::MAPPING_CHANGED_REASON.to_string(),
+        format!(
+            "memory scan refused: initial mapping validation unavailable: {SCAN_DEADLINE_REASON}"
+        ),
+        "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot"
+            .to_string(),
+    ];
+    let skips: Vec<Skipped> = reasons
+        .iter()
+        .map(|reason| Skipped {
+            subject: "capture discovery".into(),
+            reason: reason.clone(),
+        })
+        .collect();
+    let counters = scan_view_with_outcome_skips(
+        &view,
+        skips,
+        || {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        },
+        false,
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(true),
+        "the pin proves the original group exited"
+    );
+    assert!(
+        crate::process::generation_dead(pid),
+        "the pid names no live reuse"
+    );
+    for reason in &reasons {
+        assert!(
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason == *reason),
+            "a proven exit keeps non-exit refusals loud for: {reason}; kept: {:?}",
+            counters.object_skips
+        );
+    }
+    assert_eq!(
+        counters.noise.total(),
+        4,
+        "every kept refusal counts exactly once"
+    );
+    assert_eq!(
+        counters.ending_suppressed_skips, 0,
+        "nothing was excused at all"
+    );
+}
+
 /// Defers view 0 of a fresh fixture with a zero quantum, then rescans it
 /// with `prepare` applied and the group forced ending (or not) at scan
 /// start. Returns the fixture after capture-end withdrawal and the

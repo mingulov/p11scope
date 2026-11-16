@@ -134,14 +134,17 @@ fn privileged_run_default_learns_tables_for_a_getter_only_provider() -> Result<(
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     }
     // Sequential short-lived workers, pkcs11-check-shaped: each
-    // dlopens, negotiates the 3.0 interface and makes 30 table
-    // calls within milliseconds. Enough of them that slow hosts
-    // still run most workers after the late attach lands.
-    const WORKERS: usize = 120;
+    // dlopens, negotiates the 3.0 interface, makes 30 table calls
+    // and lingers about a second with the provider mapped (the
+    // matrix unit workers' lifetime), so the owned-tree watch can
+    // scan them. Enough of them that slow hosts still run most
+    // workers after the late attach lands.
+    const WORKERS: usize = 12;
     const ROUNDS_EACH: usize = 10;
     const CALLS_PER_ROUND: usize = 3;
+    const LINGER_MS: usize = 1000;
     let script = format!(
-        "for i in $(seq 1 {WORKERS}); do '{}' '{}' {ROUNDS_EACH} || {{ echo \"WORKER_FAIL i=$i rc=$?\"; exit 1; }}; done",
+        "for i in $(seq 1 {WORKERS}); do '{}' '{}' {ROUNDS_EACH} {LINGER_MS} || {{ echo \"WORKER_FAIL i=$i rc=$?\"; exit 1; }}; done",
         worker.display(),
         library.display()
     );

@@ -70742,7 +70742,8 @@ fn retry_breakdown_sums_across_consecutive_noise_flushes() {
 
 /// Retry breakdown, all flush sites: base, scan-input and stale-view noise
 /// survive the stale-view flush with no loss and no double-count, and the
-/// end-of-capture flush sums on top.
+/// end-of-capture flush sums on top — the initial-discovery flush shares
+/// the same merge-then-clear helper, so one site pins both.
 #[test]
 fn retry_breakdown_sums_across_stale_view_and_end_of_capture_flushes() {
     let stale = ProcessView::open(ProcessViewId(90), std::process::id()).unwrap();

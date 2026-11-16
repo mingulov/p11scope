@@ -9669,12 +9669,7 @@ fn discover_plan(
     if crate::run::capture_diagnostics_on() {
         discovered.counters.noise.report();
     }
-    discovered.noise_totals.merge(&discovered.counters.noise);
-    discovered.counters.noise.clear();
-    discovered.base_counters.noise.clear();
-    for input in discovered.scan_inputs.values_mut() {
-        input.counters.noise.clear();
-    }
+    flush_rebuilt_noise_to_totals(&mut discovered);
     // The concise report already names refused providers with the
     // `--module` remedy; the per-module repeats are diagnostics.
     if crate::run::capture_diagnostics_on() {
@@ -10960,6 +10955,20 @@ fn fallback_proof_in_plan(proof: &BoundFallbackProof, plan: &plan::AttachPlan) -
     })
 }
 
+/// Merge the rebuilt aggregate into the cumulative retry totals, then
+/// clear every noise source so live accumulation starts fresh. Shared by
+/// the initial-discovery flush and the stale-view flush: both rebuild
+/// first (folding base and scan-input noise into the aggregate), then
+/// flush here — one site pins both.
+fn flush_rebuilt_noise_to_totals(discovered: &mut Engine) {
+    discovered.noise_totals.merge(&discovered.counters.noise);
+    discovered.counters.noise.clear();
+    discovered.base_counters.noise.clear();
+    for input in discovered.scan_inputs.values_mut() {
+        input.counters.noise.clear();
+    }
+}
+
 fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     discovered.loader_plan_cache = None;
     let aggregate_start = crate::attach::monotonic_ns();
@@ -11527,12 +11536,7 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
     if crate::run::capture_diagnostics_on() {
         discovered.counters.noise.report();
     }
-    discovered.noise_totals.merge(&discovered.counters.noise);
-    discovered.counters.noise.clear();
-    discovered.base_counters.noise.clear();
-    for input in discovered.scan_inputs.values_mut() {
-        input.counters.noise.clear();
-    }
+    flush_rebuilt_noise_to_totals(discovered);
     Ok(removed)
 }
 

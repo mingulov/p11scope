@@ -4512,13 +4512,13 @@ const ZERO_READ_EXIT_CAUSE: &str = "the process exited during the snapshot";
 /// cannot: a start-time fallback pin reads an unreaped zombie as
 /// alive, and even a pidfd pin stays unready while the task runs its
 /// own exit path with the mm already released (state `R`, empty maps
-/// — an easily sampled window, not a microsecond race). A reused pid
-/// reads its new occupant's nonempty maps and stays unrenamed, which
-/// is honest: the new occupant proves nothing about the scanned
-/// generation. Any other read failure keeps the established wording.
-/// Reads the live file directly, like `still_the_same`: scripted maps
-/// would defeat the purpose — the question is whether the mm is gone
-/// NOW.
+/// — an easily sampled window, not a microsecond race). A reused pid reads
+/// its new occupant's nonempty maps here, but the caller renames on the
+/// proven exit before consulting this re-read (reuse implies the scanned
+/// generation exited and was reaped). Any other read failure keeps the
+/// established wording. Reads the live file directly, like `still_the_same`:
+/// scripted maps would defeat the purpose — the question is whether the mm
+/// is gone NOW.
 fn target_maps_now_empty(pid: u32) -> bool {
     use std::io::Read as _;
     let mut maps = match std::fs::File::open(format!("/proc/{pid}/maps")) {
@@ -4529,18 +4529,21 @@ fn target_maps_now_empty(pid: u32) -> bool {
     matches!(maps.read(&mut first), Ok(0))
 }
 
-/// Whether a zero-length mapping read names the exit exactly: the pin is
-/// dead (the scanned generation is gone), or a live re-read shows the mm
-/// gone while no live member proves the group alive. A zombie-leader group
-/// with live members always shows empty TGID maps while alive, so an empty
-/// TGID re-read alone never names the exit once a live non-leader member
-/// proves the group alive — that shape keeps the established wording. A
-/// start-time fallback pin has no member authority and an exhausted read
-/// budget proves nothing, so anything unproven keeps the established
+/// Whether a zero-length mapping read names the exit exactly: the pin
+/// proves the scanned generation gone (`original_exited() == Ok(true)`),
+/// or a live re-read shows the mm gone while no live member proves the
+/// group alive. A transient stat failure or missing start time proves
+/// nothing — a live, mapped process keeps the established wording. A
+/// zombie-leader group with live members always shows empty TGID maps
+/// while alive, so an empty TGID re-read alone never names the exit once
+/// a live non-leader member proves the group alive. A start-time fallback
+/// pin has no member authority and an exhausted read budget proves
+/// nothing, so an unproven pin with empty maps keeps the established
 /// rename: the single-threaded exit window — mm released before the pin
-/// settles — still names its exit.
+/// settles — still names its exit, as does a pid reused by a live
+/// process (reuse implies the scanned generation exited and was reaped).
 fn zero_read_names_exit(view: &ProcessView) -> bool {
-    if !view.still_the_same() {
+    if view.original_exited() == Ok(true) {
         return true;
     }
     if !target_maps_now_empty(view.pid()) {
@@ -8346,6 +8349,7 @@ fn scan_view_examined_mode(
         let mut snapshots = Vec::with_capacity(data.len());
         let mut operation_bytes = 0u64;
         let mut io_exhausted = false;
+        let mut data_stopped_short = false;
         for entry in &data {
             let (bytes, short, exhausted) = read_mapping(mem, entry, budget, &mut operation_bytes);
             // A zero-length read while the target's mm is gone proves the
@@ -8354,8 +8358,8 @@ fn scan_view_examined_mode(
             // say how much went unexamined. The pin alone cannot prove
             // it: a fallback pin reads an unreaped zombie as alive, and a
             // pidfd pin stays unready while the task runs its own exit
-            // path with the mm already released — so a dead pin renames
-            // outright, while a live-looking pin re-checks the maps, unless
+            // path with the mm already released — so a proven exit renames
+            // outright, while an unproven pin re-checks the maps, unless
             // a live member proves the group alive (a zombie leader's TGID
             // maps are always empty while members live).
             let short = match short {
@@ -8370,6 +8374,9 @@ fn scan_view_examined_mode(
             };
             // Bytes past a failed read were never examined; saying nothing here would
             // present a partial decode as a complete one.
+            if short.is_some() {
+                data_stopped_short = true;
+            }
             if let Some(reason) = short {
                 skipped.push(scan_skip(&module.path, reason));
             }
@@ -8462,12 +8469,13 @@ fn scan_view_examined_mode(
         // or the scan stopped mid-module — the counted gap below names the
         // file (data-always) — matching the stop-break site above. Only
         // the genuine no-table row needs an unstopped scan: a stop proves
-        // no absence. It also needs examined bytes: when data mappings
-        // exist but every snapshot read zero bytes, the per-mapping
-        // partial rows above already name each failure, and the no-table
-        // marker would claim a verified absence from zero evidence.
-        // A module with no data mappings at all keeps its row — all zero
-        // bytes of its file-backed data were examined.
+        // no absence. It also needs a complete snapshot: when any data
+        // mapping stopped short — zero bytes or a partial read followed
+        // by a zero stop — the per-mapping partial rows above already name
+        // each failure, and the no-table marker would claim a verified
+        // absence from a truncated snapshot. A module with no data
+        // mappings at all keeps its row — all zero bytes of its
+        // file-backed data were examined.
         let snapshot_bytes: usize = snapshots.iter().map(|(_, bytes)| bytes.len()).sum();
         if module.tables.is_empty() {
             if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
@@ -8478,6 +8486,7 @@ fn scan_view_examined_mode(
             } else if !io_exhausted
                 && !budget.scan_stopped()
                 && !(getter_object && !hinted)
+                && !data_stopped_short
                 && (data.is_empty() || snapshot_bytes > 0)
             {
                 // A getter manifest's program object with no file-backed
@@ -16444,9 +16453,11 @@ mod tests {
     }
 
     /// Fail-closed twin: an unprovable fallback pin (`still_the_same() ==
-    /// false` with no start time) on a live, mapped process keeps the read
-    /// wording — a transient stat failure or missing start time never names
-    /// an exit without maps proof.
+    /// false` with no start time) on a live, mapped process must not name
+    /// an exit — a transient stat failure or missing start time never
+    /// proves an exit without maps proof. Helper-level: the scan entry
+    /// check rejects unprovable views before any data read, so the rename
+    /// decision itself is the seam that keeps the read wording.
     #[test]
     fn zero_byte_snapshot_of_an_unprovable_live_process_keeps_the_read_wording() {
         let pid = std::process::id();
@@ -16470,46 +16481,6 @@ mod tests {
         assert!(
             !zero_read_names_exit(&view),
             "an unproven pin never names an exit without maps proof"
-        );
-        let mut fixture = BracketFixture::new(8, false);
-        fixture.mem.set_len(0).unwrap();
-        let identity = crate::discovery::identity::FileIdentity { dev: 37, ino: 9 };
-        fixture.mapped = Some((identity, identity));
-        let hooks = HookRegistry::builtin();
-        let hints = [fixture.path.clone()];
-        let (outcome, _, _, _) = scan_view_with_examined(
-            &ScanRequest {
-                pid: view.pid(),
-                hints: &hints,
-                hooks: &hooks,
-            },
-            &view,
-            &mut CaptureWorkBudget::default(),
-            &mut fixture,
-            true,
-        )
-        .expect("a live scan names its gaps, it does not error");
-        let reasons: Vec<&str> = outcome
-            .skipped()
-            .iter()
-            .map(|skip| skip.reason.as_str())
-            .collect();
-        assert!(
-            reasons.iter().any(|reason| reason.contains("read 0 of")
-                && reason.contains("the read returned no bytes")),
-            "the unproven zero-byte read keeps its wording: {reasons:?}"
-        );
-        assert!(
-            reasons
-                .iter()
-                .all(|reason| !reason.contains("the process exited during the snapshot")),
-            "an unproven pin never names an exit: {reasons:?}"
-        );
-        assert!(
-            reasons
-                .iter()
-                .all(|reason| !reason.contains(NO_TABLE_FOUND_MARKER)),
-            "zero examined bytes claim no verified absence: {reasons:?}"
         );
     }
 

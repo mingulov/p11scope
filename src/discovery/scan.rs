@@ -4499,6 +4499,32 @@ const ZERO_READ_CAUSE: &str = "the read returned no bytes";
 /// still truncates the scan it came from.
 const ZERO_READ_EXIT_CAUSE: &str = "the process exited during the snapshot";
 
+/// True when `/proc/<pid>/maps` reads empty right now, or the pid is
+/// gone: the target's mm is gone, so the scanned generation exited or
+/// is past running user code. A live user process always maps
+/// something, and the scan only reaches a zero-length read for a group
+/// its own maps snapshot listed — so an empty re-read proves the
+/// mapping vanished with its process. This catches what the pin
+/// cannot: a start-time fallback pin reads an unreaped zombie as
+/// alive, and even a pidfd pin stays unready while the task runs its
+/// own exit path with the mm already released (state `R`, empty maps
+/// — an easily sampled window, not a microsecond race). A reused pid
+/// reads its new occupant's nonempty maps and stays unrenamed, which
+/// is honest: the new occupant proves nothing about the scanned
+/// generation. Any other read failure keeps the established wording.
+/// Reads the live file directly, like `still_the_same`: scripted maps
+/// would defeat the purpose — the question is whether the mm is gone
+/// NOW.
+fn target_maps_now_empty(pid: u32) -> bool {
+    use std::io::Read as _;
+    let mut maps = match std::fs::File::open(format!("/proc/{pid}/maps")) {
+        Ok(maps) => maps,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+    };
+    let mut first = [0u8; 1];
+    matches!(maps.read(&mut first), Ok(0))
+}
+
 /// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A partial read simply
 /// advances and retries; only a failed or zero-length read ends the mapping, keeping
 /// what was read so far. The second return says why it stopped short — everything past
@@ -8288,14 +8314,19 @@ fn scan_view_examined_mode(
         let mut io_exhausted = false;
         for entry in &data {
             let (bytes, short, exhausted) = read_mapping(mem, entry, budget, &mut operation_bytes);
-            // A zero-length read against a dead pin proves the target exited
-            // mid-snapshot, so the mapping vanished with its process: name
-            // the exit exactly while the pin still proves it. The byte
-            // counts stay — they say how much went unexamined — and a live
-            // pin keeps the established read wording below.
+            // A zero-length read while the target's mm is gone proves the
+            // target exited mid-snapshot, so the mapping vanished with its
+            // process: name the exit exactly. The byte counts stay — they
+            // say how much went unexamined. The pin alone cannot prove
+            // it: a fallback pin reads an unreaped zombie as alive, and a
+            // pidfd pin stays unready while the task runs its own exit
+            // path with the mm already released — so a dead pin renames
+            // outright, while a live-looking pin re-checks the maps.
             let short = match short {
                 Some(reason)
-                    if !exhausted && reason.contains(ZERO_READ_CAUSE) && !view.still_the_same() =>
+                    if !exhausted
+                        && reason.contains(ZERO_READ_CAUSE)
+                        && (!view.still_the_same() || target_maps_now_empty(view.pid())) =>
                 {
                     Some(reason.replace(ZERO_READ_CAUSE, ZERO_READ_EXIT_CAUSE))
                 }
@@ -15957,6 +15988,7 @@ mod tests {
         maps: String,
         identity: crate::discovery::identity::FileIdentity,
         killed: std::rc::Rc<std::cell::Cell<bool>>,
+        weak_pin: bool,
     }
 
     struct ReapOnDrop(std::rc::Rc<std::cell::RefCell<std::process::Child>>);
@@ -15973,6 +16005,7 @@ mod tests {
         pin: std::sync::Arc<crate::process::PidPin>,
         pid: u32,
         killed: std::rc::Rc<std::cell::Cell<bool>>,
+        weak_pin: bool,
     }
 
     impl ScanMemory for ExitMidScanMemory {
@@ -15984,17 +16017,30 @@ mod tests {
                     .kill()
                     .expect("the mid-scan exit must be deliverable");
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while self.pin.still_the_same() {
+                if self.weak_pin {
+                    // A start-time fallback pin never flips for an
+                    // unreaped zombie, so the zombie state itself is the
+                    // wait condition; the test asserts the pin blindness.
+                    while !crate::process::process_is_zombie(self.pid) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the killed scan target must become a zombie promptly"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                } else {
+                    while self.pin.still_the_same() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the killed scan target must exit promptly"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                     assert!(
-                        std::time::Instant::now() < deadline,
-                        "the killed scan target must exit promptly"
+                        crate::process::process_is_zombie(self.pid),
+                        "the mid-scan target exits, it is not reused"
                     );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                assert!(
-                    crate::process::process_is_zombie(self.pid),
-                    "the mid-scan target exits, it is not reused"
-                );
             }
             // Post-exit `/proc/<pid>/mem` reads: the kernel returns 0 once
             // the target's mm is gone.
@@ -16023,6 +16069,7 @@ mod tests {
                 pin: self.pin.clone(),
                 pid: self.pid,
                 killed: self.killed.clone(),
+                weak_pin: self.weak_pin,
             })
         }
         fn held_identity(
@@ -16053,7 +16100,7 @@ mod tests {
     }
 
     impl ExitMidScanFixture {
-        fn new() -> (Self, ProcessView) {
+        fn new(weak_pin: bool) -> (Self, ProcessView) {
             use crate::fixture_guard::DieWithParent as _;
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("provider.so");
@@ -16066,7 +16113,12 @@ mod tests {
                     .unwrap(),
             ));
             let pid = child.borrow().id();
-            let view = ProcessView::open(ProcessViewId(74), pid).unwrap();
+            let view = if weak_pin {
+                crate::process::start_time_pinned_process_view_for_test(ProcessViewId(75), pid)
+                    .unwrap()
+            } else {
+                ProcessView::open(ProcessViewId(74), pid).unwrap()
+            };
             assert!(view.still_the_same());
             let pin = view.retained_pin_arc().clone();
             let key_view = ProcessView::open(ProcessViewId(73), std::process::id()).unwrap();
@@ -16101,6 +16153,7 @@ mod tests {
                     maps,
                     identity,
                     killed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                    weak_pin,
                 },
                 view,
             )
@@ -16112,7 +16165,7 @@ mod tests {
     /// verified-absence no-table row.
     #[test]
     fn zero_byte_snapshot_of_an_exited_process_names_the_exit_exactly() {
-        let (mut fixture, view) = ExitMidScanFixture::new();
+        let (mut fixture, view) = ExitMidScanFixture::new(false);
         let hooks = HookRegistry::builtin();
         let hints = [fixture.path.clone()];
         let (outcome, _, _, _) = scan_view_with_examined(
@@ -16180,6 +16233,62 @@ mod tests {
         assert!(
             !outcome.modules().is_empty(),
             "the live scan keeps its module: {outcome:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains(NO_TABLE_FOUND_MARKER)),
+            "zero examined bytes claim no verified absence: {reasons:?}"
+        );
+    }
+
+    /// Fallback-pin twin: the target exits mid-scan under a start-time
+    /// fallback pin, which reads the unreaped zombie as alive — the
+    /// zero-byte snapshots still name the exit exactly via the emptied
+    /// maps, with no vacuous no-table row.
+    #[test]
+    fn zero_byte_snapshot_of_a_fallback_pinned_zombie_names_the_exit() {
+        let (mut fixture, view) = ExitMidScanFixture::new(true);
+        let hooks = HookRegistry::builtin();
+        let hints = [fixture.path.clone()];
+        let (outcome, _, _, _) = scan_view_with_examined(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+            true,
+        )
+        .expect("a mid-scan exit names its gaps, it does not error");
+        assert!(
+            view.still_the_same(),
+            "the fallback pin reads the zombie as alive"
+        );
+        assert!(
+            crate::process::process_is_zombie(view.pid()),
+            "the mid-scan exit really happened"
+        );
+        let reasons: Vec<&str> = outcome
+            .skipped()
+            .iter()
+            .map(|skip| skip.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.contains("read 0 of"))
+                .count(),
+            2,
+            "both data mappings name their zero-byte snapshot: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("the process exited during the snapshot")),
+            "the exit is named exactly: {reasons:?}"
         );
         assert!(
             reasons

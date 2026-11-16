@@ -15905,6 +15905,255 @@ mod tests {
         );
     }
 
+    /// A scan whose target exits between the object open and the data
+    /// snapshot: production `/proc/<pid>/mem` reads return `Ok(0)` once the
+    /// target's mm is gone (an unmapped VMA in a live process fails with
+    /// EIO instead), so every data mapping snapshots zero bytes against a
+    /// dead pin. Models the alive-time open/proof with the default open and
+    /// scripted matching identities, then kills the child on the first
+    /// memory read — exactly the busy-host dlopen/dlclose-churn shape.
+    struct ExitMidScanFixture {
+        _dir: tempfile::TempDir,
+        _reap: ReapOnDrop,
+        child: std::rc::Rc<std::cell::RefCell<std::process::Child>>,
+        pin: std::sync::Arc<crate::process::PidPin>,
+        pid: u32,
+        path: PathBuf,
+        maps: String,
+        identity: crate::discovery::identity::FileIdentity,
+        killed: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    struct ReapOnDrop(std::rc::Rc<std::cell::RefCell<std::process::Child>>);
+    impl Drop for ReapOnDrop {
+        fn drop(&mut self) {
+            let mut child = self.0.borrow_mut();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    struct ExitMidScanMemory {
+        child: std::rc::Rc<std::cell::RefCell<std::process::Child>>,
+        pin: std::sync::Arc<crate::process::PidPin>,
+        pid: u32,
+        killed: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl ScanMemory for ExitMidScanMemory {
+        fn read_memory_at(&self, _bytes: &mut [u8], _offset: u64) -> std::io::Result<usize> {
+            if !self.killed.get() {
+                self.killed.set(true);
+                self.child
+                    .borrow_mut()
+                    .kill()
+                    .expect("the mid-scan exit must be deliverable");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while self.pin.still_the_same() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the killed scan target must exit promptly"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(
+                    crate::process::process_is_zombie(self.pid),
+                    "the mid-scan target exits, it is not reused"
+                );
+            }
+            // Post-exit `/proc/<pid>/mem` reads: the kernel returns 0 once
+            // the target's mm is gone.
+            Ok(0)
+        }
+    }
+
+    impl ScanIo for ExitMidScanFixture {
+        type Memory = ExitMidScanMemory;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(
+                self.maps.as_bytes().to_vec(),
+            )))
+        }
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<ExitMidScanMemory> {
+            Ok(ExitMidScanMemory {
+                child: self.child.clone(),
+                pin: self.pin.clone(),
+                pid: self.pid,
+                killed: self.killed.clone(),
+            })
+        }
+        fn held_identity(
+            &mut self,
+            _file: &File,
+        ) -> Option<crate::discovery::identity::MappedFile> {
+            Some(crate::discovery::identity::MappedFile {
+                identity: self.identity,
+                fs_magic: Some(0xef53),
+            })
+        }
+        fn range_identity(
+            &mut self,
+            _view: &ProcessView,
+            _start: u64,
+            _end: u64,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+            Ok(Ok(self.identity))
+        }
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+    }
+
+    impl ExitMidScanFixture {
+        fn new() -> (Self, ProcessView) {
+            use crate::fixture_guard::DieWithParent as _;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            std::fs::write(&path, BracketFixture::minimal_provider_elf(8)).unwrap();
+            let child = std::rc::Rc::new(std::cell::RefCell::new(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .die_with_parent()
+                    .spawn()
+                    .unwrap(),
+            ));
+            let pid = child.borrow().id();
+            let view = ProcessView::open(ProcessViewId(74), pid).unwrap();
+            assert!(view.still_the_same());
+            let pin = view.retained_pin_arc().clone();
+            let key_view = ProcessView::open(ProcessViewId(73), std::process::id()).unwrap();
+            let file = File::open(&path).unwrap();
+            let key = crate::discovery::identity::retained_object_key(
+                &key_view,
+                &file,
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            let identity = format!(
+                "{:x}:{:x} {} {}",
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                path.display()
+            );
+            let maps = format!(
+                "1000-2000 r-xp 00000000 {identity}\n\
+                 4000-6000 rw-p 00002000 {identity}\n\
+                 7000-8000 r--p 00004000 {identity}\n"
+            );
+            let identity = crate::discovery::identity::FileIdentity { dev: 37, ino: 9 };
+            (
+                Self {
+                    _dir: dir,
+                    _reap: ReapOnDrop(child.clone()),
+                    child,
+                    pin,
+                    pid,
+                    path,
+                    maps,
+                    identity,
+                    killed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                },
+                view,
+            )
+        }
+    }
+
+    /// Exit twin: zero-byte data snapshots against a dead pin name the
+    /// exit exactly, and the module — zero bytes examined — keeps no
+    /// verified-absence no-table row.
+    #[test]
+    fn zero_byte_snapshot_of_an_exited_process_names_the_exit_exactly() {
+        let (mut fixture, view) = ExitMidScanFixture::new();
+        let hooks = HookRegistry::builtin();
+        let hints = [fixture.path.clone()];
+        let (outcome, _, _, _) = scan_view_with_examined(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+            true,
+        )
+        .expect("a mid-scan exit names its gaps, it does not error");
+        assert!(!view.still_the_same(), "the mid-scan exit really happened");
+        let reasons: Vec<&str> = outcome
+            .skipped()
+            .iter()
+            .map(|skip| skip.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.contains("read 0 of"))
+                .count(),
+            2,
+            "both data mappings name their zero-byte snapshot: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("the process exited during the snapshot")),
+            "the exit is named exactly: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains(NO_TABLE_FOUND_MARKER)),
+            "zero examined bytes claim no verified absence: {reasons:?}"
+        );
+    }
+
+    /// Live twin: a zero-byte snapshot against a live pin keeps the
+    /// established read wording, but — like the exit twin — zero examined
+    /// bytes still claim no verified-absence no-table row.
+    #[test]
+    fn zero_byte_snapshot_of_a_live_process_keeps_the_read_wording() {
+        let mut fixture = BracketFixture::new(8, false);
+        fixture.mem.set_len(0).unwrap();
+        let identity = crate::discovery::identity::FileIdentity { dev: 37, ino: 9 };
+        fixture.mapped = Some((identity, identity));
+        let outcome = fixture
+            .run(&mut CaptureWorkBudget::default())
+            .expect("a live scan names its gaps, it does not error");
+        let reasons: Vec<&str> = outcome
+            .skipped()
+            .iter()
+            .map(|skip| skip.reason.as_str())
+            .collect();
+        assert!(
+            reasons.iter().any(|reason| reason.contains("read 0 of")
+                && reason.contains("the read returned no bytes")),
+            "the live zero-byte read keeps its wording: {reasons:?}"
+        );
+        assert!(
+            !outcome.modules().is_empty(),
+            "the live scan keeps its module: {outcome:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains(NO_TABLE_FOUND_MARKER)),
+            "zero examined bytes claim no verified absence: {reasons:?}"
+        );
+    }
+
     #[test]
     fn a_pointer_into_data_or_nowhere_rejects_the_whole_candidate() {
         let maps = parse_maps(

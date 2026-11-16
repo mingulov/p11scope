@@ -604,4 +604,16 @@ mod tests {
             DiscoveryNoiseClass::MapsSnapshot
         );
     }
+
+    #[test]
+    fn classification_maps_an_exit_named_zero_byte_snapshot_to_process_ended() {
+        assert_eq!(
+            classify_discovery_noise(
+                "/usr/lib64/pkcs11/libsofthsm2.so",
+                "partial snapshot of one data mapping: read 0 of 225280 bytes: \
+                 the process exited during the snapshot"
+            ),
+            DiscoveryNoiseClass::ProcessEnded
+        );
+    }
 }

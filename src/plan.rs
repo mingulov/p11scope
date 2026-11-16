@@ -1635,19 +1635,20 @@ struct ReclaimTarget<'a> {
 
 /// The one reclaim predicate: a returning exact target may reoccupy a
 /// retired index only when it is the same exact target, or — for a new pin
-/// of the same file — the same file offset, path, names and descriptor,
-/// with a positive file identity match on both sides. A missing identity
-/// never reclaims: path names are not identity. A same-key count-only
-/// return onto a retired semantic cell (the forward flip) reoccupies it as
-/// count-only, the way the kept path keeps a count-only cell's descriptor
-/// at zero; it loses nothing, so it reoccupies directly. A semantic return
-/// onto a retired count-only cell (the reverse flip) is not matched here
-/// at all: it goes through [`reclaimable_reverse_flip`] and takes a fresh
-/// semantic index while the budget has room, so flip-flopping generations
-/// keep both shapes within two generations per key. Aggregated ownership
-/// is applied separately (a reclaim that would make a semantic cell
-/// ambiguous downgrades it to count-only and reports the ambiguity) so
-/// merge can account the same set before module IDs are resolved.
+/// of the same file — the same file offset, path and names, with a
+/// positive file identity match on both sides. A missing identity never
+/// reclaims: path names are not identity. A count-only return onto a
+/// retired semantic cell (the forward flip) reoccupies it as count-only,
+/// the way the kept path keeps a count-only cell's descriptor at zero;
+/// it loses nothing, so it reoccupies directly, same-key (names subset)
+/// or cross-pin (exact names). A semantic return onto a retired
+/// count-only cell (the reverse flip) is not matched here at all: it goes
+/// through [`reclaimable_reverse_flip`] and takes a fresh semantic index
+/// while the budget has room, so flip-flopping generations keep both
+/// shapes within two generations per key. Aggregated ownership is applied
+/// separately (a reclaim that would make a semantic cell ambiguous
+/// downgrades it to count-only and reports the ambiguity) so merge can
+/// account the same set before module IDs are resolved.
 fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
     if AttachKey::of(old.slot) != old.key {
         return false;
@@ -1689,10 +1690,23 @@ fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
     {
         return false;
     }
-    // A new pin of the same file reoccupies a retired cell of the same
-    // shape only; names stay exact across pins. The reverse flip (a
-    // semantic return onto a count-only cell) is matched separately.
-    old.slot.descriptor_index == new.descriptor_index && old.slot.names == new.names
+    // A new pin of the same file reoccupies a retired cell of the
+    // same shape, or forward-flips onto a retired semantic cell when
+    // the return is count-only: that loses nothing (extend keeps the
+    // old authorized names, stays count-only and attaches a new link),
+    // so it reoccupies directly. Names stay exact across pins; the
+    // reverse flip (a semantic return onto a count-only cell) is
+    // matched separately.
+    if old.slot.names != new.names {
+        return false;
+    }
+    if old.slot.descriptor_index == new.descriptor_index {
+        return true;
+    }
+    old.slot.descriptor_index != 0
+        && new.descriptor_index == 0
+        && !new.semantic_authorized
+        && !new.names.is_empty()
 }
 
 /// The reverse flip: a semantic return onto its own (same key) or its
@@ -1926,11 +1940,12 @@ fn predicted_reclaim_shape<'a>(
 /// retired position. Exact-shape matches win before flips, same-key before
 /// cross-ID: the key's own exact generation, a same-file generation of the
 /// same shape, the key's own other-shape generation, then a same-file
-/// other-shape generation (reverse flips only — a count-only return never
-/// takes another pin's semantic cell). One position per key and one key
-/// per position. Reverse-flip tickets ride free here; extend takes a fresh
-/// semantic index for them while the budget has room and reoccupies only
-/// at capacity, reporting the counted lowering.
+/// other-shape generation (a semantic return reverse-flips while a
+/// count-only return forward-flips onto a retired semantic cell). One
+/// position per key and one key per position. Reverse-flip tickets ride
+/// free here; extend takes a fresh semantic index for them while the
+/// budget has room and reoccupies only at capacity, reporting the counted
+/// lowering. Forward flips reoccupy directly, same-key or cross-pin.
 #[allow(clippy::too_many_arguments)]
 fn reclaim_tickets(
     group: &[Discovered<'_>],
@@ -2023,19 +2038,26 @@ fn reclaim_tickets(
                 found = Some(facts.position);
             }
         }
-        // Finally a same-file other-shape generation, reverse flips only.
+        // Finally a same-file other-shape generation: a semantic
+        // return reverse-flips (extend prefers a fresh index), while a
+        // count-only return forward-flips onto a retired semantic cell
+        // (lossless, direct).
         if found.is_none()
-            && semantic
             && let Some(candidates) = index.get(&(key.file_offset, path))
         {
             for (old_key, old_semantic) in candidates {
-                if *old_semantic {
+                if *old_semantic == semantic {
                     continue;
                 }
                 let Some(facts) = memory.facts(old_key, *old_semantic) else {
                     continue;
                 };
-                if free(facts.position) && reclaimable_reverse_flip(&facts, &target) {
+                let flip = if semantic {
+                    reclaimable_reverse_flip(&facts, &target)
+                } else {
+                    reclaimable(&facts, &target)
+                };
+                if free(facts.position) && flip {
                     found = Some(facts.position);
                     break;
                 }

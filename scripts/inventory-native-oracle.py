@@ -5361,6 +5361,15 @@ def self_test():
         case("jsonl-callers-retired-unaccounted", "AGREE-CALLERS",
              lambda s, d, dash: retired_caller(s, d, dash, budget=0))
 
+        def retired_on_instance(s, d, dash):
+            # Item 7: a retired ID that still backs a final instance
+            # row is a mismatch too.
+            d.setdefault("instances", []).append({"id": "i9", "caller": "c900", "module": "m0",
+                                  "state": "observed", "reason": None,
+                                  "first_seen_ns": 1, "last_seen_ns": 2})
+            return retired_caller(s, d, dash)
+        case("jsonl-callers-retired-still-on-instance", "AGREE-CALLERS", retired_on_instance)
+
         def totals(s, d, dash):
             ev = s.events(d, True)
             next(e for e in ev if e["kind"] == "pass_committed")["event"]["totals"]["edges"] += 1
@@ -5392,6 +5401,49 @@ def self_test():
             ev.pop(_edge_rows(ev)[-1])
             return {"events": _account(ev, -1)}
         case("jsonl-edge-event-missing", "AGREE-EDGE-EVENTS", edge_missing)
+
+        def retired_on_edge(s, d, dash):
+            # Item 7: a retired ID that still backs a final edge is a
+            # mismatch, even though its absence is counted. The edge is
+            # appended after the events are built (the builder keys
+            # derived states off snapshot callers), then given its own
+            # record so only AGREE-CALLERS disagrees.
+            gone = "c900"
+            kw = retired_caller(s, d, dash)
+            edge = _deep(d["edges"][0])
+            edge["caller"] = gone
+            d["edges"].append(edge)
+            ev = kw["events"]
+            model = next(e for e in ev if e["kind"] == "edge_observed")
+            staged = _deep(model)
+            staged["event"]["caller"] = gone
+            at = next(i for i, e in enumerate(ev) if e["kind"] == "edge_observed")
+            ev.insert(at + 1, staged)
+            next(e for e in ev if e["kind"] == "pass_committed")["event"]["totals"]["edges"] += 1
+            return {"events": _account(ev, +1)}
+        case("jsonl-callers-retired-still-on-edge", "AGREE-CALLERS", retired_on_edge)
+
+        def folded_edge(s, d, dash, folded=1):
+            # A streamed edge_observed for a folded edge is absent from
+            # the final snapshot while budgets.edges.folded counts it.
+            gone = "c900"
+            d["budgets"]["callers"].update(retired=1, late_refused=0)
+            d["budgets"].setdefault("edges", {}).update(folded=folded)
+            extra = [("caller_event", {"event": "admitted", "caller": gone}),
+                     ("caller_event", {"event": "retired", "caller": gone,
+                                       "reason": "synthetic retirement"})]
+            ev = s.events(d, True, extra)
+            model = next(e for e in ev if e["kind"] == "edge_observed")
+            staged = _deep(model)
+            staged["event"]["caller"] = gone
+            at = next(i for i, e in enumerate(ev) if e["kind"] == "edge_observed")
+            ev.insert(at + 1, staged)
+            return {"events": _account(ev, +1)}
+        case("jsonl-edge-folded-excused", None, folded_edge)
+        case("jsonl-edge-folded-unaccounted", "AGREE-EDGE-EVENTS",
+             lambda s, d, dash: folded_edge(s, d, dash, folded=0))
+        case("jsonl-edge-folded-overcounted", "AGREE-EDGE-EVENTS",
+             lambda s, d, dash: folded_edge(s, d, dash, folded=2))
 
         def edge_stale_then_exact(s, d, dash):
             ev = s.events(d, True)

@@ -539,3 +539,26 @@ fn high_lifetime_caller_ids_are_keyed_and_freed_slots_reused() {
     assert!(!frame.contains(CallerId(base)), "the forgotten row is gone");
     assert_eq!(runtime.next(0).unwrap().caller.id, CallerId(20_000));
 }
+
+/// Item 5: a refusal frame covers every caller with its verdict — the
+/// dense-ID shortcut (`id < unknown`) wrongly drops lifetime IDs past
+/// the retained count, so the emitter re-sends their
+/// `caller_metadata_changed` every pass instead of skipping the
+/// unchanged verdict.
+#[test]
+fn refusal_frame_covers_lifetime_caller_ids() {
+    let mut frame = MetadataFrame::unavailable(MetadataReason::LookupLimit);
+    frame.summary.unknown = 100;
+    assert!(
+        frame.contains(CallerId(50)),
+        "a dense ID reads the refusal verdict"
+    );
+    assert!(
+        frame.contains(CallerId(5000)),
+        "a refusal verdict covers every caller, however high its lifetime ID"
+    );
+    assert!(
+        frame.metadata(CallerId(5000)).is_some(),
+        "contains agrees with the metadata the frame serves"
+    );
+}

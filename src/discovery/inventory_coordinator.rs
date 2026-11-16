@@ -23436,8 +23436,10 @@ exit 0
             });
         // The grace runs from the first pass that observes the exit, not
         // from the old EXEC instant: one pass records it, a later pass
-        // past the grace prunes.
-        let first = last + 1;
+        // past the grace prunes. Every EXEC here is older than the grace
+        // when the first pass observes the exits, so a grace measured
+        // from the EXEC instant would prune here instead of keeping.
+        let first = last + super::EXEC_STATE_GRACE_NS + 1_000;
         let catalog = capture_catalog(
             &native.scene.pins,
             &[&native.scene.path],
@@ -23455,6 +23457,11 @@ exit 0
             native.scene.coordinator.exec_exe_len_for_test(),
             CHURN as usize,
             "the first exit observation starts the grace"
+        );
+        assert_eq!(
+            native.scene.coordinator.binder.exec_instants_for_test(),
+            CHURN as usize,
+            "the first exit observation starts the binder grace too"
         );
         let now = first + super::EXEC_STATE_GRACE_NS + 1;
         let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
@@ -33989,6 +33996,112 @@ int main(void) {
             exes[0].resolution,
             ExeResolution::NoExecRecord,
             "after the sweep the image has no record at all, not a lost one"
+        );
+    }
+
+    /// Item 3: a sweep that completed WITH gaps proves nothing about
+    /// the rows it skipped, so it must not expire EXEC tombstones: a
+    /// late row for a pruned image still reads `exec_record_lost`.
+    #[test]
+    fn sweep_with_gaps_keeps_pruned_exec_tombstones() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        let at = native.stamps.tick();
+        native.execs(vec![exec_record(41, 9, at, 8, 99)]);
+        native.scene.coordinator.prune_departed_native_state(at + 1);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + 1 + EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 1);
+        let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, Vec::new()) else {
+            unreachable!()
+        };
+        batch.sweep_completed = true;
+        batch.sweep_gaps = true;
+        native.stage(NativeBatch::Witness(batch));
+        assert_eq!(
+            native.scene.coordinator.exec_pruned_for_test(),
+            1,
+            "a gappy sweep expires no tombstone"
+        );
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(
+            exes[0].resolution,
+            ExeResolution::ExecRecordLost,
+            "the kept tombstone still names the pruned record lost"
+        );
+    }
+
+    /// Item 3: a completed gap-free sweep only proves that no row older
+    /// than its beginning is still in flight, so only tombstones pruned
+    /// before the sweep began expire; a tombstone pruned after the
+    /// sweep began stays until a later sweep proves it.
+    #[test]
+    fn sweep_expires_only_tombstones_pruned_before_it_began() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        let at = native.stamps.tick();
+        native.execs(vec![exec_record(41, 9, at, 8, 99)]);
+        native.scene.coordinator.prune_departed_native_state(at + 1);
+        let pruned_old = at + 1 + EXEC_STATE_GRACE_NS;
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(pruned_old);
+        assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 1);
+        // The sweep begins after the old prune ...
+        let NativeBatch::Witness(mut first) = native.stamps.read(native.domain, Vec::new()) else {
+            unreachable!()
+        };
+        first.sweep_completed = false;
+        first.health_read_ns = pruned_old + 1_000;
+        native.stage(NativeBatch::Witness(first));
+        // ... and the young prune lands after the sweep began.
+        native.execs(vec![exec_record(42, 10, pruned_old + 2_000, 8, 100)]);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(pruned_old + 3_000);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(pruned_old + 3_000 + EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.exec_pruned_for_test(), 2);
+        let NativeBatch::Witness(mut done) = native.stamps.read(native.domain, Vec::new()) else {
+            unreachable!()
+        };
+        done.sweep_completed = true;
+        done.sweep_gaps = false;
+        native.stage(NativeBatch::Witness(done));
+        assert_eq!(
+            native.scene.coordinator.exec_pruned_for_test(),
+            1,
+            "only the tombstone pruned before the sweep began expires"
+        );
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        native.witness(vec![native.row(42, 1, 10, 220, 0)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 2);
+        let old = exes
+            .iter()
+            .find(|exe| (exe.dev, exe.ino) == (8, 99))
+            .expect("the old image reads back");
+        assert_eq!(
+            old.resolution,
+            ExeResolution::NoExecRecord,
+            "the expired image has no record at all"
+        );
+        let young = exes
+            .iter()
+            .find(|exe| (exe.dev, exe.ino) == (8, 100))
+            .expect("the young image reads back");
+        assert_eq!(
+            young.resolution,
+            ExeResolution::ExecRecordLost,
+            "the young tombstone still names its record lost"
         );
     }
 

@@ -137,6 +137,9 @@ fn resolved_offset(resolution: &Resolution) -> u64 {
 fn first_mint_v3_stubs_are_recorded() {
     let _guard = DISCOVER_LOCK.lock().unwrap();
     let (provider, log) = build_fixture();
+    // The target tmpdir persists across runs and the fixture appends:
+    // drop a stale log so mint indices start at 0.
+    let _ = std::fs::remove_file(&log);
     // Held for the whole test: the fixture mapping must stay readable
     // while logged mint addresses are converted to file offsets.
     let _held = unsafe { libloading::Library::new(provider.as_os_str()).unwrap() };

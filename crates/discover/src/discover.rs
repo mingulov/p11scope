@@ -215,8 +215,16 @@ pub fn discover_with_self_memory(
     };
 
     // Acquisition can lazily load dependencies, so both calls precede maps.
-    let legacy_acquisition = raw_exports.get_function_list.map(|_| function_list(&lib));
+    // The interface enumeration mints before the legacy table: stub-pool
+    // providers (p11-kit proxy/client) hand every getter call a heap table
+    // with fresh stub addresses from one shared pool, and a workload's
+    // first C_GetInterface call uses pool mint 0. Minting legacy first
+    // would spend mint 0 on the 68-slot table, leaving the first-mint v3
+    // slots (C_GetInterfaceList/C_GetInterface) unrecorded and their
+    // calls unattached. Static providers return the same tables whatever
+    // the order, so their manifests are unchanged.
     let interfaces_acquisition = interface_list(&lib);
+    let legacy_acquisition = raw_exports.get_function_list.map(|_| function_list(&lib));
 
     let maps = read_self_maps()?;
     let map_index = validated_map_index(&maps)?;

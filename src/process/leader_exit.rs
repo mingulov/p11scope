@@ -704,6 +704,7 @@ mod tests {
         late_member: Option<u32>,
         reused_member: Option<(u32, ExitingTask)>,
         resurrected: Option<(u32, ExitingTask)>,
+        gone_at_reread: Option<u32>,
         tgid: u32,
         listings: usize,
     }
@@ -753,6 +754,12 @@ mod tests {
             if tid == 7 {
                 return Ok(Some(self.leader));
             }
+            // A seen tid listed in the closing listing but released
+            // before its re-read, after creating a child the closing
+            // walk never lists: the re-read observes the release.
+            if self.listings > 1 && Some(tid) == self.gone_at_reread {
+                return Ok(None);
+            }
             // A tid recycled between the two listings: the first walk
             // reads the old past (or gone) member, the closing re-read
             // sees the live new thread under the same tid.
@@ -801,6 +808,7 @@ mod tests {
             late_member: None,
             reused_member: None,
             resurrected: None,
+            gone_at_reread: None,
             tgid: 7,
             listings: 0,
         }
@@ -930,6 +938,22 @@ mod tests {
             !final_exit(&mut foreign),
             "a member outside this group keeps the proof unproven"
         );
+    }
+    #[test]
+    fn listed_member_gone_at_the_closing_re_read_after_spawning_keeps_the_group_unproven() {
+        // A seen tid listed in the closing listing, released before
+        // its re-read after creating a child the closing walk never
+        // lists (created after the last directory read): the re-read
+        // observes `Ok(None)` while a live thread runs, so the proof
+        // must fail. Accepting the release would prove an exit with a
+        // live creator's child unlisted.
+        let mut gone = dying_group();
+        gone.gone_at_reread = Some(8);
+        assert!(
+            !final_exit(&mut gone),
+            "a listed-but-gone member after child creation keeps the group unproven"
+        );
+        assert_eq!(gone.listings, 2, "the task list is read twice");
     }
     #[test]
     fn real_live_group_is_not_in_final_exit_until_it_exits() {

@@ -26,6 +26,17 @@ versioned separately and are opaque, exact dispatch keys.
   object is also memory-scanned for file-backed tables (the `--module`
   search, without narrowing), so a process that fetched its table
   before the capture is counted too.
+- R2 new-site key metadata on `--key-operations` object views
+  (section version 6): a successful creation return promotes its own
+  observed finite template cells to established with per-field
+  `source` (`creation_success` for promoted facts, `query` for
+  queried ones; `CKA_TOKEN` still never promotes), and unseen fields
+  on truncated, unsupported or partly-read templates — plus
+  mismatched or unestablished Edwards/Montgomery curves on created
+  keys — name a closed per-field `reason` in JSON with `-v` counts.
+  HKDF (`CKK_HKDF`, value lengths 12/48) and Edwards/Montgomery
+  (`ec_edwards`/`ec_montgomery` with ed25519/ed448/x25519/x448) keys
+  label without a query; versions 1–5 stay frozen and byte-stable.
 
 ### Fixed
 

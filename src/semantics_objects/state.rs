@@ -25,8 +25,8 @@ use super::{
 };
 use crate::semantics::{KNOWN_CANCEL_FLAGS, cancel_operation_mask, direct_cancel_flag};
 use p11scope_ebpf_common::object_policy::{
-    DeriveResultProtocol, ObjectAction, SafeAttributeKind, authorized_result_pointer_args,
-    derive_result_protocol, object_descriptor,
+    DeriveResultProtocol, ObjectAction, SafeAttributeKind, SafeCurve,
+    authorized_result_pointer_args, derive_result_protocol, object_descriptor,
 };
 use p11scope_ebpf_common::{ARG_NONE, SlotSemantics, lifecycle, semantic_flags, transition};
 use pkcs11_types::CkRv;
@@ -485,6 +485,10 @@ struct ViewRecord {
     /// creation-success promotion. `None` for every other state.
     established_source: [Option<FieldSource>; METADATA_FIELDS],
     queries: [QueryStatus; METADATA_FIELDS],
+    /// The creation template carried more than the eight observed
+    /// cells (controller KEYMETA-T1 rulings 2026-11-16, ruling 2):
+    /// a birth fact, set once at promotion, never cleared.
+    creation_truncated: bool,
 }
 
 impl ViewRecord {
@@ -523,6 +527,10 @@ impl ViewRecord {
                 // AES and generic_secret.
                 0x1f | 0x10 | 0x42 => class == 4,
                 0x00 | 0x03 => class == 2 || class == 3,
+                // Controller KEYMETA-T1 rulings 2026-11-16, ruling 1:
+                // Edwards/Montgomery keys are public/private-key
+                // objects, like RSA/EC.
+                0x40 | 0x41 => class == 2 || class == 3,
                 // F16 (7.05 PQC): ML-KEM/ML-DSA/SLH-DSA keys are
                 // public/private-key objects, like RSA/EC.
                 0x49..=0x4b => class == 2 || class == 3,
@@ -556,13 +564,31 @@ impl ViewRecord {
                 FieldState::Value(FieldValue::Scalar(set)) => KeyLabel::pqc(key_type, set),
                 _ => None,
             },
-            // Pending owner/design ruling: 0x40 (CKK_EC_EDWARDS) and
-            // 0x41 (CKK_EC_MONTGOMERY) fall through here even with an
-            // established matching curve (ed25519/ed448, x25519/x448)
-            // — the closed label vocabulary defines no
-            // Edwards/Montgomery join, so the view stays unlabeled.
-            // Pinned by the 0x40/0x41 s2s3 twin; adding label arms
-            // must flip that twin.
+            // Controller KEYMETA-T1 rulings 2026-11-16, ruling 1:
+            // CKK_EC_EDWARDS (0x40) with an established ed25519/ed448
+            // curve, and CKK_EC_MONTGOMERY (0x41) with an established
+            // x25519/x448 curve, from the same key's template label.
+            // Both facts are already-captured approved reads; the
+            // label is a projection, no new capture. A mismatched or
+            // unestablished curve stays unlabeled (the underlying
+            // facts keep their states); the 0x03 arm above keeps the
+            // R2 join unchanged.
+            0x40 => match field(SafeAttributeKind::EcParams) {
+                FieldState::Value(FieldValue::Curve(curve))
+                    if matches!(curve, SafeCurve::Ed25519 | SafeCurve::Ed448) =>
+                {
+                    Some(KeyLabel::Ec { curve })
+                }
+                _ => None,
+            },
+            0x41 => match field(SafeAttributeKind::EcParams) {
+                FieldState::Value(FieldValue::Curve(curve))
+                    if matches!(curve, SafeCurve::X25519 | SafeCurve::X448) =>
+                {
+                    Some(KeyLabel::Ec { curve })
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2212,6 +2238,7 @@ impl ModelState {
                 established: [FieldState::Unknown; METADATA_FIELDS],
                 established_source: [None; METADATA_FIELDS],
                 queries: [QueryStatus::NotQueried; METADATA_FIELDS],
+                creation_truncated: false,
             },
         );
         self.instances
@@ -3241,8 +3268,16 @@ impl ModelState {
                     // NotQueried (no attribute was read back). Later
                     // queries conflict/invalidate through `establish`.
                     // Promoted facts record source `creation_success`
-                    // per field (keymeta §6/K5).
+                    // per field (keymeta §6/K5). Controller
+                    // KEYMETA-T1 rulings 2026-11-16, ruling 2: a
+                    // template beyond eight slots still promotes its
+                    // observed cells; the truncation itself is
+                    // recorded on the view so unseen fields carry
+                    // the named reason instead of being inferred.
                     if let Some(view) = self.objects.get_mut(&id) {
+                        view.creation_truncated = call.requested[template]
+                            .as_ref()
+                            .is_some_and(AttributeList::truncated);
                         for kind in [
                             SafeAttributeKind::Class,
                             SafeAttributeKind::KeyType,
@@ -3552,13 +3587,16 @@ impl ModelState {
                 // promoted fact never changes source silently.
                 FieldState::Value(old) if old == value => FieldState::Value(old),
                 // Conflict, never last-writer-wins: the earlier value stays
-                // as history.
+                // as history. The contradicted value's provenance clears
+                // with it (fail-closed: no stale `Some` behind the
+                // render mask for the next consumer to trust).
                 FieldState::Value(old) => {
                     effects.push(ObjectEffect::MetadataConflict {
                         call: token,
                         object: id,
                         field: kind,
                     });
+                    view.established_source[index] = None;
                     FieldState::Conflict(Some(old))
                 }
                 FieldState::Conflict(earlier) => {
@@ -3567,6 +3605,7 @@ impl ModelState {
                         object: id,
                         field: kind,
                     });
+                    view.established_source[index] = None;
                     FieldState::Conflict(earlier)
                 }
             };
@@ -3589,7 +3628,7 @@ impl ModelState {
             return;
         };
         let mut changed = false;
-        for field in view.established.iter_mut() {
+        for (index, field) in view.established.iter_mut().enumerate() {
             *field = match *field {
                 FieldState::Value(v) => {
                     changed = true;
@@ -3601,6 +3640,12 @@ impl ModelState {
                 }
                 other => other,
             };
+            // An invalidated slot keeps no provenance: the old proof
+            // no longer establishes anything (fail-closed with the
+            // conflict arms above).
+            if !matches!(*field, FieldState::Value(_)) {
+                view.established_source[index] = None;
+            }
         }
         // Seal bound (journal `SealEffectBound`): only an established or
         // conflicting field invalidates, and only `establish` (once per
@@ -4626,6 +4671,7 @@ impl ModelState {
                 queries: v.queries,
                 label: self.resolved_label(*id),
                 accessing_sessions: relations.get(id).copied().unwrap_or(0),
+                creation_truncated: v.creation_truncated,
             })
             .collect();
         ObjectProjection {
@@ -4997,6 +5043,7 @@ mod tests {
             established,
             established_source: [None; METADATA_FIELDS],
             queries: [QueryStatus::NotQueried; METADATA_FIELDS],
+            creation_truncated: false,
         }
     }
 

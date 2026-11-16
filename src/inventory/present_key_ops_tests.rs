@@ -96,6 +96,7 @@ fn object_row(object: u64) -> ObjectRow {
         scalar: None,
         curve: None,
         source: None,
+        reason: None,
     };
     let block = MetadataBlock {
         class: blank,
@@ -131,6 +132,7 @@ fn object_row(object: u64) -> ObjectRow {
         successful_references: 1,
         successful_key_references: 0,
         accessing_sessions: 1,
+        creation_truncated: false,
     }
 }
 
@@ -480,6 +482,34 @@ fn key_ops_line_names_unknown_type_not_established_while_observed() {
             "  type unknown (not established while observed) (1 key row)",
         ],
         "the tallies stay exact, the unknown type is named, never guessed:\n{snapshot}"
+    );
+}
+
+/// Controller KEYMETA-T1 rulings 2026-11-16, ruling 2: objects
+/// created from templates beyond eight slots name the truncation in
+/// verbose text with the same reason string the unseen fields carry
+/// in JSON; concise stays quiet. Counts only — never object detail.
+#[test]
+fn key_ops_verbose_names_truncated_creation_templates() {
+    let mut observations = populated(9);
+    let mut first = object_row(11);
+    first.creation_truncated = true;
+    let mut second = object_row(12);
+    second.creation_truncated = true;
+    observations.objects.push(first);
+    observations.objects.push(object_row(13));
+    observations.objects.push(second);
+    let presentation = key_ops_presentation(observations);
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert!(
+        block.contains(&"  template truncated (first 8 attributes captured) (2 objects)"),
+        "verbose names the truncation count:\n{verbose}"
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !concise.contains("template truncated"),
+        "concise stays quiet:\n{concise}"
     );
 }
 
@@ -1028,12 +1058,14 @@ fn key_ops_line_carries_no_object_identity() {
         scalar: Some(42421),
         curve: None,
         source: None,
+        reason: None,
     };
     row.established.ec_params = MetadataField {
         status: "value",
         scalar: None,
         curve: Some("secp384r1"),
         source: Some("query"),
+        reason: None,
     };
     observations.objects.push(row);
     let mut key = key_row("sign", "key", 2, 0, 1, "operations");

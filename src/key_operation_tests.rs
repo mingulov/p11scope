@@ -8375,6 +8375,7 @@ fn key_operation_emitter_tracking_bounded_across_object_churn() {
             scalar: None,
             curve: None,
             source: None,
+            reason: None,
         };
         let block = MetadataBlock {
             class: blank,
@@ -8410,6 +8411,7 @@ fn key_operation_emitter_tracking_bounded_across_object_churn() {
             successful_references: 1,
             successful_key_references: 0,
             accessing_sessions: 1,
+            creation_truncated: false,
         });
         observations
     }
@@ -8910,7 +8912,7 @@ fn key_operation_schema_contract() {
         (FieldState::Invalidated(None), "invalidated", None, None),
     ];
     for (state, status, scalar, curve_name) in fields {
-        let field = metadata_field(state, None);
+        let field = metadata_field(state, None, None);
         assert_eq!(field.status, status);
         assert!(FIELD_STATUSES.contains(&status));
         assert_eq!(field.scalar, scalar);
@@ -25915,10 +25917,7 @@ fn key_operation_newsite_montgomery_labels_end_to_end() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(
-        observations_version(&committed),
-        OBSERVATIONS_VERSION_V6
-    );
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
     let section = object_observations_json(&committed);
     assert_eq!(section["version"], 6);
     assert_eq!(
@@ -25930,7 +25929,8 @@ fn key_operation_newsite_montgomery_labels_end_to_end() {
         "the key row carries the Montgomery label"
     );
     assert_eq!(
-        section["objects"][0]["established"]["ec_params"]["value"], "x25519",
+        section["objects"][0]["established"]["ec_params"]["value"],
+        "x25519",
     );
     assert_eq!(
         section["objects"][0]["established"]["ec_params"]["source"], "creation_success",
@@ -25943,8 +25943,8 @@ fn key_operation_newsite_montgomery_labels_end_to_end() {
 /// established facts.
 #[test]
 fn key_operation_newsite_requested_block_sources_stay_null() {
-    use crate::key_operation_projection::producer::commit;
     use crate::key_operation_projection::object_observations_json;
+    use crate::key_operation_projection::producer::commit;
     use crate::semantics_key_use::KeyUseReducer;
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
@@ -26018,10 +26018,7 @@ fn key_operation_newsite_curve_name_triggers_v6_without_label() {
         },
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(
-        observations_version(&committed),
-        OBSERVATIONS_VERSION_V6
-    );
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
     let section = object_observations_json(&committed);
     assert_eq!(section["version"], 6);
     assert!(
@@ -26029,10 +26026,12 @@ fn key_operation_newsite_curve_name_triggers_v6_without_label() {
         "a curve without a key type never labels"
     );
     assert_eq!(
-        section["objects"][0]["established"]["ec_params"]["value"], "x25519",
+        section["objects"][0]["established"]["ec_params"]["value"],
+        "x25519",
     );
     assert_eq!(
-        section["objects"][0]["established"]["ec_params"]["source"], "query",
+        section["objects"][0]["established"]["ec_params"]["source"],
+        "query",
     );
 }
 
@@ -26088,19 +26087,14 @@ fn key_operation_newsite_requested_conflict_triggers_v6_without_source() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(
-        observations_version(&committed),
-        OBSERVATIONS_VERSION_V6
-    );
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
     let section = object_observations_json(&committed);
     assert_eq!(section["version"], 6);
     assert_eq!(
         section["objects"][0]["requested"]["value_len"]["status"], "conflict",
         "the duplicating sizes conflict in the requested block"
     );
-    assert_eq!(
-        section["objects"][0]["requested"]["value_len"]["value"], 12,
-    );
+    assert_eq!(section["objects"][0]["requested"]["value_len"]["value"], 12,);
     for block in ["requested", "established"] {
         for field in [
             "class",
@@ -26165,15 +26159,18 @@ fn key_operation_newsite_truncated_template_marks_unseen_size() {
         },
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(
-        observations_version(&committed),
-        OBSERVATIONS_VERSION_V6
-    );
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
     let section = object_observations_json(&committed);
     assert_eq!(section["version"], 6);
     let established = &section["objects"][0]["established"];
     let requested = &section["objects"][0]["requested"];
-    for field in ["class", "key_type", "modulus_bits", "ec_params", "parameter_set"] {
+    for field in [
+        "class",
+        "key_type",
+        "modulus_bits",
+        "ec_params",
+        "parameter_set",
+    ] {
         assert_eq!(
             established[field]["status"], "value",
             "{field}: the observed cell still promotes"
@@ -26252,10 +26249,7 @@ fn key_operation_newsite_truncation_alone_triggers_v6() {
         },
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(
-        observations_version(&committed),
-        OBSERVATIONS_VERSION_V6
-    );
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
     let section = object_observations_json(&committed);
     assert_eq!(section["version"], 6);
     assert!(

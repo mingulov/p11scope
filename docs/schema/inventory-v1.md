@@ -1154,8 +1154,9 @@ never imply S1 loss.
   a new-site `metadata_at_use` or object label (`x25519`, `x448`,
   `ed25519`, `ed448`, `hkdf_*`, `generic_*`), the HKDF key-type
   scalar (66, requested or established), a 12/48 value length, a
-  new curve name, or any established field with a non-`query`
-  source — else 5 iff PQC content is present — a
+  new curve name, any established field with a non-`query` source,
+  or any view created from a truncated template — else 5 iff PQC
+  content is present — a
   PQC `metadata_at_use` or object label, a PQC key-type scalar
   (73, 74 or 75, requested or established), a non-blank
   `parameter_set` field, or a `parameter_set` query other than
@@ -1205,7 +1206,10 @@ never imply S1 loss.
   or a successful creation return promoting its own finite
   template; an established `value` always carries `query` or
   `creation_success`, while requested blocks and every non-`value`
-  status carry null).
+  status carry null), plus `reason` at version 6 (the truncation
+  reason or null: `template truncated (first 8 attributes
+  captured)` on unknown fields whose creation template carried
+  more than the eight observed cells; null for every seen field).
   A `value` carries the accepted numeric code or null: class 0-4,
   key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at version 6;
   73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–6; OASIS
@@ -1216,10 +1220,14 @@ never imply S1 loss.
   version 6) or null, and the parameter-set code 1..=12 at
   versions 5–6. Labels are presentation names; JSON carries numeric
   codes. Since version 6, a successful creation return promotes its
-  own complete finite template to established (requested `CKA_TOKEN`,
-  unknown/conflict shapes and incomplete triples still never
-  establish); conflicting duplicates stay conflicts, never
-  last-writer-wins.
+  own observed finite template cells to established (requested
+  `CKA_TOKEN` still never establishes; unknown/conflict shapes still
+  never establish; incomplete triples establish per-field facts but
+  still never label); conflicting duplicates stay conflicts, never
+  last-writer-wins. A creation template beyond eight slots still
+  promotes its observed cells; fields past the observed window stay
+  unknown with the truncation reason, and nothing is inferred from
+  the unobserved tail.
 - `queries` holds the per-field latest query outcome (`not_queried`,
   `established`, `unavailable`, `size_only`, `unsupported`,
   `malformed`, `excluded`), distinct from current validity, over
@@ -1236,8 +1244,12 @@ never imply S1 loss.
   `generic_96`, `generic_128`, `generic_192`, `generic_256`,
   `generic_384`, `generic_other`) or null. It is withheld when class
   conflicts or an established class is incompatible with the key type
-  (AES, generic-secret and HKDF need `secret_key`; RSA/EC/PQC need
-  `public_key`/`private_key`). A PQC label joins an established
+  (AES, generic-secret and HKDF need `secret_key`; RSA, EC, PQC,
+  Edwards and Montgomery need `public_key`/`private_key`). An
+  Edwards label joins an established ed25519/ed448 curve with the
+  `ec_edwards` key type, a Montgomery label an established
+  x25519/x448 curve with the `ec_montgomery` key type, from the same
+  view; mismatched or unestablished curves stay unlabeled. A PQC label joins an established
   parameter-set code with the established key type from the same
   view; a code alone, a type alone, or a recognized mechanism never
   labels. `unknown` is a key-row label only, never a view label.

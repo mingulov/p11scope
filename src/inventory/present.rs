@@ -4302,6 +4302,25 @@ fn render_snapshot_inner(
                     if unknown_type_rows == 1 { "" } else { "s" }
                 );
             }
+            // Controller KEYMETA-T1 rulings 2026-11-16, ruling 2:
+            // objects created from templates beyond eight slots name
+            // the truncation here (verbose only; concise stays quiet)
+            // with the same reason string the unseen fields carry in
+            // JSON. Counts only — never object detail in text.
+            let truncated_objects = observations
+                .objects
+                .iter()
+                .filter(|row| row.creation_truncated)
+                .count();
+            if verbose && truncated_objects > 0 {
+                let _ = writeln!(
+                    out,
+                    "  {} ({} object{})",
+                    crate::key_operation_projection::TRUNCATED_TEMPLATE_REASON,
+                    truncated_objects,
+                    if truncated_objects == 1 { "" } else { "s" },
+                );
+            }
         }
     }
     {

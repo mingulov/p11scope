@@ -54,6 +54,13 @@ pub(crate) const OBSERVATIONS_VERSION_V5: u8 = 5;
 /// curve names. The renderer emits v6 exactly when such content is
 /// present; v1–v5 output stays byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
+/// The named reason an unseen metadata field carries at v6 when its
+/// creation template carried more than the eight observed cells
+/// (controller KEYMETA-T1 rulings 2026-11-16, ruling 2). The closed
+/// reason vocabulary has this one member; every other field carries
+/// null.
+pub(crate) const TRUNCATED_TEMPLATE_REASON: &str =
+    "template truncated (first 8 attributes captured)";
 /// The metadata label of a first-observed key at use: its identity
 /// and counts are proved, its type/size are not (first seen before
 /// attach). Frozen v4 vocabulary; never a guessed label.
@@ -183,8 +190,9 @@ pub(crate) mod contract {
     ];
     pub(crate) const FIELD_KEYS: [&str; 2] = ["status", "value"];
     /// H9 section v6 metadata field keys (R2 new-site + keymeta
-    /// §6/K5): status/value plus the per-field `source`.
-    pub(crate) const FIELD_KEYS_V6: [&str; 3] = ["status", "value", "source"];
+    /// §6/K5 + the truncation reason): status/value plus the
+    /// per-field `source` and `reason`.
+    pub(crate) const FIELD_KEYS_V6: [&str; 4] = ["status", "value", "source", "reason"];
     pub(crate) const FIELD_STATUSES: [&str; 4] = ["unknown", "value", "conflict", "invalidated"];
     pub(crate) const QUERY_STATUSES: [&str; 7] = [
         "not_queried",
@@ -546,13 +554,17 @@ impl ObsStatus {
 /// one of `scalar` / `curve` applies per field kind. `source` names
 /// the proof behind an established value (`query` or
 /// `creation_success`); it renders only at section version 6+ and is
-/// `None` for every other state.
+/// `None` for every other state. `reason` names why an unseen field
+/// stays unknown on a truncated creation template (the closed
+/// one-member vocabulary); it renders only at v6+ and is `None` for
+/// every seen field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataField {
     pub status: &'static str,
     pub scalar: Option<u16>,
     pub curve: Option<&'static str>,
     pub source: Option<&'static str>,
+    pub reason: Option<&'static str>,
 }
 
 /// The seven fixed metadata slots, requested or established. The
@@ -673,6 +685,10 @@ pub(crate) struct ObjectRow {
     pub successful_references: u64,
     pub successful_key_references: u64,
     pub accessing_sessions: u64,
+    /// The creation template carried more than the eight observed
+    /// cells. Internal only (JSON carries the per-field reasons):
+    /// feeds the `-v` truncation count and the v6 trigger.
+    pub creation_truncated: bool,
 }
 
 /// The one secondary association role (H9 §82): [`KeyAggRow`]s
@@ -859,8 +875,9 @@ fn measure(observations: &ObjectObservations) -> usize {
 }
 
 /// Render one metadata field: frozen status plus the scalar or the
-/// curve name (never key material). The `source` key renders only
-/// at v6+: v1–v5 sections keep the two frozen keys byte-stable.
+/// curve name (never key material). The `source` and `reason` keys
+/// render only at v6+: v1–v5 sections keep the two frozen keys
+/// byte-stable.
 pub(crate) fn metadata_field_json(
     field: &MetadataField,
     curve: bool,
@@ -891,6 +908,13 @@ pub(crate) fn metadata_field_json(
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
         );
+        map.insert(
+            "reason".to_string(),
+            field
+                .reason
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
     }
     out
 }
@@ -898,7 +922,7 @@ pub(crate) fn metadata_field_json(
 /// Render one seven-slot metadata block (requested or established).
 /// The `parameter_set` key renders only at v5+: v1–v4 sections keep
 /// the six frozen keys byte-stable. Every field carries `source`
-/// only at v6+.
+/// and `reason` only at v6+.
 pub(crate) fn metadata_block_json(block: &MetadataBlock, version: u8) -> serde_json::Value {
     let mut out = serde_json::json!({
         "class": metadata_field_json(&block.class, false, version),
@@ -1077,7 +1101,10 @@ fn has_pqc_content(observations: &ObjectObservations) -> bool {
 /// R2 new-site content: a new label, the HKDF key-type scalar, a
 /// 12/48 value length, or a new curve name in any row or block —
 /// or, keymeta §6/K5, any established field with a non-`query`
-/// source (a view carrying `creation_success` emits v6, never v7).
+/// source (a view carrying `creation_success` emits v6, never v7) —
+/// or, controller KEYMETA-T1 rulings 2026-11-16 ruling 2, any view
+/// created from a truncated template (so its truncation reasons are
+/// never silently dropped below v6).
 fn has_newsite_content(observations: &ObjectObservations) -> bool {
     if observations
         .key_operations
@@ -1088,6 +1115,7 @@ fn has_newsite_content(observations: &ObjectObservations) -> bool {
     }
     observations.objects.iter().any(|row| {
         row.label.is_some_and(is_newsite_metadata_label)
+            || row.creation_truncated
             || [row.requested, row.established].iter().any(|block| {
                 block.key_type.scalar.is_some_and(|scalar| scalar == 0x42)
                     || block
@@ -1636,8 +1664,12 @@ pub(crate) mod producer {
                 Attribution::Downgraded(reason) => Some(gap_label(reason)),
                 Attribution::Valid => None,
             },
-            requested: metadata_block(&view.requested),
-            established: metadata_block(&view.established),
+            requested: metadata_block(&view.requested, &view.requested, view.creation_truncated),
+            established: metadata_block(
+                &view.established,
+                &view.requested,
+                view.creation_truncated,
+            ),
             queries: QueriesBlock {
                 class: query_label(view.queries[field_index(SafeAttributeKind::Class)]),
                 key_type: query_label(view.queries[field_index(SafeAttributeKind::KeyType)]),
@@ -1655,43 +1687,58 @@ pub(crate) mod producer {
             successful_references: view.references,
             successful_key_references: view.key_uses,
             accessing_sessions: view.accessing_sessions as u64,
+            creation_truncated: view.creation_truncated,
         }
     }
 
-    fn metadata_block(view: &MetadataView) -> MetadataBlock {
+    fn metadata_block(
+        view: &MetadataView,
+        requested: &MetadataView,
+        truncated: bool,
+    ) -> MetadataBlock {
+        let field = |kind| {
+            metadata_field(
+                view.field(kind),
+                view.source(kind),
+                unknown_reason(view.field(kind), requested.field(kind), truncated),
+            )
+        };
         MetadataBlock {
-            class: metadata_field(
-                view.field(SafeAttributeKind::Class),
-                view.source(SafeAttributeKind::Class),
-            ),
-            key_type: metadata_field(
-                view.field(SafeAttributeKind::KeyType),
-                view.source(SafeAttributeKind::KeyType),
-            ),
-            token: metadata_field(
-                view.field(SafeAttributeKind::Token),
-                view.source(SafeAttributeKind::Token),
-            ),
-            value_len: metadata_field(
-                view.field(SafeAttributeKind::ValueLen),
-                view.source(SafeAttributeKind::ValueLen),
-            ),
-            modulus_bits: metadata_field(
-                view.field(SafeAttributeKind::ModulusBits),
-                view.source(SafeAttributeKind::ModulusBits),
-            ),
-            ec_params: metadata_field(
-                view.field(SafeAttributeKind::EcParams),
-                view.source(SafeAttributeKind::EcParams),
-            ),
-            parameter_set: metadata_field(
-                view.field(SafeAttributeKind::ParameterSet),
-                view.source(SafeAttributeKind::ParameterSet),
-            ),
+            class: field(SafeAttributeKind::Class),
+            key_type: field(SafeAttributeKind::KeyType),
+            token: field(SafeAttributeKind::Token),
+            value_len: field(SafeAttributeKind::ValueLen),
+            modulus_bits: field(SafeAttributeKind::ModulusBits),
+            ec_params: field(SafeAttributeKind::EcParams),
+            parameter_set: field(SafeAttributeKind::ParameterSet),
         }
     }
 
-    pub(crate) fn metadata_field(state: FieldState, source: Option<FieldSource>) -> MetadataField {
+    /// The truncation reason for one field: only an unknown field on
+    /// a truncated-template view whose request was never seen either
+    /// names the truncation. A seen field — valued, conflicting,
+    /// invalidated, or requested-but-never-promoted like TOKEN —
+    /// carries no reason: its state has its own rule.
+    fn unknown_reason(
+        state: FieldState,
+        requested: FieldState,
+        truncated: bool,
+    ) -> Option<&'static str> {
+        if truncated
+            && matches!(state, FieldState::Unknown)
+            && matches!(requested, FieldState::Unknown)
+        {
+            Some(TRUNCATED_TEMPLATE_REASON)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn metadata_field(
+        state: FieldState,
+        source: Option<FieldSource>,
+        reason: Option<&'static str>,
+    ) -> MetadataField {
         let (status, scalar, curve) = match state {
             FieldState::Unknown => ("unknown", None, None),
             FieldState::Value(FieldValue::Scalar(value)) => ("value", Some(value), None),
@@ -1713,6 +1760,7 @@ pub(crate) mod producer {
             scalar,
             curve,
             source,
+            reason,
         }
     }
 

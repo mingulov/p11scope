@@ -615,15 +615,12 @@ impl AttrObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttributeList {
     items: [Option<AttrObservation>; MAX_TEMPLATE_ATTRIBUTES],
-    /// Pending owner/design ruling: the wire TRUNCATED flag (a
-    /// template beyond eight slots) is not plumbed into this
-    /// field — `AttributeList::new` derives it from the slice
-    /// length instead, and no production logic consumes it
-    /// (only the derived equality/debug impls observe it).
-    /// Promotion reads the retained first eight cells only.
-    /// Pinned by the nine-slot s2s3 twin; plumbing the flag or
-    /// refusing promotion on truncation must flip that twin.
-    /// Kept (not removed) so the ruling has a field to attach to.
+    /// The template carried more than the eight retained cells
+    /// (controller KEYMETA-T1 rulings 2026-11-16, ruling 2): the
+    /// wire TRUNCATED bit, plumbed through promotion. Observed
+    /// cells still promote as facts; nothing is inferred from the
+    /// unobserved tail, and fields not seen carry the truncation
+    /// reason. Pinned by the nine-slot s2s3 twins.
     truncated: bool,
 }
 
@@ -637,6 +634,20 @@ impl AttributeList {
             items,
             truncated: observations.len() > MAX_TEMPLATE_ATTRIBUTES,
         }
+    }
+
+    /// Journal decode: the wire TRUNCATED bit rides beside the
+    /// retained first eight cells (the slice never holds more than
+    /// eight past the validator, so the bit — not the length —
+    /// carries the verdict here).
+    pub(crate) fn with_truncated(observations: &[AttrObservation], truncated: bool) -> Self {
+        let mut list = Self::new(observations);
+        list.truncated = list.truncated || truncated;
+        list
+    }
+
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
     }
 
     fn observations(&self) -> impl Iterator<Item = &AttrObservation> {
@@ -1114,6 +1125,11 @@ pub(crate) struct ObjectView {
     pub(crate) queries: [QueryStatus; METADATA_FIELDS],
     pub(crate) label: Option<KeyLabel>,
     pub(crate) accessing_sessions: usize,
+    /// The creation template carried more than the eight observed
+    /// cells (controller KEYMETA-T1 rulings 2026-11-16, ruling 2).
+    /// Unseen fields on such a view stay unknown with the named
+    /// truncation reason; never inferred from the tail.
+    pub(crate) creation_truncated: bool,
 }
 
 /// Cardinalities of retained state.

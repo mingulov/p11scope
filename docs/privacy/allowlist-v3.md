@@ -338,7 +338,7 @@ explicit, narrow internal exceptions, not finite attribute values.
 | `CKA_TOKEN` | Exact selector 0x0001; exactly one byte and exact equality to 0 or 1. | Requested or established `session`/`token`, with provenance; only established result may drive object lifetime. | Other byte/length is unknown; a TOKEN request is never promoted by CKR_OK creation alone (R2 new-site: other finite facts promote; TOKEN stays query-established). C3/C5/C6. |
 | `CKA_VALUE_LEN` | Exact selector 0x0161; one target word equal to 12, 16, 24, 32 or 48 only. | Finite byte-size code; label in bits only with an independently established matching AES/HKDF/generic-secret type. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
 | `CKA_MODULUS_BITS` | Exact selector 0x0121; one target word equal to a selected RSA size below. | Finite size code; RSA label requires matching RSA type/provenance. | Other values unknown; no modulus or exponent buffer read. C5/C6. |
-| `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 5, 7, 10 or 11 and byte-for-byte equality to one complete encoding below. At most eleven bytes in probe scratch. | Only curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve label requires matching EC type/provenance. | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
+| `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 5, 7, 10 or 11 and byte-for-byte equality to one complete encoding below. At most eleven bytes in probe scratch. | Only curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve label requires a matching EC type with provenance: 0x03 with any established curve, 0x40 with ed25519/ed448, 0x41 with x25519/x448; mismatched or unestablished curves stay unlabeled. | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
 | Public identities and derived facts | Monotonic capture-local allocation plus accepted reducer transitions; never raw handle, IP or digest of either. | `instance#N`, `sess#N`, `object#N`; finite origin/lifecycle/metadata states, times within observation, and saturating counts. JSON, JSONL and dashboard use the same immutable projection. | Allocation exhaustion refuses new association, records loss, and never reuses an ID. C3/C7/C8. |
 | Per-module `C_Initialize` roll-up | New aggregation over already-captured fields only: the attested slot name (`C_Initialize`, single-named, authorized, unambiguous probe) plus the verbatim return code, from joined and shed semantic Events since the lane sealed. No new capture: no argv, env, keys, PINs, payloads, handles or addresses are read or retained for this roll-up. | Saturating per-module counts (`calls`, `ok`, `already_initialized`), the last non-OK/non-already return as a `returns`-shaped row, and a finite status (`initialised`, `failed`, `unseen`, `unknown`) with its detail line, in JSON and verbose text. | The verdict fails closed: `unknown` when the lane never sealed or EVENTS loss (or an unreadable loss counter) may have hidden evidence; zero observed calls word the absence, never "never initialised". |
 | Operation length cell (S-protocol) | Named out positions only (the §5.1 S-cells); entry retention with an entry capacity read plus the `1<<20` cap, full-span validation of the cell word and disjointness against the call's own output buffer (NULL base skips the check: query shapes read); return read on terminal CKR_OK, BUFFER_TOO_SMALL and query-shape OK only; PENDING and every other return never. | Private in-flight plus completed-call transport; cleared on every terminal path; public numeric value only from CLASSIFIED shapes per §5.2 — query values never classify, BUFFER_TOO_SMALL corroborates only (§5.4). | Null cell, absurd capacity, overlap, overflow or refused shape: unavailable with a named reason, never a guessed bound. Gated by `--key-sizes` (off by default, §10.5): without the flag no length word is acquired on any path. |
@@ -378,8 +378,9 @@ finite set. The AES byte-size policy follows the 128/192/256-bit key sizes in
 [FIPS 197](https://doi.org/10.6028/NIST.FIPS.197-upd1). Public JSON carries
 the accepted numeric code; labels are presentation names. The projection's
 `rsa_other` fallback label can only mean 8192 (every other accepted RSA size
-has its own label); `aes_other`, `hkdf_other` and `generic_other` can never
-occur (every accepted size has its own label).
+has its own label); `hkdf_other` and `generic_other` can never
+occur (every accepted size has its own label), while `aes_other`
+covers AES keys carrying the 12/48-byte schedule sizes.
 
 Pointer aliasing can still place an exact permitted constant at a readable
 address. Finite equality limits the value disclosed; it does not prove C type
@@ -2278,7 +2279,15 @@ establish on success (see the promotion rule above); `CKA_TOKEN`,
 unknown/conflict shapes and incomplete triples still never label.
 It also partially supersedes the finite-vocabulary rule that
 Edwards and Montgomery key-type labels do not authorize curve
-decoding for those types, which the R2 rows remove.
+decoding for those types, which the R2 rows remove: `ec_edwards`
+(0x40) with an established ed25519/ed448 curve, and
+`ec_montgomery` (0x41) with an established x25519/x448 curve, from
+the same key's template join into the corresponding curve label
+(controller KEYMETA-T1 rulings 2026-11-16). Both facts are
+already-authorized reads; the label is a projection, no new
+capture. A mismatched curve (an Edwards type with a Montgomery or
+secp curve, or vice versa) or an unestablished curve stays
+unlabeled while the underlying facts keep their states.
 Promoted fields carry per-field `source: creation_success`;
 queried fields carry `source: query`. KEM T0, the terminal states
 and every other exclusion stay in force. Allowlist-v1 bytes are

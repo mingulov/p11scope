@@ -1461,6 +1461,7 @@ fn finish_counts_the_selected_stale_publication_not_the_current() {
             scalar: None,
             curve: None,
             source: None,
+            reason: None,
         };
         let block = MetadataBlock {
             class: blank,
@@ -1496,6 +1497,7 @@ fn finish_counts_the_selected_stale_publication_not_the_current() {
             successful_references: 1,
             successful_key_references: 0,
             accessing_sessions: 1,
+            creation_truncated: false,
         }
     }
 
@@ -1592,6 +1594,7 @@ fn finish_with_fitting_stale_selection_discloses_nothing() {
             scalar: None,
             curve: None,
             source: None,
+            reason: None,
         };
         let block = MetadataBlock {
             class: blank,
@@ -1627,6 +1630,7 @@ fn finish_with_fitting_stale_selection_discloses_nothing() {
             successful_references: 1,
             successful_key_references: 0,
             accessing_sessions: 1,
+            creation_truncated: false,
         }
     }
 

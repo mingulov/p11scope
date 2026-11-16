@@ -3890,10 +3890,14 @@ impl AttachPlan {
                 };
                 let merged_owner = previous_owner.reclaim(candidate_owner);
                 aggregate_owners[position] = merged_owner;
-                if merged_owner == AggregateOwner::Ambiguous && updated.descriptor_index != 0 {
-                    updated.descriptor_index = 0;
-                    updated.semantics = SlotSemantics::COUNT_ONLY;
-                    updated.semantic_authorized = false;
+                // Like the kept path, a reclaim that merges ambiguous is
+                // marked even when it reoccupies count-only.
+                if merged_owner == AggregateOwner::Ambiguous {
+                    if updated.descriptor_index != 0 {
+                        updated.descriptor_index = 0;
+                        updated.semantics = SlotSemantics::COUNT_ONLY;
+                        updated.semantic_authorized = false;
+                    }
                     updated.semantic_ambiguous = true;
                 }
                 // The same function of the same file: its capture-lifetime
@@ -4203,9 +4207,11 @@ impl AttachPlan {
             .count();
     }
 
-    /// Forgets a retired key: descriptor-replaced slots must never
-    /// revive their old descriptor or reuse their cookie, so a failed
-    /// replacement leaves no revival memory behind.
+    /// Forgets one retired position: a descriptor-replaced slot must
+    /// never revive its old descriptor or reuse its cookie, so a failed
+    /// replacement leaves no revival memory behind at its index. The
+    /// key's generations elsewhere stay: only this position was
+    /// replaced.
     pub(crate) fn forget_retired_key(&mut self, slot: u32) {
         self.mutations.bump();
         let position = slot as usize;
@@ -4213,8 +4219,8 @@ impl AttachPlan {
             return;
         }
         let key = AttachKey::of(&self.slots[position]);
-        self.retired_keys.remove(&key);
-        self.revivable.remove(&key);
+        forget_memory_at(&mut self.retired_keys, &key, position);
+        forget_memory_at(&mut self.revivable, &key, position);
     }
 
     /// Gives back the cells at `accepted..` — every cell this candidate

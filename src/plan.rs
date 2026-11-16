@@ -12479,6 +12479,96 @@ pub(crate) mod tests {
         assert!(slot.semantic_ambiguous);
     }
 
+    #[test]
+    fn unlinked_scan_slot_names_its_heuristic_reason() {
+        // An unlinked heuristic table proves no publication (no interface
+        // linkage, live return, manifest, or export proof), so its slots
+        // stay unknown — with the named reason, never a bare unknown.
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let plan = build_from_test_sources(std::slice::from_ref(&scanned), &[]);
+
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, [UNKNOWN_FUNCTION_NAME]);
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            [UnprovenNames::HeuristicTable.token()]
+        );
+    }
+
+    #[test]
+    fn unmatched_selection_slot_names_its_selection_reason() {
+        // A selection table no exact-standard v3 query proved stays
+        // unknown with the selection reason.
+        let object = PinnedObjectId(7);
+        let allocated = exact_plan(vec![], vec![exact_module(0, object)]);
+        let mut plan = allocated.clone();
+        plan.add_selection_table(
+            &allocated,
+            ModuleId(0),
+            [selection_target(object, 0x10, UNKNOWN_FUNCTION_NAME)],
+        )
+        .unwrap();
+
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, [UNKNOWN_FUNCTION_NAME]);
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            [UnprovenNames::SelectionWithoutStandardProof.token()]
+        );
+    }
+
+    #[test]
+    fn named_slot_carries_no_unnamed_reason() {
+        // Positive twins: a manifest-authorized slot, and a slot where an
+        // authorized name displaced `unknown`, carry no reason.
+        let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
+        let plan = build_from_test_sources(&[], std::slice::from_ref(&manifest));
+        assert_eq!(plan.slots[0].names, ["C_Login"]);
+        assert!(plan.unnamed_reasons_of(&plan.slots[0]).is_empty());
+
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
+        let plan = build_from_test_sources(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+        );
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, ["C_Login"]);
+        assert!(plan.unnamed_reasons_of(&plan.slots[0]).is_empty());
+    }
+
+    #[test]
+    fn mixed_unproven_sources_union_their_reasons() {
+        // A slot claimed by both an unlinked scan table and an unmatched
+        // selection table carries both reasons, sorted.
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let mut plan = build_from_test_sources(std::slice::from_ref(&scanned), &[]);
+        assert_eq!(plan.slots[0].names, [UNKNOWN_FUNCTION_NAME]);
+        let module = plan.modules[0].clone();
+        let allocated = plan.clone();
+        plan.add_selection_table(
+            &allocated,
+            module.id,
+            [SelectionTableTarget::provider_local(
+                module.object,
+                "/opt/p11.so".into(),
+                0x10,
+                UNKNOWN_FUNCTION_NAME,
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, [UNKNOWN_FUNCTION_NAME]);
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            [
+                UnprovenNames::HeuristicTable.token(),
+                UnprovenNames::SelectionWithoutStandardProof.token(),
+            ]
+        );
+    }
+
     fn prearm_piece(proved: Vec<(String, u64)>) -> PrearmPlanPiece {
         PrearmPlanPiece {
             object: TEST_PINNED_OBJECT,

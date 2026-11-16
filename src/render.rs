@@ -9682,6 +9682,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unknown_rows_carry_reasons_and_named_rows_omit_them() {
+        // Unknown stays unknown only with a named reason; named rows omit
+        // the key (absent, never null or empty).
+        let mut unknown = report("unknown", 3, 0, false);
+        unknown.unnamed_reasons = vec!["heuristic_table".into()];
+        let named = report("C_Sign", 5, 0, false);
+        let v = profile_json(
+            &[unknown, named],
+            VersionedEvidence::wrap(&evidence()),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            v["functions"][0]["unnamed_reasons"],
+            serde_json::json!(["heuristic_table"])
+        );
+        assert!(
+            v["functions"][1].get("unnamed_reasons").is_none(),
+            "named rows omit the key: {}",
+            v["functions"][1]
+        );
+    }
+
+    #[test]
     fn interface_name_bytes_never_reach_capture_output() {
         // inspect may show names; capture output may not (spec §4.3, allowlist v1).
         // The count is the evidence; the bytes came out of a provider's memory.

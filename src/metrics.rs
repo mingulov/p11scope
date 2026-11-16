@@ -1639,6 +1639,29 @@ mod tests {
         assert_eq!(calls, 30);
     }
 
+    /// Folded unknown rows union their unnamed reasons, sorted and
+    /// deduplicated, so no contributing source's reason is lost.
+    #[test]
+    fn merge_slot_reports_unions_unnamed_reasons() {
+        let mut first = merge_fixture("unknown", 0x1234, 4242, 10, 0, buckets_with(1, 0));
+        first.unnamed_reasons = vec!["heuristic_table".into()];
+        let mut second = merge_fixture("unknown", 0x1234, 4242, 20, 0, buckets_with(0, 1));
+        second.unnamed_reasons = vec![
+            "selection_without_standard_proof".into(),
+            "heuristic_table".into(),
+        ];
+        let merged = merge_slot_reports(vec![first, second]);
+        assert_eq!(merged.len(), 1, "one target reads one row");
+        assert_eq!(
+            merged[0].unnamed_reasons,
+            vec![
+                "heuristic_table".to_string(),
+                "selection_without_standard_proof".to_string(),
+            ]
+        );
+        assert_eq!(merged[0].calls, 30);
+    }
+
     /// Different counter modes never fold together: a counts row and
     /// a latency row for the same function stay two rows, since their
     /// cells measure different things.

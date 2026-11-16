@@ -98,8 +98,7 @@ fn file_offset(provider: &Path, addr: u64) -> u64 {
     let want = provider.to_string_lossy().into_owned();
     for line in maps.lines() {
         let mut parts = line.split_whitespace();
-        let (Some(range), Some(perms), Some(offset)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(range), Some(perms), Some(offset)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
@@ -123,7 +122,11 @@ fn file_offset(provider: &Path, addr: u64) -> u64 {
 }
 
 fn resolution<'a>(s: &'a SurfaceRecord, name: &str) -> &'a Resolution {
-    &s.functions.iter().find(|f| f.name == name).unwrap().resolution
+    &s.functions
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap()
+        .resolution
 }
 
 fn resolved_offset(resolution: &Resolution) -> u64 {
@@ -186,7 +189,11 @@ fn first_mint_v3_stubs_are_recorded() {
     let v32 = m
         .surfaces
         .iter()
-        .find(|s| s.version.as_ref().is_some_and(|v| v.major == 3 && v.minor == 2))
+        .find(|s| {
+            s.version
+                .as_ref()
+                .is_some_and(|v| v.major == 3 && v.minor == 2)
+        })
         .expect("a v3.2 surface");
     assert_eq!(
         resolved_offset(resolution(v32, "C_Initialize")),

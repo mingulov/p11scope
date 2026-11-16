@@ -5033,12 +5033,21 @@ struct PrearmInput {
 /// already gone). Both proof paths (the watch's synchronous scans
 /// and the live apply path) lower to this before staging; staging
 /// never re-resolves a bare pid, so a recycled pid is never named.
+/// The proof also carries the scan's decoded module (tables and
+/// interfaces): learning persists them as run-persistent scan
+/// inputs, so a getter-only provider (hidden symbols, no exports
+/// to pre-arm) still attaches its table functions without waiting
+/// for frame admission.
 struct OwnedLearnProof {
     view: ProcessViewId,
     path: String,
     object: PinnedObjectId,
     loader_exe: Option<String>,
     loader_unknown_reason: Option<&'static str>,
+    /// Scaffolding: the run-table harvest reads this (the next
+    /// commit); until then it is carried, not consumed.
+    #[allow(dead_code)]
+    module: ScannedModule,
 }
 
 /// Names the loader behind a run-tree proof through the proving
@@ -18608,6 +18617,7 @@ impl Engine {
                     object: module.object,
                     loader_exe,
                     loader_unknown_reason,
+                    module: module.scanned.clone(),
                 })
             })
             .collect();
@@ -22536,6 +22546,7 @@ impl Engine {
                             object,
                             loader_exe,
                             loader_unknown_reason,
+                            module: module.clone(),
                         }
                     })
             })

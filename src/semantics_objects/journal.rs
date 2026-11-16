@@ -1451,8 +1451,9 @@ pub(crate) struct JournalAdapter {
     shed_only_taints: BTreeSet<(u64, u64)>,
     /// Terminals expected-absent because the journal deliberately
     /// released their BEGIN (JK-19b): (image, native key) pairs whose
-    /// BEGIN was refused-due-to-taint, dropped by a taint, or disposed
-    /// as an unclaimable original. Their terminal keeps the
+    /// BEGIN was refused-due-to-taint, dropped by a taint, disposed
+    /// as an unclaimable original, or wiped by a void. Their terminal
+    /// keeps the
     /// Contradiction disposition and telemetry, but it is the release
     /// working as intended — a bursting shed-tainted image's own later
     /// ENDs — not new evidence, so it never promotes to a permanent
@@ -2266,10 +2267,10 @@ impl JournalAdapter {
         let Some(entry) = self.open.get(&key) else {
             if self.take_derived_absence(end_image(&end), key) {
                 // The journal deliberately released this call's BEGIN
-                // (a taint refusal/drop or an unclaimable-original
-                // disposal), so its END is expected-absent: keep the
-                // disposition and telemetry, but do not promote to a
-                // permanent taint for it.
+                // (a taint refusal/drop, an unclaimable-original
+                // disposal, or a void wipe), so its END is
+                // expected-absent: keep the disposition and telemetry,
+                // but do not promote to a permanent taint for it.
                 self.contradictions.note(TaintCause::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
                 ));
@@ -2681,9 +2682,9 @@ impl JournalAdapter {
 
     /// Record one (image, key) whose terminal is expected-absent
     /// because the journal deliberately released its BEGIN (a taint
-    /// refusal/drop or an unclaimable-original disposal). Capped at
-    /// the open-table bound; past the cap the key is not recorded and
-    /// its terminal promotes (fail closed).
+    /// refusal/drop, an unclaimable-original disposal, or a void
+    /// wipe). Capped at the open-table bound; past the cap the key is
+    /// not recorded and its terminal promotes (fail closed).
     fn note_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) {
         if self.derived_absent.len() < self.limits.open_calls {
             self.derived_absent.insert((image, key));
@@ -7210,6 +7211,18 @@ impl JournalAdapter {
         self.void_wiped.clear();
         self.void_wiped.extend(self.open.keys().copied());
         debug_assert!(self.void_wiped.len() <= self.limits.open_calls);
+        // The wiped BEGINs' terminals will arrive unmatched: the void
+        // deliberately released them, so they are expected-absent, never
+        // new taint evidence. Recorded before the table clears, under
+        // the same open-table cap (past it, terminals promote).
+        let wiped: Vec<((u64, u64), JournalNativeKey)> = self
+            .open
+            .iter()
+            .map(|(key, entry)| (entry.image, *key))
+            .collect();
+        for (image, key) in wiped {
+            self.note_derived_absence(image, key);
+        }
         self.open.clear();
         self.ledger.release_all_h8open();
         self.refused.clear();

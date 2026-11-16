@@ -14752,13 +14752,23 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
         followup_below > clean_max,
         "minting advances past the q2 H3 cover"
     );
+    // Controller KEYROWS-CHURN ruling (round 3): the old no-gap
+    // expectation encoded the spurious void-straddle taint masking the
+    // void-refused key. With void-wipe expected-absence the seal
+    // honestly reports it as DomainTainted; the honest report wins
+    // (never hide a refused key).
     assert_eq!(
         fixture
             .machine
             .diagnostic_audit_for_test()
             .map(|(gap, h3, bound, floor, _)| (gap, h3, bound, floor)),
-        Some((None, "Clean", Some(clean_max + 1), None)),
-        "the follow-up audit finds no gap and no barrier to void"
+        Some((
+            Some(crate::semantics_objects::journal::JournalGap::DomainTainted),
+            "Clean",
+            Some(clean_max + 1),
+            None
+        )),
+        "the follow-up audit reports the void-refused key as DomainTainted"
     );
     fixture.published_labeled("midcall-followup-clean1", None);
     assert_eq!(

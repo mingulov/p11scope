@@ -1729,6 +1729,14 @@ impl AttachPlan {
             .unwrap_or_default()
     }
 
+    /// Test-only: drops every unnamed-reason entry, so counter-staging
+    /// twins can compare the same plan with and without reasons.
+    #[cfg(test)]
+    pub(crate) fn strip_unnamed_reasons_for_test(&mut self) {
+        self.mutations.bump();
+        self.slot_unnamed_reasons.clear();
+    }
+
     /// Borrow presentation metadata before reserving its eventual owned copy.
     pub(crate) fn borrowed_ordinals_of(
         &self,
@@ -12801,6 +12809,116 @@ pub(crate) mod tests {
             named.unnamed_reasons_of(&named.slots[0]).is_empty(),
             "a slot the surgery named carries no reason"
         );
+    }
+
+    #[test]
+    fn selection_table_merges_reasons_with_a_retired_same_key_row() {
+        // A retired unknown row and a fresh unknown selection slot can
+        // share one AttachKey; the fresh claim must union its reason
+        // with the retired row's, not replace it.
+        let object = PinnedObjectId(7);
+        let base = exact_plan(vec![], vec![exact_module(0, object)]);
+        let mut plan = base.clone();
+        let allocated = plan.clone();
+        plan.add_selection_table(
+            &allocated,
+            ModuleId(0),
+            [selection_target(object, 0x10, UNKNOWN_FUNCTION_NAME)],
+        )
+        .unwrap();
+        let key = AttachKey::of(&plan.slots[0]);
+        plan.deactivate(0);
+        // A scan-discovered sibling proved the same target unproven
+        // another way (extend surgery legitimately unions both tokens
+        // onto one key; see mixed_unproven_sources_union_their_reasons).
+        plan.slot_unnamed_reasons
+            .get_mut(&key)
+            .expect("the retired unknown row keeps its reason entry")
+            .insert(UnprovenNames::HeuristicTable);
+        let snapshot = plan.clone();
+        plan.add_selection_table(
+            &snapshot,
+            ModuleId(0),
+            [selection_target(object, 0x10, UNKNOWN_FUNCTION_NAME)],
+        )
+        .unwrap();
+        assert_eq!(plan.slots.len(), 2);
+        assert_eq!(plan.slots[1].names, [UNKNOWN_FUNCTION_NAME]);
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[1]),
+            [
+                UnprovenNames::HeuristicTable.token(),
+                UnprovenNames::SelectionWithoutStandardProof.token()
+            ],
+            "the fresh slot unions the retired row's reason with its own claim"
+        );
+    }
+
+    fn unknown_pair_plan() -> (AttachPlan, AttachKey, AttachKey) {
+        // Two unknown slots with distinct reason entries: the survivor
+        // and the tail cell the give-backs remove.
+        let object = PinnedObjectId(7);
+        let mut plan = exact_plan(
+            vec![
+                exact_slot(0, object, 0x10, 0, vec![ModuleId(0)]),
+                exact_slot(1, object, 0x20, 0, vec![ModuleId(0)]),
+            ],
+            vec![exact_module(0, object)],
+        );
+        for slot in &mut plan.slots {
+            slot.names = vec![UNKNOWN_FUNCTION_NAME.into()];
+        }
+        let survivor = AttachKey::of(&plan.slots[0]);
+        let tail = AttachKey::of(&plan.slots[1]);
+        plan.slot_unnamed_reasons
+            .insert(survivor, BTreeSet::from([UnprovenNames::HeuristicTable]));
+        plan.slot_unnamed_reasons.insert(
+            tail,
+            BTreeSet::from([UnprovenNames::SelectionWithoutStandardProof]),
+        );
+        (plan, survivor, tail)
+    }
+
+    #[test]
+    fn withdraw_unlinked_additions_drops_reasons_for_given_back_cells() {
+        // Never-linked tail cells are given back; their reason entries
+        // must go with them, while a surviving unknown slot keeps its.
+        let (mut plan, survivor, tail) = unknown_pair_plan();
+        plan.deactivate(1);
+        plan.withdraw_unlinked_additions(1);
+        assert_eq!(plan.slots.len(), 1);
+        assert!(
+            !plan.slot_unnamed_reasons.contains_key(&tail),
+            "the given-back cell's reason entry leaves with it"
+        );
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            [UnprovenNames::HeuristicTable.token()],
+            "the surviving unknown slot keeps its reason"
+        );
+        assert_eq!(AttachKey::of(&plan.slots[0]), survivor);
+    }
+
+    #[test]
+    fn excise_unlinked_tail_cells_drops_reasons_for_excised_cells() {
+        // A withheld retry's never-linked tail cell is excised; its
+        // reason entry must go with it, while a surviving unknown slot
+        // keeps its.
+        let (mut plan, survivor, tail) = unknown_pair_plan();
+        plan.deactivate(1);
+        let remap = plan.excise_unlinked_tail_cells(1, &BTreeSet::from([1u32]));
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(remap, [0, u32::MAX]);
+        assert!(
+            !plan.slot_unnamed_reasons.contains_key(&tail),
+            "the excised cell's reason entry leaves with it"
+        );
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            [UnprovenNames::HeuristicTable.token()],
+            "the surviving unknown slot keeps its reason"
+        );
+        assert_eq!(AttachKey::of(&plan.slots[0]), survivor);
     }
 
     #[test]

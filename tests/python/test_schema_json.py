@@ -1803,5 +1803,31 @@ class CallerExecRowAgreement(unittest.TestCase):
         self.assertIn("proven exec", caller["description"])
 
 
+class UnnamedReasonsRowAgreement(unittest.TestCase):
+    """functions[].unnamed_reasons: the v3-additive unnamed-row reasons.
+
+    Like initialization above, the release oracle closes only the
+    object-canary row keys (presence-conditional: earlier documents
+    predate the key), so this pins the machine schema's additive shape
+    instead: optional, nonempty, and exactly the oracle's closed
+    vocabulary.
+    """
+
+    def row_schema(self):
+        return SCHEMA["properties"]["functions"]["items"]
+
+    def test_unnamed_reasons_is_optional_nonempty_and_closed_vocabulary(self):
+        row = self.row_schema()
+        self.assertIn("unnamed_reasons", row["properties"])
+        self.assertNotIn("unnamed_reasons", row["required"])
+        reasons = row["properties"]["unnamed_reasons"]
+        self.assertEqual(reasons["type"], "array")
+        self.assertEqual(reasons["minItems"], 1)
+        self.assertEqual(
+            set(reasons["items"]["enum"]),
+            set(CHECKER["UNNAMED_REASON_TOKENS"]),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1020,7 +1020,7 @@ impl std::error::Error for LegacyReadFailure {
 pub(super) mod tests {
     use super::{
         CaptureCollection, CaptureSnapshot, CounterCapture, CounterCaptureInputs, CounterFailure,
-        LegacyReadFailure,
+        LegacyReadFailure, stage_projection,
     };
     use crate::discovery::identity::{PinnedObjects, ReconciledModule};
     use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
@@ -1029,7 +1029,7 @@ pub(super) mod tests {
         CounterRow, ReadReservation, ReadStage, ReadWindow,
     };
     use crate::metrics::{KernelEvidence, LegacyReadGaps};
-    use crate::plan::{AdmissionPolicy, AttachPlan};
+    use crate::plan::{AdmissionPolicy, AttachPlan, UNKNOWN_FUNCTION_NAME};
     use crate::process::{MountNamespaceId, ProcessViewId};
     use crate::semantics_edge::resources::{SemanticResourcePool, SemanticResourceReserver};
     use p11scope_ebpf_common::{
@@ -2626,5 +2626,45 @@ pub(super) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn stage_projection_charges_unnamed_reasons() {
+        // Twin: the same plan with and without unnamed reasons. The
+        // projection stages an owned reasons list per row, so the pool
+        // must charge more with them. Reports differ only in the list.
+        let (_file, plan, pins) = fixture();
+        assert_eq!(plan.slots[0].names.as_slice(), [UNKNOWN_FUNCTION_NAME]);
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            ["heuristic_table"],
+            "precondition: the staged row carries a reason"
+        );
+        let mut stripped = plan.clone();
+        stripped.strip_unnamed_reasons_for_test();
+        assert!(stripped.unnamed_reasons_of(&stripped.slots[0]).is_empty());
+
+        let scratch = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+        let staged = |staged_plan: &AttachPlan| {
+            let staged_read = read(staged_plan, CounterMode::Counts, 1, 5, &scratch.reserver());
+            let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+            let baseline = pool.snapshot().charged_bytes;
+            let (reports, _storage) =
+                stage_projection(staged_plan, &pins, &staged_read, &pool.reserver())
+                    .expect("staging succeeds");
+            (pool.snapshot().charged_bytes - baseline, reports)
+        };
+        let (with_reasons, reports) = staged(&plan);
+        let (without_reasons, stripped_reports) = staged(&stripped);
+        assert!(
+            with_reasons > without_reasons,
+            "the pool charges {with_reasons} with reasons vs {without_reasons} without"
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].unnamed_reasons, ["heuristic_table"]);
+        assert!(stripped_reports[0].unnamed_reasons.is_empty());
+        let mut expected = reports[0].clone();
+        expected.unnamed_reasons.clear();
+        assert_eq!(stripped_reports[0], expected);
     }
 }

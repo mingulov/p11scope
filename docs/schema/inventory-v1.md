@@ -1155,7 +1155,9 @@ never imply S1 loss.
   `ed25519`, `ed448`, `hkdf_*`, `generic_*`), the HKDF key-type
   scalar (66, requested or established), a 12/48 value length, a
   new curve name, any established field with a non-`query` source,
-  or any view created from a truncated template — else 5 iff PQC
+  any view created from a truncated template, or an
+  unsupported-value, unusable-curve or partly-read reason — else 5
+  iff PQC
   content is present — a
   PQC `metadata_at_use` or object label, a PQC key-type scalar
   (73, 74 or 75, requested or established), a non-blank
@@ -1206,13 +1208,17 @@ never imply S1 loss.
   or a successful creation return promoting its own finite
   template; an established `value` always carries `query` or
   `creation_success`, while requested blocks and every non-`value`
-  status carry null), plus `reason` at version 6 (one of three
+  status carry null), plus `reason` at version 6 (one of four
   closed reasons or null: `template truncated (first 8 attributes
   captured)` on unknown fields never seen on a truncated template,
   `template value outside approved finite set` on kinds seen with an
-  unclassifiable value, `curve unusable for key type` on a mismatched
-  or — on a complete template — unestablished Edwards/Montgomery
-  curve; null for every other field).
+  unclassifiable value (a value outside the approved finite set, or
+  an unavailable, malformed or size-only cell), `curve unusable for
+  key type` on a mismatched or — on a complete template seen at
+  creation — unestablished Edwards/Montgomery curve on a created
+  object, and `template partly read` on unknown fields never seen
+  on a partly-read template; null for every other field, and null
+  on every field of a query-only view).
   A `value` carries the accepted numeric code or null: class 0-4,
   key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at version 6;
   73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–6; OASIS
@@ -1231,7 +1237,9 @@ never imply S1 loss.
   promotes its observed cells; fields past the observed window stay
   unknown with the truncation reason, kinds seen with an
   unclassifiable value stay unknown with the unsupported reason, and
-  nothing is inferred from the unobserved tail.
+  nothing is inferred from the unobserved tail. A template the probe
+  only partly read still promotes its observed cells; its unseen
+  fields stay unknown with the partly-read reason.
 - `queries` holds the per-field latest query outcome (`not_queried`,
   `established`, `unavailable`, `size_only`, `unsupported`,
   `malformed`, `excluded`), distinct from current validity, over
@@ -1253,9 +1261,11 @@ never imply S1 loss.
   Edwards label joins an established ed25519/ed448 curve with the
   `ec_edwards` key type, a Montgomery label an established
   x25519/x448 curve with the `ec_montgomery` key type, from the same
-  view; mismatched or unestablished curves stay unlabeled with the
-  curve reason on the curve field in JSON and its count in verbose
-  text. A PQC label joins an established
+  view; on a created object whose own template was seen, a
+  mismatched curve — or, on a complete template, an unestablished
+  curve — stays unlabeled with the curve reason on the curve field
+  in JSON and its count in verbose text. A PQC label joins an
+  established
   parameter-set code with the established key type from the same
   view; a code alone, a type alone, or a recognized mechanism never
   labels. `unknown` is a key-row label only, never a view label.

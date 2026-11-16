@@ -977,6 +977,18 @@ class ObservedRsaTests(unittest.TestCase):
             with self.assertRaisesRegex(ORACLE.OracleRefusal,
                                         "unvalued metadata carries a source"):
                 ORACLE.check_section(mutated)
+        with self.subTest("established value without source refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][0]["established"]["class"]["source"] = None
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "established value carries no source"):
+                ORACLE.check_section(mutated)
+        with self.subTest("query source without a query refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][0]["established"]["key_type"]["source"] = "query"
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "query source without a query"):
+                ORACLE.check_section(mutated)
         with self.subTest("HKDF key type below v6 refused"):
             mutated = copy.deepcopy(section)
             mutated["version"] = 5

@@ -1017,7 +1017,8 @@ and never proves an app identity. See the app identity rows of
   `status` is `withheld` while no edge holds semantic state — the
   scan lane alone, where `occupied` is 0 and every edge reads
   `unknown (semantic capture withheld)` — and `observed` once the
-  semantic feed materializes any; `unknown_edges` counts the edges
+  feed materializes any, including claims since folded into
+  `departed_use`; `unknown_edges` counts the edges
   lacking semantic claims; `refused` counts semantic keys refused
   past budget — materializations past `limit` (each also a named
   budget gap) plus per-edge keys past the S1 bounds),

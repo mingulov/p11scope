@@ -225,7 +225,9 @@ slots, so retained callers plateau instead of climbing toward the
 (round 5, 19.8-churn/s with 10,643 short-lived forks, host load ~8.5):
 Private_Dirty + SwapPss 33.6 → 42.5 MiB (+2.56 MiB/h incl. swap, swap
 itself 0 throughout; VmRSS +2.30 MiB/h), retained callers flat at 174
-with 454 retirements recycled and 0 refusals. The remaining slope is
+with 454 retirements recycled and 0 refusals. That churn carried no
+attributed calls (`folded 0`), so fold-driven recycling is evidenced
+by the lifetime twin and fold cells, not by that plateau. The remaining slope is
 accounted saturating structures (unbound-image census +1.03 MiB/h
 toward its cap, ever-enumerated set +0.18 MiB/h), not caller or edge
 retention, which stay flat. A 5000-exited-callers-with-calls lifetime
@@ -1723,7 +1725,9 @@ memory on long busy-host captures — exited callers fold into exact
 per-module aggregates (named identities, exact counts) instead of
 holding retained slots, so retained callers plateau (3 h soak:
 Private_Dirty + SwapPss +2.56 MiB/h incl. swap, callers flat at 174
-with 0 refusals) instead of climbing toward the 4096-caller refusal.
+with 0 refusals; that soak folded 0, the fold itself is evidenced by
+the lifetime twin and fold cells) instead of climbing toward the
+4096-caller refusal.
 
 - Ordering-evidence pre-arm exactness producer for non-`run` scopes,
   inventory Detailed-subset activation, and same-granularity rewrite proof
@@ -2806,7 +2810,8 @@ The old bounds are measurements, not a product startup SLA.
   twice while budgets count each caller once. Semantic-lane custody
   (`admission_images`) and Joint-terminal counts for callers folded
   before the lane seated are the remaining S1-lane remainders, not
-  the caller budget. Retired
+  the caller budget: past 4096 lifetime histories S1 joins refuse
+  with `Capacity` while the caller budget survives via the fold. Retired
   caller IDs stay refused as bounded contiguous ID ranges (caller IDs are
   never reused), so late mapping evidence can never invent a caller with
   no row: it is refused and counted in `budgets.callers.late_refused`,

@@ -55,6 +55,15 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   the rows whose last record retention deleted (0 unless the retention
   cannot hold them; when all three unretained counts are 0, every last
   retained record equals its snapshot row).
+  Folded instances (additive within v1, v0.8.0): a streamed instance
+  may be absent from the final snapshot `instances[]` and
+  `semantic_edges[]` when the departed fold removed it after it
+  streamed (every folded instance streamed at least one record of
+  each kind: the fold waits for the first records). The streamed keys
+  are then a superset of the snapshot, and the missing keys count
+  exactly into `budgets.instances.folded` — never silently lost.
+  Consumers must therefore compare streamed instance keys as a
+  superset of the snapshot, not an equality.
 
 - `object_observed` (additive): one object view as the snapshot
   `objects[]` row verbatim, keyed by capture-local `object`:

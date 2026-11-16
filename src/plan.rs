@@ -23041,6 +23041,348 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
+    /// Same-file pin migration above a retired same-key sibling: the
+    /// active unknown generation migrates to the new pin while its
+    /// retired unknown generation keeps rendering under the old pin,
+    /// so the old pin's entry is copied to the new key, not moved —
+    /// both generations keep the carried and fresh reasons.
+    #[test]
+    fn pin_migration_with_retired_sibling_keeps_reasons_on_both_keys() {
+        let identity = test_identity(110, "sha-migrate-sibling-reasons");
+        let worker = |pin: u32| {
+            let mut module = sole_complete_module();
+            module.object = PinnedObjectId(pin);
+            module.scanned.key = scanned_key(PinnedObjectId(pin));
+            for entry in &mut module.scanned.tables[0].entries {
+                entry.object = scanned_key(PinnedObjectId(pin));
+            }
+            module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
+            module.forward_verified = vec![vec![false; 68]];
+            count_only_copy(&module, true)
+        };
+        let mut plan = scoped_plan(std::slice::from_ref(&worker(110)), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME]),
+            "pin 110 attaches unknown"
+        );
+        let natural: Vec<&str> = plan.unnamed_reasons_of(&plan.slots[0]);
+        assert!(
+            !natural.is_empty(),
+            "precondition: the unknown row carries a reason"
+        );
+        plan.object_identities
+            .insert(PinnedObjectId(110), identity.clone());
+        // Pin 110 exits, then returns before any revival clearance:
+        // the unticketed return takes fresh cells and drops the
+        // revival memory, so the active generation sits above its
+        // retired same-key generation.
+        let retired = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(retired)
+            .unwrap_or_else(|error| panic!("pin 110 exit must not refuse: {error}"));
+        assert_eq!(plan.retired_slots.len(), 68, "pin 110 retires");
+        let returned = plan.rebuild_from_sources(
+            std::slice::from_ref(&worker(110)),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert!(
+            returned.reclaimed.is_empty(),
+            "no clearance, no reclaim tickets"
+        );
+        plan.extend_exact(returned)
+            .unwrap_or_else(|error| panic!("pin 110 return must not refuse: {error}"));
+        assert_eq!(
+            plan.slots.len(),
+            136,
+            "the unticketed return takes fresh cells"
+        );
+        assert_eq!(
+            plan.retired_slots.len(),
+            68,
+            "the first generation stays retired"
+        );
+        assert!(
+            plan.retired_keys.is_empty(),
+            "the unticketed return drops the revival memory"
+        );
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME]),
+            "both generations stay unknown"
+        );
+        // A second witness proved the same targets unproven another
+        // way (extend surgery legitimately unions both tokens onto
+        // one key; see mixed_unproven_sources_union_their_reasons).
+        let extra = if natural.contains(&UnprovenNames::HeuristicTable.token()) {
+            UnprovenNames::SelectionWithoutStandardProof
+        } else {
+            UnprovenNames::HeuristicTable
+        };
+        let old_keys: BTreeSet<AttachKey> = plan.slots.iter().map(AttachKey::of).collect();
+        assert_eq!(old_keys.len(), 68, "both generations share the old keys");
+        for key in &old_keys {
+            plan.slot_unnamed_reasons
+                .get_mut(key)
+                .expect("the unknown row keeps its reason entry")
+                .insert(extra);
+        }
+        // The same file reappears on a new pin with the same offsets:
+        // the still-active cells migrate in place, with no retire/new
+        // delta, while the retired generation keeps rendering under
+        // the old pin.
+        let mut rebuilt = scoped_plan(std::slice::from_ref(&worker(111)), AdmissionScope::Shared);
+        assert_eq!(rebuilt.slots.len(), 68);
+        rebuilt
+            .object_identities
+            .insert(PinnedObjectId(111), identity.clone());
+        let retired_positions: BTreeSet<usize> = plan.retired_slots.iter().copied().collect();
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("the same-file migration must not refuse: {error}"));
+        assert!(delta.retire.is_empty(), "migration retires nothing");
+        assert!(delta.new.is_empty(), "migration allocates nothing");
+        assert_eq!(plan.slots.len(), 136);
+        assert_eq!(
+            plan.retired_slots, retired_positions,
+            "the retired generation stays retired"
+        );
+        for slot in &plan.slots {
+            let expected_pin = if retired_positions.contains(&(slot.index as usize)) {
+                110
+            } else {
+                111
+            };
+            assert_eq!(
+                slot.object,
+                PinnedObjectId(expected_pin),
+                "cell {} stays on its pin",
+                slot.index
+            );
+            assert_eq!(
+                slot.names,
+                [UNKNOWN_FUNCTION_NAME],
+                "cell {} stays unknown",
+                slot.index
+            );
+            let reasons = plan.unnamed_reasons_of(slot);
+            assert!(
+                reasons.contains(&extra.token()),
+                "cell {} keeps the carried reason: {reasons:?}",
+                slot.index
+            );
+            for token in &natural {
+                assert!(
+                    reasons.contains(token),
+                    "cell {} keeps the proven reason: {reasons:?}",
+                    slot.index
+                );
+            }
+        }
+        assert!(
+            plan.slot_unnamed_reasons
+                .keys()
+                .any(|key| key.object == PinnedObjectId(111)),
+            "the returning key carries reasons"
+        );
+        assert!(
+            plan.slot_unnamed_reasons
+                .keys()
+                .any(|key| key.object == PinnedObjectId(110)),
+            "the retired generation keeps its old-pin entries"
+        );
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Cross-pin reclaim above a staying retired generation: both
+    /// generations retire, the same file returns on a new pin, merge
+    /// tickets the cleared generation, and the reclaim reoccupies it
+    /// while the forgotten unknown generation keeps rendering under
+    /// the old pin — so the old pin's entry is copied to the
+    /// returning key, not moved.
+    #[test]
+    fn slot_reclaim_with_staying_retired_generation_keeps_reasons_on_both_keys() {
+        let identity = test_identity(120, "sha-reclaim-sibling-reasons");
+        let worker = |pin: u32| {
+            let mut module = sole_complete_module();
+            module.object = PinnedObjectId(pin);
+            module.scanned.key = scanned_key(PinnedObjectId(pin));
+            for entry in &mut module.scanned.tables[0].entries {
+                entry.object = scanned_key(PinnedObjectId(pin));
+            }
+            module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
+            module.forward_verified = vec![vec![false; 68]];
+            count_only_copy(&module, true)
+        };
+        let mut plan = scoped_plan(std::slice::from_ref(&worker(120)), AdmissionScope::Named);
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME]),
+            "pin 120 attaches unknown"
+        );
+        let natural: Vec<&str> = plan.unnamed_reasons_of(&plan.slots[0]);
+        assert!(
+            !natural.is_empty(),
+            "precondition: the unknown row carries a reason"
+        );
+        plan.object_identities
+            .insert(PinnedObjectId(120), identity.clone());
+        // Pin 120 exits, returns unticketed (fresh cells, memory
+        // dropped), then exits again: both generations retire with
+        // only the second remembered.
+        let retired = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(retired)
+            .unwrap_or_else(|error| panic!("pin 120 exit must not refuse: {error}"));
+        assert_eq!(plan.retired_slots.len(), 68, "pin 120 retires");
+        let returned = plan.rebuild_from_sources(
+            std::slice::from_ref(&worker(120)),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert!(
+            returned.reclaimed.is_empty(),
+            "no clearance, no reclaim tickets"
+        );
+        plan.extend_exact(returned)
+            .unwrap_or_else(|error| panic!("pin 120 return must not refuse: {error}"));
+        assert_eq!(
+            plan.slots.len(),
+            136,
+            "the unticketed return takes fresh cells"
+        );
+        assert_eq!(
+            plan.retired_slots.len(),
+            68,
+            "the first generation stays retired"
+        );
+        assert!(
+            plan.retired_keys.is_empty(),
+            "the unticketed return drops the revival memory"
+        );
+        let retired_again = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(retired_again)
+            .unwrap_or_else(|error| panic!("pin 120 exit must not refuse: {error}"));
+        assert_eq!(plan.retired_slots.len(), 136, "both generations retire");
+        assert_eq!(
+            plan.retired_keys.len(),
+            68,
+            "only the second generation is remembered"
+        );
+        plan.revivable.clone_from(&plan.retired_keys);
+        let staying: BTreeSet<usize> = (0..68usize).collect();
+        assert!(
+            staying
+                .iter()
+                .all(|position| plan.retired_slots.contains(position)),
+            "the forgotten generation stays retired"
+        );
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME]),
+            "both generations stay unknown"
+        );
+        // A second witness proved the same targets unproven another
+        // way (extend surgery legitimately unions both tokens onto
+        // one key; see mixed_unproven_sources_union_their_reasons).
+        let extra = if natural.contains(&UnprovenNames::HeuristicTable.token()) {
+            UnprovenNames::SelectionWithoutStandardProof
+        } else {
+            UnprovenNames::HeuristicTable
+        };
+        let old_keys: BTreeSet<AttachKey> = plan.slots.iter().map(AttachKey::of).collect();
+        assert_eq!(old_keys.len(), 68, "both generations share the old keys");
+        for key in &old_keys {
+            plan.slot_unnamed_reasons
+                .get_mut(key)
+                .expect("the unknown row keeps its reason entry")
+                .insert(extra);
+        }
+        // The same file returns on a new pin: merge tickets the
+        // cleared generation and the return reoccupies it in place,
+        // while the forgotten generation stays retired underneath.
+        let returning = worker(121);
+        let identities = BTreeMap::from([(PinnedObjectId(121), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&returning),
+            &[],
+            &identities,
+        );
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "merge tickets the cleared generation"
+        );
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("the unknown return must not refuse: {error}"));
+        assert_eq!(delta.new.len(), 68);
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| (68..136usize).contains(&(slot.index as usize))),
+            "the return reoccupies the cleared cells, never fresh"
+        );
+        assert_eq!(plan.slots.len(), 136, "no fresh cell burns");
+        assert_eq!(
+            plan.retired_slots, staying,
+            "exactly the forgotten generation stays retired"
+        );
+        for slot in &plan.slots {
+            let expected_pin = if staying.contains(&(slot.index as usize)) {
+                120
+            } else {
+                121
+            };
+            assert_eq!(
+                slot.object,
+                PinnedObjectId(expected_pin),
+                "cell {} stays on its pin",
+                slot.index
+            );
+            assert_eq!(
+                slot.names,
+                [UNKNOWN_FUNCTION_NAME],
+                "cell {} stays unknown",
+                slot.index
+            );
+            let reasons = plan.unnamed_reasons_of(slot);
+            assert!(
+                reasons.contains(&extra.token()),
+                "cell {} keeps the carried reason: {reasons:?}",
+                slot.index
+            );
+            for token in &natural {
+                assert!(
+                    reasons.contains(token),
+                    "cell {} keeps the proven reason: {reasons:?}",
+                    slot.index
+                );
+            }
+        }
+        assert!(
+            plan.slot_unnamed_reasons
+                .keys()
+                .any(|key| key.object == PinnedObjectId(121)),
+            "the returning key carries reasons"
+        );
+        assert!(
+            plan.slot_unnamed_reasons
+                .keys()
+                .any(|key| key.object == PinnedObjectId(120)),
+            "the staying generation keeps its old-pin entries"
+        );
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
     /// B1: an ambiguous ticketed reclaim must reserve the room later
     /// mandatory fresh additions need. The plan holds 2,044 of the 2,112
     /// slots with 68 retired semantic cells; the same file returns with a

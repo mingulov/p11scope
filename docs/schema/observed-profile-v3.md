@@ -644,10 +644,12 @@ disclosed as a window (at most a `physical static probe gap` row in
 It bounds the first-use gap, it is not a missed-call count. It may stand beside a
 null `attached_at_ns` when a replacement attach failed after the first
 complete attach. `first_attach_points` (additive) lists each endpoint that
-ever attached as `{file_offset, began_ns, attached_ns}`, one entry per file
-offset taken from the earliest of the module's slots at that offset (a
-second pinned identity of the same file, such as the same inode under
-another device, can attach first): the instant just
+ever attached as `{file_offset, began_ns, attached_ns}`, one entry per
+endpoint file offset: the earliest stamp at that offset over the
+declared endpoints plus every plan slot of the module (a second pinned
+identity of the same file, such as the same inode under another device,
+can attach first), so no point follows `first_attached_at_ns`, which
+keeps its declared-set meaning and may exceed every point: the instant just
 before that endpoint's own first native attach call (its return side;
 the attach batch's start when that round has no usable clock; `null`
 when no clock could be read) and that attach's completion stamp. Counts are completed calls, so no call that

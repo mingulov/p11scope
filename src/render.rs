@@ -1123,7 +1123,9 @@ pub enum ModuleLayer {
 /// the instant just before the endpoint's own first native attach call
 /// (its return side; the attach batch's start when that round has no
 /// usable clock; `null` when no clock could be read) and its completion
-/// stamp, `CLOCK_MONOTONIC`, kept across replaced probes.
+/// stamp, `CLOCK_MONOTONIC`, kept across replaced probes: the earliest
+/// stamp at the endpoint's file offset over the declared endpoints plus
+/// every plan slot of the module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FirstAttachPoint {
     pub file_offset: u64,

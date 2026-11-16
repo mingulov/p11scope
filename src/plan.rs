@@ -3260,14 +3260,9 @@ impl AttachPlan {
             // whole, an object that keeps cells keeps them and omits only
             // its fresh cells as a counted growth gap — instead of aborting
             // the capture. Retirement, replacement and every kept/active
-            // cell stay. Only kept and reused demand without a fresh cell
-            // to shed still errors, which cannot fit under any repair.
+            // cell stay. Other policies keep the original error with no
+            // repair attempted.
             if !rebuilt.repair_overflowing_extension(self) {
-                let (_, _, additions) = self.reuse_assignments(&rebuilt);
-                debug_assert!(
-                    additions == 0,
-                    "kept+reused alone exceed capacity: {additions} fresh additions with no owning module to shed"
-                );
                 return Err(error);
             }
             self.validate_extension_capacity(&rebuilt)?;
@@ -4024,6 +4019,13 @@ impl AttachPlan {
                 return true;
             }
             let Some(victim) = prior.overflow_victim(self) else {
+                // Only kept and reused demand without a fresh cell to shed
+                // still errors, which cannot fit under any repair.
+                let (_, _, additions) = prior.reuse_assignments(self);
+                debug_assert!(
+                    additions == 0,
+                    "kept+reused alone exceed capacity: {additions} fresh additions with no owning module to shed"
+                );
                 return false;
             };
             self.shed_overflow_victim(prior, victim, &marker);

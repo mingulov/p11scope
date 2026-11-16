@@ -5525,6 +5525,95 @@ fn newsite_created_template_records_seen_kinds_despite_values() {
     );
 }
 
+// Fix round 4 (t3 I1): the curve reason needs a created object whose
+// own template was seen. A creation with a captured template records
+// `creation_template_seen`; a creation without one (no requested
+// list) does not. The slot-1 half of a `C_GenerateKeyPair` records
+// `keypair_private`; the slot-0 half does not.
+#[test]
+fn newsite_created_template_seen_and_pair_half_recorded() {
+    // Created with a template: seen, not a private half.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = attrs(&[scalar(CKA_CLASS, 3), scalar(CKA_KEY_TYPE, 0x41)]);
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let v = view(&h.project(), id);
+    assert!(
+        v.creation_template_seen,
+        "a captured template records as seen"
+    );
+    assert!(!v.keypair_private, "a single creation is no pair half");
+    // Created without a template: not seen.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let v = view(&h.project(), id);
+    assert!(!v.creation_template_seen, "no requested list, nothing seen");
+    assert!(!v.keypair_private, "a single creation is no pair half");
+    // A keypair: slot 0 public, slot 1 private, each with its own
+    // template seen.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let public = attrs(&[scalar(CKA_CLASS, 2), scalar(CKA_KEY_TYPE, 0x41)]);
+    let private = attrs(&[scalar(CKA_CLASS, 3), scalar(CKA_KEY_TYPE, 0x41)]);
+    let x = h.run(
+        3,
+        call("C_GenerateKeyPair")
+            .on(SA)
+            .request(0, public)
+            .request(1, private),
+        4,
+        ok().result(0, H1).result(1, H2),
+    );
+    let e = h.settle(4);
+    let public_id = created(&e, x, 0).unwrap();
+    let private_id = created(&e, x, 1).unwrap();
+    let p = h.project();
+    let public_view = view(&p, public_id);
+    let private_view = view(&p, private_id);
+    assert!(
+        public_view.creation_template_seen,
+        "the public half saw its template"
+    );
+    assert!(!public_view.keypair_private, "slot 0 is the public half");
+    assert!(
+        private_view.creation_template_seen,
+        "the private half saw its template"
+    );
+    assert!(private_view.keypair_private, "slot 1 is the private half");
+}
+
+// Fix round 4 (t3 M3): a creation template with a read failure
+// records `creation_partly_read` and never `creation_template_seen`;
+// its observed cells still promote.
+#[test]
+fn newsite_created_partly_read_template_records_its_failure() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let template = AttributeList::with_flags(
+        &[scalar(CKA_CLASS, 3), scalar(CKA_KEY_TYPE, 0x41)],
+        false,
+        true,
+    );
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert!(v.creation_partly_read, "the read failure is recorded");
+    assert!(!v.creation_template_seen, "a failed template is not seen");
+    assert!(!v.creation_truncated, "a read failure is not a truncation");
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        scalar_field(0x41),
+        "the observed type still promotes"
+    );
+}
+
 // Keymeta §6/K5 source twin: a promoted fact never keeps its source
 // past a conflict. The AES size promotes with `creation_success`; a
 // later query disagreeing on the size conflicts the field, and the

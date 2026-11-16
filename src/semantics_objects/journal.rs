@@ -14562,6 +14562,40 @@ pub(crate) mod tests {
         );
     }
 
+    /// Fix round 4 (t3 M3): the journal carries the wire
+    /// HEADER_READ_FAILURE and INVALID_SPAN bits beside the retained
+    /// cells, so promotion names partly-read templates. Without
+    /// either bit the list decodes fully read.
+    #[test]
+    fn object_journal_attribute_list_carries_wire_partly_read_bits() {
+        fn list(flags: u8) -> [u8; 36] {
+            let mut list = [0u8; 36];
+            for index in 0..8 {
+                list[4 * index] = 1;
+                list[4 * index + 1] = 1;
+                list[4 * index + 2] = 4;
+            }
+            list[32] = 8;
+            list[33] = flags;
+            list
+        }
+        let clean = attribute_list(&list(0x01)).expect("inspected list decodes");
+        assert!(!clean.partly_read(), "no failure bit, fully read");
+        let header = attribute_list(&list(0x05)).expect("inspected list decodes");
+        assert!(
+            header.partly_read(),
+            "HEADER_READ_FAILURE is carried to promotion"
+        );
+        let mut span = [0u8; 36];
+        span[33] = 0x08;
+        let refused = attribute_list(&span).expect("a refused span still decodes");
+        assert!(
+            refused.partly_read(),
+            "INVALID_SPAN is carried to promotion"
+        );
+        assert!(!refused.truncated(), "a refused span is not a truncation");
+    }
+
     #[test]
     fn object_journal_fork_child_birth_after_parent_h3_void_respects_fence() {
         use crate::semantics_objects::{Birth, FieldState, KeyLabel, Lifetime, ViewOrigin};
@@ -18300,7 +18334,7 @@ pub(crate) mod tests {
             );
             assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
         }
-        let mut proof = scene.attest_calls(CREATES as usize);
+        let _ = scene.attest_calls(CREATES as usize);
         let mut begin = begin_bytes(CREATES + 1, 1, function_id("C_SetAttributeValue"), 0);
         put_u64(&mut begin, 80, OTHER);
         put_u64(&mut begin, 88, POPULATED_KEY_BASE + 1);
@@ -18308,7 +18342,7 @@ pub(crate) mod tests {
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         let end = end_bytes(&begin, OBJECT_ACTION_SET, 0, ENTRY_NS + 60);
         assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
-        proof = scene.attest_session_function(OTHER, "C_SetAttributeValue");
+        let proof = scene.attest_session_function(OTHER, "C_SetAttributeValue");
         scene.prepare_claims();
         let bootstrap = scene.bootstrap(proof, 0);
         let calls = scene.adapter.open.len();

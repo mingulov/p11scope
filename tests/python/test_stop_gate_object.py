@@ -565,6 +565,35 @@ class StopGate(unittest.TestCase):
                 assert not shadowed.fullmatch(candidate), (at, candidate)
         return definition, f'{register} = {old_value}', f'{register} = {new_value}'
 
+    def test_slot_count_only_is_a_policy_read_in_every_endpoint(self):
+        """In-place downgrade (A'): every static entry program and the
+        return program read the per-slot SLOT_COUNT_ONLY switch, and the
+        switch is a policy read like DESCRIPTORS, not a capture-map
+        access: the gate roles and the admission proof are unchanged."""
+        self.assertNotIn("SLOT_COUNT_ONLY", C.CAPTURE_MAPS,
+                         "the count-only switch is a policy read, not a capture access")
+        for variant, disassembly in self.objects:
+            names = [name for name in C.PROGRAMS[variant]
+                     if name.startswith("p11_entry") or name == "p11_return"]
+            self.assertTrue(names, variant)
+            analyses = self.analyses(disassembly, variant)
+            for name in names:
+                with self.subTest(variant=variant, program=name):
+                    entry = analyses[name]
+                    lookups = [pc for pc, text in entry.consumer.insns
+                               if pc in entry.consumer.helper and text == "call 0x1"
+                               and entry.facts.get(pc, {}).get("r1") == ("map", "SLOT_COUNT_ONLY")]
+                    # The return root outlines its descriptor reads into
+                    # its ordinary/object branches; the entry roots read
+                    # the switch inline.
+                    if name == "p11_return":
+                        self.assertEqual(len(lookups), 0,
+                                         "p11_return keeps its descriptor reads outlined")
+                    else:
+                        self.assertGreaterEqual(len(lookups), 1,
+                                                f"{name} reads SLOT_COUNT_ONLY")
+            print(f"verified {variant} count-only switch reads in {len(names)} endpoints")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

@@ -1937,15 +1937,18 @@ fn predicted_reclaim_shape<'a>(
 }
 
 /// Merge's reclaim accounting: each new key of `group` eligible for one
-/// retired position. Exact-shape matches win before flips, same-key before
-/// cross-ID: the key's own exact generation, a same-file generation of the
-/// same shape, the key's own other-shape generation, then a same-file
-/// other-shape generation (a semantic return reverse-flips while a
-/// count-only return forward-flips onto a retired semantic cell). One
-/// position per key and one key per position. Reverse-flip tickets ride
-/// free here; extend takes a fresh semantic index for them while the
-/// budget has room and reoccupies only at capacity, reporting the counted
-/// lowering. Forward flips reoccupy directly, same-key or cross-pin.
+/// retired position. Each key tries its own exact-shape generation
+/// first, then a same-file exact-shape generation, then its own
+/// other-shape generation, then a same-file other-shape generation (a
+/// semantic return reverse-flips while a count-only return
+/// forward-flips onto a retired semantic cell) — but that preference
+/// is per key, not across the group: keys are ticketed greedily in
+/// sorted-key order, so one key's flip can claim a position another
+/// key would have matched exactly. One position per key and one key
+/// per position. Reverse-flip tickets ride free here; extend takes a
+/// fresh semantic index for them while the budget has room and
+/// reoccupies only at capacity, reporting the counted lowering.
+/// Forward flips reoccupy directly, same-key or cross-pin.
 #[allow(clippy::too_many_arguments)]
 fn reclaim_tickets(
     group: &[Discovered<'_>],

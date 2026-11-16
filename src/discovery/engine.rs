@@ -28793,21 +28793,31 @@ impl Engine {
             // position with the same slot — the key reoccupies its own
             // retired index after clean detach, so the clearance is
             // sound without the two-tick proof. Anything else fails
-            // closed (and prunes below). Withheld seeds are count-only.
+            // closed (and prunes below). A withheld seed re-clears
+            // with its remembered generation's shape — exhaustion
+            // withholds whatever shape failed, semantic included —
+            // cross-checked against the retired slot, so the clearance
+            // can never disagree with the retirement memory.
             for (key, position) in &self.withheld_revivable {
-                if self
-                    .plan
-                    .retired_keys()
-                    .get(key)
-                    .is_some_and(|remembered| remembered.contains(*position))
-                    && self.plan.retired_slots().contains(position)
-                    && self
-                        .plan
-                        .slots
-                        .get(*position)
-                        .is_some_and(|slot| plan::AttachKey::of(slot) == *key)
+                let shape = self.plan.retired_keys().get(key).and_then(|remembered| {
+                    if remembered.get(true) == Some(*position) {
+                        Some(true)
+                    } else if remembered.get(false) == Some(*position) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                });
+                let Some(semantic) = shape else {
+                    continue;
+                };
+                if self.plan.retired_slots().contains(position)
+                    && self.plan.slots.get(*position).is_some_and(|slot| {
+                        plan::AttachKey::of(slot) == *key
+                            && (slot.descriptor_index != 0) == semantic
+                    })
                 {
-                    plan::remember_retired(&mut revivable, *key, *position, false);
+                    plan::remember_retired(&mut revivable, *key, *position, semantic);
                 }
             }
         }

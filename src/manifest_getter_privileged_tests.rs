@@ -849,6 +849,46 @@ fn build_dlopen_fixture(dir: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((library, loader))
 }
 
+/// The staging dir for the dlopen fixture a `run` child loads: the
+/// runner points `CARGO_TARGET_TMPDIR` at an owned-child-writable dir
+/// (like the other owned-run cells), never under the root-owned 0700
+/// TMPDIR the dropped child cannot traverse. `None` when the runner did
+/// not provide it: there is no TMPDIR fallback.
+fn run_child_staging_dir_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    lookup("CARGO_TARGET_TMPDIR").map(PathBuf::from)
+}
+
+fn run_child_staging_dir() -> Result<PathBuf> {
+    run_child_staging_dir_from(|name| std::env::var_os(name)).context(
+        "the run-child dlopen cell needs CARGO_TARGET_TMPDIR, the runner-provided \
+         owned-child-writable dir: its fixture must live where the sudo-dropped \
+         run child can read it, never under the root-owned 0700 TMPDIR",
+    )
+}
+
+/// Copies the dlopen fixture into the owned-child-writable staging dir
+/// and chmods both files 0755, so the sudo-dropped `run` child can exec
+/// the loader and dlopen the library whatever the ambient umask. Returns
+/// the staged (library, loader) paths; the manifest must be generated
+/// from the staged library, since it embeds the object path.
+fn stage_run_child_fixture(
+    staging: &Path,
+    library: &Path,
+    loader: &Path,
+) -> Result<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let staged_library = staging.join("libembedded_getter.so");
+    let staged_loader = staging.join("dlopen_loader");
+    for (source, staged) in [(library, &staged_library), (loader, &staged_loader)] {
+        std::fs::copy(source, staged)
+            .with_context(|| format!("staging {} for the run child", source.display()))?;
+        std::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok((staged_library, staged_loader))
+}
+
 /// The observer's stdout, which carries the `run` child's protocol lines
 /// (the child inherits it); other lines are skipped.
 struct RunLines(mpsc::Receiver<String>);
@@ -979,6 +1019,11 @@ fn privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child() -> Result<(
     let observer = observer_binary()?;
     let dir = tempfile::tempdir()?;
     let (library, loader) = build_dlopen_fixture(dir.path())?;
+    // The run child drops to the sudo invoker, which cannot traverse the
+    // root-owned 0700 TMPDIR tree: stage the fixture where it can read
+    // and execute it, and generate the manifest from the staged library.
+    let staging = run_child_staging_dir()?;
+    let (library, loader) = stage_run_child_fixture(&staging, &library, &loader)?;
     let manifest = dir.path().join("getters.json");
     getter_manifest(&library, &manifest, &[])?;
     let getter_offsets = manifest_getter_offsets(&manifest)?;
@@ -1078,4 +1123,59 @@ fn privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child() -> Result<(
         println!("GETTER_CELL {tag} observer log:\n{}", tail(&log));
     }
     check_evidence(tag, &result?, &[], &[])
+}
+
+#[test]
+fn run_child_staging_uses_the_runner_target_tmpdir_only() {
+    let lookup = |name: &str| match name {
+        "CARGO_TARGET_TMPDIR" => Some(std::ffi::OsString::from("/owned/target/tmp")),
+        "TMPDIR" => Some(std::ffi::OsString::from("/root-only")),
+        _ => None,
+    };
+    assert_eq!(
+        run_child_staging_dir_from(lookup),
+        Some(PathBuf::from("/owned/target/tmp")),
+        "the fixture must stage in the owned-child-writable target tmpdir, not TMPDIR"
+    );
+    let no_target_tmpdir = |name: &str| match name {
+        "TMPDIR" => Some(std::ffi::OsString::from("/root-only")),
+        _ => None,
+    };
+    assert_eq!(
+        run_child_staging_dir_from(no_target_tmpdir),
+        None,
+        "without CARGO_TARGET_TMPDIR there is no TMPDIR fallback"
+    );
+}
+
+#[test]
+fn run_child_staging_copies_and_chmods_the_fixture() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let source = tempfile::tempdir()?;
+    let library = source.path().join("libembedded_getter.so");
+    let loader = source.path().join("dlopen_loader");
+    std::fs::write(&library, b"library-bytes")?;
+    std::fs::write(&loader, b"loader-bytes")?;
+    // Restrictive sources: a plain copy would keep 0600 and stay
+    // unreadable to the dropped child, so the chmod must be explicit.
+    for path in [&library, &loader] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let staging = tempfile::tempdir()?;
+    let (staged_library, staged_loader) =
+        stage_run_child_fixture(staging.path(), &library, &loader)?;
+    assert_eq!(staged_library.file_name(), library.file_name());
+    assert_eq!(staged_loader.file_name(), loader.file_name());
+    assert_eq!(std::fs::read(&staged_library)?, b"library-bytes");
+    assert_eq!(std::fs::read(&staged_loader)?, b"loader-bytes");
+    for staged in [&staged_library, &staged_loader] {
+        let mode = std::fs::metadata(staged)?.permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o755,
+            "staged {} must be world-readable and executable",
+            staged.display()
+        );
+    }
+    Ok(())
 }

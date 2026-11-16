@@ -56,9 +56,19 @@
 #     already-set directory (a controller-delivered verified prebuilt)
 #     is used as is and nothing is rebuilt. Without cc or python3
 #     those cells SKIP with a reason instead of failing.
+#   P11SCOPE_GETTER_STATIC_APP: an already-set path (a
+#     controller-delivered prebuilt `cc -static` build of the static
+#     getter fixture for hosts without libc.a) is forwarded to exactly
+#     the GETTER_STATIC_TESTS cells and recorded as an opt-in; when it
+#     names no file the run refuses before executing. Unset, those cells
+#     build the fixture in-test as before, so hosts with libc.a are
+#     unaffected. This variable never skips a cell: without both the
+#     prebuilt and libc.a the cell fails naming the prerequisite.
 #   CARGO_TARGET_TMPDIR: the runner points this at an
-#     owned-child-writable dir under OUTDIR for the owned-child counter
-#     run cell only; every other cell inherits the ambient value.
+#     owned-child-writable dir under OUTDIR for exactly the
+#     OWNED_CHILD_TMP_TESTS cells (the owned-child counter run cell and
+#     the getter run-child dlopen cell, whose dropped children must read
+#     staged files); every other cell inherits the ambient value.
 #   RLIMIT_NOFILE: the Task 4 gates sample soft/hard nofile per phase, the
 #     T7 boundary cell pref lights live FD occupancy against it, and
 #     Session::start may raise soft to hard at attach; wide cells attach
@@ -715,6 +725,30 @@ inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_p
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64
 inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64
+)
+
+# Owned-child-tmpdir membership: cells whose privilege-dropped `run`
+# child must read files the test stages (the runner points
+# CARGO_TARGET_TMPDIR at an invoker-owned dir under OUTDIR for exactly
+# these cells). Not a campaign list: every member also runs as a
+# default cell.
+OWNED_CHILD_TMP_TESTS=(
+metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
+manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child
+)
+
+# Static-getter membership: the getter cells that link the fixture with
+# `cc -static` (libc.a). The runner forwards an already-set
+# P11SCOPE_GETTER_STATIC_APP (a controller-delivered prebuilt for hosts
+# without libc.a) to exactly these cells and refuses when it names no
+# file; unset, the cells build the fixture in-test as before. Not a
+# campaign list: every member also runs as a default cell.
+GETTER_STATIC_TESTS=(
+manifest_getter_privileged_tests::privileged_default_getter_manifest_counts_static_program_exactly
+manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_program_that_fetched_before_the_capture
+manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly
+manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed
+manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_counts_static_program_exactly
 )
 
 # Feature-alternative load gates: exactly one exists per binary. Default
@@ -1540,8 +1574,10 @@ main() {
     local need_wrap=0 wrap_skip=
     local need_btrfs_run=0 btrfs_mnt='' btrfs_skip=''
     local need_target_tmp=0 target_tmpdir=
+    local need_getter_static=0
     local cell_tmpdir
     local -A counter_fixture_set=() wrap_fixture_set=() btrfs_set=() xfail_reason=() xfail_sig=()
+    local -A owned_child_tmp_set=() getter_static_set=()
     local -a cell_env=()
 
     if [ $# -eq 0 ]; then
@@ -1785,6 +1821,8 @@ main() {
     for name in "${COUNTER_FIXTURE_TESTS[@]}"; do counter_fixture_set[$name]=1; done
     for name in "${WRAP_FIXTURE_TESTS[@]}"; do wrap_fixture_set[$name]=1; done
     for name in "${BTRFS_TESTS[@]}" "${BTRFS_TMPDIR_XFAIL_TESTS[@]}"; do btrfs_set[$name]=1; done
+    for name in "${OWNED_CHILD_TMP_TESTS[@]}"; do owned_child_tmp_set[$name]=1; done
+    for name in "${GETTER_STATIC_TESTS[@]}"; do getter_static_set[$name]=1; done
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
         xfail_reason[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_REASONS[$i]}
         xfail_sig[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_SIGNATURES[$i]}
@@ -1793,9 +1831,8 @@ main() {
         if [ -n "${counter_fixture_set[$name]+present}" ]; then need_counter=1; fi
         if [ -n "${wrap_fixture_set[$name]+present}" ]; then need_wrap=1; fi
         if [ -n "${btrfs_set[$name]+present}" ]; then need_btrfs_run=1; fi
-        if [ "$name" = "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64" ]; then
-            need_target_tmp=1
-        fi
+        if [ -n "${owned_child_tmp_set[$name]+present}" ]; then need_target_tmp=1; fi
+        if [ -n "${getter_static_set[$name]+present}" ]; then need_getter_static=1; fi
     done
     if [ "$need_counter" -eq 1 ]; then
         "$REPO_ROOT/scripts/ci/build-counter-fixtures.sh" "$outdir/counter-fixtures" \
@@ -1837,6 +1874,12 @@ main() {
             chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$target_tmpdir" || return 1
         fi
         chmod 0700 "$target_tmpdir" || return 1
+    fi
+    if [ "$need_getter_static" -eq 1 ] && [ -n "${P11SCOPE_GETTER_STATIC_APP:-}" ]; then
+        if [ ! -f "$P11SCOPE_GETTER_STATIC_APP" ]; then
+            echo "$PROG: P11SCOPE_GETTER_STATIC_APP=$P11SCOPE_GETTER_STATIC_APP names no file (deliver a prebuilt static getter fixture, or unset it to build in-test with cc -static)" >&2
+            return 1
+        fi
     fi
     if [ "$need_btrfs_run" -eq 1 ]; then
         "$REPO_ROOT/scripts/ci/prepare-btrfs-tmpdir.sh" "$outdir/btrfs.img" "$outdir/btrfs-mnt" \
@@ -1881,6 +1924,9 @@ main() {
         fi
         if [ -n "${P11SCOPE_TEST_TIME_SCALE:-}" ]; then
             echo "# opt-in: P11SCOPE_TEST_TIME_SCALE=$P11SCOPE_TEST_TIME_SCALE"
+        fi
+        if [ -n "${P11SCOPE_GETTER_STATIC_APP:-}" ]; then
+            echo "# opt-in: P11SCOPE_GETTER_STATIC_APP=$P11SCOPE_GETTER_STATIC_APP"
         fi
     } >"$results"
     grep '^# opt-in: ' "$results" >&2 || true
@@ -1955,8 +2001,12 @@ main() {
             fi
             cell_tmpdir=$btrfs_mnt
         fi
-        if [ "$name" = "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64" ]; then
+        if [ -n "${owned_child_tmp_set[$name]+present}" ]; then
             cell_env+=(CARGO_TARGET_TMPDIR="$target_tmpdir")
+        fi
+        if [ -n "${getter_static_set[$name]+present}" ] \
+            && [ -n "${P11SCOPE_GETTER_STATIC_APP:-}" ]; then
+            cell_env+=(P11SCOPE_GETTER_STATIC_APP="$P11SCOPE_GETTER_STATIC_APP")
         fi
         short=${name##*::}
         log=$logdir/$short.log

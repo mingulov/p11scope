@@ -2363,6 +2363,12 @@
       "path": "attach::tests::attach_over_a_set_switch_refuses_semantic_admits_count_only_lp64",
       "reason": "privileged: attach over a set switch refuses semantic, admits count-only",
       "cell": "privileged"
+    },
+    {
+      "file": "src/attach.rs",
+      "path": "attach::tests::refused_downgrade_commit_disputes_identical_slot_revalidation_lp64",
+      "reason": "privileged: refused downgrade commit disputes identical-slot revalidation",
+      "cell": "privileged"
     }
   ]
 }

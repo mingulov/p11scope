@@ -12695,13 +12695,108 @@ mod tests {
         }
     }
 
+    /// Refused-commit composition: a downgrade whose switch write
+    /// landed but whose read-back failed leaves cell=1 under the
+    /// unchanged semantic retained entry — identical to the plan slot,
+    /// so the identical-entry fast path would hide it from the
+    /// switched-semantic refusal. `downgrade_in_place` therefore
+    /// records every refusal that may leave the switch set, and
+    /// `count_only_switched` unions those disputed indices with zero
+    /// extra cell reads, so revalidation refuses the slot instead of
+    /// attesting it.
+    #[test]
+    fn refused_downgrade_commit_disputes_attested_revalidation() {
+        fn body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+            source
+                .split_once(signature)
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+        }
+        fn contract(source: &str) -> bool {
+            let (Some(downgrade), Some(switched)) = (
+                body(source, "    pub fn downgrade_in_place("),
+                body(source, "    fn count_only_switched("),
+            ) else {
+                return false;
+            };
+            downgrade.contains("disputes_attestation")
+                && downgrade.contains("count_only_disputed")
+                && switched.contains("count_only_disputed")
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "a refused downgrade commit must dispute attested revalidation"
+        );
+        for (signature, marker) in [
+            ("    pub fn downgrade_in_place(", "disputes_attestation"),
+            ("    pub fn downgrade_in_place(", "count_only_disputed"),
+            ("    fn count_only_switched(", "count_only_disputed"),
+        ] {
+            let start = source.find(signature).unwrap();
+            let tail = source[start..].replacen(marker, "REMOVED", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed {marker} after {signature:?}"
+            );
+        }
+    }
+
+    /// Refusal dispute table: exactly the refusals that may leave a
+    /// set switch under the unchanged semantic retained entry dispute
+    /// attestation — an observed set cell, or a commit whose write
+    /// landed but whose read-back failed or disagreed (even a zero
+    /// read-back: BPF may have narrowed calls between the write and
+    /// the read). Every other refusal wrote nothing and observed no
+    /// set cell, so the slot keeps today's path undisputed.
+    #[test]
+    fn in_place_downgrade_refusal_dispute_table() {
+        use super::InPlaceDowngradeRefusal::*;
+        assert!(SwitchAlreadySet.disputes_attestation());
+        assert!(SwitchReadBack("unreadable".to_string()).disputes_attestation());
+        for read in [0, 1, 2] {
+            assert!(
+                SwitchReadBackMismatch(read).disputes_attestation(),
+                "read-back {read} disputes"
+            );
+        }
+        for refusal in [
+            NoRetainedTarget,
+            NewDescriptorNotCountOnly(3),
+            NewSemanticsNotCountOnly,
+            OldDescriptorAlreadyCountOnly,
+            AttachKeyChanged,
+            NoLiveLink,
+            UnsafeDecoderBuild,
+            NoLiveEntryLink,
+            LiveEntryProgramMismatch {
+                expected: "p11_entry",
+            },
+            ResolvedEntryProgramMismatch {
+                resolved: "p11_entry",
+                expected: "p11_entry_journal",
+            },
+            NoSwitchMap,
+            SwitchMapShape("shape".to_string()),
+            SwitchRead("unreadable".to_string()),
+            SwitchWrite("unwritable".to_string()),
+        ] {
+            assert!(
+                !refusal.disputes_attestation(),
+                "{refusal:?} must not dispute"
+            );
+        }
+    }
+
     /// Attach-time narrowing guard: a slot whose count-only switch is
     /// set refuses a semantic attach at that index; count-only
     /// (descriptor 0) stays admitted, so a planner that never
     /// re-raises count-only slots keeps working. An absent map and a
     /// present but wrong-shaped map both stay open (the BPF read
     /// fails open too, so skipping keeps userspace coherent with
-    /// what the probes run); Packet 2 owns that gate.
+    /// what the probes run); Packet 2 owns that gate. The skip arms
+    /// are pinned by the `.and_then` chain itself — comment-only pins
+    /// would still pass with the skip deleted.
     #[test]
     fn attach_refuses_a_set_switch_unless_the_slot_is_count_only() {
         fn body(source: &str) -> Option<&str> {
@@ -12716,8 +12811,7 @@ mod tests {
             };
             text.contains("\"SLOT_COUNT_ONLY\"")
                 && text.contains("count-only switch is set")
-                && text.contains("absent switch map stays open")
-                && text.contains("wrong-shaped switch map stays open")
+                && text.contains(".and_then(|map| Array::try_from(map).ok())")
         }
         let source = include_str!("attach.rs");
         assert!(
@@ -12728,8 +12822,7 @@ mod tests {
         for marker in [
             "\"SLOT_COUNT_ONLY\"",
             "count-only switch is set",
-            "absent switch map stays open",
-            "wrong-shaped switch map stays open",
+            ".and_then(|map| Array::try_from(map).ok())",
         ] {
             let tail = source[start..].replacen(marker, "REMOVED", 1);
             assert!(
@@ -24801,6 +24894,142 @@ mod tests {
             "a set switch admits the count-only attach: failed={failed:?}"
         );
         eprintln!("attach guard: unset admits, set refuses semantic and admits count-only");
+        rig.finish()?;
+        Ok(())
+    }
+
+    /// Refused-commit composition, behavioral: a set switch under an
+    /// unchanged semantic retained entry — exactly what a refused
+    /// downgrade commit leaves behind (the cell write landed, the
+    /// read-back failed, `retained_static` untouched, identical to the
+    /// plan slot) — must dispute attested revalidation instead of
+    /// validating through the identical-entry fast path. The
+    /// white-box cell write stands in for the in-tree write whose
+    /// read-back failed; the retry then refuses `SwitchAlreadySet`
+    /// (the stuck slot can never re-downgrade), and the switched set
+    /// plus the switched-semantic refusal must reject the receipt.
+    #[ignore = "privileged: refused downgrade commit disputes identical-slot revalidation"]
+    #[test]
+    fn refused_downgrade_commit_disputes_identical_slot_revalidation_lp64() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let mut rig = DowngradeTightLoopCell::build()?;
+        let init = rig.provider_init_offset()?;
+        let (pins, plan) = rig.pin_and_plan_semantic(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(rig.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Singles,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.has_slot_link(0));
+        // White-box normalization: the rig plans ownerless slots, but
+        // an attested seal needs one unambiguous authorized owner per
+        // semantic slot. Both the subset plan and the live retained
+        // entry take the same owner, so the identical-entry premise
+        // still holds exactly as the attach produced it.
+        let owner = vec![crate::plan::ModuleId(0)];
+        session
+            .retained_static
+            .get_mut(&0)
+            .context("retained slot 0")?
+            .slot
+            .module_ids = owner.clone();
+        let mut subset_plan = plan.clone();
+        subset_plan.slots[0].module_ids = owner;
+        let original = session
+            .retained_static
+            .get(&0)
+            .context("retained slot 0")?
+            .slot
+            .clone();
+        anyhow::ensure!(original.descriptor_index != 0, "the cell starts semantic");
+        // Seal the live plan over the live pins: the seal-time strict
+        // check proves the live state is coherent before the refusal.
+        let slot = subset_plan.slots[0].clone();
+        let subset = crate::inventory_semantics::AttestedSubset::scripted(
+            subset_plan,
+            pins.clone(),
+            std::collections::BTreeMap::from([(
+                slot.object,
+                std::collections::BTreeSet::from([slot.index]),
+            )]),
+        );
+        let domain = crate::attach::capture::NativeDomainId::mint();
+        let attached = super::seal_attached_subset_with(
+            subset,
+            domain,
+            super::CapturePolicy::Allowlisted,
+            Ok(crate::kinds::DESCRIPTORS.to_vec()),
+            &session.retained_static,
+            &session.current_static_sides(),
+            |id| pins.retain_inventory_target(id).ok(),
+        )
+        .map_err(|reason| anyhow::anyhow!("live seal refused: {reason:?}"))?;
+        let revalidate = |session: &super::Session| {
+            attached.validate_with(
+                domain,
+                super::CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &session.retained_static,
+                &session.current_static_sides(),
+                |id| pins.retain_inventory_target(id).ok(),
+                &session.count_only_switched(&attached),
+            )
+        };
+        anyhow::ensure!(
+            session.count_only_switched(&attached).is_empty(),
+            "no switch is set before the refusal"
+        );
+        anyhow::ensure!(
+            revalidate(&session).is_ok(),
+            "the coherent live state validates before the refusal"
+        );
+        // The refused-commit end state: cell=1, retained entry
+        // identical to the plan slot. The direct map write stands in
+        // for `downgrade_in_place`'s own write whose read-back failed.
+        {
+            let switch = session
+                .ebpf
+                .map_mut("SLOT_COUNT_ONLY")
+                .context("switch map")?;
+            let mut gate = aya::maps::Array::<_, u32>::try_from(switch)?;
+            gate.set(0, 1, 0)?;
+            anyhow::ensure!(gate.get(&0, 0)? == 1, "the white-box set did not stick");
+        }
+        let mut narrowed = original.clone();
+        narrowed.descriptor_index = 0;
+        narrowed.semantics = super::SlotSemantics::COUNT_ONLY;
+        let outcome = session.downgrade_in_place(std::slice::from_ref(&narrowed));
+        anyhow::ensure!(
+            outcome.downgraded.is_empty()
+                && outcome.refused == vec![(0, super::InPlaceDowngradeRefusal::SwitchAlreadySet)],
+            "the retry refuses the set switch: {outcome:?}"
+        );
+        anyhow::ensure!(
+            session
+                .retained_static
+                .get(&0)
+                .is_some_and(|retained| retained.slot == original),
+            "the refused downgrade left retained untouched"
+        );
+        anyhow::ensure!(
+            session.count_only_switched(&attached) == std::collections::BTreeSet::from([0]),
+            "the refused slot reads switched despite its identical entry"
+        );
+        anyhow::ensure!(
+            revalidate(&session).is_err(),
+            "a refused commit disputes attested revalidation"
+        );
+        eprintln!("refused commit: SwitchAlreadySet retry, switched names 0, revalidation refuses");
         rig.finish()?;
         Ok(())
     }

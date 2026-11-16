@@ -327,6 +327,9 @@ attach::instance_tests::privileged_planned_count_only_journal_call_gaps_with_evi
 # In-place downgrade (A′) attach guard: a semantic attach over a set
 # switch refuses by name while a count-only attach stays admitted.
 attach::tests::attach_over_a_set_switch_refuses_semantic_admits_count_only_lp64
+# In-place downgrade (A′) refused commit: a set switch under an
+# unchanged semantic retained entry disputes attested revalidation.
+attach::tests::refused_downgrade_commit_disputes_identical_slot_revalidation_lp64
 # Installed linked control: a real Session sealed over the loaded journal
 # pair drains linked through the live wiring (behavioral seal-to-drain
 # linkage, 6.06). Same owned fixture Session shape as the retirement

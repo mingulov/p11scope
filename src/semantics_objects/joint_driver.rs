@@ -3400,6 +3400,70 @@ mod tests {
     }
 
     #[test]
+    fn joint_resource_void_wiped_destroy_end_refuses_collection() {
+        // Collection seam: a void-wiped destroy END on a clean image is
+        // not derived-absent (the void filter skips state-changing
+        // calls), so the collection refuses — presence here is the
+        // whole rule, with no function gate to fall back on.
+        use crate::semantics_objects::journal::tests::{
+            COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes, function_id,
+        };
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_DESTROY;
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0xf1a0);
+        let retained = producers(&events);
+        let mut begin = begin_bytes(1, 1, function_id("C_DestroyObject"), 0);
+        begin[88..96].copy_from_slice(&0x9090_9090_9090_9090u64.to_le_bytes());
+        begin[126] = 1;
+        let end = end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 100);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec()], 1),
+            events.clone(),
+        );
+        let start = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        let reservation = start.invocations[0].reservation;
+        assert_eq!(
+            adapter.ingest_any_from_raw(start.ordered[0], Some(reservation), false),
+            super::super::JournalDisposition::BeginAdmitted
+        );
+        drop(start);
+        adapter.ledger.release_raw(&reservation);
+        adapter.void_staged();
+        assert!(
+            !adapter.image_refused((COOKIE, EXEC)),
+            "precondition: the wiped image stays untainted"
+        );
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([end.to_vec()], 1), events);
+        let terminal = RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            4,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(
+            terminal.resource_refused,
+            "a void-wiped destroy END must refuse the collection"
+        );
+    }
+
+    #[test]
     fn joint_resource_foreign_session_events_and_ledger_refuse_before_mutation() {
         use crate::semantics_objects::journal::tests::{
             ENTRY_NS, begin_bytes, end_bytes_absent, function_id,

@@ -2278,7 +2278,16 @@ impl JournalAdapter {
                 // without promoting, so exit-churn terminals never
                 // revoke a shed-taint's lift. Without an excuse the
                 // terminal is new evidence and promotes (duplicates,
-                // foreign terminals).
+                // foreign terminals). Excusing a dropped
+                // state-changing terminal here stays safe: a
+                // shed-taint lands only on images without journal
+                // keys, birth and attestation refuse tainted images,
+                // tainted BEGINs refuse, and the taint already
+                // dropped every open and refused entry — the excused
+                // terminal can neither prove a key nor open new
+                // staging, and records ingest in ordinal order past
+                // the taint. The lift purge still removes its
+                // absence before the image goes clean.
                 if self.take_derived_absence(image, key).is_some() {
                     self.contradictions.note(TaintCause::Contradiction(
                         JournalContradiction::TerminalBeforeBegin,
@@ -2305,7 +2314,12 @@ impl JournalAdapter {
             // (Ok, Partial and plain Failed alone); the END passed
             // wire validation, so malformed reads false exactly as
             // there. The excuse is consumed either way: a second
-            // terminal for one key still promotes.
+            // terminal for one key still promotes. The function check
+            // below duplicates the record-time void filter and the lift
+            // purge as a second layer: even a wrongly recorded
+            // non-neutral absence is still rejected here. ABANDON has
+            // no such layer (it consumes blindly), so its safety rests
+            // on the filter and purge alone.
             let excused = self
                 .take_derived_absence(image, key)
                 .is_some_and(|function| {
@@ -15546,6 +15560,112 @@ pub(crate) mod tests {
         assert!(
             scene.adapter.image_refused((COOKIE, EXEC)),
             "a lifted-image destroy terminal still taints"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_wiped_destroy_abandon_still_taints() {
+        // ABANDON half of the void-wipe destroy twin: abandons carry no
+        // return, so the arrival consumes the excuse unchecked — only
+        // the record-time void filter keeps a void-wiped destroy from
+        // being excused. The return-probe reason is deliberate: the
+        // call ran, so its state change outlived the wipe.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let destroy = function_id("C_DestroyObject");
+        let mut begin = begin_bytes(1, 1, destroy, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&abandon),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped destroy abandon still taints"
+        );
+    }
+
+    #[test]
+    fn object_journal_lifted_dropped_destroy_abandon_still_taints() {
+        // ABANDON half of the lifted-image destroy twin: the taint drop
+        // records every open regardless of function, so only the lift
+        // purge keeps a dropped destroy from riding the lift — the
+        // abandon arrival consumes blindly, with no END-style gate.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let destroy = function_id("C_DestroyObject");
+        let mut begin = begin_bytes(1, 1, destroy, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "precondition: the shed-taint lifts"
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&abandon),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a lifted dropped-destroy abandon still taints"
+        );
+    }
+
+    #[test]
+    fn object_journal_lifted_refused_destroy_terminals_still_taint() {
+        // A destroy BEGIN refused while tainted records its key
+        // expected-absent, so only the lift purge removes it. The END
+        // leg would still taint through the arrival gate alone; the
+        // ABANDON leg (fresh scene, since the END leg taints its
+        // image) is the purge pin — without the purge the abandon is
+        // excused and the image stays clean.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_DESTROY;
+        let destroy = function_id("C_DestroyObject");
+        let mut begin = begin_bytes(1, 1, destroy, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        assert_eq!(scene.ingest(&begin), JournalDisposition::Refused);
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "precondition: the shed-taint lifts"
+        );
+        let end = end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a lifted refused-destroy END still taints"
+        );
+        let mut scene = Scene::new(image_default());
+        assert!(scene.adapter.refuse_other_caller_image((COOKIE, EXEC)));
+        assert_eq!(scene.ingest(&begin), JournalDisposition::Refused);
+        scene.adapter.untaint_shed_image((COOKIE, EXEC));
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "precondition: the shed-taint lifts"
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&abandon),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "a lifted refused-destroy abandon still taints"
         );
     }
 

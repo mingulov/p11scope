@@ -75,12 +75,14 @@ struct WorkerGroundTruth {
 ///   count, no overcount above the ledger);
 /// * at least one worker is fully observed (the positive: learning
 ///   attached something);
-/// * misses form a run prefix with at most one boundary partial
-///   (any hole or late partial is a post-attach loss);
-/// * every missed call sits inside the module's disclosed
-///   `mapped_unattached` table window (fully-missed bursts end
-///   before it closes; the boundary partial starts before it
-///   closes);
+/// * zeros form a run prefix with at most one partial immediately
+///   after them (any hole, late partial or zero after a partial is
+///   a post-attach loss);
+/// * every miss is disclosed per worker: a fully-missed burst is
+///   contained in one disclosed `mapped_unattached` table window or
+///   ends before its own endpoint's first attach began; the
+///   boundary partial starts inside one such window or straddles
+///   its own endpoint's first attach;
 /// * no BPF event loss is on the record (counts would be lower
 ///   bounds, not exact);
 /// * no mechanism is decoded from the learned tables and
@@ -137,8 +139,11 @@ fn check_exact_accounting(
             && want.get("dev") == row_module.get("dev")
     };
     // Per-worker observed counts, each from exactly the provider's
-    // own row (absent = the slot never attached = zero observed).
+    // own row (absent = the slot never attached = zero observed),
+    // plus each present row's probed endpoint for the per-endpoint
+    // miss disclosure below.
     let mut observed: Vec<u64> = Vec::with_capacity(workers.len());
+    let mut endpoints: Vec<Option<u64>> = Vec::with_capacity(workers.len());
     for worker in workers {
         let rows: Vec<&serde_json::Value> = functions
             .iter()
@@ -185,6 +190,11 @@ fn check_exact_accounting(
             worker.calls,
         );
         observed.push(calls);
+        endpoints.push(rows.first().and_then(|row| {
+            row.get("target")
+                .and_then(|target| target.get("file_offset"))
+                .and_then(serde_json::Value::as_u64)
+        }));
     }
     let full = workers.iter().filter(|worker| {
         observed
@@ -197,21 +207,27 @@ fn check_exact_accounting(
     );
     // Miss shape: zeros form a run prefix, at most one partial sits
     // immediately after them, the rest is fully observed. Anything
-    // else is a mid-capture (post-attach) loss.
+    // else is a mid-capture (post-attach) loss: a zero is honest
+    // only before every observed worker, partial or full.
     let mut partials = 0usize;
     let mut first_full: Option<usize> = None;
-    let mut seen_partial_after_full = false;
+    let mut first_partial: Option<usize> = None;
     for (index, worker) in workers.iter().enumerate() {
         let calls = observed[index];
         if calls == worker.calls {
             first_full.get_or_insert(index);
         } else if calls == 0 {
             ensure!(
-                first_full.is_none(),
-                "worker {index} ({}) missed after worker {} was fully observed: \
+                first_full.is_none() && first_partial.is_none(),
+                "worker {index} ({}) missed after worker {} was {}: \
                  a mid-capture loss, never a pre-first-attach window",
                 worker.name,
-                first_full.unwrap_or(0),
+                first_full.or(first_partial).unwrap_or(0),
+                if first_full.is_some() {
+                    "fully observed"
+                } else {
+                    "partially observed"
+                },
             );
         } else {
             partials += 1;
@@ -219,23 +235,26 @@ fn check_exact_accounting(
                 partials <= 1,
                 "workers partially observed twice: a mid-capture loss, never one attach boundary"
             );
-            if first_full.is_some() {
-                seen_partial_after_full = true;
-            }
+            ensure!(
+                first_full.is_none(),
+                "a partial worker follows a fully observed one: a mid-capture loss, never the attach boundary"
+            );
+            first_partial.get_or_insert(index);
         }
     }
-    ensure!(
-        !seen_partial_after_full,
-        "a partial worker follows a fully observed one: a mid-capture loss, never the attach boundary"
-    );
-    // Every miss sits inside the disclosed table window: the
-    // module's `mapped_unattached` window covers its undeclared
-    // (table) endpoints up to their max attach instant.
+    // Every miss is disclosed per worker, never against the latest
+    // window end: a fully-missed burst is contained in one disclosed
+    // `mapped_unattached` table window, or it ends before its own
+    // endpoint's first attach began (no call entered before
+    // `began_ns` can be counted); the boundary partial starts inside
+    // one such window, or its own endpoint's first attach began
+    // mid-burst. A burst in a hole between two windows, or past its
+    // endpoint's attach, is an undisclosed mid-capture loss.
     let windows = module
         .get("unobserved_windows")
         .and_then(serde_json::Value::as_array)
         .context("the provider record discloses no unobserved windows")?;
-    let window_end = windows
+    let table_windows: Vec<(u64, u64)> = windows
         .iter()
         .filter(|window| {
             window
@@ -243,26 +262,79 @@ fn check_exact_accounting(
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|reason| reason == "mapped_unattached")
         })
-        .filter_map(|window| window.get("end_ns").and_then(serde_json::Value::as_u64))
-        .max()
-        .context("the provider record discloses no mapped_unattached table window")?;
+        .filter_map(|window| {
+            Some((
+                window.get("start_ns").and_then(serde_json::Value::as_u64)?,
+                window.get("end_ns").and_then(serde_json::Value::as_u64)?,
+            ))
+        })
+        .collect();
+    ensure!(
+        !table_windows.is_empty(),
+        "the provider record discloses no mapped_unattached table window"
+    );
+    // Each endpoint's first attach by file offset: `began_ns` is
+    // `None` when no clock could be read, and then the endpoint
+    // discloses nothing.
+    let attach_points: Vec<(u64, Option<u64>)> = module
+        .get("first_attach_points")
+        .and_then(serde_json::Value::as_array)
+        .map(|points| {
+            points
+                .iter()
+                .filter_map(|point| {
+                    Some((
+                        point
+                            .get("file_offset")
+                            .and_then(serde_json::Value::as_u64)?,
+                        point.get("began_ns").and_then(serde_json::Value::as_u64),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let attach_began = |endpoint: Option<u64>| -> Option<u64> {
+        let endpoint = endpoint?;
+        attach_points
+            .iter()
+            .find(|(offset, _)| *offset == endpoint)
+            .and_then(|(_, began)| *began)
+    };
     for (index, worker) in workers.iter().enumerate() {
         let calls = observed[index];
+        if calls == worker.calls {
+            continue;
+        }
+        let began = attach_began(endpoints[index]);
         if calls == 0 {
+            let contained = table_windows
+                .iter()
+                .any(|(start, end)| *start <= worker.burst_start_ns && worker.burst_end_ns <= *end);
+            let pre_attach = began.is_some_and(|began| worker.burst_end_ns <= began);
             ensure!(
-                worker.burst_end_ns < window_end,
-                "worker {index} ({}) missed with its burst ending at {}ns, after the disclosed \
-                 table window closed at {window_end}ns: an undisclosed mid-capture loss",
-                worker.name,
-                worker.burst_end_ns,
-            );
-        } else if calls < worker.calls {
-            ensure!(
-                worker.burst_start_ns < window_end,
-                "worker {index} ({}) partially observed with its burst starting at {}ns, after the \
-                 disclosed table window closed at {window_end}ns: an undisclosed mid-capture loss",
+                contained || pre_attach,
+                "worker {index} ({}) missed with its burst [{}ns, {}ns]: inside no single \
+                 disclosed mapped_unattached table window ({table_windows:?}) and not before \
+                 its own endpoint's first attach ({began:?}): an undisclosed mid-capture loss",
                 worker.name,
                 worker.burst_start_ns,
+                worker.burst_end_ns,
+            );
+        } else {
+            let start_covered = table_windows.iter().any(|(start, end)| {
+                *start <= worker.burst_start_ns && worker.burst_start_ns < *end
+            });
+            let attach_in_burst = began
+                .is_some_and(|began| worker.burst_start_ns < began && began < worker.burst_end_ns);
+            ensure!(
+                start_covered || attach_in_burst,
+                "worker {index} ({}) partially observed with its burst [{}ns, {}ns]: starting \
+                 inside no disclosed mapped_unattached table window ({table_windows:?}) and \
+                 straddling no endpoint first attach of its own ({began:?}): an undisclosed \
+                 mid-capture loss",
+                worker.name,
+                worker.burst_start_ns,
+                worker.burst_end_ns,
             );
         }
     }

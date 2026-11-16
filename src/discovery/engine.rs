@@ -18593,22 +18593,39 @@ impl Engine {
             // A kept slot that shares an attach group with retired ones (a
             // getter slot a scanned table of the same object also holds)
             // cannot detach alone without a group rebuild, and the ended
-            // original can run none of them: the whole proof retires, and
-            // the kept slots are deactivated with it.
+            // original can run none of them: the retired slots' whole
+            // groups retire, and only those kept group mates are
+            // deactivated with them. A kept slot in no retiring group stays.
             Some(ended) if !ended.proof.covers_exactly(&selected) => {
                 match session.prepare_ended_pid_retirement(&ended.owner, &selected) {
                     Some(narrowed) => {
                         session.detach_ended_pid_slots(&selected, &ended.owner, &narrowed)
                     }
-                    None => {
-                        let linked = ended.proof.slots();
-                        ended_kept = linked
-                            .iter()
-                            .map(|slot| slot.index)
-                            .filter(|index| !selected.iter().any(|slot| slot.index == *index))
-                            .collect();
-                        session.detach_ended_pid_slots(&linked, &ended.owner, &ended.proof)
-                    }
+                    None => match ended.proof.group_closure(&selected) {
+                        Some(linked) => {
+                            ended_kept = linked
+                                .iter()
+                                .map(|slot| slot.index)
+                                .filter(|index| !selected.iter().any(|slot| slot.index == *index))
+                                .collect();
+                            match session.prepare_ended_pid_retirement(&ended.owner, &linked) {
+                                Some(closed) => {
+                                    session.detach_ended_pid_slots(&linked, &ended.owner, &closed)
+                                }
+                                None => session.detach_ended_pid_slots(
+                                    &linked,
+                                    &ended.owner,
+                                    &ended.proof,
+                                ),
+                            }
+                        }
+                        // Nothing retires (a pre-arm watch keeps every
+                        // slot), or a selected slot is outside the proof:
+                        // the kept slots stay linked and active.
+                        None => {
+                            session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof)
+                        }
+                    },
                 }
             }
             Some(ended) => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),

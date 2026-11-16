@@ -97,10 +97,44 @@ impl EndedPidRetirement {
                 .eq(self.pairs.keys().copied())
     }
 
-    /// The slots this proof names, as they were linked when the original
-    /// owner ended.
-    pub(crate) fn slots(&self) -> Vec<Slot> {
-        self.pairs.values().map(|pair| pair.slot.clone()).collect()
+    /// The proof's slots that share an entry or return registration with
+    /// `selected`, transitively: the whole attach groups a detach of
+    /// `selected` disturbs, as they were linked when the original owner
+    /// ended. `None` when `selected` is empty or names a slot outside the
+    /// proof, so nothing beyond the selection is ever retired.
+    pub(crate) fn group_closure(&self, selected: &[Slot]) -> Option<Vec<Slot>> {
+        if selected.is_empty() {
+            return None;
+        }
+        let mut closed: BTreeSet<u32> = BTreeSet::new();
+        for slot in selected {
+            self.pairs.get(&slot.index)?;
+            closed.insert(slot.index);
+        }
+        loop {
+            let grown: Vec<u32> = self
+                .pairs
+                .iter()
+                .filter(|(index, _)| !closed.contains(index))
+                .filter(|(_, pair)| {
+                    closed.iter().any(|member| {
+                        let member = &self.pairs[member];
+                        member.entry == pair.entry || member.return_ == pair.return_
+                    })
+                })
+                .map(|(index, _)| *index)
+                .collect();
+            if grown.is_empty() {
+                break;
+            }
+            closed.extend(grown);
+        }
+        Some(
+            closed
+                .iter()
+                .map(|index| self.pairs[index].slot.clone())
+                .collect(),
+        )
     }
 
     pub(super) fn prepare(

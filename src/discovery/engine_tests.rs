@@ -34058,6 +34058,76 @@ fn an_ended_pid_retirement_keeping_a_grouped_slot_deactivates_it() {
     assert_eq!(session.physical_gap_summary().episodes, 0);
 }
 
+/// Twin: an ended original whose candidate retires nothing (a pre-arm
+/// watch keeps every grouped slot) detaches nothing and keeps every slot
+/// active, so the watch's declared keys keep their attach stamps for
+/// evidence assembly.
+#[test]
+fn an_ended_pid_retirement_retiring_nothing_keeps_every_grouped_slot() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .group_all();
+    let slots = engine.plan.slots.clone();
+    assert!(slots.len() >= 2, "the route needs grouped slots");
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let owner = engine.views.remove(0);
+    let proof = session
+        .prepare_ended_pid_retirement(&owner, &slots)
+        .unwrap();
+    assert!(
+        proof.group_closure(&[]).is_none(),
+        "an empty selection closes over nothing"
+    );
+    let ended = PendingEndedPidRetirement { owner, proof };
+    let candidate = LiveCandidate {
+        pinned: std::mem::replace(&mut engine.pinned, PinnedObjects::empty()),
+        modules: Vec::new(),
+        plan: engine.plan.clone(),
+        delta: plan::AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: Vec::new(),
+        },
+        views: BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    };
+    let outcome = engine
+        .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
+        .unwrap();
+    assert!(!outcome.detach_failed);
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        slots.len(),
+        "no kept slot is deactivated when nothing retires"
+    );
+    assert!(
+        !session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .is_empty(),
+        "the group stays linked"
+    );
+    assert_eq!(session.physical_gap_summary().episodes, 0);
+}
+
 /// A view whose manifest getter work a closed or spent pass skipped is
 /// requested again even with no loader context (a static program's owner
 /// is view-owned); a settled view is not.
@@ -61297,8 +61367,8 @@ fn automatic_exec_named_pid_end_receipt_follows_the_attached_target_only() {
         assert_eq!(proof.is_some(), change == "metadata", "{change}");
         if let Some(proof) = proof {
             assert_eq!(
-                proof.slots(),
-                slots,
+                proof.group_closure(&slots),
+                Some(slots.clone()),
                 "the proof names the slots as attached"
             );
         }

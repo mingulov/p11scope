@@ -611,6 +611,19 @@ const COLLECTED_INPUT_BYTES: usize = 64 * 1024;
 const COLLECTED_POOL_BYTES: usize = SEMANTIC_TRANSITION_SCRATCH + 2 * 1024 * 1024;
 const COLLECTED_CREDITS: usize = 8192;
 
+/// Lets the cleanup worker thread run between one-credit polls that still
+/// wait on it: after a short burst of immediate polls, each further poll
+/// sleeps 1 ms. Spinning every credit back to back can exhaust them on a
+/// loaded host before the worker is ever scheduled, which is starvation
+/// of the test thread, not a retirement result. The credit bound stays.
+fn yield_to_worker(poll: usize) {
+    if poll >= 256 {
+        std::thread::sleep(Duration::from_millis(1));
+    } else {
+        std::thread::yield_now();
+    }
+}
+
 fn collected_case(
     count: usize,
     closer: super::fixture::Closer,
@@ -650,11 +663,11 @@ fn collected_prepare_to_ticket(
     input: &mut Option<RetainedRetirementInput>,
     reserve: &SemanticResourceReserver,
 ) -> anyhow::Result<CollectedRetirementTicket> {
-    for _ in 0..COLLECTED_CREDITS {
+    for poll in 0..COLLECTED_CREDITS {
         let progress = native.prepare(q, input, reserve, 1)?;
         assert_eq!(progress.used, 1);
         match progress.state {
-            CollectedRetirementState::Preparing => {}
+            CollectedRetirementState::Preparing => yield_to_worker(poll),
             CollectedRetirementState::Prepared(ticket) => return Ok(ticket),
             CollectedRetirementState::RefusedUntouched(original) => {
                 assert!(input.is_none());
@@ -672,11 +685,11 @@ fn collected_submit(
     q: &super::super::CollectedFinishQ,
     ticket: &CollectedRetirementTicket,
 ) {
-    for _ in 0..COLLECTED_CREDITS {
+    for poll in 0..COLLECTED_CREDITS {
         let progress = native.begin(q, ticket, 1).unwrap();
         assert_eq!(progress.used, 1);
         match progress.state {
-            CollectedRetirementState::Transferring => {}
+            CollectedRetirementState::Transferring => yield_to_worker(poll),
             CollectedRetirementState::Pending => return,
             _ => panic!("healthy original ownership did not reach its own worker"),
         }

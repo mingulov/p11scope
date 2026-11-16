@@ -3735,7 +3735,10 @@ impl CaptureFacts {
             // arrival order. Among lowerings the largest lowered count the
             // capture saw is kept, like every omission above.
             if refused_kind == plan::RefusalKind::CapacityLowering {
-                let known = history.lowerings.entry(id).or_insert_with(|| refused.clone());
+                let known = history
+                    .lowerings
+                    .entry(id)
+                    .or_insert_with(|| refused.clone());
                 let larger = matches!(
                     (
                         plan::capacity_lowered_count(&known.reason),

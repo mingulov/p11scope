@@ -4679,8 +4679,7 @@ fn capacity_lowering_and_growth_omission_keep_separate_high_water_marks() {
     assert_eq!(plan_lower.retired_slots().len(), 68);
     let remembered = plan_lower.retired_keys().clone();
     plan_lower.set_revivable(remembered);
-    let rebuilt =
-        plan_lower.rebuild_from_sources(&[filler.clone(), a_sem.clone()], &[], &empty);
+    let rebuilt = plan_lower.rebuild_from_sources(&[filler.clone(), a_sem.clone()], &[], &empty);
     plan_lower.extend_exact(rebuilt).unwrap();
     let lower_records: Vec<_> = plan_lower.refused_modules_typed().collect();
     assert_eq!(lower_records.len(), 1, "{lower_records:?}");
@@ -4758,11 +4757,15 @@ fn capacity_lowering_and_growth_omission_keep_separate_high_water_marks() {
             "{label}: both gaps are counted: {reasons:?}"
         );
         assert!(
-            reasons.iter().any(|reason| plan::is_growth_omission(reason)),
+            reasons
+                .iter()
+                .any(|reason| plan::is_growth_omission(reason)),
             "{label}: the omission survives: {reasons:?}"
         );
         assert!(
-            reasons.iter().any(|reason| plan::is_capacity_lowering(reason)),
+            reasons
+                .iter()
+                .any(|reason| plan::is_capacity_lowering(reason)),
             "{label}: the lowering survives: {reasons:?}"
         );
         let kinds: Vec<plan::RefusalKind> = facts
@@ -4841,8 +4844,7 @@ fn revival_refresh_clears_detached_finalized_slots_after_two_observations() {
 /// count-only seed beside it pins the unchanged shape.
 #[test]
 fn withheld_semantic_cell_revival_keeps_its_semantic_shape() {
-    let (descriptor, ambiguous) =
-        crate::kinds::descriptor_index(&["C_Sign".to_string()]);
+    let (descriptor, ambiguous) = crate::kinds::descriptor_index(&["C_Sign".to_string()]);
     assert!(
         !ambiguous && descriptor != 0,
         "the twin needs a semantic descriptor"

@@ -4823,9 +4823,7 @@ impl AttachPlan {
                 .slots
                 .get(position)
                 .map(|slot| AggregateOwner::from_module_ids(&slot.module_ids));
-            if let (Some(owner), Some(current)) =
-                (owner, self.aggregate_owners.get_mut(position))
-            {
+            if let (Some(owner), Some(current)) = (owner, self.aggregate_owners.get_mut(position)) {
                 *current = owner;
             }
         }
@@ -23790,20 +23788,25 @@ pub(crate) mod tests {
         assert_eq!(plan.slots.len(), 2012, "100 lifetime slots free");
         let provider = provider_with_tables(60, "/opt/p.so", 1, 60, true);
         let mut forwarding = provider_with_tables(61, "/opt/f.so", 2, 50, true);
-        let targets: Vec<(&'static str, u32, u64)> = (0..60u64)
-            .map(|index| ("C_Sign", 60, index * 8))
-            .collect();
+        let targets: Vec<(&'static str, u32, u64)> =
+            (0..60u64).map(|index| ("C_Sign", 60, index * 8)).collect();
         replace_table_targets(&mut forwarding, 1, &targets);
         // Fresh snapshot: 110 slots fit on their own; only the lifetime
         // prior makes the 110-addition extension overflow by 10.
         let rebuilt = scoped_plan(&[provider, forwarding], AdmissionScope::Named);
         assert_eq!(rebuilt.slots.len(), 110);
         assert!(
-            rebuilt.slots.iter().filter(|slot| slot.module_ids.len() == 2).count() == 60,
+            rebuilt
+                .slots
+                .iter()
+                .filter(|slot| slot.module_ids.len() == 2)
+                .count()
+                == 60,
             "the provider cells are shared with the forwarder"
         );
-        plan.extend_exact(rebuilt)
-            .unwrap_or_else(|error| panic!("the surviving provider must admit, not abort: {error}"));
+        plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+            panic!("the surviving provider must admit, not abort: {error}")
+        });
         let refused = refusal_of(&plan, "/opt/f.so").expect("F is a counted refusal");
         let kinds: Vec<RefusalKind> = plan
             .refused_modules_typed()
@@ -23828,7 +23831,11 @@ pub(crate) mod tests {
             .find(|module| module.object == PinnedObjectId(60))
             .expect("the surviving provider stays admitted")
             .id;
-        for slot in plan.slots.iter().filter(|slot| slot.object == PinnedObjectId(60)) {
+        for slot in plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == PinnedObjectId(60))
+        {
             assert_eq!(
                 slot.module_ids,
                 [module],
@@ -24024,7 +24031,10 @@ pub(crate) mod tests {
     fn ambiguous_count_only_reclaim_marks_semantic_ambiguity() {
         let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
         let mut plan = scoped_plan(
-            &[filler.clone(), count_only_copy(&sole_complete_module(), false)],
+            &[
+                filler.clone(),
+                count_only_copy(&sole_complete_module(), false),
+            ],
             AdmissionScope::Shared,
         );
         assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
@@ -24037,10 +24047,8 @@ pub(crate) mod tests {
         let mut returning = count_only_copy(&sole_complete_module(), false);
         returning.object = PinnedObjectId(90);
         returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
-        let identities = BTreeMap::from([(
-            PinnedObjectId(90),
-            test_identity(42, "sha-amb-count-only"),
-        )]);
+        let identities =
+            BTreeMap::from([(PinnedObjectId(90), test_identity(42, "sha-amb-count-only"))]);
         let mut rebuilt =
             plan.rebuild_from_sources_with_identities(&[filler, returning], &[], &identities);
         assert_eq!(rebuilt.reclaimed.len(), 68);
@@ -24086,8 +24094,7 @@ pub(crate) mod tests {
     /// key's other-shape generation elsewhere stays revivable.
     #[test]
     fn forget_retired_key_keeps_the_key_s_other_generation() {
-        let (descriptor, ambiguous) =
-            crate::kinds::descriptor_index(&["C_Sign".to_string()]);
+        let (descriptor, ambiguous) = crate::kinds::descriptor_index(&["C_Sign".to_string()]);
         assert!(
             !ambiguous && descriptor != 0,
             "the twin needs a semantic descriptor"
@@ -24160,11 +24167,8 @@ pub(crate) mod tests {
         plan.revivable.clone_from(&plan.retired_keys);
         let returning = count_only_copy(&worker(101), false);
         let identities = BTreeMap::from([(PinnedObjectId(101), identity.clone())]);
-        let rebuilt = plan.rebuild_from_sources_with_identities(
-            &[filler, returning],
-            &[],
-            &identities,
-        );
+        let rebuilt =
+            plan.rebuild_from_sources_with_identities(&[filler, returning], &[], &identities);
         assert_eq!(
             rebuilt.reclaimed.len(),
             68,

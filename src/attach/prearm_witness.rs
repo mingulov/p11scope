@@ -560,12 +560,26 @@ impl<B: FinalizeBackend> StartupWitness<B> {
                 }
             })
             .collect();
-        Some(WitnessVerdict {
+        let verdict = WitnessVerdict {
             active_ns: self.active_ns,
             scope_start_ns: self.scope_start_ns,
             walk_started_ns,
             slots,
-        })
+        };
+        // Diagnostics twin of the start-time "witness unavailable" line:
+        // names each watched file's finalize verdict (by fd identity, as
+        // the evidence JSON renders it), so an operator can tell a voided
+        // witness (Keep) from a later proof-condition failure (Clear with
+        // a window still emitted). Diagnostics-gated; tests stay silent.
+        if crate::run::capture_diagnostics_on() {
+            for slot in &verdict.slots {
+                eprintln!(
+                    "p11scope: pre-arm witness: watched file (dev {} ino {}): {:?}",
+                    slot.fd_dev, slot.fd_ino, slot.verdict
+                );
+            }
+        }
+        Some(verdict)
     }
 }
 
@@ -1199,6 +1213,17 @@ impl FinalizeBackend for LiveBackend {
         }
         Ok(self.read_state()?.busy == 0)
     }
+    fn settle_balanced(&mut self, max_flips: u32) -> Result<bool, String> {
+        Ok(settle_balance_with(
+            || {
+                self.read_state()
+                    .ok()
+                    .map(|state| (state.busy, state.pending_in, state.pending_out))
+            },
+            max_flips,
+            || std::thread::sleep(std::time::Duration::from_millis(1)),
+        ))
+    }
     fn release(&mut self) -> Result<(), String> {
         self.links.clear();
         Ok(())
@@ -1348,17 +1373,51 @@ pub(crate) trait FinalizeBackend {
     fn deactivate(&mut self) -> Result<(), Self::Error>;
     /// Poll busy until 0; returns true if quiesced within `max_flips` reads.
     fn settle_busy(&mut self, max_flips: u32) -> Result<bool, Self::Error>;
+    /// Poll departure balance (idle and `pending_in == pending_out`);
+    /// returns true if observed within `max_flips` reads. Best-effort:
+    /// finalize proceeds either way and the close-time check decides.
+    fn settle_balanced(&mut self, max_flips: u32) -> Result<bool, Self::Error>;
     /// Release hooks and close the object.
     fn release(&mut self) -> Result<(), Self::Error>;
     /// Verifier recursion misses for one program (0 when healthy).
     fn recursion_misses(&mut self, program: &str) -> Result<u64, Self::Error>;
 }
 
-/// Finalize: one walk, deactivate, settle, read, release. Returns
-/// per-slot verdicts; any failure keeps windows with its §8 group 3-5
-/// reason. Ordering (walk vs attach) is the engine builder's: only
-/// `finish_prearm_capture` knows each object's exact attach stamp.
-/// Checks run in close order; the first failure wins for every slot.
+/// Balance-drain deadline: 1 s as poll flips, mirroring
+/// [`QUIESCE_MAX_FLIPS`]. Each flip is one 1 ms sleep plus a state read.
+/// Entries still uncompleted after the drain are pinned or leaked-alive,
+/// never slow: measured stuck entries persist past 7 s, so a longer
+/// bound only delays the sound Pending verdict.
+pub(crate) const BALANCE_MAX_FLIPS: u32 = 1000;
+
+/// Poll departure balance through `read` (which reports
+/// `(busy, pending_in, pending_out)` or `None` when the state could
+/// not be read): true once an idle balanced read is observed, false
+/// after `max_flips` misses. A missed read sleeps once, including the
+/// last one; zero flips never read and report false. Read gaps are
+/// misses, never errors: the close-time read still decides.
+pub(crate) fn settle_balance_with(
+    mut read: impl FnMut() -> Option<(u64, u64, u64)>,
+    max_flips: u32,
+    mut sleep: impl FnMut(),
+) -> bool {
+    for _ in 0..max_flips {
+        if read()
+            .is_some_and(|(busy, pending_in, pending_out)| busy == 0 && pending_in == pending_out)
+        {
+            return true;
+        }
+        sleep();
+    }
+    false
+}
+
+/// Finalize: one walk, deactivate, balance drain, settle, read,
+/// release. Returns per-slot verdicts; any failure keeps windows with
+/// its §8 group 3-5 reason. Ordering (walk vs attach) is the engine
+/// builder's: only `finish_prearm_capture` knows each object's exact
+/// attach stamp. Checks run in close order; the first failure wins for
+/// every slot.
 ///
 /// The walk runs exactly once: an abandoned walk emits no END, so a
 /// second walk could never satisfy `walk_end == 1` (§8 group 3).
@@ -1374,6 +1433,17 @@ pub(crate) fn finalize_with<B: FinalizeBackend>(
     // release). A failed deactivate still drains the close, but the
     // state read is then untrusted: the hooks may have stayed live.
     let deactivated = backend.deactivate().is_ok();
+    // Balance drain (busy-host churn): the deactivate above froze new
+    // departures (their hook stays gated), while torn-completions are
+    // ungated by design, so lagged completions keep landing through
+    // this settle instead of freezing as PENDING. Best-effort and
+    // verdict-neutral: a timeout (a genuinely pinned teardown) proceeds
+    // exactly as today, and the close-time Pending check below still
+    // decides. Skipped when the walk already failed or the deactivate
+    // did, so a doomed close fails fast.
+    if walk_ok && deactivated {
+        let _ = backend.settle_balanced(BALANCE_MAX_FLIPS);
+    }
     let settled = backend.settle_busy(QUIESCE_MAX_FLIPS).unwrap_or(false);
     // Single close-time read (§4.6 step 4): pending is frozen after
     // deactivate + settle, so re-reading cannot observe a change.
@@ -3210,8 +3280,10 @@ mod tests {
         walks: Vec<super::WalkOutcome>,
         state: super::PwState,
         busy_settles: bool,
+        balanced: bool,
         misses: u64,
         settle_max: Option<u32>,
+        balance_max: Option<u32>,
         // Scripted close-error inputs (None takes the Ok path).
         misses_err: Option<String>,
         deactivate_err: Option<String>,
@@ -3231,8 +3303,10 @@ mod tests {
                 walks: vec![super::WalkOutcome::Done],
                 state,
                 busy_settles: true,
+                balanced: true,
                 misses: 0,
                 settle_max: None,
+                balance_max: None,
                 misses_err: None,
                 deactivate_err: None,
                 read_err: None,
@@ -3264,6 +3338,11 @@ mod tests {
             self.ops.push("settle".into());
             self.settle_max = Some(max);
             Ok(self.busy_settles)
+        }
+        fn settle_balanced(&mut self, max: u32) -> Result<bool, String> {
+            self.ops.push("balance".into());
+            self.balance_max = Some(max);
+            Ok(self.balanced)
         }
         fn release(&mut self) -> Result<(), String> {
             self.ops.push("release".into());
@@ -3365,6 +3444,175 @@ mod tests {
             Some(1000),
             "quiesce deadline flips: {:?}",
             backend.settle_max
+        );
+    }
+
+    /// Scripted balance reads: each entry is one `read()` outcome, in
+    /// order; once the script runs out it repeats its last entry, so a
+    /// timeout test never runs dry.
+    struct BalanceScript {
+        reads: Vec<Option<(u64, u64, u64)>>,
+        read_count: usize,
+        sleep_count: usize,
+    }
+
+    impl BalanceScript {
+        fn run(&mut self, max_flips: u32) -> bool {
+            let mut script = std::mem::take(&mut self.reads);
+            let mut last = script.last().copied().unwrap_or(None);
+            let result = super::settle_balance_with(
+                || {
+                    self.read_count += 1;
+                    if !script.is_empty() {
+                        last = script.remove(0);
+                    }
+                    last
+                },
+                max_flips,
+                || self.sleep_count += 1,
+            );
+            self.reads = script;
+            result
+        }
+    }
+
+    #[test]
+    fn settle_balance_with_balances_fast() {
+        // Two lagged completions, then an idle balanced read: true after
+        // exactly three reads and two sleeps (no trailing sleep on success).
+        let mut script = BalanceScript {
+            reads: vec![Some((0, 2, 1)), Some((0, 3, 2)), Some((0, 3, 3))],
+            read_count: 0,
+            sleep_count: 0,
+        };
+        assert!(script.run(1000), "lagged completions settle");
+        assert_eq!(script.read_count, 3, "reads to balance");
+        assert_eq!(script.sleep_count, 2, "sleeps to balance");
+    }
+
+    #[test]
+    fn settle_balance_with_times_out() {
+        // A pinned teardown never balances: false after exactly the bound,
+        // one read and one sleep per flip.
+        let mut script = BalanceScript {
+            reads: vec![Some((0, 2, 1))],
+            read_count: 0,
+            sleep_count: 0,
+        };
+        assert!(!script.run(5), "pinned teardown times out");
+        assert_eq!(script.read_count, 5, "bounded reads");
+        assert_eq!(script.sleep_count, 5, "bounded sleeps");
+    }
+
+    #[test]
+    fn settle_balance_with_requires_idle() {
+        // Balanced counters under an in-flight hook are not balance: the
+        // first read misses, the idle one settles.
+        let mut script = BalanceScript {
+            reads: vec![Some((1, 2, 2)), Some((0, 2, 2))],
+            read_count: 0,
+            sleep_count: 0,
+        };
+        assert!(script.run(1000), "idle balance settles");
+        assert_eq!(script.read_count, 2, "busy read is a miss");
+        assert_eq!(script.sleep_count, 1, "one miss sleeps once");
+    }
+
+    #[test]
+    fn settle_balance_with_tolerates_read_gaps() {
+        // An unreadable state is a miss, never an error: the next idle
+        // balanced read still settles, and the close-time read decides.
+        let mut script = BalanceScript {
+            reads: vec![None, Some((0, 2, 2))],
+            read_count: 0,
+            sleep_count: 0,
+        };
+        assert!(script.run(1000), "read gap is a miss");
+        assert_eq!(script.read_count, 2, "gap read counts");
+        assert_eq!(script.sleep_count, 1, "gap sleeps once");
+    }
+
+    #[test]
+    fn settle_balance_with_zero_flips_never_reads() {
+        // No flips means no observation and no balance claim: false with
+        // zero reads and zero sleeps.
+        let mut script = BalanceScript {
+            reads: vec![Some((0, 2, 2))],
+            read_count: 0,
+            sleep_count: 0,
+        };
+        assert!(!script.run(0), "zero flips claim nothing");
+        assert_eq!(script.read_count, 0, "no read without flips");
+        assert_eq!(script.sleep_count, 0, "no sleep without flips");
+    }
+
+    #[test]
+    fn finalize_drains_balance_after_deactivate() {
+        // Close ordering gains the balance drain between the deactivate
+        // and the busy settle, with the 1 s flip bound: arrivals freeze
+        // at the deactivate while ungated torn-completions land.
+        let mut backend = ScriptFinalize::clean();
+        super::finalize_with(&mut backend, 1, Some("1".into()));
+        let ops = backend.ops.join(",");
+        let deact = ops.find("deactivate").unwrap();
+        let balance = ops.find("balance").unwrap();
+        let settle = ops.find("settle").unwrap();
+        assert!(
+            deact < balance && balance < settle,
+            "balance drain between deactivate and settle: {ops}"
+        );
+        assert_eq!(
+            backend.balance_max,
+            Some(1000),
+            "balance deadline flips: {:?}",
+            backend.balance_max
+        );
+    }
+
+    #[test]
+    fn finalize_skips_balance_drain_on_doomed_close() {
+        // A failed walk or a failed deactivate skips the drain: no
+        // balance poll on a close whose verdict is already decided.
+        let mut backend = ScriptFinalize::clean();
+        backend.walks = vec![super::WalkOutcome::Fatal("snapshot".into())];
+        super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert!(
+            !backend.ops.iter().any(|op| op == "balance"),
+            "no drain after a failed walk: {:?}",
+            backend.ops
+        );
+        let mut backend = ScriptFinalize::clean();
+        backend.deactivate_err = Some("cfg map gone".into());
+        super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert!(
+            !backend.ops.iter().any(|op| op == "balance"),
+            "no drain after a failed deactivate: {:?}",
+            backend.ops
+        );
+    }
+
+    #[test]
+    fn finalize_ignores_balance_timeout() {
+        // A balance timeout is timing-only, never a verdict: an otherwise
+        // clean close still clears.
+        let mut backend = ScriptFinalize::clean();
+        backend.balanced = false;
+        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(verdicts, vec![super::FileVerdict::Clear]);
+    }
+
+    #[test]
+    fn finalize_balance_timeout_keeps_pending_reason() {
+        // A timeout behind a real imbalance keeps the Pending reason: the
+        // timeout must not relabel it as Quiesce.
+        let mut backend = ScriptFinalize::clean();
+        backend.balanced = false;
+        backend.state.pending_in = 2;
+        backend.state.pending_out = 1;
+        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(
+            verdicts,
+            vec![super::FileVerdict::Keep(super::KeepReason::Pending)]
         );
     }
 

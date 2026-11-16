@@ -539,22 +539,24 @@ static PW_INLINE int pw_depart_one(u64 tsk_addr, u64 mm_addr)
     }
 }
 
-/* Teardown completion (addendum §4.3). */
+/* Teardown completion (addendum §4.3). Deliberately not gated on
+ * active: departures freeze at deactivate (their hook stays gated, so no
+ * new PENDING appears), while completions must keep draining through the
+ * post-deactivate settle — otherwise a departure recorded just before
+ * the freeze could never complete and every busy host would read
+ * Pending. Before activation the maps are empty, so early completions
+ * find nothing and only delete absent keys. After release the links are
+ * gone and this never runs.
+ */
 static PW_INLINE int pw_torn_one(u64 mm_addr)
 {
     struct pw_state *s;
-    struct pw_cfg *cfg;
     u64 mmkey;
 
     s = pw_state();
     if (!s)
         return 0;
     pw_busy_inc(s);
-    cfg = pw_cfg();
-    if (!cfg || !cfg->active) {
-        pw_busy_dec(s);
-        return 0;
-    }
     if (!mm_addr) {
         pw_busy_dec(s);
         return 0;

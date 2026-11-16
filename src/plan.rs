@@ -22135,71 +22135,34 @@ pub(crate) mod tests {
             .expect("every active cell stays reachable exactly once");
     }
 
-    /// Extension fallback, reused cells: a new pin of the same file that
-    /// reclaims 68 retired cells but also lists 10 fresh ones past the
-    /// lifetime budget keeps its module on the 68 reused cells and omits
-    /// only the 10 fresh cells as a counted growth gap. The reused cells
-    /// stay owned — no ownerless new link — and no attribution is lost.
+    /// Extension fallback, reused cells: a same-file new pin that migrates
+    /// 68 active cells but also lists 40 fresh ones past the lifetime
+    /// budget keeps its module on the 68 migrated cells and omits only
+    /// the 40 fresh cells as a counted growth gap. The migrated cells
+    /// stay owned — no ownerless active cell — and no attribution is lost.
     #[test]
     fn fallback_keeps_reused_cells_owned_and_omits_only_fresh_growth() {
-        use crate::discovery::scan::ScannedEntry;
-
-        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1970, true);
-        let old_b = provider_with_tables(53, "/opt/oldb.so", 1, 68, true);
-        let mut plan = scoped_plan(
-            &[filler.clone(), sole_complete_module(), old_b],
-            AdmissionScope::Named,
-        );
-        assert_eq!(plan.slots.len(), 2106);
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
+        let gen1 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 68, true);
+        let mut plan = scoped_plan(&[filler, gen1], AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
         plan.object_identities
-            .insert(PinnedObjectId(42), test_identity(42, "sha-reused-kept"));
-        let rebuilt =
-            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
-        plan.extend_exact(rebuilt).unwrap();
-        assert_eq!(plan.retired_slots.len(), 136);
-        plan.revivable.clone_from(&plan.retired_keys);
-        // The returning pin lists the same 68 targets (reclaimed) plus 10
-        // fresh ones: a 2,048-slot snapshot fits, but 2,106 + 10 lifetime
-        // slots do not.
-        let mut returning = sole_complete_module();
-        returning.object = PinnedObjectId(90);
-        let fresh: Vec<ScannedEntry> = (0..10u64)
-            .map(|entry| ScannedEntry {
-                name: "C_Sign",
-                object: returning.scanned.key,
-                object_path: returning.scanned.path.clone(),
-                file_offset: 0x1000 + 68 * 8 + entry * 8,
-            })
-            .collect();
-        returning.scanned.tables[0].entries.extend(fresh);
-        returning.entry_objects = vec![vec![PinnedObjectId(90); 78]];
-        returning.forward_verified = vec![vec![false; 78]];
-        let identities =
-            BTreeMap::from([(PinnedObjectId(90), test_identity(42, "sha-reused-kept"))]);
-        let rebuilt =
-            plan.rebuild_from_sources_with_identities(&[filler, returning], &[], &identities);
-        assert_eq!(rebuilt.slots.len(), 2048);
-        assert_eq!(rebuilt.reclaimed.len(), 68);
-        let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+            .insert(PinnedObjectId(82), test_identity(82, "sha-reused-kept"));
+        let mut gen2 = provider_with_tables(82, "/opt/libsofthsm2.so", 1, 108, true);
+        gen2.object = PinnedObjectId(83);
+        gen2.entry_objects = vec![vec![PinnedObjectId(83); 108]];
+        // Fresh snapshot: 108 slots fit on their own; only the lifetime
+        // prior makes the extension overflow by the fresh 40.
+        let mut rebuilt = scoped_plan(std::slice::from_ref(&gen2), AdmissionScope::Shared);
+        assert_eq!(rebuilt.slots.len(), 108);
+        rebuilt
+            .object_identities
+            .insert(PinnedObjectId(83), test_identity(82, "sha-reused-kept"));
+        plan.extend_exact(rebuilt).unwrap_or_else(|error| {
             panic!("a reused-cell module must omit its fresh growth, not abort: {error}")
         });
-        assert_eq!(plan.slots.len(), 2106, "no capacity growth");
-        assert_eq!(delta.new.len(), 68, "only the reclaimed cells attach");
-        let module = plan
-            .modules
-            .iter()
-            .find(|module| module.object == PinnedObjectId(90))
-            .expect("the returning module stays admitted")
-            .id;
-        for slot in &delta.new {
-            assert_eq!(slot.module_ids, [module], "no ownerless new link: {slot:?}");
-            assert_eq!(
-                plan.module_of_slot(slot.index),
-                Some(module),
-                "the reclaimed cell keeps its attribution: {slot:?}"
-            );
-        }
-        let omission = refusal_of(&plan, "/opt/p11.so").expect("the fresh growth is a counted gap");
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize, "no capacity growth");
+        let omission = refusal_of(&plan, "/opt/libsofthsm2.so").expect("a counted gap");
         assert!(
             is_growth_omission(&omission.reason),
             "continuing growth omits, never refuses whole: {}",
@@ -22207,7 +22170,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             growth_omitted_count(&omission.reason),
-            Some(10),
+            Some(40),
             "the gap counts the fresh cells only: {}",
             omission.reason
         );
@@ -22217,6 +22180,32 @@ pub(crate) mod tests {
             omission.reason
         );
         assert_eq!(plan.modules_skipped.len(), 1);
+        let module = plan
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(83))
+            .expect("the returning module stays admitted")
+            .id;
+        let migrated: Vec<u32> = plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == PinnedObjectId(83))
+            .map(|slot| slot.index)
+            .collect();
+        assert_eq!(migrated.len(), 68, "the 68 cells migrate");
+        for index in migrated {
+            assert!(plan.is_active(index), "cell {index} stays active");
+            assert_eq!(
+                plan.slots[index as usize].module_ids,
+                [module],
+                "no ownerless active cell: {index}"
+            );
+            assert_eq!(
+                plan.module_of_slot(index),
+                Some(module),
+                "the migrated cell keeps its attribution: {index}"
+            );
+        }
         plan.validate_slot_index()
             .expect("the partial topology stays clean");
     }
@@ -22237,7 +22226,9 @@ pub(crate) mod tests {
         assert_eq!(plan.retired_slots.len(), 60);
         let a = provider_with_tables(60, "/opt/a.so", 1, 60, true);
         let b = provider_with_tables(61, "/opt/b.so", 1, 60, true);
-        let rebuilt = plan.rebuild_from_sources(&[filler, a, b], &[], &PinnedObjects::empty());
+        // Fresh snapshot: 2,072 slots fit on their own; only the lifetime
+        // prior makes the extension overflow by the second provider.
+        let rebuilt = scoped_plan(&[filler, a, b], AdmissionScope::Named);
         assert_eq!(rebuilt.slots.len(), 2072);
         plan.extend_exact(rebuilt)
             .unwrap_or_else(|error| panic!("one fitting provider must admit, not abort: {error}"));
@@ -22308,8 +22299,9 @@ pub(crate) mod tests {
         grown_plus.scanned.tables[0].entries.extend(fresh);
         grown_plus.entry_objects = vec![vec![grown_plus.object; 1101]];
         grown_plus.forward_verified = vec![vec![false; 1101]];
-        let rebuilt =
-            plan.rebuild_from_sources(&[others, grown_plus], &[], &PinnedObjects::empty());
+        // Fresh snapshot: 2,045 slots fit on their own; only the lifetime
+        // prior makes the extension overflow by the fresh growth.
+        let rebuilt = scoped_plan(&[others, grown_plus], AdmissionScope::Named);
         assert_eq!(rebuilt.slots.len(), 2045);
         let delta = plan
             .extend_exact(rebuilt)
@@ -22404,14 +22396,19 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
-    /// Reclaim across workers: 32 sequential same-file workers, each
-    /// downgraded to count-only while active and then retired, stay on
-    /// one 68-cell generation with no refusal and no abort. Without the
-    /// count-only reoccupy each worker burns 68 fresh slots and the
-    /// thirtieth exhausts the budget.
+    /// Reclaim across workers: the first of 32 sequential same-file
+    /// workers is downgraded to count-only while active by a transient
+    /// co-claimant and then retired; every later semantic worker
+    /// reoccupies that count-only generation instead of burning 68 fresh
+    /// slots. Without the count-only reoccupy each worker burns a fresh
+    /// generation and the thirtieth exhausts the budget.
     #[test]
     fn thirty_two_sequential_workers_stay_bounded_without_refusal() {
         let identity = test_identity(7, "sha-thirty-two-workers");
+        let names: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .collect();
         let worker = |pin: u32| {
             let mut module = sole_complete_module();
             module.object = PinnedObjectId(pin);
@@ -22444,6 +22441,15 @@ pub(crate) mod tests {
                 .extend_exact(rebuilt)
                 .unwrap_or_else(|error| panic!("worker {nurse} arrival must not refuse: {error}"));
             assert_eq!(delta.new.len(), 68, "worker {nurse}");
+            if nurse != 0 {
+                assert!(
+                    delta
+                        .new
+                        .iter()
+                        .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+                    "worker {nurse}: the return onto count-only cells attaches count-only"
+                );
+            }
             assert!(
                 plan.modules_skipped.is_empty(),
                 "worker {nurse}: no refusal: {:?}",
@@ -22454,33 +22460,37 @@ pub(crate) mod tests {
                 "worker {nurse}: bounded, got {}",
                 plan.slots.len()
             );
-            assert_eq!(plan.module_ambiguous, 0, "worker {nurse}: one owner");
-            // Downgraded to count-only while active.
-            let downgraded = count_only_copy(&generation, true);
-            let rebuilt = plan.rebuild_from_sources(
-                std::slice::from_ref(&downgraded),
-                &[],
-                &PinnedObjects::empty(),
-            );
-            let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
-                panic!("worker {nurse} downgrade must not refuse: {error}")
-            });
             if nurse == 0 {
+                // Downgraded to count-only while active: a transient rival
+                // co-claims every target with the same names, so the shared
+                // slots go count-only and ambiguous, and the kept path
+                // replaces instead of carrying the semantic descriptors.
+                let targets: Vec<(&'static str, u32, u64)> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (*name, pin, 0x1000 + index as u64 * 8))
+                    .collect();
+                let mut forward = provider_with_tables(200, "/opt/forward.so", 1, 68, false);
+                replace_table_targets(&mut forward, 0, &targets);
+                for entry in &mut forward.scanned.tables[0].entries {
+                    entry.object_path = generation.scanned.path.clone();
+                }
+                let downgraded = count_only_copy(&generation, true);
+                let rebuilt =
+                    plan.rebuild_from_sources(&[downgraded, forward], &[], &PinnedObjects::empty());
+                let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+                    panic!("worker {nurse} downgrade must not refuse: {error}")
+                });
                 assert_eq!(
                     delta.replace.len(),
                     68,
                     "the active semantic generation lowers"
                 );
-            } else {
                 assert!(
-                    delta.replace.is_empty(),
-                    "worker {nurse}: already count-only"
+                    plan.slots.iter().all(|slot| slot.descriptor_index == 0),
+                    "worker {nurse}: every cell is count-only"
                 );
             }
-            assert!(
-                plan.slots.iter().all(|slot| slot.descriptor_index == 0),
-                "worker {nurse}: every cell is count-only"
-            );
             // Exit.
             let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
             plan.extend_exact(rebuilt)
@@ -22522,17 +22532,9 @@ pub(crate) mod tests {
             subject: "C_B".into(),
             reason: "holder-b exited".into(),
         }];
-        let rebuilt = plan.rebuild_from_sources_with(
-            &[filler, a, b],
-            &[],
-            &[],
-            |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
-            |_, _| true,
-            None,
-            false,
-            plan.admission_policy,
-            true,
-        );
+        // Fresh snapshot with the counter hint: 1,520 slots fit on their
+        // own; only the lifetime prior makes the extension overflow.
+        let rebuilt = scoped_plan_with_counter_hint(&[filler, a, b], AdmissionScope::Shared);
         assert_eq!(rebuilt.slots.len(), 1520);
         plan.extend_exact(rebuilt)
             .unwrap_or_else(|error| panic!("one fitting provider must admit, not abort: {error}"));
@@ -22619,7 +22621,9 @@ pub(crate) mod tests {
         plan.extend_exact(rebuilt).unwrap();
         let a = provider_with_tables(60, "/opt/a.so", 1, 60, true);
         let b = provider_with_tables(61, "/opt/b.so", 1, 60, true);
-        let rebuilt = plan.rebuild_from_sources(&[filler, a, b], &[], &PinnedObjects::empty());
+        // Fresh snapshot: 2,072 slots fit on their own; only the lifetime
+        // prior makes the extension overflow by the second provider.
+        let rebuilt = scoped_plan(&[filler, a, b], AdmissionScope::Named);
         plan.extend_exact(rebuilt)
             .unwrap_or_else(|error| panic!("one fitting provider must admit, not abort: {error}"));
         let refused = refusal_of(&plan, "/opt/b.so").expect("B is a counted refusal");

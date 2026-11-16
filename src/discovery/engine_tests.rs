@@ -30144,10 +30144,12 @@ fn live_extension_at_capacity_refuses_a_whole_new_module_without_aborting() {
     assert_eq!(engine.plan.modules_skipped[0].subject, new.path);
 }
 
-/// Existing growth at capacity, live path: an already-admitted provider
-/// that grows past the lifetime budget omits its fresh endpoints as a
-/// counted growth gap through `live_candidate` and the tick apply —
-/// never the fatal capacity branch.
+/// Existing growth at capacity, engine paths: an already-admitted
+/// provider that grows 101 endpoints past the lifetime budget omits its
+/// fresh endpoints as a counted growth gap — through `live_candidate`
+/// and the tick apply (merge routes it, the fallback stays quiet), and
+/// through the extension seam directly on a fresh snapshot (the
+/// fallback omits it) — never the fatal capacity branch.
 #[test]
 fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
     let capacity = p11scope_ebpf_common::MAX_SLOTS;
@@ -30190,11 +30192,11 @@ fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
         engine.plan.active_slot_count(),
         capacity as usize - 100 - 68
     );
-    // Grow 101 endpoints past the lifetime budget: merge admits the
-    // 2,045-slot snapshot, the extension omits the fresh growth.
+    // Live path: merge omits the growth against the lifetime budget, the
+    // tick accepts, and the extension fallback stays quiet.
     let grown = with_endpoints(raw.clone(), capacity - 100 - 68 + 101);
     let candidate = engine
-        .live_candidate(engine.pinned.clone(), vec![grown], Vec::new())
+        .live_candidate(engine.pinned.clone(), vec![grown.clone()], Vec::new())
         .unwrap_or_else(|error| {
             panic!("existing growth is a counted omission, not an abort: {error}")
         });
@@ -30221,6 +30223,11 @@ fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
         "the gap names the kept cells: {}",
         omission.reason
     );
+    assert!(
+        !omission.reason.contains("extend fallback fired"),
+        "merge routes lifetime growth; the fallback stays quiet: {}",
+        omission.reason
+    );
     let mut additions_allowed = true;
     let outcome = engine
         .apply_candidate(
@@ -30236,6 +30243,43 @@ fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
     assert_eq!(
         engine.plan.active_slot_count(),
         capacity as usize - 100 - 68
+    );
+    // Extension seam directly: the same growth on a fresh snapshot omits
+    // through the fallback instead of aborting.
+    let mut pins = engine.pinned.clone();
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&grown), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let rebuilt = plan::build_from_reconciled_modules(&modules);
+    assert_eq!(rebuilt.slots.len(), 2045);
+    let delta = engine
+        .plan
+        .extend_exact_with_stable_module_ids(rebuilt)
+        .unwrap_or_else(|error| {
+            panic!("existing growth is a counted omission, not an abort: {error}")
+        });
+    assert!(delta.new.is_empty(), "no fresh cell attaches: {delta:?}");
+    assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        capacity as usize - 100 - 68
+    );
+    assert_eq!(engine.plan.modules_skipped.len(), 1);
+    let omission = &engine.plan.modules_skipped[0];
+    assert!(
+        plan::is_growth_omission(&omission.reason),
+        "existing growth omits: {}",
+        omission.reason
+    );
+    assert_eq!(
+        plan::growth_omitted_count(&omission.reason),
+        Some(101),
+        "the gap counts the fresh cells: {}",
+        omission.reason
+    );
+    assert!(
+        omission.reason.contains("extend fallback fired"),
+        "the seam gap says the fallback fired: {}",
+        omission.reason
     );
 }
 

@@ -551,6 +551,17 @@ jobs:
       # +40 B) and only .BTF.ext line info and .debug_* move with the
       # added lines. No section is added or removed, and the shape is
       # verified run-independent across two snapshot builds.
+      # An eleventh recorded transition covers the v0.8.0 keymeta R2
+      # creation-template facts (Task 1): the Montgomery/Edwards
+      # curve codes and the 11-byte EC-params scratch join the shared
+      # object classifier/reader, which compile into the default
+      # Detailed object only. The Detailed object gains .text (+712 B,
+      # cumulative +2040) with matching .BTF.ext line info and
+      # debug/reloc moves; uprobe, maps, .BTF and the symbol tables
+      # are unchanged, and no section is added or removed. Both
+      # Inventory objects keep exactly the transition-10 code sizes
+      # (.text +112/+176 B, uprobe +128 B, maps +28 B, .BTF +37 B);
+      # only DWARF bytes move with the added source lines.
       # Allowed-change process: when kernel code changes on purpose, run
       # scripts/check-bpf-noninterference.py locally for the baseline tag
       # versus the candidate, take the per-section size deltas of the two

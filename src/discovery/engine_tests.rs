@@ -30168,14 +30168,19 @@ fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
         .unwrap();
     engine.publish_current_capture_facts().unwrap();
+    engine
+        .views
+        .push(ProcessView::open(raw.view, std::process::id()).unwrap());
+    let view_id = engine.views[0].id();
     assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
     assert_eq!(engine.plan.active_slot_count(), capacity as usize - 100);
     // Retire 68 cells: the lifetime budget stays spent while the live set
     // shrinks.
     let smaller = with_endpoints(raw.clone(), capacity - 100 - 68);
-    let candidate = engine
+    let mut candidate = engine
         .live_candidate(engine.pinned.clone(), vec![smaller], Vec::new())
         .unwrap();
+    candidate.views.insert(view_id);
     let mut additions_allowed = true;
     let outcome = engine
         .apply_candidate(
@@ -30195,11 +30200,12 @@ fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
     // Live path: merge omits the growth against the lifetime budget, the
     // tick accepts, and the extension fallback stays quiet.
     let grown = with_endpoints(raw.clone(), capacity - 100 - 68 + 101);
-    let candidate = engine
+    let mut candidate = engine
         .live_candidate(engine.pinned.clone(), vec![grown.clone()], Vec::new())
         .unwrap_or_else(|error| {
             panic!("existing growth is a counted omission, not an abort: {error}")
         });
+    candidate.views.insert(view_id);
     assert_eq!(
         candidate.plan.modules_skipped.len(),
         1,
@@ -30283,33 +30289,66 @@ fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
     );
 }
 
-/// Whole new module at capacity, tick path: the `live_candidate` plus
-/// apply twin of the direct-extension capacity test — a rebuilt snapshot
-/// whose whole new module would push lifetime allocation past the budget
-/// returns a counted named refusal from the tick, never an abort.
+/// Whole new module at capacity, tick path: the tick-commit twin of the
+/// direct-extension capacity test — a rebuilt snapshot whose whole new
+/// module would push lifetime allocation past the budget is refused by
+/// the fallback and committed through the tick apply, never an abort.
 #[test]
 fn tick_refuses_a_whole_new_module_at_capacity_without_aborting() {
     let capacity = p11scope_ebpf_common::MAX_SLOTS;
     let (mut engine, raw) = engine_admitting_overlay(70, capacity - 100);
-    let kept = with_endpoints(raw.clone(), 512);
+    engine
+        .views
+        .push(ProcessView::open(raw.view, std::process::id()).unwrap());
+    let view_id = engine.views[0].id();
+    let mut kept = raw.clone();
+    kept.tables[0].entries = overlay_entries(&raw, first_offsets(capacity - 100 - 68));
     let new = with_endpoints(overlay_module(overlay_key(71)), 101);
     let mut pins = engine.pinned.clone();
     let skipped = pins.absorb(overlay_pins(&[(new.key, OVERLAY_SHA, 1)]));
     assert!(skipped.is_empty(), "{skipped:?}");
-    let candidate = engine
-        .live_candidate(pins, vec![kept, new.clone()], skipped)
+    let (modules, skipped) = bind_scanned_modules(&[kept, new.clone()], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut rebuilt = plan::build_from_reconciled_modules(&modules);
+    assert_eq!(rebuilt.slots.len(), 2045);
+    let binding_losses = engine
+        .capture_facts
+        .bind_plan_module_ids(&mut rebuilt, &modules, &engine.manifests, &pins)
+        .unwrap();
+    assert!(binding_losses.is_empty(), "{binding_losses:?}");
+    let mut plan = engine.plan.clone();
+    let delta = plan
+        .extend_exact_with_stable_module_ids(rebuilt)
         .unwrap_or_else(|error| {
             panic!("at capacity a whole new module is a counted refusal, not an abort: {error}")
         });
     assert_eq!(
-        candidate.delta.retire.len(),
-        capacity as usize - 100 - 512,
+        delta.retire.len(),
+        68,
         "the prior cells outside the rebuilt snapshot retire"
     );
     assert!(
-        candidate.delta.new.is_empty(),
+        delta.new.is_empty(),
         "the overflowing new object is dropped whole"
     );
+    let candidate = LiveCandidate {
+        pinned: pins,
+        modules,
+        plan,
+        delta,
+        views: [view_id].into_iter().collect(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: true,
+    };
     let mut additions_allowed = true;
     let outcome = engine
         .apply_candidate(
@@ -30322,7 +30361,10 @@ fn tick_refuses_a_whole_new_module_at_capacity_without_aborting() {
         .unwrap();
     assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
     assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
-    assert_eq!(engine.plan.active_slot_count(), 512);
+    assert_eq!(
+        engine.plan.active_slot_count(),
+        capacity as usize - 100 - 68
+    );
     let new_object = engine
         .pinned
         .id_for_scanned(&new, new.key, &new.path)

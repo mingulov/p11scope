@@ -3579,6 +3579,19 @@ fn attribute_cell(kind: u8, status: u8, value: u16) -> AttrObservation {
                     3 => Some(FieldValue::Curve(
                         p11scope_ebpf_common::object_policy::SafeCurve::Secp521r1,
                     )),
+                    // R2 new-site: Montgomery/Edwards curve codes.
+                    4 => Some(FieldValue::Curve(
+                        p11scope_ebpf_common::object_policy::SafeCurve::X25519,
+                    )),
+                    5 => Some(FieldValue::Curve(
+                        p11scope_ebpf_common::object_policy::SafeCurve::X448,
+                    )),
+                    6 => Some(FieldValue::Curve(
+                        p11scope_ebpf_common::object_policy::SafeCurve::Ed25519,
+                    )),
+                    7 => Some(FieldValue::Curve(
+                        p11scope_ebpf_common::object_policy::SafeCurve::Ed448,
+                    )),
                     _ => None,
                 },
                 Some(kind) => {

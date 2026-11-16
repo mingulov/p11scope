@@ -50,11 +50,15 @@ pub const OBJECT_LAYOUT_LP64: u8 = 1;
 pub const OBJECT_LAYOUT_ILP32: u8 = 2;
 
 /// Frozen entry-derive codes.
+/// R2 new-site: codes 5..=7 extend the frozen 0..=4 range additively.
 pub const OBJECT_DERIVE_UNAVAILABLE: u8 = 0;
 pub const OBJECT_DERIVE_DH_PKCS: u8 = 1;
 pub const OBJECT_DERIVE_SHA256: u8 = 2;
 pub const OBJECT_DERIVE_ECDH1: u8 = 3;
 pub const OBJECT_DERIVE_ECDH1_COFACTOR: u8 = 4;
+pub const OBJECT_DERIVE_HKDF_DERIVE: u8 = 5;
+pub const OBJECT_DERIVE_HKDF_DATA: u8 = 6;
+pub const OBJECT_DERIVE_CONCAT_BASE_AND_KEY: u8 = 7;
 
 /// Largest valid attribute kind, attribute status and handle status codes.
 /// F16 (7.05 PQC): kind 7 (`CKA_PARAMETER_SET`) validates; 8+ refuses.
@@ -395,7 +399,7 @@ pub fn validate_object_tail(tail: &[u8], descriptor: &ObjectDescriptorWire) -> b
         return false;
     }
     let entry_derive = tail[14];
-    if entry_derive > OBJECT_DERIVE_ECDH1_COFACTOR {
+    if entry_derive > OBJECT_DERIVE_CONCAT_BASE_AND_KEY {
         return false;
     }
     if action != OBJECT_ACTION_DERIVE && entry_derive != OBJECT_DERIVE_UNAVAILABLE {

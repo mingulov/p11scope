@@ -813,6 +813,9 @@ pub fn adapter_fill_return(
             2 => DeriveEntry::Accepted(ScalarDeriveMechanism::Sha256),
             3 => DeriveEntry::Accepted(ScalarDeriveMechanism::Ecdh1),
             4 => DeriveEntry::Accepted(ScalarDeriveMechanism::Ecdh1Cofactor),
+            5 => DeriveEntry::Accepted(ScalarDeriveMechanism::HkdfDerive),
+            6 => DeriveEntry::Accepted(ScalarDeriveMechanism::HkdfData),
+            7 => DeriveEntry::Accepted(ScalarDeriveMechanism::ConcatBaseAndKey),
             _ => DeriveEntry::Unavailable,
         };
         let derive_ok = row.action != OBJECT_ACTION_DERIVE

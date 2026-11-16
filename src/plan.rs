@@ -23815,6 +23815,177 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
+    /// I-C (tier-3 review of port3 fix1): a count-only return reoccupies
+    /// another pin's retired semantic cells of the same file. The
+    /// cross-pin forward flip is lossless — extend keeps the old
+    /// authorized names, stays count-only and attaches a new link — so
+    /// with room it tickets and reoccupies instead of burning fresh
+    /// cells. Exact names and a positive file identity match on both
+    /// sides, like every cross-pin reclaim.
+    #[test]
+    fn cross_pin_count_only_return_reoccupies_a_retired_semantic_cell_with_room() {
+        let identity = test_identity(7, "sha-xpin-forward");
+        let worker = |pin: u32| {
+            let mut module = sole_complete_module();
+            module.object = PinnedObjectId(pin);
+            module.scanned.key = scanned_key(PinnedObjectId(pin));
+            for entry in &mut module.scanned.tables[0].entries {
+                entry.object = scanned_key(PinnedObjectId(pin));
+            }
+            module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
+            module.forward_verified = vec![vec![false; 68]];
+            module
+        };
+        let mut plan = scoped_plan(&[], AdmissionScope::Named);
+        // Pin 100 arrives semantic and retires.
+        let identities = BTreeMap::from([(PinnedObjectId(100), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&worker(100)),
+            &[],
+            &identities,
+        );
+        assert!(rebuilt.reclaimed.is_empty(), "the first pin is fresh");
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("pin 100 arrival must not refuse: {error}"));
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "pin 100 attaches semantic"
+        );
+        let rebuilt = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("pin 100 exit must not refuse: {error}"));
+        assert_eq!(plan.retired_slots.len(), 68, "pin 100");
+        plan.revivable.clone_from(&plan.retired_keys);
+        // A new pin of the same file returns count-only: 68 tickets, and
+        // the return reoccupies the retired semantic cells in place.
+        let returning = count_only_copy(&worker(101), false);
+        let identities = BTreeMap::from([(PinnedObjectId(101), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&returning),
+            &[],
+            &identities,
+        );
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "merge tickets the cross-pin forward flip"
+        );
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("the forward flip must not refuse: {error}"));
+        assert_eq!(delta.new.len(), 68);
+        assert!(
+            delta.new.iter().all(|slot| (slot.index as usize) < 68),
+            "the return reoccupies, never fresh: {:?}",
+            delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>()
+        );
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+            "the flip attaches count-only"
+        );
+        assert_eq!(plan.slots.len(), 68, "no fresh cell burns");
+        assert!(plan.retired_slots.is_empty());
+        assert!(
+            plan.modules_skipped.is_empty(),
+            "no refusal: {:?}",
+            plan.modules_skipped
+        );
+        let module = plan
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(101))
+            .expect("the returning pin stays admitted")
+            .id;
+        for slot in &plan.slots {
+            assert_eq!(slot.names.len(), 1, "cell {} keeps one name", slot.index);
+            assert_ne!(
+                slot.names[0], UNKNOWN_FUNCTION_NAME,
+                "cell {} keeps its authorized name",
+                slot.index
+            );
+            assert_eq!(
+                plan.module_of_slot(slot.index),
+                Some(module),
+                "cell {} stays sole-owned",
+                slot.index
+            );
+        }
+        assert_eq!(plan.module_ambiguous, 0);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// I-C at capacity (tier-3 review of port3 fix1): with the lifetime
+    /// budget full, a new pin's count-only return reoccupies its file's
+    /// retired semantic cells instead of refusing the module whole.
+    #[test]
+    fn cross_pin_count_only_return_reoccupies_at_capacity_instead_of_refusing() {
+        let identity = test_identity(7, "sha-xpin-forward-full");
+        let worker = |pin: u32| {
+            let mut module = sole_complete_module();
+            module.object = PinnedObjectId(pin);
+            module.scanned.key = scanned_key(PinnedObjectId(pin));
+            for entry in &mut module.scanned.tables[0].entries {
+                entry.object = scanned_key(PinnedObjectId(pin));
+            }
+            module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
+            module.forward_verified = vec![vec![false; 68]];
+            module
+        };
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
+        let mut plan = scoped_plan(&[filler.clone(), worker(100)], AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
+        plan.object_identities
+            .insert(PinnedObjectId(100), identity.clone());
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.retired_slots.len(), 68);
+        plan.revivable.clone_from(&plan.retired_keys);
+        let returning = count_only_copy(&worker(101), false);
+        let identities = BTreeMap::from([(PinnedObjectId(101), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            &[filler, returning],
+            &[],
+            &identities,
+        );
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "merge tickets the cross-pin forward flip"
+        );
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "the ticketed return is admitted: {:?}",
+            rebuilt.modules_skipped
+        );
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("the at-capacity flip must not refuse: {error}"));
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
+        assert!(plan.retired_slots.is_empty());
+        assert!(
+            plan.modules_skipped.is_empty(),
+            "no refusal and no lowering: {:?}",
+            plan.modules_skipped
+        );
+        assert_eq!(
+            plan.slots
+                .iter()
+                .filter(|slot| slot.object == PinnedObjectId(101))
+                .filter(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized)
+                .count(),
+            68,
+            "the return reoccupies count-only"
+        );
+        assert_eq!(plan.module_ambiguous, 0);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
     /// Extension fallback, refusal quality: the fallback refusal of a
     /// heuristic provider at capacity uses the shared capacity reason —
     /// reserve clause, counter hint, counted demand — and drops the

@@ -246,6 +246,19 @@ static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(RV
 static DESCRIPTORS: Array<SlotSemantics> =
     Array::with_max_entries(MAX_DESCRIPTORS, BPF_F_RDONLY_PROG);
 
+/// In-place count-only downgrade (A′): one narrowing-only switch cell
+/// per slot. A planner replace that only narrows a semantic slot to
+/// count-only on the same object+offset flips the cell 0->1 while the
+/// slot's link stays live, instead of detaching and reattaching. A set
+/// cell narrows the call to descriptor 0 (COUNT_ONLY) although the
+/// link cookie still names the downgraded semantic descriptor. Flags
+/// 0, never frozen: userspace writes it while links are live. Absent
+/// from Inventory and counter/bank-proof objects, which never take a
+/// descriptor downgrade.
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+#[map]
+static SLOT_COUNT_ONLY: Array<u32> = Array::with_max_entries(MAX_SLOTS, 0);
+
 /// Mechanism id -> parameter shape code, published by userspace from
 /// pkcs11-types' registry. An unknown mechanism id looks up empty and is
 /// treated as `shape::NONE`.
@@ -2401,6 +2414,24 @@ where
         .unwrap_or(SlotSemantics::COUNT_ONLY)
 }
 
+/// Whether the slot's count-only switch is set: a set cell narrows the
+/// call to descriptor 0 even though the link cookie still names the
+/// downgraded semantic descriptor. A missing cell or a failed lookup
+/// reads as unset (fail open: an unreadable switch must never drop a
+/// call). Counter/bank-proof objects carry no switch and always read
+/// the cookie descriptor.
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+#[inline(always)]
+fn slot_count_only(slot: u32) -> bool {
+    SLOT_COUNT_ONLY.get(slot).copied().unwrap_or(0) != 0
+}
+
+#[cfg(all(not(feature = "inventory-only"), feature = "counter-broad"))]
+#[inline(always)]
+fn slot_count_only(_slot: u32) -> bool {
+    false
+}
+
 /// Decode allowlisted `CK_MECHANISM` parameters for `shape` at `pmech`,
 /// writing the result into `output.p0/p1/p2`. Anything unexpected —
 /// an `ulParameterLen` that matches no known layout, null `pParameter`, or
@@ -3223,7 +3254,13 @@ fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
         bump_evidence(EVIDENCE_TEMPLATE_TAIL_FAILURES);
         return 0;
     };
-    let semantics = semantics_of(&ctx);
+    // In-place downgrade (A′): the pair continuation narrows with the
+    // same switch the pair entry read.
+    let semantics = if slot_count_only(slot) {
+        SlotSemantics::COUNT_ONLY
+    } else {
+        semantics_of(&ctx)
+    };
     // SAFETY: START owns this per-thread/per-slot value until the return
     // probe removes it; the primary entry program has already inserted it.
     let start = unsafe { &mut *start };
@@ -4036,8 +4073,16 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
             seed.image.exec_id,
         )
     };
+    // In-place downgrade (A′): one switch read per call. A set switch
+    // narrows this call to count-only (effective descriptor 0) although
+    // the link cookie still names the downgraded semantic descriptor.
+    let count_only = slot_count_only(slot);
     if flags & FLAG_POLICY_ALLOWLISTED != 0 {
-        seed.object_required = object_marker_for(cookie_of(&ctx));
+        seed.object_required = if count_only {
+            0
+        } else {
+            object_marker_for(cookie_of(&ctx))
+        };
     }
     // The final immutable seed is bound before native side allocation. No
     // pointer escapes a failed transaction; its native cleanup owns rollback.
@@ -4067,8 +4112,13 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
 
     // Materialized late on purpose: its fields stay out of entry's live set
     // across the marker call above. The descriptor table is frozen, so this
-    // reads the same row it would have read earlier.
-    let semantics = semantics_of(&ctx);
+    // reads the same row it would have read earlier. A set count-only
+    // switch narrows the call to COUNT_ONLY (no argument reads below).
+    let semantics = if count_only {
+        SlotSemantics::COUNT_ONLY
+    } else {
+        semantics_of(&ctx)
+    };
     if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {
         start.session = value;
     }
@@ -4244,7 +4294,12 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
             return 0;
         }
         // H7 adapters tail: entry-fill after the ABI record.
-        let null_cancel = semantics_of(&ctx).semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL
+        let cancel_semantics = if count_only {
+            SlotSemantics::COUNT_ONLY
+        } else {
+            semantics_of(&ctx)
+        };
+        let null_cancel = cancel_semantics.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL
             != 0
             && entry_capture & capture::MECHANISM_MASK == capture::MECHANISM_NULL;
         let fill_side =
@@ -4306,8 +4361,11 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
             core::ptr::addr_of_mut!((*completed).key.pid_tgid).write(key.pid_tgid);
             core::ptr::addr_of_mut!((*completed).key.slot).write(key.slot);
             core::ptr::addr_of_mut!((*completed).key._pad).write(0);
-            core::ptr::addr_of_mut!((*completed).descriptor)
-                .write(cookie_descriptor(cookie_of(&ctx)));
+            core::ptr::addr_of_mut!((*completed).descriptor).write(if count_only {
+                0
+            } else {
+                cookie_descriptor(cookie_of(&ctx))
+            });
             core::ptr::addr_of_mut!((*completed).layout).write(match layout {
                 LinuxLayout::Lp64 => 1,
                 LinuxLayout::Ilp32 => 2,
@@ -4578,7 +4636,16 @@ fn capture_return_facts<const DEFER_ROUTING: bool>(
     layout: LinuxLayout,
     accounting: ReturnAccounting,
 ) -> ReturnEventFacts {
-    let semantics = semantics_of(ctx);
+    // In-place downgrade (A′): a set switch narrows the return facts
+    // to count-only. The object side-row descriptor below still comes
+    // from the link cookie: one link, so the cookie descriptor is the
+    // bound descriptor (object_required - 1), and a mismatch refuses
+    // on the existing fault arm.
+    let semantics = if slot_count_only(slot_of(ctx)) {
+        SlotSemantics::COUNT_ONLY
+    } else {
+        semantics_of(ctx)
+    };
     let mut mechanism = start.mechanism;
     let mut capture_flags = start.capture;
     if flags & FLAG_POLICY_ALLOWLISTED != 0

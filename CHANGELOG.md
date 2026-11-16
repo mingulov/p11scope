@@ -50,7 +50,11 @@ versioned separately and are opaque, exact dispatch keys.
   existing `attached_at_ns` follows the current slots, so a probe
   replaced mid-capture moves it later), with per-endpoint
   `first_attach_points` showing each endpoint's window. Calls after
-  it are observed unless another disclosed window says otherwise.
+  it are observed unless another disclosed window says otherwise,
+  except while probes are being swapped mid-load: a probe replaced
+  mid-capture is briefly detached and reattached, and calls in that
+  moment can be missed without a disclosed window (a known issue;
+  a gapless replacement is planned for 0.8.0).
 
 ### Fixed
 
@@ -240,7 +244,9 @@ versioned separately and are opaque, exact dispatch keys.
   calls a hooked getter; under `--system`/`--cgroup` the program's exit
   reattaches its getter probes and names that short window.
   `inventory --manifest` refuses a manifest that names getters
-  (inventory never hooks one).
+  (inventory never hooks one); under `metrics`, a `C_GetInterface`
+  getter is not hooked (a named gap), so calls reached only through
+  its table are not counted.
 - On a busy host, a long `inventory --system --key-operations`
   capture can stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Since
@@ -271,6 +277,10 @@ versioned separately and are opaque, exact dispatch keys.
   the observer, or `SIGCONT` to the member. A suspended (Ctrl-Z)
   observer is not dead: a held member stays stopped until the
   observer runs again.
+- On a busy host, a system-wide capture can report a few `discovery
+  unavailable` skips when short-lived processes exit in the middle
+  of a scan; call counts stay exact and nothing is lost — the report
+  still reads `PARTIAL` because those scans never completed.
 
 ## [0.7.0] - 2026-11-13
 

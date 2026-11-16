@@ -816,7 +816,7 @@
             ".debug_line": 97,
             ".debug_loclists": 383,
             ".debug_rnglists": 41,
-            ".debug_str": 121,
+            ".debug_str": 120,
             ".debug_str_offsets": 24,
             ".rel.BTF": 16,
             ".rel.BTF.ext": 128,
@@ -864,7 +864,7 @@
       },
       "identical": [],
       "lane": "keymeta R2 creation-template facts (v0.8.0 Task 1)",
-      "rationale": "R2 creation-template finite sets on top of the member-stop transition above: the Montgomery/Edwards curve codes and the 11-byte EC-params scratch join the shared object classifier/reader (object_policy.rs, object_capture.rs, object_flow.rs), which compile into the default Detailed object only. The Detailed object gains .text +712 B (cumulative +2040) with matching .BTF.ext line info and debug/reloc moves; uprobe (+184), maps (+28), .BTF (+213) and the symbol tables are unchanged, and no section is added or removed. Both Inventory objects keep exactly the transition-10 code sizes (.text +112/+176, uprobe +128, maps +28, .BTF +37): only DWARF bytes move with the added source lines (.debug_info +15, .debug_str +38/+37, .debug_str_offsets +12, .rel.debug_str_offsets +48)."
+      "rationale": "R2 creation-template finite sets on top of the member-stop transition above: the Montgomery/Edwards curve codes and the 11-byte EC-params scratch join the shared object classifier/reader (object_policy.rs, object_capture.rs, object_flow.rs), which compile into the default Detailed object only. The Detailed object gains .text +712 B (cumulative +2040) with matching .BTF.ext line info and debug/reloc moves; uprobe (+184), maps (+28), .BTF (+213) and the symbol tables are unchanged, and no section is added or removed. Both Inventory objects keep exactly the transition-10 code sizes (.text +112/+176, uprobe +128, maps +28, .BTF +37): only DWARF bytes move with the added source lines (.debug_info +15, .debug_str +37/+37, .debug_str_offsets +12, .rel.debug_str_offsets +48)."
     }
   ],
   "version": 1

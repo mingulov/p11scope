@@ -120,8 +120,19 @@ fn tail(log: &Path) -> String {
 fn privileged_run_default_learns_tables_for_a_getter_only_provider() -> Result<()> {
     let tag = "run-learned-tables";
     let observer = observer_binary()?;
-    let dir = tempfile::tempdir()?;
+    // Fixtures live directly under /tmp (not the runner's 0700
+    // TMPDIR): the observer's child is fully deprivileged (zero
+    // capabilities even as root), so it cannot traverse
+    // root-only directories to reach them.
+    let dir = tempfile::TempDir::new_in("/tmp")?;
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )?;
     let (library, worker) = build_fixtures(dir.path())?;
+    for path in [&library, &worker] {
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    }
     // Sequential short-lived workers, pkcs11-check-shaped: each
     // dlopens, negotiates the 3.0 interface and makes 30 table
     // calls within milliseconds. Enough of them that slow hosts

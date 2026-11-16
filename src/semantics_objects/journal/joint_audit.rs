@@ -600,10 +600,13 @@ fn vector_capacity(required: usize) -> Option<usize> {
 ///   makes a view `Valid` (`contradict`).
 /// - `SessionEnded`: only a `Live` session ends (`end_session`).
 /// - `MetadataInvalidated`: only a view holding an established or
-///   conflicting field emits, a view allocates with none, and only
-///   `establish` on one of a call's input handles writes one. So each
-///   object present at seal start emits once for its state then, plus
-///   once per input-handle establishment.
+///   conflicting field emits, and each invalidation needs an arming:
+///   a pre-seal object arrives armed, `establish` re-arms at most one
+///   view per input handle, and R2 promotion arms each view a
+///   creation mints, at most one per result handle. So each object
+///   present at seal start emits once for its state then, plus once
+///   per input-handle establishment and once per result-handle
+///   promotion.
 ///
 /// Only staged begins (`adapter.open`) apply an action and mint records:
 /// a refused begin applies none (`note_refused` only voids, a broad
@@ -619,8 +622,9 @@ pub(super) struct SealEffectBound {
     pub(super) downgrades: usize,
     /// `SessionEnded`: once per session.
     pub(super) session_ends: usize,
-    /// `MetadataInvalidated`: once per object plus once per input-handle
-    /// re-establishment.
+    /// `MetadataInvalidated`: once per object plus once per
+    /// input-handle re-establishment and once per result-handle
+    /// promotion.
     pub(super) invalidations: usize,
     /// Every other effect of an applied seal: the per-call direct effects
     /// plus the seal-level settlement gaps.

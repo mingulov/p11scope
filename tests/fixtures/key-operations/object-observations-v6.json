@@ -96,7 +96,7 @@
       "object": 13,
       "session": 1,
       "origin": "created",
-      "creation": "generate",
+      "creation": "generate_pair",
       "birth": {"start_ns": 5000, "end_ns": 6000},
       "lifetime": "live",
       "lifetime_reason": null,

@@ -646,8 +646,8 @@ present), the call is kept the same way as a plain row with a
 counted gap naming the caller. The gap names a void only when that
 exact original was recorded wiped by one; otherwise its reason is
 cause-neutral. Tracking continues for this process only when all of
-the following hold: the call only uses an existing key, does not
-create, destroy or rebind objects, or reads attributes; its own
+the following hold: the call is a key use, an operation that neither
+creates, destroys nor rebinds objects, or an attribute read; its own
 observed return is success, a partial attribute result or an
 ordinary failure (a handle or session error, a pending return or an
 ambiguous failure does not qualify); and its exact original is

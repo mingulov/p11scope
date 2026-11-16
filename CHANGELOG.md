@@ -44,12 +44,12 @@ versioned separately and are opaque, exact dispatch keys.
   by an image taint, or a tainted original still present) can now
   degrade instead of always ending per-key tracking, but only within
   strict limits. Per-key tracking continues only when all of the
-  following hold: the call only uses an existing key, does not create,
-  destroy or rebind objects, or reads attributes; its own observed
-  return is success, a partial attribute result or an ordinary
-  failure (a handle or session error, a pending return or an ambiguous
-  failure does not qualify); and its exact original is still
-  unclaimed. The original is then disposed with the call. Every other
+  following hold: the call is a key use, an operation that neither
+  creates, destroys nor rebinds objects, or an attribute read; its
+  own observed return is success, a partial attribute result or an
+  ordinary failure (a handle or session error, a pending return or
+  an ambiguous failure does not qualify); and its exact original is
+  still unclaimed. The original is then disposed with the call. Every other
   case keeps the earlier fail-closed path where the next seal ends
   per-key tracking for that image with the named `claim_unmatched`
   gap: every other function (create, copy, generate, generate-pair,

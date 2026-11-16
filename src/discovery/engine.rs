@@ -18770,6 +18770,12 @@ impl Engine {
             })
             .collect();
         if !proofs.is_empty() {
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: live apply proved {} run-learned files",
+                    proofs.len(),
+                );
+            }
             self.learn_owned_proofs(&candidate.pinned, &proofs);
         }
         if generation_stale {
@@ -22711,6 +22717,16 @@ impl Engine {
             })
             .collect();
         self.release_view_id(id);
+        if crate::run::capture_diagnostics_on() {
+            let tables: usize = modules.iter().map(|module| module.tables.len()).sum();
+            let interfaces: usize = modules.iter().map(|module| module.interfaces.len()).sum();
+            eprintln!(
+                "p11scope: owned-tree watch scanned {pid}: {} modules {tables} tables \
+                 {interfaces} interfaces {} proofs",
+                modules.len(),
+                proofs.len(),
+            );
+        }
         if proofs.is_empty() {
             if image_changed {
                 // The scan read the image the member just left.
@@ -22933,6 +22949,12 @@ impl Engine {
                 crate::render::LEARNED_SKIP_SUBJECT,
                 crate::render::LEARNED_CAP_REASON,
             );
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: run-learned tables for {} refused: past the learned cap",
+                    proof.path
+                );
+            }
             return;
         }
         // Absorb the proving scan's pins when they carry object
@@ -23007,6 +23029,15 @@ impl Engine {
                     )
                 }),
         );
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "p11scope: run-learned tables for {}: {} tables {} interfaces (store {} modules)",
+                proof.path,
+                proof.module.tables.len(),
+                proof.module.interfaces.len(),
+                after.0,
+            );
+        }
         if after == before {
             return;
         }

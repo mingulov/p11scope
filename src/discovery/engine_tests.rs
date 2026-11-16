@@ -70710,6 +70710,36 @@ fn retry_breakdown_survives_the_end_of_capture_noise_flush() {
     assert_eq!(classes.len(), 2, "only nonzero classes appear: {classes:?}");
 }
 
+/// Retry breakdown, cross-flush summation: consecutive end-of-capture
+/// flushes accumulate — each flush merges into the cumulative totals
+/// before clearing, and reading the breakdown between flushes drains
+/// nothing.
+#[test]
+fn retry_breakdown_sums_across_consecutive_noise_flushes() {
+    let mut engine = Engine::empty();
+    engine.counters.noise.note_skip(
+        "process view",
+        "the process generation could not be retained: gone",
+    );
+    engine.report_discovery_noise();
+    let classes = engine.discovery_retry_classes();
+    assert_eq!(classes.get("process-view"), Some(&1));
+    assert_eq!(classes.len(), 1, "only nonzero classes appear: {classes:?}");
+    engine.counters.noise.note_skip(
+        "process view",
+        "the process generation could not be scanned: gone",
+    );
+    engine.counters.noise.note_skip(
+        "live discovery generation",
+        "candidate generation exited before mutation; canonical identity, plan, and links were unchanged",
+    );
+    engine.report_discovery_noise();
+    let classes = engine.discovery_retry_classes();
+    assert_eq!(classes.get("process-view"), Some(&2));
+    assert_eq!(classes.get("process-ended"), Some(&1));
+    assert_eq!(classes.len(), 2, "only nonzero classes appear: {classes:?}");
+}
+
 /// T4a helper: service collected Finish until the boxed graph reaches
 /// `phase`. Panics on the 30 s guard when the phase never arrives.
 fn drive_engine_graph_to_phase(

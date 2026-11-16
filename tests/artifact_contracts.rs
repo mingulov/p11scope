@@ -13264,6 +13264,129 @@ print("accepted")
     }
 }
 
+/// The retry-breakdown producer renders `evidence.discovery_retry_classes`,
+/// and the capture checker admits it: a real aggregated map — classified by
+/// the production noise classifier, serialized in the production shape —
+/// rides the checker's metrics and profile lanes through
+/// `exact_evidence_keys`, while malformed objects (an unknown label, a zero
+/// count, present-but-empty, null) are refused.
+#[test]
+fn rendered_retry_breakdown_satisfies_the_discovery_retry_consumer() {
+    use p11scope::discovery::noise::DiscoveryNoiseAggregator;
+    let mut noise = DiscoveryNoiseAggregator::default();
+    noise.note_skip(
+        "capture discovery",
+        "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot",
+    );
+    noise.note_skip(
+        "process view",
+        "the process generation could not be retained: gone",
+    );
+    noise.note_skip(
+        "process view",
+        "the process generation could not be scanned: gone",
+    );
+    noise.note_skip(
+        "live discovery generation",
+        "candidate generation exited before mutation; canonical identity, plan, and links were unchanged",
+    );
+    noise.note_skip(
+        "capture discovery",
+        "a discovery pass ended without a stated cause",
+    );
+    let rendered: BTreeMap<String, u64> = noise
+        .counts_by_label()
+        .into_iter()
+        .map(|(label, count)| (label.to_string(), count))
+        .collect();
+    assert_eq!(rendered.get("maps-snapshot"), Some(&1));
+    assert_eq!(rendered.get("process-view"), Some(&2));
+    assert_eq!(rendered.get("process-ended"), Some(&1));
+    assert_eq!(rendered.get("other"), Some(&1));
+    assert_eq!(
+        rendered.len(),
+        4,
+        "only nonzero classes appear: {rendered:?}"
+    );
+    let rendered = serde_json::to_value(&rendered).expect("breakdown serializes");
+
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("checker-retry-breakdown");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("breakdown.json");
+    fs::write(&path, serde_json::to_vec(&rendered).unwrap()).unwrap();
+
+    // The driver builds the checker's own fixtures, injects the
+    // Rust-rendered breakdown (or a mutation of it), and runs the real
+    // consumer lane in both document lanes.
+    let driver = r#"
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("checker", "scripts/check-capture-evidence.py")
+checker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(checker)
+rendered = json.load(open(sys.argv[1]))
+mode = sys.argv[2]
+def metrics_document():
+    evidence = checker.evidence_fixture(checker.LEGACY_SURFACES)
+    evidence.update(table_entries=68, slots=68, active_slots=68, attached_probes=136)
+    return checker.document_fixture(
+        evidence, schema=checker.METRICS_SCHEMA, mode="metrics", privacy="aggregate-only")
+def profile_document():
+    evidence = checker.evidence_fixture(checker.LEGACY_SURFACES)
+    evidence.update(table_entries=68, slots=68, active_slots=68, attached_probes=136)
+    return checker.document_fixture(evidence)
+breakdown = dict(rendered)
+if mode == "broken-label":
+    breakdown["bogus-label"] = 1
+elif mode == "broken-zero":
+    breakdown["other"] = 0
+elif mode == "broken-empty":
+    breakdown = {}
+elif mode == "broken-null":
+    breakdown = None
+elif mode != "sized" and mode != "absent":
+    raise AssertionError(f"unknown driver mode: {mode}")
+for lane in ("metrics", "profile"):
+    document = metrics_document() if lane == "metrics" else profile_document()
+    if mode != "absent":
+        document["evidence"]["discovery_retry_classes"] = breakdown
+    if lane == "metrics":
+        checker.exact_metrics_schema(document)
+    else:
+        checker.exact_profile_v3_selection(document)
+print("accepted")
+"#;
+    for mode in ["sized", "absent"] {
+        let accepted = Command::new("python3")
+            .args(["-c", driver])
+            .arg(&path)
+            .arg(mode)
+            .output()
+            .expect("running python3");
+        assert!(
+            accepted.status.success(),
+            "the checker refused a real rendered {mode} document:\n{}\n{}",
+            String::from_utf8_lossy(&accepted.stdout),
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&accepted.stdout).contains("accepted"),
+            "the {mode} driver run printed no acceptance marker",
+        );
+    }
+    for mode in ["broken-label", "broken-zero", "broken-empty", "broken-null"] {
+        let refused = Command::new("python3")
+            .args(["-c", driver])
+            .arg(&path)
+            .arg(mode)
+            .output()
+            .expect("running python3");
+        assert!(
+            !refused.status.success(),
+            "the checker accepted a {mode} discovery_retry_classes object",
+        );
+    }
+}
+
 /// Task 8 Step 2, "Freeze the consumer map explicitly": metrics and function
 /// attribution use capture aggregate owners; semantic attachment decisions use
 /// active topology; final evidence/discovery and module labels use sanitized

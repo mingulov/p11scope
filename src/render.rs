@@ -18520,6 +18520,55 @@ pub(crate) mod tests {
         assert!(!line.contains('\n'), "{line}");
     }
 
+    // Dominant retry class, ties: equal counts break toward the
+    // alphabetically first label, and zero counts never win — an
+    // all-zero map names no dominant class at all.
+    #[test]
+    fn coverage_line_verbose_breaks_retry_class_ties_alphabetically() {
+        let mut ev = evidence();
+        ev.skipped = vec![
+            SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            },
+            SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            },
+        ];
+        ev.discovery_retry_classes = BTreeMap::from([
+            ("maps-snapshot".to_string(), 0),
+            ("process-ended".to_string(), 5),
+            ("other".to_string(), 5),
+        ]);
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let verbose = coverage_line(&ev, true);
+        assert!(
+            verbose.contains("dominant retry class: other x5"),
+            "{verbose}"
+        );
+        // A six-way tie names the alphabetically first of all six labels.
+        ev.discovery_retry_classes = BTreeMap::from([
+            ("maps-snapshot".to_string(), 7),
+            ("object-missing".to_string(), 7),
+            ("other".to_string(), 7),
+            ("process-ended".to_string(), 7),
+            ("process-view".to_string(), 7),
+            ("stale-view".to_string(), 7),
+        ]);
+        let verbose = coverage_line(&ev, true);
+        assert!(
+            verbose.contains("dominant retry class: maps-snapshot x7"),
+            "{verbose}"
+        );
+        // An all-zero map names no dominant class at all.
+        ev.discovery_retry_classes =
+            BTreeMap::from([("maps-snapshot".to_string(), 0), ("other".to_string(), 0)]);
+        let verbose = coverage_line(&ev, true);
+        assert!(!verbose.contains("dominant retry class"), "{verbose}");
+    }
+
     // The JSON evidence carries the complete per-class retry breakdown,
     // and omits the key — never null — when discovery never retried.
     #[test]

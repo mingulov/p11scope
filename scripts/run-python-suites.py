@@ -79,6 +79,7 @@ RUN = [
     ("test_getter_manifest.py", []),
     ("test_h4a_prepost_userspace.py", ["--self-test"]),
     ("test_caller_reasons_overflow_oracle.py", []),
+    ("test_discovery_retry_classes_oracle.py", []),
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),
     ("test_canary_object.py", []),

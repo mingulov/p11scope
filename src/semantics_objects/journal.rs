@@ -14223,6 +14223,39 @@ pub(crate) mod tests {
         );
     }
 
+    /// R2 new-site: the wire→journal curve mapping is exact on all
+    /// seven codes — the three secp codes plus the four
+    /// Montgomery/Edwards codes. Swapping two codes must fail here,
+    /// not surface as a mislabeled curve downstream.
+    #[test]
+    fn object_journal_curve_codes_map_to_exact_curves() {
+        use p11scope_ebpf_common::object_policy::SafeCurve;
+        for (code, curve, name) in [
+            (1u16, SafeCurve::Secp256r1, "secp256r1"),
+            (2u16, SafeCurve::Secp384r1, "secp384r1"),
+            (3u16, SafeCurve::Secp521r1, "secp521r1"),
+            (4u16, SafeCurve::X25519, "x25519"),
+            (5u16, SafeCurve::X448, "x448"),
+            (6u16, SafeCurve::Ed25519, "ed25519"),
+            (7u16, SafeCurve::Ed448, "ed448"),
+        ] {
+            assert_eq!(
+                attribute_cell(6, 1, code),
+                AttrObservation::classified(
+                    Some(SafeAttributeKind::EcParams),
+                    QueryStatus::Established,
+                    Some(FieldValue::Curve(curve)),
+                ),
+                "wire curve code {code} decodes to {name}"
+            );
+        }
+        assert_eq!(
+            attribute_cell(6, 1, 8).status(),
+            QueryStatus::Unsupported,
+            "an out-of-range curve code retains nothing"
+        );
+    }
+
     #[test]
     fn object_journal_fork_child_birth_after_parent_h3_void_respects_fence() {
         use crate::semantics_objects::{Birth, FieldState, KeyLabel, Lifetime, ViewOrigin};

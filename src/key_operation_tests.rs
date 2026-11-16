@@ -732,6 +732,9 @@ struct ShapedS1 {
     /// Requested (creation-template) cells for pair 0 as (kind,
     /// status, value); empty leaves the zero list.
     request_cells: Vec<(u8, u8, u16)>,
+    /// Wire TRUNCATED bit on the pair-0 list: the template carried
+    /// more than the eight retained cells.
+    request_truncated: bool,
     /// KEM result (word, status) override (`None` = the healthy
     /// minted-output default).
     kem_result: Option<(u64, u8)>,
@@ -763,6 +766,7 @@ impl ShapedS1 {
             find_handles: None,
             getattr_cells: Vec::new(),
             request_cells: Vec::new(),
+            request_truncated: false,
             kem_result: None,
         }
     }
@@ -854,6 +858,9 @@ fn begin_for_call(scene: &JointScene, call: &ShapedS1, sequence: u64) -> [u8; 22
         }
         begin[160] = call.request_cells.len() as u8;
         begin[161] = 1;
+        if call.request_truncated {
+            begin[161] |= 2;
+        }
     }
     begin
 }
@@ -24955,9 +24962,15 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
     );
     // Keymeta §6/K5: every v6 metadata field carries the per-field
     // `source` key beside status/value; the frozen v1–v5 field shape
-    // is unchanged.
+    // is unchanged. Controller KEYMETA-T1 rulings 2026-11-16, ruling
+    // 2: every v6 metadata field also carries the per-field `reason`
+    // key, naming why an unseen field stays unknown on a truncated
+    // template (null everywhere else).
     assert_eq!(FIELD_KEYS.to_vec(), vec!["status", "value"]);
-    assert_eq!(FIELD_KEYS_V6.to_vec(), vec!["status", "value", "source"]);
+    assert_eq!(
+        FIELD_KEYS_V6.to_vec(),
+        vec!["status", "value", "source", "reason"]
+    );
     for def in [
         "metadata_field_class",
         "metadata_field_key_type",
@@ -24970,7 +24983,7 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
         assert_eq!(
             required(&format!("/$defs/{def}/required")),
             sorted(FIELD_KEYS_V6.iter().map(|key| key.to_string()).collect()),
-            "{def}: v6 fields require status, value and source"
+            "{def}: v6 fields require status, value, source and reason"
         );
         assert_eq!(
             names(&format!("/$defs/{def}/properties/source/enum")),
@@ -24986,6 +24999,21 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
                 .len(),
             3,
             "{def}: the source enum admits null beside the two provenances"
+        );
+        assert_eq!(
+            names(&format!("/$defs/{def}/properties/reason/enum")),
+            vec!["template truncated (first 8 attributes captured)".to_string()],
+            "{def}: the reason enum is exactly the truncation reason"
+        );
+        assert_eq!(
+            schema
+                .pointer(&format!("/$defs/{def}/properties/reason/enum"))
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .len(),
+            2,
+            "{def}: the reason enum admits null beside the reason"
         );
     }
     // The v6 tables extend their frozen parents by exactly the
@@ -25215,6 +25243,430 @@ fn key_operation_newsite_version_follows_content() {
                 keys,
                 vec!["status".to_string(), "value".to_string()],
                 "v1 {block}.{field} stays byte-stable without source"
+            );
+        }
+    }
+}
+
+/// Keymeta §6 Edwards/Montgomery join (controller KEYMETA-T1 rulings
+/// 2026-11-16, ruling 1), end to end: a private Montgomery key
+/// created with the X25519 curve label in-window renders `x25519`
+/// on its object view and key row at section v6.
+#[test]
+fn key_operation_newsite_montgomery_labels_end_to_end() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x41), (6u8, 1u8, 4u16)],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    assert_eq!(
+        section["objects"][0]["label"], "x25519",
+        "the created Montgomery view labels without a query"
+    );
+    assert_eq!(
+        section["key_operations"][0]["metadata_at_use"], "x25519",
+        "the key row carries the Montgomery label"
+    );
+    assert_eq!(
+        section["objects"][0]["established"]["ec_params"]["value"], "x25519",
+    );
+    assert_eq!(
+        section["objects"][0]["established"]["ec_params"]["source"], "creation_success",
+        "the promoted curve carries its source"
+    );
+}
+
+/// Keymeta §6/K5 source twin: requested blocks never carry a
+/// source — on every field, at section v6, even beside promoted
+/// established facts.
+#[test]
+fn key_operation_newsite_requested_block_sources_stay_null() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::object_observations_json;
+    use crate::semantics_key_use::KeyUseReducer;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1f), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    for field in [
+        "class",
+        "key_type",
+        "token",
+        "value_len",
+        "modulus_bits",
+        "ec_params",
+        "parameter_set",
+    ] {
+        assert!(
+            section["objects"][0]["requested"][field]["source"].is_null(),
+            "{field}: a requested fact never carries a source"
+        );
+    }
+}
+
+/// Keymeta §6 trigger twin: a query-established new-site curve name
+/// trips section v6 by content, with no label and no
+/// `creation_success` source anywhere.
+#[test]
+fn key_operation_newsite_curve_name_triggers_v6_without_label() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(6u8, 1u8, 4u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    assert!(
+        section["objects"][0]["label"].is_null(),
+        "a curve without a key type never labels"
+    );
+    assert_eq!(
+        section["objects"][0]["established"]["ec_params"]["value"], "x25519",
+    );
+    assert_eq!(
+        section["objects"][0]["established"]["ec_params"]["source"], "query",
+    );
+}
+
+/// Keymeta §6 trigger twin: requested-only new-site content trips
+/// section v6. Duplicating conflicting sizes promote nothing (no
+/// established value, no source anywhere), but the requested 12
+/// still counts as new-site content.
+#[test]
+fn key_operation_newsite_requested_conflict_triggers_v6_without_source() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![
+                (1u8, 1u8, 4u16),
+                (1u8, 1u8, 3u16),
+                (2u8, 1u8, 0x1f),
+                (2u8, 1u8, 0x00),
+                (4u8, 1u8, 12u16),
+                (4u8, 1u8, 16u16),
+            ],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    assert_eq!(
+        section["objects"][0]["requested"]["value_len"]["status"], "conflict",
+        "the duplicating sizes conflict in the requested block"
+    );
+    assert_eq!(
+        section["objects"][0]["requested"]["value_len"]["value"], 12,
+    );
+    for block in ["requested", "established"] {
+        for field in [
+            "class",
+            "key_type",
+            "token",
+            "value_len",
+            "modulus_bits",
+            "ec_params",
+            "parameter_set",
+        ] {
+            assert!(
+                section["objects"][0][block][field]["source"].is_null(),
+                "{block}.{field}: a conflict promotes no source"
+            );
+        }
+    }
+    assert!(
+        section["objects"][0]["label"].is_null(),
+        "a conflicted template never labels"
+    );
+}
+
+/// Keymeta truncated creation templates (controller KEYMETA-T1
+/// rulings 2026-11-16, ruling 2), end to end: the wire TRUNCATED
+/// bit reaches promotion; the eight observed cells still promote,
+/// while the unseen size stays unknown with the named truncation
+/// reason in both blocks. A seen-but-never-promoted slot (TOKEN)
+/// carries no reason: its unknown-ness has its own rule.
+#[test]
+fn key_operation_newsite_truncated_template_marks_unseen_size() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    const TRUNCATED: &str = "template truncated (first 8 attributes captured)";
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![
+                (1u8, 1u8, 4u16),
+                (2u8, 1u8, 0x1f),
+                (3u8, 1u8, 1u16),
+                (5u8, 1u8, 2048u16),
+                (6u8, 1u8, 1u16),
+                (7u8, 1u8, 2u16),
+                (1u8, 1u8, 4u16),
+                (2u8, 1u8, 0x1f),
+            ],
+            request_truncated: true,
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    let established = &section["objects"][0]["established"];
+    let requested = &section["objects"][0]["requested"];
+    for field in ["class", "key_type", "modulus_bits", "ec_params", "parameter_set"] {
+        assert_eq!(
+            established[field]["status"], "value",
+            "{field}: the observed cell still promotes"
+        );
+        assert_eq!(
+            established[field]["source"], "creation_success",
+            "{field}: the observed cell carries its source"
+        );
+        assert!(
+            established[field]["reason"].is_null(),
+            "{field}: a seen field carries no truncation reason"
+        );
+    }
+    for (block, cells) in [("requested", requested), ("established", established)] {
+        assert_eq!(
+            cells["value_len"]["status"], "unknown",
+            "{block}: the tail size stays unknown"
+        );
+        assert_eq!(
+            cells["value_len"]["reason"], TRUNCATED,
+            "{block}: the unseen size names the truncation"
+        );
+    }
+    assert_eq!(
+        established["token"]["status"], "unknown",
+        "TOKEN still never promotes"
+    );
+    assert!(
+        established["token"]["reason"].is_null(),
+        "a seen-but-never-promoted slot carries no truncation reason"
+    );
+    assert!(
+        section["objects"][0]["label"].is_null(),
+        "an AES key without its size never labels"
+    );
+}
+
+/// Keymeta truncated creation templates (controller KEYMETA-T1
+/// rulings 2026-11-16, ruling 2): truncation itself is v6 content.
+/// Nothing here promotes (every observed cell conflicts), labels,
+/// or carries a source — the section still renders v6 so the
+/// truncation reasons are never silently dropped.
+#[test]
+fn key_operation_newsite_truncation_alone_triggers_v6() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    const TRUNCATED: &str = "template truncated (first 8 attributes captured)";
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![
+                (1u8, 1u8, 4u16),
+                (1u8, 1u8, 3u16),
+                (2u8, 1u8, 0x1f),
+                (2u8, 1u8, 0x00),
+                (3u8, 1u8, 1u16),
+                (3u8, 1u8, 0u16),
+                (5u8, 1u8, 2048u16),
+                (5u8, 1u8, 1024u16),
+            ],
+            request_truncated: true,
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V6
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    assert!(
+        section["objects"][0]["label"].is_null(),
+        "nothing labels without a promoted fact"
+    );
+    for block in ["requested", "established"] {
+        for field in [
+            "class",
+            "key_type",
+            "token",
+            "value_len",
+            "modulus_bits",
+            "ec_params",
+            "parameter_set",
+        ] {
+            assert!(
+                section["objects"][0][block][field]["source"].is_null(),
+                "{block}.{field}: nothing promotes, so no source exists"
+            );
+        }
+    }
+    for block in ["requested", "established"] {
+        for field in ["value_len", "ec_params", "parameter_set"] {
+            assert_eq!(
+                section["objects"][0][block][field]["reason"], TRUNCATED,
+                "{block}.{field}: the unseen field names the truncation"
+            );
+        }
+        for field in ["class", "key_type", "token", "modulus_bits"] {
+            assert!(
+                section["objects"][0][block][field]["reason"].is_null(),
+                "{block}.{field}: a seen (conflicting) field carries no reason"
             );
         }
     }

@@ -4003,6 +4003,22 @@ impl AttachPlan {
         {
             return false;
         }
+        // Fallback diagnostics, fixed at entry: what merge charged against
+        // what the extension needs, so a merge/extend disagreement reads as
+        // a diagnosed fallback instead of an ordinary refusal.
+        let (_, _, extend_additions) = prior.reuse_assignments(self);
+        let merge_additions = self
+            .slot_by_key
+            .keys()
+            .filter(|key| !prior.slot_by_key.contains_key(key) && !self.reclaimed.contains_key(key))
+            .count();
+        let lifetime = prior.slots.len().saturating_add(extend_additions);
+        let marker = format!(
+            "; extend fallback fired: merge charged {merge_additions} additions in a {}-slot snapshot; \
+             extend needs {extend_additions} additions in {lifetime} of {} lifetime slots",
+            self.slots.len(),
+            prior.admission_policy.endpoint_limit(),
+        );
         loop {
             if prior.validate_extension_capacity(self).is_ok() {
                 return true;
@@ -4010,7 +4026,7 @@ impl AttachPlan {
             let Some(victim) = prior.overflow_victim(self) else {
                 return false;
             };
-            self.shed_overflow_victim(prior, victim);
+            self.shed_overflow_victim(prior, victim, &marker);
         }
     }
 
@@ -4077,7 +4093,7 @@ impl AttachPlan {
     /// gap. Solely-owned fresh cells go back and the snapshot is
     /// renumbered; shared fresh cells stay for their surviving owners
     /// with the victim stripped from them.
-    fn shed_overflow_victim(&mut self, prior: &Self, object: PinnedObjectId) {
+    fn shed_overflow_victim(&mut self, prior: &Self, object: PinnedObjectId, marker: &str) {
         let prior_keys: BTreeSet<AttachKey> = prior.slot_by_key.keys().copied().collect();
         let (migrated, reclaimed, _) = prior.reuse_assignments(self);
         let victim_ids: BTreeSet<ModuleId> = self
@@ -4164,7 +4180,7 @@ impl AttachPlan {
         let reserve = (leaves_reserve && (shared || churn)).then(|| shared_scope_reserve(capacity));
         if kept == 0 {
             let holders = slot_holders(&holding, &paths);
-            let reason = CapacityRefusal {
+            let mut reason = CapacityRefusal {
                 policy: self.admission_policy,
                 needed: fresh,
                 capacity,
@@ -4180,6 +4196,7 @@ impl AttachPlan {
                 broad_admit: false,
             }
             .reason();
+            reason.push_str(marker);
             let skipped = Skipped {
                 subject: path,
                 reason,
@@ -4239,19 +4256,21 @@ impl AttachPlan {
         } else {
             let is_closure = victim_class == Some(AdmissionClass::ClosureArray.label());
             let holders = slot_holders(&holding, &paths);
+            let mut reason = growth_omission_reason(&GrowthOmission {
+                omitted: fresh,
+                capacity,
+                in_use,
+                retired,
+                kept,
+                policy: self.admission_policy,
+                holders: &holders,
+                provider_remedies: !is_closure,
+                counter_hint: self.counter_hint,
+            });
+            reason.push_str(marker);
             let omission = Skipped {
                 subject: path,
-                reason: growth_omission_reason(&GrowthOmission {
-                    omitted: fresh,
-                    capacity,
-                    in_use,
-                    retired,
-                    kept,
-                    policy: self.admission_policy,
-                    holders: &holders,
-                    provider_remedies: !is_closure,
-                    counter_hint: self.counter_hint,
-                }),
+                reason,
             };
             self.refused_module_objects.push((
                 object,

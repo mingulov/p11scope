@@ -5916,6 +5916,23 @@ fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
     }
 }
 
+/// Whether a failed `/proc/<pid>/mem` open proves the process is gone, so
+/// the scan takes the exited error path instead of latching a global
+/// `scan_unavailable`. `ESRCH`/`ENOENT` prove the pid named no process at
+/// open time; anything else (wrapped validation failures such as
+/// cold-filesystem exit churn, which carry no errno) is re-proven fresh
+/// from the pid via `generation_dead`. Reuse-safe: a live pid — the
+/// original generation or a reused one — keeps its loud refusal. Reaching
+/// this site proves `/proc` access worked moments ago (maps were just
+/// read, or cold was just proven), so a fresh `NotFound` is a genuine
+/// exit rather than a `hidepid` artifact.
+fn mem_open_exited(pid: u32, error: &std::io::Error) -> bool {
+    if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+        return true;
+    }
+    crate::process::generation_dead(pid)
+}
+
 fn capture_scan_reason(reason: &str) -> bool {
     matches!(
         reason,
@@ -7645,16 +7662,17 @@ fn scan_view_examined_mode(
                 )));
             }
         };
-        // `ESRCH` from `/proc/<pid>/mem` proves the process exited between
-        // the maps read and the mem open: the pid names no process. That is
-        // the ordinary end of a process — already counted via the exit ledger
-        // (descendant gaps) — never a memory-unreadable loss, so the scan
-        // takes the exited error path (the engine drops the view silently,
-        // like a pid that exited before discovery) instead of latching a
-        // global `scan_unavailable`. A short-lived child exiting mid-scan
-        // must not fail a never-mapped cell.
+        // A mem open that proves the process is gone takes the exited
+        // error path (the engine drops the view silently, like a pid that
+        // exited before discovery) instead of latching a global
+        // `scan_unavailable`: the ordinary end of a process is already
+        // counted via the exit ledger (descendant gaps), never a
+        // memory-unreadable loss. A short-lived child exiting mid-scan —
+        // reaped (`ENOENT`), zombie (`ESRCH`), or churning through the
+        // cold-filesystem exit states — must not fail a never-mapped
+        // cell, while a live pid's refusal stays loud.
         if let Err(error) = &mem
-            && error.raw_os_error() == Some(libc::ESRCH)
+            && mem_open_exited(pid, error)
         {
             return Err(exited_before_discovery(pid));
         }
@@ -11289,46 +11307,43 @@ mod tests {
         );
     }
 
-    /// A child that exits between the maps read and the mem open surfaces
-    /// `ESRCH` from `/proc/<pid>/mem`. That is the ordinary end of a
-    /// process, already counted via the exit ledger (descendant gaps) —
-    /// not a memory-unreadable loss. The scan returns the exited error
-    /// so the engine drops the view silently instead of latching a
-    /// global `scan_unavailable` that would fail never-mapped cells.
-    #[test]
-    fn mem_esrch_mid_scan_takes_the_exited_path_not_unavailable() {
-        struct EsrchMemIo {
-            maps: Vec<u8>,
+    /// Scripted maps plus one scripted `/proc/<pid>/mem` errno, for the
+    /// mid-scan mem-failure tests below.
+    struct MemErrnoFixture {
+        maps: Vec<u8>,
+        mem_errno: i32,
+    }
+    impl ScanIo for MemErrnoFixture {
+        type Memory = File;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
         }
-        impl ScanIo for EsrchMemIo {
-            type Memory = File;
-            fn open_maps(
-                &mut self,
-                _: &ProcessView,
-                _: &mut CaptureWorkBudget,
-            ) -> std::io::Result<Box<dyn Read>> {
-                Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
-            }
-            fn open_mem(
-                &mut self,
-                _: &ProcessView,
-                _: &mut CaptureWorkBudget,
-            ) -> std::io::Result<File> {
-                Err(std::io::Error::from_raw_os_error(libc::ESRCH))
-            }
-            fn final_generation(
-                &mut self,
-                view: &ProcessView,
-                _: &mut CaptureWorkBudget,
-            ) -> Result<(), String> {
-                view.run_while_same(|| ())
-            }
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<File> {
+            Err(std::io::Error::from_raw_os_error(self.mem_errno))
         }
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+    }
+
+    fn scan_own_view_with_mem_errno(mem_errno: i32) -> Result<ScanOutcome, String> {
         let pid = std::process::id();
         let view = ProcessView::open(ProcessViewId(0), pid).expect("own view opens");
         let maps = b"00400000-00401000 r--p 00000000 08:01 1234 /bin/true\n".to_vec();
-        let mut io = EsrchMemIo { maps };
-        let result = scan_process_view_with_io(
+        let mut io = MemErrnoFixture { maps, mem_errno };
+        scan_process_view_with_io(
             &ScanRequest {
                 pid,
                 hints: &[],
@@ -11337,12 +11352,89 @@ mod tests {
             &view,
             &mut CaptureWorkBudget::default(),
             &mut io,
-        );
+        )
+    }
+
+    /// A child that exits between the maps read and the mem open surfaces
+    /// `ESRCH` from `/proc/<pid>/mem`. That is the ordinary end of a
+    /// process, already counted via the exit ledger (descendant gaps) —
+    /// not a memory-unreadable loss. The scan returns the exited error
+    /// so the engine drops the view silently instead of latching a
+    /// global `scan_unavailable` that would fail never-mapped cells.
+    #[test]
+    fn mem_esrch_mid_scan_takes_the_exited_path_not_unavailable() {
+        let pid = std::process::id();
+        let result = scan_own_view_with_mem_errno(libc::ESRCH);
         let error = result.expect_err("ESRCH mem must take the exited path, not Unavailable");
         assert!(
             error.contains(&format!("pid {pid} exited before discovery")),
             "{error}"
         );
+    }
+
+    /// A child reaped between the maps read and the mem open surfaces
+    /// `ENOENT`: no `/proc/<pid>` entry at all. Same ordinary end as
+    /// `ESRCH` above, same exited path.
+    #[test]
+    fn mem_enoent_mid_scan_takes_the_exited_path_not_unavailable() {
+        let pid = std::process::id();
+        let result = scan_own_view_with_mem_errno(libc::ENOENT);
+        let error = result.expect_err("ENOENT mem must take the exited path, not Unavailable");
+        assert!(
+            error.contains(&format!("pid {pid} exited before discovery")),
+            "{error}"
+        );
+    }
+
+    /// Guard against over-suppression: a mem failure that proves no exit
+    /// on a live view stays a loud `Unavailable`, never the silent
+    /// exited path.
+    #[test]
+    fn mem_eio_on_a_live_view_stays_unavailable() {
+        let result = scan_own_view_with_mem_errno(libc::EIO);
+        let outcome = result.expect("EIO mem on a live view must stay Unavailable, not Err");
+        assert_eq!(
+            outcome.unavailable_reason(),
+            Some("unreadable"),
+            "EIO mem must stay loud: {outcome:?}"
+        );
+    }
+
+    /// `mem_open_exited` decides from the strongest proof available: the
+    /// open errno first, then a fresh pid read. `u32::MAX` never names a
+    /// process, so it stands in for a dead pid deterministically.
+    #[test]
+    fn mem_open_exited_proves_exit_from_errno_or_fresh_pid_read() {
+        use std::io::Error;
+        let live = std::process::id();
+        let dead = u32::MAX;
+        // Errno proof needs no pid read: `ESRCH`/`ENOENT` mean gone even
+        // for a pid that is alive now (reuse after the open failed).
+        assert!(mem_open_exited(
+            live,
+            &Error::from_raw_os_error(libc::ESRCH)
+        ));
+        assert!(mem_open_exited(
+            live,
+            &Error::from_raw_os_error(libc::ENOENT)
+        ));
+        // Wrapped validation failures (cold-filesystem exit churn) carry
+        // no errno: the fresh pid read decides.
+        let churn = "cold process task census contains an unproven or exiting member";
+        assert!(mem_open_exited(dead, &Error::other(churn)));
+        assert!(!mem_open_exited(live, &Error::other(churn)));
+        // Ordinary refusals on a live pid stay loud, and prove exit on a
+        // dead one (the refusal fired microseconds before the exit).
+        assert!(!mem_open_exited(
+            live,
+            &Error::from_raw_os_error(libc::EACCES)
+        ));
+        assert!(!mem_open_exited(live, &Error::from_raw_os_error(libc::EIO)));
+        assert!(mem_open_exited(
+            dead,
+            &Error::from_raw_os_error(libc::EACCES)
+        ));
+        assert!(mem_open_exited(dead, &Error::from_raw_os_error(libc::EIO)));
     }
 
     #[test]

@@ -4184,12 +4184,8 @@ fn semantic_receipt_query_refusal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 impl AttachedSemanticSet {
-    /// `switched` names the slots whose `SLOT_COUNT_ONLY` cell reads
-    /// set: a retained slot narrowed to count-only on its live link
-    /// keeps validating exactly on those. Seal-time callers pass an
-    /// empty set (no downgrade could have committed before the seal).
-    #[allow(clippy::too_many_arguments)]
     fn validate_with(
         &self,
         domain: crate::attach::capture::NativeDomainId,
@@ -4200,6 +4196,10 @@ impl AttachedSemanticSet {
         watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
         switched: &BTreeSet<u32>,
     ) -> std::result::Result<(), crate::inventory_semantics::SemanticRefusal> {
+        // `switched` names the slots whose `SLOT_COUNT_ONLY` cell reads
+        // set: a retained slot narrowed to count-only on its live link
+        // keeps validating exactly on those. Seal-time callers pass an
+        // empty set (no downgrade could have committed before the seal).
         use crate::inventory_semantics::SemanticRefusal;
         if domain != self.domain || policy != CapturePolicy::Allowlisted {
             return Err(SemanticRefusal::Attachment);

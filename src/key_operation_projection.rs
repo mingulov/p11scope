@@ -57,10 +57,24 @@ pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
 /// The named reason an unseen metadata field carries at v6 when its
 /// creation template carried more than the eight observed cells
 /// (controller KEYMETA-T1 rulings 2026-11-16, ruling 2). The closed
-/// reason vocabulary has this one member; every other field carries
-/// null.
+/// reason vocabulary has three members (fix round 3); every other
+/// field carries null.
 pub(crate) const TRUNCATED_TEMPLATE_REASON: &str =
     "template truncated (first 8 attributes captured)";
+/// The named reason a seen-but-unclassifiable metadata field carries
+/// at v6: the kind appeared in the retained window with a value
+/// outside the approved finite set (or an unavailable, malformed or
+/// size-only cell). Never the truncation reason, which is reserved
+/// for fields never seen.
+pub(crate) const UNSUPPORTED_TEMPLATE_VALUE_REASON: &str =
+    "template value outside approved finite set";
+/// The named reason an Edwards/Montgomery curve field carries at v6
+/// when its key type stays unlabeled: the established curve is
+/// mismatched for the key type, or no curve was established on a
+/// complete template (controller KEYMETA-T1 rulings 2026-11-16,
+/// ruling 1). On truncated templates the truncation reason keeps
+/// precedence for unseen curves.
+pub(crate) const CURVE_UNUSABLE_REASON: &str = "curve unusable for key type";
 /// The metadata label of a first-observed key at use: its identity
 /// and counts are proved, its type/size are not (first seen before
 /// attach). Frozen v4 vocabulary; never a guessed label.
@@ -554,10 +568,10 @@ impl ObsStatus {
 /// one of `scalar` / `curve` applies per field kind. `source` names
 /// the proof behind an established value (`query` or
 /// `creation_success`); it renders only at section version 6+ and is
-/// `None` for every other state. `reason` names why an unseen field
-/// stays unknown on a truncated creation template (the closed
-/// one-member vocabulary); it renders only at v6+ and is `None` for
-/// every seen field.
+/// `None` for every other state. `reason` names why a field stays
+/// unknown — or, for a mismatched Edwards/Montgomery curve, why its
+/// key type stays unlabeled (the closed three-member vocabulary); it
+/// renders only at v6+ and is `None` for every other field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataField {
     pub status: &'static str,
@@ -1104,7 +1118,9 @@ fn has_pqc_content(observations: &ObjectObservations) -> bool {
 /// source (a view carrying `creation_success` emits v6, never v7) —
 /// or, controller KEYMETA-T1 rulings 2026-11-16 ruling 2, any view
 /// created from a truncated template (so its truncation reasons are
-/// never silently dropped below v6).
+/// never silently dropped below v6) — or, fix round 3, any
+/// unsupported-value or unusable-curve reason (so those reasons are
+/// never silently dropped on complete templates).
 fn has_newsite_content(observations: &ObjectObservations) -> bool {
     if observations
         .key_operations
@@ -1123,8 +1139,30 @@ fn has_newsite_content(observations: &ObjectObservations) -> bool {
                         .scalar
                         .is_some_and(|scalar| scalar == 12 || scalar == 48)
                     || block.ec_params.curve.is_some_and(is_newsite_curve_name)
+                    || block_has_fix3_reason(block)
             })
             || block_has_creation_source(&row.established)
+    })
+}
+
+/// Whether any field of one block carries an unsupported-value or
+/// unusable-curve reason (fix round 3): v6 content on its own, so the
+/// reason never silently drops below v6.
+fn block_has_fix3_reason(block: &MetadataBlock) -> bool {
+    [
+        block.class,
+        block.key_type,
+        block.token,
+        block.value_len,
+        block.modulus_bits,
+        block.ec_params,
+        block.parameter_set,
+    ]
+    .iter()
+    .any(|field| {
+        field.reason.is_some_and(|reason| {
+            reason == UNSUPPORTED_TEMPLATE_VALUE_REASON || reason == CURVE_UNUSABLE_REASON
+        })
     })
 }
 
@@ -1622,6 +1660,19 @@ pub(crate) mod producer {
     }
 
     fn object_row(view: &ObjectView) -> ObjectRow {
+        let mut requested = metadata_block(
+            &view.requested,
+            &view.requested,
+            view.creation_truncated,
+            &view.creation_seen,
+        );
+        let mut established = metadata_block(
+            &view.established,
+            &view.requested,
+            view.creation_truncated,
+            &view.creation_seen,
+        );
+        apply_curve_reason(view, &mut requested, &mut established);
         ObjectRow {
             object: view.id.as_u64(),
             session: view.session.as_u64(),
@@ -1664,12 +1715,8 @@ pub(crate) mod producer {
                 Attribution::Downgraded(reason) => Some(gap_label(reason)),
                 Attribution::Valid => None,
             },
-            requested: metadata_block(&view.requested, &view.requested, view.creation_truncated),
-            established: metadata_block(
-                &view.established,
-                &view.requested,
-                view.creation_truncated,
-            ),
+            requested,
+            established,
             queries: QueriesBlock {
                 class: query_label(view.queries[field_index(SafeAttributeKind::Class)]),
                 key_type: query_label(view.queries[field_index(SafeAttributeKind::KeyType)]),
@@ -1695,12 +1742,18 @@ pub(crate) mod producer {
         view: &MetadataView,
         requested: &MetadataView,
         truncated: bool,
+        seen: &[bool; crate::semantics_objects::METADATA_FIELDS],
     ) -> MetadataBlock {
-        let field = |kind| {
+        let field = |kind: SafeAttributeKind| {
             metadata_field(
                 view.field(kind),
                 view.source(kind),
-                unknown_reason(view.field(kind), requested.field(kind), truncated),
+                unknown_reason(
+                    view.field(kind),
+                    requested.field(kind),
+                    truncated,
+                    seen[field_index(kind)],
+                ),
             )
         };
         MetadataBlock {
@@ -1714,23 +1767,78 @@ pub(crate) mod producer {
         }
     }
 
-    /// The truncation reason for one field: only an unknown field on
-    /// a truncated-template view whose request was never seen either
-    /// names the truncation. A seen field — valued, conflicting,
-    /// invalidated, or requested-but-never-promoted like TOKEN —
-    /// carries no reason: its state has its own rule.
+    /// The unknown reason for one field: a seen-but-valueless kind
+    /// names the unsupported reason (fix round 3); a never-seen kind
+    /// on a truncated-template view names the truncation. A field
+    /// with a state — valued, conflicting, invalidated, or
+    /// requested-but-never-promoted like TOKEN — carries no reason:
+    /// its state has its own rule.
     fn unknown_reason(
         state: FieldState,
         requested: FieldState,
         truncated: bool,
+        seen: bool,
     ) -> Option<&'static str> {
-        if truncated
-            && matches!(state, FieldState::Unknown)
-            && matches!(requested, FieldState::Unknown)
-        {
+        if !matches!(state, FieldState::Unknown) || !matches!(requested, FieldState::Unknown) {
+            return None;
+        }
+        if seen {
+            Some(UNSUPPORTED_TEMPLATE_VALUE_REASON)
+        } else if truncated {
             Some(TRUNCATED_TEMPLATE_REASON)
         } else {
             None
+        }
+    }
+
+    /// The Edwards/Montgomery curve reason (fix round 3, ruling 1): a
+    /// mismatched established curve names the curve reason on the
+    /// established curve field only (the requested curve is merely
+    /// requested, never a label fact); an unestablished curve on a
+    /// complete template with no curve seen names it in both blocks.
+    /// Truncation keeps precedence for unseen curves on truncated
+    /// templates, and the unsupported reason keeps precedence for
+    /// seen-but-valueless curves; matched curves on incompatible
+    /// classes, conflicts and non-Edwards/Montgomery types carry none.
+    fn apply_curve_reason(
+        view: &ObjectView,
+        requested: &mut MetadataBlock,
+        established: &mut MetadataBlock,
+    ) {
+        if view.label.is_some() {
+            return;
+        }
+        let key_type = match view.established.field(SafeAttributeKind::KeyType) {
+            FieldState::Value(FieldValue::Scalar(key_type))
+                if key_type == 0x40 || key_type == 0x41 =>
+            {
+                key_type
+            }
+            _ => return,
+        };
+        match view.established.field(SafeAttributeKind::EcParams) {
+            FieldState::Value(FieldValue::Curve(curve)) => {
+                let matched = matches!(
+                    (key_type, curve),
+                    (0x40, SafeCurve::Ed25519 | SafeCurve::Ed448)
+                        | (0x41, SafeCurve::X25519 | SafeCurve::X448)
+                );
+                if !matched {
+                    established.ec_params.reason = Some(CURVE_UNUSABLE_REASON);
+                }
+            }
+            FieldState::Unknown
+                if !view.creation_truncated
+                    && !view.creation_seen[field_index(SafeAttributeKind::EcParams)]
+                    && matches!(
+                        view.requested.field(SafeAttributeKind::EcParams),
+                        FieldState::Unknown
+                    ) =>
+            {
+                requested.ec_params.reason = Some(CURVE_UNUSABLE_REASON);
+                established.ec_params.reason = Some(CURVE_UNUSABLE_REASON);
+            }
+            _ => {}
         }
     }
 

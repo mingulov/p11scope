@@ -1206,10 +1206,13 @@ never imply S1 loss.
   or a successful creation return promoting its own finite
   template; an established `value` always carries `query` or
   `creation_success`, while requested blocks and every non-`value`
-  status carry null), plus `reason` at version 6 (the truncation
-  reason or null: `template truncated (first 8 attributes
-  captured)` on unknown fields whose creation template carried
-  more than the eight observed cells; null for every seen field).
+  status carry null), plus `reason` at version 6 (one of three
+  closed reasons or null: `template truncated (first 8 attributes
+  captured)` on unknown fields never seen on a truncated template,
+  `template value outside approved finite set` on kinds seen with an
+  unclassifiable value, `curve unusable for key type` on a mismatched
+  or — on a complete template — unestablished Edwards/Montgomery
+  curve; null for every other field).
   A `value` carries the accepted numeric code or null: class 0-4,
   key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at version 6;
   73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–6; OASIS
@@ -1226,8 +1229,9 @@ never imply S1 loss.
   still never label); conflicting duplicates stay conflicts, never
   last-writer-wins. A creation template beyond eight slots still
   promotes its observed cells; fields past the observed window stay
-  unknown with the truncation reason, and nothing is inferred from
-  the unobserved tail.
+  unknown with the truncation reason, kinds seen with an
+  unclassifiable value stay unknown with the unsupported reason, and
+  nothing is inferred from the unobserved tail.
 - `queries` holds the per-field latest query outcome (`not_queried`,
   `established`, `unavailable`, `size_only`, `unsupported`,
   `malformed`, `excluded`), distinct from current validity, over
@@ -1249,7 +1253,9 @@ never imply S1 loss.
   Edwards label joins an established ed25519/ed448 curve with the
   `ec_edwards` key type, a Montgomery label an established
   x25519/x448 curve with the `ec_montgomery` key type, from the same
-  view; mismatched or unestablished curves stay unlabeled. A PQC label joins an established
+  view; mismatched or unestablished curves stay unlabeled with the
+  curve reason on the curve field in JSON and its count in verbose
+  text. A PQC label joins an established
   parameter-set code with the established key type from the same
   view; a code alone, a type alone, or a recognized mechanism never
   labels. `unknown` is a key-row label only, never a view label.

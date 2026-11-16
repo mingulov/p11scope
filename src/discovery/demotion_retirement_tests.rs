@@ -8201,3 +8201,964 @@ fn demotion_retirement_round5_folded_state_has_memory_rows() {
         "no mechanism rows folded without claims"
     );
 }
+
+/// Fix round 6, blocking 1: a Dropped pair with a live recovery naming
+/// the folded caller must settle at the fold (gap + remove), never
+/// suspend into a live target naming the folded caller. Place, drop
+/// via the rejected-row path (which leaves the recovery, like
+/// production), fold, service: no Suspended names the folded caller,
+/// the dropped base prunes into the exact totals, and a revival
+/// attributes exactly new minus base.
+#[test]
+fn demotion_retirement_round6_dropped_pair_recovery_settles_at_fold() {
+    use crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED;
+    let mut scene = Scene::shared();
+    let folded = scene.caller;
+    let coordinator = &mut scene.native.scene.coordinator;
+    let key = coordinator
+        .recoveries
+        .keys()
+        .next()
+        .copied()
+        .expect("the shared scene places one pair with a recovery");
+    assert!(
+        matches!(
+            coordinator.pair_targets.get(&key),
+            Some(
+                PairTarget::Bound { caller, .. }
+                    | PairTarget::Pending { caller, .. }
+                    | PairTarget::Suspended { caller, .. }
+            ) if *caller == folded
+        ),
+        "the placed pair targets the caller before the drop"
+    );
+    let watermark = coordinator.recoveries[&key].watermark;
+    // A newer held absolute the recovery has not yet accounted: staged
+    // only (no commit), so the watermark stays behind and the drop
+    // base diverges from it — the realistic distinct-quantity case.
+    scene
+        .native
+        .counts_read(Vec::new(), vec![(41, 1, 0, watermark.saturating_add(3))]);
+    // A later rejected row for the same pair drops through the
+    // production drop path, which preserves the recovery (the
+    // precondition the fold must settle).
+    let row = scene.native.row(41, 1, 7, 300, 0);
+    assert_eq!(
+        PairKey::of(&row),
+        key,
+        "the rejected row names the placed pair"
+    );
+    let base = scene
+        .native
+        .scene
+        .coordinator
+        .drop_pair_count(&row, crate::inventory_diagnostics::DiagnosticReason::NotAdmitted);
+    let coordinator = &scene.native.scene.coordinator;
+    assert!(
+        matches!(
+            coordinator.pair_targets.get(&key),
+            Some(PairTarget::Dropped { base: dropped, .. }) if *dropped == base
+        ),
+        "the rejected row drops the pair with its staged absolute"
+    );
+    assert!(
+        coordinator
+            .recoveries
+            .get(&key)
+            .is_some_and(|recovery| recovery.caller == folded),
+        "the drop leaves the live recovery naming the caller"
+    );
+    assert_ne!(
+        base, watermark,
+        "the test needs distinct base and watermark to catch a rebase past the watermark"
+    );
+    // A withheld range the fold must disclose, not silence.
+    let withheld = watermark.saturating_add(5);
+    scene
+        .native
+        .scene
+        .coordinator
+        .recoveries
+        .get_mut(&key)
+        .expect("live recovery")
+        .withheld_through = withheld.max(base);
+    let gaps_before = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED)
+        .count();
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test dropped-recovery exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[folded]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        1,
+        "the proven-exited caller folds"
+    );
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(folded)
+            .is_none(),
+        "the folded caller holds no adapter row"
+    );
+    // Per-pass servicing must not resurrect a live target naming the
+    // folded caller.
+    round2_quiet_ownership(&mut scene);
+    let coordinator = &scene.native.scene.coordinator;
+    assert!(
+        coordinator.recoveries.values().all(|recovery| recovery.caller != folded),
+        "no stranded recovery names the folded caller"
+    );
+    assert!(
+        coordinator.pair_targets.values().all(|target| match target {
+            PairTarget::Suspended { caller, .. } => *caller != folded,
+            PairTarget::Bound { caller, .. } | PairTarget::Pending { caller, .. } =>
+                *caller != folded,
+            PairTarget::Dropped { .. } => true,
+        }),
+        "servicing never suspends a live target naming the folded caller"
+    );
+    assert!(
+        matches!(
+            coordinator.pair_targets.get(&key),
+            Some(PairTarget::Dropped { base: dropped, .. }) if *dropped == base
+        ),
+        "the dropped base survives the fold and servicing unchanged"
+    );
+    let gaps_after = coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED)
+        .count();
+    assert!(
+        gaps_after > gaps_before,
+        "the withheld range is disclosed as a retirement-count gap, never silent"
+    );
+    // The dropped base prunes into the exact totals on schedule.
+    scene
+        .native
+        .scene
+        .coordinator
+        .prune_departed_native_state(1_000_000_000_000);
+    assert_eq!(
+        scene.native.scene.coordinator.pruned_pair_totals(),
+        (1, base),
+        "the staged absolute reaches the counted totals exactly once"
+    );
+    assert!(
+        scene.native.scene.coordinator.pair_targets.get(&key).is_none(),
+        "the dropped pair prunes on schedule"
+    );
+    // A revival past the pruned base (cookie reuse by a new process)
+    // attributes exactly new minus base, never past a watermark.
+    let growth = 3u64;
+    let revived_absolute = base.saturating_add(growth);
+    scene.native.scene.source.spawn(8, 800);
+    let revived = scene
+        .native
+        .scene
+        .coordinator
+        .adapter
+        .admit(8, ImageAuthority::ScanPinned, 2000)
+        .expect("the reviving caller admits");
+    scene.native.scene.project_paths(8, &[&scene.a], 2001);
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    scene.native.answer(8, 800, 41);
+    let repeat = scene.native.row(41, 1, 8, 2002, 0);
+    assert_eq!(
+        PairKey::of(&repeat),
+        key,
+        "the reviving row names the pruned pair"
+    );
+    scene.native.witness(vec![repeat]);
+    scene
+        .native
+        .counts_read(Vec::new(), vec![(41, 1, 0, revived_absolute)]);
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    assert_eq!(
+        edge_count(&scene.native, revived, "a.so"),
+        growth,
+        "a revival past the pruned base stages post-drop growth only"
+    );
+}
+
+/// Fix round 6, blocking 1 (servicing choke point): a recovery whose
+/// caller record is gone — a stranded entry from before the fold fix,
+/// or any future forget path — must settle (gap + remove) when
+/// serviced, never suspend into a live target naming the gone caller
+/// or clobber a revived pair. Dropped base preserved, prunes exact.
+#[test]
+fn demotion_retirement_round6_gone_caller_recovery_settles_without_suspend() {
+    use crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED;
+    let mut scene = Scene::shared();
+    let gone = scene.caller;
+    let coordinator = &mut scene.native.scene.coordinator;
+    let key = coordinator
+        .recoveries
+        .keys()
+        .next()
+        .copied()
+        .expect("the shared scene places one pair with a recovery");
+    let watermark = coordinator.recoveries[&key].watermark;
+    let endpoint = coordinator.recoveries[&key].endpoint;
+    let carrier = coordinator.recoveries[&key].carrier;
+    let checkpoint = coordinator.recoveries[&key].ordinary_checkpoint;
+    scene
+        .native
+        .counts_read(Vec::new(), vec![(41, 1, 0, watermark.saturating_add(3))]);
+    let row = scene.native.row(41, 1, 7, 300, 0);
+    assert_eq!(PairKey::of(&row), key, "the drop names the placed pair");
+    let base = scene
+        .native
+        .scene
+        .coordinator
+        .drop_pair_count(&row, crate::inventory_diagnostics::DiagnosticReason::NotAdmitted);
+    assert_ne!(
+        base, watermark,
+        "the test needs distinct base and watermark"
+    );
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test choke exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[gone]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        1,
+        "the proven-exited caller folds"
+    );
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(gone)
+            .is_none(),
+        "the folded caller holds no adapter row"
+    );
+    // Simulate a stranded pre-fix entry: a live recovery naming the
+    // gone caller over a Dropped target (or a pruned pair). Servicing
+    // must settle it, never suspend.
+    let gaps_before = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED)
+        .count();
+    // Ensure a Dropped target with the original base (fold may have
+    // left Suspended→Dropped with a rewritten base pre-fix; restore
+    // the exact base to isolate the choke point from the fold fix).
+    scene.native.scene.coordinator.pair_targets.insert(
+        key,
+        PairTarget::Dropped {
+            base,
+            base_since: 300,
+        },
+    );
+    scene.native.scene.coordinator.pair_counts.remove(&key);
+    scene.native.scene.coordinator.recoveries.remove(&key);
+    scene
+        .native
+        .scene
+        .coordinator
+        .recovery_order
+        .retain(|ordered| *ordered != key);
+    scene.native.scene.coordinator.recoveries.insert(
+        key,
+        PairRecovery {
+            caller: gone,
+            endpoint,
+            carrier,
+            ordinary_checkpoint: checkpoint,
+            epoch: None,
+            scan: None,
+            sighting: None,
+            fence: None,
+            pending_reads: [None, None, None],
+            withheld_through: base.saturating_add(2),
+            discarded_through: watermark,
+            watermark,
+            blocked: false,
+            recovered: false,
+            deferred_count: false,
+            receipt_refused: false,
+            epoch_pending: false,
+            diagnostic: RecoveryDiagnostics::default(),
+        },
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .recovery_order
+        .push(key);
+    round2_quiet_ownership(&mut scene);
+    let coordinator = &scene.native.scene.coordinator;
+    assert!(
+        !coordinator.recoveries.contains_key(&key),
+        "a gone caller's recovery is settled and removed, never retained"
+    );
+    assert!(
+        coordinator.pair_targets.values().all(|target| match target {
+            PairTarget::Suspended { caller, .. } => *caller != gone,
+            PairTarget::Bound { caller, .. } | PairTarget::Pending { caller, .. } =>
+                *caller != gone,
+            PairTarget::Dropped { .. } => true,
+        }),
+        "servicing never suspends a live target naming the gone caller"
+    );
+    assert!(
+        matches!(
+            coordinator.pair_targets.get(&key),
+            Some(PairTarget::Dropped { base: dropped, .. }) if *dropped == base
+        ),
+        "the dropped base survives choke-point servicing unchanged"
+    );
+    let gaps_after = coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED)
+        .count();
+    assert!(
+        gaps_after > gaps_before,
+        "the withheld range is disclosed as a retirement-count gap, never silent"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .prune_departed_native_state(1_000_000_000_000);
+    assert_eq!(
+        scene.native.scene.coordinator.pruned_pair_totals(),
+        (1, base),
+        "the staged absolute reaches the counted totals exactly once"
+    );
+}
+
+/// Fix round 6, fold gate: an exec-retired caller with a pending
+/// successor keeps its facts until the handoff releases, then folds
+/// with exact totals.
+#[test]
+fn demotion_retirement_round6_fold_gate_pending_successor_blocks_fold() {
+    let mut scene = Scene::shared();
+    let old = scene.caller;
+    let live_edges: Vec<(ModuleId, u64)> = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .edges_of(old)
+        .map(|edge| (edge.module, edge.entry_count))
+        .collect();
+    assert!(!live_edges.is_empty(), "the scene stages an edge");
+    let before = scene.native.scene.coordinator.registry.departed_totals();
+    scene
+        .native
+        .scene
+        .coordinator
+        .mint_pending_successor(ExecTransition::unheld_predecessor(old, 7), 2000)
+        .expect("a live caller mints its exec handoff");
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .pending_successors
+            .contains_key(&old),
+        "the handoff pins the exec-retired caller"
+    );
+    scene.native.scene.coordinator.note_rendered_callers(&[old]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(2001, None)
+            .retired,
+        0,
+        "a caller with a pending successor keeps its facts"
+    );
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(old)
+            .is_some(),
+        "the pinned row stays"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .pending_successors
+        .remove(&old);
+    scene.native.scene.coordinator.note_rendered_callers(&[old]);
+    let receipt = scene
+        .native
+        .scene
+        .coordinator
+        .retire_rendered_callers(2002, None);
+    assert_eq!(receipt.retired, 1, "the caller folds after the pin releases");
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(old)
+            .is_none(),
+        "the folded row leaves the adapter"
+    );
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .registry
+            .edges_of(old)
+            .count(),
+        0,
+        "no edge row survives its caller's fold"
+    );
+    let after = scene.native.scene.coordinator.registry.departed_totals();
+    assert_eq!(
+        after.edges - before.edges,
+        live_edges.len() as u64,
+        "the folded edges land in the departed aggregate"
+    );
+    assert_eq!(
+        after.entries - before.entries,
+        live_edges.iter().map(|(_, entries)| entries).sum::<u64>(),
+        "the folded entries land in the departed aggregate"
+    );
+}
+
+/// Fix round 6, fold gate: a caller with a pending count keeps its
+/// facts until the count resolves, then folds with exact totals.
+#[test]
+fn demotion_retirement_round6_fold_gate_pending_count_blocks_fold() {
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test pending-count exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let live_edges: Vec<(ModuleId, u64)> = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .edges_of(caller)
+        .map(|edge| (edge.module, edge.entry_count))
+        .collect();
+    assert!(!live_edges.is_empty(), "the scene stages an edge");
+    let before = scene.native.scene.coordinator.registry.departed_totals();
+    let domain = scene.native.domain;
+    scene.native.scene.coordinator.pending_ids.insert(
+        999_999,
+        PendingCountObservation {
+            key: PairKey {
+                image: DomainCookie::new(domain, 999),
+                exec: 1,
+                object: 0,
+            },
+            caller,
+            endpoint: EndpointId(0),
+            observation: PairCount {
+                count: 1,
+                first_ns: 0,
+                anchor_ns: 0,
+                last_ns: 0,
+                retirement_usable: false,
+                diagnostic_observation: 0,
+                diagnostic_transition: 0,
+            },
+            generation: Some(0),
+            origin: PendingCountOrigin::Untracked,
+            diagnostic: None,
+        },
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        0,
+        "a caller with a pending count keeps its facts"
+    );
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .is_some(),
+        "the pinned row stays"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .pending_ids
+        .remove(&999_999);
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1002, None)
+            .retired,
+        1,
+        "the caller folds after the pin releases"
+    );
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .is_none(),
+        "the folded row leaves the adapter"
+    );
+    let after = scene.native.scene.coordinator.registry.departed_totals();
+    assert_eq!(
+        after.edges - before.edges,
+        live_edges.len() as u64,
+        "the folded edges land in the departed aggregate"
+    );
+    assert_eq!(
+        after.entries - before.entries,
+        live_edges.iter().map(|(_, entries)| entries).sum::<u64>(),
+        "the folded entries land in the departed aggregate"
+    );
+}
+
+/// Fix round 6, fold gate: a caller with a pending binder row keeps
+/// its facts until that row decides, then folds with exact totals.
+#[test]
+fn demotion_retirement_round6_fold_gate_pending_binder_row_blocks_fold() {
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let live_edges: Vec<(ModuleId, u64)> = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .edges_of(caller)
+        .map(|edge| (edge.module, edge.entry_count))
+        .collect();
+    assert!(!live_edges.is_empty(), "the scene stages an edge");
+    let before = scene.native.scene.coordinator.registry.departed_totals();
+    // One witness read without its horizons for the live caller, with
+    // a new ticket the binder has never bound: the row stays pending
+    // with its sighting, pinning the caller through its incarnation
+    // snapshot. (A repeat of the bound ticket would decide at once.)
+    let pending = scene.native.row(42, 1, 7, 300, 0);
+    scene.native.read(vec![pending]);
+    // Exec-retire (not kill): foldable, but the binder row still pends.
+    scene
+        .native
+        .scene
+        .coordinator
+        .adapter
+        .exec_transition_scoped(caller, 500);
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(2001, None)
+            .retired,
+        0,
+        "a caller with a pending binder row keeps its facts"
+    );
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .is_some(),
+        "the pinned row stays"
+    );
+    scene.native.drain();
+    scene.native.read(Vec::new());
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(2002, None)
+            .retired,
+        1,
+        "the caller folds after the binder row decides"
+    );
+    let after = scene.native.scene.coordinator.registry.departed_totals();
+    assert_eq!(
+        after.edges - before.edges,
+        live_edges.len() as u64,
+        "the folded edges land in the departed aggregate"
+    );
+    assert_eq!(
+        after.entries - before.entries,
+        live_edges.iter().map(|(_, entries)| entries).sum::<u64>(),
+        "the folded entries land in the departed aggregate"
+    );
+}
+
+/// Fix round 6, fold gate: the capture-bound caller keeps its facts
+/// until the binding releases, then folds with exact totals.
+#[test]
+fn demotion_retirement_round6_fold_gate_capture_bound_blocks_fold() {
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test capture exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let live_edges: Vec<(ModuleId, u64)> = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .edges_of(caller)
+        .map(|edge| (edge.module, edge.entry_count))
+        .collect();
+    assert!(!live_edges.is_empty(), "the scene stages an edge");
+    let before = scene.native.scene.coordinator.registry.departed_totals();
+    scene
+        .native
+        .scene
+        .coordinator
+        .begin_capture_coverage(CaptureScopeCoverage::System);
+    scene
+        .native
+        .scene
+        .coordinator
+        .capture
+        .as_mut()
+        .expect("capture coverage")
+        .bound = Some(caller);
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        0,
+        "the capture-bound caller keeps its facts"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .capture
+        .as_mut()
+        .expect("capture coverage")
+        .bound = None;
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1002, None)
+            .retired,
+        1,
+        "the caller folds after the binding releases"
+    );
+    let after = scene.native.scene.coordinator.registry.departed_totals();
+    assert_eq!(
+        after.edges - before.edges,
+        live_edges.len() as u64,
+        "the folded edges land in the departed aggregate"
+    );
+    assert_eq!(
+        after.entries - before.entries,
+        live_edges.iter().map(|(_, entries)| entries).sum::<u64>(),
+        "the folded entries land in the departed aggregate"
+    );
+}
+
+/// Fix round 6, fold gate: a caller holding an owner keeps its facts
+/// until the owner releases, then folds with exact totals.
+#[test]
+fn demotion_retirement_round6_fold_gate_owner_blocks_fold() {
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test owner exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let before = scene.native.scene.coordinator.registry.departed_totals();
+    scene
+        .native
+        .scene
+        .coordinator
+        .owners
+        .insert(caller, crate::process::ProcessViewId(1));
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        0,
+        "a caller holding an owner keeps its facts"
+    );
+    scene.native.scene.coordinator.owners.remove(&caller);
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1002, None)
+            .retired,
+        1,
+        "the caller folds after the owner releases"
+    );
+    let after = scene.native.scene.coordinator.registry.departed_totals();
+    assert!(
+        after.edges > before.edges,
+        "the folded edges land in the departed aggregate"
+    );
+}
+
+/// Fix round 6, fold gate: a caller with a pending leader exit keeps
+/// its facts until the exit resolves, then folds with exact totals.
+#[test]
+fn demotion_retirement_round6_fold_gate_pending_leader_exit_blocks_fold() {
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let domain = scene.native.domain;
+    // Defer while live (the retirement clears the map), then
+    // exec-retire (which does not): foldable but pinned.
+    scene
+        .native
+        .scene
+        .coordinator
+        .defer_leader_exit(caller, 7, 2000, domain);
+    assert!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .pending_leader_exits
+            .contains_key(&caller),
+        "the leader exit pins the caller"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .adapter
+        .exec_transition_scoped(caller, 500);
+    let before = scene.native.scene.coordinator.registry.departed_totals();
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        0,
+        "a caller with a pending leader exit keeps its facts"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .pending_leader_exits
+        .remove(&caller);
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1002, None)
+            .retired,
+        1,
+        "the caller folds after the exit resolves"
+    );
+    let after = scene.native.scene.coordinator.registry.departed_totals();
+    assert!(
+        after.edges > before.edges,
+        "the folded edges land in the departed aggregate"
+    );
+}
+
+/// Fix round 6, fold gate: a caller with a pending adjudication keeps
+/// its facts until the tail adjudicates, then folds with exact totals.
+#[test]
+fn demotion_retirement_round6_fold_gate_pending_adjudication_blocks_fold() {
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test adjudication exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let before = scene.native.scene.coordinator.registry.departed_totals();
+    scene
+        .native
+        .scene
+        .coordinator
+        .reference_stage_adjudication(caller, 7);
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        0,
+        "a caller with a pending adjudication keeps its facts"
+    );
+    scene
+        .native
+        .scene
+        .coordinator
+        .pending_adjudication
+        .remove(&caller);
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1002, None)
+            .retired,
+        1,
+        "the caller folds after the adjudication releases"
+    );
+    let after = scene.native.scene.coordinator.registry.departed_totals();
+    assert!(
+        after.edges > before.edges,
+        "the folded edges land in the departed aggregate"
+    );
+}

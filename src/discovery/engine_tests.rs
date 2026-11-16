@@ -4560,7 +4560,7 @@ fn capacity_lowering_and_growth_omission_keep_separate_high_water_marks() {
     use plan::AdmissionScope;
     let a_key = overlay_key(66);
     let filler_key = overlay_key(67);
-    let mut pins = overlay_pins(&[(a_key, OVERLAY_SHA, 1), (filler_key, OVERLAY_SHA, 1)]);
+    let pins = overlay_pins(&[(a_key, OVERLAY_SHA, 1), (filler_key, OVERLAY_SHA, 1)]);
     let pristine_a = overlay_module(a_key);
     let pristine_filler = overlay_module(filler_key);
     let a_obj = pins

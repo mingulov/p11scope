@@ -14977,6 +14977,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prune_capture_memory_drops_reasons_with_ordinals() {
+        // The capture-memory bound covers reasons exactly like
+        // ordinals: a cell the plan no longer holds takes its reason
+        // entry with it, while a surviving unknown slot keeps both.
+        let (mut plan, survivor, tail) = unknown_pair_plan();
+        for (key, ordinal) in [(survivor, 7u16), (tail, 9u16)] {
+            plan.slot_ordinals.insert(
+                key,
+                BTreeSet::from([SlotOrdinal {
+                    table_file_offset: None,
+                    ordinal,
+                }]),
+            );
+        }
+        // Stage the post-excise state: the tail cell is gone.
+        plan.slots.pop();
+        plan.prune_capture_memory();
+        assert!(
+            !plan.slot_ordinals.contains_key(&tail),
+            "the excised cell's ordinals leave with it"
+        );
+        assert!(
+            !plan.slot_unnamed_reasons.contains_key(&tail),
+            "the excised cell's reason entry leaves with it"
+        );
+        assert_eq!(
+            plan.slot_ordinals.get(&survivor).map(BTreeSet::len),
+            Some(1),
+            "the surviving unknown slot keeps its ordinals"
+        );
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            [UnprovenNames::HeuristicTable.token()],
+            "the surviving unknown slot keeps its reason"
+        );
+        assert_eq!(AttachKey::of(&plan.slots[0]), survivor);
+    }
+
+    #[test]
     fn conservative_cursor_copies_unnamed_reasons() {
         // White-box drive of the cursor's carried-map stages plus
         // assembly: reasons travel like ordinals, whole.
@@ -22747,6 +22786,225 @@ pub(crate) mod tests {
                 slot.index
             );
         }
+    }
+
+    /// Cross-pin count-only reclaim onto a retired unknown row merges
+    /// the retired row's reasons into the returning key: the retired
+    /// row proved the target unproven one way, the return proves it
+    /// another, and the reclaimed slot must read both — never the
+    /// returning claim alone, and nothing stays under the retired key.
+    #[test]
+    fn slot_reclaim_cross_pin_unknown_return_merges_retired_reasons() {
+        let identity = test_identity(7, "sha-xpin-unknown-reasons");
+        let worker = |pin: u32| {
+            let mut module = sole_complete_module();
+            module.object = PinnedObjectId(pin);
+            module.scanned.key = scanned_key(PinnedObjectId(pin));
+            for entry in &mut module.scanned.tables[0].entries {
+                entry.object = scanned_key(PinnedObjectId(pin));
+            }
+            module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
+            module.forward_verified = vec![vec![false; 68]];
+            count_only_copy(&module, true)
+        };
+        let mut plan = scoped_plan(&[], AdmissionScope::Named);
+        // Pin 100 arrives unknown count-only and retires.
+        let identities = BTreeMap::from([(PinnedObjectId(100), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&worker(100)),
+            &[],
+            &identities,
+        );
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("pin 100 arrival must not refuse: {error}"));
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME]),
+            "pin 100 attaches unknown"
+        );
+        let natural: Vec<&str> = plan.unnamed_reasons_of(&plan.slots[0]);
+        assert!(
+            !natural.is_empty(),
+            "precondition: the unknown row carries a reason"
+        );
+        let retired = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+        plan.extend_exact(retired)
+            .unwrap_or_else(|error| panic!("pin 100 exit must not refuse: {error}"));
+        assert_eq!(plan.retired_slots.len(), 68, "pin 100 retires");
+        // A second witness proved the same targets unproven another
+        // way before they retired (extend surgery legitimately unions
+        // both tokens onto one key; see
+        // mixed_unproven_sources_union_their_reasons).
+        let extra = if natural.contains(&UnprovenNames::HeuristicTable.token()) {
+            UnprovenNames::SelectionWithoutStandardProof
+        } else {
+            UnprovenNames::HeuristicTable
+        };
+        let retired_keys: Vec<AttachKey> = plan.slots.iter().map(AttachKey::of).collect();
+        for key in &retired_keys {
+            plan.slot_unnamed_reasons
+                .get_mut(key)
+                .expect("the retired unknown row keeps its reason entry")
+                .insert(extra);
+        }
+        plan.revivable.clone_from(&plan.retired_keys);
+        // The same file returns on a new pin: 68 tickets, and the
+        // return reoccupies the retired unknown cells in place.
+        let returning = worker(101);
+        let identities = BTreeMap::from([(PinnedObjectId(101), identity.clone())]);
+        let rebuilt = plan.rebuild_from_sources_with_identities(
+            std::slice::from_ref(&returning),
+            &[],
+            &identities,
+        );
+        assert_eq!(
+            rebuilt.reclaimed.len(),
+            68,
+            "merge tickets the cross-pin unknown return"
+        );
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("the unknown return must not refuse: {error}"));
+        assert_eq!(delta.new.len(), 68);
+        assert!(
+            delta.new.iter().all(|slot| (slot.index as usize) < 68),
+            "the return reoccupies, never fresh"
+        );
+        assert_eq!(plan.slots.len(), 68, "no fresh cell burns");
+        assert!(plan.retired_slots.is_empty());
+        let retired_sample = AttachKey {
+            object: PinnedObjectId(100),
+            file_offset: 0x1000,
+        };
+        assert!(
+            !plan.slot_unnamed_reasons.contains_key(&retired_sample),
+            "nothing stays under the retired key"
+        );
+        for slot in &plan.slots {
+            assert_eq!(
+                slot.names,
+                [UNKNOWN_FUNCTION_NAME],
+                "cell {} stays unknown",
+                slot.index
+            );
+            let reasons = plan.unnamed_reasons_of(slot);
+            assert!(
+                reasons.contains(&extra.token()),
+                "cell {} keeps the retired row's reason: {reasons:?}",
+                slot.index
+            );
+            for token in &natural {
+                assert!(
+                    reasons.contains(token),
+                    "cell {} keeps the returning claim's reason: {reasons:?}",
+                    slot.index
+                );
+            }
+        }
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// Same-file pin migration carries the superseded key's reasons
+    /// to the new key: the migrated slot reads the union of what the
+    /// old pin's row and the returning row proved, not the return
+    /// alone, and nothing stays under the superseded pin.
+    #[test]
+    fn pin_migration_carries_unnamed_reasons_to_the_new_key() {
+        let identity = test_identity(82, "sha-migrate-reasons");
+        let worker = |pin: u32| {
+            let mut module = sole_complete_module();
+            module.object = PinnedObjectId(pin);
+            module.scanned.key = scanned_key(PinnedObjectId(pin));
+            for entry in &mut module.scanned.tables[0].entries {
+                entry.object = scanned_key(PinnedObjectId(pin));
+            }
+            module.entry_objects = vec![vec![PinnedObjectId(pin); 68]];
+            module.forward_verified = vec![vec![false; 68]];
+            count_only_copy(&module, true)
+        };
+        let mut plan = scoped_plan(std::slice::from_ref(&worker(82)), AdmissionScope::Shared);
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots
+                .iter()
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME]),
+            "pin 82 attaches unknown"
+        );
+        let natural: Vec<&str> = plan.unnamed_reasons_of(&plan.slots[0]);
+        assert!(
+            !natural.is_empty(),
+            "precondition: the unknown row carries a reason"
+        );
+        plan.object_identities
+            .insert(PinnedObjectId(82), identity.clone());
+        // A second witness proved the same targets unproven another
+        // way (extend surgery legitimately unions both tokens onto
+        // one key; see mixed_unproven_sources_union_their_reasons).
+        let extra = if natural.contains(&UnprovenNames::HeuristicTable.token()) {
+            UnprovenNames::SelectionWithoutStandardProof
+        } else {
+            UnprovenNames::HeuristicTable
+        };
+        let old_keys: Vec<AttachKey> = plan.slots.iter().map(AttachKey::of).collect();
+        for key in &old_keys {
+            plan.slot_unnamed_reasons
+                .get_mut(key)
+                .expect("the unknown row keeps its reason entry")
+                .insert(extra);
+        }
+        // The same file reappears on a new pin with the same offsets:
+        // the still-active cells migrate in place, with no retire/new
+        // delta.
+        let mut rebuilt = scoped_plan(std::slice::from_ref(&worker(83)), AdmissionScope::Shared);
+        assert_eq!(rebuilt.slots.len(), 68);
+        rebuilt
+            .object_identities
+            .insert(PinnedObjectId(83), identity.clone());
+        let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
+            panic!("the same-file migration must not refuse: {error}")
+        });
+        assert!(delta.retire.is_empty(), "migration retires nothing");
+        assert!(delta.new.is_empty(), "migration allocates nothing");
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            !plan
+                .slot_unnamed_reasons
+                .keys()
+                .any(|key| key.object == PinnedObjectId(82)),
+            "nothing stays under the superseded pin"
+        );
+        for slot in &plan.slots {
+            assert_eq!(
+                slot.object,
+                PinnedObjectId(83),
+                "cell {} migrates to the new pin",
+                slot.index
+            );
+            assert_eq!(
+                slot.names,
+                [UNKNOWN_FUNCTION_NAME],
+                "cell {} stays unknown",
+                slot.index
+            );
+            let reasons = plan.unnamed_reasons_of(slot);
+            assert!(
+                reasons.contains(&extra.token()),
+                "cell {} keeps the superseded row's reason: {reasons:?}",
+                slot.index
+            );
+            for token in &natural {
+                assert!(
+                    reasons.contains(token),
+                    "cell {} keeps the returning claim's reason: {reasons:?}",
+                    slot.index
+                );
+            }
+        }
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
     }
 
     /// B1: an ambiguous ticketed reclaim must reserve the room later

@@ -3532,7 +3532,10 @@ fn mechanism_evidence(capture_word: u32, mechanism: u64) -> MechanismEvidence {
 /// template beyond eight slots) rides beside the retained first eight
 /// cells (controller KEYMETA-T1 rulings 2026-11-16, ruling 2); the
 /// validator already pins the honest shape (bit set only at eight
-/// inspected cells).
+/// inspected cells). The wire HEADER_READ_FAILURE and INVALID_SPAN
+/// bits ride beside them the same way (fix round 4): a partly-read
+/// template still promotes its observed cells, and its unseen fields
+/// name the partly-read reason.
 fn attribute_list(list: &[u8; 36]) -> Option<AttributeList> {
     if list.iter().all(|byte| *byte == 0) {
         return None;
@@ -3550,7 +3553,15 @@ fn attribute_list(list: &[u8; 36]) -> Option<AttributeList> {
         ));
     }
     let truncated = list[33] & p11scope_ebpf_common::object_capture::attr_list_flag::TRUNCATED != 0;
-    Some(AttributeList::with_truncated(&observations, truncated))
+    let partly_read = list[33]
+        & (p11scope_ebpf_common::object_capture::attr_list_flag::HEADER_READ_FAILURE
+            | p11scope_ebpf_common::object_capture::attr_list_flag::INVALID_SPAN)
+        != 0;
+    Some(AttributeList::with_flags(
+        &observations,
+        truncated,
+        partly_read,
+    ))
 }
 
 /// One validated attribute cell to a model observation. Values re-check

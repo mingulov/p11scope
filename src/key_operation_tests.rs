@@ -25070,10 +25070,11 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
             names(&format!("/$defs/{def}/properties/reason/enum")),
             vec![
                 "curve unusable for key type".to_string(),
+                "template partly read".to_string(),
                 "template truncated (first 8 attributes captured)".to_string(),
                 "template value outside approved finite set".to_string(),
             ],
-            "{def}: the reason enum is exactly the three fix-round-3 reasons"
+            "{def}: the reason enum is exactly the four closed reasons"
         );
         assert_eq!(
             schema
@@ -25082,8 +25083,8 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
                 .as_array()
                 .expect("array")
                 .len(),
-            4,
-            "{def}: the reason enum admits null beside the three reasons"
+            5,
+            "{def}: the reason enum admits null beside the four reasons"
         );
     }
     // The v6 tables extend their frozen parents by exactly the

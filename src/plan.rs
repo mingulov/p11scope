@@ -22596,11 +22596,18 @@ pub(crate) mod tests {
         assert_eq!(plan.slots.len(), MAX_SLOTS as usize - 100);
         let active_keys: BTreeSet<AttachKey> = plan.slot_by_key.keys().copied().collect();
         let new = provider_with_tables(52, "/opt/new.so", 1, 101, true);
-        let kept = provider_with_tables(51, "/opt/filler.so", 1, 512, true);
-        // The rebuilt snapshot is valid on its own (613 <= 2,112): only the
-        // capture-lifetime prior allocation makes the extension overflow.
+        // The kept subset stays well under the ceiling on both capacities
+        // (wide 512, FULL 300): the rebuilt snapshot is valid on its own
+        // (613 <= 2,112 wide, 401 <= 512 FULL) and only the prior
+        // lifetime allocation makes the extension overflow.
+        let kept_endpoints = if cfg!(feature = "wide-detailed-2112") {
+            512
+        } else {
+            300
+        };
+        let kept = provider_with_tables(51, "/opt/filler.so", 1, kept_endpoints, true);
         let rebuilt = scoped_plan(&[kept, new.clone()], AdmissionScope::Shared);
-        assert_eq!(rebuilt.slots.len(), 613);
+        assert_eq!(rebuilt.slots.len(), kept_endpoints + 101);
         let added: BTreeSet<AttachKey> = rebuilt
             .slot_by_key
             .keys()
@@ -22613,7 +22620,10 @@ pub(crate) mod tests {
             .unwrap_or_else(|error| {
                 panic!("an at-capacity new module must be a counted refusal, not an abort: {error}")
             });
-        assert_eq!(delta.retire.len(), MAX_SLOTS as usize - 100 - 512);
+        assert_eq!(
+            delta.retire.len(),
+            MAX_SLOTS as usize - 100 - kept_endpoints
+        );
         assert!(
             delta.new.is_empty(),
             "the overflowing new object is dropped whole"
@@ -22623,10 +22633,14 @@ pub(crate) mod tests {
             MAX_SLOTS as usize - 100,
             "capacity is unchanged"
         );
-        assert_eq!(plan.active_slot_count(), 512, "the kept cells stay active");
+        assert_eq!(
+            plan.active_slot_count(),
+            kept_endpoints,
+            "the kept cells stay active"
+        );
         assert_eq!(
             plan.retired_slots.len(),
-            MAX_SLOTS as usize - 100 - 512,
+            MAX_SLOTS as usize - 100 - kept_endpoints,
             "the retired cells stay retired"
         );
         assert!(

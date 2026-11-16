@@ -30550,7 +30550,24 @@ fn live_extension_at_capacity_refuses_a_whole_new_module_without_aborting() {
     let (mut engine, raw) = engine_admitting_overlay(70, capacity - 100);
     assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
     assert_eq!(engine.plan.active_slot_count(), capacity as usize - 100);
-    let kept = with_endpoints(raw.clone(), 512);
+    // The kept subset must overlap the prior allocation and stay valid
+    // on its own under both ceilings. Wide keeps the 0x1000-based helper
+    // (512 cells landing on prior cells 512..1024; rebuilt 613 <= 2,112).
+    // FULL's 412-cell prior ends before 0x1000, so FULL truncates the raw
+    // 0-based scan instead (300 cells; rebuilt 401 <= 512). Either way
+    // only the prior lifetime allocation overflows the extension.
+    let kept_endpoints: u32 = if cfg!(feature = "wide-detailed-2112") {
+        512
+    } else {
+        300
+    };
+    let kept = if cfg!(feature = "wide-detailed-2112") {
+        with_endpoints(raw.clone(), kept_endpoints)
+    } else {
+        let mut kept = raw.clone();
+        kept.tables[0].entries = overlay_entries(&raw, first_offsets(kept_endpoints));
+        kept
+    };
     let new = with_endpoints(overlay_module(overlay_key(71)), 101);
     let mut pins = engine.pinned.clone();
     let skipped = pins.absorb(overlay_pins(&[(new.key, OVERLAY_SHA, 1)]));
@@ -30562,10 +30579,8 @@ fn live_extension_at_capacity_refuses_a_whole_new_module_without_aborting() {
         .find(|module| module.scanned.key == new.key)
         .map(|module| module.object)
         .expect("the new module is reconciled");
-    // Valid on its own (613 <= 2,112): only the prior lifetime allocation
-    // makes the extension overflow.
     let rebuilt = plan::build_from_reconciled_modules(&modules);
-    assert_eq!(rebuilt.slots.len(), 613);
+    assert_eq!(rebuilt.slots.len(), kept_endpoints as usize + 101);
     let delta = engine
         .plan
         .extend_exact_with_stable_module_ids(rebuilt)
@@ -30574,7 +30589,7 @@ fn live_extension_at_capacity_refuses_a_whole_new_module_without_aborting() {
         });
     assert_eq!(
         delta.retire.len(),
-        capacity as usize - 100 - 512,
+        capacity as usize - 100 - kept_endpoints as usize,
         "the prior cells outside the rebuilt snapshot retire"
     );
     assert!(
@@ -30582,7 +30597,7 @@ fn live_extension_at_capacity_refuses_a_whole_new_module_without_aborting() {
         "the overflowing new object is dropped whole"
     );
     assert_eq!(engine.plan.slots.len(), capacity as usize - 100);
-    assert_eq!(engine.plan.active_slot_count(), 512);
+    assert_eq!(engine.plan.active_slot_count(), kept_endpoints as usize);
     assert!(
         engine
             .plan

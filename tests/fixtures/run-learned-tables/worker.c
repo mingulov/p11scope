@@ -4,9 +4,12 @@
  * negotiates the 3.0 interface through C_GetInterfaceList +
  * C_GetInterface (like the kryoptic/haskoki matrix legs), calls
  * three table functions per round, prints a DONE ledger line, and
- * exits within milliseconds.
+ * exits. An optional linger keeps the provider mapped for about a
+ * second first, matching the matrix unit workers' lifetime (fast
+ * workers would exit between observer ticks and prove nothing
+ * about table learning).
  *
- * Usage: worker <provider.so> <rounds>
+ * Usage: worker <provider.so> <rounds> [linger_ms]
  * Prints: DONE worker=<pid> table_calls=<n>
  * (table_calls counts table calls only, never the getter calls).
  */
@@ -14,6 +17,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef unsigned long CK_ULONG;
@@ -43,14 +47,21 @@ static void *slot(void *table, unsigned index) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: worker <provider.so> <rounds>\n");
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "usage: worker <provider.so> <rounds> [linger_ms]\n");
         return 2;
     }
     char *end = NULL;
     long rounds = strtol(argv[2], &end, 10);
     if (end == argv[2] || *end != '\0' || rounds < 1 || rounds > 1000000) {
         return 2;
+    }
+    long linger_ms = 0;
+    if (argc == 4) {
+        linger_ms = strtol(argv[3], &end, 10);
+        if (end == argv[3] || *end != '\0' || linger_ms < 0 || linger_ms > 60000) {
+            return 2;
+        }
     }
     /* RTLD_LAZY like the Python loaders in the matrix legs. */
     void *handle = dlopen(argv[1], RTLD_LAZY | RTLD_LOCAL);
@@ -88,6 +99,13 @@ int main(int argc, char **argv) {
             return 5;
         }
         table_calls++;
+    }
+    if (linger_ms > 0) {
+        struct timespec linger = {
+            .tv_sec = linger_ms / 1000,
+            .tv_nsec = (linger_ms % 1000) * 1000000L,
+        };
+        nanosleep(&linger, NULL);
     }
     printf("DONE worker=%ld table_calls=%ld\n", (long)getpid(), table_calls);
     fflush(stdout);

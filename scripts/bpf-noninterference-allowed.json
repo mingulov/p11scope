@@ -673,6 +673,102 @@
       "identical": [],
       "lane": "fork-event hook timestamp",
       "rationale": "Stamps Event.ts_ns with helpers::bpf_ktime_get_ns() in p11_link_emit_fork (745362b51, #[cfg(not(feature = \"inventory-only\"))]): the Detailed object gains .text +8 to cumulative +1328 for the helper call and stack-spilled store into ts_ns, with .rel.text -16 and debug shifts (.debug_addr +8, .debug_info +34, .debug_line +10, .debug_loclists +240, .rel.debug_addr +16, .rel.debug_info +48; .debug_rnglists -14); .BTF, .BTF.ext, .symtab, .strtab, maps (+28) and uprobe (+184) are unchanged from transition 8 and no section is added or removed. Both Inventory objects keep the exact transition-8 CI shape (with plain Inventory .debug_str +83 on CI vs +84 locally due to work-path disambiguator hashes)."
+    },
+    {
+      "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
+      "candidate_revision": "dev/v0.8.0 member-stop lane (BPF inputs of 2cf8db9e7eb7d1605a1f61f387346b69b96496d6; shape pinned from CI run 43760758475; the record commit adds only this record, which is not a BPF input)",
+      "changed": {
+        "p11scope-ebpf": {
+          "added": {},
+          "deltas": {
+            ".BTF": 213,
+            ".BTF.ext": 712,
+            ".debug_abbrev": 1,
+            ".debug_addr": 184,
+            ".debug_frame": 24,
+            ".debug_info": 2037,
+            ".debug_line": 564,
+            ".debug_loclists": 2247,
+            ".debug_rnglists": 402,
+            ".debug_str": 313,
+            ".debug_str_offsets": 48,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 720,
+            ".rel.debug_addr": 368,
+            ".rel.debug_frame": 32,
+            ".rel.debug_info": 992,
+            ".rel.debug_line": 16,
+            ".rel.debug_str_offsets": 192,
+            ".rel.text": 128,
+            ".reluprobe": 32,
+            ".strtab": 36,
+            ".symtab": 48,
+            ".text": 1328,
+            "maps": 28,
+            "uprobe": 184
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory": {
+          "added": {},
+          "deltas": {
+            ".BTF": 37,
+            ".BTF.ext": 128,
+            ".debug_abbrev": -24,
+            ".debug_addr": 88,
+            ".debug_info": 1024,
+            ".debug_line": 97,
+            ".debug_loclists": 383,
+            ".debug_rnglists": 41,
+            ".debug_str": 83,
+            ".debug_str_offsets": 12,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 128,
+            ".rel.debug_addr": 176,
+            ".rel.debug_info": 400,
+            ".rel.debug_str_offsets": 48,
+            ".rel.text": 32,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 112,
+            "maps": 28,
+            "uprobe": 128
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory-callers": {
+          "added": {},
+          "deltas": {
+            ".BTF": 37,
+            ".BTF.ext": 144,
+            ".debug_abbrev": -24,
+            ".debug_addr": 88,
+            ".debug_info": 1058,
+            ".debug_line": 101,
+            ".debug_loclists": 391,
+            ".debug_rnglists": 51,
+            ".debug_str": 73,
+            ".debug_str_offsets": 12,
+            ".rel.BTF": 16,
+            ".rel.BTF.ext": 144,
+            ".rel.debug_addr": 176,
+            ".rel.debug_info": 400,
+            ".rel.debug_str_offsets": 48,
+            ".rel.text": 32,
+            ".reluprobe": 32,
+            ".strtab": 9,
+            ".symtab": 24,
+            ".text": 176,
+            "maps": 28,
+            "uprobe": 128
+          },
+          "removed": []
+        }
+      },
+      "identical": [],
+      "lane": "run-tree member-stop shared ABI types",
+      "rationale": "The member-stop lane adds its shared ABI to p11scope-ebpf-common (16f649620: MEMBER_STOP_* constants and the MemberFileKey, MemberStopConfig and MemberStop repr(C) types with Pod impls under cfg(feature = \"user\"); b0bcbe0ad doc text; 680b2e8fb MemberStop vm_start/vm_end) and its own native member_stop.c object; none of it is referenced by the three Rust BPF objects. Every program, map, BTF, relocation and debug section keeps the exact transition-9 CI shape except .debug_str: +313 (was +312) in p11scope-ebpf and +73 (was +72) in p11scope-ebpf-inventory-callers, one byte from the changed p11scope-ebpf-common crate disambiguator hash string; plain Inventory is unchanged from transition 9. No section is added or removed."
     }
   ],
   "version": 1

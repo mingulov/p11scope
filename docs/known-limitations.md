@@ -1098,7 +1098,7 @@ tear the close read (as above). With `--pause never`, the observer
 attaches a provider's export hooks shortly after the child loads it
 (return hook first, then entry hook). A `C_GetFunctionList` or
 `C_GetInterface` call that runs between those two attaches counts one
-discovery update failure, and that withholds the detail as
+discovery state failure (`discovery_state_failures`), and that withholds the detail as
 `promotion_caller_changed`. The default pause policy holds the child at
 its provider load until those hooks are live.
 With `run`, a host whose kernel and userspace monotonic clocks cannot

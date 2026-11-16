@@ -568,9 +568,10 @@ jobs:
       # receipts' objects (llvm-readelf --sections on each side), and
       # record exactly that transition (with the lane and rationale) in
       # the record above; object hashes vary across runs (Cargo bakes the
-      # work path into the disambiguator), so the record pins the
-      # run-independent shape. The repeat-baseline control stays strict
-      # and any unrecorded byte still fails loudly.
+      # work path into the disambiguator), so the record pins the common
+      # shape and the DWARF string sizes (.debug_str family) must be
+      # confirmed from CI output. The repeat-baseline control stays
+      # strict and any unrecorded byte still fails loudly.
       # Earlier pin 3681a1ab7, the integrated keygen pick (BPF inputs final since
       # b27149d51; the pin commit itself only guards the canary strip),
       # on top of 873adf5c4:

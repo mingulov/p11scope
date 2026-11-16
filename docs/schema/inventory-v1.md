@@ -1214,9 +1214,10 @@ never imply S1 loss.
   `template value outside approved finite set` on kinds seen with an
   unclassifiable value (a value outside the approved finite set, or
   an unavailable, malformed or size-only cell), `curve unusable for
-  key type` on a mismatched or — on a complete template seen at
-  creation — unestablished Edwards/Montgomery curve on a created
-  object, and `template partly read` on unknown fields never seen
+  key type` on a mismatched Edwards/Montgomery curve on a created
+  object — or, on a complete `C_CreateObject` or public-half
+  `C_GenerateKeyPair` template seen at creation, an unestablished
+  one — and `template partly read` on unknown fields never seen
   on a partly-read template; null for every other field, and null
   on every field of a query-only view).
   A `value` carries the accepted numeric code or null: class 0-4,
@@ -1262,7 +1263,8 @@ never imply S1 loss.
   `ec_edwards` key type, a Montgomery label an established
   x25519/x448 curve with the `ec_montgomery` key type, from the same
   view; on a created object whose own template was seen, a
-  mismatched curve — or, on a complete template, an unestablished
+  mismatched curve — or, on a complete `C_CreateObject` or
+  public-half `C_GenerateKeyPair` template, an unestablished
   curve — stays unlabeled with the curve reason on the curve field
   in JSON and its count in verbose text. A PQC label joins an
   established

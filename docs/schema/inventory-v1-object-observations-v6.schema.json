@@ -259,7 +259,7 @@
             "template partly read",
             null
           ],
-          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched or (on a complete template) unestablished Edwards/Montgomery curve on a created object whose own template was seen, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
+          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched Edwards/Montgomery curve on a created object whose own template was seen, or (on a complete C_CreateObject or public-half C_GenerateKeyPair template) an unestablished one, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
         }
       }
     },
@@ -316,7 +316,7 @@
             "template partly read",
             null
           ],
-          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched or (on a complete template) unestablished Edwards/Montgomery curve on a created object whose own template was seen, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
+          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched Edwards/Montgomery curve on a created object whose own template was seen, or (on a complete C_CreateObject or public-half C_GenerateKeyPair template) an unestablished one, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
         }
       }
     },
@@ -362,7 +362,7 @@
             "template partly read",
             null
           ],
-          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched or (on a complete template) unestablished Edwards/Montgomery curve on a created object whose own template was seen, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
+          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched Edwards/Montgomery curve on a created object whose own template was seen, or (on a complete C_CreateObject or public-half C_GenerateKeyPair template) an unestablished one, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
         }
       }
     },
@@ -411,7 +411,7 @@
             "template partly read",
             null
           ],
-          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched or (on a complete template) unestablished Edwards/Montgomery curve on a created object whose own template was seen, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
+          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched Edwards/Montgomery curve on a created object whose own template was seen, or (on a complete C_CreateObject or public-half C_GenerateKeyPair template) an unestablished one, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
         }
       }
     },
@@ -460,7 +460,7 @@
             "template partly read",
             null
           ],
-          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched or (on a complete template) unestablished Edwards/Montgomery curve on a created object whose own template was seen, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
+          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched Edwards/Montgomery curve on a created object whose own template was seen, or (on a complete C_CreateObject or public-half C_GenerateKeyPair template) an unestablished one, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
         }
       }
     },
@@ -510,7 +510,7 @@
             "template partly read",
             null
           ],
-          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched or (on a complete template) unestablished Edwards/Montgomery curve on a created object whose own template was seen, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
+          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched Edwards/Montgomery curve on a created object whose own template was seen, or (on a complete C_CreateObject or public-half C_GenerateKeyPair template) an unestablished one, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
         }
       }
     },
@@ -566,7 +566,7 @@
             "template partly read",
             null
           ],
-          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched or (on a complete template) unestablished Edwards/Montgomery curve on a created object whose own template was seen, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
+          "description": "Why a field stays unknown — or, for a mismatched Edwards/Montgomery curve, why its key type stays unlabeled: the truncation reason for fields never seen on a truncated template, the unsupported reason for kinds seen with an unclassifiable value (a value outside the approved finite set, or an unavailable, malformed or size-only cell), the curve reason for a mismatched Edwards/Montgomery curve on a created object whose own template was seen, or (on a complete C_CreateObject or public-half C_GenerateKeyPair template) an unestablished one, the partly-read reason for fields never seen on a partly-read template. Null for every other field."
         }
       }
     },

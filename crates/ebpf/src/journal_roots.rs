@@ -255,6 +255,17 @@ pub(super) mod program {
 
     #[inline(never)]
     pub(crate) fn begin(key: &StartKey, descriptor: u32, layout: LinuxLayout) {
+        // In-place downgrade (A′): a count-only call (descriptor 0,
+        // planned or downgraded) skips BEGIN without a scope gap and
+        // without semantic-capture-failure evidence. An intended
+        // count-only slot is not a capture failure: counts stay exact
+        // through STATS, and the call journals nothing (its return
+        // completes as an UNJOURNALED END, the pre-existing shape for
+        // count-only slots). Controller ruling 2026-11-16 07:43
+        // (REPLACE-INPLACE B1b).
+        if descriptor == 0 {
+            return;
+        }
         let configured = JOURNAL_CLASSES.get(descriptor).copied().unwrap_or(0);
         // Irrelevant is configured explicitly and still takes the native
         // call; the native function's own validation decides. Unknown never

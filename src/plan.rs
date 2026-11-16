@@ -3387,7 +3387,8 @@ impl AttachPlan {
     fn prune_capture_memory(&mut self) {
         let live_keys: BTreeSet<AttachKey> = self.slots.iter().map(AttachKey::of).collect();
         self.slot_ordinals.retain(|key, _| live_keys.contains(key));
-        self.slot_unnamed_reasons.retain(|key, _| live_keys.contains(key));
+        self.slot_unnamed_reasons
+            .retain(|key, _| live_keys.contains(key));
         let live_objects: BTreeSet<PinnedObjectId> = self
             .slots
             .iter()
@@ -22982,9 +22983,9 @@ pub(crate) mod tests {
         rebuilt
             .object_identities
             .insert(PinnedObjectId(83), identity.clone());
-        let delta = plan.extend_exact(rebuilt).unwrap_or_else(|error| {
-            panic!("the same-file migration must not refuse: {error}")
-        });
+        let delta = plan
+            .extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("the same-file migration must not refuse: {error}"));
         assert!(delta.retire.is_empty(), "migration retires nothing");
         assert!(delta.new.is_empty(), "migration allocates nothing");
         assert_eq!(plan.slots.len(), 68);

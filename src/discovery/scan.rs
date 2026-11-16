@@ -5937,17 +5937,24 @@ fn mem_open_exited(pid: u32, error: &std::io::Error) -> bool {
 /// Whether a failed `/proc/<pid>/mem` open proves the whole original
 /// process exited, so the scan takes the exited error path instead of
 /// latching a global `scan_unavailable`. `ESRCH`/`ENOENT` prove the
-/// opened task was gone at open time; anything else is proven from
-/// the view's pin first (`original_exited` is pidfd-backed
-/// whole-group authority: a dead leader with live members reads
-/// `false`, keeping the live group's refusal loud). Only a fallback
-/// pin without a pidfd — which cannot see zombies through its
-/// start-time comparison — falls back to the fresh leader read,
-/// leaving the dead-leader-live-member residual for that pin shape.
-/// Fail-closed: any unproven shape keeps its loud refusal.
+/// opened task was gone at open time. An errno'd refusal (`EACCES`,
+/// `EPERM`, `EIO`, ...) proves the task existed at open time, so it
+/// is proven from the view's pin first (`original_exited` is
+/// pidfd-backed whole-group authority: a dead leader with live
+/// members reads `false`, keeping the live group's refusal loud);
+/// only a fallback pin without a pidfd — which cannot see zombies
+/// through its start-time comparison — falls back to the fresh
+/// leader read for errno'd failures. A wrapped validation failure
+/// with no errno (cold exit churn) keeps the fresh leader read: the
+/// census itself proves transitional exit churn, silenced even
+/// across brief live-member linger. Fail-closed: any unproven shape
+/// keeps its loud refusal.
 fn mem_open_exited_for_view(view: &ProcessView, pid: u32, error: &std::io::Error) -> bool {
     if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
         return true;
+    }
+    if error.raw_os_error().is_none() {
+        return mem_open_exited(pid, error);
     }
     if view.original_exited() == Ok(true) {
         return true;

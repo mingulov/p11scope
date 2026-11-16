@@ -3699,7 +3699,22 @@ impl AttachPlan {
                 // The superseded key's reasons follow the migrated key
                 // like its ordinals, so the union below keeps what the
                 // old pin's row proved, not just the returning claim.
-                if let Some(reasons) = self.slot_unnamed_reasons.remove(key) {
+                // A retired same-key row keeps rendering under the old
+                // key, so the entry is copied while any other slot
+                // under it remains; only a fully vacated key moves its
+                // entry. The end-of-surgery retain drops whatever no
+                // remaining row reads.
+                let keep_old_key = self
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .any(|(index, slot)| index != *position && AttachKey::of(slot) == *key);
+                let carried = if keep_old_key {
+                    self.slot_unnamed_reasons.get(key).cloned()
+                } else {
+                    self.slot_unnamed_reasons.remove(key)
+                };
+                if let Some(reasons) = carried {
                     self.slot_unnamed_reasons
                         .entry(new_key)
                         .or_default()
@@ -3923,7 +3938,21 @@ impl AttachPlan {
                 }
                 // A reclaim onto a retired unknown row merges its
                 // reasons into the returning key, never replaces them.
-                if let Some(reasons) = self.slot_unnamed_reasons.remove(&old_key) {
+                // A retired sibling keeps rendering under the old key,
+                // so the entry is copied while any other slot under it
+                // remains; only a fully vacated key moves its entry.
+                // The end-of-surgery retain drops whatever no remaining
+                // row reads.
+                let keep_old_key = slots
+                    .iter()
+                    .enumerate()
+                    .any(|(index, slot)| index != position && AttachKey::of(slot) == old_key);
+                let carried = if keep_old_key {
+                    self.slot_unnamed_reasons.get(&old_key).cloned()
+                } else {
+                    self.slot_unnamed_reasons.remove(&old_key)
+                };
+                if let Some(reasons) = carried {
                     self.slot_unnamed_reasons
                         .entry(key)
                         .or_default()

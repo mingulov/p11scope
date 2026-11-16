@@ -283,6 +283,14 @@ fn tail(path: &Path) -> String {
     lines.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
+/// Needle for one hook-attach receipt line: the engine prints
+/// `file_offset={offset:#x} abi={abi:?}`, so the needle carries the
+/// product's trailing delimiter — without it a hex-prefix offset
+/// (e.g. `0x2ce`) also matches another offset's line (`0x2ce0`).
+fn attach_receipt_needle(offset: u64) -> String {
+    format!("dynamic export attached file_offset={offset:#x} ")
+}
+
 /// Waits until every address reads back as an int3 through the target's
 /// own memory: the kernel installed the uprobe there.
 fn wait_for_breakpoints(
@@ -572,11 +580,7 @@ fn run_cell_with(
             // per-offset attach receipts, so the calls below cannot run
             // ahead of the hooks that must observe them.
             for offset in &getter_offsets {
-                wait_for_text(
-                    &log,
-                    &format!("dynamic export attached file_offset={offset:#x}"),
-                    &mut child,
-                )?;
+                wait_for_text(&log, &attach_receipt_needle(*offset), &mut child)?;
             }
         }
         wait_for_getter_hooks(&mut child, &app_path, &getter_offsets, &log)?;
@@ -1197,4 +1201,28 @@ fn run_child_staging_copies_and_chmods_the_fixture() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn attach_receipt_needle_terminates_at_the_offset() {
+    // Product lines as `note_dynamic_export_attached` formats them
+    // (`src/discovery/engine.rs`): the offset is followed by ` abi=`.
+    let own = "p11scope: dynamic export attached file_offset=0x2ce abi=FunctionList";
+    let longer = "p11scope: dynamic export attached file_offset=0x2ce0 abi=FunctionList";
+    // Control: the unterminated needle cannot tell a hex-prefix offset
+    // from the longer offset's line, so the delimiter must do it.
+    let short = "dynamic export attached file_offset=0x2ce";
+    assert!(
+        longer.contains(short),
+        "the prefix collision the delimiter guards against is gone: {longer:?}"
+    );
+    let needle = attach_receipt_needle(0x2ce);
+    assert!(
+        own.contains(&needle),
+        "the terminated needle must accept its own line: {needle:?}"
+    );
+    assert!(
+        !longer.contains(&needle),
+        "the terminated needle must reject the hex-prefix collision: {needle:?}"
+    );
 }

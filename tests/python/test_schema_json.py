@@ -1025,8 +1025,8 @@ class SchemaOracleAgreement(unittest.TestCase):
         universe: base keys + profile-only keys + run-only child flag +
         the optional additive envelopes (counter, selection, excludes,
         forwarding, module misses, legacy, short-lived splits, deep-scan
-        selection) and the two additive annotations (refused pause,
-        snapshot failure)."""
+        selection, retry breakdown) and the two additive annotations
+        (refused pause, snapshot failure)."""
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
@@ -1036,7 +1036,7 @@ class SchemaOracleAgreement(unittest.TestCase):
                "gap_exe_hints", "target_exec_hints", "gap_exit_mappings",
                "unmatched_forwarding", "unmatched_modules",
                "pause_refused", "snapshot_failure",
-               "deep_scan_selection"}
+               "deep_scan_selection", "discovery_retry_classes"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
 
@@ -1069,6 +1069,59 @@ class SchemaOracleAgreement(unittest.TestCase):
                 invalid["evidence"]["deep_scan_selection"] = selection
                 with self.assertRaises(AssertionError):
                     CHECKER["exact_metrics_schema"](invalid)
+
+    def test_discovery_retry_classes_shape_twins(self):
+        """The additive retry breakdown: a nonempty map from each nonzero
+        noise label to its positive u64 count. Present only when discovery
+        retried; absent, never null, otherwise."""
+        document = self.metrics_document()
+        valid = copy.deepcopy(document)
+        valid["evidence"]["discovery_retry_classes"] = {
+            "maps-snapshot": 84,
+            "other": 106,
+            "process-ended": 14,
+            "process-view": 13635,
+        }
+        CHECKER["exact_metrics_schema"](valid)
+        for breakdown in (
+            {},
+            {"other": 2, "bogus-label": 1},
+            {"other": 0},
+            {"other": -1},
+            {"other": True},
+            {"other": 2**64},
+            {"other": "106"},
+            {"other": None},
+            {"other": 1.5},
+            None,
+            [],
+            "other",
+            106,
+        ):
+            with self.subTest(breakdown=breakdown):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["discovery_retry_classes"] = breakdown
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+
+    def test_discovery_retry_classes_schema_matches_oracle_shape(self):
+        """Schema property for the retry breakdown is the oracle's closed
+        shape: optional, keys a subset of the six noise labels, values
+        positive u64, never empty."""
+        props = evidence_schema()["properties"]
+        self.assertIn("discovery_retry_classes", props)
+        self.assertNotIn("discovery_retry_classes", evidence_schema()["required"])
+        breakdown = props["discovery_retry_classes"]
+        self.assertEqual(breakdown["type"], "object")
+        self.assertEqual(
+            set(breakdown["propertyNames"]["enum"]),
+            set(CHECKER["DISCOVERY_RETRY_CLASSES"]),
+        )
+        self.assertEqual(
+            breakdown["additionalProperties"],
+            {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        )
+        self.assertEqual(breakdown.get("minProperties"), 1)
 
     def test_excluded_modules_shape_twins(self):
         document = self.metrics_document()

@@ -19341,6 +19341,7 @@ fn evidence_verdict(
             .iter()
             .map(render::capture_skipped_out)
             .collect(),
+        discovery_retry_classes: BTreeMap::new(),
         semantic_unverified_slots: plan
             .slots
             .iter()
@@ -42850,6 +42851,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
             .iter()
             .map(render::capture_skipped_out)
             .collect(),
+        discovery_retry_classes: BTreeMap::new(),
         semantic_unverified_slots: 0,
         in_flight_at_end: 0,
         surfaces: plan.surfaces.clone(),
@@ -70677,6 +70679,35 @@ fn graph_inputs_epoch_bumps_on_mutating_entry_points() {
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
     engine.report_discovery_noise();
     assert_eq!(engine.graph_inputs_epoch_for_test(), epoch);
+}
+
+/// Retry breakdown: the report's per-class counts survive the
+/// end-of-capture noise flush — the flush merges into the cumulative
+/// totals before clearing, so initial + live stays complete.
+#[test]
+fn retry_breakdown_survives_the_end_of_capture_noise_flush() {
+    let mut engine = Engine::empty();
+    engine.counters.noise.note_skip(
+        "process view",
+        "the process generation could not be retained: gone",
+    );
+    engine.counters.noise.note_skip(
+        "process view",
+        "the process generation could not be scanned: gone",
+    );
+    engine.counters.noise.note_skip(
+        "live discovery generation",
+        "candidate generation exited before mutation; canonical identity, plan, and links were unchanged",
+    );
+    engine.report_discovery_noise();
+    assert!(
+        engine.counters.noise.is_empty(),
+        "the flush still clears the live accumulator"
+    );
+    let classes = engine.discovery_retry_classes();
+    assert_eq!(classes.get("process-view"), Some(&2));
+    assert_eq!(classes.get("process-ended"), Some(&1));
+    assert_eq!(classes.len(), 2, "only nonzero classes appear: {classes:?}");
 }
 
 /// T4a helper: service collected Finish until the boxed graph reaches

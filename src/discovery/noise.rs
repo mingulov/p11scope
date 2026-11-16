@@ -206,6 +206,16 @@ impl DiscoveryNoiseAggregator {
             .fold(0u64, |acc, entry| acc.saturating_add(entry.count))
     }
 
+    /// Nonzero per-class counts keyed by the stable categorical label, for
+    /// the report's complete retry breakdown. First samples stay out: they
+    /// may name target paths, while labels and counts are finite.
+    pub fn counts_by_label(&self) -> BTreeMap<&'static str, u64> {
+        self.entries
+            .iter()
+            .map(|(class, entry)| (class.label(), entry.count))
+            .collect()
+    }
+
     /// True when nothing has been noted.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

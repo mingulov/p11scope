@@ -476,6 +476,20 @@ individuals, or unavailable snapshots — truly unexamined, never
 guessed. The object never feeds verdicts by itself; the paired
 finite skip below carries the `skipped` observation cause.
 
+`discovery_retry_classes` is present if and only if discovery skipped at
+least one view and folded it into the per-class noise accumulator;
+otherwise the key is absent, never null. It carries the complete
+per-class retry breakdown behind the generic `skipped` rows as an object
+mapping each nonzero noise label to its saturating u64 count over the
+whole capture (initial discovery plus live): `process-ended`,
+`maps-snapshot`, `object-missing`, `process-view`, `stale-view`, and
+`other`. Labels and counts are finite — the stderr first samples that
+may name target paths never reach this key. The object never feeds
+verdicts by itself; the paired `skipped` rows carry the observation
+cause. Verbose text names the dominant class beside the `skipped`
+listing (`dominant retry class: <label> x<count>`); the concise
+coverage line stays one line without it.
+
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation
 tracking is not attached there. For cgroup scope it counts destination-

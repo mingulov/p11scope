@@ -1443,6 +1443,7 @@ mod tests {
             attach_failures: vec![],
             aliased: vec![],
             skipped: vec![],
+            discovery_retry_classes: BTreeMap::new(),
             semantic_unverified_slots: 0,
             in_flight_at_end: 0,
             surfaces: vec![],

@@ -1339,6 +1339,13 @@ pub struct Evidence {
     /// Discovered entries with no attachable target, and why. Also published
     /// per module in `discovery[].skipped`.
     pub skipped: Vec<SkippedOut>,
+    /// Complete per-class discovery retry counts behind the `skipped`
+    /// rows: every skipped discovery view, folded by noise class over the
+    /// whole capture (initial + live). Keyed by the stable class label;
+    /// only nonzero classes appear. Absent — never null — when discovery
+    /// never retried.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub discovery_retry_classes: BTreeMap<String, u64>,
     /// Planned slots whose names are not authorized for semantic
     /// interpretation (every scan-found slot, whatever its linkage). Counts
     /// through them are exact; only their semantics are withheld, so this is
@@ -4640,7 +4647,10 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     )));
                 }
                 if verbose {
-                    let items = skipped_item_list(ev);
+                    let mut items = skipped_item_list(ev);
+                    if let Some(dominant) = dominant_retry_class(ev) {
+                        items.push(dominant);
+                    }
                     if !items.is_empty() {
                         fragments.push(format!("skipped: {}", items.join(", ")));
                     }
@@ -5002,6 +5012,24 @@ fn skipped_item_list(ev: &Evidence) -> Vec<String> {
         items.push(format!("and {} more", distinct.len() - SHOWN));
     }
     items
+}
+
+/// The largest discovery retry class behind the `skipped` rows, for the
+/// verbose listing only: generic rows hide thousands of retried views, so
+/// `-v` names the dominant class with its count. Ties break toward the
+/// alphabetically first label; empty when discovery never retried.
+/// Concise output never calls this and stays one line.
+fn dominant_retry_class(ev: &Evidence) -> Option<String> {
+    let mut best: Option<(&String, u64)> = None;
+    for (label, count) in &ev.discovery_retry_classes {
+        if *count == 0 {
+            continue;
+        }
+        if best.is_none_or(|(_, kept)| *count > kept) {
+            best = Some((label, *count));
+        }
+    }
+    best.map(|(label, count)| format!("dominant retry class: {label} x{count}"))
 }
 
 /// True for an owned run that never paused while its command ran
@@ -7029,6 +7057,7 @@ pub(crate) mod tests {
             attach_failures: vec![],
             aliased: vec![],
             skipped: vec![],
+            discovery_retry_classes: BTreeMap::new(),
             semantic_unverified_slots: 0,
             in_flight_at_end: 0,
             surfaces: vec![ok_surface()],
@@ -18452,6 +18481,69 @@ pub(crate) mod tests {
         let line = coverage_line(&ev, false);
         assert!(line.contains("3 session-tracking gaps"), "{line}");
         assert!(!line.contains("262144"), "{line}");
+    }
+
+    // Dominant retry class: verbose names the largest discovery retry
+    // class behind the generic skipped rows; the concise default stays
+    // one line without it.
+    #[test]
+    fn coverage_line_verbose_names_the_dominant_retry_class() {
+        let mut ev = evidence();
+        ev.skipped = vec![
+            SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            },
+            SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            },
+        ];
+        ev.discovery_retry_classes = BTreeMap::from([
+            ("process-view".to_string(), 19861),
+            ("process-ended".to_string(), 341),
+            ("other".to_string(), 300),
+        ]);
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let verbose = coverage_line(&ev, true);
+        assert!(
+            verbose.contains("discovery subject (discovery unavailable) x2"),
+            "{verbose}"
+        );
+        assert!(
+            verbose.contains("dominant retry class: process-view x19861"),
+            "{verbose}"
+        );
+        let line = coverage_line(&ev, false);
+        assert!(!line.contains("dominant retry class"), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+    }
+
+    // The JSON evidence carries the complete per-class retry breakdown,
+    // and omits the key — never null — when discovery never retried.
+    #[test]
+    fn json_reports_the_complete_retry_breakdown_and_omits_it_when_empty() {
+        let mut ev = evidence();
+        ev.discovery_retry_classes = BTreeMap::from([
+            ("process-view".to_string(), 19861),
+            ("process-ended".to_string(), 341),
+            ("other".to_string(), 300),
+        ]);
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["discovery_retry_classes"]["process-view"], 19861);
+        assert_eq!(json["discovery_retry_classes"]["process-ended"], 341);
+        assert_eq!(json["discovery_retry_classes"]["other"], 300);
+        assert_eq!(
+            json["discovery_retry_classes"].as_object().unwrap().len(),
+            3
+        );
+        let clean = evidence();
+        let json = serde_json::to_value(&clean).unwrap();
+        assert!(
+            json.get("discovery_retry_classes").is_none(),
+            "an empty breakdown omits the key: {json}"
+        );
     }
 
     // Semantic key budget (RED): the JSON evidence names the enforced

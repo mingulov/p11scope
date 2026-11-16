@@ -14383,6 +14383,7 @@ pub(crate) fn evidence_for(
             .iter()
             .map(render::capture_skipped_out)
             .collect(),
+        discovery_retry_classes: engine.discovery_retry_classes(),
         semantic_unverified_slots: plan.semantic_unverified_slot_count(),
         in_flight_at_end: reports.iter().map(|r| r.in_flight).sum(),
         surfaces: plan.surfaces.clone(),

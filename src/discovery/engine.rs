@@ -584,6 +584,12 @@ pub struct Engine {
         crate::attach::prearm_witness::StartupWitness<crate::attach::prearm_witness::LiveBackend>,
     >,
     base_counters: DiscoveryCounters,
+    /// Cumulative discovery-noise counts across every reported-and-cleared
+    /// accumulator (initial discovery, stale-view flushes, live capture):
+    /// each clear site merges first, so the report's retry breakdown stays
+    /// complete after the live accumulator is dropped. First samples are
+    /// retained in memory only and never serialized.
+    noise_totals: DiscoveryNoiseAggregator,
     budget: CaptureWorkBudget,
     inventory: Option<inventory::InventoryState>,
     next_view_id: u32,
@@ -9657,10 +9663,13 @@ fn discover_plan(
     discovered.counters.report_notes();
     // Task 3.2 (S1): one categorical summary per noise class instead of one
     // line per skipped view. Cleared here so live accumulation starts fresh
-    // and a later rebuild cannot re-merge initial noise.
+    // and a later rebuild cannot re-merge initial noise. The rebuild above
+    // already folded base and scan-input noise into the aggregate, so one
+    // merge retains the whole initial breakdown for the report.
     if crate::run::capture_diagnostics_on() {
         discovered.counters.noise.report();
     }
+    discovered.noise_totals.merge(&discovered.counters.noise);
     discovered.counters.noise.clear();
     discovered.base_counters.noise.clear();
     for input in discovered.scan_inputs.values_mut() {
@@ -11513,10 +11522,12 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
     rebuild_discovered(discovered)?;
     // Stale removals happen during attach preparation, after the initial
     // report: flush their summaries now so the operator sees them before the
-    // capture starts, and live accumulation starts fresh.
+    // capture starts, and live accumulation starts fresh. Merged first so
+    // the report keeps their counts beside the initial breakdown.
     if crate::run::capture_diagnostics_on() {
         discovered.counters.noise.report();
     }
+    discovered.noise_totals.merge(&discovered.counters.noise);
     discovered.counters.noise.clear();
     discovered.base_counters.noise.clear();
     for input in discovered.scan_inputs.values_mut() {
@@ -13516,6 +13527,7 @@ impl Engine {
             prearm_witness: None,
             prearm_witness_live: None,
             base_counters: DiscoveryCounters::default(),
+            noise_totals: DiscoveryNoiseAggregator::default(),
             budget: CaptureWorkBudget::default(),
             inventory: None,
             next_view_id: 0,
@@ -39153,7 +39165,22 @@ impl Engine {
         if crate::run::capture_diagnostics_on() {
             self.counters.noise.report();
         }
+        self.noise_totals.merge(&self.counters.noise);
         self.counters.noise.clear();
+    }
+
+    /// Complete per-class discovery retry counts (initial + live): the
+    /// cumulative totals plus whatever the live accumulator still holds.
+    /// Keyed by the stable noise label; only nonzero classes appear, so
+    /// the report omits the key entirely when discovery never retried.
+    pub fn discovery_retry_classes(&self) -> BTreeMap<String, u64> {
+        let mut totals = self.noise_totals.clone();
+        totals.merge(&self.counters.noise);
+        totals
+            .counts_by_label()
+            .into_iter()
+            .map(|(label, count)| (label.to_string(), count))
+            .collect()
     }
 
     pub(crate) fn retain_return_probe_admission(

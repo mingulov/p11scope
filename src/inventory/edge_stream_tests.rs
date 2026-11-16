@@ -1460,6 +1460,7 @@ fn finish_counts_the_selected_stale_publication_not_the_current() {
             status: "absent",
             scalar: None,
             curve: None,
+            source: None,
         };
         let block = MetadataBlock {
             class: blank,
@@ -1590,6 +1591,7 @@ fn finish_with_fitting_stale_selection_discloses_nothing() {
             status: "absent",
             scalar: None,
             curve: None,
+            source: None,
         };
         let block = MetadataBlock {
             class: blank,

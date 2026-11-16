@@ -26,11 +26,18 @@ pub enum SafeAttributeKind {
 }
 
 /// Only complete, exact encodings of these curves may be classified.
+/// R2 new-site: X25519 additionally accepts the 11-byte draft-josefsson
+/// OID NSS passes for ephemeral TLS keypairs; the other three accept
+/// their RFC 8410 5-byte OIDs only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafeCurve {
     Secp256r1,
     Secp384r1,
     Secp521r1,
+    X25519,
+    X448,
+    Ed25519,
+    Ed448,
 }
 
 /// Compare the entire target word; excluded/unknown selectors gain no reads.
@@ -57,25 +64,30 @@ pub const fn valid_safe_attribute_length(
 ) -> bool {
     match kind {
         SafeAttributeKind::Token => len == 1,
-        SafeAttributeKind::EcParams => len == 7 || len == 10,
+        SafeAttributeKind::EcParams => len == 5 || len == 7 || len == 10 || len == 11,
         _ => len == layout.word_bytes() as u64,
     }
 }
 
 /// Return the exact approved scalar only after full-width membership checks.
-/// A size fact alone establishes no key type, and requested facts establish no
-/// result properties. `EcParams` requires complete bytes instead of a scalar.
+/// A size fact alone establishes no key type. `EcParams` requires
+/// complete bytes instead of a scalar.
 /// F16 (7.05 PQC): the KeyType arm additionally accepts the three PQC key
 /// types (`CKK_ML_KEM`/`CKK_ML_DSA`/`CKK_SLH_DSA`), which qualify a
 /// parameter set but never label alone; the ParameterSet arm accepts the
 /// union `1..=12` of the three `CKP_*` ranges, with per-family validity
 /// decided at label time.
+/// R2 new-site: KeyType accepts `CKK_HKDF` (0x42); ValueLen accepts the
+/// measured HKDF/AES schedule sizes 12 and 48.
 pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> Option<u16> {
     match (kind, value) {
         (SafeAttributeKind::Class, 0..=4)
-        | (SafeAttributeKind::KeyType, 0x00..=0x04 | 0x10 | 0x1f | 0x40 | 0x41 | 0x49..=0x4b)
+        | (
+            SafeAttributeKind::KeyType,
+            0x00..=0x04 | 0x10 | 0x1f | 0x40 | 0x41 | 0x42 | 0x49..=0x4b,
+        )
         | (SafeAttributeKind::Token, 0 | 1)
-        | (SafeAttributeKind::ValueLen, 16 | 24 | 32)
+        | (SafeAttributeKind::ValueLen, 12 | 16 | 24 | 32 | 48)
         | (SafeAttributeKind::ModulusBits, 1024 | 2048 | 3072 | 4096 | 8192)
         | (SafeAttributeKind::ParameterSet, 1..=12) => Some(value as u16),
         _ => None,
@@ -83,11 +95,19 @@ pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> O
 }
 
 /// Exact complete-byte equality only; no DER parser or prefix fallback.
+/// R2 new-site: the 11-byte draft-josefsson Curve25519 OID (measured in
+/// Firefox ephemeral keypair templates) plus the four RFC 8410 5-byte
+/// OIDs. No printable-string forms: unmeasured, deferred.
 pub fn classify_ec_params(bytes: &[u8]) -> Option<SafeCurve> {
     match bytes {
         [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07] => Some(SafeCurve::Secp256r1),
         [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22] => Some(SafeCurve::Secp384r1),
         [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23] => Some(SafeCurve::Secp521r1),
+        [0x06, 0x09, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01]
+        | [0x06, 0x03, 0x2b, 0x65, 0x6e] => Some(SafeCurve::X25519),
+        [0x06, 0x03, 0x2b, 0x65, 0x6f] => Some(SafeCurve::X448),
+        [0x06, 0x03, 0x2b, 0x65, 0x70] => Some(SafeCurve::Ed25519),
+        [0x06, 0x03, 0x2b, 0x65, 0x71] => Some(SafeCurve::Ed448),
         _ => None,
     }
 }
@@ -265,12 +285,17 @@ pub fn valid_object_descriptor(function: u32, candidate: &ObjectCaptureDescripto
 }
 
 /// Keep which accepted mechanism must match the existing return-time evidence.
+/// R2 new-site: HKDF derive/data plus base-and-key concatenation join the
+/// closed set (none belongs to the may-leave-`phKey`-untouched family).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarDeriveMechanism {
     DhPkcs,
     Sha256,
     Ecdh1,
     Ecdh1Cofactor,
+    HkdfDerive,
+    HkdfData,
+    ConcatBaseAndKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,12 +306,17 @@ pub enum DeriveResultProtocol {
 
 /// Full-width membership only. Successful SSL3/TLS12/WTLS calls may leave
 /// `phKey` untouched, so neither success nor a nonzero cell authorizes it.
+/// R2 new-site: the HKDF/concat additions are standard derives outside
+/// that family: CKR_OK writes the handle, like the existing four.
 pub const fn derive_result_protocol(mechanism: u64) -> DeriveResultProtocol {
     match mechanism {
         0x21 => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::DhPkcs),
         0x393 => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::Sha256),
         0x1050 => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::Ecdh1),
         0x1051 => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::Ecdh1Cofactor),
+        0x402a => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::HkdfDerive),
+        0x402b => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::HkdfData),
+        0x360 => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::ConcatBaseAndKey),
         _ => DeriveResultProtocol::Unavailable,
     }
 }

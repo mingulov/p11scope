@@ -953,15 +953,42 @@ pub(crate) enum FieldState {
     Invalidated(Option<FieldValue>),
 }
 
+/// How one established metadata field was proven (keymeta §6/K5,
+/// allowlist-v3 R2 block): a provider attribute-result read on the
+/// object, or a successful creation return promoting its own finite
+/// template. Requested facts never carry one; a fact never changes
+/// source silently (a confirming query keeps the first establisher).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldSource {
+    Query,
+    CreationSuccess,
+}
+
+impl FieldSource {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::CreationSuccess => "creation_success",
+        }
+    }
+}
+
 /// Seven fixed metadata slots indexed by [`SafeAttributeKind`] order.
+/// `sources` rides the established view only; the requested view
+/// carries `None` in every slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataView {
     fields: [FieldState; METADATA_FIELDS],
+    sources: [Option<FieldSource>; METADATA_FIELDS],
 }
 
 impl MetadataView {
     pub(crate) fn field(&self, kind: SafeAttributeKind) -> FieldState {
         self.fields[field_index(kind)]
+    }
+
+    pub(crate) fn source(&self, kind: SafeAttributeKind) -> Option<FieldSource> {
+        self.sources[field_index(kind)]
     }
 }
 
@@ -1010,10 +1037,24 @@ pub(crate) enum PqcCode {
 /// same successful `C_GenerateKeyPair` return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyLabel {
-    Aes { value_len: u16 },
-    Rsa { modulus_bits: u16 },
-    Ec { curve: SafeCurve },
+    Aes {
+        value_len: u16,
+    },
+    Rsa {
+        modulus_bits: u16,
+    },
+    Ec {
+        curve: SafeCurve,
+    },
     Pqc(PqcCode),
+    /// R2 new-site: an HKDF key with its established byte size.
+    Hkdf {
+        value_len: u16,
+    },
+    /// R2 new-site: a generic-secret key with its established byte size.
+    GenericSecret {
+        value_len: u16,
+    },
 }
 
 impl KeyLabel {

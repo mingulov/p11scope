@@ -549,11 +549,20 @@ fn s2s3_creation_protocols_all_six_families_mint_fresh_results() {
         source.requested.field(SafeAttributeKind::KeyType),
         scalar_field(0x1f)
     );
+    // R2 new-site (allowlist-v3 R2 amendment): a successful creation
+    // return promotes the finite requested facts to established, so a
+    // complete template labels without a query. Requested CKA_TOKEN,
+    // unknown/conflict shapes, and incomplete triples still never
+    // label (see the newsite_* twins).
     assert_eq!(
         source.established.field(SafeAttributeKind::Class),
-        FieldState::Unknown
+        scalar_field(4)
     );
-    assert_eq!(source.label, None, "requested metadata never labels");
+    assert_eq!(
+        source.label,
+        Some(KeyLabel::Aes { value_len: 32 }),
+        "complete creation template labels on success"
+    );
     let copy = view(&p, ids[1]);
     assert_eq!(
         copy.requested.field(SafeAttributeKind::Class),
@@ -2473,13 +2482,16 @@ fn s2s3_metadata_provenance_requested_and_established_are_separate() {
         v.established.field(SafeAttributeKind::Class),
         scalar_field(4)
     );
+    // R2 new-site: the complete creation template promotes type and
+    // size at success; the later unavailable/size-only query neither
+    // erases them nor needs to re-establish them.
     assert_eq!(
         v.established.field(SafeAttributeKind::KeyType),
-        FieldState::Unknown
+        scalar_field(0x1f)
     );
     assert_eq!(
         v.established.field(SafeAttributeKind::ValueLen),
-        FieldState::Unknown
+        scalar_field(32)
     );
     assert_eq!(
         v.established.field(SafeAttributeKind::Token),
@@ -2495,7 +2507,9 @@ fn s2s3_metadata_provenance_requested_and_established_are_separate() {
         QueryStatus::SizeOnly,
         "ValueLen query recorded"
     );
-    assert_eq!(v.label, None, "size/type unknown: no label");
+    // R2 new-site: the promoted complete triple already labels; the
+    // partial query adds nothing.
+    assert_eq!(v.label, Some(KeyLabel::Aes { value_len: 32 }));
 
     // Retry is a new call; it establishes the remaining fields.
     let retry = attrs(&[scalar(CKA_KEY_TYPE, 0x1f), scalar(CKA_VALUE_LEN, 32)]);
@@ -5048,6 +5062,56 @@ fn newsite_created_chacha20_key_promotes_value_len_without_label() {
         "the finite value length still promotes"
     );
     assert_eq!(v.label, None, "a size alone never labels");
+}
+
+// Keymeta §6 gap re-proof (R2-doc §7.3): a `C_DeriveKey` HKDF result
+// with full entry evidence (listed entry mechanism, matching
+// return mechanism, retained result handle) promotes the derived
+// view's finite template and labels it. The entry-evidence
+// requirement itself persists by design — without retained entry
+// evidence the result stays unavailable (see the guarded twins
+// above), which belongs to keyrows/void work, not keymeta.
+#[test]
+fn newsite_derived_hkdf_via_derive_key_promotes() {
+    const HKDF_DERIVE: u64 = 0x402a;
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    h.run(3, call("C_GenerateKey").on(SA), 4, ok().result(0, H1));
+    let template = attrs(&[
+        scalar(CKA_CLASS, 4),
+        scalar(CKA_KEY_TYPE, 0x42),
+        scalar(CKA_VALUE_LEN, 48),
+    ]);
+    let v = MechanismEvidence::Value;
+    let x = h.run(
+        5,
+        call("C_DeriveKey")
+            .on(SA)
+            .input(0, H1)
+            .mech(v(HKDF_DERIVE))
+            .request(0, template),
+        6,
+        ok().mech(v(HKDF_DERIVE)).result(0, H2),
+    );
+    let e = h.settle(6);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        scalar_field(0x42),
+        "the derive result establishes the HKDF key type"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        scalar_field(48),
+        "the derive result establishes the requested size"
+    );
+    assert_eq!(
+        v.label,
+        Some(KeyLabel::Hkdf { value_len: 48 }),
+        "the derived view labels without a query"
+    );
 }
 
 // Keymeta §6 generic unlisted-type twin (`CKK_POLY1305`, 0x34),

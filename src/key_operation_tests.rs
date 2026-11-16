@@ -4412,16 +4412,17 @@ fn key_operation_unknown_key_and_requested_only() {
     );
 }
 
-/// Data always: a key GENERATED in the observed window whose type
-/// has no label family (a generic-secret HMAC key, the
-/// joint-throughput workload) and whose attributes are never read
-/// back still keeps its per-key row with exact counts under the
-/// honest `unknown` metadata label. The requested template never
-/// labels and no type or size is guessed. The conflicted twin keeps
-/// the strict guard: a key whose metadata conflicts never rows and
-/// counts `metadata_conflicting` instead.
+/// Data always: a key GENERATED in the observed window with a
+/// complete finite template (a generic-secret HMAC key, the
+/// joint-throughput workload) keeps its per-key row with exact
+/// counts under its established label — R2 new-site: the complete
+/// creation template establishes on success, so the row carries
+/// `generic_256` and the section versions v6. No type or size is
+/// guessed: incomplete triples still row `unknown`. The conflicted
+/// twin keeps the strict guard: a key whose metadata conflicts
+/// never rows and counts `metadata_conflicting` instead.
 #[test]
-fn key_operation_generated_generic_secret_key_rows_with_unknown_metadata() {
+fn key_operation_generated_generic_secret_key_rows_with_generic_label() {
     const GENERIC_SECRET_KEY_GEN: u64 = 0x0350;
     const SHA256_HMAC: u64 = 0x0251;
     for conflicted in [false, true] {
@@ -4487,7 +4488,15 @@ fn key_operation_generated_generic_secret_key_rows_with_unknown_metadata() {
             .find(|row| row.creation == Some("generate"))
             .expect("the generated key stands");
         assert_eq!(object.origin, "created");
-        assert_eq!(object.label, None, "no label family for generic secret");
+        assert_eq!(
+            object.label,
+            if conflicted {
+                None
+            } else {
+                Some("generic_256")
+            },
+            "R2 new-site: the complete template labels unless conflicted"
+        );
         assert_eq!(object.successful_key_references, 3);
         if conflicted {
             assert!(
@@ -4506,7 +4515,10 @@ fn key_operation_generated_generic_secret_key_rows_with_unknown_metadata() {
             assert_eq!(row.object, object.object, "the row names the generated key");
             assert_eq!(row.category, "sign");
             assert_eq!(row.role, "key");
-            assert_eq!(row.metadata_at_use, "unknown", "no guessed type or size");
+            assert_eq!(
+                row.metadata_at_use, "generic_256",
+                "R2 new-site: the promoted label rows"
+            );
             assert_eq!(
                 (row.started, row.completed, row.failed, row.active),
                 (3, 3, 0, 0)
@@ -4519,8 +4531,8 @@ fn key_operation_generated_generic_secret_key_rows_with_unknown_metadata() {
                 "the signs are not counted twice"
             );
             let json = crate::key_operation_projection::object_observations_json(&committed);
-            assert_eq!(json["version"], 4, "unknown metadata rows stamp v4");
-            assert_eq!(json["key_operations"][0]["metadata_at_use"], "unknown");
+            assert_eq!(json["version"], 6, "new-site labels stamp v6");
+            assert_eq!(json["key_operations"][0]["metadata_at_use"], "generic_256");
         }
     }
 }
@@ -8355,6 +8367,7 @@ fn key_operation_emitter_tracking_bounded_across_object_churn() {
             status: "absent",
             scalar: None,
             curve: None,
+            source: None,
         };
         let block = MetadataBlock {
             class: blank,
@@ -8890,7 +8903,7 @@ fn key_operation_schema_contract() {
         (FieldState::Invalidated(None), "invalidated", None, None),
     ];
     for (state, status, scalar, curve_name) in fields {
-        let field = metadata_field(state);
+        let field = metadata_field(state, None);
         assert_eq!(field.status, status);
         assert!(FIELD_STATUSES.contains(&status));
         assert_eq!(field.scalar, scalar);
@@ -11817,10 +11830,11 @@ fn key_operation_kem_later_use_qualifies_forward_only() {
 
 /// Item 18 (created-output twin): the actual minted output of each
 /// KEM family flows into the later use — never the original input.
-/// Its first use stays unknown; a generic-secret GET keeps it
-/// unknown under M2; independently established AES metadata qualifies
-/// only a subsequent use of that same output. Earlier same-category
-/// `unknown` rows and receipt snapshots never change (no backfill). Each
+/// Its first use stays unknown; independently established metadata
+/// (generic-secret or AES) qualifies only a subsequent use of that
+/// same output — R2 new-site: generic-secret gained a label family,
+/// so both GET shapes prove. Earlier same-category `unknown` rows
+/// and receipt snapshots never change (no backfill). Each
 /// establishment runs on its own output: sequential contradictory
 /// GETs would conflict on KeyType instead of qualifying.
 #[test]
@@ -11853,14 +11867,14 @@ fn key_operation_kem_created_output_later_use_m2_twins() {
             "encapsulation_key",
         ),
     ] {
-        for (cells, proves) in [
+        for (cells, expected) in [
             (
                 vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x10u16), (4u8, 1u8, 32u16)],
-                false,
+                "generic_256",
             ),
             (
                 vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1Fu16), (4u8, 1u8, 32u16)],
-                true,
+                "aes_256",
             ),
         ] {
             let mut scene = JointScene::new();
@@ -11996,26 +12010,16 @@ fn key_operation_kem_created_output_later_use_m2_twins() {
                 .iter()
                 .filter(|row| row.metadata_at_use != "unknown")
                 .collect();
-            if proves {
-                assert!(
-                    unknown2.contains(&(category, 1)),
-                    "the earlier unknown-metadata row stands untouched: {unknown2:?}"
-                );
-                assert_eq!(labelled.len(), 1, "exactly the qualified use labels");
-                let row = labelled[0];
-                assert_eq!(row.category, category);
-                assert_eq!(row.role, role);
-                assert_eq!(row.metadata_at_use, "aes_256");
-                assert_eq!(row.completed, 1);
-            } else {
-                // Generic secret has no label family: both uses row
-                // under unknown metadata on the one output object.
-                assert!(
-                    unknown2.contains(&(category, 2)),
-                    "generic-secret GET keeps the output unknown: {unknown2:?}"
-                );
-                assert!(labelled.is_empty(), "generic-secret labels nothing");
-            }
+            assert!(
+                unknown2.contains(&(category, 1)),
+                "the earlier unknown-metadata row stands untouched: {unknown2:?}"
+            );
+            assert_eq!(labelled.len(), 1, "exactly the qualified use labels");
+            let row = labelled[0];
+            assert_eq!(row.category, category);
+            assert_eq!(row.role, role);
+            assert_eq!(row.metadata_at_use, expected);
+            assert_eq!(row.completed, 1);
             let receipts2 = direct_receipts(&sink);
             assert!(
                 receipts2.len() > receipts1.len(),
@@ -24842,7 +24846,8 @@ fn key_operation_schema_v5_pins_pqc_metadata_contract() {
 fn key_operation_pqc_version_follows_content() {
     use crate::key_operation_projection::producer::commit;
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V5, object_observations_json, observations_version,
+        OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6, object_observations_json,
+        observations_version,
     };
     use crate::semantics_key_use::KeyUseReducer;
     // Both scenes sign with the ML-DSA mechanism id (0x1d): labels
@@ -25043,8 +25048,10 @@ fn key_operation_pqc_version_follows_content() {
         section["objects"][0]["established"]["parameter_set"]["status"],
         "unknown"
     );
-    // A requested-only keygen template versions v5: the PQC scalars
-    // sit in the requested block, nothing establishes, nothing labels.
+    // A PQC keygen template versions v6: R2 new-site success
+    // promotes the requested scalars to established (with
+    // `creation_success` sources), but the mismatched secret class
+    // still withholds the label, so the row stays unknown.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -25081,11 +25088,11 @@ fn key_operation_pqc_version_follows_content() {
     let requested_only = commit(1, &[&staging], &scene.model.project(), &keyuse);
     assert_eq!(
         observations_version(&requested_only),
-        OBSERVATIONS_VERSION_V5,
-        "a requested-only keygen template versions v5"
+        OBSERVATIONS_VERSION_V6,
+        "a promoted PQC keygen template versions v6"
     );
     let section = object_observations_json(&requested_only);
-    assert_eq!(section["version"], 5);
+    assert_eq!(section["version"], 6);
     assert_seven_key_blocks(&section);
     assert_eq!(
         section["objects"][0]["requested"]["key_type"]["value"],
@@ -25096,8 +25103,12 @@ fn key_operation_pqc_version_follows_content() {
         2
     );
     assert_eq!(
-        section["objects"][0]["established"]["parameter_set"]["status"],
-        "unknown"
+        section["objects"][0]["established"]["parameter_set"]["status"], "value",
+        "R2 new-site: success promotes the requested set"
+    );
+    assert_eq!(
+        section["objects"][0]["established"]["parameter_set"]["value"],
+        2
     );
     assert!(section["objects"][0]["label"].is_null());
     let rows = section["key_operations"].as_array().unwrap();
@@ -25375,7 +25386,9 @@ fn key_operation_newsite_promoted_field_carries_creation_source() {
 }
 
 /// Keymeta §6/K5 source twin: a field established by an attribute
-/// query carries source `query`, distinct from promoted facts.
+/// query carries source `query`, distinct from promoted facts. The
+/// HKDF values force section v6 (sources render at v6+ only; v1
+/// stays byte-stable without them).
 #[test]
 fn key_operation_newsite_queried_field_carries_query_source() {
     use crate::semantics_key_use::KeyUseReducer;
@@ -25400,12 +25413,14 @@ fn key_operation_newsite_queried_field_carries_query_source() {
         &mut keyuse,
         &mut sink,
         &ShapedS1 {
-            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x42u16), (4u8, 1u8, 48u16)],
             ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
         },
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
     let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    assert_eq!(section["objects"][0]["label"], "hkdf_384");
     let established = &section["objects"][0]["established"];
     for field in ["class", "key_type", "value_len"] {
         assert_eq!(
@@ -25465,4 +25480,364 @@ fn key_operation_newsite_token_request_never_promotes() {
         established["token"]["source"].is_null(),
         "an unpromoted slot carries no source"
     );
+}
+
+/// R2 new-site: the v6 schema pins the extended metadata contract —
+/// the metadata_label enum extended by exactly the sixteen new-site
+/// labels, the key-type enum extended by exactly CKK_HKDF (66), the
+/// value-len enum extended by exactly 12/48, and the curve enum
+/// extended by exactly the four Montgomery/Edwards names. Every new
+/// `KeyLabel` renders its label, and the v6 trigger agrees with the
+/// table on all 47 labels.
+#[test]
+fn key_operation_schema_v6_pins_newsite_metadata_contract() {
+    use crate::key_operation_projection::contract::{
+        CURVE_LABELS, CURVE_LABELS_V6, FIELD_KEYS, FIELD_KEYS_V6, METADATA_LABELS_V5,
+        METADATA_LABELS_V6,
+    };
+    use crate::key_operation_projection::{is_newsite_curve_name, is_newsite_metadata_label};
+    use crate::semantics_key_use::metadata_label;
+    use crate::semantics_objects::KeyLabel;
+    use p11scope_ebpf_common::object_policy::SafeCurve;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v6.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    let numbers = |pointer: &str| -> Vec<u64> {
+        schema
+            .pointer(pointer)
+            .expect("pointer present")
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|value| value.as_u64())
+            .collect()
+    };
+    let names = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 6);
+    assert_eq!(
+        required("/$defs/metadata_label/enum"),
+        sorted(
+            METADATA_LABELS_V6
+                .iter()
+                .map(|label| label.to_string())
+                .collect()
+        )
+    );
+    assert_eq!(
+        numbers("/$defs/metadata_field_key_type/properties/value/enum"),
+        vec![0, 1, 2, 3, 4, 16, 31, 64, 65, 66, 73, 74, 75],
+        "key-type enum gains exactly CKK_HKDF"
+    );
+    assert_eq!(
+        numbers("/$defs/metadata_field_value_len/properties/value/enum"),
+        vec![12, 16, 24, 32, 48],
+        "value-len enum gains exactly 12/48"
+    );
+    assert_eq!(
+        names("/$defs/metadata_field_curve/properties/value/enum"),
+        sorted(
+            CURVE_LABELS_V6
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        )
+    );
+    // Keymeta §6/K5: every v6 metadata field carries the per-field
+    // `source` key beside status/value; the frozen v1–v5 field shape
+    // is unchanged.
+    assert_eq!(FIELD_KEYS.to_vec(), vec!["status", "value"]);
+    assert_eq!(FIELD_KEYS_V6.to_vec(), vec!["status", "value", "source"]);
+    for def in [
+        "metadata_field_class",
+        "metadata_field_key_type",
+        "metadata_field_token",
+        "metadata_field_value_len",
+        "metadata_field_modulus_bits",
+        "metadata_field_curve",
+        "metadata_field_parameter_set",
+    ] {
+        assert_eq!(
+            required(&format!("/$defs/{def}/required")),
+            sorted(FIELD_KEYS_V6.iter().map(|key| key.to_string()).collect()),
+            "{def}: v6 fields require status, value and source"
+        );
+        assert_eq!(
+            names(&format!("/$defs/{def}/properties/source/enum")),
+            vec!["creation_success".to_string(), "query".to_string()],
+            "{def}: the source enum is exactly the two provenances"
+        );
+        assert_eq!(
+            schema
+                .pointer(&format!("/$defs/{def}/properties/source/enum"))
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .len(),
+            3,
+            "{def}: the source enum admits null beside the two provenances"
+        );
+    }
+    // The v6 tables extend their frozen parents by exactly the
+    // new-site rows.
+    assert_eq!(METADATA_LABELS_V6.len(), METADATA_LABELS_V5.len() + 16);
+    assert_eq!(
+        METADATA_LABELS_V6[..31].to_vec(),
+        METADATA_LABELS_V5.to_vec()
+    );
+    assert_eq!(CURVE_LABELS_V6.len(), CURVE_LABELS.len() + 4);
+    assert_eq!(CURVE_LABELS_V6[..3].to_vec(), CURVE_LABELS.to_vec());
+    // Every new label renders; every v6 label past index 30 trips
+    // the v6 trigger; the trigger agrees with the table on all 47.
+    let labels: [(KeyLabel, &str); 16] = [
+        (
+            KeyLabel::Ec {
+                curve: SafeCurve::X25519,
+            },
+            "x25519",
+        ),
+        (
+            KeyLabel::Ec {
+                curve: SafeCurve::X448,
+            },
+            "x448",
+        ),
+        (
+            KeyLabel::Ec {
+                curve: SafeCurve::Ed25519,
+            },
+            "ed25519",
+        ),
+        (
+            KeyLabel::Ec {
+                curve: SafeCurve::Ed448,
+            },
+            "ed448",
+        ),
+        (KeyLabel::Hkdf { value_len: 12 }, "hkdf_96"),
+        (KeyLabel::Hkdf { value_len: 16 }, "hkdf_128"),
+        (KeyLabel::Hkdf { value_len: 24 }, "hkdf_192"),
+        (KeyLabel::Hkdf { value_len: 32 }, "hkdf_256"),
+        (KeyLabel::Hkdf { value_len: 48 }, "hkdf_384"),
+        (KeyLabel::Hkdf { value_len: 7 }, "hkdf_other"),
+        (KeyLabel::GenericSecret { value_len: 12 }, "generic_96"),
+        (KeyLabel::GenericSecret { value_len: 16 }, "generic_128"),
+        (KeyLabel::GenericSecret { value_len: 24 }, "generic_192"),
+        (KeyLabel::GenericSecret { value_len: 32 }, "generic_256"),
+        (KeyLabel::GenericSecret { value_len: 48 }, "generic_384"),
+        (KeyLabel::GenericSecret { value_len: 7 }, "generic_other"),
+    ];
+    for (label, expected) in labels {
+        assert_eq!(metadata_label(label), expected);
+        assert!(METADATA_LABELS_V6.contains(&expected));
+        assert!(is_newsite_metadata_label(expected));
+    }
+    for label in METADATA_LABELS_V6 {
+        assert_eq!(
+            is_newsite_metadata_label(label),
+            !METADATA_LABELS_V5.contains(&label),
+            "{label}"
+        );
+    }
+    for name in CURVE_LABELS_V6 {
+        assert_eq!(
+            is_newsite_curve_name(name),
+            !CURVE_LABELS.contains(&name),
+            "{name}"
+        );
+    }
+}
+
+/// R2 new-site: the section version follows the content. A scene
+/// whose HKDF key is created in-window (complete finite template, no
+/// query) renders v6 with the HKDF label on its key row — the
+/// promotion path end to end. Keymeta §6/K5: an old-vocabulary
+/// creation (AES-256) also renders v6, through the non-`query`
+/// source; only a query-established scene renders v1 (negative
+/// control: no new-site content, byte-stable two-key fields).
+#[test]
+fn key_operation_newsite_version_follows_content() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V6, object_observations_json,
+        observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    fn commit_scene(
+        request_cells: Vec<(u8, u8, u16)>,
+    ) -> crate::key_operation_projection::ObjectObservations {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                request_cells,
+                ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+            },
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+        );
+        commit(1, &[&staging], &scene.model.project(), &keyuse)
+    }
+    let hkdf = commit_scene(vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x42), (4u8, 1u8, 48u16)]);
+    assert_eq!(observations_version(&hkdf), OBSERVATIONS_VERSION_V6);
+    let section = object_observations_json(&hkdf);
+    assert_eq!(section["version"], 6);
+    assert_eq!(
+        section["key_operations"][0]["metadata_at_use"], "hkdf_384",
+        "the key row carries the promoted HKDF label"
+    );
+    let established = &section["objects"][0]["established"];
+    assert_eq!(established["key_type"]["value"], 0x42);
+    assert_eq!(established["value_len"]["value"], 48);
+    assert_eq!(section["objects"][0]["label"], "hkdf_384");
+    assert_eq!(
+        section["objects"][0]["queries"]["key_type"], "not_queried",
+        "promotion establishes without a query"
+    );
+    assert_eq!(
+        established["key_type"]["source"], "creation_success",
+        "the promoted HKDF type carries its source"
+    );
+    // Old-vocabulary creation still renders v6: the established
+    // block carries non-`query` sources.
+    let aes = commit_scene(vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1f), (4u8, 1u8, 32u16)]);
+    assert_eq!(observations_version(&aes), OBSERVATIONS_VERSION_V6);
+    let promoted = object_observations_json(&aes);
+    assert_eq!(promoted["version"], 6);
+    assert_eq!(
+        promoted["key_operations"][0]["metadata_at_use"], "aes_256",
+        "the key row carries the promoted AES label"
+    );
+    assert_eq!(
+        promoted["objects"][0]["established"]["value_len"]["source"],
+        "creation_success"
+    );
+    // Negative control: a query-established AES scene renders v1
+    // with byte-stable two-key metadata fields.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let legacy = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(observations_version(&legacy), OBSERVATIONS_VERSION);
+    let section = object_observations_json(&legacy);
+    assert_eq!(section["version"], 1);
+    assert_eq!(
+        section["key_operations"][0]["metadata_at_use"], "aes_256",
+        "the control row proves the scene is live"
+    );
+    for block in ["requested", "established"] {
+        for field in [
+            "class",
+            "key_type",
+            "token",
+            "value_len",
+            "modulus_bits",
+            "ec_params",
+        ] {
+            let keys: Vec<String> = section["objects"][0][block][field]
+                .as_object()
+                .expect("field object")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["status".to_string(), "value".to_string()],
+                "v1 {block}.{field} stays byte-stable without source"
+            );
+        }
+    }
 }

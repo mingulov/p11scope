@@ -23552,7 +23552,9 @@ pub(crate) mod tests {
     /// lifetime budget full and no exact-shape retired generation, a
     /// returning semantic provider reoccupies its retired count-only
     /// cells instead of refusing — and the lowering is recorded as one
-    /// counted capacity lowering, never as an "unverified" gap.
+    /// counted capacity lowering. The reoccupied cells stay count-only
+    /// and unauthorized, so they still count as semantically unverified
+    /// slots; the record is the counted gap, never a refusal.
     #[test]
     fn semantic_return_at_capacity_reoccupies_count_only_with_a_counted_lowering() {
         let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
@@ -23577,6 +23579,7 @@ pub(crate) mod tests {
             rebuilt.modules_skipped
         );
         let retired: Vec<usize> = plan.retired_slots.iter().copied().collect();
+        let unverified = plan.semantic_unverified_slot_count();
         let delta = plan
             .extend_exact(rebuilt)
             .unwrap_or_else(|error| panic!("the at-capacity flip must not refuse: {error}"));
@@ -23622,6 +23625,11 @@ pub(crate) mod tests {
         assert_eq!(kinds, [RefusalKind::CapacityLowering]);
         assert_eq!(whole_refusal_needed_count(&record.reason), None);
         assert!(!is_growth_omission(&record.reason));
+        assert_eq!(
+            plan.semantic_unverified_slot_count(),
+            unverified,
+            "the lowered cells stay semantically unverified: counted, never refused"
+        );
         plan.validate_slot_index()
             .expect("the partial topology stays clean");
     }
@@ -23837,6 +23845,66 @@ pub(crate) mod tests {
             .expect("the partial topology stays clean");
     }
 
+    /// Re-admit cost fixture (tier-3 review of port3 fix1): twenty small
+    /// new providers past 100 free slots — the fallback refuses nineteen
+    /// whole and admits the first, and every refused victim gets one
+    /// trial back, each re-running the shed from the pristine snapshot.
+    /// The trial count is victim-bounded and every trial re-validates, so
+    /// the pass costs V trials x V shed steps with one reuse assignment
+    /// each; this fixture's suite time is the cost proof. It prints its
+    /// extend time under `--nocapture` for the record.
+    #[test]
+    fn fallback_with_many_whole_refused_victims_admits_only_what_fits() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, 1952, true);
+        let old = provider_with_tables(53, "/opt/old.so", 1, 60, true);
+        let mut plan = scoped_plan(&[filler, old], AdmissionScope::Named);
+        assert_eq!(plan.slots.len(), 2012, "100 lifetime slots free");
+        let providers: Vec<ReconciledModule> = (0..20u32)
+            .map(|index| {
+                provider_with_tables(
+                    60 + index,
+                    &format!("/opt/victim{index:02}.so"),
+                    1,
+                    60,
+                    true,
+                )
+            })
+            .collect();
+        // Fresh snapshot: 1,200 slots fit on their own; the extension
+        // overflows by 1,100 past the lifetime prior.
+        let rebuilt = scoped_plan(&providers, AdmissionScope::Named);
+        assert_eq!(rebuilt.slots.len(), 1200);
+        let start = std::time::Instant::now();
+        plan.extend_exact(rebuilt)
+            .unwrap_or_else(|error| panic!("one fitting provider must admit, not abort: {error}"));
+        eprintln!(
+            "re-admit fixture: 19 refused victims re-tried in {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            slots_of(&plan, 60),
+            60,
+            "the first-admitted provider fits and stays"
+        );
+        for index in 1..20u32 {
+            assert_eq!(
+                slots_of(&plan, 60 + index),
+                0,
+                "victim {index} stays refused"
+            );
+            let kinds: Vec<RefusalKind> = plan
+                .refused_modules_typed()
+                .filter(|(object, _, _)| *object == PinnedObjectId(60 + index))
+                .map(|(_, _, kind)| kind)
+                .collect();
+            assert_eq!(kinds, [RefusalKind::CapacityWhole], "victim {index}");
+        }
+        assert_eq!(plan.modules_skipped.len(), 19);
+        assert_eq!(plan.active_slot_count(), 60);
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
     /// I-C (tier-3 review of port3 fix1): a count-only return reoccupies
     /// another pin's retired semantic cells of the same file. The
     /// cross-pin forward flip is lossless — extend keeps the old
@@ -23939,6 +24007,122 @@ pub(crate) mod tests {
         assert_eq!(plan.module_ambiguous, 0);
         plan.validate_slot_index()
             .expect("the partial topology stays clean");
+    }
+
+    /// M-1 (tier-3 review of port3 fix1): a reclaimed cell that merges
+    /// ambiguous is marked semantic-ambiguous even when it reoccupies
+    /// count-only. The kept path marks such cells; the reclaim path
+    /// forced count-only before the ambiguity check ran, so the mark
+    /// never landed.
+    #[test]
+    fn ambiguous_count_only_reclaim_marks_semantic_ambiguity() {
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, MAX_SLOTS as usize - 68, true);
+        let mut plan = scoped_plan(
+            &[filler.clone(), count_only_copy(&sole_complete_module(), false)],
+            AdmissionScope::Shared,
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
+        plan.object_identities
+            .insert(PinnedObjectId(42), test_identity(42, "sha-amb-count-only"));
+        let rebuilt =
+            plan.rebuild_from_sources(std::slice::from_ref(&filler), &[], &PinnedObjects::empty());
+        plan.extend_exact(rebuilt).unwrap();
+        plan.revivable.clone_from(&plan.retired_keys);
+        let mut returning = count_only_copy(&sole_complete_module(), false);
+        returning.object = PinnedObjectId(90);
+        returning.entry_objects = vec![vec![PinnedObjectId(90); 68]];
+        let identities = BTreeMap::from([(
+            PinnedObjectId(90),
+            test_identity(42, "sha-amb-count-only"),
+        )]);
+        let mut rebuilt =
+            plan.rebuild_from_sources_with_identities(&[filler, returning], &[], &identities);
+        assert_eq!(rebuilt.reclaimed.len(), 68);
+        // Module 0 is the filler; the returning module gets a rival id,
+        // like the semantic twin: the merge would otherwise donate the
+        // historical id and no ambiguity would arise.
+        let returning_id = ModuleId(2);
+        let returning_object = PinnedObjectId(90);
+        for module in &mut rebuilt.modules {
+            if module.object == returning_object {
+                module.id = returning_id;
+            }
+        }
+        for slot in &mut rebuilt.slots {
+            if slot.object == returning_object {
+                slot.module_ids = vec![returning_id];
+            }
+        }
+        let delta = plan.extend_exact_with_stable_module_ids(rebuilt).unwrap();
+        assert_eq!(delta.new.len(), 68);
+        assert!(
+            delta
+                .new
+                .iter()
+                .all(|slot| slot.descriptor_index == 0 && !slot.semantic_authorized),
+            "the reclaim reoccupies count-only"
+        );
+        assert_eq!(
+            plan.module_ambiguous, 68,
+            "the rival owner latches ambiguity"
+        );
+        for slot in &delta.new {
+            assert!(
+                slot.semantic_ambiguous,
+                "a newly ambiguous reclaim is marked: {slot:?}"
+            );
+        }
+        plan.validate_slot_index()
+            .expect("the partial topology stays clean");
+    }
+
+    /// A failed replacement forgets only its own retired position: the
+    /// key's other-shape generation elsewhere stays revivable.
+    #[test]
+    fn forget_retired_key_keeps_the_key_s_other_generation() {
+        let (descriptor, ambiguous) =
+            crate::kinds::descriptor_index(&["C_Sign".to_string()]);
+        assert!(
+            !ambiguous && descriptor != 0,
+            "the twin needs a semantic descriptor"
+        );
+        let slot = |index: u32, semantic: bool| Slot {
+            index,
+            descriptor_index: if semantic { descriptor } else { 0 },
+            object: PinnedObjectId(43),
+            object_path: "/opt/forget.so".into(),
+            file_offset: u64::from(index) * 8,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[if semantic { descriptor } else { 0 } as usize],
+            semantic_authorized: semantic,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(0)],
+        };
+        let mut plan = AttachPlan::from_slots(vec![slot(0, true), slot(1, false)]);
+        plan.deactivate(0);
+        plan.deactivate(1);
+        let key0 = AttachKey::of(&plan.slots[0]);
+        let key1 = AttachKey::of(&plan.slots[1]);
+        // The two-generation shape a flip-flopping key holds: semantic
+        // at 0, count-only at 1.
+        let mut both = RetiredPositions::at(true, 0);
+        both.set(false, 1);
+        plan.retired_keys.insert(key0, both);
+        plan.revivable.insert(key0, both);
+        plan.retired_keys.remove(&key1);
+        plan.forget_retired_key(0);
+        assert_eq!(
+            plan.retired_keys.get(&key0),
+            Some(&RetiredPositions::at(false, 1)),
+            "forgetting one position keeps the other generation"
+        );
+        assert_eq!(
+            plan.revivable.get(&key0),
+            Some(&RetiredPositions::at(false, 1)),
+            "revivable keeps the other generation too"
+        );
     }
 
     /// I-C at capacity (tier-3 review of port3 fix1): with the lifetime

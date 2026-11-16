@@ -324,6 +324,10 @@ trait FinalExitIo {
     /// `Ok(None)` only when the member's directory is provably gone
     /// (`ENOENT`: the thread was released); any other failure is `Err`.
     fn member(&mut self, tid: u32) -> Result<Option<ExitingTask>, ()>;
+    /// The member's `Tgid` membership, with the same gone-vs-error
+    /// contract as [`Self::member`]: `Ok(None)` only when the thread
+    /// was released between the listing and this read.
+    fn task_tgid(&mut self, tid: u32) -> Result<Option<u32>, ()>;
 }
 
 /// Whether the retained thread group is in its final exit: either the
@@ -336,12 +340,18 @@ trait FinalExitIo {
 /// the group before `clone` returns to it. A member created during the
 /// first listing may be missed by it, but its creator is then read later
 /// and was not exiting at creation time; so the task list is read a
-/// second time after every member was proven, and any thread it adds
-/// fails the proof. An `exec` kill leaves the execing thread live, so it
-/// never qualifies. Any unreadable member, a reused leader, or an
-/// exhausted budget answers false: only a positive proof counts.
+/// second time after every member was proven, and every thread it lists
+/// is re-read: the same birth, still past user mode, still in this
+/// group (`Tgid == pid`). A recycled tid backed by a live new thread
+/// (a new birth) fails the proof, as does any thread the first listing
+/// missed. A member that was already gone in the first walk and
+/// reappears in the closing listing is a new thread and fails too. An
+/// `exec` kill leaves the execing thread live, so it never qualifies.
+/// Any unreadable member, a reused leader, or an exhausted budget
+/// answers false: only a positive proof counts.
 fn final_exit_with<Io: FinalExitIo>(
     io: &mut Io,
+    pid: u32,
     retained_birth: u64,
     work: &mut LeaderExitReadBudget,
 ) -> bool {
@@ -363,7 +373,10 @@ fn final_exit_with<Io: FinalExitIo>(
     let Ok(tasks) = io.tasks() else {
         return false;
     };
-    let mut seen = std::collections::BTreeSet::new();
+    // Every proven member by (tid, birth). A member already gone is
+    // left out: a tid that reappears in the closing listing is a new
+    // thread, never the released one.
+    let mut seen = std::collections::BTreeMap::new();
     for entry in tasks {
         if !work.spend(2) {
             return false;
@@ -371,15 +384,19 @@ fn final_exit_with<Io: FinalExitIo>(
         let Ok(tid) = entry else {
             return false;
         };
-        seen.insert(tid);
         match io.member(tid) {
             Ok(None) => {}
-            Ok(Some(task)) if task.past_user_mode() => {}
+            Ok(Some(task)) if task.past_user_mode() => {
+                seen.insert(tid, task.stat.birth);
+            }
             Ok(Some(_)) | Err(()) => return false,
         }
     }
-    // A thread the first listing missed was created by a member that was
-    // not yet exiting: any such thread fails the proof.
+    // Re-validate every thread the closing listing carries: a new tid,
+    // a recycled tid (a new birth under an old number), a recovered
+    // member, or a member that left this group all fail the proof. A
+    // thread gone between the listing and its re-read already exited,
+    // so it keeps the proof.
     if !work.spend(1) {
         return false;
     }
@@ -387,12 +404,22 @@ fn final_exit_with<Io: FinalExitIo>(
         return false;
     };
     for entry in again {
-        if !work.spend(1) {
+        if !work.spend(3) {
             return false;
         }
-        match entry {
-            Ok(tid) if seen.contains(&tid) => {}
-            _ => return false,
+        let Ok(tid) = entry else {
+            return false;
+        };
+        let Some(first) = seen.get(&tid) else {
+            return false;
+        };
+        match io.member(tid) {
+            Ok(None) => {}
+            Ok(Some(task))
+                if task.stat.birth == *first
+                    && task.past_user_mode()
+                    && io.task_tgid(tid) == Ok(Some(pid)) => {}
+            Ok(Some(_)) | Err(()) => return false,
         }
     }
     // Close the walk on the same original leader: a reused or recovered
@@ -477,6 +504,27 @@ impl FinalExitIo for OsExitIo<'_> {
         };
         parse_exiting_task(&stat).map(Some)
     }
+    fn task_tgid(&mut self, tid: u32) -> Result<Option<u32>, ()> {
+        let directory = self.directory.directory.as_fd();
+        let path = std::ffi::CString::new(format!("task/{tid}/status")).map_err(|_| ())?;
+        let text = match read_relative_io(directory, &path, STATUS_BYTES) {
+            Ok(text) => text,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(None);
+            }
+            Err(_) => return Err(()),
+        };
+        text.lines()
+            .find_map(|line| line.strip_prefix("Tgid:"))
+            .ok_or(())?
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| ())
+    }
 }
 
 impl PidPin {
@@ -505,6 +553,7 @@ impl PidPin {
                 original: self,
                 directory,
             },
+            self.pid(),
             birth,
             work,
         )
@@ -654,6 +703,8 @@ mod tests {
         leader_reads: usize,
         late_member: Option<u32>,
         reused_member: Option<(u32, ExitingTask)>,
+        resurrected: Option<(u32, ExitingTask)>,
+        tgid: u32,
         listings: usize,
     }
     impl FinalExitIo for ScriptedFinalExit {
@@ -672,9 +723,29 @@ mod tests {
         fn tasks(&mut self) -> Result<Self::Tasks, ()> {
             self.listings += 1;
             let mut tids = vec![Ok(7)];
-            tids.extend(self.members.iter().map(|(tid, _)| Ok(*tid)));
+            tids.extend(self.members.iter().filter_map(|(tid, task)| {
+                // A released thread leaves the task list: the closing
+                // listing omits it unless a new thread reused the tid
+                // (scripted via `resurrected`).
+                if self.listings > 1
+                    && matches!(task, Ok(None))
+                    && Some(*tid) != self.resurrected.map(|(resurrected, _)| resurrected)
+                {
+                    None
+                } else {
+                    Some(Ok(*tid))
+                }
+            }));
             if self.listings > 1 {
                 tids.extend(self.late_member.map(Ok));
+                if let Some((resurrected, _)) = self.resurrected
+                    && !self
+                        .members
+                        .iter()
+                        .any(|(member, _)| *member == resurrected)
+                {
+                    tids.push(Ok(resurrected));
+                }
             }
             Ok(tids.into_iter())
         }
@@ -683,19 +754,28 @@ mod tests {
                 return Ok(Some(self.leader));
             }
             // A tid recycled between the two listings: the first walk
-            // reads the old past member, the closing re-read sees the
-            // live new thread under the same tid.
-            if self.listings > 1
-                && let Some((reused, fresh)) = self.reused_member
-                && tid == reused
-            {
-                return Ok(Some(fresh));
+            // reads the old past (or gone) member, the closing re-read
+            // sees the live new thread under the same tid.
+            if self.listings > 1 {
+                if let Some((reused, fresh)) = self.reused_member
+                    && tid == reused
+                {
+                    return Ok(Some(fresh));
+                }
+                if let Some((resurrected, fresh)) = self.resurrected
+                    && tid == resurrected
+                {
+                    return Ok(Some(fresh));
+                }
             }
             self.members
                 .iter()
                 .find(|(member, _)| *member == tid)
                 .map(|(_, task)| *task)
                 .unwrap_or(Ok(None))
+        }
+        fn task_tgid(&mut self, _tid: u32) -> Result<Option<u32>, ()> {
+            Ok(Some(self.tgid))
         }
     }
     fn task(state: u8, flags: u32) -> ExitingTask {
@@ -720,11 +800,13 @@ mod tests {
             leader_reads: 0,
             late_member: None,
             reused_member: None,
+            resurrected: None,
+            tgid: 7,
             listings: 0,
         }
     }
     fn final_exit(io: &mut ScriptedFinalExit) -> bool {
-        final_exit_with(io, 500, &mut LeaderExitReadBudget::for_test(512))
+        final_exit_with(io, 7, 500, &mut LeaderExitReadBudget::for_test(512))
     }
     #[test]
     fn group_past_user_mode_is_in_final_exit() {
@@ -768,6 +850,7 @@ mod tests {
             assert!(
                 !final_exit_with(
                     &mut dying_group(),
+                    7,
                     500,
                     &mut LeaderExitReadBudget::for_test(units)
                 ),
@@ -821,6 +904,32 @@ mod tests {
             "a recycled member tid with a live new thread keeps the group unproven"
         );
         assert_eq!(reused.listings, 2, "the task list is read twice");
+        // A tid that was already gone in the first walk and reappears
+        // in the closing listing is a new thread, never the released
+        // one.
+        let mut resurrected = dying_group();
+        resurrected.resurrected = Some((
+            10,
+            ExitingTask {
+                stat: TaskStat {
+                    birth: 502,
+                    state: b'S',
+                    flags: 0,
+                },
+            },
+        ));
+        assert!(
+            !final_exit(&mut resurrected),
+            "a gone tid that reappears is a new thread"
+        );
+        // A member that left this group between the two listings fails
+        // the proof even when its birth and state still read past.
+        let mut foreign = dying_group();
+        foreign.tgid = 9;
+        assert!(
+            !final_exit(&mut foreign),
+            "a member outside this group keeps the proof unproven"
+        );
     }
     #[test]
     fn real_live_group_is_not_in_final_exit_until_it_exits() {

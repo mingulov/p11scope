@@ -4523,18 +4523,20 @@ fn target_maps_now_empty(pid: u32) -> bool {
 }
 
 /// Whether a zero-length mapping read names the exit exactly, against
-/// the live maps re-read and a fresh exit-proof budget.
+/// the live maps re-read and a fresh exit-proof budget. A proven exit
+/// names without touching the maps at all.
 fn zero_read_names_exit(view: &ProcessView) -> bool {
     zero_read_names_exit_with(
         view,
-        target_maps_now_empty(view.pid()),
+        || target_maps_now_empty(view.pid()),
         &mut LeaderExitReadBudget::for_final_exit_proof(),
     )
 }
 
 /// Test seam for [`zero_read_names_exit`]: the rename decision with the
-/// maps re-read and the exit-proof budget supplied by the caller.
-/// Production passes the live re-read and a fresh proof budget.
+/// maps re-read (lazy, so a proven exit never touches `/proc` maps)
+/// and the exit-proof budget supplied by the caller. Production passes
+/// the live re-read and a fresh proof budget.
 ///
 /// Whether a zero-length mapping read names the exit exactly: the whole
 /// group provably exited
@@ -4552,7 +4554,7 @@ fn zero_read_names_exit(view: &ProcessView) -> bool {
 /// still names its exit through the final-exit proof.
 fn zero_read_names_exit_with(
     view: &ProcessView,
-    maps_now_empty: bool,
+    maps_now_empty: impl FnOnce() -> bool,
     work: &mut LeaderExitReadBudget,
 ) -> bool {
     if crate::process::whole_group_proven_exited(view) {
@@ -4561,7 +4563,7 @@ fn zero_read_names_exit_with(
     // The second walk runs only for a zero-byte read against empty maps
     // with no proven exit yet — rare — and reuses the caller's budget so
     // an exhausted proof keeps the read wording.
-    maps_now_empty && view.final_exit_in_progress_within(work)
+    maps_now_empty() && view.final_exit_in_progress_within(work)
 }
 
 /// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A partial read simply
@@ -6043,9 +6045,12 @@ fn cold_exit_churn_message(text: &str) -> bool {
 /// process exited, so the scan takes the exited error path instead of
 /// latching a global `scan_unavailable`.
 ///
-/// * `ESRCH` proves the open named no live user task (no mm: a zombie
-///   leader or a kernel thread), never a reused live process, so it
-///   silences unconditionally.
+/// * `ESRCH` proves the open named no live user task with an mm (a
+///   zombie leader or a kernel thread), never a reused live process —
+///   but a leader that completed `exit_mm` answers `ESRCH` while
+///   members still hold the mm and run user code, so it silences only
+///   on the shared whole-group proof
+///   ([`crate::process::whole_group_proven_exited`]).
 /// * `ENOENT` proves nothing by itself: a live target whose `/proc`
 ///   visibility changes between the maps read and the mem open (a
 ///   committed setuid under hidepid) surfaces the same errno as a
@@ -6069,7 +6074,7 @@ fn cold_exit_churn_message(text: &str) -> bool {
 /// open takes the generation-change refusal before this check.
 fn mem_open_exited_for_view(view: &ProcessView, pid: u32, error: &std::io::Error) -> bool {
     if error.raw_os_error() == Some(libc::ESRCH) {
-        return true;
+        return crate::process::whole_group_proven_exited(view);
     }
     if error.raw_os_error() == Some(libc::ENOENT) {
         return crate::process::whole_group_proven_exited(view);
@@ -12135,8 +12140,7 @@ mod tests {
             loop {
                 let mut status: libc::c_int = 0;
                 // SAFETY: a writable status word; `tid` is our traced task.
-                let rc =
-                    unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+                let rc = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
                 if rc == tid {
                     return status;
                 }
@@ -12357,7 +12361,10 @@ int main(int argc, char **argv) {
         ptrace_op(libc::PTRACE_CONT, leader, 0);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !crate::process::process_is_zombie(pid) {
-            assert!(Instant::now() < deadline, "the leader never became a zombie");
+            assert!(
+                Instant::now() < deadline,
+                "the leader never became a zombie"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
 
@@ -16878,7 +16885,7 @@ int main(int argc, char **argv) {
         assert!(
             !zero_read_names_exit_with(
                 &view,
-                true,
+                || true,
                 &mut LeaderExitReadBudget::for_final_exit_proof()
             ),
             "an exiting leader with a live member keeps the read wording"
@@ -16920,7 +16927,7 @@ int main(int argc, char **argv) {
             "a pidfd-backed pin, not the fallback"
         );
         assert!(
-            !zero_read_names_exit_with(&view, true, &mut LeaderExitReadBudget::for_test(0)),
+            !zero_read_names_exit_with(&view, || true, &mut LeaderExitReadBudget::for_test(0)),
             "an exhausted exit budget keeps the read wording"
         );
         group.call_three();

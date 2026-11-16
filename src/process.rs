@@ -1467,6 +1467,16 @@ impl PidPin {
         if pidfd.is_none() && start_time.is_none() {
             return Err(pin_failure(pid));
         }
+        // TGID-only scope: a non-leader TID view would let the exit
+        // proof's kill arm report its thread gone while the group
+        // lives. A pidfd proves TGID by itself (`pidfd_open` on a live
+        // TID fails `ENOENT`); a fallback pin must read `Tgid == pid`.
+        if pidfd.is_none() && tgid_of(pid) != Some(pid) {
+            return Err(format!(
+                "cannot pin pid {pid}: it names a non-leader thread, not a process \
+                 (TID scope is unsupported; pass the thread-group leader)"
+            ));
+        }
         Ok(Self {
             pid,
             pidfd,
@@ -1669,6 +1679,17 @@ pub(crate) fn raise_nofile() -> io::Result<usize> {
     }
 }
 
+/// The `Tgid` of `pid` from `/proc/<pid>/status`: the pid of its
+/// thread-group leader. `None` when unreadable or malformed — callers
+/// fail closed.
+fn tgid_of(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
 fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     // SAFETY: Linux pidfd_open syscall takes scalar pid/flags and returns a new fd.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
@@ -1819,7 +1840,9 @@ pub(crate) fn generation_gone(pid: u32) -> bool {
 /// `/proc` `ENOENT` is ambiguous. Anything else answers false: a
 /// live pid (signal delivered or `EPERM`), a zombie (still answers),
 /// an unrepresentable pid, or an unexpected error. Only `ESRCH` is
-/// proof, never the absence of a `/proc` entry.
+/// proof, never the absence of a `/proc` entry. The caller must pass
+/// a TGID: a non-leader TID answers `ESRCH` once its thread is
+/// reaped while the group lives ([`PidPin::open`] refuses TID views).
 pub(crate) fn process_proven_exited(pid: u32) -> bool {
     // `kill` takes a `pid_t`: convert exactly, never wrapping — a
     // negative `pid_t` would address a process GROUP. Zero addresses
@@ -1836,21 +1859,30 @@ pub(crate) fn process_proven_exited(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Whether the view's whole original thread group provably exited: the
-/// single proof behind every exit-wording and silent-exit decision. It
-/// holds when the retained pidfd reports the group gone, when the
-/// leader and every member are past user mode
-/// ([`PidPin::final_exit_in_progress`]), or when `kill` answers `ESRCH`
+/// Whether the view's whole original thread group provably exited:
+/// the proof behind the zero-byte exit wording and the errno'd
+/// mem-open silent path. It holds when the retained pidfd reports the
+/// group gone, when the leader and every member are past user mode
+/// ([`PidPin::final_exit_in_progress`], with per-member birth and
+/// `Tgid` re-validation), or when `kill` answers `ESRCH`
 /// ([`process_proven_exited`], hidepid-proof). Pidfd authority only for
 /// the pin arm: a start-time fallback pin's mismatch means the pid was
 /// reused by a live process, which is NOT an exit. A fallback pin with
 /// an unreadable task set, an exhausted proof budget, or a zombie
 /// leader with live members is unproven, never exited.
 ///
-/// Silent paths must use this proof, never an empty maps re-read alone:
-/// a zombie-leader group shows empty TGID maps while alive, and a
-/// leader running `exit_mm` empties its TGID maps while members keep
-/// the mm — either would drop gaps for a live group.
+/// Requires a TGID view: [`PidPin::open`] refuses non-leader TIDs, so
+/// the kill arm never proves a thread gone while its group lives.
+///
+/// Two documented exceptions keep their own proof: the cold-churn
+/// mem arm (a zombie-aware leader read, not a whole-group proof) and
+/// the engine's `generation_dead` silence (owned by MT-EXIT-SCAN; this
+/// helper governs the exit decision, not that path's per-class
+/// accounting). Silent paths must use this proof or a documented
+/// exception, never an empty maps re-read alone: a zombie-leader group
+/// shows empty TGID maps while alive, and a leader running `exit_mm`
+/// empties its TGID maps while members keep the mm — either would drop
+/// gaps for a live group.
 pub(crate) fn whole_group_proven_exited(view: &ProcessView) -> bool {
     // Pidfd authority only: without it a mismatch is pid reuse.
     if view.retained_pin().pidfd().is_ok() && view.original_exited() == Ok(true) {

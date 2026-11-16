@@ -1223,6 +1223,54 @@
       "cell": "privileged"
     },
     {
+      "file": "src/manifest_getter_privileged_tests.rs",
+      "path": "manifest_getter_privileged_tests::privileged_default_getter_manifest_counts_static_program_exactly",
+      "reason": "privileged: the helper's default manifest (all three getters) counts a static program's table calls exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/manifest_getter_privileged_tests.rs",
+      "path": "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_dynamic_program_under_cgroup_exactly",
+      "reason": "privileged: profile --cgroup arms a dynamically linked embedding program's loader for its getters and counts its table calls exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/manifest_getter_privileged_tests.rs",
+      "path": "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_later_dlopen_in_a_run_child",
+      "reason": "privileged: run with a getter-only manifest counts a provider object its child dlopens after the capture started exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/manifest_getter_privileged_tests.rs",
+      "path": "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_later_dlopen_under_a_named_pid",
+      "reason": "privileged: a named-pid capture with a getter-only manifest counts a provider object the process dlopens after the capture started exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/manifest_getter_privileged_tests.rs",
+      "path": "manifest_getter_privileged_tests::privileged_getter_manifest_counts_a_program_that_fetched_before_the_capture",
+      "reason": "privileged: a static program that fetched its tables before the capture is counted exactly through the scanned program object",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/manifest_getter_privileged_tests.rs",
+      "path": "manifest_getter_privileged_tests::privileged_getter_only_manifest_both_getters_counts_static_program_exactly",
+      "reason": "privileged: profile --pid with a getter-only manifest (both getters) counts a static program's table calls exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/manifest_getter_privileged_tests.rs",
+      "path": "manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_the_attach_window_are_disclosed",
+      "reason": "privileged: getter-only manifest table calls made right after the getter returns are never hidden: the attach window is named",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/manifest_getter_privileged_tests.rs",
+      "path": "manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_counts_static_program_exactly",
+      "reason": "privileged: profile --pid with a C_GetFunctionList-only manifest counts a static program's table calls exactly",
+      "cell": "privileged"
+    },
+    {
       "file": "src/uretprobe_hazard.rs",
       "path": "uretprobe_hazard::tests::privileged_post_setup_shed_rekeys_the_retained_approval_as_root",
       "reason": "privileged: post-setup shed re-keys the retained approval as root (needs a real shed)",

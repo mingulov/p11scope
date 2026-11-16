@@ -85,9 +85,12 @@ struct WorkerGroundTruth {
 ///   its own endpoint's first attach;
 /// * no BPF event loss is on the record (counts would be lower
 ///   bounds, not exact);
-/// * no mechanism is decoded from the learned tables and
-///   attribution stays withheld (20:50: standard-layout names, not
-///   proven).
+/// * getter-only slots stay withheld while learned standard-layout
+///   slots are authorized and their mechanism accounting is exact
+///   (17:14: getter-only tables are names-only/never decoded; E1
+///   file-scanned tables with interface-linkage evidence may decode
+///   mechanisms; THIS cell's 12 ordinals carry none, so every
+///   mechanism counter is zero here).
 fn check_exact_accounting(
     report: &serde_json::Value,
     provider_path: &str,
@@ -346,16 +349,67 @@ fn check_exact_accounting(
         "observed ({seen}) + disclosed-missed ({missed}) != ground truth ({ground})"
     );
     println!("TABLE_CELL exact accounting: observed={seen} missed={missed} ground={ground}");
-    // 20:50 names ruling for the learned getter-only tables:
-    // standard-layout names may be shown, always marked unproven,
-    // never decoded (no mechanisms, no arguments).
+    // 17:14 positive mechanism/getter assertions. The 20:50 getter-only
+    // "never decoded" ruling covers ONLY getter-only tables (names shown,
+    // marked unproven, never decoded). File-scanned E1-learned tables with
+    // interface-linkage standard-layout evidence follow the pre-existing
+    // 2026-11-11 standard-layout scan policy (plan.rs:6196-6231 grants
+    // `semantic_authorized` per table target at :6276-6277): decoding their
+    // mechanism arguments is ALLOWED — mechanism types are approved v3 data.
+    // THIS cell's 12 ordinals (ORDINALS: C_Initialize .. C_OpenSession) carry
+    // no mechanism argument (kinds::descriptor), so THIS capture must show
+    // zero mechanism accounting in every counter. A future mechanism-bearing
+    // worker (e.g. C_EncryptInit) decoding through a learned slot MUST fail
+    // this cell by publishing a row or incrementing an unregistered counter;
+    // it must never silently pass a `mechanisms.is_empty()`-only check.
     let mechanisms = report
         .get("mechanisms")
         .and_then(serde_json::Value::as_array)
         .context("observed profile has no mechanisms array")?;
     ensure!(
         mechanisms.is_empty(),
-        "mechanisms decoded from learned getter-only tables: {mechanisms:?}"
+        "mechanisms published for this non-mechanism workload (its 12 ordinals carry no \
+         mechanism argument; a mechanism-bearing worker must update this cell, never pass \
+         silently): {mechanisms:?}"
+    );
+    let unregistered = evidence
+        .get("unregistered_mechanisms")
+        .and_then(serde_json::Value::as_u64)
+        .context("observed profile evidence has no unregistered_mechanisms count")?;
+    ensure!(
+        unregistered == 0,
+        "unregistered_mechanisms={unregistered}: a learned-slot mechanism argument was read \
+         (counted, never published); this non-mechanism workload must show zero"
+    );
+    let gated = evidence
+        .get("unregistered_standard_layout_mechanisms")
+        .and_then(serde_json::Value::as_u64)
+        .context("observed profile evidence has no unregistered_standard_layout_mechanisms count")?;
+    ensure!(
+        gated == 0,
+        "unregistered_standard_layout_mechanisms={gated}: a standard-layout-slot mechanism value \
+         outside the registered registry was counted; this non-mechanism workload must show zero"
+    );
+    // Getter-only slots stay withheld (the three getters), while learned
+    // table slots are authorized (decode-allowed): `slots` must exceed
+    // `semantic_unverified_slots`, and the withheld attribution must cite
+    // the unverified slots as its cause.
+    let slots = evidence
+        .get("slots")
+        .and_then(serde_json::Value::as_u64)
+        .context("observed profile evidence has no slots count")?;
+    let unverified = evidence
+        .get("semantic_unverified_slots")
+        .and_then(serde_json::Value::as_u64)
+        .context("observed profile evidence has no semantic_unverified_slots count")?;
+    ensure!(
+        unverified > 0,
+        "semantic_unverified_slots={unverified}: getter-only slots must stay withheld (unproven)"
+    );
+    ensure!(
+        slots > unverified,
+        "slots={slots} semantic_unverified_slots={unverified}: no learned table slot is authorized \
+         (decode-allowed); the run learned nothing but getters"
     );
     let attribution = evidence
         .pointer("/gap_classes/attribution/status")
@@ -363,7 +417,17 @@ fn check_exact_accounting(
         .unwrap_or("unknown");
     ensure!(
         attribution == "withheld",
-        "attribution status is {attribution:?}, learned getter-only names must stay unproven (withheld)"
+        "attribution status is {attribution:?}, getter-only names must stay unproven (withheld)"
+    );
+    let causes = evidence
+        .pointer("/gap_classes/attribution/causes")
+        .and_then(serde_json::Value::as_array)
+        .context("attribution gap class names no causes")?;
+    ensure!(
+        causes
+            .iter()
+            .any(|cause| cause.as_str().is_some_and(|cause| cause == "semantic_unverified_slots")),
+        "attribution is withheld without the semantic_unverified_slots cause: {causes:?}"
     );
     Ok(())
 }
@@ -763,7 +827,11 @@ mod exact_accounting_tests {
             "mechanisms": [],
             "evidence": {
                 "event_loss": 0,
-                "gap_classes": {"attribution": {"status": "withheld"}},
+                "slots": 92,
+                "semantic_unverified_slots": 3,
+                "unregistered_mechanisms": 0,
+                "unregistered_standard_layout_mechanisms": 0,
+                "gap_classes": {"attribution": {"status": "withheld", "causes": ["semantic_unverified_slots"]}},
                 "discovery": [{
                     "path": PROVIDER,
                     "dev": [DEV.0, DEV.1],

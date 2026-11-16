@@ -2714,6 +2714,7 @@ fn canary_reports() -> Vec<crate::metrics::SlotReport> {
         file_offset: 0x10,
         target_object: None,
         ordinals: Vec::new(),
+        unnamed_reasons: Vec::new(),
     }]
 }
 

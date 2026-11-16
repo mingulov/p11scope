@@ -5171,6 +5171,11 @@ struct FunctionOut {
     /// with at least one positively counted return; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     initialization: Option<InitializationOut>,
+    /// Why the row's names stayed `["unknown"]`, as stable tokens,
+    /// sorted. Present exactly on unknown rows (absent, never null or
+    /// empty, on named rows): unknown stays unknown only with a reason.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unnamed_reasons: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -5359,6 +5364,7 @@ fn functions_out(
                 })
                 .collect(),
             initialization: initialization_out(&r.names, &r.rv_counts),
+            unnamed_reasons: r.unnamed_reasons.clone(),
         })
         .collect()
 }
@@ -6722,6 +6728,7 @@ pub(crate) mod tests {
             file_offset: 0,
             target_object: None,
             ordinals: Vec::new(),
+            unnamed_reasons: Vec::new(),
             names: vec![name.into()],
             aliased,
             semantic_authorized: true,

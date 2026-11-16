@@ -13010,6 +13010,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         file_offset: 0,
         target_object: None,
         ordinals: Vec::new(),
+        unnamed_reasons: Vec::new(),
         names: vec!["C_Sign".into()],
         aliased: false,
         semantic_authorized: true,

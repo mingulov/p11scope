@@ -230,6 +230,31 @@ pub(crate) enum ObjectSlotEligibility {
 /// never a rival claim and never semantic authority.
 pub(crate) const UNKNOWN_FUNCTION_NAME: &str = "unknown";
 
+/// Why one target's decoded label cannot be presented as a PKCS#11 name.
+/// Unknown stays unknown only with a named reason: slots whose final
+/// names are `[UNKNOWN_FUNCTION_NAME]` carry the union of their
+/// contributors' reasons in `functions[].unnamed_reasons`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum UnprovenNames {
+    /// A scan-decoded heuristic table: no interface linkage, live
+    /// return, manifest, or export proof published it as the
+    /// provider's table (the only way a scan target is unauthorized).
+    HeuristicTable,
+    /// A manifest selection table no exact-standard v3 query proved:
+    /// counted, but its positions are not standard names.
+    SelectionWithoutStandardProof,
+}
+
+impl UnprovenNames {
+    /// The stable schema token rendered in `functions[].unnamed_reasons`.
+    pub(crate) const fn token(self) -> &'static str {
+        match self {
+            Self::HeuristicTable => "heuristic_table",
+            Self::SelectionWithoutStandardProof => "selection_without_standard_proof",
+        }
+    }
+}
+
 /// One table ordinal that reaches a slot's exact target (review answer (c)).
 /// Several on one target are several ordinals sharing it — the grouping an
 /// unnamed row would otherwise hide. The ordinal is a position, never a name.
@@ -1139,6 +1164,11 @@ pub struct AttachPlan {
     // Every table ordinal that reached an exact target this capture. Keyed
     // like `slot_by_key` but never pruned: a retired row keeps its ordinals.
     slot_ordinals: BTreeMap<AttachKey, BTreeSet<SlotOrdinal>>,
+    // Why an exact target's names stayed unknown: the union of its
+    // contributors' reasons, present exactly while the slot's final names
+    // are `[UNKNOWN_FUNCTION_NAME]`. An authorized name displaces both
+    // `unknown` and its reasons, so a named slot never carries an entry.
+    slot_unnamed_reasons: BTreeMap<AttachKey, BTreeSet<UnprovenNames>>,
     // Identity of every pinned object a slot or module used, recorded where
     // the pins were in hand; capture-lifetime like the slots themselves.
     object_identities: BTreeMap<PinnedObjectId, TargetObject>,
@@ -1302,8 +1332,21 @@ pub(crate) struct SelectionTableTarget {
     pub(crate) file_offset: u64,
     pub(crate) name: &'static str,
     pub(crate) ordinal: Option<u16>,
+    /// Why `name` is unknown, when it is: `Some` exactly when `name` is
+    /// `UNKNOWN_FUNCTION_NAME` (no exact-standard v3 query proved it).
+    pub(crate) unproven: Option<UnprovenNames>,
     // Foreign targets can acquire this binding only through comparable pins.
     provider: PinnedObjectId,
+}
+
+/// One selection table's claims per exact target: the display path,
+/// the claimed names, their positions, and why unproven names stay
+/// unknown.
+struct GroupedSelectionClaims {
+    path: String,
+    names: BTreeSet<&'static str>,
+    ordinals: BTreeSet<u16>,
+    unproven: BTreeSet<UnprovenNames>,
 }
 
 impl SelectionTableTarget {
@@ -1319,6 +1362,8 @@ impl SelectionTableTarget {
             file_offset,
             name,
             ordinal: standard_ordinal(name),
+            unproven: (name == UNKNOWN_FUNCTION_NAME)
+                .then_some(UnprovenNames::SelectionWithoutStandardProof),
             provider: object,
         }
     }
@@ -1340,6 +1385,8 @@ impl SelectionTableTarget {
             file_offset,
             name,
             ordinal: Some(ordinal),
+            unproven: (name == UNKNOWN_FUNCTION_NAME)
+                .then_some(UnprovenNames::SelectionWithoutStandardProof),
             provider,
         })
     }
@@ -1607,6 +1654,7 @@ impl AttachPlan {
             admission_policy,
             admission_scope: AdmissionScope::Named,
             slot_ordinals: BTreeMap::new(),
+            slot_unnamed_reasons: BTreeMap::new(),
             object_identities: BTreeMap::new(),
             first_plan_objects: BTreeSet::new(),
             first_plan_had_provider: false,
@@ -1655,6 +1703,15 @@ impl AttachPlan {
         self.slot_ordinals
             .get(&AttachKey::of(slot))
             .map(|ordinals| ordinals.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Why this slot's names stayed unknown, as stable schema tokens,
+    /// sorted. Empty unless the slot's names are `[UNKNOWN_FUNCTION_NAME]`.
+    pub(crate) fn unnamed_reasons_of(&self, slot: &Slot) -> Vec<&'static str> {
+        self.slot_unnamed_reasons
+            .get(&AttachKey::of(slot))
+            .map(|reasons| reasons.iter().copied().map(UnprovenNames::token).collect())
             .unwrap_or_default()
     }
 
@@ -2091,8 +2148,7 @@ impl AttachPlan {
         let Some(provider) = self.modules.iter().find(|known| known.id == module) else {
             return Err(format!("selection table names missing module {}", module.0));
         };
-        let mut grouped: BTreeMap<AttachKey, (String, BTreeSet<&'static str>, BTreeSet<u16>)> =
-            BTreeMap::new();
+        let mut grouped: BTreeMap<AttachKey, GroupedSelectionClaims> = BTreeMap::new();
         for target in targets {
             if target.provider != provider.object {
                 return Err(format!(
@@ -2100,17 +2156,23 @@ impl AttachPlan {
                     module.0, provider.object, target.object
                 ));
             }
-            let (path, names, ordinals) = grouped
+            let claims = grouped
                 .entry(AttachKey {
                     object: target.object,
                     file_offset: target.file_offset,
                 })
-                .or_insert_with(|| (target.object_path.clone(), BTreeSet::new(), BTreeSet::new()));
-            if target.object_path < *path {
-                *path = target.object_path;
+                .or_insert_with(|| GroupedSelectionClaims {
+                    path: target.object_path.clone(),
+                    names: BTreeSet::new(),
+                    ordinals: BTreeSet::new(),
+                    unproven: BTreeSet::new(),
+                });
+            if target.object_path < claims.path {
+                claims.path = target.object_path;
             }
-            names.insert(target.name);
-            ordinals.extend(target.ordinal);
+            claims.names.insert(target.name);
+            claims.ordinals.extend(target.ordinal);
+            claims.unproven.extend(target.unproven);
         }
 
         let candidate_additions = self
@@ -2140,22 +2202,33 @@ impl AttachPlan {
             ));
         }
 
-        for (key, (object_path, names, ordinals)) in grouped {
+        for (key, claims) in grouped {
             // Selection tables carry no table location, only positions.
             self.slot_ordinals
                 .entry(key)
                 .or_default()
-                .extend(ordinals.into_iter().map(|ordinal| SlotOrdinal {
+                .extend(claims.ordinals.into_iter().map(|ordinal| SlotOrdinal {
                     table_file_offset: None,
                     ordinal,
                 }));
             if let Some(position) = self.slot_by_key.get(&key).copied() {
                 let slot = &mut self.slots[position];
-                slot.names.extend(names.into_iter().map(str::to_string));
+                slot.names
+                    .extend(claims.names.into_iter().map(str::to_string));
                 slot.names.sort();
                 slot.names.dedup();
                 // An available naming witness displaces a prior `unknown`.
                 drop_transparent_unknown(&mut slot.names);
+                // Reasons follow the same rule: an authorized name
+                // displaces them, otherwise the selection reason joins.
+                if slot.names.as_slice() == [UNKNOWN_FUNCTION_NAME] {
+                    self.slot_unnamed_reasons
+                        .entry(key)
+                        .or_default()
+                        .extend(claims.unproven);
+                } else {
+                    self.slot_unnamed_reasons.remove(&key);
+                }
                 slot.aliased |= slot.names.len() >= 2;
                 if !slot.module_ids.contains(&module) {
                     slot.module_ids.push(module);
@@ -2174,13 +2247,16 @@ impl AttachPlan {
                 }
                 continue;
             }
-            let mut names: Vec<_> = names.into_iter().map(str::to_string).collect();
+            let mut names: Vec<_> = claims.names.into_iter().map(str::to_string).collect();
             drop_transparent_unknown(&mut names);
+            if names.as_slice() == [UNKNOWN_FUNCTION_NAME] && !claims.unproven.is_empty() {
+                self.slot_unnamed_reasons.insert(key, claims.unproven);
+            }
             let slot = Slot {
                 index: self.slots.len() as u32,
                 descriptor_index: 0,
                 object: key.object,
-                object_path,
+                object_path: claims.path,
                 file_offset: key.file_offset,
                 aliased: names.len() >= 2,
                 names,
@@ -3327,6 +3403,10 @@ struct Target<'a> {
     /// operator-authoritative, scan targets need linkage-or-manifest
     /// authorization for their table.
     name_authorized: bool,
+    /// Why `name` cannot be presented, when it cannot: `Some` exactly
+    /// when `name_authorized` is false. Slots whose final names stay
+    /// unknown carry the union of their contributors' reasons.
+    unproven: Option<UnprovenNames>,
     /// Index into the scan piece's `tables` this target was decoded from.
     /// `None` for manifest targets, which are authoritative and never capped.
     table: Option<usize>,
@@ -3426,6 +3506,10 @@ struct Building {
     object_path: String,
     file_offset: u64,
     name_authority: BTreeMap<String, bool>,
+    /// Why contributors' labels are unpresentable, when they are: kept
+    /// only while the final names stay unknown (an authorized name
+    /// displaces both `unknown` and its reasons).
+    unproven: BTreeSet<UnprovenNames>,
     fork_safe: bool,
     module_ids: Vec<ModuleId>,
     standard_layout_evidence: Option<&'static str>,
@@ -4888,6 +4972,7 @@ fn merge(
                             object_path: target.object_path.to_string(),
                             file_offset: target.file_offset,
                             name_authority: BTreeMap::new(),
+                            unproven: BTreeSet::new(),
                             fork_safe: true,
                             module_ids: Vec::new(),
                             standard_layout_evidence: None,
@@ -4909,6 +4994,9 @@ fn merge(
                         .entry(name.to_string())
                         .and_modify(|authorized| *authorized |= target.semantic_authorized)
                         .or_insert(target.semantic_authorized);
+                }
+                if let Some(reason) = target.unproven {
+                    slot.unproven.insert(reason);
                 }
                 slot.fork_safe &= target.fork_safe;
                 if target.semantic_authorized && target.standard_layout_evidence.is_none() {
@@ -5027,6 +5115,7 @@ fn merge(
     let mut standard_layout_slots = BTreeSet::new();
     let mut standard_layout_evidence = BTreeSet::new();
     let mut reproven_unfinished_slots = BTreeSet::new();
+    let mut slot_unnamed_reasons = BTreeMap::new();
     let slots: Vec<Slot> = building
         .into_iter()
         .enumerate()
@@ -5038,6 +5127,17 @@ fn merge(
                 slot.name_authority.remove(UNKNOWN_FUNCTION_NAME);
             }
             let names: Vec<_> = slot.name_authority.keys().cloned().collect();
+            // Reasons survive only beside a final `unknown`: an authorized
+            // name displaced them together with the unknown claim.
+            if names.as_slice() == [UNKNOWN_FUNCTION_NAME] && !slot.unproven.is_empty() {
+                slot_unnamed_reasons.insert(
+                    AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    },
+                    std::mem::take(&mut slot.unproven),
+                );
+            }
             let semantic_authorized = !admission_policy.forces_count_only()
                 && slot.name_authority.values().all(|value| *value);
             let (descriptor_index, semantic_ambiguous) = crate::kinds::descriptor_index(&names);
@@ -5087,6 +5187,7 @@ fn merge(
     let mut plan = AttachPlan::from_slots_with_policy(slots, admission_policy)
         .expect("merge enforces its immutable admission policy");
     plan.slot_ordinals = slot_ordinals;
+    plan.slot_unnamed_reasons = slot_unnamed_reasons;
     plan.modules = modules;
     plan.uncorroborated_candidates = uncorroborated_candidates;
     plan.skipped = skipped;
@@ -5683,6 +5784,7 @@ mod decoded_occurrence_count_tests {
             standard_layout_evidence: None,
             reproven_unfinished: false,
             name_authorized: false,
+            unproven: Some(UnprovenNames::HeuristicTable),
             table: None,
             ordinal: None,
             aliases: Vec::new(),
@@ -6277,6 +6379,7 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
                 standard_layout_evidence,
                 reproven_unfinished,
                 name_authorized: authorized,
+                unproven: (!authorized).then_some(UnprovenNames::HeuristicTable),
                 table: Some(index),
                 ordinal: standard_ordinal(entry.name).map(|ordinal| SlotOrdinal {
                     table_file_offset: table.file_offset,
@@ -6525,6 +6628,7 @@ fn lower_manifest<'m>(
                     standard_layout_evidence: None,
                     reproven_unfinished: false,
                     name_authorized: true,
+                    unproven: None,
                 });
             }
             Resolution::NullPointer => skip("null pointer".into()),
@@ -6686,6 +6790,7 @@ fn lower_prearm(piece: &PrearmPlanPiece) -> Discovered<'_> {
             standard_layout_evidence: None,
             reproven_unfinished: false,
             name_authorized: true,
+            unproven: None,
             table: None,
             ordinal: standard_ordinal(name).map(|ordinal| SlotOrdinal {
                 table_file_offset: None,
@@ -13842,6 +13947,7 @@ pub(crate) mod tests {
                 standard_layout_evidence: None,
                 reproven_unfinished: false,
                 name_authorized: true,
+                unproven: None,
                 table: None,
                 ordinal: None,
                 aliases: Vec::new(),

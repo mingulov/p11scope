@@ -946,6 +946,11 @@ fn stage_projection(
             file_offset: slot.file_offset,
             target_object: plan.borrowed_target_object_of(slot).cloned(),
             ordinals,
+            unnamed_reasons: plan
+                .unnamed_reasons_of(slot)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         });
     }
     Ok((crate::metrics::merge_slot_reports(reports), storage))

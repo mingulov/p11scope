@@ -93,6 +93,9 @@ pub struct SlotReport {
     pub target_object: Option<crate::plan::TargetObject>,
     /// Every table ordinal that reached the target (`plan::SlotOrdinal`).
     pub ordinals: Vec<crate::plan::SlotOrdinal>,
+    /// Why the row's names stayed unknown, as stable schema tokens,
+    /// sorted. Nonempty exactly when `names` is `["unknown"]`.
+    pub unnamed_reasons: Vec<String>,
 }
 
 fn slot_report(
@@ -124,6 +127,11 @@ fn slot_report(
         file_offset: slot.file_offset,
         target_object: plan.target_object_of(slot),
         ordinals: plan.ordinals_of(slot),
+        unnamed_reasons: plan
+            .unnamed_reasons_of(slot)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -431,6 +439,9 @@ pub fn merge_slot_reports(reports: Vec<SlotReport>) -> Vec<SlotReport> {
         row.ordinals.extend(report.ordinals);
         row.ordinals.sort();
         row.ordinals.dedup();
+        row.unnamed_reasons.extend(report.unnamed_reasons);
+        row.unnamed_reasons.sort();
+        row.unnamed_reasons.dedup();
     }
     merged
 }
@@ -1583,6 +1594,7 @@ mod tests {
                 sha256: Some("aa".into()),
             }),
             ordinals: vec![],
+            unnamed_reasons: vec![],
         }
     }
 

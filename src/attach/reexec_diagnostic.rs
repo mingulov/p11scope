@@ -875,6 +875,7 @@ mod tests {
                 file_offset: 0,
                 target_object: None,
                 ordinals: vec![],
+                unnamed_reasons: vec![],
             }
         }
         #[test]

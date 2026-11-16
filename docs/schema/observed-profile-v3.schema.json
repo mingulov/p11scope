@@ -1152,6 +1152,12 @@
             "description": "V3-additive CKR_* names for the rv_counts keys that have a registered name, keyed by the same 16-digit hex strings. Unregistered (vendor) codes are absent; their rv_counts hex key is the verbatim rendering. Render-time presentation of already-captured return codes; rv_counts is unchanged.",
             "type": "object",
             "additionalProperties": {"type": "string", "minLength": 1}
+          },
+          "unnamed_reasons": {
+            "description": "V3-additive reason set for rows whose names stayed [\"unknown\"], sorted. Present exactly on unknown rows (absent, never null or empty, on named rows). heuristic_table: a scan-decoded table with no interface linkage, live return, manifest, or export proof. selection_without_standard_proof: a manifest selection table no exact-standard v3 query proved.",
+            "type": "array",
+            "minItems": 1,
+            "items": {"enum": ["heuristic_table", "selection_without_standard_proof"]}
           }
         }
       }

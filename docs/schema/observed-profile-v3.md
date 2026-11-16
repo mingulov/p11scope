@@ -845,6 +845,20 @@ positions share one target. `discovery[].tables[]` adds the linkage value
 and `functions[]` rows). Export linkage presents standard names only: scan-found
 slots stay semantics-unverified and count-only whatever their linkage.
 
+Every `functions[]` row whose names stayed `["unknown"]` carries
+`unnamed_reasons`: the sorted, deduplicated reasons its contributors'
+labels are unpresentable, from the closed vocabulary
+`heuristic_table` (a scan-decoded table with no interface linkage,
+live return, manifest, or export proof — the only way a scan target
+is unauthorized) and `selection_without_standard_proof` (a manifest
+selection table no exact-standard v3 query proved; counted, but its
+positions are not standard names). The key is present exactly on
+unknown rows (absent, never null or empty, on named rows): an
+authorized name displaces both `unknown` and its reasons. Like
+`initialization`, this is a v3-additive disclosure that introduces no
+new schema revision: the `functions[]` item shape stays open and the
+key stays optional.
+
 ## Initialize claim on `functions[]` rows
 
 Every `functions[]` row that names `C_Initialize` and has at least one

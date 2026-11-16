@@ -121,6 +121,7 @@ fn evidence() -> Evidence {
 
 fn report(calls: u64, errors: u64, in_flight: u64) -> SlotReport {
     SlotReport {
+        unnamed_reasons: vec![],
         names: vec!["C_Sign".into()],
         aliased: false,
         semantic_authorized: false,

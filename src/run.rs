@@ -14773,6 +14773,7 @@ mod tests {
             file_offset: 0,
             target_object: None,
             ordinals: Vec::new(),
+            unnamed_reasons: Vec::new(),
             names: vec!["C_Sign".into()],
             aliased: false,
             semantic_authorized: true,
@@ -23345,6 +23346,7 @@ int main(int argc, char **argv) {
             file_offset: 0x1000,
             target_object: None,
             ordinals: Vec::new(),
+            unnamed_reasons: Vec::new(),
         }
     }
 
@@ -28810,6 +28812,7 @@ int main(int argc, char **argv) {
             file_offset: 0,
             target_object: None,
             ordinals: Vec::new(),
+            unnamed_reasons: Vec::new(),
             names: vec!["C_Initialize".to_string()],
             aliased: false,
             semantic_authorized: true,
@@ -28892,6 +28895,7 @@ int main(int argc, char **argv) {
             file_offset: 0,
             target_object: None,
             ordinals: Vec::new(),
+            unnamed_reasons: Vec::new(),
             names: vec!["C_Initialize".to_string()],
             aliased: false,
             semantic_authorized: true,

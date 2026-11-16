@@ -70,6 +70,7 @@ fn slot_report(calls: u64, in_flight: u64) -> SlotReport {
         file_offset: 0,
         target_object: None,
         ordinals: Vec::new(),
+        unnamed_reasons: Vec::new(),
         names: vec!["C_Sign".into()],
         aliased: false,
         semantic_authorized: true,

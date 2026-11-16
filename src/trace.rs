@@ -1356,6 +1356,7 @@ mod tests {
             file_offset: 0,
             target_object: None,
             ordinals: Vec::new(),
+            unnamed_reasons: Vec::new(),
             names: vec![],
             aliased: false,
             semantic_authorized: true,

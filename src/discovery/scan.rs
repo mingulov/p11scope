@@ -5909,6 +5909,10 @@ fn offer_examined_file(
     }
 }
 
+/// Classifier for a mem failure the scan keeps loud. The scan path
+/// diverts proven-exit opens (see `mem_open_exited_for_view`) before
+/// reaching this, so the `ESRCH` arm below survives as the classifier
+/// contract, never a reachable scan outcome.
 fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
     match error.raw_os_error() {
         Some(libc::EACCES | libc::EPERM) => ("ptrace", true),
@@ -5917,16 +5921,16 @@ fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
     }
 }
 
-/// Whether a failed `/proc/<pid>/mem` open proves the process is gone, so
-/// the scan takes the exited error path instead of latching a global
-/// `scan_unavailable`. `ESRCH`/`ENOENT` prove the pid named no process at
-/// open time; anything else (wrapped validation failures such as
-/// cold-filesystem exit churn, which carry no errno) is re-proven fresh
+/// The fallback exit primitive behind `mem_open_exited_for_view`.
+/// `ESRCH` proves the open named no live user task (no mm: a zombie
+/// leader or a kernel thread); `ENOENT` is taken as gone here and
+/// re-proven hidepid-safe by the caller; anything else (a wrapped
+/// validation failure, which carries no errno) is re-proven fresh
 /// from the pid via `generation_dead`. Reuse-safe: a live pid — the
-/// original generation or a reused one — keeps its loud refusal. Reaching
-/// this site proves `/proc` access worked moments ago (maps were just
-/// read, or cold was just proven), so a fresh `NotFound` is a genuine
-/// exit rather than a `hidepid` artifact.
+/// original generation or a reused one — keeps its loud refusal.
+/// Reaching this site proves `/proc` access worked moments ago (maps
+/// were just read, or cold was just proven), so a fresh `NotFound`
+/// is a genuine exit rather than a `hidepid` artifact.
 fn mem_open_exited(pid: u32, error: &std::io::Error) -> bool {
     if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
         return true;
@@ -5934,33 +5938,74 @@ fn mem_open_exited(pid: u32, error: &std::io::Error) -> bool {
     crate::process::generation_dead(pid)
 }
 
+/// Cold-proof failures that name transitional exit churn: the census
+/// or its validation observed the group mid-exit. Only these may
+/// take the silent exited path at the mem-open site (with a fresh
+/// leader-dead read); every other wrapped failure — budget,
+/// deadline, metadata I/O, namespace, ambiguity — stays loud and
+/// counted with its own reason.
+const COLD_EXIT_CHURN_MESSAGES: [&str; 10] = [
+    "cold process filesystem requires the original leader at Z",
+    "cold process task census contains an unproven or exiting member",
+    "cold process leader generation or Z boundary changed",
+    "cold process task census changed; filesystem remains unproven",
+    "cold process member generation or liveness changed",
+    "cold process member changed while its filesystem was checked",
+    "cold process member changed during directory acquisition",
+    "cold process filesystem has no proven live nonleader",
+    "original process exited while its filesystem was identified",
+    "original process exited during filesystem access",
+];
+
+/// Whether a wrapped mem-open failure names known exit churn.
+fn cold_exit_churn_message(text: &str) -> bool {
+    COLD_EXIT_CHURN_MESSAGES.contains(&text)
+}
+
 /// Whether a failed `/proc/<pid>/mem` open proves the whole original
 /// process exited, so the scan takes the exited error path instead of
-/// latching a global `scan_unavailable`. `ESRCH`/`ENOENT` prove the
-/// opened task was gone at open time. An errno'd refusal (`EACCES`,
-/// `EPERM`, `EIO`, ...) proves the task existed at open time, so it
-/// is proven from the view's pin first (`original_exited` is
-/// pidfd-backed whole-group authority: a dead leader with live
-/// members reads `false`, keeping the live group's refusal loud);
-/// only a fallback pin without a pidfd — which cannot see zombies
-/// through its start-time comparison — falls back to the fresh
-/// leader read for errno'd failures. A wrapped validation failure
-/// with no errno (cold exit churn) keeps the fresh leader read: the
-/// census itself proves transitional exit churn, silenced even
-/// across brief live-member linger. Fail-closed: any unproven shape
-/// keeps its loud refusal.
+/// latching a global `scan_unavailable`.
+///
+/// * `ESRCH` proves the open named no live user task (no mm: a zombie
+///   leader or a kernel thread), never a reused live process, so it
+///   silences unconditionally.
+/// * `ENOENT` proves nothing by itself: a live target whose `/proc`
+///   visibility changes between the maps read and the mem open (a
+///   committed setuid under hidepid) surfaces the same errno as a
+///   reaped child. It silences only on a fresh whole-group proof —
+///   the view's pin (`original_exited`) or a `kill` `ESRCH`
+///   (`process_proven_exited`, hidepid-proof).
+/// * Any other errno'd refusal (`EACCES`, `EPERM`, `EIO`, ...) proves
+///   the task existed at open time, so it is proven from the view's
+///   pin first: a dead leader with live members reads `false`,
+///   keeping the live group's refusal loud. Without pidfd authority
+///   (a fallback pin, which cannot see zombies through its
+///   start-time comparison) only a reaped pid silences, never
+///   leader-Z.
+/// * A wrapped failure with no errno (a cold-proof error) silences
+///   only when it names known exit churn (see
+///   `COLD_EXIT_CHURN_MESSAGES`) and the leader freshly reads dead;
+///   budget, deadline, metadata I/O, namespace and ambiguity
+///   refusals stay loud and counted with their own reason.
+///
+/// Fail-closed: any unproven shape keeps its loud refusal. Callers
+/// run inside `run_while_same`, so a generation change across the
+/// open takes the generation-change refusal before this check.
 fn mem_open_exited_for_view(view: &ProcessView, pid: u32, error: &std::io::Error) -> bool {
-    if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+    if error.raw_os_error() == Some(libc::ESRCH) {
         return true;
     }
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        return view.original_exited() == Ok(true) || crate::process::process_proven_exited(pid);
+    }
     if error.raw_os_error().is_none() {
-        return mem_open_exited(pid, error);
+        return cold_exit_churn_message(&error.to_string()) && mem_open_exited(pid, error);
     }
     if view.original_exited() == Ok(true) {
         return true;
     }
     if view.retained_pin().pidfd().is_err() {
-        return mem_open_exited(pid, error);
+        return crate::process::process_proven_exited(pid);
     }
     false
 }
@@ -11594,11 +11639,8 @@ mod tests {
             crate::process::generation_dead(pid),
             "fixture precondition: leader-Z reads dead via the bare pid"
         );
-        let view = crate::process::start_time_pinned_process_view_for_test(
-            ProcessViewId(78),
-            pid,
-        )
-        .expect("a cold view opens through the live survivor");
+        let view = crate::process::start_time_pinned_process_view_for_test(ProcessViewId(78), pid)
+            .expect("a cold view opens through the live survivor");
         assert_eq!(
             view.original_exited(),
             Ok(false),
@@ -11824,11 +11866,7 @@ mod tests {
             "fixture precondition: the pin proves the original exited"
         );
         assert!(
-            mem_open_exited_for_view(
-                &view,
-                pid,
-                &std::io::Error::from_raw_os_error(libc::ENOENT)
-            ),
+            mem_open_exited_for_view(&view, pid, &std::io::Error::from_raw_os_error(libc::ENOENT)),
             "ENOENT after a proven reap takes the exited path"
         );
     }
@@ -11867,9 +11905,10 @@ mod tests {
         );
         let outcome = result.expect("a mid-open exit refuses, never the silent Err path");
         assert!(
-            outcome.skipped().iter().any(|skip| skip
-                .reason
-                .contains(SCAN_GENERATION_CHANGED_REASON)),
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains(SCAN_GENERATION_CHANGED_REASON)),
             "a mid-open exit names the generation change: {:?}",
             outcome.skipped()
         );

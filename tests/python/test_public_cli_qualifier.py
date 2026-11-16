@@ -562,6 +562,38 @@ def load_handoff_pair():
     raise AssertionError("assert_handoff_pair missing from the run-prearm oracle")
 
 
+def load_pre68_dispatch(name, label):
+    """Compile a pre-6.8 twin dispatch from the real oracle block.
+
+    AST-extracted (not copied) so the tests track the shipped oracle;
+    the handoff-pair delegate compiles into the same namespace
+    (functions only, never the block's top-level capture assertions).
+    """
+    tree = ast.parse(extract_handoff_oracle())
+    nodes = [node for node in tree.body
+             if isinstance(node, ast.FunctionDef)
+             and node.name in ("assert_handoff_pair", name)]
+    found = {node.name for node in nodes}
+    if "assert_handoff_pair" not in found:
+        raise AssertionError("assert_handoff_pair missing from the run-prearm oracle")
+    if name not in found:
+        raise AssertionError(f"{name} missing from the run-prearm oracle")
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]),
+                 label, "exec"), namespace)
+    return namespace[name]
+
+
+def load_pre68_held():
+    """Compile assert_pre68_held from the real oracle block."""
+    return load_pre68_dispatch("assert_pre68_held", "<pre68-held>")
+
+
+def load_pre68_passive():
+    """Compile assert_pre68_passive from the real oracle block."""
+    return load_pre68_dispatch("assert_pre68_passive", "<pre68-passive>")
+
+
 def load_prearm_counter():
     """Compile completed_calls from the real run-prearm oracle block.
 
@@ -703,6 +735,110 @@ class HandoffPairTests(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertIn(line, text)
+
+
+class Pre68DispatchTests(unittest.TestCase):
+    """The pre-6.8 twins accept exactly two disclosures each.
+
+    The 6.6 overlay split either absorbs into the kept pre-arm object
+    (the >= 6.8 shape) or joins live across the id change (the handoff
+    pair). Each dispatch is AST-extracted from the shipped oracle and
+    loaded per test, so a missing dispatch fails (not errors) here.
+    """
+
+    def test_pre68_held_exists_in_oracle(self):
+        load_pre68_held()
+
+    def test_pre68_passive_exists_in_oracle(self):
+        load_pre68_passive()
+
+    def test_held_accepts_merged_empty(self):
+        check = load_pre68_held()
+        self.assertEqual(
+            check({"attached_at_ns": 200, "unobserved_windows": []}),
+            "merged []")
+
+    def test_held_accepts_handoff_pair(self):
+        check = load_pre68_held()
+        self.assertEqual(
+            check(handoff_module((100, 200), (100, 150), 200)),
+            "handoff pair")
+
+    def test_held_rejects_other_shapes(self):
+        check = load_pre68_held()
+        cases = {
+            "single-pre-attach": {
+                "attached_at_ns": 200,
+                "unobserved_windows": [
+                    {"reason": "pre_attach",
+                     "start_ns": 100, "end_ns": 200}]},
+            "lone-late-discovery": {
+                "attached_at_ns": 200,
+                "unobserved_windows": [
+                    {"reason": "late_discovery",
+                     "start_ns": 100, "end_ns": 200}]},
+            "broken-pair-end": handoff_module((100, 199), (100, 150), 200),
+            "broken-pair-starts": handoff_module((100, 200), (101, 150), 200),
+        }
+        for name, module in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(AssertionError):
+                    check(module)
+
+    def test_held_absent_windows_fails_loud(self):
+        # No silent pass on a missing disclosure: the merged arm reads
+        # the key, exactly like the handoff arm does today.
+        check = load_pre68_held()
+        with self.assertRaises(KeyError):
+            check({"attached_at_ns": 200})
+
+    def test_passive_accepts_merged_pre_attach(self):
+        check = load_pre68_passive()
+        self.assertEqual(
+            check({"attached_at_ns": 200, "unobserved_windows": [
+                {"reason": "pre_attach",
+                 "start_ns": 100, "end_ns": 200}]}),
+            "merged pre_attach")
+
+    def test_passive_accepts_handoff_pair(self):
+        check = load_pre68_passive()
+        self.assertEqual(
+            check(handoff_module((100, 200), (100, 150), 200)),
+            "handoff pair")
+
+    def test_passive_rejects_other_shapes(self):
+        check = load_pre68_passive()
+        cases = {
+            "empty": {"attached_at_ns": 200, "unobserved_windows": []},
+            "pre-attach-end-mismatch": {
+                "attached_at_ns": 200,
+                "unobserved_windows": [
+                    {"reason": "pre_attach",
+                     "start_ns": 100, "end_ns": 199}]},
+            "lone-late-discovery": {
+                "attached_at_ns": 200,
+                "unobserved_windows": [
+                    {"reason": "late_discovery",
+                     "start_ns": 100, "end_ns": 200}]},
+            "broken-pair-end": handoff_module((100, 199), (100, 150), 200),
+            "broken-pair-starts": handoff_module((100, 200), (101, 150), 200),
+        }
+        for name, module in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(AssertionError):
+                    check(module)
+
+    def test_passive_absent_windows_fails_loud(self):
+        check = load_pre68_passive()
+        with self.assertRaises(KeyError):
+            check({"attached_at_ns": 200})
+
+    def test_dispatch_call_sites_are_the_two_pre68_twins(self):
+        text = QUAL.read_text()
+        self.assertEqual(text.count("assert_pre68_held("), 2,
+                         "def plus exactly the held pre-6.8 call")
+        self.assertEqual(text.count("assert_pre68_passive("), 2,
+                         "def plus exactly the passive pre-6.8 call")
 
 
 class PrearmExactnessTests(unittest.TestCase):

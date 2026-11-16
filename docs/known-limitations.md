@@ -828,6 +828,25 @@ these cases, and fixes are planned for 0.8.0:
   `2>&1 | tee` under load): some diagnostic lines may be dropped, and
   the number dropped is not reported yet.
 
+### A mid-load plan rebuild can lose first calls in its replace window
+
+When a new worker's view arrives while the attach plan is still
+loading, the rebuilt plan replaces every probe (detach, then
+reattach; 33–59 ms measured in the run-tree cells). Calls that enter
+in that window are lost, and the loss is not disclosed: the report
+carries no gap row for the interval, only the replace evidence (a
+second counter-slot row for the endpoint, or a failed replacement's
+null attach). The run-tree learned-provider cells judge exact
+per-call accounting, so a rebuild that lands in a call burst fails
+them intermittently (seen on 6.6, 6.12 and 7.3 CI legs); the CI gate
+records the witnessed
+shape as the reviewed `PLAN-REPLACE-GAP` expected failure (a miss the
+report ties to a replace, within the calls before the last re-attach)
+on the four affected cells, while overcounts, unwitnessed misses and
+any other failure stay failed. Timing the interval and disclosing the
+window is planned (the `PLAN-REPLACE-GAP` fix lane). Rerunning the
+capture usually lands a clean run.
+
 ## Known limitations in 0.6.0
 
 The following limits apply to the v0.6.0 release. Rate, latency and

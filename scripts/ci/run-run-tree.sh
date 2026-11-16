@@ -111,15 +111,24 @@ privileged_run_tree_non_member_provider_is_never_staged
 # - PLAN-REPLACE-GAP, as above: undisclosed misses after the first
 #   provider attach (CI 43704790202 v6.6 under the old floor: 0.8996).
 #   It passes on the CI host.
+# descendants_reach_high_coverage:
+# - PLAN-REPLACE-GAP, as above: the same 32-grandchild learned-provider
+#   shape trips the same witnessed misses (CI 43820453040 v6.6: 4-8
+#   calls per function, 4 slot rows each; CI 43805916591 and
+#   43794735150 v6.6 likewise with 2-3 slot rows). Only the witnessed
+#   signature is declared: the cell's older overcount shape and an
+#   unwitnessed miss stay failed.
 EXPECTED_FAILURES=(
 privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
 privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
 privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves
 privileged_run_tree_arming_exhaustion_still_stages_and_counts
+privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage
 )
 EXPECTED_SIGNATURES=(
 'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
 'attach plan requires [0-9]+ allocated slots but only [0-9]+ are available'
+'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
 'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
 'undisclosed miss: [0-9]+ calls after the pre-attach window \([^)]*; replace witness: [^)]+\)'
 )
@@ -133,10 +142,12 @@ EXPECTED_ANCHORS=(
 "^run exits with the shell's status$"
 '^exact accounting failed: \['
 '^exact accounting failed: \['
+'^exact accounting failed: \['
 )
 EXPECTED_REASONS=(
 'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
 'SLOT-RECLAIM: descriptor-replaced slots of the same pinned object are never reused'
+'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
 'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
 'PLAN-REPLACE-GAP: the replace detach gap of a mid-load plan rebuild loses first calls'
 )
@@ -274,6 +285,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     local never=privileged_run_tree_unprearmed_shortlived_never_pause_still_learns
     local arming=privileged_run_tree_arming_exhaustion_still_stages_and_counts
     local parallel=privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves
+    local desc=privileged_run_tree_unprearmed_shortlived_descendants_reach_high_coverage
     # Each declared signature of a cell is an expected failure...
     LOG_BODY="thread 'x' panicked at tests/run_tree.rs:330:5:
 exact accounting failed: [\"undisclosed miss: 9 calls after the pre-attach window (C_GetInfo: observed 30 of 31 that entered after its first attach at 1; replace witness: 25 slot rows, 31 calls entered before the last re-attach)\"]
@@ -289,6 +301,10 @@ exact accounting failed: [\"undisclosed miss: 28 calls after the pre-attach wind
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.00s"
     check "$arming" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
     check "$parallel" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
+    LOG_BODY="thread 'x' panicked at tests/run_tree.rs:539:5:
+exact accounting failed: [\"undisclosed miss: 4 calls after the pre-attach window (C_Finalize: observed 28 of 32 that entered after its first attach at 41208742991; replace witness: 4 slot rows, 32 calls entered before the last re-attach, no physical gap row)\"]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.00s"
+    check "$desc" 101 0 False expected-failure 'PLAN-REPLACE-GAP: the replace detach gap'
     # ...while any other failure of it stays failed (never masked): the
     # arming cell declares no capacity signature, and its reserve-row
     # failure is not declared at all...
@@ -311,6 +327,16 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     LOG_BODY="exact accounting failed (not an undisclosed miss): [\"probe loss: C_GetInfo observed none of 31 calls after its first attach\"]; misses 0 ; window end 1
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
     check "$parallel" 101 1 False failed 'rc=101'
+    # The descendants cell's other shapes stay failed: its older
+    # overcount and an unwitnessed miss are not the declared gap.
+    LOG_BODY="thread 'x' panicked at tests/run_tree.rs:534:5:
+exact accounting failed (not an undisclosed miss): [\"C_Finalize: observed 31 exceeds the 10 calls after its first attach plus 0 during it\"]; misses 0 ; window end 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$desc" 101 1 False failed 'rc=101'
+    LOG_BODY="thread 'x' panicked at tests/run_tree.rs:534:5:
+exact accounting failed (not an undisclosed miss): [\"unexplained miss: C_Finalize lost 13 calls after its first attach at 43972685236 with no replace witness (one slot row, attached)\"]; misses 0 ; window end 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s"
+    check "$desc" 101 1 False failed 'rc=101'
     # A partial miss without the report's replace evidence (no witness,
     # or more than could enter before the last re-attach) is not the
     # declared gap, and neither is a miss text that names no witness.

@@ -1110,6 +1110,94 @@ class ObservedRsaTests(unittest.TestCase):
             with self.assertRaisesRegex(ORACLE.OracleRefusal,
                                         "unestablished curve carries no reason"):
                 ORACLE.check_section(mutated)
+        with self.subTest("reason-free private-half pair row checks"):
+            # Real producer output (evidence/keymeta-t1-fix5/
+            # producer-rows.txt, PAIR obj=2): the private half of a
+            # C_GenerateKeyPair carries its type with no curve
+            # reason — the curve lives in the public template.
+            accepted = copy.deepcopy(section)
+            row = accepted["objects"][1]
+            row["origin"] = "created"
+            row["creation"] = "generate_pair"
+            row["label"] = None
+            for block in (row["requested"], row["established"]):
+                for cell in block.values():
+                    cell["status"] = "unknown"
+                    cell["value"] = None
+                    cell["source"] = None
+                    cell["reason"] = None
+            for block, source in ((row["requested"], None),
+                                  (row["established"],
+                                   "creation_success")):
+                block["class"] = {"status": "value", "value": 3,
+                                  "source": source, "reason": None}
+                block["key_type"] = {"status": "value", "value": 65,
+                                     "source": source, "reason": None}
+            for name in row["queries"]:
+                row["queries"][name] = "not_queried"
+            ORACLE.check_section(accepted)
+        with self.subTest("reason-free unwrap row checks"):
+            # Real producer output (evidence/keymeta-t1-fix5/
+            # producer-rows.txt, UNWRAP obj=2): an unwrap template
+            # carries the key type but must not carry
+            # CKA_EC_PARAMS, so the unwrapped key names no curve
+            # reason.
+            accepted = copy.deepcopy(section)
+            row = accepted["objects"][1]
+            row["origin"] = "created"
+            row["creation"] = "unwrap"
+            row["label"] = None
+            for block in (row["requested"], row["established"]):
+                for cell in block.values():
+                    cell["status"] = "unknown"
+                    cell["value"] = None
+                    cell["source"] = None
+                    cell["reason"] = None
+            for block, source in ((row["requested"], None),
+                                  (row["established"],
+                                   "creation_success")):
+                block["class"] = {"status": "value", "value": 3,
+                                  "source": source, "reason": None}
+                block["key_type"] = {"status": "value", "value": 65,
+                                     "source": source, "reason": None}
+            for name in row["queries"]:
+                row["queries"][name] = "not_queried"
+            ORACLE.check_section(accepted)
+        with self.subTest("reason-free copy row checks"):
+            # The copy twin's real producer row
+            # (evidence/keymeta-t1-fix5/producer-rows.txt, COPY
+            # obj=2: TOKEN-only template, query-established class
+            # and type, no curve), lifted to v6 keys — the shape it
+            # takes once other section content trips v6. A copy
+            # template can only change modifiable attributes, so no
+            # curve reason is due.
+            accepted = copy.deepcopy(section)
+            row = accepted["objects"][1]
+            row["origin"] = "created"
+            row["creation"] = "copy"
+            row["label"] = None
+            for block in (row["requested"], row["established"]):
+                for cell in block.values():
+                    cell["status"] = "unknown"
+                    cell["value"] = None
+                    cell["source"] = None
+                    cell["reason"] = None
+            row["requested"]["token"] = {"status": "value",
+                                         "value": 0,
+                                         "source": None,
+                                         "reason": None}
+            row["established"]["class"] = {"status": "value",
+                                           "value": 3,
+                                           "source": "query",
+                                           "reason": None}
+            row["established"]["key_type"] = {
+                "status": "value", "value": 65,
+                "source": "query", "reason": None}
+            for name in row["queries"]:
+                row["queries"][name] = "not_queried"
+            row["queries"]["class"] = "established"
+            row["queries"]["key_type"] = "established"
+            ORACLE.check_section(accepted)
         with self.subTest("token creation_success refused"):
             mutated = copy.deepcopy(section)
             mutated["objects"][1]["established"]["token"] = {

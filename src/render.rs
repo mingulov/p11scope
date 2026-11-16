@@ -11821,6 +11821,74 @@ pub(crate) mod tests {
         );
     }
 
+    /// Coverage line (tier-3 review of port3 fix2): one provider file
+    /// with both a growth omission and a capacity lowering counts one
+    /// partially covered file, not two records; a file with a whole
+    /// refusal and a lowering counts once, as not watched. The
+    /// module-gaps listing still carries both records verbatim — only
+    /// the coverage counts dedupe by file.
+    #[test]
+    fn one_module_with_omission_and_lowering_counts_one_file() {
+        const LOWERING_RECORD: &str = "68 semantic endpoints attached count-only for capacity: \
+             no room for fresh semantic cells; 2112 of 2112 attach slots are in use \
+             (2044 active, 68 retired)";
+        let omission = || SkippedOut {
+            name: "/opt/p.so".into(),
+            reason: GROWTH_OMISSION_RECORD.into(),
+        };
+        let lowering = || SkippedOut {
+            name: "/opt/p.so".into(),
+            reason: LOWERING_RECORD.into(),
+        };
+        let summary = |skipped: Vec<SkippedOut>| {
+            let mut ev = evidence();
+            ev.discovery.modules_skipped = skipped;
+            ev.verdict();
+            scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                crate::cli::TextVerbosity::Concise,
+            )
+        };
+        // Omission + lowering: one file partially covered.
+        let out = summary(vec![omission(), lowering()]);
+        assert!(out.contains("1 provider file partially covered"), "{out}");
+        assert!(
+            !out.contains("2 provider files partially covered"),
+            "{out}"
+        );
+        // Refusal + lowering: the file counts once, as not watched.
+        // (The gaps listing below still names the lowering row
+        // "partially covered"; only the count fragment dedupes.)
+        let out = summary(vec![
+            SkippedOut {
+                name: "/opt/p.so".into(),
+                reason: "module needs 68 more; only 512 attach slots are available; 480 are in \
+                     use - refusing to attach a prefix"
+                    .into(),
+            },
+            lowering(),
+        ]);
+        assert!(out.contains("1 provider file not watched"), "{out}");
+        assert!(
+            !out.contains("provider file partially covered")
+                && !out.contains("provider files partially covered"),
+            "{out}"
+        );
+        // The listing still shows both records; only the counts dedupe.
+        let mut ev = evidence();
+        ev.discovery.modules_skipped = vec![omission(), lowering()];
+        ev.verdict();
+        let value = versioned_evidence(&ev);
+        assert_eq!(value["modules_skipped"][0]["name"], "/opt/p.so");
+        assert_eq!(value["modules_skipped"][1]["name"], "/opt/p.so");
+        assert_eq!(
+            value["modules_skipped"][1]["reason"],
+            LOWERING_RECORD
+        );
+    }
+
     /// The terminal summary names a refused module with its reason in plain
     /// words and the way to capture it alone.
     #[test]

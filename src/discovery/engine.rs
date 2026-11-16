@@ -18651,12 +18651,11 @@ impl Engine {
             )
         });
         let mut outcome = ApplyOutcome::default();
-        if crate::run::capture_diagnostics_on()
-            && candidate
-                .modules
-                .iter()
-                .any(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID)
-        {
+        let carries_run_learned = candidate
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID);
+        if crate::run::capture_diagnostics_on() && carries_run_learned {
             eprintln!(
                 "p11scope: apply candidate carries run-learned tables: {} modules, delta +{}/~{}/-{}",
                 candidate.modules.len(),
@@ -19625,12 +19624,7 @@ impl Engine {
                 DiagnosticOutcome::Rejected
             });
         }
-        if crate::run::capture_diagnostics_on()
-            && candidate
-                .modules
-                .iter()
-                .any(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID)
-        {
+        if crate::run::capture_diagnostics_on() && carries_run_learned {
             eprintln!(
                 "p11scope: apply outcome for run-learned tables: accepted={} disposition={:?} \
                  static_failures={} detach_failed={} changed={}",

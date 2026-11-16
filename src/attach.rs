@@ -1926,6 +1926,13 @@ pub struct Session {
     /// multi-group rebuild can reattach surviving siblings; pruned as the
     /// slot's last link detaches (see [`RetainedStaticTarget`]).
     retained_static: BTreeMap<u32, RetainedStaticTarget>,
+    /// In-place downgrade slots whose latest refusal may have left a
+    /// set `SLOT_COUNT_ONLY` cell under the unchanged semantic
+    /// retained entry ([`InPlaceDowngradeRefusal::disputes_attestation`]):
+    /// the identical-entry fast path in [`Session::count_only_switched`]
+    /// would otherwise hide them from the switched-semantic refusal.
+    /// Sticky and fail-closed: Packet 2's detach+replace owns clearing.
+    count_only_disputed: BTreeSet<u32>,
     pid_pairs: pid_continuity::PairBook,
     global_retirements: global_retirement::Retirements,
     native_retirement: native_retirement::NativeRetirement,
@@ -3217,6 +3224,22 @@ impl std::fmt::Display for InPlaceDowngradeRefusal {
                 write!(f, "count-only switch read back {read}, not set")
             }
         }
+    }
+}
+
+impl InPlaceDowngradeRefusal {
+    /// Refusals that may leave a set `SLOT_COUNT_ONLY` cell under the
+    /// unchanged semantic retained entry: an observed set cell, or a
+    /// commit whose write landed but whose read-back failed or
+    /// disagreed. A disputed slot reads switched for attested
+    /// revalidation even when its retained entry is identical to the
+    /// plan slot, so the receipt refuses it instead of attesting
+    /// semantic capture the narrowed BPF slot no longer performs.
+    fn disputes_attestation(&self) -> bool {
+        matches!(
+            self,
+            Self::SwitchAlreadySet | Self::SwitchReadBack(_) | Self::SwitchReadBackMismatch(_)
+        )
     }
 }
 
@@ -7730,12 +7753,17 @@ impl Session {
     /// differs from the plan slot pay the cell read: the sole
     /// in-tree writer always updates the retained entry with the
     /// switch, so no committed downgrade hides behind an identical
-    /// entry. A set switch under an identical retained entry is
-    /// reachable only through an out-of-band map write; out-of-band
-    /// switch integrity belongs to Packet 2 with the never-cleared
-    /// switch. A missing/unreadable map reads as none set — no
-    /// downgrade could have committed without it — and an unreadable
-    /// cell keeps its strict equality check.
+    /// entry. A set switch under an identical retained entry is also
+    /// reachable through `downgrade_in_place`'s own refused commit —
+    /// the write landed, the read-back failed or disagreed, and the
+    /// retained entry stayed semantic — so refused slots are tracked
+    /// in `count_only_disputed` and unioned below with zero extra
+    /// cell reads; a retry reads already-set and stays disputed.
+    /// Pure out-of-band writes (no in-session downgrade observed
+    /// them) remain Packet 2 scope with the never-cleared switch. A
+    /// missing/unreadable map reads as none set — no downgrade could
+    /// have committed without it — and an unreadable cell keeps its
+    /// strict equality check.
     fn count_only_switched(&self, attached: &AttachedSemanticSet) -> BTreeSet<u32> {
         let mut switched = BTreeSet::new();
         let gate: Option<Array<_, u32>> = self
@@ -7762,6 +7790,11 @@ impl Session {
                 }
             }
         }
+        // Refused commits and observed set cells dispute attestation
+        // without another map read: the identical-entry fast path
+        // above never names them, but the I3 guard must still see
+        // them.
+        switched.extend(self.count_only_disputed.iter().copied());
         switched
     }
 
@@ -8479,6 +8512,7 @@ impl Session {
                 lifecycle_tracking_unavailable: None,
                 process_creation_tracking_unavailable: None,
                 retained_static: BTreeMap::new(),
+                count_only_disputed: BTreeSet::new(),
                 pid_pairs: pid_continuity::PairBook::default(),
                 global_retirements: global_retirement::Retirements::default(),
                 native_retirement: native_retirement::NativeRetirement::default(),
@@ -9940,7 +9974,9 @@ impl Session {
     /// the new one is count-only); refused slots report their reason
     /// and take today's detach+replace path with its named physical
     /// gap. The switch is written as 1 and read back, and
-    /// `retained_static` follows the new slot. No link is detached,
+    /// `retained_static` follows the new slot. Refusals that may
+    /// leave the switch set dispute attested revalidation (see
+    /// `count_only_disputed`). No link is detached,
     /// no link is attached, and `pid_pairs`/`global_retirements` are
     /// untouched: there is no physical gap to disclose.
     pub fn downgrade_in_place(&mut self, slots: &[Slot]) -> InPlaceDowngradeOutcome {
@@ -10124,6 +10160,16 @@ impl Session {
                 retained.slot = slot.clone();
             }
             outcome.downgraded.push(slot.index);
+        }
+        // A refused commit can leave cell=1 under the unchanged
+        // semantic retained entry, identical to the plan slot: the
+        // identical-entry fast path would hide it from the
+        // switched-semantic refusal, so disputed slots stay named
+        // until Packet 2's detach+replace re-establishes them.
+        for (index, reason) in &outcome.refused {
+            if reason.disputes_attestation() {
+                self.count_only_disputed.insert(*index);
+            }
         }
         outcome
     }

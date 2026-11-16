@@ -3566,6 +3566,10 @@ impl AttachPlan {
                 return Err(error);
             }
             self.validate_extension_capacity(&rebuilt)?;
+            debug_assert!(
+                rebuilt.validate_slot_index().is_ok(),
+                "the fallback repair keeps a clean slot index"
+            );
         }
 
         // Exact reuse assignments, computed once and applied verbatim so
@@ -4370,30 +4374,132 @@ impl AttachPlan {
             self.slots.len(),
             prior.admission_policy.endpoint_limit(),
         );
+        let pristine = self.clone();
+        if !self.shed_until_fits(prior, &marker, &BTreeSet::new()) {
+            return false;
+        }
+        // Re-admit pass: shedding in reverse admission order can
+        // over-refuse (a whole new module goes before an existing
+        // module's growth, and then the growth goes too). Once the plan
+        // fits, every whole-refused victim gets one chance back,
+        // earliest-admitted first: re-run the shed from the pristine
+        // snapshot with that victim (and every re-admitted one)
+        // protected, and keep the trial only when it fits without
+        // refusing anything the current plan admits.
+        let mut protected = BTreeSet::new();
+        let mut attempted = BTreeSet::new();
+        loop {
+            let candidates = self.whole_refused_in_admission_order(&pristine);
+            let Some(victim) = candidates
+                .into_iter()
+                .find(|victim| !attempted.contains(victim))
+            else {
+                break;
+            };
+            attempted.insert(victim);
+            let mut trial_protected = protected.clone();
+            trial_protected.insert(victim);
+            let mut trial = pristine.clone();
+            if trial.shed_until_fits(prior, &marker, &trial_protected)
+                && !trial.refusal_worse_than(self)
+            {
+                *self = trial;
+                protected.insert(victim);
+            }
+        }
+        true
+    }
+
+    /// Sheds overflow victims until the extension fits or no unprotected
+    /// module holds a fresh cell. A protection may legitimately hold the
+    /// overflow, so a trial that cannot fit around its protections fails
+    /// (returns false) instead of asserting.
+    fn shed_until_fits(
+        &mut self,
+        prior: &Self,
+        marker: &str,
+        protected: &BTreeSet<PinnedObjectId>,
+    ) -> bool {
         loop {
             if prior.validate_extension_capacity(self).is_ok() {
                 return true;
             }
-            let Some(victim) = prior.overflow_victim(self) else {
+            let Some(victim) = prior.overflow_victim(self, protected) else {
                 // Only kept and reused demand without a fresh cell to shed
                 // still errors, which cannot fit under any repair.
-                let (_, _, additions) = prior.reuse_assignments(self);
-                debug_assert!(
-                    additions == 0,
-                    "kept+reused alone exceed capacity: {additions} fresh additions with no owning module to shed"
-                );
+                if protected.is_empty() {
+                    let (_, _, additions) = prior.reuse_assignments(self);
+                    debug_assert!(
+                        additions == 0,
+                        "kept+reused alone exceed capacity: {additions} fresh additions with no owning module to shed"
+                    );
+                }
                 return false;
             };
-            self.shed_overflow_victim(prior, victim, &marker);
+            self.shed_overflow_victim(prior, victim, marker);
         }
     }
 
-    /// The next fallback victim: the last-admitted object holding a fresh
-    /// cell, by admission class (closures and heuristics decide last),
-    /// then object key, then snapshot position. The within-class demand
-    /// order merge admits by is not retained on the plan, so key order
-    /// breaks those ties; equal demands always order by key.
-    fn overflow_victim(&self, rebuilt: &Self) -> Option<PinnedObjectId> {
+    /// Whole-refused victims of the repair, earliest-admitted first by the
+    /// pristine snapshot's module order. Merge-refused modules never
+    /// entered the snapshot, so they are not re-admit candidates.
+    fn whole_refused_in_admission_order(&self, pristine: &Self) -> Vec<PinnedObjectId> {
+        let mut order: BTreeMap<PinnedObjectId, (u8, ObjectKey, usize)> = BTreeMap::new();
+        for (index, module) in pristine.modules.iter().enumerate() {
+            order.entry(module.object).or_insert((
+                Self::fallback_class_rank(module.admission_class),
+                module.key,
+                index,
+            ));
+        }
+        let mut victims: Vec<PinnedObjectId> = self
+            .refused_module_objects
+            .iter()
+            .filter(|(_, _, kind)| *kind == RefusalKind::CapacityWhole)
+            .map(|(object, _, _)| *object)
+            .filter(|object| order.contains_key(object))
+            .collect();
+        victims.sort_by(|left, right| order[left].cmp(&order[right]));
+        victims
+    }
+
+    /// Whether this plan refuses any object worse than `current` does: a
+    /// trial re-admission must never displace an already-admitted module.
+    /// Kinds rank growth omission below whole refusal; admitted objects
+    /// rank lowest. Merge-time kinds are identical on both sides (same
+    /// pristine snapshot, and the repair only appends records), so any
+    /// consistent rank keeps them equal.
+    fn refusal_worse_than(&self, current: &Self) -> bool {
+        fn rank(kind: RefusalKind) -> u8 {
+            match kind {
+                RefusalKind::GrowthOmission => 1,
+                RefusalKind::CapacityWhole => 2,
+                _ => 3,
+            }
+        }
+        let mut current_ranks: BTreeMap<PinnedObjectId, u8> = BTreeMap::new();
+        for (object, _, kind) in &current.refused_module_objects {
+            let rank = rank(*kind);
+            if current_ranks.get(object).copied().unwrap_or(0) < rank {
+                current_ranks.insert(*object, rank);
+            }
+        }
+        self.refused_module_objects
+            .iter()
+            .any(|(object, _, kind)| rank(*kind) > current_ranks.get(object).copied().unwrap_or(0))
+    }
+
+    /// The next fallback victim: the last-admitted unprotected object
+    /// holding a fresh cell, by admission class (closures and heuristics
+    /// decide last), then object key, then snapshot position. The
+    /// within-class demand order merge admits by is not retained on the
+    /// plan, so key order breaks those ties; equal demands always order by
+    /// key.
+    fn overflow_victim(
+        &self,
+        rebuilt: &Self,
+        protected: &BTreeSet<PinnedObjectId>,
+    ) -> Option<PinnedObjectId> {
         let prior_keys: BTreeSet<AttachKey> = self.slot_by_key.keys().copied().collect();
         // Exact reuse assignments the extension will apply: migrated and
         // reclaimed keys cost no fresh cell, so they never count toward
@@ -4419,6 +4525,7 @@ impl AttachPlan {
             .modules
             .iter()
             .enumerate()
+            .filter(|(_, module)| !protected.contains(&module.object))
             .filter(|(_, module)| fresh_of.get(&module.id).copied().unwrap_or(0) > 0)
             .max_by(|(left_position, left), (right_position, right)| {
                 (
@@ -4510,6 +4617,15 @@ impl AttachPlan {
         let mut holding: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
         for slot in &self.slots {
             if !self.is_active(slot.index) {
+                continue;
+            }
+            // Holders count kept and reused cells only: fresh demand the
+            // fallback is about to shed holds no room yet.
+            let key = AttachKey::of(slot);
+            if !prior_keys.contains(&key)
+                && !migrated.contains_key(&key)
+                && !reclaimed.contains_key(&key)
+            {
                 continue;
             }
             for id in &slot.module_ids {

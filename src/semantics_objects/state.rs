@@ -504,6 +504,11 @@ struct ViewRecord {
     /// `C_GenerateKeyPair` return (fix round 4): a birth fact, set
     /// once at promotion, never cleared.
     keypair_private: bool,
+    /// The view's creation call is one whose own template is
+    /// expected to carry `CKA_EC_PARAMS` for Edwards/Montgomery
+    /// keys (fix round 5): a birth fact, set once at promotion,
+    /// never cleared. Gates the unestablished-curve reason.
+    creation_expects_curve_params: bool,
 }
 
 impl ViewRecord {
@@ -2259,6 +2264,7 @@ impl ModelState {
                 creation_template_seen: false,
                 creation_partly_read: false,
                 keypair_private: false,
+                creation_expects_curve_params: false,
             },
         );
         self.instances
@@ -3315,6 +3321,19 @@ impl ModelState {
                         if family == CreationFamily::GeneratePair && slot == 1 {
                             view.keypair_private = true;
                         }
+                        // Fix round 5 (controller KEYMETA-T1 fix4
+                        // ruling 2026-11-16): only a `C_CreateObject`
+                        // template and the public half (slot 0) of a
+                        // `C_GenerateKeyPair` are expected to carry
+                        // `CKA_EC_PARAMS` for Edwards/Montgomery keys
+                        // — unwrap templates for those private keys
+                        // must not carry it, and copy templates can
+                        // only change modifiable attributes. The
+                        // unestablished-curve reason needs this birth
+                        // fact; the mismatch reason never does (it
+                        // names observed facts).
+                        view.creation_expects_curve_params = family == CreationFamily::Create
+                            || (family == CreationFamily::GeneratePair && slot == 0);
                         for kind in [
                             SafeAttributeKind::Class,
                             SafeAttributeKind::KeyType,
@@ -4715,6 +4734,7 @@ impl ModelState {
                 creation_template_seen: v.creation_template_seen,
                 creation_partly_read: v.creation_partly_read,
                 keypair_private: v.keypair_private,
+                creation_expects_curve_params: v.creation_expects_curve_params,
             })
             .collect();
         ObjectProjection {
@@ -5107,6 +5127,7 @@ mod tests {
             creation_template_seen: false,
             creation_partly_read: false,
             keypair_private: false,
+            creation_expects_curve_params: false,
         }
     }
 

@@ -5178,12 +5178,7 @@ fn newsite_created_edwards_montgomery_with_curve_stay_unlabeled() {
             scalar(CKA_KEY_TYPE, u64::from(key_type)),
             AttrObservation::curve(CKA_EC_PARAMS, params, LinuxLayout::Lp64),
         ]);
-        let x = h.run(
-            3,
-            create(SA).request(0, template),
-            4,
-            ok().result(0, H1),
-        );
+        let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
         let e = h.settle(4);
         let id = created(&e, x, 0).unwrap();
         let p = h.project();
@@ -5231,12 +5226,7 @@ fn newsite_created_nine_slot_template_promotes_first_eight_only() {
         scalar(CKA_ID, 7),
         scalar(CKA_VALUE_LEN, 48),
     ]);
-    let x = h.run(
-        3,
-        create(SA).request(0, template),
-        4,
-        ok().result(0, H1),
-    );
+    let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
     let e = h.settle(4);
     let id = created(&e, x, 0).unwrap();
     let p = h.project();

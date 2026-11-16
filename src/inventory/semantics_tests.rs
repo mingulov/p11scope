@@ -1460,7 +1460,8 @@ fn native_semantic_attached_receipt_rejects_foreign_or_forged_slot() {
                 Ok(crate::kinds::DESCRIPTORS.to_vec()),
                 &retained,
                 &sides,
-                |id| fixture.watched(id)
+                |id| fixture.watched(id),
+                &BTreeSet::new(),
             )
             .is_ok()
     );
@@ -1475,6 +1476,7 @@ fn native_semantic_attached_receipt_rejects_foreign_or_forged_slot() {
                 &retained,
                 &sides,
                 |id| fixture.watched(id),
+                &BTreeSet::new(),
             )
             .is_err(),
     )];
@@ -1496,6 +1498,7 @@ fn native_semantic_attached_receipt_rejects_foreign_or_forged_slot() {
                     &forged,
                     &sides,
                     |id| fixture.watched(id),
+                    &BTreeSet::new(),
                 )
                 .is_err(),
         ));
@@ -1537,6 +1540,7 @@ fn native_semantic_attached_receipt_rejects_foreign_or_forged_slot() {
                     &retained,
                     &sides,
                     |id| fixture.watched(id),
+                    &BTreeSet::new(),
                 )
                 .is_err(),
         ));
@@ -1568,6 +1572,7 @@ fn native_semantic_attached_receipt_rejects_foreign_or_forged_slot() {
                     &retained,
                     &sides,
                     |id| fixture.watched(id),
+                    &BTreeSet::new(),
                 )
                 .is_err(),
         ));
@@ -1575,6 +1580,97 @@ fn native_semantic_attached_receipt_rejects_foreign_or_forged_slot() {
     assert!(
         refused.iter().all(|(_, refused)| *refused),
         "refusal controls: {refused:?}"
+    );
+}
+
+/// In-place downgrade (A′) on an attested session: a retained slot
+/// narrowed to descriptor 0 with COUNT_ONLY semantics keeps
+/// validating while its switch reads set, so later admissions keep
+/// working after a downgrade. An unswitched narrowing still refuses,
+/// as do a switched slot with semantic semantics or a moved key.
+#[test]
+fn native_semantic_attached_receipt_admits_a_switched_count_only_slot() {
+    let fixture = ProviderFixture::new();
+    let subset = fixture.subset();
+    let (retained, sides) = fixture.inputs(&subset);
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    let receipt = seal_attached_subset_with(
+        subset,
+        domain,
+        CapturePolicy::Allowlisted,
+        Ok(crate::kinds::DESCRIPTORS.to_vec()),
+        &retained,
+        &sides,
+        |id| fixture.watched(id),
+    )
+    .unwrap();
+    let index = *retained.keys().next().unwrap();
+    let descriptors = || Ok(crate::kinds::DESCRIPTORS.to_vec());
+    let mut narrowed = retained.clone();
+    let target = narrowed.get_mut(&index).unwrap();
+    assert_ne!(target.slot.descriptor_index, 0);
+    target.slot.descriptor_index = 0;
+    target.slot.semantics = SlotSemantics::COUNT_ONLY;
+    let switched = BTreeSet::from([index]);
+    assert!(
+        receipt
+            .validate_with(
+                domain,
+                CapturePolicy::Allowlisted,
+                descriptors(),
+                &narrowed,
+                &sides,
+                |id| fixture.watched(id),
+                &switched,
+            )
+            .is_ok(),
+        "a switched count-only narrowing keeps validating"
+    );
+    assert!(
+        receipt
+            .validate_with(
+                domain,
+                CapturePolicy::Allowlisted,
+                descriptors(),
+                &narrowed,
+                &sides,
+                |id| fixture.watched(id),
+                &BTreeSet::new(),
+            )
+            .is_err(),
+        "an unswitched narrowing still refuses"
+    );
+    let mut semantic = narrowed.clone();
+    semantic.get_mut(&index).unwrap().slot.semantics = retained.get(&index).unwrap().slot.semantics;
+    assert!(
+        receipt
+            .validate_with(
+                domain,
+                CapturePolicy::Allowlisted,
+                descriptors(),
+                &semantic,
+                &sides,
+                |id| fixture.watched(id),
+                &switched,
+            )
+            .is_err(),
+        "a switched slot with semantic semantics still refuses"
+    );
+    let mut moved = narrowed.clone();
+    moved.get_mut(&index).unwrap().slot.file_offset += 1;
+    assert!(
+        receipt
+            .validate_with(
+                domain,
+                CapturePolicy::Allowlisted,
+                descriptors(),
+                &moved,
+                &sides,
+                |id| fixture.watched(id),
+                &switched,
+            )
+            .is_err(),
+        "a switched slot on a moved key still refuses"
     );
 }
 

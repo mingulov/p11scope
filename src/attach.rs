@@ -3918,7 +3918,16 @@ fn seal_attached_subset_from_programs(
         // journal roots seals linked.
         journal_linked: journal_pair_present(programs),
     };
-    attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
+    // Seal time: no downgrade could have committed before the seal.
+    attached.validate_with(
+        domain,
+        policy,
+        descriptors,
+        retained,
+        owned_sides,
+        watched,
+        &BTreeSet::new(),
+    )?;
     // Only a successful sealing mints: the generation always names a
     // complete validated endpoint set, never a refused one or a bare
     // counter value. Production mints from the attach cell; host twins
@@ -3967,7 +3976,16 @@ pub(crate) fn seal_attached_subset_with(
         // suites keep exercising birth-to-grant mapping.
         journal_linked: true,
     };
-    attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
+    // Seal time: no downgrade could have committed before the seal.
+    attached.validate_with(
+        domain,
+        policy,
+        descriptors,
+        retained,
+        owned_sides,
+        watched,
+        &BTreeSet::new(),
+    )?;
     // Only a successful sealing mints: the generation always names a
     // complete validated endpoint set, never a refused one. One-based
     // like the production attach-cell mint: a first sealing minting 0
@@ -4073,6 +4091,10 @@ fn semantic_receipt_query_refusal(
 }
 
 impl AttachedSemanticSet {
+    /// `switched` names the slots whose `SLOT_COUNT_ONLY` cell reads
+    /// set: a retained slot narrowed to count-only on its live link
+    /// keeps validating exactly on those. Seal-time callers pass an
+    /// empty set (no downgrade could have committed before the seal).
     fn validate_with(
         &self,
         domain: crate::attach::capture::NativeDomainId,
@@ -4081,6 +4103,7 @@ impl AttachedSemanticSet {
         retained: &BTreeMap<u32, RetainedStaticTarget>,
         owned_sides: &BTreeSet<StaticEndpoint>,
         watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+        switched: &BTreeSet<u32>,
     ) -> std::result::Result<(), crate::inventory_semantics::SemanticRefusal> {
         use crate::inventory_semantics::SemanticRefusal;
         if domain != self.domain || policy != CapturePolicy::Allowlisted {
@@ -4108,7 +4131,19 @@ impl AttachedSemanticSet {
                     .get(*index as usize)
                     .ok_or(SemanticRefusal::Attachment)?;
                 let actual = retained.get(index).ok_or(SemanticRefusal::Attachment)?;
-                if actual.slot != *slot
+                // In-place downgrade (A′): a retained slot narrowed to
+                // count-only on its live link keeps validating while
+                // its SLOT_COUNT_ONLY cell is set — same attach key,
+                // object, path and ABI, descriptor 0 with COUNT_ONLY
+                // semantics (controller ruling 2026-11-16 07:43,
+                // REPLACE-INPLACE I1). Anything else still refuses.
+                let mut narrowed = slot.clone();
+                narrowed.descriptor_index = 0;
+                narrowed.semantics = SlotSemantics::COUNT_ONLY;
+                let downgraded = switched.contains(index)
+                    && crate::plan::AttachKey::of(&actual.slot) == crate::plan::AttachKey::of(slot)
+                    && actual.slot == narrowed;
+                if (!downgraded && actual.slot != *slot)
                     || !owned_sides.contains(&(*index, ProbeSide::Entry))
                     || !owned_sides.contains(&(*index, ProbeSide::Return))
                     || Some(actual.abi) != pins.abi_for(slot.object)
@@ -4150,6 +4185,9 @@ impl AttachedSemanticSet {
         if frozen.domain != self.domain {
             return Err(SemanticRefusal::Attachment);
         }
+        // Freeze time (slice B/C): no production path builds this
+        // yet; when one revalidates a live session it must thread the
+        // session's switched set instead of this empty seal-time set.
         self.validate_with(
             readback.domain,
             readback.policy,
@@ -4157,6 +4195,7 @@ impl AttachedSemanticSet {
             readback.retained,
             readback.owned_sides,
             watched,
+            &BTreeSet::new(),
         )?;
         let plan = self.subset.plan();
         let pins = self.subset.pins();
@@ -4203,6 +4242,9 @@ impl<S> FrozenObjectTable<S> {
         watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
     ) -> ObjectResult<(u32, ElfAbi)> {
         use crate::inventory_semantics::SemanticRefusal;
+        // Freeze time (slice B/C): no production path builds this
+        // yet; when one revalidates a live session it must thread the
+        // session's switched set instead of this empty seal-time set.
         self.attached.validate_with(
             readback.domain,
             readback.policy,
@@ -4210,6 +4252,7 @@ impl<S> FrozenObjectTable<S> {
             readback.retained,
             readback.owned_sides,
             watched,
+            &BTreeSet::new(),
         )?;
         match self.slots.get(&slot) {
             Some((ObjectSlotEligibility::Eligible { descriptor_index }, abi)) => {
@@ -7576,10 +7619,35 @@ impl Session {
         current_static_sides_from(&self.links)
     }
 
+    /// Required slots whose `SLOT_COUNT_ONLY` cell reads set: the
+    /// attested revalidation admits a retained slot narrowed to
+    /// count-only exactly on these. A missing/unreadable map reads as
+    /// none set — no downgrade could have committed without it — and
+    /// an unreadable cell keeps its strict equality check.
+    fn count_only_switched(&self, attached: &AttachedSemanticSet) -> BTreeSet<u32> {
+        let mut switched = BTreeSet::new();
+        let gate: Option<Array<_, u32>> = self
+            .ebpf
+            .map("SLOT_COUNT_ONLY")
+            .and_then(|map| Array::try_from(map).ok());
+        let Some(gate) = gate else {
+            return switched;
+        };
+        for required in attached.subset.required().values() {
+            for index in required {
+                if gate.get(index, 0).is_ok_and(|cell| cell != 0) {
+                    switched.insert(*index);
+                }
+            }
+        }
+        switched
+    }
+
     pub(crate) fn validate_semantic_set(&self, attached: &AttachedSemanticSet) -> Result<()> {
         let domain = self
             .native_domain()
             .context("Detailed image domain unavailable")?;
+        let switched = self.count_only_switched(attached);
         attached
             .validate_with(
                 domain,
@@ -7592,6 +7660,7 @@ impl Session {
                         .watched(object)
                         .map(|watched| watched.retained_target())
                 },
+                &switched,
             )
             .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))
     }
@@ -12751,7 +12820,7 @@ mod tests {
             let Some(text) = body(source) else {
                 return false;
             };
-            text.contains("switched")
+            text.contains("switched.contains(")
                 && text.contains("SlotSemantics::COUNT_ONLY")
                 && text.contains("AttachKey::of")
         }
@@ -12760,9 +12829,16 @@ mod tests {
             contract(source),
             "validate_with must accept a switched count-only retained slot"
         );
+        // Full removal: the markers legitimately recur (both key
+        // sides, the parameter and its use); the contract must fail
+        // only when a marker is entirely absent.
         let start = source.find("    fn validate_with(").unwrap();
-        for marker in ["switched", "SlotSemantics::COUNT_ONLY", "AttachKey::of"] {
-            let tail = source[start..].replacen(marker, "REMOVED", 1);
+        for marker in [
+            "switched.contains(",
+            "SlotSemantics::COUNT_ONLY",
+            "AttachKey::of",
+        ] {
+            let tail = source[start..].replace(marker, "REMOVED");
             assert!(
                 !contract(&format!("{}{}", &source[..start], tail)),
                 "removed {marker}"

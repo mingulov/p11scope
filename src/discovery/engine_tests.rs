@@ -21956,6 +21956,22 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
         1,
         "the scan-proven file still stages"
     );
+    // A second prover maps the same tables at another address
+    // (ASLR): the union must dedup by file identity, not stack a
+    // copy per prover.
+    let mut relocated = proofs[0].module.clone();
+    for table in &mut relocated.tables {
+        table.address = 0x8000;
+    }
+    let second = vec![OwnedLearnProof {
+        view: ProcessViewId(11),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module: relocated,
+    }];
+    engine.learn_owned_proofs(&pins, &second);
     let candidate = engine
         .live_candidate_with_pending(
             engine.pinned.clone(),

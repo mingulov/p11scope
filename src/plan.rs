@@ -1572,6 +1572,12 @@ impl AttachPlan {
             .filter(|(key, _)| subset.slot_by_key.contains_key(key))
             .map(|(key, value)| (*key, value.clone()))
             .collect();
+        subset.slot_unnamed_reasons = self
+            .slot_unnamed_reasons
+            .iter()
+            .filter(|(key, _)| subset.slot_by_key.contains_key(key))
+            .map(|(key, value)| (*key, value.clone()))
+            .collect();
         subset.object_identities = self.object_identities.clone();
         subset.standard_layout_slots = subset
             .slots
@@ -2780,6 +2786,23 @@ impl AttachPlan {
         for (key, ordinals) in rebuilt.slot_ordinals {
             self.slot_ordinals.entry(key).or_default().extend(ordinals);
         }
+        // Unnamed reasons follow the final names, not the maps: a slot the
+        // surgery left unknown unions the superseded and rebuilt reasons
+        // (both proved the key unproven), while a slot the surgery named
+        // drops its reasons with `unknown`. Retired rows keep rendering,
+        // so the retain covers retired positions too, not just live keys.
+        let mut merged_reasons = std::mem::take(&mut self.slot_unnamed_reasons);
+        for (key, reasons) in rebuilt.slot_unnamed_reasons {
+            merged_reasons.entry(key).or_default().extend(reasons);
+        }
+        let unknown_keys: BTreeSet<AttachKey> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.names.as_slice() == [UNKNOWN_FUNCTION_NAME])
+            .map(AttachKey::of)
+            .collect();
+        merged_reasons.retain(|key, _| unknown_keys.contains(key));
+        self.slot_unnamed_reasons = merged_reasons;
         self.object_identities.extend(rebuilt.object_identities);
         self.modules = rebuilt.modules;
         // The spill count is current-state evidence like `entries_seen`,
@@ -7130,6 +7153,7 @@ pub(crate) struct ConservativePlanCursor {
     measure_ordinals_after: Option<AttachKey>,
     measure_identities_after: Option<PinnedObjectId>,
     measure_provisional_after: Option<AttachKey>,
+    measure_reasons_after: Option<AttachKey>,
     measure_refused: usize,
     measure_skipped: usize,
     // Owned derivation state (allocated after the reservation).
@@ -7181,10 +7205,12 @@ pub(crate) struct ConservativePlanCursor {
     copy_key: Option<AttachKey>,
     copy_object: Option<PinnedObjectId>,
     copy_provisional: Option<AttachKey>,
+    copy_reasons: Option<AttachKey>,
     copy_index: usize,
     output_ordinals: BTreeMap<AttachKey, BTreeSet<SlotOrdinal>>,
     output_identities: BTreeMap<PinnedObjectId, TargetObject>,
     output_provisional: BTreeMap<AttachKey, PinnedObjectId>,
+    output_reasons: BTreeMap<AttachKey, BTreeSet<UnprovenNames>>,
     output_refused: Vec<(PinnedObjectId, Skipped, RefusalKind)>,
     output_modules_skipped: Vec<Skipped>,
     retire_slot: usize,
@@ -7219,6 +7245,7 @@ impl ConservativePlanCursor {
             measure_ordinals_after: None,
             measure_identities_after: None,
             measure_provisional_after: None,
+            measure_reasons_after: None,
             measure_refused: 0,
             measure_skipped: 0,
             storage: None,
@@ -7269,10 +7296,12 @@ impl ConservativePlanCursor {
             copy_key: None,
             copy_object: None,
             copy_provisional: None,
+            copy_reasons: None,
             copy_index: 0,
             output_ordinals: BTreeMap::new(),
             output_identities: BTreeMap::new(),
             output_provisional: BTreeMap::new(),
+            output_reasons: BTreeMap::new(),
             output_refused: Vec::new(),
             output_modules_skipped: Vec::new(),
             retire_slot: 0,
@@ -7719,6 +7748,30 @@ impl ConservativePlanCursor {
                 plan_add(&mut self.measured, plan_text_bytes(&skip.subject)?)?;
                 plan_add(&mut self.measured, plan_text_bytes(&skip.reason)?)?;
                 self.measure_skipped += 1;
+                Ok(false)
+            }
+            9 => {
+                let next = match &self.measure_reasons_after {
+                    Some(after) => old
+                        .slot_unnamed_reasons
+                        .range((Excluded(after), Unbounded))
+                        .next(),
+                    None => old.slot_unnamed_reasons.first_key_value(),
+                };
+                let Some((key, reasons)) = next else {
+                    self.measure_stage = 10;
+                    self.measure_reasons_after = None;
+                    return Ok(false);
+                };
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<AttachKey, BTreeSet<UnprovenNames>>(1)?,
+                )?;
+                plan_add(
+                    &mut self.measured,
+                    plan_tree_bytes::<UnprovenNames, ()>(reasons.len())?,
+                )?;
+                self.measure_reasons_after = Some(*key);
                 Ok(false)
             }
             _ => {
@@ -8257,6 +8310,17 @@ impl ConservativePlanCursor {
                 self.copy_index += 1;
                 Ok(false)
             }
+            4 => {
+                let next = next_after(&old.slot_unnamed_reasons, &self.copy_reasons);
+                let Some((key, reasons)) = next else {
+                    self.copy_stage = 5;
+                    self.copy_reasons = None;
+                    return Ok(false);
+                };
+                self.copy_reasons = Some(key);
+                self.output_reasons.insert(key, reasons);
+                Ok(false)
+            }
             _ => {
                 let Some(skip) = old.modules_skipped.get(self.copy_index) else {
                     self.phase = ConservativePlanPhase::Retire;
@@ -8325,6 +8389,7 @@ impl ConservativePlanCursor {
         out.slot_by_key = std::mem::take(&mut self.output_slot_by_key);
         out.provisional_get_function_list = std::mem::take(&mut self.output_provisional);
         out.slot_ordinals = std::mem::take(&mut self.output_ordinals);
+        out.slot_unnamed_reasons = std::mem::take(&mut self.output_reasons);
         out.object_identities = std::mem::take(&mut self.output_identities);
         out.retired_slots = std::mem::take(&mut self.output_retired);
         // Mirror extend's retire loop exactly: newly retired positions
@@ -8509,7 +8574,10 @@ impl ConservativePlanCursor {
             }
             8 => {
                 let done = match self.output.as_mut().or(self.old.as_mut()) {
-                    Some(plan) => Self::drain_map(&mut plan.slot_ordinals),
+                    Some(plan) => {
+                        Self::drain_map(&mut plan.slot_ordinals)
+                            & Self::drain_map(&mut plan.slot_unnamed_reasons)
+                    }
                     None => true,
                 };
                 if done {
@@ -8604,7 +8672,9 @@ impl ConservativePlanCursor {
                 false
             }
             21 => {
-                if Self::drain_map(&mut self.output_ordinals) {
+                if Self::drain_map(&mut self.output_ordinals)
+                    & Self::drain_map(&mut self.output_reasons)
+                {
                     self.reclaim_step += 1;
                 }
                 false
@@ -12640,6 +12710,58 @@ pub(crate) mod tests {
         assert_eq!(plan.slots.len(), 1);
         assert_eq!(plan.slots[0].names, ["C_Login"]);
         assert!(plan.unnamed_reasons_of(&plan.slots[0]).is_empty());
+    }
+
+    #[test]
+    fn extend_carries_unnamed_reasons_and_drops_them_when_named() {
+        // Live rebuilds extend: reasons survive the carry, while a slot
+        // the surgery named drops them with `unknown`.
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let mut plan = build_from_test_sources(std::slice::from_ref(&scanned), &[]);
+        let rebuilt = build_from_test_sources(std::slice::from_ref(&scanned), &[]);
+        plan.extend_exact(rebuilt).unwrap();
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, [UNKNOWN_FUNCTION_NAME]);
+        assert_eq!(
+            plan.unnamed_reasons_of(&plan.slots[0]),
+            [UnprovenNames::HeuristicTable.token()]
+        );
+
+        // Surgery twin: the old authorized name survives a rebuilt
+        // unknown, so no reason may linger beside it.
+        let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
+        let mut named = build_from_test_sources(&[], std::slice::from_ref(&manifest));
+        let rebuilt_unknown = build_from_test_sources(std::slice::from_ref(&scanned), &[]);
+        named.extend_exact(rebuilt_unknown).unwrap();
+        assert_eq!(named.slots.len(), 1);
+        assert_eq!(named.slots[0].names, ["C_Login"]);
+        assert!(
+            named.unnamed_reasons_of(&named.slots[0]).is_empty(),
+            "a slot the surgery named carries no reason"
+        );
+    }
+
+    #[test]
+    fn conservative_cursor_copies_unnamed_reasons() {
+        // White-box drive of the cursor's carried-map stages plus
+        // assembly: reasons travel like ordinals, whole.
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let old = build_from_test_sources(std::slice::from_ref(&scanned), &[]);
+        assert!(
+            !old.slot_unnamed_reasons.is_empty(),
+            "precondition: the old plan names a reason"
+        );
+        let mut cursor = ConservativePlanCursor::new();
+        for _ in 0..1_000 {
+            if cursor.phase == ConservativePlanPhase::Retire {
+                break;
+            }
+            cursor.copy_one_map_entry(&old).unwrap();
+        }
+        assert_eq!(cursor.phase, ConservativePlanPhase::Retire);
+        cursor.assemble(&old);
+        let out = cursor.output.take().expect("assembly produces a plan");
+        assert_eq!(out.slot_unnamed_reasons, old.slot_unnamed_reasons);
     }
 
     #[test]

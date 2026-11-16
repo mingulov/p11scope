@@ -25,7 +25,7 @@ use p11scope_ebpf_common::SlotSemantics;
 use p11scope_ebpf_common::object_journal::{JournalRecord, ValidatedJournalBegin};
 use p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -453,6 +453,8 @@ type ResourceContext<'a> = (
     &'a mut StagingLedger,
     &'a BTreeMap<JournalNativeKey, OpenEntry>,
     &'a SessionDrainProducers,
+    &'a BTreeSet<(u64, u64)>,
+    &'a BTreeSet<((u64, u64), JournalNativeKey)>,
 );
 
 /// One bounded original poll. Neither the wire buffer nor its audit establishes
@@ -941,7 +943,13 @@ impl RawJointQuantum {
             fault,
             producers,
             reserve,
-            Some((&mut adapter.ledger, &adapter.open, producers)),
+            Some((
+                &mut adapter.ledger,
+                &adapter.open,
+                producers,
+                &adapter.tainted_images,
+                &adapter.derived_absent,
+            )),
             0,
         )?;
         // Read no more records than the shared ledger can reserve for. At
@@ -957,7 +965,13 @@ impl RawJointQuantum {
                 descriptors,
                 initial_work.min(capacity),
                 fault,
-                Some((&mut adapter.ledger, &adapter.open, producers)),
+                Some((
+                    &mut adapter.ledger,
+                    &adapter.open,
+                    producers,
+                    &adapter.tainted_images,
+                    &adapter.derived_absent,
+                )),
                 |drain, rows, work, ordinary, journal| {
                     Self::read_bounded_slice(drain, rows, work, stop, ordinary, journal)
                 },
@@ -1061,7 +1075,13 @@ impl RawJointQuantum {
             descriptors,
             work.min(self.capacity - self.attempted).min(room),
             fault,
-            Some((&mut adapter.ledger, &adapter.open, producers)),
+            Some((
+                &mut adapter.ledger,
+                &adapter.open,
+                producers,
+                &adapter.tainted_images,
+                &adapter.derived_absent,
+            )),
             |drain, rows, work, ordinary, journal| {
                 Self::read_bounded_slice(drain, rows, work, stop, ordinary, journal)
             },
@@ -1962,7 +1982,13 @@ impl RawJointQuantum {
             work,
             fault,
             producers,
-            Some((&mut adapter.ledger, &adapter.open, producers)),
+            Some((
+                &mut adapter.ledger,
+                &adapter.open,
+                producers,
+                &adapter.tainted_images,
+                &adapter.derived_absent,
+            )),
         )
     }
 
@@ -2065,16 +2091,21 @@ impl RawJointQuantum {
         };
         let mut deliver_journal = |record| {
             let index = ordered.borrow().len();
-            let resource = resources.as_mut().and_then(|(ledger, open, producers)| {
-                Self::resource_for_record(
-                    &record,
-                    invocations,
-                    ledger,
-                    open,
-                    producers,
-                    resource_refused,
-                )
-            });
+            let resource =
+                resources
+                    .as_mut()
+                    .and_then(|(ledger, open, producers, tainted, absent)| {
+                        Self::resource_for_record(
+                            &record,
+                            invocations,
+                            ledger,
+                            open,
+                            producers,
+                            tainted,
+                            absent,
+                            resource_refused,
+                        )
+                    });
             if let JournalRecord::End(end) = &record {
                 // Dispatch already validated and observed this completed
                 // payload. Its H0 copy is not a second wire item or tap.
@@ -2127,12 +2158,15 @@ impl RawJointQuantum {
         poll
     }
 
+    #[allow(clippy::too_many_arguments)] // Collection borrows each retained owner separately.
     fn resource_for_record(
         record: &JournalRecord,
         invocations: &mut Vec<RawInvocation>,
         ledger: &mut StagingLedger,
         open: &BTreeMap<JournalNativeKey, OpenEntry>,
         producers: &SessionDrainProducers,
+        tainted: &BTreeSet<(u64, u64)>,
+        absent: &BTreeSet<((u64, u64), JournalNativeKey)>,
         refused: &mut bool,
     ) -> Option<JointResourceOrigin> {
         let key = match record {
@@ -2171,6 +2205,30 @@ impl RawJointQuantum {
             Some(at) => at,
             None => {
                 let Some(entry) = open.get(&key) else {
+                    // A terminal whose BEGIN the journal deliberately
+                    // released grants no resource but never refuses: a
+                    // tainted image's refused BEGIN or a disposed
+                    // unclaimable original. Ingest already disposes
+                    // the terminal as expected-absent; refusing here
+                    // would void the whole collection
+                    // (ResourceUnavailable) for image-local noise.
+                    // Under exit churn that voids every pass and no
+                    // birth ever seals.
+                    let image = match record {
+                        JournalRecord::End(end) => {
+                            let base = end.payload_base();
+                            (base.event.image.task_cookie, base.event.image.exec_id)
+                        }
+                        JournalRecord::Abandon(abandon) => {
+                            (abandon.image_cookie(), abandon.image_exec())
+                        }
+                        JournalRecord::Begin(_) => {
+                            unreachable!("begin records return above")
+                        }
+                    };
+                    if tainted.contains(&image) || absent.contains(&(image, key)) {
+                        return None;
+                    }
                     *refused = true;
                     return None;
                 };
@@ -2552,7 +2610,13 @@ impl RawJointQuantum {
             fault,
             producers,
             reserve,
-            Some((&mut adapter.ledger, &adapter.open, producers)),
+            Some((
+                &mut adapter.ledger,
+                &adapter.open,
+                producers,
+                &adapter.tainted_images,
+                &adapter.derived_absent,
+            )),
             limit.min(1_024),
         )
     }
@@ -2647,7 +2711,7 @@ impl RawJointQuantum {
             invocations,
             ledger_generation: resources
                 .as_ref()
-                .and_then(|(ledger, _, _)| ledger.generation()),
+                .and_then(|(ledger, _, _, _, _)| ledger.generation()),
             resource_refused: false,
             cuts: None,
             _charge: charge,

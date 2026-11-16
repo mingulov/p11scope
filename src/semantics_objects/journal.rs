@@ -1449,19 +1449,20 @@ pub(crate) struct JournalAdapter {
     /// sighting bound; past it the taint lands but never lifts (fail
     /// closed).
     shed_only_taints: BTreeSet<(u64, u64)>,
-    /// Terminals expected-absent because of taint (JK-19b): (image,
-    /// native key) pairs whose BEGIN was refused-due-to-taint or
-    /// dropped by a taint. Their terminal keeps the Contradiction
-    /// disposition and telemetry, but it is the taint working as
-    /// intended — a bursting shed-tainted image's own later ENDs —
-    /// not new evidence, so it never promotes the shed-taint to
-    /// permanent. Consumed on arrival: a second terminal for one key
-    /// is genuinely duplicative and promotes. Image-scoped, so one
+    /// Terminals expected-absent because the journal deliberately
+    /// released their BEGIN (JK-19b): (image, native key) pairs whose
+    /// BEGIN was refused-due-to-taint, dropped by a taint, or disposed
+    /// as an unclaimable original. Their terminal keeps the
+    /// Contradiction disposition and telemetry, but it is the release
+    /// working as intended — a bursting shed-tainted image's own later
+    /// ENDs — not new evidence, so it never promotes to a permanent
+    /// taint. Consumed on arrival: a second terminal for one key is
+    /// genuinely duplicative and promotes. Image-scoped, so one
     /// image's refused keys never excuse another image's unmatched
     /// terminal. Capped at the open-table bound (the same key
     /// population); past the cap new keys are not recorded and their
     /// terminals promote (fail closed).
-    taint_derived_absent: BTreeSet<((u64, u64), JournalNativeKey)>,
+    derived_absent: BTreeSet<((u64, u64), JournalNativeKey)>,
     /// Shed-taints lifted by timely binding (JK-19b): images whose
     /// pre-bind sheds stay first-observed / not attributed, eligible
     /// for the Exec-to-attach birth fallback. Capped like the taint
@@ -1595,7 +1596,7 @@ impl JournalAdapter {
             tainted_images: BTreeSet::new(),
             taint_overflow: false,
             shed_only_taints: BTreeSet::new(),
-            taint_derived_absent: BTreeSet::new(),
+            derived_absent: BTreeSet::new(),
             lifted_images: BTreeSet::new(),
             contradictions: JournalContradictionDiagnosis::default(),
             sightings: BTreeMap::new(),
@@ -2142,7 +2143,7 @@ impl JournalAdapter {
         if self.is_tainted(image) {
             // Its terminal will arrive unmatched: expected-absent
             // because of this refusal, never a promotion.
-            self.note_taint_derived_absence(image, key);
+            self.note_derived_absence(image, key);
             return JournalDisposition::Refused;
         }
         if self.open.contains_key(&key) {
@@ -2263,11 +2264,12 @@ impl JournalAdapter {
     fn ingest_end(&mut self, ordinal: u64, end: ValidatedJournalEnd) -> JournalDisposition {
         let key = (end.thread(), end.sequence());
         let Some(entry) = self.open.get(&key) else {
-            if self.take_taint_derived_absence(end_image(&end), key) {
-                // The taint itself refused or dropped this call's
-                // BEGIN, so its END is expected-absent: keep the
-                // disposition and telemetry, but do not promote a
-                // shed-taint to permanent for it.
+            if self.take_derived_absence(end_image(&end), key) {
+                // The journal deliberately released this call's BEGIN
+                // (a taint refusal/drop or an unclaimable-original
+                // disposal), so its END is expected-absent: keep the
+                // disposition and telemetry, but do not promote to a
+                // permanent taint for it.
                 self.contradictions.note(TaintCause::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
                 ));
@@ -2331,10 +2333,10 @@ impl JournalAdapter {
             // accompanying fault independently invalidates. Without a BEGIN
             // the key is unrepresentable, never silently absorbed.
             let image = (abandon.image_cookie(), abandon.image_exec());
-            if self.take_taint_derived_absence(image, key) {
-                // The taint itself refused or dropped this call's
-                // BEGIN: keep the disposition and telemetry, but do
-                // not promote a shed-taint to permanent for it.
+            if self.take_derived_absence(image, key) {
+                // The journal deliberately released this call's BEGIN:
+                // keep the disposition and telemetry, but do not
+                // promote to a permanent taint for it.
                 self.contradictions.note(TaintCause::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
                 ));
@@ -2625,7 +2627,7 @@ impl JournalAdapter {
             .map(|(key, _)| *key)
             .collect();
         for key in dropped_keys {
-            self.note_taint_derived_absence(image, key);
+            self.note_derived_absence(image, key);
         }
         self.remove_open_where(|_, entry| entry.image == image);
         let dropped: Vec<RefusedBegin> = self
@@ -2678,19 +2680,21 @@ impl JournalAdapter {
     }
 
     /// Record one (image, key) whose terminal is expected-absent
-    /// because of taint. Capped at the open-table bound; past the cap
-    /// the key is not recorded and its terminal promotes (fail closed).
-    fn note_taint_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) {
-        if self.taint_derived_absent.len() < self.limits.open_calls {
-            self.taint_derived_absent.insert((image, key));
+    /// because the journal deliberately released its BEGIN (a taint
+    /// refusal/drop or an unclaimable-original disposal). Capped at
+    /// the open-table bound; past the cap the key is not recorded and
+    /// its terminal promotes (fail closed).
+    fn note_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) {
+        if self.derived_absent.len() < self.limits.open_calls {
+            self.derived_absent.insert((image, key));
         }
     }
 
     /// Consume one expected-absent terminal: true when this image's key
-    /// was recorded taint-derived. A second terminal for one key finds
+    /// was recorded derived-absent. A second terminal for one key finds
     /// nothing and promotes (genuinely duplicative).
-    fn take_taint_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) -> bool {
-        self.taint_derived_absent.remove(&(image, key))
+    fn take_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey) -> bool {
+        self.derived_absent.remove(&(image, key))
     }
 
     /// Refuse an image S1 proved to be another caller's (its calls shed
@@ -5479,7 +5483,7 @@ impl JournalAdapter {
         }
         let missing_terminal = entry.end.is_none();
         if missing_terminal {
-            self.note_taint_derived_absence(entry.image, native);
+            self.note_derived_absence(entry.image, native);
         }
         let entry = self
             .open

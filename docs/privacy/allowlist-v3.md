@@ -78,20 +78,26 @@ which documents the implemented chroot/container gap publication below; owner ap
 and [learned provider file first loader](#learned-provider-file-first-loader-v070),
 which names the fanotify-learned file's first loading program below (owner direction 2026-11-11: program paths publish).**
 The [New-site key metadata (R2, 2026-11-13)](#new-site-key-metadata-r2-2026-11-13)
-(re-proposed with the per-field `source` refinement) and
+section below (re-proposed with the per-field `source` refinement) is
+APPROVED and IMPLEMENTED (owner/Opus privacy reviews
+`opus-rv-v080-keymeta-t0-privacy` + `t0-fix1`, 2026-11-14, plus the
+controller KEYMETA-T1 rulings 2026-11-16; Opus tier 3 is the final
+privacy review and no separate re-review is outstanding). The
 [Key metadata: inferred family and size class (v0.8.0 keymeta)](#key-metadata-inferred-family-and-size-class-v080-keymeta)
-sections below are PROPOSED and carry no capture authority until reviewed.
-The R2 section also amends in place, with the same PROPOSED status and
-outside OD11 until reviewed: the DeriveKey scalar-result set (four to
-seven), the `CKA_TOKEN`, `CKA_VALUE_LEN` and `CKA_EC_PARAMS` rows, the
-finite vocabulary (key type 0x42, value sizes 12/48, the
-Montgomery/Edwards encodings, and removal of the rule that
-Edwards/Montgomery key types do not authorize curve decoding), the
-requested-values promotion rule and the establishment rule. The keymeta
-section adds the three operation-length rows. Until both reviews pass,
-the implemented boundary stays EC parameter lengths 7/10, value lengths
-16/24/32, key types without 0x42, the four-member derive set and no
-promotion.
+section stays PROPOSED and carries no capture authority until reviewed.
+The R2 section also amends in place, APPROVED under the same reviews
+(outside OD11's 2026-10-24 scope, which never covered these rows):
+the DeriveKey scalar-result set (four to seven), the `CKA_TOKEN`,
+`CKA_VALUE_LEN` and `CKA_EC_PARAMS` rows, the finite vocabulary (key
+type 0x42, value sizes 12/48, the Montgomery/Edwards encodings, and
+removal of the rule that Edwards/Montgomery key types do not authorize
+curve decoding), the requested-values promotion rule and the
+establishment rule. The keymeta section adds the three
+operation-length rows. Until the length review passes, no
+operation-length word is captured; the implemented R2 boundary is EC
+parameter lengths 5/7/10/11, value lengths 12/16/24/32/48, key types
+including 0x42, the seven-member derive set and promotion with
+per-field source and reason.
 Apart from the sections the status line lists, this document does not
 enable capture, describe implemented fields, or qualify a release. The
 implemented contracts remain
@@ -2267,22 +2273,30 @@ of silence, whatever traffic already-marked filesystems produce.
 
 § references are to `docs/superpowers/specs/2026-11-14-v080-keymeta-design.md`.
 
-**Status: PROPOSED (v0.8.0 keymeta Task 0 2026-11-14; R2 re-proposed
-with the per-field `source` refinement, keymeta §6/K5); owner/Opus
-privacy review and Codex re-review required before activation.**
+**Status: APPROVED and IMPLEMENTED (v0.8.0 keymeta Task 0
+2026-11-14, R2 re-proposed with the per-field `source` refinement,
+keymeta §6/K5; owner/Opus privacy reviews
+`opus-rv-v080-keymeta-t0-privacy` + `t0-fix1`, 2026-11-14, plus the
+controller KEYMETA-T1 rulings 2026-11-16; Opus tier 3 is the final
+privacy review and no separate re-review is outstanding).**
 This section scopes section version 6 of
 `inventory-v1-object-observations-v6.schema.json`
-(to be created in Task 1): the finite rows below plus the
+(landed in Task 1): the finite rows below plus the
 sixteen-label publication. It partially supersedes the "requested
 metadata never labels" clause: complete finite creation templates
-establish on success (see the promotion rule above); `CKA_TOKEN`,
+establish on success (see the promotion rule above), and a
+template beyond eight slots still promotes its observed finite
+cells while its unseen fields stay unknown with the truncation
+reason and nothing is inferred from the unobserved tail
+(controller KEYMETA-T1 rulings 2026-11-16, ruling 2); `CKA_TOKEN`,
 unknown/conflict shapes and incomplete triples still never label.
 It also partially supersedes the finite-vocabulary rule that
 Edwards and Montgomery key-type labels do not authorize curve
 decoding for those types, which the R2 rows remove: `ec_edwards`
 (0x40) with an established ed25519/ed448 curve, and
 `ec_montgomery` (0x41) with an established x25519/x448 curve, from
-the same key's template join into the corresponding curve label
+the same view's established facts (creation or query reads alike)
+join into the corresponding curve label
 (controller KEYMETA-T1 rulings 2026-11-16). Both facts are
 already-authorized reads; the label is a projection, no new
 capture. A mismatched curve (an Edwards type with a Montgomery or
@@ -2290,7 +2304,15 @@ secp curve, or vice versa) or an unestablished curve stays
 unlabeled with its named reason while the underlying facts keep
 their states. Promoted fields carry per-field
 `source: creation_success`;
-queried fields carry `source: query`. KEM T0, the terminal states
+queried fields carry `source: query`. Every v6 metadata field also
+carries a per-field `reason` (null or one of four closed strings):
+`template truncated (first 8 attributes captured)` on unknown
+fields never seen on a truncated template, `template value outside
+approved finite set` on kinds seen with an unclassifiable value,
+`curve unusable for key type` on a mismatched — or, on a complete
+template seen at creation, unestablished — Edwards/Montgomery
+curve, and `template partly read` on unknown fields never seen on
+a partly-read template. KEM T0, the terminal states
 and every other exclusion stay in force. Allowlist-v1 bytes are
 unchanged.
 

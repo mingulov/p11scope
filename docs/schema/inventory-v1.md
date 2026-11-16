@@ -1203,8 +1203,9 @@ never imply S1 loss.
   plus `source` at version 6 (`query`, `creation_success` or null:
   how the field was established — a provider attribute-result read
   or a successful creation return promoting its own finite
-  template; null unless `status` is `value`, and requested blocks
-  always carry null).
+  template; an established `value` always carries `query` or
+  `creation_success`, while requested blocks and every non-`value`
+  status carry null).
   A `value` carries the accepted numeric code or null: class 0-4,
   key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at version 6;
   73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–6; OASIS

@@ -379,6 +379,8 @@ def _metadata_block(block, keys=METADATA_KEYS,
         if "source" in fields:
             source = cell["source"]
             if source is None:
+                _require(not established or status != "value",
+                         "established value carries no source")
                 continue
             _require(type(source) is str and source in FIELD_SOURCES,
                      "unexpected metadata source")
@@ -427,6 +429,11 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
         _keys(queries, keys)
         for name in keys:
             _label(queries[name], QUERY_STATUSES, "query status")
+        if "source" in fields:
+            for name in keys:
+                _require(row["established"][name]["source"] != "query"
+                         or queries[name] != "not_queried",
+                         "query source without a query")
         if row["label"] is not None:
             _label(row["label"], labels, "object metadata")
         _require(_u64(row["successful_references"])

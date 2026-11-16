@@ -26,9 +26,11 @@ pub enum SafeAttributeKind {
 }
 
 /// Only complete, exact encodings of these curves may be classified.
-/// R2 new-site: X25519 additionally accepts the 11-byte draft-josefsson
-/// OID NSS passes for ephemeral TLS keypairs; the other three accept
-/// their RFC 8410 5-byte OIDs only.
+/// R2 new-site: the five accepted Montgomery/Edwards encodings are the
+/// 11-byte draft-josefsson OID NSS passes for ephemeral TLS keypairs
+/// (`06 09 2b 06 01 04 01 da 47 0f 01`, X25519) plus the four RFC 8410
+/// 5-byte OIDs (`06 03 2b 65 6e` X25519, `06 03 2b 65 6f` X448,
+/// `06 03 2b 65 70` Ed25519, `06 03 2b 65 71` Ed448).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafeCurve {
     Secp256r1,

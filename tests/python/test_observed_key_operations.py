@@ -1109,6 +1109,168 @@ class ObservedRsaTests(unittest.TestCase):
             with self.assertRaisesRegex(ORACLE.OracleRefusal,
                                         "unestablished curve carries no reason"):
                 ORACLE.check_section(mutated)
+        with self.subTest("token creation_success refused"):
+            mutated = copy.deepcopy(section)
+            mutated["objects"][1]["established"]["token"] = {
+                "status": "value", "value": 0,
+                "source": "creation_success", "reason": None}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "token carries creation success"):
+                ORACLE.check_section(mutated)
+        with self.subTest("creation_success on a first-observed row refused"):
+            mutated = copy.deepcopy(section)
+            row = mutated["objects"][1]
+            row["origin"] = "first_observed"
+            row["creation"] = None
+            row["established"]["key_type"] = {
+                "status": "value", "value": 0,
+                "source": "creation_success", "reason": None}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "creation source without a creation"):
+                ORACLE.check_section(mutated)
+        with self.subTest("spurious curve reason on a non-E/M type refused"):
+            mutated = copy.deepcopy(section)
+            row = mutated["objects"][1]
+            row["requested"]["key_type"] = {
+                "status": "value", "value": 3,
+                "source": None, "reason": None}
+            row["established"]["key_type"] = {
+                "status": "value", "value": 3,
+                "source": "query", "reason": None}
+            row["requested"]["ec_params"] = {
+                "status": "value", "value": "secp256r1",
+                "source": None, "reason": None}
+            row["established"]["ec_params"] = {
+                "status": "value", "value": "secp256r1",
+                "source": "query",
+                "reason": "curve unusable for key type"}
+            row["queries"]["key_type"] = "established"
+            row["queries"]["ec_params"] = "established"
+            row["label"] = None
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "unexpected curve reason"):
+                ORACLE.check_section(mutated)
+        with self.subTest("spurious curve reason on a matched E/M curve refused"):
+            mutated = copy.deepcopy(section)
+            row = mutated["objects"][1]
+            row["requested"]["class"] = {
+                "status": "value", "value": 4,
+                "source": None, "reason": None}
+            row["established"]["class"] = {
+                "status": "value", "value": 4,
+                "source": "query", "reason": None}
+            row["requested"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": None, "reason": None}
+            row["established"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": "query", "reason": None}
+            row["requested"]["ec_params"] = {
+                "status": "value", "value": "ed25519",
+                "source": None, "reason": None}
+            row["established"]["ec_params"] = {
+                "status": "value", "value": "ed25519",
+                "source": "query",
+                "reason": "curve unusable for key type"}
+            row["queries"]["class"] = "established"
+            row["queries"]["key_type"] = "established"
+            row["queries"]["ec_params"] = "established"
+            row["label"] = None
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "unexpected curve reason"):
+                ORACLE.check_section(mutated)
+        with self.subTest("curve reason on an established-unknown with "
+                          "an observed request refused"):
+            mutated = copy.deepcopy(section)
+            row = mutated["objects"][1]
+            row["requested"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": None, "reason": None}
+            row["established"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": "creation_success", "reason": None}
+            row["requested"]["ec_params"] = {
+                "status": "value", "value": "x25519",
+                "source": None, "reason": None}
+            row["established"]["ec_params"] = {
+                "status": "unknown", "value": None,
+                "source": None,
+                "reason": "curve unusable for key type"}
+            row["queries"]["key_type"] = "not_queried"
+            row["queries"]["ec_params"] = "not_queried"
+            row["label"] = None
+            with self.assertRaisesRegex(
+                    ORACLE.OracleRefusal,
+                    "established reason on an observed request"):
+                ORACLE.check_section(mutated)
+        with self.subTest("first-observed curve reason refused"):
+            mutated = copy.deepcopy(section)
+            row = mutated["objects"][1]
+            row["origin"] = "first_observed"
+            row["creation"] = None
+            row["requested"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": None, "reason": None}
+            row["established"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": "query", "reason": None}
+            for block in (row["requested"], row["established"]):
+                block["ec_params"] = {
+                    "status": "unknown", "value": None,
+                    "source": None,
+                    "reason": "curve unusable for key type"}
+            row["queries"]["key_type"] = "established"
+            row["queries"]["ec_params"] = "not_queried"
+            row["label"] = None
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "first-observed field carries a reason"):
+                ORACLE.check_section(mutated)
+        with self.subTest("first-observed rows without reasons check"):
+            accepted = copy.deepcopy(section)
+            accepted["objects"][1]["origin"] = "first_observed"
+            accepted["objects"][1]["creation"] = None
+            ORACLE.check_section(accepted)
+        with self.subTest("partly-read rows check"):
+            partly = copy.deepcopy(section)
+            for block in (partly["objects"][1]["requested"],
+                          partly["objects"][1]["established"]):
+                for name in ("value_len", "ec_params", "parameter_set"):
+                    block[name] = {
+                        "status": "unknown", "value": None,
+                        "source": None,
+                        "reason": "template partly read"}
+            ORACLE.check_section(partly)
+        with self.subTest("partial partly-read reasons refused"):
+            mutated = copy.deepcopy(section)
+            for block in (mutated["objects"][1]["requested"],
+                          mutated["objects"][1]["established"]):
+                block["value_len"] = {
+                    "status": "unknown", "value": None,
+                    "source": None,
+                    "reason": "template partly read"}
+                block["modulus_bits"] = {
+                    "status": "unknown", "value": None,
+                    "source": None, "reason": None}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "incomplete partly-read reasons"):
+                ORACLE.check_section(mutated)
+        with self.subTest("mixed truncation and partly-read reasons refused"):
+            mutated = copy.deepcopy(section)
+            for block in (mutated["objects"][1]["requested"],
+                          mutated["objects"][1]["established"]):
+                block["value_len"] = {
+                    "status": "unknown", "value": None,
+                    "source": None,
+                    "reason": ("template truncated "
+                               "(first 8 attributes captured)")}
+                for name in ("ec_params", "parameter_set"):
+                    block[name] = {
+                        "status": "unknown", "value": None,
+                        "source": None,
+                        "reason": "template partly read"}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "mixed template reasons"):
+                ORACLE.check_section(mutated)
         with self.subTest("HKDF key type below v6 refused"):
             mutated = copy.deepcopy(section)
             mutated["version"] = 5

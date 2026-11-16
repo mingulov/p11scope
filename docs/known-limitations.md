@@ -217,8 +217,19 @@ callers' binaries: on the same 5-vCPU VM, callers built as non-PIE
 executables kept the observer at 110 to 330 MB. v0.6.0 behaves the
 pre-fix way. Plan for about 400 MB of observer memory for a
 quarter-hour system-wide capture on a busy host; `--pid`, cgroup and
-`run` captures of a quiet scope stay far below that. A bound on RSS
-growth during long captures is planned for 0.8.0.
+`run` captures of a quiet scope stay far below that. Since 0.8.0 the
+inventory observer bounds RSS growth on long captures: exited callers
+fold into exact per-module aggregates instead of holding retained
+slots, so retained callers plateau instead of climbing toward the
+4096-caller refusal. Measured on a 3 h busy-host `--system` soak
+(round 5, 19.8-churn/s with 10,643 short-lived forks, host load ~8.5):
+Private_Dirty + SwapPss 33.6 → 42.5 MiB (+2.56 MiB/h incl. swap, swap
+itself 0 throughout; VmRSS +2.30 MiB/h), retained callers flat at 174
+with 454 retirements recycled and 0 refusals. The remaining slope is
+accounted saturating structures (unbound-image census +1.03 MiB/h
+toward its cap, ever-enumerated set +0.18 MiB/h), not caller or edge
+retention, which stay flat. A 5000-exited-callers-with-calls lifetime
+twin holds 0 refusals with a flat census past the budget.
 
 ### Short-lived processes never scanned
 
@@ -1707,12 +1718,16 @@ Shipped in 0.7.1 and no longer planned: bounded open-handle
 tables with a single acquire step (one table per lane; inventory
 pins each pass through a per-pass collector table).
 
+Shipped in 0.8.0 and no longer planned: bounded inventory-observer
+memory on long busy-host captures — exited callers fold into exact
+per-module aggregates (named identities, exact counts) instead of
+holding retained slots, so retained callers plateau (3 h soak:
+Private_Dirty + SwapPss +2.56 MiB/h incl. swap, callers flat at 174
+with 0 refusals) instead of climbing toward the 4096-caller refusal.
+
 - Ordering-evidence pre-arm exactness producer for non-`run` scopes,
   inventory Detailed-subset activation, and same-granularity rewrite proof
   (packet 6.13 follow-ups).
-- Bounded observer memory for long system-wide captures on busy hosts
-  (0.8.0), for example by keeping capture data on disk and
-  building the report from it separately.
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.

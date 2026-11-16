@@ -28768,17 +28768,23 @@ impl Engine {
         }
         let mut revivable = BTreeMap::new();
         if detailed && !pending {
-            for (key, position) in self.plan.retired_keys() {
-                let slot = *position as u32;
-                if !detached_now.contains(&slot) || !self.revival_observed_detached.contains(&slot)
-                {
-                    continue;
-                }
-                if !self.revival_finalized.contains(&slot) && session.revival_finalized(slot) {
-                    self.revival_finalized.insert(slot);
-                }
-                if self.revival_finalized.contains(&slot) {
-                    revivable.insert(*key, *position);
+            for (key, remembered) in self.plan.retired_keys() {
+                for semantic in [true, false] {
+                    let Some(position) = remembered.get(semantic) else {
+                        continue;
+                    };
+                    let slot = position as u32;
+                    if !detached_now.contains(&slot)
+                        || !self.revival_observed_detached.contains(&slot)
+                    {
+                        continue;
+                    }
+                    if !self.revival_finalized.contains(&slot) && session.revival_finalized(slot) {
+                        self.revival_finalized.insert(slot);
+                    }
+                    if self.revival_finalized.contains(&slot) {
+                        plan::remember_retired(&mut revivable, *key, position, semantic);
+                    }
                 }
             }
             // View-collapse fix8 F1: withheld cells the post-attach
@@ -28787,9 +28793,13 @@ impl Engine {
             // position with the same slot — the key reoccupies its own
             // retired index after clean detach, so the clearance is
             // sound without the two-tick proof. Anything else fails
-            // closed (and prunes below).
+            // closed (and prunes below). Withheld seeds are count-only.
             for (key, position) in &self.withheld_revivable {
-                if self.plan.retired_keys().get(key) == Some(position)
+                if self
+                    .plan
+                    .retired_keys()
+                    .get(key)
+                    .is_some_and(|remembered| remembered.contains(*position))
                     && self.plan.retired_slots().contains(position)
                     && self
                         .plan
@@ -28797,14 +28807,17 @@ impl Engine {
                         .get(*position)
                         .is_some_and(|slot| plan::AttachKey::of(slot) == *key)
                 {
-                    revivable.insert(*key, *position);
+                    plan::remember_retired(&mut revivable, *key, *position, false);
                 }
             }
         }
         // Seeds that no longer name a retired cell (revived, withdrawn,
         // or superseded) leave with it: bounded by the retired set.
         self.withheld_revivable.retain(|key, position| {
-            self.plan.retired_keys().get(key) == Some(position)
+            self.plan
+                .retired_keys()
+                .get(key)
+                .is_some_and(|remembered| remembered.contains(*position))
                 && self.plan.retired_slots().contains(position)
                 && self
                     .plan

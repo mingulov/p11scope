@@ -4590,7 +4590,7 @@ fn revival_refresh_clears_detached_finalized_slots_after_two_observations() {
     engine.refresh_revivable(&session);
     assert_eq!(
         engine.plan.revivable().get(&key0),
-        Some(&0),
+        Some(&plan::RetiredPositions::at(false, 0)),
         "detached twice plus finalized clears"
     );
     assert!(

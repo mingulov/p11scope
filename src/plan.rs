@@ -437,7 +437,6 @@ pub(crate) enum RefusalKind {
     /// count-only for capacity; ...`): the module attached on reoccupied
     /// count-only cells because no room for fresh semantic cells remained.
     /// Partial coverage, never a whole refusal.
-    #[cfg_attr(not(test), allow(dead_code))]
     CapacityLowering,
 }
 
@@ -661,6 +660,30 @@ fn growth_omission_reason(details: &GrowthOmission) -> String {
         }
     }
     reason
+}
+
+/// The counted reason an at-capacity reverse flip records: the module
+/// attached, but `lowered` of its semantic endpoints were lowered onto
+/// reoccupied count-only cells because no room for fresh semantic cells
+/// remained. Partial coverage, never a refusal.
+fn capacity_lowering_reason(
+    lowered: usize,
+    policy: AdmissionPolicy,
+    in_use: usize,
+    active: usize,
+    retired: usize,
+) -> String {
+    let endpoints = if lowered == 1 {
+        "endpoint"
+    } else {
+        "endpoints"
+    };
+    format!(
+        "{lowered} semantic {endpoints} {CAPACITY_LOWERING_HEAD}: no room for fresh semantic cells; \
+         {in_use} of {} {} are in use ({active} active, {retired} retired)",
+        policy.endpoint_limit(),
+        policy.capacity_subject(),
+    )
 }
 
 /// A module's admission class, in admission order.
@@ -1180,18 +1203,22 @@ pub struct AttachPlan {
     // an exact reappearance revives its retired position once the engine
     // clears it, else it gets a fresh monotonic slot.
     slot_by_key: BTreeMap<AttachKey, usize>,
-    // Exact target -> retired position, for absence-retired slots only.
-    // Remembers where a target was so a later reappearance can revive it
-    // once the engine proves its links are gone and its counts final
-    // (see `revivable`); never populated for descriptor-replaced slots.
-    retired_keys: BTreeMap<AttachKey, usize>,
+    // Exact target -> retired generations (at most one count-only and one
+    // semantic retired position), for absence-retired slots only. Remembers
+    // where a target was so a later reappearance can revive it once the
+    // engine proves its links are gone and its counts final (see
+    // `revivable`); never populated for descriptor-replaced slots. An
+    // active key may still hold its retired other-shape generation, so a
+    // flip-flop keeps both shapes within two generations per key.
+    retired_keys: BTreeMap<AttachKey, RetiredPositions>,
     // Absence-retired exact targets the engine cleared for revival this
     // rebuild: their links are physically detached, a drain barrier passed
     // since, and no call is in flight. Recomputed before every live rebuild;
     // merge budgets same-target revival, and same-file cross-ID reclaim
     // (positive file identity), free and extend reoccupies their positions
-    // when descriptor and names still match.
-    revivable: BTreeMap<AttachKey, usize>,
+    // when descriptor and names still match. Same two-generation shape as
+    // `retired_keys`: the cleared subset of it, per shape.
+    revivable: BTreeMap<AttachKey, RetiredPositions>,
     // Exact bootstrap targets which have not yet acquired table authority.
     provisional_get_function_list: BTreeMap<AttachKey, PinnedObjectId>,
     // Rebuild-only reclaim ticket: each new exact target computed by merge
@@ -1454,6 +1481,126 @@ pub(crate) enum CounterHistoryError {
     Topology,
 }
 
+/// The retired generations remembered for one exact target: at most one
+/// count-only and one semantic retired position. A flip-flopping key keeps
+/// both shapes, so an exact-shape return reoccupies its own generation
+/// instead of burning a fresh slot per alternation, and growth stays
+/// capped at two generations per key. An active key may hold memory for
+/// its retired other-shape generation; only a position that is still
+/// retired, keyed and shaped as remembered is ever revived (see
+/// [`RetiredMemory::facts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RetiredPositions {
+    semantic: Option<usize>,
+    count_only: Option<usize>,
+}
+
+impl RetiredPositions {
+    pub(crate) fn get(self, semantic: bool) -> Option<usize> {
+        if semantic {
+            self.semantic
+        } else {
+            self.count_only
+        }
+    }
+
+    /// Whether either remembered generation sits at `position`.
+    pub(crate) fn contains(self, position: usize) -> bool {
+        self.semantic == Some(position) || self.count_only == Some(position)
+    }
+
+    fn set(&mut self, semantic: bool, position: usize) {
+        if semantic {
+            self.semantic = Some(position);
+            if self.count_only == Some(position) {
+                self.count_only = None;
+            }
+        } else {
+            self.count_only = Some(position);
+            if self.semantic == Some(position) {
+                self.semantic = None;
+            }
+        }
+    }
+
+    /// Drops every remembered generation at `position`. Returns whether
+    /// nothing is remembered anymore.
+    fn clear_position(&mut self, position: usize) -> bool {
+        if self.semantic == Some(position) {
+            self.semantic = None;
+        }
+        if self.count_only == Some(position) {
+            self.count_only = None;
+        }
+        self.is_empty()
+    }
+
+    fn is_empty(self) -> bool {
+        self.semantic.is_none() && self.count_only.is_none()
+    }
+
+    /// Every remembered position, semantic first.
+    pub(crate) fn iter(self) -> impl Iterator<Item = usize> {
+        [self.semantic, self.count_only].into_iter().flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn at(semantic: bool, position: usize) -> Self {
+        let mut remembered = Self::default();
+        remembered.set(semantic, position);
+        remembered
+    }
+}
+
+/// Remembers `position` — whose retired slot reads `semantic` — for `key`,
+/// keeping the key's remembered other-shape generation.
+pub(crate) fn remember_retired(
+    memory: &mut BTreeMap<AttachKey, RetiredPositions>,
+    key: AttachKey,
+    position: usize,
+    semantic: bool,
+) {
+    memory.entry(key).or_default().set(semantic, position);
+}
+
+/// Forgets `key`'s remembered generations at `position` (a reclaimed index
+/// is active now); generations the key still holds elsewhere stay, and a
+/// key with nothing left leaves the memory.
+fn forget_memory_at(
+    memory: &mut BTreeMap<AttachKey, RetiredPositions>,
+    key: &AttachKey,
+    position: usize,
+) {
+    if let Some(remembered) = memory.get_mut(key)
+        && remembered.clear_position(position)
+    {
+        memory.remove(key);
+    }
+}
+
+/// Keeps the remembered generations `keep` maps to a new position (an
+/// excision's compaction or a withdrawal's floor); anything unmapped, and
+/// any key left with nothing, leaves the memory.
+fn retain_memory(
+    memory: &mut BTreeMap<AttachKey, RetiredPositions>,
+    keep: impl Fn(usize) -> Option<usize>,
+) {
+    *memory = memory
+        .iter()
+        .filter_map(|(key, remembered)| {
+            let mut mapped = RetiredPositions::default();
+            for (semantic, position) in
+                [(true, remembered.semantic), (false, remembered.count_only)]
+            {
+                if let Some(next) = position.and_then(&keep) {
+                    mapped.set(semantic, next);
+                }
+            }
+            (!mapped.is_empty()).then_some((*key, mapped))
+        })
+        .collect();
+}
+
 /// Facts about one retired slot index that decide whether a returning
 /// exact target may reoccupy it. Shared by merge accounting, extension
 /// capacity validation and extend allocation through [`reclaimable`].
@@ -1478,14 +1625,17 @@ struct ReclaimTarget<'a> {
 /// retired index only when it is the same exact target, or — for a new pin
 /// of the same file — the same file offset, path, names and descriptor,
 /// with a positive file identity match on both sides. A missing identity
-/// never reclaims: path names are not identity. A return onto a
-/// count-only retired cell reoccupies it as count-only (extend forces the
-/// shape, the way the kept path keeps a count-only cell's descriptor at
-/// zero), so flip-flopping generations reuse one index instead of burning
-/// a fresh slot per alternation. Aggregated ownership is
-/// applied separately (a reclaim that would make a semantic cell ambiguous
-/// downgrades it to count-only and reports the ambiguity) so merge can
-/// account the same set before module IDs are resolved.
+/// never reclaims: path names are not identity. A same-key count-only
+/// return onto a retired semantic cell (the forward flip) reoccupies it as
+/// count-only, the way the kept path keeps a count-only cell's descriptor
+/// at zero; it loses nothing, so it reoccupies directly. A semantic return
+/// onto a retired count-only cell (the reverse flip) is not matched here
+/// at all: it goes through [`reclaimable_reverse_flip`] and takes a fresh
+/// semantic index while the budget has room, so flip-flopping generations
+/// keep both shapes within two generations per key. Aggregated ownership
+/// is applied separately (a reclaim that would make a semantic cell
+/// ambiguous downgrades it to count-only and reports the ambiguity) so
+/// merge can account the same set before module IDs are resolved.
 fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
     if AttachKey::of(old.slot) != old.key {
         return false;
@@ -1501,22 +1651,11 @@ fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
         // way the kept path restores them over `unknown`, keeps the cell
         // count-only, and attaches a new link, so the retired cell's
         // descriptor is never applied. Anything wider or different, or any
-        // authorized/descriptor-bearing return onto a semantic cell, stays
-        // an exact-shape match only.
-        if new.descriptor_index == 0
+        // authorized/descriptor-bearing return, stays an exact-shape match
+        // only (a semantic return onto a count-only cell is the reverse
+        // flip, handled separately).
+        return new.descriptor_index == 0
             && !new.semantic_authorized
-            && !new.names.is_empty()
-            && new
-                .names
-                .iter()
-                .all(|name| name == UNKNOWN_FUNCTION_NAME || old.slot.names.contains(name))
-        {
-            return true;
-        }
-        // The reverse flip: a return onto its own retired count-only cell
-        // reoccupies that index — as count-only, never restoring a
-        // descriptor — instead of burning a fresh slot per alternation.
-        return old.slot.descriptor_index == 0
             && !new.names.is_empty()
             && new
                 .names
@@ -1538,10 +1677,46 @@ fn reclaimable(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
     {
         return false;
     }
-    // A new pin of the same file reoccupies a count-only retired cell as
-    // count-only; names stay exact across pins, and extend forces the
-    // count-only shape.
-    (old.slot.descriptor_index == new.descriptor_index || old.slot.descriptor_index == 0)
+    // A new pin of the same file reoccupies a retired cell of the same
+    // shape only; names stay exact across pins. The reverse flip (a
+    // semantic return onto a count-only cell) is matched separately.
+    old.slot.descriptor_index == new.descriptor_index && old.slot.names == new.names
+}
+
+/// The reverse flip: a semantic return onto its own (same key) or its
+/// file's (cross-ID new pin) retired count-only cell. Same name rules as
+/// [`reclaimable`] — a names subset same-key, exact names across pins —
+/// and the same positive file identity match across pins. Callers only
+/// reoccupy through this predicate when no fresh semantic index fits, and
+/// then report the lowering as a counted capacity lowering.
+fn reclaimable_reverse_flip(old: &RetiredSlotFacts<'_>, new: &ReclaimTarget<'_>) -> bool {
+    if AttachKey::of(old.slot) != old.key {
+        return false;
+    }
+    if old.slot.descriptor_index != 0 || new.descriptor_index == 0 {
+        return false;
+    }
+    if new.names.is_empty() {
+        return false;
+    }
+    if old.key == new.key {
+        return new
+            .names
+            .iter()
+            .all(|name| name == UNKNOWN_FUNCTION_NAME || old.slot.names.contains(name));
+    }
+    if old.key.file_offset != new.key.file_offset {
+        return false;
+    }
+    if old.slot.object_path != new.path {
+        return false;
+    }
+    let (Some(old_identity), Some(new_identity)) = (old.identity, new.identity) else {
+        return false;
+    };
+    old_identity == new_identity
+        && old_identity.sha256.is_some()
+        && new_identity.sha256.is_some()
         && old.slot.names == new.names
 }
 
@@ -1569,25 +1744,35 @@ fn migration_matches(
 /// Retired-slot memory borrowed from a plan (or from merge's
 /// [`ExistingAllocation`]) for reclaim decisions.
 struct RetiredMemory<'a> {
-    revivable: &'a BTreeMap<AttachKey, usize>,
-    retired_keys: &'a BTreeMap<AttachKey, usize>,
+    revivable: &'a BTreeMap<AttachKey, RetiredPositions>,
+    retired_keys: &'a BTreeMap<AttachKey, RetiredPositions>,
     retired_slots: &'a BTreeSet<usize>,
     slots: &'a [Slot],
     identities: &'a BTreeMap<PinnedObjectId, TargetObject>,
 }
 
 impl RetiredMemory<'_> {
-    /// The retired facts for `old_key`, or `None` unless the key is still
-    /// cleared revivable at its remembered, still-retired position.
-    fn facts(&self, old_key: &AttachKey) -> Option<RetiredSlotFacts<'_>> {
-        let position = *self.revivable.get(old_key)?;
-        if self.retired_keys.get(old_key) != Some(&position) {
+    /// The retired facts for `old_key`'s remembered `semantic` generation,
+    /// or `None` unless that generation is still cleared revivable at its
+    /// remembered, still-retired position with a matching key and shape.
+    /// Every inconsistency fails closed.
+    fn facts(&self, old_key: &AttachKey, semantic: bool) -> Option<RetiredSlotFacts<'_>> {
+        let position = self.revivable.get(old_key)?.get(semantic)?;
+        if self
+            .retired_keys
+            .get(old_key)
+            .and_then(|remembered| remembered.get(semantic))
+            != Some(position)
+        {
             return None;
         }
         if !self.retired_slots.contains(&position) {
             return None;
         }
         let slot = self.slots.get(position)?;
+        if AttachKey::of(slot) != *old_key || (slot.descriptor_index != 0) != semantic {
+            return None;
+        }
         Some(RetiredSlotFacts {
             position,
             key: *old_key,
@@ -1596,18 +1781,40 @@ impl RetiredMemory<'_> {
         })
     }
 
-    /// Retired keys by `(file offset, path)` for cross-ID candidate lookup
-    /// without scanning every revivable key once per new target.
-    fn cross_index(&self) -> BTreeMap<(u64, &str), Vec<AttachKey>> {
-        let mut index: BTreeMap<(u64, &str), Vec<AttachKey>> = BTreeMap::new();
+    /// The retired facts for the generation of `old_key` remembered at
+    /// `position`, with its shape, or `None` when neither generation names
+    /// that position. Re-checks a ticketed position against the memory.
+    fn facts_at(
+        &self,
+        old_key: &AttachKey,
+        position: usize,
+    ) -> Option<(RetiredSlotFacts<'_>, bool)> {
+        for semantic in [true, false] {
+            if let Some(facts) = self.facts(old_key, semantic)
+                && facts.position == position
+            {
+                return Some((facts, semantic));
+            }
+        }
+        None
+    }
+
+    /// Retired generations by `(file offset, path)` for cross-ID candidate
+    /// lookup without scanning every revivable key once per new target.
+    /// Each entry names its old key and shape; callers match exact-shape
+    /// candidates before flip candidates.
+    fn cross_index(&self) -> BTreeMap<(u64, &str), Vec<(AttachKey, bool)>> {
+        let mut index: BTreeMap<(u64, &str), Vec<(AttachKey, bool)>> = BTreeMap::new();
         for old_key in self.revivable.keys() {
-            let Some(facts) = self.facts(old_key) else {
-                continue;
-            };
-            index
-                .entry((old_key.file_offset, facts.slot.object_path.as_str()))
-                .or_default()
-                .push(*old_key);
+            for semantic in [true, false] {
+                let Some(facts) = self.facts(old_key, semantic) else {
+                    continue;
+                };
+                index
+                    .entry((old_key.file_offset, facts.slot.object_path.as_str()))
+                    .or_default()
+                    .push((*old_key, semantic));
+            }
         }
         index
     }
@@ -1704,8 +1911,14 @@ fn predicted_reclaim_shape<'a>(
 }
 
 /// Merge's reclaim accounting: each new key of `group` eligible for one
-/// retired position, first match wins per the shared predicate and the
-/// already-claimed set. One position per key and one key per position.
+/// retired position. Exact-shape matches win before flips, same-key before
+/// cross-ID: the key's own exact generation, a same-file generation of the
+/// same shape, the key's own other-shape generation, then a same-file
+/// other-shape generation (reverse flips only — a count-only return never
+/// takes another pin's semantic cell). One position per key and one key
+/// per position. Reverse-flip tickets ride free here; extend takes a fresh
+/// semantic index for them while the budget has room and reoccupies only
+/// at capacity, reporting the counted lowering.
 #[allow(clippy::too_many_arguments)]
 fn reclaim_tickets(
     group: &[Discovered<'_>],
@@ -1756,27 +1969,61 @@ fn reclaim_tickets(
             semantic_authorized,
             identity: new_identities.get(&key.object),
         };
-        let mut found = None;
-        if let Some(facts) = memory.facts(&key)
-            && !claimed_positions.contains(&facts.position)
-            && !claimed_here.contains(&facts.position)
-            && reclaimable(&facts, &target)
-        {
-            found = Some(facts.position);
-        }
+        let semantic = descriptor != 0;
+        let free = |position: usize| {
+            !claimed_positions.contains(&position) && !claimed_here.contains(&position)
+        };
+        // The key's own exact-shape generation first.
+        let mut found = memory
+            .facts(&key, semantic)
+            .filter(|facts| free(facts.position) && reclaimable(facts, &target))
+            .map(|facts| facts.position);
+        // Then a same-file exact-shape generation.
         if found.is_none()
             && let Some(candidates) = index.get(&(key.file_offset, path))
         {
-            for old_key in candidates {
-                let Some(facts) = memory.facts(old_key) else {
-                    continue;
-                };
-                if claimed_positions.contains(&facts.position)
-                    || claimed_here.contains(&facts.position)
-                {
+            for (old_key, old_semantic) in candidates {
+                if *old_semantic != semantic {
                     continue;
                 }
-                if reclaimable(&facts, &target) {
+                let Some(facts) = memory.facts(old_key, *old_semantic) else {
+                    continue;
+                };
+                if free(facts.position) && reclaimable(&facts, &target) {
+                    found = Some(facts.position);
+                    break;
+                }
+            }
+        }
+        // Then the key's own other-shape generation: a count-only return
+        // forward-flips onto its retired semantic cells (lossless, direct);
+        // a semantic return reverse-flips (extend prefers a fresh index).
+        if found.is_none()
+            && let Some(facts) = memory.facts(&key, !semantic)
+            && free(facts.position)
+        {
+            let flip = if semantic {
+                reclaimable_reverse_flip(&facts, &target)
+            } else {
+                reclaimable(&facts, &target)
+            };
+            if flip {
+                found = Some(facts.position);
+            }
+        }
+        // Finally a same-file other-shape generation, reverse flips only.
+        if found.is_none()
+            && semantic
+            && let Some(candidates) = index.get(&(key.file_offset, path))
+        {
+            for (old_key, old_semantic) in candidates {
+                if *old_semantic {
+                    continue;
+                }
+                let Some(facts) = memory.facts(old_key, *old_semantic) else {
+                    continue;
+                };
+                if free(facts.position) && reclaimable_reverse_flip(&facts, &target) {
                     found = Some(facts.position);
                     break;
                 }
@@ -2544,14 +2791,21 @@ impl AttachPlan {
                 semantic_authorized: false,
                 identity: self.object_identities.get(&provisional.object),
             };
-            let same = memory
-                .facts(&key)
-                .filter(|facts| reclaimable(facts, &target))
-                .map(|facts| (facts.position, key));
+            // Seeds are count-only: their own count-only generation
+            // first, then a forward flip onto their retired semantic
+            // generation, then the same across same-file pins.
+            let same = [false, true].into_iter().find_map(|semantic| {
+                memory
+                    .facts(&key, semantic)
+                    .filter(|facts| reclaimable(facts, &target))
+                    .map(|facts| (facts.position, key))
+            });
             same.or_else(|| {
-                memory.revivable.keys().find_map(|old_key| {
-                    let facts = memory.facts(old_key)?;
-                    reclaimable(&facts, &target).then_some((facts.position, *old_key))
+                [false, true].into_iter().find_map(|semantic| {
+                    memory.revivable.keys().find_map(|old_key| {
+                        let facts = memory.facts(old_key, semantic)?;
+                        reclaimable(&facts, &target).then_some((facts.position, *old_key))
+                    })
                 })
             })
         } else {
@@ -2584,10 +2838,10 @@ impl AttachPlan {
             self.retired_slots.remove(&position);
             // Cross-ID seed reclaim consumes the old retired key at this
             // position, not just the returning key.
-            self.retired_keys.remove(&old_key);
-            self.revivable.remove(&old_key);
-            self.retired_keys.remove(&key);
-            self.revivable.remove(&key);
+            forget_memory_at(&mut self.retired_keys, &old_key, position);
+            forget_memory_at(&mut self.revivable, &old_key, position);
+            forget_memory_at(&mut self.retired_keys, &key, position);
+            forget_memory_at(&mut self.revivable, &key, position);
             self.provisional_get_function_list
                 .insert(key, provisional.object);
             self.module_ambiguous = self
@@ -2828,9 +3082,9 @@ impl AttachPlan {
         &self.retired_slots
     }
 
-    /// Absence-retired exact targets by retired position, for the
+    /// Absence-retired exact targets by retired generation, for the
     /// engine's revival refresh.
-    pub(crate) fn retired_keys(&self) -> &BTreeMap<AttachKey, usize> {
+    pub(crate) fn retired_keys(&self) -> &BTreeMap<AttachKey, RetiredPositions> {
         &self.retired_keys
     }
 
@@ -2838,14 +3092,14 @@ impl AttachPlan {
     /// Test-only: production writes clearance wholesale via
     /// [`Self::set_revivable`] and reads it through merge.
     #[cfg(test)]
-    pub(crate) fn revivable(&self) -> &BTreeMap<AttachKey, usize> {
+    pub(crate) fn revivable(&self) -> &BTreeMap<AttachKey, RetiredPositions> {
         &self.revivable
     }
 
     /// Replaces the revival clearance wholesale; the engine recomputes
     /// it after every candidate application. A no-op when unchanged, so
     /// the plan fence never trips on an identical clearance.
-    pub(crate) fn set_revivable(&mut self, revivable: BTreeMap<AttachKey, usize>) {
+    pub(crate) fn set_revivable(&mut self, revivable: BTreeMap<AttachKey, RetiredPositions>) {
         if self.revivable == revivable {
             return;
         }
@@ -2894,21 +3148,27 @@ impl AttachPlan {
 
     /// The exact retired-index assignment extend will apply. Every ticket is
     /// re-checked against the shared predicate with the rebuilt slot's
-    /// actual facts, at one position per key and one key per position, so
-    /// validation counts exactly what allocation reoccupies. Returns the
-    /// assignment and the number of rebuilt active targets that need a fresh
-    /// index, computed with the same capacity check extend uses.
+    /// actual facts and actual shape, at one position per key and one key
+    /// per position, so validation counts exactly what allocation
+    /// reoccupies. Returns the assignment and the number of rebuilt active
+    /// targets that need a fresh index, computed with the same capacity
+    /// check extend uses.
     ///
     /// Keys that migrate onto an active index are excluded (migration takes
-    /// precedence: it leaves no retired cell and no detach gap). A reclaim
-    /// that would newly make a semantic cell ambiguous prefers a fresh index
-    /// that keeps the descriptor while the final allocation still fits. The
-    /// mandatory additions are counted first: a later-merged fresh key (a
-    /// provider built after this one, a selection table's new key) has
-    /// already been charged by merge, so the preference may only take room
-    /// beyond `slots + mandatory`. Only when that fresh charge would be
-    /// refused does an ambiguous reclaim reoccupy the retired index as
-    /// count-only (still counted, reported ambiguous).
+    /// precedence: it leaves no retired cell and no detach gap). An
+    /// exact-shape reclaim reoccupies directly, as does a count-only return
+    /// onto a retired semantic cell (the forward flip loses nothing). A
+    /// semantic return onto a retired count-only cell (the reverse flip)
+    /// prefers a fresh index that keeps the descriptor while the final
+    /// allocation still fits, exactly like a reclaim that would newly make
+    /// a semantic cell ambiguous. The mandatory additions are counted
+    /// first: a later-merged fresh key (a provider built after this one, a
+    /// selection table's new key) has already been charged by merge, so the
+    /// preference may only take room beyond `slots + mandatory`. Only when
+    /// that fresh charge would be refused does a preferred reclaim
+    /// reoccupy the retired index as count-only (still counted, reported
+    /// ambiguous, or — for a reverse flip — as a counted capacity
+    /// lowering).
     fn reclaim_assignment(
         &self,
         rebuilt: &AttachPlan,
@@ -2947,30 +3207,51 @@ impl AttachPlan {
                 continue;
             };
             let old_key = AttachKey::of(old_slot);
-            let Some(facts) = memory.facts(&old_key) else {
+            let Some((facts, old_semantic)) = memory.facts_at(&old_key, position) else {
                 mandatory += 1;
                 continue;
             };
-            if facts.position != position
-                || !reclaimable(
-                    &facts,
-                    &reclaim_target_from_slot(slot, &rebuilt.object_identities),
-                )
-            {
-                mandatory += 1;
-                continue;
-            }
-            claimed_positions.insert(position);
-            if self.reuse_makes_new_ambiguity(position, rebuilt, slot) {
-                preferred.push((key, position));
-            } else {
+            let target = reclaim_target_from_slot(slot, &rebuilt.object_identities);
+            let new_semantic = slot.descriptor_index != 0;
+            if new_semantic == old_semantic {
+                if !reclaimable(&facts, &target) {
+                    mandatory += 1;
+                    continue;
+                }
+                claimed_positions.insert(position);
+                if self.reuse_makes_new_ambiguity(position, rebuilt, slot) {
+                    preferred.push((key, position));
+                } else {
+                    assigned.insert(key, position);
+                }
+            } else if !new_semantic {
+                // The forward flip: a count-only return onto a retired
+                // semantic cell reoccupies it directly (a count-only cell
+                // can never newly merge to ambiguous).
+                if !reclaimable(&facts, &target) {
+                    mandatory += 1;
+                    continue;
+                }
+                claimed_positions.insert(position);
                 assigned.insert(key, position);
+            } else {
+                // The reverse flip: a semantic return onto a retired
+                // count-only cell takes a fresh semantic index while the
+                // budget has room, and reoccupies as a counted capacity
+                // lowering only at capacity.
+                if !reclaimable_reverse_flip(&facts, &target) {
+                    mandatory += 1;
+                    continue;
+                }
+                claimed_positions.insert(position);
+                preferred.push((key, position));
             }
         }
         // Only room the mandatory additions leave may hold a preferred fresh
         // index: `slots + mandatory + preferred < capacity`. Everything else
-        // reoccupies its retired index as a counted count-only ambiguity, so
-        // no later-charged addition is ever left without its index.
+        // reoccupies its retired index as a counted count-only ambiguity or
+        // capacity lowering, so no later-charged addition is ever left
+        // without its index.
         let mut preferred_count = 0usize;
         for (key, position) in preferred {
             if self
@@ -3301,11 +3582,13 @@ impl AttachPlan {
         // Old retired keys by position, built once: consuming a reclaimed
         // position never scans the retirement memory per slot.
         let mut retired_by_position: BTreeMap<usize, Vec<AttachKey>> = BTreeMap::new();
-        for (old_key, position) in &self.retired_keys {
-            retired_by_position
-                .entry(*position)
-                .or_default()
-                .push(*old_key);
+        for (old_key, remembered) in &self.retired_keys {
+            for position in remembered.iter() {
+                retired_by_position
+                    .entry(position)
+                    .or_default()
+                    .push(*old_key);
+            }
         }
 
         let mut slots = self.slots.clone();
@@ -3325,6 +3608,9 @@ impl AttachPlan {
         // Exact targets whose verified basis carried across an unfinished
         // re-proof instead of replacing (see the carry branch below).
         let mut carried_keys = BTreeSet::new();
+        // Semantic endpoints lowered onto reoccupied count-only cells for
+        // capacity, by owning object, for the lowering records below.
+        let mut lowered: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
 
         for (key, position) in &self.slot_by_key {
             if rebuilt.slot_by_key.contains_key(key) {
@@ -3374,7 +3660,8 @@ impl AttachPlan {
                 continue;
             }
             retired_slots.insert(*position);
-            retired_keys.insert(*key, *position);
+            let retired_semantic = slots[*position].descriptor_index != 0;
+            remember_retired(&mut retired_keys, *key, *position, retired_semantic);
             slot_by_key.remove(key);
             delta.retire.push(slots[*position].clone());
         }
@@ -3511,10 +3798,19 @@ impl AttachPlan {
                 let mut updated = slot.clone();
                 updated.index = position as u32;
                 let old_slot = slots[position].clone();
+                // A semantic return reoccupying a count-only retired cell
+                // only ever reaches this branch at capacity (with room it
+                // takes a fresh index instead): count it for the capacity
+                // lowering record below.
+                if old_slot.descriptor_index == 0 && slot.descriptor_index != 0 {
+                    *lowered.entry(slot.object).or_default() += 1;
+                }
                 // A return onto a count-only retired cell reoccupies it as
                 // count-only, the way the kept path keeps a count-only
                 // cell's descriptor at zero: the retired cell never regains
-                // a descriptor through reclaim.
+                // a descriptor through reclaim. A semantic return only
+                // arrives here at capacity (see above); with room it takes
+                // a fresh semantic index instead.
                 if old_slot.descriptor_index == 0 {
                     updated.descriptor_index = 0;
                     updated.semantics = SlotSemantics::COUNT_ONLY;
@@ -3571,19 +3867,21 @@ impl AttachPlan {
                 slots[position] = updated.clone();
                 slot_by_key.insert(key, position);
                 retired_slots.remove(&position);
-                // Cross-ID reclaim consumes every old retired key at this
-                // position (same position, different pin ID), not just the
-                // new key.
+                // Reclaim consumes the remembered generations at this
+                // position — every old retired key naming it (cross-ID: the
+                // same position under a different pin ID) and the returning
+                // key itself. Generations any of them still holds elsewhere
+                // stay for a later exact-shape return.
                 for old_key in retired_by_position
                     .get(&position)
                     .map(Vec::as_slice)
                     .unwrap_or(&[])
                 {
-                    retired_keys.remove(old_key);
-                    revivable.remove(old_key);
+                    forget_memory_at(&mut retired_keys, old_key, position);
+                    forget_memory_at(&mut revivable, old_key, position);
                 }
-                retired_keys.remove(&key);
-                revivable.remove(&key);
+                forget_memory_at(&mut retired_keys, &key, position);
+                forget_memory_at(&mut revivable, &key, position);
                 delta.new.push(updated);
             } else {
                 let mut added = slot.clone();
@@ -3593,16 +3891,48 @@ impl AttachPlan {
                 } else {
                     AggregateOwner::from_module_ids(&added.module_ids)
                 };
-                // An active key leaves the revival memory: it is neither
-                // retired nor cleared anymore, wherever it was before.
-                retired_keys.remove(&key);
-                revivable.remove(&key);
+                // A fresh index over an unticketed key drops that key's
+                // revival memory: the return matched no retired generation.
+                // A ticketed key that takes a fresh index instead (a reverse
+                // flip with room) keeps its retired generation: the next
+                // same-shape return still reoccupies it, which is what caps
+                // flip-flopping keys at two generations.
+                if !rebuilt.reclaimed.contains_key(&key) {
+                    retired_keys.remove(&key);
+                    revivable.remove(&key);
+                }
                 slot_by_key.insert(key, slots.len());
                 delta.new.push(added.clone());
                 slots.push(added);
                 aggregate_owners.push(owner);
             }
         }
+
+        // One counted capacity-lowering record per lowered object: the
+        // module attached, but its semantic endpoints were lowered onto
+        // reoccupied count-only cells for capacity. Built before the
+        // rebuilt plan's fields move below.
+        let lowering_records: Vec<(PinnedObjectId, Skipped)> = lowered
+            .iter()
+            .map(|(object, count)| {
+                let subject = rebuilt
+                    .modules
+                    .iter()
+                    .find(|module| module.object == *object)
+                    .map(|module| module.path.clone())
+                    .unwrap_or_else(|| format!("object {object:?}"));
+                let in_use = slots.len();
+                let retired = retired_slots.len();
+                let reason = capacity_lowering_reason(
+                    *count,
+                    self.admission_policy,
+                    in_use,
+                    in_use.saturating_sub(retired),
+                    retired,
+                );
+                (*object, Skipped { subject, reason })
+            })
+            .collect();
 
         self.slots = slots;
         // Standard-layout basis follows the exact target across the
@@ -3676,6 +4006,14 @@ impl AttachPlan {
         self.skipped = rebuilt.skipped;
         self.modules_skipped = rebuilt.modules_skipped;
         self.refused_module_objects = rebuilt.refused_module_objects;
+        for (object, record) in lowering_records {
+            self.refused_module_objects.push((
+                object,
+                record.clone(),
+                RefusalKind::CapacityLowering,
+            ));
+            self.modules_skipped.push(record);
+        }
         self.entries_seen = rebuilt.entries_seen;
         self.surfaces = rebuilt.surfaces;
         self.vendor_interfaces = rebuilt.vendor_interfaces;
@@ -3817,7 +4155,8 @@ impl AttachPlan {
             return;
         }
         self.retired_slots.insert(position);
-        self.retired_keys.insert(key, position);
+        let retired_semantic = self.slots[position].descriptor_index != 0;
+        remember_retired(&mut self.retired_keys, key, position, retired_semantic);
         self.slot_by_key.remove(&key);
         self.module_ambiguous = self
             .aggregate_owners
@@ -3865,8 +4204,9 @@ impl AttachPlan {
         self.reproven_unfinished_slots
             .retain(|position| (*position as usize) < accepted);
         self.retired_slots.retain(|position| *position < accepted);
-        self.retired_keys.retain(|_, position| *position < accepted);
-        self.revivable.retain(|_, position| *position < accepted);
+        for memory in [&mut self.retired_keys, &mut self.revivable] {
+            retain_memory(memory, |position| (position < accepted).then_some(position));
+        }
         self.slot_by_key.retain(|_, position| *position < accepted);
         let slot_by_key = &self.slot_by_key;
         self.provisional_get_function_list
@@ -3967,13 +4307,10 @@ impl AttachPlan {
             })
             .collect();
         for memory in [&mut self.retired_keys, &mut self.revivable] {
-            *memory = memory
-                .iter()
-                .filter_map(|(key, position)| {
-                    let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
-                    (new != u32::MAX).then_some((*key, new as usize))
-                })
-                .collect();
+            retain_memory(memory, |position| {
+                let new = old_to_new.get(position).copied().unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new as usize)
+            });
         }
         for position in self.slot_by_key.values_mut() {
             let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
@@ -4370,13 +4707,10 @@ impl AttachPlan {
             })
             .collect();
         for memory in [&mut self.retired_keys, &mut self.revivable] {
-            *memory = memory
-                .iter()
-                .filter_map(|(key, position)| {
-                    let new = old_to_new.get(*position).copied().unwrap_or(u32::MAX);
-                    (new != u32::MAX).then_some((*key, new as usize))
-                })
-                .collect();
+            retain_memory(memory, |position| {
+                let new = old_to_new.get(position).copied().unwrap_or(u32::MAX);
+                (new != u32::MAX).then_some(new as usize)
+            });
         }
         let retired_slots = self.retired_slots.clone();
         self.slot_by_key = self
@@ -4486,23 +4820,31 @@ impl AttachPlan {
             }
         }
         // Structural checks only: `slots` is hand-mutated by legitimate
-        // flows, so position and key agreement are re-verified at use
-        // (see `reclaim_assignment`), never here.
-        for (key, position) in &self.retired_keys {
-            if self.slot_by_key.contains_key(key) {
-                return Err(format!(
-                    "retired key at slot {position} remains attach-indexed"
-                ));
+        // flows, so position, key and shape agreement are re-verified at
+        // use (see `reclaim_assignment`), never here. An attach-indexed
+        // (active) key may hold its retired other-shape generation.
+        for (_, remembered) in &self.retired_keys {
+            if remembered.is_empty() {
+                return Err("a retired key remembers no generation".into());
             }
-            if !self.retired_slots.contains(position) {
-                return Err(format!("retired key at slot {position} is not retired"));
+            for position in remembered.iter() {
+                if !self.retired_slots.contains(&position) {
+                    return Err(format!("retired key at slot {position} is not retired"));
+                }
             }
         }
-        for (key, position) in &self.revivable {
-            if self.retired_keys.get(key) != Some(position) {
-                return Err(format!(
-                    "revivable key at slot {position} has no retired memory"
-                ));
+        for (key, remembered) in &self.revivable {
+            let Some(known) = self.retired_keys.get(key) else {
+                return Err("a revivable key has no retired memory".into());
+            };
+            for semantic in [true, false] {
+                if let Some(position) = remembered.get(semantic)
+                    && known.get(semantic) != Some(position)
+                {
+                    return Err(format!(
+                        "revivable key at slot {position} has no retired memory"
+                    ));
+                }
             }
         }
         for (key, object) in &self.provisional_get_function_list {
@@ -4672,23 +5014,29 @@ impl AttachPlan {
             .retired_keys
             .iter()
             .filter(|(key, _)| key.object == module.object)
-            .filter_map(|(key, position)| retired(key, position))
+            .flat_map(|(key, remembered)| remembered.iter().map(move |position| (key, position)))
+            .filter_map(|(key, position)| retired(key, &position))
             .find_map(donated);
         if same_object.is_some() {
             return same_object;
         }
         // Same verified file identity, independent of the pin ID: the
-        // positive identity match that also gates cross-ID reclaim.
+        // positive identity match that also gates cross-ID reclaim. Every
+        // same-file retired generation is a donor candidate: a multi-id
+        // generation cannot donate, but a later sole-owned one still can,
+        // so the scan skips undonatable slots instead of stopping at the
+        // first same-file slot.
         let new_identity = new_identities.get(&module.object)?;
         new_identity.sha256.as_ref()?;
         self.retired_keys
             .iter()
-            .filter_map(|(key, position)| retired(key, position))
-            .find(|slot| {
+            .flat_map(|(key, remembered)| remembered.iter().map(move |position| (key, position)))
+            .filter_map(|(key, position)| retired(key, &position))
+            .filter(|slot| {
                 slot.object_path == module.path
                     && self.object_identities.get(&slot.object) == Some(new_identity)
             })
-            .and_then(donated)
+            .find_map(donated)
     }
 }
 
@@ -5170,6 +5518,7 @@ fn merge(
     let retired_churn = allocated
         .retired_keys
         .iter()
+        .flat_map(|(key, remembered)| remembered.iter().map(move |position| (key, position)))
         .filter(|(key, position)| {
             allocated.retired_slots.contains(position) && !discovered_keys.contains(key)
         })
@@ -7192,9 +7541,9 @@ struct ExistingAllocation<'a> {
     /// same-file reclaim (slot reclaim) also reads this: a new pin for the
     /// same file reuses a revivable retired index with the same file
     /// offset and path, so short-lived churn stops burning fresh slots.
-    revivable: &'a BTreeMap<AttachKey, usize>,
-    /// Exact target -> retired position, for the same reclaim memory.
-    retired_keys: &'a BTreeMap<AttachKey, usize>,
+    revivable: &'a BTreeMap<AttachKey, RetiredPositions>,
+    /// Exact target -> retired generations, for the same reclaim memory.
+    retired_keys: &'a BTreeMap<AttachKey, RetiredPositions>,
     /// Retired positions, for the same reclaim memory.
     retired_slots: &'a BTreeSet<usize>,
     /// Allocated slots by index, for cross-ID reclaim path comparison
@@ -9928,7 +10277,13 @@ impl ConservativePlanCursor {
             if !old.retired_slots.contains(position)
                 && let Some(slot) = out.slots.get(*position)
             {
-                out.retired_keys.insert(AttachKey::of(slot), *position);
+                let retired_semantic = slot.descriptor_index != 0;
+                remember_retired(
+                    &mut out.retired_keys,
+                    AttachKey::of(slot),
+                    *position,
+                    retired_semantic,
+                );
             }
         }
         out.revivable = old.revivable.clone();
@@ -15557,11 +15912,11 @@ pub(crate) mod tests {
         plan.deactivate(1);
         // A clearance for a position with no retired memory fails
         // closed at validation (the retired key sits at 1, not 99).
-        plan.set_revivable(BTreeMap::from([(key, 99)]));
+        plan.set_revivable(BTreeMap::from([(key, RetiredPositions::at(false, 99))]));
         assert!(plan.validate_slot_index().is_err());
         // The cleared, matching cell revives in place: same index, no
         // growth, key re-indexed, retirement cleared, still valid.
-        plan.set_revivable(BTreeMap::from([(key, 1)]));
+        plan.set_revivable(BTreeMap::from([(key, RetiredPositions::at(false, 1))]));
         let revived = plan
             .add_provisional_get_function_list(seed(0x10))
             .unwrap()
@@ -15586,7 +15941,10 @@ pub(crate) mod tests {
         let other_key = AttachKey::of(&other);
         plan.deactivate(other.index);
         plan.slots[other.index as usize].names = vec!["C_Sign".into()];
-        plan.set_revivable(BTreeMap::from([(other_key, other.index as usize)]));
+        plan.set_revivable(BTreeMap::from([(
+            other_key,
+            RetiredPositions::at(false, other.index as usize),
+        )]));
         let fresh = plan
             .add_provisional_get_function_list(seed(0x20))
             .unwrap()
@@ -23955,7 +24313,14 @@ pub(crate) mod tests {
         plan.deactivate(1);
         assert_eq!(plan.retired_keys.len(), 1);
         let key = AttachKey::of(&plan.slots[1]);
-        assert_eq!(plan.retired_keys.get(&key), Some(&1));
+        assert_eq!(
+            plan.retired_keys.get(&key),
+            Some(&RetiredPositions::at(
+                plan.slots[1].descriptor_index != 0,
+                1
+            )),
+            "the retired generation is remembered under its own shape"
+        );
         assert!(!plan.slot_by_key.contains_key(&key));
     }
 
@@ -23971,8 +24336,10 @@ pub(crate) mod tests {
         let key_of = |plan: &AttachPlan, position: usize| AttachKey::of(&plan.slots[position]);
         let key1 = key_of(&plan, 1);
         let key3 = key_of(&plan, 3);
-        plan.revivable.insert(key1, 1);
-        plan.revivable.insert(key3, 3);
+        let sem1 = plan.slots[1].descriptor_index != 0;
+        let sem3 = plan.slots[3].descriptor_index != 0;
+        plan.revivable.insert(key1, RetiredPositions::at(sem1, 1));
+        plan.revivable.insert(key3, RetiredPositions::at(sem3, 3));
         // A wholly inactive tail is withdrawn with its memories.
         plan.withdraw_unlinked_additions(3);
         assert_eq!(plan.slots.len(), 3);
@@ -23984,21 +24351,34 @@ pub(crate) mod tests {
             !plan.revivable.contains_key(&key3),
             "withdrawn cells leave revivable"
         );
-        assert_eq!(plan.retired_keys.get(&key1), Some(&1), "survivors stay");
+        assert_eq!(
+            plan.retired_keys.get(&key1),
+            Some(&RetiredPositions::at(sem1, 1)),
+            "survivors stay"
+        );
         assert_eq!(
             plan.revivable.get(&key1),
-            Some(&1),
+            Some(&RetiredPositions::at(sem1, 1)),
             "survivors stay revivable"
         );
         // Excising an inactive tail cell remaps the survivors after it.
         plan.deactivate(2);
         let key2 = key_of(&plan, 2);
-        plan.revivable.insert(key2, 2);
+        let sem2 = plan.slots[2].descriptor_index != 0;
+        plan.revivable.insert(key2, RetiredPositions::at(sem2, 2));
         let map = plan.excise_unlinked_tail_cells(1, &BTreeSet::from([1]));
         assert_eq!(map[1], u32::MAX, "the excised cell is gone");
         assert_eq!(plan.slots.len(), 2);
-        assert_eq!(plan.retired_keys.get(&key2), Some(&1), "remapped down");
-        assert_eq!(plan.revivable.get(&key2), Some(&1), "remapped down");
+        assert_eq!(
+            plan.retired_keys.get(&key2),
+            Some(&RetiredPositions::at(sem2, 1)),
+            "remapped down"
+        );
+        assert_eq!(
+            plan.revivable.get(&key2),
+            Some(&RetiredPositions::at(sem2, 1)),
+            "remapped down"
+        );
         assert!(
             !plan.retired_keys.contains_key(&key1),
             "excised leaves memory"

@@ -11807,11 +11807,13 @@ fn joint_machine_restricted_unclaimable_originals_keep_named_end() {
     }
 }
 
-/// Keyrows follow-up (tier-3 R1): an unclaimable original whose own
-/// observed return is a handle or session error is never disposed. Those
-/// classes can leave the binding behind at a reused handle or in a closed
-/// session, so the original stays, the next seal ends with the named
-/// `ClaimUnmatched` gap and the following use gets no per-key row.
+/// Keyrows follow-up (tier-3 R1/I-1): an unclaimable original whose
+/// own observed return is a handle or session error, a pending return
+/// or a general/device (ambiguous) error is never disposed. Those
+/// classes can leave the binding behind at a reused handle or in a
+/// closed session, or could still change state, so the original stays,
+/// the next seal ends with the named `ClaimUnmatched` gap and the
+/// following use gets no per-key row.
 fn assert_unclaimable_original_error_return_keeps_fail_closed(name: &str, rv: u64) {
     use crate::inventory_semantics::JointServiceProgress;
     use crate::semantics_key_use::SealFailureDisposition;
@@ -11878,7 +11880,7 @@ fn assert_unclaimable_original_error_return_keeps_fail_closed(name: &str, rv: u6
         );
         assert!(
             !adapter.dispose_unclaimable_original(&victim),
-            "{name} (rv {rv:#x}): a handle or session error return never disposes its unclaimable original"
+            "{name} (rv {rv:#x}): a refused error class never disposes its unclaimable original"
         );
         assert!(
             adapter
@@ -12000,6 +12002,245 @@ fn joint_machine_misaligned_session_error_keeps_named_end() {
     assert_unclaimable_original_error_return_keeps_fail_closed(
         "C_SignInit",
         CkRv::SESSION_HANDLE_INVALID.0,
+    );
+}
+
+/// Keyrows follow-up (tier-3 I-1): a misaligned `C_SignInit` original
+/// with a general error keeps the named fail-closed path. The ambiguous
+/// class could still have changed state, so the original is not
+/// disposed.
+#[test]
+fn joint_machine_misaligned_sign_init_general_error_keeps_named_end() {
+    use pkcs11_types::CkRv;
+    assert_unclaimable_original_error_return_keeps_fail_closed("C_SignInit", CkRv::GENERAL_ERROR.0);
+}
+
+/// Keyrows follow-up (tier-3 I-1): a misaligned `C_SignInit` original
+/// with a device-removed error keeps the named fail-closed path.
+#[test]
+fn joint_machine_misaligned_sign_init_device_removed_keeps_named_end() {
+    use pkcs11_types::CkRv;
+    assert_unclaimable_original_error_return_keeps_fail_closed(
+        "C_SignInit",
+        CkRv::DEVICE_REMOVED.0,
+    );
+}
+
+/// Keyrows follow-up (tier-3 I-1): a misaligned `C_SignInit` original
+/// with a pending return keeps the named fail-closed path. The call may
+/// still complete, so the original is not disposed.
+#[test]
+fn joint_machine_misaligned_sign_init_pending_keeps_named_end() {
+    use pkcs11_types::CkRv;
+    assert_unclaimable_original_error_return_keeps_fail_closed("C_SignInit", CkRv::PENDING.0);
+}
+
+/// Keyrows follow-up (tier-3 m-1): an unclaimable original whose own
+/// observed return is an ordinary failure or a partial attribute result
+/// is disposed with its call. The call still reduces as plain S1 with
+/// its counted gap, but no `ClaimUnmatched` end is recorded, per-key
+/// tracking continues and the following use gets its per-key row.
+fn assert_unclaimable_original_allowed_return_disposes_and_keeps_tracking(name: &str, rv: u64) {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    let functions: &[&str] = if name == "C_SignInit" {
+        &["C_CreateObject", "C_SignInit"]
+    } else {
+        &["C_CreateObject", name, "C_SignInit"]
+    };
+    let mut fixture = MachineScene::with_initial_files_and_functions(1, &[0], functions, false);
+    fixture.prime(1);
+    let api_before = fixture.api_returns_total();
+    let direct_before = fixture.direct_fallback_total();
+    let reduced_before = fixture.reduced_for(0);
+    let caller = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .expect("the prime retained one feed")
+        .caller;
+    fixture
+        .scene
+        .push_object_with_rv(std::process::id(), 0, name, 2, rv);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    fixture.reach_phase("Claiming");
+    let victim = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .find(|input| input.s1_facts().function == name)
+        .expect("the second call is prepared")
+        .clone();
+    assert_eq!(
+        victim.s1_facts().rv,
+        rv,
+        "{name}: the admission carries the posed return"
+    );
+    let invocation = victim
+        .joint_resource_origin()
+        .expect("the collected call names its H8 original")
+        .invocation();
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        assert!(
+            adapter
+                .retained_starts_for_test()
+                .iter()
+                .any(|(thread, sequence, _)| (*thread, *sequence) == invocation),
+            "{name} (rv {rv:#x}): precondition: the misaligned call's original is still retained"
+        );
+        assert!(
+            adapter.dispose_unclaimable_original(&victim),
+            "{name} (rv {rv:#x}): an allowed return disposes its unclaimable original"
+        );
+        assert!(
+            !adapter
+                .retained_starts_for_test()
+                .iter()
+                .any(|(thread, sequence, _)| (*thread, *sequence) == invocation),
+            "{name} (rv {rv:#x}): the disposed original is the misaligned call's own"
+        );
+    }
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .misalign_next_prepared_ordinal_for_test();
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!(
+                "{name} (rv {rv:#x}): the seal stopped the lane at {reason:?}; the disposed original must not become unmatched",
+            ),
+        }
+    }
+    assert!(
+        published,
+        "{name} (rv {rv:#x}): the quantum after the degradation publishes"
+    );
+    assert_eq!(
+        fixture.api_returns_total(),
+        api_before + 3,
+        "{name} (rv {rv:#x}): the misaligned call and its following uses stay counted"
+    );
+    assert_eq!(
+        fixture.direct_fallback_total(),
+        direct_before + 1,
+        "{name} (rv {rv:#x}): the unclaimable call reduces S1-direct without Joint evidence"
+    );
+    assert_ne!(
+        fixture
+            .machine
+            .diagnostic_audit_for_test()
+            .map(|audit| audit.0),
+        Some(Some(
+            crate::semantics_objects::journal::JournalGap::ClaimUnmatched
+        )),
+        "{name} (rv {rv:#x}): no ClaimUnmatched end is recorded"
+    );
+    let image = fixture.scene.real.h0.0.borrow().io.targets[&std::process::id()].1;
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test((image.task_cookie, image.exec_id)),
+        "{name} (rv {rv:#x}): per-key tracking continues for the image"
+    );
+    {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let staged = registry.staged_gaps_for_test();
+        let retained: Vec<_> = registry
+            .gaps()
+            .iter()
+            .chain(staged.iter())
+            .filter(|gap| gap.reason == "joint_unclaimable_claim_history_loss")
+            .collect();
+        assert_eq!(
+            retained.len(),
+            1,
+            "{name} (rv {rv:#x}): one counted gap names the call"
+        );
+        assert_eq!(
+            retained[0].caller,
+            Some(caller),
+            "{name} (rv {rv:#x}): the gap names the tracked caller"
+        );
+    }
+    {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let feed = &registry
+            .instance_semantic_edges()
+            .next()
+            .expect("the prime retained one feed")
+            .feed;
+        assert_eq!(
+            feed.mode(),
+            FeedMode::Joint,
+            "{name} (rv {rv:#x}): the tracked feed keeps Joint after the degradation"
+        );
+        assert!(
+            !feed.fell_back() && !feed.degraded_loss(),
+            "{name} (rv {rv:#x}): no segment ends at the misaligned call"
+        );
+    }
+    assert_eq!(
+        fixture.reduced_for(0),
+        reduced_before + 1,
+        "{name} (rv {rv:#x}): the following use gets its per-key row"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        None,
+        "{name} (rv {rv:#x}): the lane never latches"
+    );
+}
+
+/// Keyrows follow-up (tier-3 m-1): a misaligned `C_SignInit` original
+/// with an ordinary failure is disposed with its call and the following
+/// use keeps per-key tracking.
+#[test]
+fn joint_machine_misaligned_sign_init_ordinary_failure_keeps_tracking() {
+    use pkcs11_types::CkRv;
+    assert_unclaimable_original_allowed_return_disposes_and_keeps_tracking(
+        "C_SignInit",
+        CkRv::KEY_FUNCTION_NOT_PERMITTED.0,
+    );
+}
+
+/// Keyrows follow-up (tier-3 m-1): a misaligned `C_GetAttributeValue`
+/// original with a partial attribute result is disposed with its call
+/// and the following use keeps per-key tracking.
+#[test]
+fn joint_machine_misaligned_get_attributes_partial_keeps_tracking() {
+    use pkcs11_types::CkRv;
+    assert_unclaimable_original_allowed_return_disposes_and_keeps_tracking(
+        "C_GetAttributeValue",
+        CkRv::ATTRIBUTE_SENSITIVE.0,
     );
 }
 

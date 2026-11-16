@@ -3119,11 +3119,106 @@ const SLOT_COUNT_ONLY_SET: u32 = 1;
 /// count-only through their live links, and slots that refused with
 /// their reason and must take today's detach+replace path instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use]
 pub struct InPlaceDowngradeOutcome {
     /// Slots whose switch flipped 0->1 with no detach and no new link.
     pub downgraded: Vec<u32>,
     /// (slot, reason) for every slot that keeps today's path.
-    pub refused: Vec<(u32, String)>,
+    pub refused: Vec<(u32, InPlaceDowngradeRefusal)>,
+}
+
+/// Why one slot refused an in-place downgrade and keeps today's
+/// detach+replace path with its named physical gap. Packet 2 matches
+/// on the variant — write vs read-back failure especially — never on
+/// message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InPlaceDowngradeRefusal {
+    /// The slot names no retained static target.
+    NoRetainedTarget,
+    /// The replacement descriptor by number.
+    NewDescriptorNotCountOnly(u32),
+    /// The replacement descriptor is 0 but its semantics are not
+    /// count-only, so userspace metadata would disagree with BPF.
+    NewSemanticsNotCountOnly,
+    /// The retained descriptor is already count-only.
+    OldDescriptorAlreadyCountOnly,
+    /// The replacement names a different attach key than the live link.
+    AttachKeyChanged,
+    /// The slot has no live link.
+    NoLiveLink,
+    /// Unsafe-decoder builds take today's path.
+    UnsafeDecoderBuild,
+    /// The slot has no live entry link.
+    NoLiveEntryLink,
+    /// The live entry link names another program.
+    LiveEntryProgramMismatch {
+        /// The program the slot's links must carry.
+        expected: &'static str,
+    },
+    /// The narrowed slot resolves another entry program.
+    ResolvedEntryProgramMismatch {
+        /// The program the narrowed slot resolves.
+        resolved: &'static str,
+        /// The program the slot's links carry.
+        expected: &'static str,
+    },
+    /// The session embeds no `SLOT_COUNT_ONLY` map.
+    NoSwitchMap,
+    /// The switch map has an unexpected shape.
+    SwitchMapShape(String),
+    /// The switch cell cannot be read before the write.
+    SwitchRead(String),
+    /// The switch cell is already set: narrowing-only, no rewrite.
+    SwitchAlreadySet,
+    /// The narrowing write failed.
+    SwitchWrite(String),
+    /// The switch cell cannot be read back after the write.
+    SwitchReadBack(String),
+    /// The switch cell read back a value other than set.
+    SwitchReadBackMismatch(u32),
+}
+
+impl std::fmt::Display for InPlaceDowngradeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        match self {
+            Self::NoRetainedTarget => write!(f, "has no retained static target"),
+            Self::NewDescriptorNotCountOnly(descriptor) => {
+                write!(f, "new descriptor {descriptor} is not count-only")
+            }
+            Self::NewSemanticsNotCountOnly => write!(f, "new semantics are not count-only"),
+            Self::OldDescriptorAlreadyCountOnly => {
+                write!(f, "old descriptor is already count-only")
+            }
+            Self::AttachKeyChanged => write!(f, "attach key changed under the live link"),
+            Self::NoLiveLink => write!(f, "has no live link"),
+            Self::UnsafeDecoderBuild => write!(f, "unsafe-decoder build takes today's path"),
+            Self::NoLiveEntryLink => write!(f, "has no live entry link"),
+            Self::LiveEntryProgramMismatch { expected } => {
+                write!(f, "live entry program is not {expected}")
+            }
+            Self::ResolvedEntryProgramMismatch { resolved, expected } => {
+                write!(f, "count-only entry program is {resolved}, not {expected}")
+            }
+            Self::NoSwitchMap => write!(f, "session has no SLOT_COUNT_ONLY map"),
+            Self::SwitchMapShape(error) => {
+                write!(f, "switch map has an unexpected shape: {error}")
+            }
+            Self::SwitchRead(error) => {
+                write!(f, "cannot read its count-only switch: {error}")
+            }
+            Self::SwitchAlreadySet => write!(f, "count-only switch already set"),
+            Self::SwitchWrite(error) => {
+                write!(f, "cannot write its count-only switch: {error}")
+            }
+            Self::SwitchReadBack(error) => {
+                write!(f, "cannot read back its count-only switch: {error}")
+            }
+            Self::SwitchReadBackMismatch(read) => {
+                write!(f, "count-only switch read back {read}, not set")
+            }
+        }
+    }
 }
 
 /// What one [`Session::detach_slots`] call rebuilt, if anything: per-member
@@ -9820,54 +9915,55 @@ impl Session {
         let mut eligible: Vec<Slot> = Vec::new();
         for slot in slots {
             let Some(retained) = self.retained_static.get(&slot.index) else {
-                outcome.refused.push((
-                    slot.index,
-                    format!("slot {} has no retained static target", slot.index),
-                ));
+                outcome
+                    .refused
+                    .push((slot.index, InPlaceDowngradeRefusal::NoRetainedTarget));
                 continue;
             };
             if slot.descriptor_index != 0 {
                 outcome.refused.push((
                     slot.index,
-                    format!(
-                        "slot {} new descriptor {} is not count-only",
-                        slot.index, slot.descriptor_index
-                    ),
+                    InPlaceDowngradeRefusal::NewDescriptorNotCountOnly(slot.descriptor_index),
+                ));
+                continue;
+            }
+            // Descriptor 0 alone does not make a count-only slot: the
+            // new slot's semantics must be COUNT_ONLY too, so
+            // userspace metadata and the narrowed BPF slot agree.
+            if slot.semantics != SlotSemantics::COUNT_ONLY {
+                outcome.refused.push((
+                    slot.index,
+                    InPlaceDowngradeRefusal::NewSemanticsNotCountOnly,
                 ));
                 continue;
             }
             if retained.slot.descriptor_index == 0 {
                 outcome.refused.push((
                     slot.index,
-                    format!("slot {} old descriptor is already count-only", slot.index),
+                    InPlaceDowngradeRefusal::OldDescriptorAlreadyCountOnly,
                 ));
                 continue;
             }
             if crate::plan::AttachKey::of(slot) != crate::plan::AttachKey::of(&retained.slot) {
-                outcome.refused.push((
-                    slot.index,
-                    format!("slot {} attach key changed under the live link", slot.index),
-                ));
+                outcome
+                    .refused
+                    .push((slot.index, InPlaceDowngradeRefusal::AttachKeyChanged));
                 continue;
             }
             if !self.has_slot_link(slot.index) {
                 outcome
                     .refused
-                    .push((slot.index, format!("slot {} has no live link", slot.index)));
+                    .push((slot.index, InPlaceDowngradeRefusal::NoLiveLink));
                 continue;
             }
             // Entry program unchanged: the live entry link is the plain
             // endpoint (or its journal twin) and the count-only slot
-            // resolves to the same program. Unsafe-decoder builds
-            // (template/ia32 roots) take today's path.
+            // resolves to the same program. Template/ia32 roots refuse:
+            // an unsafe-decoder build takes today's path.
             if self.embedded_flavor.unsafe_present {
-                outcome.refused.push((
-                    slot.index,
-                    format!(
-                        "slot {} unsafe-decoder build takes today's path",
-                        slot.index
-                    ),
-                ));
+                outcome
+                    .refused
+                    .push((slot.index, InPlaceDowngradeRefusal::UnsafeDecoderBuild));
                 continue;
             }
             let expected_entry = if self.journal {
@@ -9887,19 +9983,17 @@ impl Session {
                 }
             }
             if entry_programs.is_empty() {
-                outcome.refused.push((
-                    slot.index,
-                    format!("slot {} has no live entry link", slot.index),
-                ));
+                outcome
+                    .refused
+                    .push((slot.index, InPlaceDowngradeRefusal::NoLiveEntryLink));
                 continue;
             }
             if entry_programs.len() != 1 || !entry_programs.contains(expected_entry) {
                 outcome.refused.push((
                     slot.index,
-                    format!(
-                        "slot {} live entry program is not {expected_entry}",
-                        slot.index
-                    ),
+                    InPlaceDowngradeRefusal::LiveEntryProgramMismatch {
+                        expected: expected_entry,
+                    },
                 ));
                 continue;
             }
@@ -9913,10 +10007,10 @@ impl Session {
             if resolved != expected_entry {
                 outcome.refused.push((
                     slot.index,
-                    format!(
-                        "slot {} count-only entry program is {resolved}, not {expected_entry}",
-                        slot.index
-                    ),
+                    InPlaceDowngradeRefusal::ResolvedEntryProgramMismatch {
+                        resolved,
+                        expected: expected_entry,
+                    },
                 ));
                 continue;
             }
@@ -9932,10 +10026,7 @@ impl Session {
                     for slot in &eligible {
                         outcome.refused.push((
                             slot.index,
-                            format!(
-                                "slot {} switch map has an unexpected shape: {error:#}",
-                                slot.index
-                            ),
+                            InPlaceDowngradeRefusal::SwitchMapShape(format!("{error:#}")),
                         ));
                     }
                     return outcome;
@@ -9943,10 +10034,9 @@ impl Session {
             },
             None => {
                 for slot in &eligible {
-                    outcome.refused.push((
-                        slot.index,
-                        format!("slot {} session has no SLOT_COUNT_ONLY map", slot.index),
-                    ));
+                    outcome
+                        .refused
+                        .push((slot.index, InPlaceDowngradeRefusal::NoSwitchMap));
                 }
                 return outcome;
             }
@@ -9957,43 +10047,35 @@ impl Session {
                 Err(error) => {
                     outcome.refused.push((
                         slot.index,
-                        format!(
-                            "slot {} cannot read its count-only switch: {error:#}",
-                            slot.index
-                        ),
+                        InPlaceDowngradeRefusal::SwitchRead(format!("{error:#}")),
                     ));
                     continue;
                 }
             };
-            // Narrowing-only: only 0->1 while the link is live. A set
-            // cell refuses back to today's path instead of writing again.
+            // Narrowing-only: only 0->1 while the link is live. An
+            // already set cell refuses back to today's path instead of
+            // writing again.
             if current != 0 {
-                outcome.refused.push((
-                    slot.index,
-                    format!("slot {} count-only switch already set", slot.index),
-                ));
+                outcome
+                    .refused
+                    .push((slot.index, InPlaceDowngradeRefusal::SwitchAlreadySet));
                 continue;
             }
             if let Err(error) = switch.set(slot.index, SLOT_COUNT_ONLY_SET, 0) {
                 outcome.refused.push((
                     slot.index,
-                    format!(
-                        "slot {} cannot write its count-only switch: {error:#}",
-                        slot.index
-                    ),
+                    InPlaceDowngradeRefusal::SwitchWrite(format!("{error:#}")),
                 ));
                 continue;
             }
-            // Read back the cell: only an exact set state commits the downgrade.
+            // The cell is written as 1 and read back: only an exact set
+            // state commits the downgrade.
             let read: u32 = match switch.get(&slot.index, 0) {
                 Ok(read) => read,
                 Err(error) => {
                     outcome.refused.push((
                         slot.index,
-                        format!(
-                            "slot {} cannot read back its count-only switch: {error:#}",
-                            slot.index
-                        ),
+                        InPlaceDowngradeRefusal::SwitchReadBack(format!("{error:#}")),
                     ));
                     continue;
                 }
@@ -10001,10 +10083,7 @@ impl Session {
             if read != SLOT_COUNT_ONLY_SET {
                 outcome.refused.push((
                     slot.index,
-                    format!(
-                        "slot {} count-only switch read back {read}, not set",
-                        slot.index
-                    ),
+                    InPlaceDowngradeRefusal::SwitchReadBackMismatch(read),
                 ));
                 continue;
             }
@@ -24493,6 +24572,24 @@ mod tests {
             session.physical_gap_summary().episodes == 0,
             "a fresh session opens with no physical gap"
         );
+        // Descriptor 0 with semantic semantics is not a count-only
+        // slot: the downgrade refuses it by name before any write, so
+        // userspace metadata and the BPF slot cannot disagree.
+        {
+            let mut semantic_zero = original.clone();
+            semantic_zero.descriptor_index = 0;
+            let refused = session.downgrade_in_place(std::slice::from_ref(&semantic_zero));
+            anyhow::ensure!(
+                refused.downgraded.is_empty()
+                    && refused.refused
+                        == vec![(0, super::InPlaceDowngradeRefusal::NewSemanticsNotCountOnly)],
+                "semantic descriptor 0 refuses by name: {refused:?}"
+            );
+            anyhow::ensure!(
+                downgrade_tight_loop_switch(&session, 0)? == 0,
+                "the refused downgrade wrote nothing"
+            );
+        }
         for round in 0..ROUNDS {
             rig.send_go(CALLS_PER_ROUND)?;
             rig.await_held()?;

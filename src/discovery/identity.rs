@@ -9913,11 +9913,22 @@ pub fn bind_scanned_modules(
                 .abi_for(object)
                 .is_none_or(|inspected| inspected != decoded)
         }) {
-            lost.push(Skipped {
-                subject: module.path.clone(),
-                reason: "module decoder ABI disagrees with its retained pinned identity; its tables were not attached"
-                    .into(),
-            });
+            // Same dedicated row as total identity loss above: a
+            // run-persistent learned module whose tables cannot bind
+            // names the learned input, never a path-carrying row
+            // that collapses to the generic discovery row.
+            if module.view == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID {
+                lost.push(Skipped {
+                    subject: crate::render::LEARNED_SKIP_SUBJECT.into(),
+                    reason: crate::render::LEARNED_TABLE_UNBOUND_REASON.into(),
+                });
+            } else {
+                lost.push(Skipped {
+                    subject: module.path.clone(),
+                    reason: "module decoder ABI disagrees with its retained pinned identity; its tables were not attached"
+                        .into(),
+                });
+            }
             continue;
         }
         let mut scanned = module.clone();

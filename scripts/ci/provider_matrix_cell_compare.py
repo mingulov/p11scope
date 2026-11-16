@@ -228,6 +228,8 @@ def target_capture(observed, module_path):
     modules (p11-kit's configured backends) are counted separately and
     never enter target coverage. Rows with names ["unknown"] are
     attached but unnamed: their calls are counted apart from recall.
+    Empty names ([]) are attached-but-unnamed too (recall-neutral);
+    mixed-name rows fan out under each name.
     """
     sha256, dev, ino = file_identity(module_path)
     capture = {}

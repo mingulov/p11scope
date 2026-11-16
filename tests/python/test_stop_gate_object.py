@@ -566,8 +566,9 @@ class StopGate(unittest.TestCase):
         return definition, f'{register} = {old_value}', f'{register} = {new_value}'
 
     def test_slot_count_only_is_a_policy_read_in_every_endpoint(self):
-        """In-place downgrade (A'): every static entry program and the
-        return program read the per-slot SLOT_COUNT_ONLY switch, and the
+        """In-place downgrade (A'): every static entry program reads the
+        per-slot SLOT_COUNT_ONLY switch inline, and the return program
+        reads it through its outlined ordinary/object branches; the
         switch is a policy read like DESCRIPTORS, not a capture-map
         access: the gate roles and the admission proof are unchanged."""
         self.assertNotIn("SLOT_COUNT_ONLY", C.CAPTURE_MAPS,

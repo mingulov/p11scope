@@ -12665,7 +12665,10 @@ mod tests {
     /// Attach-time narrowing guard: a slot whose count-only switch is
     /// set refuses a semantic attach at that index; count-only
     /// (descriptor 0) stays admitted, so a planner that never
-    /// re-raises count-only slots keeps working.
+    /// re-raises count-only slots keeps working. An absent map and a
+    /// present but wrong-shaped map both stay open (the BPF read
+    /// fails open too, so skipping keeps userspace coherent with
+    /// what the probes run); Packet 2 owns that gate.
     #[test]
     fn attach_refuses_a_set_switch_unless_the_slot_is_count_only() {
         fn body(source: &str) -> Option<&str> {
@@ -12678,7 +12681,10 @@ mod tests {
             let Some(text) = body(source) else {
                 return false;
             };
-            text.contains("\"SLOT_COUNT_ONLY\"") && text.contains("count-only switch is set")
+            text.contains("\"SLOT_COUNT_ONLY\"")
+                && text.contains("count-only switch is set")
+                && text.contains("absent switch map stays open")
+                && text.contains("wrong-shaped switch map stays open")
         }
         let source = include_str!("attach.rs");
         assert!(
@@ -12686,7 +12692,12 @@ mod tests {
             "attach_targets must refuse a set switch for a semantic slot"
         );
         let start = source.find("    pub(crate) fn attach_targets(").unwrap();
-        for marker in ["\"SLOT_COUNT_ONLY\"", "count-only switch is set"] {
+        for marker in [
+            "\"SLOT_COUNT_ONLY\"",
+            "count-only switch is set",
+            "absent switch map stays open",
+            "wrong-shaped switch map stays open",
+        ] {
             let tail = source[start..].replacen(marker, "REMOVED", 1);
             assert!(
                 !contract(&format!("{}{}", &source[..start], tail)),
@@ -24660,6 +24671,103 @@ mod tests {
             "fifty downgrades open no physical gap"
         );
         eprintln!("downgrade tight loop: {ROUNDS} downgrades, exact counts, links unchanged");
+        rig.finish()?;
+        Ok(())
+    }
+
+    /// In-place downgrade (A′) attach guard, behavioral: with the
+    /// switch unset a detached slot reattaches semantically; once a
+    /// downgrade sets the switch, a semantic attach at that index
+    /// refuses through `attach_targets` (failed + named
+    /// attach-failure, no link), while a count-only attach stays
+    /// admitted. The absent/wrong-shape map arms keep today's skip
+    /// and are pinned by the source twin beside this cell.
+    #[ignore = "privileged: attach over a set switch refuses semantic, admits count-only"]
+    #[test]
+    fn attach_over_a_set_switch_refuses_semantic_admits_count_only_lp64() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let mut rig = DowngradeTightLoopCell::build()?;
+        let init = rig.provider_init_offset()?;
+        let (pins, plan) = rig.pin_and_plan_semantic(&[init])?;
+        let mut session = super::Session::start(
+            &plan,
+            &super::Scope::Pid(rig.child.id()),
+            &pins,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::BackendSelection::Singles,
+        )?;
+        anyhow::ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        anyhow::ensure!(session.has_slot_link(0));
+        let original = session
+            .retained_static
+            .get(&0)
+            .context("retained slot 0")?
+            .slot
+            .clone();
+        anyhow::ensure!(original.descriptor_index != 0, "the cell starts semantic");
+        // Unset control: a detached slot reattaches semantically.
+        session.detach_slots(&plan.slots)?;
+        anyhow::ensure!(!session.has_slot_link(0), "the detach closed the link");
+        let (failed, _) =
+            session.attach_targets(&plan.slots, &pins, &std::collections::BTreeSet::new())?;
+        anyhow::ensure!(
+            failed.is_empty() && session.has_slot_link(0),
+            "unset switch admits the semantic reattach: failed={failed:?}"
+        );
+        // Downgrade sets the switch; the semantic reattach refuses.
+        let mut narrowed = original.clone();
+        narrowed.descriptor_index = 0;
+        narrowed.semantics = super::SlotSemantics::COUNT_ONLY;
+        let outcome = session.downgrade_in_place(std::slice::from_ref(&narrowed));
+        anyhow::ensure!(
+            outcome.downgraded == vec![0] && outcome.refused.is_empty(),
+            "downgrade outcome: {outcome:?}"
+        );
+        anyhow::ensure!(
+            downgrade_tight_loop_switch(&session, 0)? == 1,
+            "the switch did not read back set"
+        );
+        session.detach_slots(&plan.slots)?;
+        anyhow::ensure!(!session.has_slot_link(0), "the detach closed the link");
+        let failures_before = session.attach_failures().len();
+        let (failed, _) = session.attach_targets(
+            std::slice::from_ref(&original),
+            &pins,
+            &std::collections::BTreeSet::new(),
+        )?;
+        anyhow::ensure!(
+            failed == vec![0],
+            "a set switch refuses the semantic attach: failed={failed:?}"
+        );
+        anyhow::ensure!(
+            !session.has_slot_link(0),
+            "the refused attach opened no link"
+        );
+        anyhow::ensure!(
+            session.attach_failures()[failures_before..]
+                .iter()
+                .any(|(slot, reason)| *slot == 0 && reason.contains("count-only switch is set")),
+            "the refusal names the set switch: {:?}",
+            session.attach_failures()
+        );
+        // Count-only stays admitted over the set switch.
+        let (failed, _) = session.attach_targets(
+            std::slice::from_ref(&narrowed),
+            &pins,
+            &std::collections::BTreeSet::new(),
+        )?;
+        anyhow::ensure!(
+            failed.is_empty() && session.has_slot_link(0),
+            "a set switch admits the count-only attach: failed={failed:?}"
+        );
+        eprintln!("attach guard: unset admits, set refuses semantic and admits count-only");
         rig.finish()?;
         Ok(())
     }

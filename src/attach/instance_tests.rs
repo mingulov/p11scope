@@ -1235,15 +1235,20 @@ fn privileged_reattach_mid_object_call_faults_instead_of_straddling_lp64() -> Re
 }
 
 /// In-place downgrade (A′) on a journal session: the narrowed slot
-/// resolves `p11_entry_journal`, and post-flip calls skip BEGIN
-/// without a scope gap or evidence — an intended count-only slot is
-/// not a capture failure. Phase A (pre-flip) proves the instruments:
-/// the held call begins (BEGIN+END on the ring). Phase B (post-flip):
-/// the held call never begins (one END only) while counts stay exact.
-/// On builds that omit the journal the cell asserts the finite
-/// refusal instead.
+/// resolves `p11_entry_journal`, and a post-flip call on an
+/// affecting endpoint (here `C_SignInit`) never begins: it takes a
+/// scope gap WITHOUT semantic-capture-failure evidence — an intended
+/// count-only slot is not a capture failure, but the history is
+/// honestly marked incomplete. Phase A (pre-flip) proves the
+/// instruments: the held call begins (BEGIN+END on the ring) with
+/// the marker still unpublished. Phase B (post-flip): the held call
+/// journals one END and no BEGIN while counts stay exact, evidence
+/// stays flat, and the marker reads DIRTY. The generation is minted
+/// up front so the gap arm is live: without it the DIRTY assertion
+/// could never fire. On builds that omit the journal the cell
+/// asserts the finite refusal instead.
 #[test]
-#[ignore = "privileged: journal downgrade skips BEGIN without a gap"]
+#[ignore = "privileged: journal downgrade gaps an affecting call without evidence"]
 fn privileged_downgrade_in_place_journal_skips_begin_lp64() -> Result<()> {
     if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
         ensure!(
@@ -1280,6 +1285,11 @@ fn privileged_downgrade_in_place_journal_skips_begin_lp64() -> Result<()> {
         harness.session.attach_failures()
     );
     ensure!(harness.session.has_slot_link(0));
+    // The attach generation makes the scope-gap arm live: at
+    // generation 0 `p11_instance_scope_gap` no-ops and no marker
+    // assertion below could fire.
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(minted != 0, "the minted attach generation is live");
     let links_before = downgrade_session_links(&harness.session);
     ensure!(
         links_before
@@ -1324,7 +1334,13 @@ fn privileged_downgrade_in_place_journal_skips_begin_lp64() -> Result<()> {
         "phase A journals BEGIN+END: {} ring bytes",
         ring_after.producer.saturating_sub(ring_before.producer)
     );
-    // Phase B: downgrade, then a held call skips BEGIN (one END only).
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == journal_marker::MARKER_UNPUBLISHED,
+        "phase A marks no scope gap: {}",
+        marker_summary(&proc_record_of(&harness, &target)?)
+    );
+    // Phase B: downgrade, then a held affecting call gaps without
+    // evidence (one END, no BEGIN).
     let mut narrowed = plan.slots[0].clone();
     narrowed.descriptor_index = 0;
     narrowed.semantics = SlotSemantics::COUNT_ONLY;
@@ -1385,14 +1401,230 @@ fn privileged_downgrade_in_place_journal_skips_begin_lp64() -> Result<()> {
          {evidence_before:?} -> {evidence_after:?}"
     );
     ensure!(
-        marker_word_of(&proc_record_of(&harness, &target)?) != journal_marker::MARKER_DIRTY,
-        "no scope gap across the journal downgrade"
+        marker_word_of(&proc_record_of(&harness, &target)?) == journal_marker::MARKER_DIRTY,
+        "the downgraded affecting call marks its scope gap: {}",
+        marker_summary(&proc_record_of(&harness, &target)?)
     );
     ensure!(
         harness.session.physical_gap_summary().episodes == 0,
         "no physical gap across the journal downgrade"
     );
     eprintln!("journal downgrade: entered=2 returned=2 evidence={evidence_after:?}");
+    Ok(())
+}
+
+/// In-place downgrade (A′) on a journal session: a post-flip call on
+/// a proved-irrelevant endpoint (here `C_GetSlotInfo`) skips BEGIN
+/// silently — no scope gap, no evidence. Phase A (pre-flip) proves
+/// the instruments: the native BEGIN is already a no-op for class
+/// zero, so the call journals one UNJOURNALED END with the marker
+/// still unpublished. Phase B (post-flip): the same shape — one END,
+/// no BEGIN — with counts exact, evidence flat and the marker still
+/// unpublished. The generation is minted up front so a gap would
+/// mark: the unpublished word proves the skip, not a dead gap arm.
+/// On builds that omit the journal the cell asserts the finite
+/// refusal instead.
+#[test]
+#[ignore = "privileged: journal downgrade skips an irrelevant call silently"]
+fn privileged_downgrade_in_place_journal_irrelevant_skips_silently_lp64() -> Result<()> {
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        ensure!(
+            crate::EBPF_JOURNAL_OBJECT.is_empty(),
+            "an omitted build must embed no journal bytes"
+        );
+        let spec = super::journal::JournalSpec;
+        let error = spec
+            .prepare()
+            .err()
+            .context("the omitted build refuses journal preparation")?;
+        ensure!(
+            format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+            "the omitted build refuses with its finite reason: {error:#}"
+        );
+        eprintln!("JOURNAL_DOWNGRADE journal=inapplicable");
+        return Ok(());
+    }
+    use p11scope_ebpf_common::object_journal::JOURNAL_END_FULL_RING_BYTES;
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_journal(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.attach_failures().is_empty(),
+        "attach failures: {:?}",
+        harness.session.attach_failures()
+    );
+    ensure!(harness.session.has_slot_link(0));
+    // The attach generation makes the scope-gap arm live: at
+    // generation 0 `p11_instance_scope_gap` no-ops and the
+    // unpublished word below would prove nothing.
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(minted != 0, "the minted attach generation is live");
+    ensure!(
+        downgrade_session_links(&harness.session)
+            .iter()
+            .any(|(_, program)| *program == ProducerProgram::UProbe("p11_entry_journal")),
+        "the live entry link is the journal endpoint"
+    );
+    let evidence_before = object_call_evidence(&harness.session)?;
+    let (entered_before, returned_before) = downgrade_slot_stats(&harness.session, 0)?;
+    ensure!(
+        entered_before == 0 && returned_before == 0,
+        "the idle child made no calls before phase A: {entered_before}/{returned_before}"
+    );
+    // Phase A: a semantic irrelevant call journals one UNJOURNALED
+    // END (the native BEGIN is a no-op for class zero).
+    let ring_before = crate::events::event_drain_positions(harness.session.event_drain()?);
+    let reply = target.command(b'c')?;
+    ensure!(reply.starts_with("CALL "), "owned call ledger: {reply}");
+    let ring_after = crate::events::event_drain_positions(harness.session.event_drain()?);
+    ensure!(
+        ring_after.producer.checked_sub(ring_before.producer) == Some(JOURNAL_END_FULL_RING_BYTES),
+        "phase A journals one END and no BEGIN: {} ring bytes",
+        ring_after.producer.saturating_sub(ring_before.producer)
+    );
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == journal_marker::MARKER_UNPUBLISHED,
+        "phase A marks no scope gap: {}",
+        marker_summary(&proc_record_of(&harness, &target)?)
+    );
+    // Phase B: downgrade, then the irrelevant call skips silently.
+    let mut narrowed = plan.slots[0].clone();
+    narrowed.descriptor_index = 0;
+    narrowed.semantics = SlotSemantics::COUNT_ONLY;
+    let outcome = harness
+        .session
+        .downgrade_in_place(std::slice::from_ref(&narrowed));
+    ensure!(
+        outcome.downgraded == vec![0] && outcome.refused.is_empty(),
+        "journal downgrade outcome: {outcome:?}"
+    );
+    ensure!(
+        downgrade_switch_cell(&harness.session, 0)? == 1,
+        "the journal switch did not read back set"
+    );
+    let ring_before = crate::events::event_drain_positions(harness.session.event_drain()?);
+    let reply = target.command(b'c')?;
+    ensure!(reply.starts_with("CALL "), "owned call ledger: {reply}");
+    let ring_after = crate::events::event_drain_positions(harness.session.event_drain()?);
+    ensure!(
+        ring_after.producer.checked_sub(ring_before.producer) == Some(JOURNAL_END_FULL_RING_BYTES),
+        "phase B journals one END and no BEGIN: {} ring bytes",
+        ring_after.producer.saturating_sub(ring_before.producer)
+    );
+    let (entered, returned) = downgrade_slot_stats(&harness.session, 0)?;
+    ensure!(
+        entered == 2 && returned == 2,
+        "entered {entered} returned {returned}, ground truth 2"
+    );
+    let evidence_after = object_call_evidence(&harness.session)?;
+    ensure!(
+        evidence_after == evidence_before,
+        "no ring loss, unmatched return or capture failure across the journal downgrade: \
+         {evidence_before:?} -> {evidence_after:?}"
+    );
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == journal_marker::MARKER_UNPUBLISHED,
+        "the downgraded irrelevant call skips silently: {}",
+        marker_summary(&proc_record_of(&harness, &target)?)
+    );
+    ensure!(
+        harness.session.physical_gap_summary().episodes == 0,
+        "no physical gap across the journal downgrade"
+    );
+    eprintln!("journal downgrade irrelevant: entered=2 returned=2 evidence={evidence_after:?}");
+    Ok(())
+}
+
+/// In-place downgrade (A′): a PLANNED count-only journal slot (the
+/// switch never set) keeps today's Gap path — its call never begins,
+/// marks a scope gap AND bumps semantic-capture-failure evidence. A
+/// planned descriptor 0 is an unproven slot, not an intended
+/// narrowing, so it must not take the silent skip. The generation is
+/// minted up front so the gap arm is live. On builds that omit the
+/// journal the cell asserts the finite refusal instead.
+#[test]
+#[ignore = "privileged: planned count-only journal call keeps its gap"]
+fn privileged_planned_count_only_journal_call_gaps_with_evidence_lp64() -> Result<()> {
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        ensure!(
+            crate::EBPF_JOURNAL_OBJECT.is_empty(),
+            "an omitted build must embed no journal bytes"
+        );
+        let spec = super::journal::JournalSpec;
+        let error = spec
+            .prepare()
+            .err()
+            .context("the omitted build refuses journal preparation")?;
+        ensure!(
+            format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+            "the omitted build refuses with its finite reason: {error:#}"
+        );
+        eprintln!("JOURNAL_PLANNED_ZERO journal=inapplicable");
+        return Ok(());
+    }
+    use p11scope_ebpf_common::object_journal::JOURNAL_END_FULL_RING_BYTES;
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, mut plan, _) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    plan.slots[0].descriptor_index = 0;
+    plan.slots[0].semantics = SlotSemantics::COUNT_ONLY;
+    let mut harness = Harness::start_journal(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.attach_failures().is_empty(),
+        "attach failures: {:?}",
+        harness.session.attach_failures()
+    );
+    ensure!(harness.session.has_slot_link(0));
+    ensure!(
+        downgrade_session_links(&harness.session)
+            .iter()
+            .any(|(_, program)| *program == ProducerProgram::UProbe("p11_entry_journal")),
+        "the live entry link is the journal endpoint"
+    );
+    ensure!(
+        downgrade_switch_cell(&harness.session, 0)? == 0,
+        "a planned slot never sets its switch"
+    );
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(minted != 0, "the minted attach generation is live");
+    let evidence_before = object_call_evidence(&harness.session)?;
+    let ring_before = crate::events::event_drain_positions(harness.session.event_drain()?);
+    let reply = target.command(b'c')?;
+    ensure!(reply.starts_with("CALL "), "owned call ledger: {reply}");
+    let ring_after = crate::events::event_drain_positions(harness.session.event_drain()?);
+    ensure!(
+        ring_after.producer.checked_sub(ring_before.producer) == Some(JOURNAL_END_FULL_RING_BYTES),
+        "the planned call journals one END and no BEGIN: {} ring bytes",
+        ring_after.producer.saturating_sub(ring_before.producer)
+    );
+    let (entered, returned) = downgrade_slot_stats(&harness.session, 0)?;
+    ensure!(
+        entered == 1 && returned == 1,
+        "entered {entered} returned {returned}, ground truth 1"
+    );
+    let evidence_after = object_call_evidence(&harness.session)?;
+    ensure!(
+        evidence_after.0 == evidence_before.0
+            && evidence_after.1 == evidence_before.1
+            && evidence_after.2 == evidence_before.2 + 1,
+        "the planned call bumps exactly the capture-failure evidence: \
+         {evidence_before:?} -> {evidence_after:?}"
+    );
+    ensure!(
+        marker_word_of(&proc_record_of(&harness, &target)?) == journal_marker::MARKER_DIRTY,
+        "the planned call marks its scope gap: {}",
+        marker_summary(&proc_record_of(&harness, &target)?)
+    );
+    eprintln!("journal planned zero: entered=1 returned=1 evidence={evidence_after:?}");
     Ok(())
 }
 

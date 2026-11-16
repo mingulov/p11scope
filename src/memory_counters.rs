@@ -152,6 +152,7 @@ pub(crate) struct HistoryRows {
     pub skips: CounterRow,
     pub losses: CounterRow,
     pub refusals: CounterRow,
+    pub lowerings: CounterRow,
     pub fallbacks: CounterRow,
     pub recorroborated: CounterRow,
     pub conflicted: CounterRow,
@@ -801,6 +802,7 @@ mod tests {
                 skips: row(5),
                 losses: row(6),
                 refusals: row(7),
+                lowerings: row(19),
                 fallbacks: row(8),
                 recorroborated: row(9),
                 conflicted: row(10),
@@ -937,6 +939,7 @@ mod tests {
         assert_eq!(profile.r5_seal_value_bytes, Some(100));
         let r6 = profile.r6.as_ref().expect("profile owns R6");
         assert_eq!(r6.modules.len, 1);
+        assert_eq!(r6.lowerings.len, 19);
         assert_eq!(r6.fallback_tombstones.len, 13);
         assert_eq!(profile.r7_param_combos.expect("R7").len, 1);
         assert_eq!(profile.r8_mech_shapes.expect("R8").len, 7);

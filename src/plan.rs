@@ -618,6 +618,18 @@ pub(crate) fn whole_refusal_needed_count(reason: &str) -> Option<usize> {
         .ok()
 }
 
+/// The lowered count an at-capacity semantic-lowering record states —
+/// the `N` of `N semantic endpoints attached count-only for capacity`
+/// — or `None` for any other reason. The lowering head is required
+/// beside the count: whole refusals interpolate holder paths verbatim,
+/// and a path may name the phrase.
+pub(crate) fn capacity_lowered_count(reason: &str) -> Option<usize> {
+    if !is_capacity_lowering(reason) {
+        return None;
+    }
+    reason.split_once(" semantic endpoint")?.0.parse().ok()
+}
+
 /// The omitted endpoints are not called new: an endpoint deactivated earlier
 /// in the capture and listed again needs a fresh slot just the same.
 /// Like a whole refusal, an omission names what holds the room the growth

@@ -6601,6 +6601,7 @@ fn history_memory_lens_moves_with_recorded_sets() {
         zero.rows.skips,
         zero.rows.losses,
         zero.rows.refusals,
+        zero.rows.lowerings,
         zero.rows.fallbacks,
         zero.rows.recorroborated,
         zero.rows.conflicted,
@@ -6706,6 +6707,13 @@ fn history_memory_lens_moves_with_recorded_sets() {
             crate::plan::RefusalKind::AwaitingPublication,
         ),
     );
+    history.lowerings.insert(
+        crate::plan::ModuleId(1),
+        Skipped {
+            subject: "s".to_string(),
+            reason: "r".to_string(),
+        },
+    );
     history.fallbacks.insert(
         (1, 2),
         crate::render::ManifestObjectFallback {
@@ -6779,6 +6787,7 @@ fn history_memory_lens_moves_with_recorded_sets() {
     assert_eq!(lens.rows.skips.len, 1);
     assert_eq!(lens.rows.losses.len, 0);
     assert_eq!(lens.rows.refusals.len, 1);
+    assert_eq!(lens.rows.lowerings.len, 1);
     assert_eq!(lens.rows.fallbacks.len, 1);
     assert_eq!(lens.rows.recorroborated.len, 1);
     assert_eq!(lens.rows.conflicted.len, 1);

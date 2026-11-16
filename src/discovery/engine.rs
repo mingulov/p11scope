@@ -2055,6 +2055,11 @@ struct CaptureHistory {
     /// read by both through `scan_gap_key`.
     scan_gap_tombstones: BTreeSet<(String, String)>,
     refusals: BTreeMap<plan::ModuleId, (Skipped, plan::RefusalKind)>,
+    /// At-capacity semantic lowerings, one high-water entry per module
+    /// beside `refusals`: the module attached (partial coverage), so
+    /// its lowering must never replace — or be replaced by — a
+    /// refusal or omission for the same module.
+    lowerings: BTreeMap<plan::ModuleId, Skipped>,
     fallbacks: BTreeMap<(u32, u32), render::ManifestObjectFallback>,
     corroboration_tombstones: BTreeSet<plan::ModuleId>,
     /// §4.12 outcomes re-derived after attach. Corroboration is a
@@ -3724,6 +3729,25 @@ impl CaptureFacts {
         }
         for (object, refused, refused_kind) in plan.refused_modules_typed() {
             let id = self.module_id_for_object(pinned, object)?;
+            // A capacity lowering keeps its own high-water entry, never the
+            // refusal entry: the module attached, so the lowering neither
+            // replaces nor blocks an omission or refusal for it, in either
+            // arrival order. Among lowerings the largest lowered count the
+            // capture saw is kept, like every omission above.
+            if refused_kind == plan::RefusalKind::CapacityLowering {
+                let known = history.lowerings.entry(id).or_insert_with(|| refused.clone());
+                let larger = matches!(
+                    (
+                        plan::capacity_lowered_count(&known.reason),
+                        plan::capacity_lowered_count(&refused.reason),
+                    ),
+                    (Some(known), Some(current)) if current > known
+                );
+                if larger {
+                    known.clone_from(refused);
+                }
+                continue;
+            }
             // One record per module, a high-water mark like every omission
             // above: a whole refusal stays the capture's record of it and
             // outranks any growth omission (G-03); among growth omissions the
@@ -3821,6 +3845,7 @@ impl CaptureFacts {
             .refusals
             .values()
             .map(|(skipped, _)| skipped.clone())
+            .chain(history.lowerings.values().cloned())
             .collect();
         plan.vendor_interfaces = history.vendor_interfaces;
         if !history.interface_list.is_empty() {
@@ -3893,6 +3918,7 @@ impl CaptureFacts {
                 .refusals
                 .values()
                 .map(|(skipped, _)| skipped_out(skipped))
+                .chain(history.lowerings.values().map(skipped_out))
                 .collect(),
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
             scan_unavailable: history.scan_unavailable.clone(),
@@ -33889,6 +33915,11 @@ impl Engine {
                 refusals: counter_row(
                     history.refusals.len(),
                     size_of::<(plan::ModuleId, (Skipped, plan::RefusalKind))>(),
+                    HEAP_HISTORY_VALUE,
+                ),
+                lowerings: counter_row(
+                    history.lowerings.len(),
+                    size_of::<(plan::ModuleId, Skipped)>(),
                     HEAP_HISTORY_VALUE,
                 ),
                 fallbacks: counter_row(

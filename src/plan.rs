@@ -4939,7 +4939,7 @@ impl AttachPlan {
         // flows, so position, key and shape agreement are re-verified at
         // use (see `reclaim_assignment`), never here. An attach-indexed
         // (active) key may hold its retired other-shape generation.
-        for (_, remembered) in &self.retired_keys {
+        for remembered in self.retired_keys.values() {
             if remembered.is_empty() {
                 return Err("a retired key remembers no generation".into());
             }

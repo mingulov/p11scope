@@ -26287,3 +26287,274 @@ fn key_operation_newsite_truncation_alone_triggers_v6() {
         }
     }
 }
+
+/// Fix round 3: a truncated template whose first-eight window holds a
+/// safe-kind cell with an unclassifiable value (non-finite scalar,
+/// explicit unsupported, unavailable, size-only, malformed) names its
+/// own reason on that field in both blocks — never the truncation
+/// reason, which is reserved for fields never seen. The tail field
+/// still names the truncation.
+#[test]
+fn key_operation_newsite_truncated_template_marks_seen_unsupported_value() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    const TRUNCATED: &str = "template truncated (first 8 attributes captured)";
+    const UNSUPPORTED: &str = "template value outside approved finite set";
+    for (status, value, case) in [
+        (1u8, 100u16, "non-finite scalar"),
+        (2u8, 0u16, "explicit unsupported"),
+        (3u8, 0u16, "unavailable"),
+        (4u8, 0u16, "size-only"),
+        (6u8, 0u16, "malformed"),
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                request_cells: vec![
+                    (1u8, 1u8, 4u16),
+                    (2u8, 1u8, 0x1f),
+                    (4u8, status, value),
+                    (3u8, 1u8, 1u16),
+                    (6u8, 1u8, 1u16),
+                    (7u8, 1u8, 2u16),
+                    (1u8, 1u8, 4u16),
+                    (2u8, 1u8, 0x1f),
+                ],
+                request_truncated: true,
+                ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+            },
+        );
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(
+            observations_version(&committed),
+            OBSERVATIONS_VERSION_V6,
+            "{case}: truncation trips v6"
+        );
+        let section = object_observations_json(&committed);
+        assert_eq!(section["version"], 6, "{case}: section v6");
+        for block in ["requested", "established"] {
+            assert_eq!(
+                section["objects"][0][block]["value_len"]["status"], "unknown",
+                "{case} {block}: the unclassifiable size stays unknown"
+            );
+            assert_eq!(
+                section["objects"][0][block]["value_len"]["reason"], UNSUPPORTED,
+                "{case} {block}: the seen-but-unclassifiable size names its own reason"
+            );
+            assert_eq!(
+                section["objects"][0][block]["modulus_bits"]["status"], "unknown",
+                "{case} {block}: the tail field stays unknown"
+            );
+            assert_eq!(
+                section["objects"][0][block]["modulus_bits"]["reason"], TRUNCATED,
+                "{case} {block}: the never-seen tail names the truncation"
+            );
+        }
+        for field in ["class", "key_type", "ec_params", "parameter_set"] {
+            assert_eq!(
+                section["objects"][0]["established"][field]["status"], "value",
+                "{case}: {field} promotes"
+            );
+            assert!(
+                section["objects"][0]["established"][field]["reason"].is_null(),
+                "{case}: {field} carries no reason"
+            );
+        }
+    }
+}
+
+/// Fix round 3: an Edwards/Montgomery key type with an established but
+/// mismatched curve stays unlabeled with its named reason on the
+/// established curve field. A matching curve on an incompatible class
+/// stays unlabeled with no curve reason: the curve itself is usable.
+#[test]
+fn key_operation_newsite_edwards_montgomery_mismatch_carries_reason() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    const CURVE_REASON: &str = "curve unusable for key type";
+    for (key_type, curve_code, curve_name, case) in [
+        (0x40u16, 4u16, "x25519", "edwards + x25519"),
+        (0x41u16, 6u16, "ed25519", "montgomery + ed25519"),
+        (0x40u16, 1u16, "secp256r1", "edwards + secp256r1"),
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                request_cells: vec![
+                    (1u8, 1u8, 3u16),
+                    (2u8, 1u8, key_type),
+                    (6u8, 1u8, curve_code),
+                ],
+                ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+            },
+        );
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(
+            observations_version(&committed),
+            OBSERVATIONS_VERSION_V6,
+            "{case}: newsite content trips v6"
+        );
+        let section = object_observations_json(&committed);
+        assert_eq!(section["version"], 6, "{case}: section v6");
+        assert!(
+            section["objects"][0]["label"].is_null(),
+            "{case}: the mismatch stays unlabeled"
+        );
+        assert_eq!(
+            section["objects"][0]["established"]["ec_params"]["value"], curve_name,
+            "{case}: the curve fact is established"
+        );
+        assert_eq!(
+            section["objects"][0]["established"]["ec_params"]["reason"], CURVE_REASON,
+            "{case}: the mismatched curve names its reason"
+        );
+        assert!(
+            section["objects"][0]["requested"]["ec_params"]["reason"].is_null(),
+            "{case}: the requested curve carries no label reason"
+        );
+    }
+    // Negative control: a matching curve on an incompatible class stays
+    // unlabeled for the class, not the curve — no curve reason.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x40), (6u8, 1u8, 6u16)],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&committed);
+    assert!(
+        section["objects"][0]["label"].is_null(),
+        "class-incompatible stays unlabeled"
+    );
+    assert!(
+        section["objects"][0]["established"]["ec_params"]["reason"].is_null(),
+        "a usable curve on an incompatible class carries no curve reason"
+    );
+}
+
+/// Fix round 3: an Edwards/Montgomery key type with no established
+/// curve stays unlabeled with its named reason on the curve field in
+/// both blocks. A generic EC type with no curve carries no curve
+/// reason: the rule is Edwards/Montgomery only.
+#[test]
+fn key_operation_newsite_edwards_montgomery_unestablished_carries_reason() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    const CURVE_REASON: &str = "curve unusable for key type";
+    for (key_type, case) in [
+        (0x40u16, "edwards without a curve"),
+        (0x41u16, "montgomery without a curve"),
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                request_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, key_type)],
+                ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+            },
+        );
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(
+            observations_version(&committed),
+            OBSERVATIONS_VERSION_V6,
+            "{case}: creation content trips v6"
+        );
+        let section = object_observations_json(&committed);
+        assert_eq!(section["version"], 6, "{case}: section v6");
+        assert!(
+            section["objects"][0]["label"].is_null(),
+            "{case}: the missing curve stays unlabeled"
+        );
+        for block in ["requested", "established"] {
+            assert_eq!(
+                section["objects"][0][block]["ec_params"]["status"], "unknown",
+                "{case} {block}: the curve stays unknown"
+            );
+            assert_eq!(
+                section["objects"][0][block]["ec_params"]["reason"], CURVE_REASON,
+                "{case} {block}: the unestablished curve names its reason"
+            );
+        }
+    }
+    // Negative control: a generic EC type with no curve is simply
+    // absent — no Edwards/Montgomery curve reason.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x03)],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&committed);
+    assert!(
+        section["objects"][0]["label"].is_null(),
+        "ec without a curve stays unlabeled"
+    );
+    for block in ["requested", "established"] {
+        assert!(
+            section["objects"][0][block]["ec_params"]["reason"].is_null(),
+            "{block}: a non-Edwards/Montgomery absence carries no curve reason"
+        );
+    }
+}

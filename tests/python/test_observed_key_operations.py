@@ -1036,6 +1036,76 @@ class ObservedRsaTests(unittest.TestCase):
                     ORACLE.OracleRefusal,
                     "established reason on an observed request"):
                 ORACLE.check_section(mutated)
+        with self.subTest("partial truncation reasons refused"):
+            mutated = copy.deepcopy(section)
+            for block in (mutated["objects"][1]["requested"],
+                          mutated["objects"][1]["established"]):
+                block["value_len"] = {
+                    "status": "unknown", "value": None,
+                    "source": None,
+                    "reason": ("template truncated "
+                               "(first 8 attributes captured)")}
+                block["modulus_bits"] = {
+                    "status": "unknown", "value": None,
+                    "source": None, "reason": None}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "incomplete truncation reasons"):
+                ORACLE.check_section(mutated)
+        with self.subTest("v6 without visible content or reasons refused"):
+            mutated = copy.deepcopy(section)
+            for row in mutated["objects"]:
+                for block in (row["requested"], row["established"]):
+                    for cell in block.values():
+                        cell["status"] = "unknown"
+                        cell["value"] = None
+                        cell["source"] = None
+                        cell["reason"] = None
+                for name in row["queries"]:
+                    row["queries"][name] = "not_queried"
+                row["label"] = None
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "incomplete truncation reasons"):
+                ORACLE.check_section(mutated)
+        with self.subTest("mismatched curve without a reason refused"):
+            mutated = copy.deepcopy(section)
+            row = mutated["objects"][1]
+            row["requested"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": None, "reason": None}
+            row["established"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": "creation_success", "reason": None}
+            row["requested"]["ec_params"] = {
+                "status": "value", "value": "x25519",
+                "source": None, "reason": None}
+            row["established"]["ec_params"] = {
+                "status": "value", "value": "x25519",
+                "source": "creation_success", "reason": None}
+            row["queries"]["key_type"] = "not_queried"
+            row["queries"]["ec_params"] = "not_queried"
+            row["label"] = None
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "mismatched curve carries no reason"):
+                ORACLE.check_section(mutated)
+        with self.subTest("unestablished curve without a reason refused"):
+            mutated = copy.deepcopy(section)
+            row = mutated["objects"][1]
+            row["requested"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": None, "reason": None}
+            row["established"]["key_type"] = {
+                "status": "value", "value": 64,
+                "source": "creation_success", "reason": None}
+            for block in (row["requested"], row["established"]):
+                block["ec_params"] = {
+                    "status": "unknown", "value": None,
+                    "source": None, "reason": None}
+            row["queries"]["key_type"] = "not_queried"
+            row["queries"]["ec_params"] = "not_queried"
+            row["label"] = None
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "unestablished curve carries no reason"):
+                ORACLE.check_section(mutated)
         with self.subTest("HKDF key type below v6 refused"):
             mutated = copy.deepcopy(section)
             mutated["version"] = 5

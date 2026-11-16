@@ -513,6 +513,36 @@ fn key_ops_verbose_names_truncated_creation_templates() {
     );
 }
 
+/// Fix round 3: Edwards/Montgomery objects whose curve is mismatched or
+/// unestablished name the curve reason in verbose text with the same
+/// string the curve field carries in JSON; concise stays quiet. Counts
+/// only — never object detail.
+#[test]
+fn key_ops_verbose_names_unusable_curve_reasons() {
+    const CURVE_REASON: &str = "curve unusable for key type";
+    let mut observations = populated(9);
+    let mut first = object_row(11);
+    first.established.ec_params.reason = Some(CURVE_REASON);
+    let mut second = object_row(12);
+    second.established.ec_params.reason = Some(CURVE_REASON);
+    observations.objects.push(first);
+    observations.objects.push(object_row(13));
+    observations.objects.push(second);
+    let presentation = key_ops_presentation(observations);
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    let expected = format!("  {CURVE_REASON} (2 objects)");
+    assert!(
+        block.contains(&expected.as_str()),
+        "verbose names the curve count:\n{verbose}"
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !concise.contains(CURVE_REASON),
+        "concise stays quiet:\n{concise}"
+    );
+}
+
 #[test]
 fn key_ops_line_journal_unavailable_names_tracking_off() {
     let presentation =

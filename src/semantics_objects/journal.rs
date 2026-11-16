@@ -15260,6 +15260,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_void_wiped_begin_end_stays_untainted() {
+        // A BEGIN wiped by a void leaves its terminal expected-absent:
+        // the straddling END keeps the Contradiction disposition and
+        // telemetry, but it is the void working as intended, not new
+        // evidence, so it never permanently taints the image.
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped terminal must not taint"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_wiped_begin_abandon_stays_untainted() {
+        // Abandon twin of the void-wipe twin above: a BEGIN wiped by a
+        // void leaves its ABANDON expected-absent too, never a
+        // permanent taint.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&abandon),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped abandon must not taint"
+        );
+    }
+
+    #[test]
     fn review2_localized_raw_refusal_during_shed_grace_stays_refused() {
         // Round-2 F1: a localized raw refusal during shed grace is
         // independent invalidation evidence. It must revoke shed-only

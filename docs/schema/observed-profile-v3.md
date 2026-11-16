@@ -453,7 +453,9 @@ it is informational and never a verdict input. `learned_event_loss`
 counts queue overflows, lost drain tails, and unexpected drain deaths
 (each +1; any means some provider files may not have been learned).
 `learned_cap_skipped` counts candidates refused by the 32-file
-per-capture cap. Each loss files its own aggregate gap row in
+per-capture cap plus provider tables refused by the 32-module
+learned-table cap (a second budget beside the file store). Each loss
+files its own aggregate gap row in
 `evidence.skipped` per capture (repeat filings dedupe to the same row;
 vocabulary below), and every learned row forces `PARTIAL` through the
 `skipped` observation cause. Unavailable learning (no fanotify marks)
@@ -1135,7 +1137,8 @@ Run-tree scope gaps file under their own subject. Each record is
   could not be read at run end.
 
 Learned-file gaps file under their own subject. Each record is
-`{name: "learned provider file", reason}` with `reason` exactly one of:
+`{name: "learned provider file", reason}` with `reason` exactly one of
+the ten reasons below:
 
 - `a provider file was learned after its first use; its earlier calls
   were not observed`: the fanotify drain staged a provider file after
@@ -1150,6 +1153,18 @@ Learned-file gaps file under their own subject. Each record is
 - `file learning reached its 32-file per-capture cap; further provider
   files were not learned`: later candidates were refused loudly. The
   refused count rides in `evidence.learned_cap_skipped`.
+- `table learning reached its 32-module per-capture cap; further
+  provider tables were not learned`: the run-persistent learned-table
+  store (a second 32-entry budget beside the file store) was full,
+  so a later provider's decoded tables were refused while its file
+  may still have staged. The refused count rides in
+  `evidence.learned_cap_skipped` together with the file-cap
+  refusals; the row names which budget refused.
+- `a learned provider's tables lost their pinned identity; its calls
+  were not observed`: a run-persistent learned module could not be
+  bound to a pinned file identity when a candidate was built, so
+  its table calls went unobserved from then on. The file's own
+  staging is unaffected.
 - `file learning was unavailable; short-lived first loads of new
   provider files were not learned`: fanotify could not start, the
   drain thread could not spawn, or no filesystem could be marked —

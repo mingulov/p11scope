@@ -1941,11 +1941,13 @@ pub(crate) const RUN_TREE_SUBJECT: &str = "run process tree";
 pub(crate) const RUN_TREE_SURVIVORS: &str = "process-tree members were still present when the command exited; their calls after the run end are out of scope";
 pub(crate) const RUN_TREE_DEGRADED: &str = "only the started command is observed";
 pub(crate) const RUN_TREE_MEMBERSHIP_UNKNOWN: &str = "handed-back descendants are unknown";
-/// Learned-file gaps file under this subject with eight finite reasons
+/// Learned-file gaps file under this subject with ten finite reasons
 /// (schema v3): the staged-file count rides in
 /// `evidence.learned_staged_files`, the loss in
 /// `evidence.learned_event_loss`, the cap excess in
-/// `evidence.learned_cap_skipped`, never in the reason.
+/// `evidence.learned_cap_skipped`, never in the reason. The table
+/// cap shares the file cap's counter: the row names which budget
+/// refused.
 pub(crate) const LEARNED_SKIP_SUBJECT: &str = "learned provider file";
 pub(crate) const LEARNED_FIRST_RUN_REASON: &str =
     "a provider file was learned after its first use; its earlier calls were not observed";
@@ -1953,6 +1955,9 @@ pub(crate) const LEARNED_OVERFLOW_REASON: &str =
     "file-learning events were lost; some provider files may not have been learned";
 pub(crate) const LEARNED_CAP_REASON: &str =
     "file learning reached its 32-file per-capture cap; further provider files were not learned";
+pub(crate) const LEARNED_TABLE_CAP_REASON: &str = "table learning reached its 32-module per-capture cap; further provider tables were not learned";
+pub(crate) const LEARNED_TABLE_UNBOUND_REASON: &str =
+    "a learned provider's tables lost their pinned identity; its calls were not observed";
 pub(crate) const LEARNED_UNAVAILABLE_REASON: &str =
     "file learning was unavailable; short-lived first loads of new provider files were not learned";
 pub(crate) const LEARNED_REPLACED_DELETED_REASON: &str =
@@ -2143,7 +2148,7 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             reason: s.reason.clone(),
         };
     }
-    // Learned-file gaps keep their subject and their eight finite
+    // Learned-file gaps keep their subject and their ten finite
     // reasons; the counts ride in the `evidence.learned_*` keys.
     // Anything else under the subject falls through to the fail-closed
     // generic below instead of breaking the closed vocabulary.
@@ -2153,6 +2158,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             LEARNED_FIRST_RUN_REASON
                 | LEARNED_OVERFLOW_REASON
                 | LEARNED_CAP_REASON
+                | LEARNED_TABLE_CAP_REASON
+                | LEARNED_TABLE_UNBOUND_REASON
                 | LEARNED_UNAVAILABLE_REASON
                 | LEARNED_REPLACED_DELETED_REASON
                 | LEARNED_DISABLED_REASON
@@ -4633,6 +4640,8 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LEARNED_FIRST_RUN_REASON,
                     LEARNED_OVERFLOW_REASON,
                     LEARNED_CAP_REASON,
+                    LEARNED_TABLE_CAP_REASON,
+                    LEARNED_TABLE_UNBOUND_REASON,
                     LEARNED_UNAVAILABLE_REASON,
                     LEARNED_REPLACED_DELETED_REASON,
                     LEARNED_DISABLED_REASON,

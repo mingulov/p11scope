@@ -11201,6 +11201,7 @@ pub(crate) mod tests {
             &[],
             lookup,
             |_, _| true,
+            None,
             false,
             plan.admission_policy,
             false,

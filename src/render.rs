@@ -4540,13 +4540,26 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 // A module still attached on the endpoints it had when its
                 // growth did not fit is partially covered, not refused (G-03).
                 // A Part 0 prefix-admitted closure array is likewise partial.
-                let partially_covered = ev
-                    .discovery
-                    .modules_skipped
-                    .iter()
-                    .filter(|module| crate::plan::is_partial_coverage(&module.reason))
-                    .count() as u64;
-                let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;
+                // One file can hold two records (an omission or refusal
+                // beside a capacity lowering): the coverage line counts
+                // distinct files per class, and a file in both classes
+                // counts once, as not watched — the worse gap wins, the
+                // way a whole refusal outranks a growth omission in the
+                // engine's own high-water entry. The gaps listing still
+                // shows every record verbatim.
+                let mut partial_files: std::collections::BTreeSet<&str> =
+                    std::collections::BTreeSet::new();
+                let mut refused_files: std::collections::BTreeSet<&str> =
+                    std::collections::BTreeSet::new();
+                for module in &ev.discovery.modules_skipped {
+                    if crate::plan::is_partial_coverage(&module.reason) {
+                        partial_files.insert(module.name.as_str());
+                    } else {
+                        refused_files.insert(module.name.as_str());
+                    }
+                }
+                let refused = refused_files.len() as u64;
+                let partially_covered = partial_files.difference(&refused_files).count() as u64;
                 for (n, one, many) in [
                     (
                         refused,

@@ -12527,6 +12527,193 @@ mod tests {
         }
     }
 
+    /// In-place downgrade (A′): the narrowed slot's entry program
+    /// resolves journal-aware, mirroring the attach-time resolver: a
+    /// journal session's count-only slot keeps `p11_entry_journal`,
+    /// never the plain `p11_entry` the non-journal resolver returns
+    /// for every lp64 count-only slot.
+    #[test]
+    fn downgrade_entry_program_resolves_journal_aware() {
+        fn body<'a>(source: &'a str, signature: &str, end: &str) -> Option<&'a str> {
+            source
+                .split_once(signature)
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once(end).map(|(text, _)| text))
+        }
+        fn contract(source: &str) -> bool {
+            let (Some(downgrade), Some(helper)) = (
+                body(source, "    pub fn downgrade_in_place(", "\n    }\n"),
+                body(source, "fn downgrade_entry_program(", "\n}\n"),
+            ) else {
+                return false;
+            };
+            downgrade.contains("downgrade_entry_program(")
+                && helper.contains("p11_entry_journal")
+                && helper.contains("entry_program(")
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "downgrade_in_place must resolve the narrowed entry program journal-aware"
+        );
+        for (signature, marker) in [
+            ("    pub fn downgrade_in_place(", "downgrade_entry_program("),
+            ("fn downgrade_entry_program(", "p11_entry_journal"),
+            ("fn downgrade_entry_program(", "entry_program("),
+        ] {
+            let start = source.find(signature).unwrap();
+            let tail = source[start..].replacen(marker, "REMOVED", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed {marker}"
+            );
+        }
+    }
+
+    /// In-place downgrade (A′): descriptor 0 alone does not make a
+    /// count-only slot. The downgrade refuses a new slot whose
+    /// semantics are not `SlotSemantics::COUNT_ONLY`, so userspace
+    /// metadata and the narrowed BPF slot cannot disagree.
+    #[test]
+    fn downgrade_in_place_requires_count_only_semantics() {
+        fn body(source: &str) -> Option<&str> {
+            source
+                .split_once("    pub fn downgrade_in_place(")
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+        }
+        fn contract(source: &str) -> bool {
+            let Some(text) = body(source) else {
+                return false;
+            };
+            text.contains("SlotSemantics::COUNT_ONLY")
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "downgrade_in_place must require COUNT_ONLY semantics on the new slot"
+        );
+        let start = source.find("    pub fn downgrade_in_place(").unwrap();
+        let tail = source[start..].replacen("SlotSemantics::COUNT_ONLY", "REMOVED", 1);
+        assert!(
+            !contract(&format!("{}{}", &source[..start], tail)),
+            "removed SlotSemantics::COUNT_ONLY"
+        );
+    }
+
+    /// In-place downgrade (A′): the outcome is `#[must_use]` and every
+    /// refusal carries a named reason, so Packet 2 classifies write
+    /// vs read-back failure without matching message text, and an
+    /// ignored outcome cannot silently leave a semantic link live.
+    #[test]
+    fn downgrade_outcome_uses_a_named_refusal_reason() {
+        fn contract(source: &str) -> bool {
+            source.contains("#[must_use]\npub struct InPlaceDowngradeOutcome")
+                && source.contains("pub refused: Vec<(u32, InPlaceDowngradeRefusal)>")
+                && source.contains("pub enum InPlaceDowngradeRefusal")
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "InPlaceDowngradeOutcome must be must_use with a refusal-reason enum"
+        );
+        for marker in [
+            "#[must_use]\npub struct InPlaceDowngradeOutcome",
+            "pub refused: Vec<(u32, InPlaceDowngradeRefusal)>",
+            "pub enum InPlaceDowngradeRefusal",
+        ] {
+            assert!(
+                !contract(&source.replace(marker, "REMOVED")),
+                "removed {marker}"
+            );
+        }
+    }
+
+    /// In-place downgrade (A′) on an attested session: a retained slot
+    /// narrowed to descriptor 0 keeps validating while its
+    /// `SLOT_COUNT_ONLY` cell is set — same attach key, object, path
+    /// and ABI, `COUNT_ONLY` semantics — so later admissions keep
+    /// working after a downgrade instead of failing the whole set.
+    #[test]
+    fn validate_with_accepts_a_switched_count_only_retained_slot() {
+        fn body(source: &str) -> Option<&str> {
+            source
+                .split_once("    fn validate_with(")
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+        }
+        fn contract(source: &str) -> bool {
+            let Some(text) = body(source) else {
+                return false;
+            };
+            text.contains("switched")
+                && text.contains("SlotSemantics::COUNT_ONLY")
+                && text.contains("AttachKey::of")
+        }
+        let source = include_str!("attach.rs");
+        assert!(
+            contract(source),
+            "validate_with must accept a switched count-only retained slot"
+        );
+        let start = source.find("    fn validate_with(").unwrap();
+        for marker in ["switched", "SlotSemantics::COUNT_ONLY", "AttachKey::of"] {
+            let tail = source[start..].replacen(marker, "REMOVED", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed {marker}"
+            );
+        }
+    }
+
+    /// Template pair calls read the count-only switch twice (pair entry
+    /// plus the tail-called continuation), so a flip landing between
+    /// the reads would split the call. That cannot happen while
+    /// `downgrade_in_place` refuses unsafe-decoder builds — the only
+    /// template programs — and this twin pins the conjunction: a
+    /// future relaxation of the refusal must thread the pair's
+    /// effective bit through START instead of re-reading.
+    #[test]
+    fn template_pair_continuation_cannot_split_across_a_flip() {
+        fn blocked<'a>(source: &'a str, signature: &str, end: &str) -> Option<&'a str> {
+            source
+                .split_once(signature)
+                .map(|(_, tail)| tail)
+                .and_then(|tail| tail.split_once(end).map(|(text, _)| text))
+        }
+        fn contract(attach: &str, bpf: &str) -> bool {
+            let (Some(downgrade), Some(continuation)) = (
+                blocked(attach, "    pub fn downgrade_in_place(", "\n    }\n"),
+                blocked(bpf, "fn p11_entry_template_second_impl(", "\n}\n"),
+            ) else {
+                return false;
+            };
+            downgrade.contains("unsafe-decoder build takes today's path")
+                && continuation.contains("slot_count_only(slot)")
+                && continuation.contains("downgrade_in_place refuses unsafe")
+        }
+        let attach = include_str!("attach.rs");
+        let bpf = include_str!("../crates/ebpf/src/main.rs");
+        assert!(
+            contract(attach, bpf),
+            "the template continuation re-read stays pinned to the unsafe refusal"
+        );
+        let start = attach.find("    pub fn downgrade_in_place(").unwrap();
+        let tail =
+            attach[start..].replacen("unsafe-decoder build takes today's path", "REMOVED", 1);
+        assert!(
+            !contract(&format!("{}{}", &attach[..start], tail), bpf),
+            "removed the unsafe refusal"
+        );
+        let start = bpf.find("fn p11_entry_template_second_impl(").unwrap();
+        for marker in ["slot_count_only(slot)", "downgrade_in_place refuses unsafe"] {
+            let tail = bpf[start..].replacen(marker, "REMOVED", 1);
+            assert!(
+                !contract(attach, &format!("{}{}", &bpf[..start], tail)),
+                "removed {marker}"
+            );
+        }
+    }
+
     /// Loader parity: the capture loader resizes the count-only switch
     /// beside STATS, so a sized Detailed session and the switch agree
     /// on the slot universe.
@@ -24039,6 +24226,22 @@ mod tests {
         Ok(gate.get(&slot, 0)?)
     }
 
+    fn downgrade_tight_loop_evidence(session: &super::Session) -> anyhow::Result<(u64, u64, u64)> {
+        use anyhow::Context as _;
+        use p11scope_ebpf_common::{
+            EVIDENCE_RING_LOSS, EVIDENCE_SEMANTIC_CAPTURE_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
+        };
+        let map: aya::maps::PerCpuArray<_, u64> =
+            aya::maps::PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE")?)?;
+        let total =
+            |index| -> anyhow::Result<u64> { Ok(map.get(&index, 0)?.iter().copied().sum()) };
+        Ok((
+            total(EVIDENCE_RING_LOSS)?,
+            total(EVIDENCE_UNMATCHED_RETURNS)?,
+            total(EVIDENCE_SEMANTIC_CAPTURE_FAILURES)?,
+        ))
+    }
+
     fn downgrade_tight_loop_links(
         session: &super::Session,
     ) -> Vec<(Vec<u32>, super::ProducerProgram)> {
@@ -24055,8 +24258,9 @@ mod tests {
     /// provider). Every round keeps exact accounting (entered ==
     /// returned == ground truth), the link set never changes (no
     /// detach, no attach), the switch reads back set and the retained
-    /// slot follows the count-only descriptor. Between rounds a
-    /// white-box reset (switch cell 0, retained slot restored) opens
+    /// slot follows the count-only descriptor. Across all rounds no
+    /// EVIDENCE fault fires and no physical gap opens. Between rounds
+    /// a white-box reset (switch cell 0, retained slot restored) opens
     /// the next identical downgrade; the downgrade itself always runs
     /// the production path.
     #[ignore = "privileged: in-place count-only downgrade tight loop"]
@@ -24102,6 +24306,11 @@ mod tests {
         anyhow::ensure!(
             entered_base == 0 && returned_base == 0,
             "the idle child made no calls before the first burst: {entered_base}/{returned_base}"
+        );
+        let evidence_base = downgrade_tight_loop_evidence(&session)?;
+        anyhow::ensure!(
+            session.physical_gap_summary().episodes == 0,
+            "a fresh session opens with no physical gap"
         );
         for round in 0..ROUNDS {
             rig.send_go(CALLS_PER_ROUND)?;
@@ -24164,6 +24373,14 @@ mod tests {
                 .context("retained slot 0")?
                 .slot = original.clone();
         }
+        anyhow::ensure!(
+            downgrade_tight_loop_evidence(&session)? == evidence_base,
+            "fifty downgrades fault no ring loss, unmatched return or capture failure"
+        );
+        anyhow::ensure!(
+            session.physical_gap_summary().episodes == 0,
+            "fifty downgrades open no physical gap"
+        );
         eprintln!("downgrade tight loop: {ROUNDS} downgrades, exact counts, links unchanged");
         rig.finish()?;
         Ok(())

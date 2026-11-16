@@ -222,6 +222,7 @@ DRIVEN = {
     "test_image_identity_core.py": _ARTIFACT_CONTRACTS,
     "test_inventory_caller_object.py": "tests/inventory_caller_bpf_contracts.rs",
     "test_inventory_object.py": "tests/inventory_bpf_contracts.rs",
+    "test_journal_descriptor_source.py": "tests/journal_descriptor_source.rs",
     "test_lane02_prepared_dependencies.py": _ARTIFACT_CONTRACTS,
     "test_lane13_evidence.py": _ARTIFACT_CONTRACTS,
     "test_live_freeze_prepared_dependencies.py": "scripts/check-live-discovery-evidence.py",

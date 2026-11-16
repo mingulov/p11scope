@@ -2147,6 +2147,75 @@ class EntryObjectTests(unittest.TestCase):
                             variant, name,
                             mutate(OBJECTS[variant], consumer.name, pc, old, new))
 
+    def test_slot_count_only_set_arm_reads_no_arguments(self):
+        """Every consumer's switch-set arm reads no call arguments.
+
+        In-place downgrade (A'): code reachable only via the set edge
+        of a switch-flag branch must hold no argument-reader internal
+        call (capture_scalar/arg_u64/read_word/template/object-marker)
+        and no user-memory helper read. The contract proves it per
+        consumer; this test pins the empty inventory.
+        """
+        for variant in OBJECTS:
+            names = ["p11_entry", "ordinary_return", "object_return_ordinary"] \
+                if variant == "default" else [
+                    "p11_entry", "p11_entry_ia32", "p11_entry_template",
+                    "p11_entry_template_pair", "p11_entry_template_second",
+                    "p11_entry_template_types", "ordinary_return",
+                    "object_return_ordinary"]
+            for name in names:
+                with self.subTest(variant=variant, consumer=name):
+                    report = descriptor_source_case(variant, name)
+                    self.assertIn("set_arm_argument_reads", report,
+                                  f"{name} reports its set-arm read inventory")
+                    self.assertEqual(report["set_arm_argument_reads"], [],
+                                     f"{name} set arm reads no arguments")
+
+    def test_object_marker_calls_join_the_unset_side(self):
+        """OBJECT_DESCRIPTORS joins the gated-source inventory.
+
+        In-place downgrade (A'): the object marker is consulted only on
+        the switch-unset side — every in-consumer OBJECT_DESCRIPTORS
+        lookup and every object_marker_for internal call must carry
+        ("switch", "unset"). Entry roots must actually consult the
+        marker (non-vacuous); returns never do.
+        """
+        for variant in OBJECTS:
+            entries = ["p11_entry"] if variant == "default" else [
+                "p11_entry", "p11_entry_ia32", "p11_entry_template",
+                "p11_entry_template_pair", "p11_entry_template_second",
+                "p11_entry_template_types"]
+            returns = ["ordinary_return", "object_return_ordinary"]
+            for name in entries + returns:
+                with self.subTest(variant=variant, consumer=name):
+                    report = descriptor_source_case(variant, name)
+                    self.assertIn("object_marker_lookups", report,
+                                  f"{name} reports its object-marker lookups")
+                    self.assertIn("object_marker_calls", report,
+                                  f"{name} reports its object-marker calls")
+                    seen = len(report["object_marker_lookups"]) + len(report["object_marker_calls"])
+                    if name in entries:
+                        self.assertGreaterEqual(seen, 1,
+                                                f"{name} consults the object marker")
+                    else:
+                        self.assertEqual(seen, 0,
+                                         f"{name} never consults the object marker")
+
+    def test_switch_correlation_keeps_no_unsided_constant(self):
+        """The vestigial None-side keep is gone from _correlate.
+
+        A switch-gated selector meeting a re-arriving constant from an
+        unrefined (None-side) edge must not keep its correlation: only
+        a constant agreeing with its own side's value keeps it. The
+        unilateral absent-key keeps in merge_facts stay (they are
+        load-bearing for fixpoint re-delivery), with their soundness
+        argument pinned beside them.
+        """
+        source = (Path(__file__).resolve().parents[2] / "scripts/check-entry-object.py").read_text()
+        correlate = source.split("    def _correlate(")[1].split("\n    def flow_edges(")[0]
+        self.assertNotIn("side is None", correlate,
+                         "_correlate must not keep a gated selector for an unsided constant")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

@@ -57,6 +57,44 @@ fn begin_decision_calls_every_valid_context_and_gaps_the_rest() {
     }
 }
 
+/// In-place downgrade (A′): a count-only journal call (descriptor 0,
+/// planned or downgraded) skips BEGIN without a scope gap and without
+/// semantic-capture-failure evidence — an intended count-only slot is
+/// not a capture failure. The skip sits in `begin()` ahead of the
+/// `begin_decision` call, so the frozen `begin_decision` contract
+/// above (descriptor 0 gaps) stays untouched.
+#[test]
+fn count_only_calls_skip_begin_without_a_gap() {
+    const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
+    fn begin_body(source: &str) -> Option<&str> {
+        source
+            .split_once("    pub(crate) fn begin(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+    }
+    fn contract(source: &str) -> bool {
+        let Some(text) = begin_body(source) else {
+            return false;
+        };
+        match (text.find("descriptor == 0"), text.find("begin_decision(")) {
+            (Some(skip), Some(decide)) => skip < decide,
+            _ => false,
+        }
+    }
+    assert!(
+        contract(SOURCE),
+        "journal begin() must skip descriptor 0 ahead of begin_decision"
+    );
+    let start = SOURCE.find("    pub(crate) fn begin(").unwrap();
+    for marker in ["descriptor == 0", "begin_decision("] {
+        let tail = SOURCE[start..].replacen(marker, "REMOVED", 1);
+        assert!(
+            !contract(&format!("{}{}", &SOURCE[..start], tail)),
+            "removed {marker}"
+        );
+    }
+}
+
 #[test]
 fn completion_reason_names_result_lost_only_on_unjournaled() {
     use p11scope_ebpf_common::object_journal::{

@@ -22680,6 +22680,36 @@ impl Engine {
                 modules.len(),
                 proofs.len(),
             );
+            let mut filed = false;
+            for module in &modules {
+                if module.tables.is_empty() && module.interfaces.is_empty() {
+                    continue;
+                }
+                if !filed {
+                    filed = true;
+                    for pin in pins.pinned() {
+                        eprintln!(
+                            "p11scope: watch scan filed pin: key={}:{}:{} path={}",
+                            pin.key.device.major, pin.key.device.minor, pin.key.inode, pin.path,
+                        );
+                    }
+                }
+                let resolved = pins
+                    .id_for_scanned(module, module.key, &module.path)
+                    .is_some();
+                eprintln!(
+                    "p11scope: watch proof resolution for {}: key={}:{}:{} path={} \
+                     mountns={}:{} resolved={}",
+                    pid,
+                    module.key.device.major,
+                    module.key.device.minor,
+                    module.key.inode,
+                    module.path,
+                    module.mount_namespace.device,
+                    module.mount_namespace.inode,
+                    resolved,
+                );
+            }
         }
         if proofs.is_empty() {
             if image_changed {

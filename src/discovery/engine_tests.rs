@@ -4603,6 +4603,64 @@ fn revival_refresh_clears_detached_finalized_slots_after_two_observations() {
     assert_eq!(engine.plan.revivable().len(), 2);
 }
 
+/// N1 (tier-3 review of port3 fix1, rv1): a withheld semantic cell
+/// re-clears revivable with its semantic shape, not count-only. The
+/// refresh used to record every withheld seed count-only, so a
+/// withheld semantic generation disagreed with the retirement memory
+/// and `validate_slot_index` failed every later rebuild. The
+/// count-only seed beside it pins the unchanged shape.
+#[test]
+fn withheld_semantic_cell_revival_keeps_its_semantic_shape() {
+    let (descriptor, ambiguous) =
+        crate::kinds::descriptor_index(&["C_Sign".to_string()]);
+    assert!(
+        !ambiguous && descriptor != 0,
+        "the twin needs a semantic descriptor"
+    );
+    let slot = |index: u32, semantic: bool| plan::Slot {
+        index,
+        descriptor_index: if semantic { descriptor } else { 0 },
+        object: PinnedObjectId(43),
+        object_path: "/opt/revive.so".into(),
+        file_offset: u64::from(index) * 8,
+        names: vec!["C_Sign".into()],
+        aliased: false,
+        semantics: crate::kinds::DESCRIPTORS[if semantic { descriptor } else { 0 } as usize],
+        semantic_authorized: semantic,
+        semantic_ambiguous: false,
+        fork_safe: false,
+        module_ids: vec![plan::ModuleId(0)],
+    };
+    let mut engine = Engine::empty();
+    engine.plan = plan::AttachPlan::from_slots(vec![slot(0, true), slot(1, false)]);
+    engine.plan.deactivate(0);
+    engine.plan.deactivate(1);
+    let key = |position: usize| plan::AttachKey::of(&engine.plan.slots[position]);
+    let (sem_key, co_key) = (key(0), key(1));
+    assert_eq!(
+        engine.plan.retired_keys().get(&sem_key),
+        Some(&plan::RetiredPositions::at(true, 0)),
+        "deactivate remembers the real shape"
+    );
+    engine.withheld_revivable.insert(sem_key, 0);
+    engine.withheld_revivable.insert(co_key, 1);
+    engine.refresh_revivable(&ScriptedSession::default());
+    assert_eq!(
+        engine.plan.revivable().get(&sem_key),
+        Some(&plan::RetiredPositions::at(true, 0)),
+        "a withheld semantic cell re-clears semantic"
+    );
+    assert_eq!(
+        engine.plan.revivable().get(&co_key),
+        Some(&plan::RetiredPositions::at(false, 1)),
+        "a withheld count-only cell still re-clears count-only"
+    );
+    engine
+        .plan
+        .validate_slot_index()
+        .expect("revival agrees with the retirement memory");
+}
+
 /// An awaiting-publication gap ranks below a counted capacity refusal in the
 /// engine history the report renders. A closure that starts unpublished
 /// records "nothing published yet"; when it later publishes tables but the
@@ -28975,6 +29033,170 @@ fn exhaustion_withhold_preserves_surviving_attached_slot_indices() {
         "the wait gap is filed: {:?}",
         engine.counters.object_skips
     );
+
+    // Next-tick retry through the ordinary seed path: the withheld
+    // endpoint re-derives IN PLACE at index 0 — no fresh cell is
+    // consumed — and the completed slot is untouched.
+    let mut retry = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .unwrap();
+    let placement = place_count_only_seed(&mut retry, seed);
+    assert_eq!(placement, SeedPlacement::Placed);
+    assert_eq!(
+        retry
+            .delta
+            .new
+            .iter()
+            .map(|slot| slot.index)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "the retry re-derives the withheld endpoint at its own index"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, retry, &mut additions_allowed, false, &[])
+        .unwrap();
+    assert_eq!(session.attached_slots, [1]);
+    assert_eq!(
+        session
+            .attached_requests
+            .iter()
+            .map(|request| request.iter().map(|(slot, _, _)| *slot).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![vec![0]],
+        "the retry attaches the same index the hole held"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        2,
+        "the retry consumed no fresh cell"
+    );
+    assert_eq!(engine.plan.slot_index_for_key(low_key), Some(0));
+    assert_eq!(engine.plan.slot_index_for_key(high_key), Some(1));
+    assert!(outcome.static_failures.is_empty());
+}
+
+/// N1 semantic variant (tier-3 review of port3 fix1, rv1): fd
+/// exhaustion withholds whatever shape failed, semantic included.
+/// Like `exhaustion_withhold_preserves_surviving_attached_slot_indices`
+/// the lower cell waits while the higher completes — but the waiting
+/// cell is semantic, so its withheld seed must re-clear semantic:
+/// pre-fix the refresh recorded it count-only and the retry's rebuild
+/// failed validation instead of re-deriving the key in place.
+#[test]
+fn exhaustion_withhold_reuses_a_semantic_cell_in_place_on_retry() {
+    let (_fixture, view, module, pins) = loaded_seed_provider();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let mut candidate = engine
+        .live_candidate(pins.clone(), vec![module.clone()], Vec::new())
+        .unwrap();
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let collected = engine.collect_dynamic_export_work(
+        LoaderContextId::from_case_id(0),
+        std::slice::from_ref(&module),
+        &candidate.pinned,
+        &ScriptedSession::default(),
+        false,
+        &[],
+    );
+    let seed = &collected.count_only_seeds[0];
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    // Two cells on one object: the lower waits, the higher completes.
+    let low = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object: seed.object,
+            object_path: seed.object_path.clone(),
+            file_offset: seed.file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    let high = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object: seed.object,
+            object_path: seed.object_path.clone(),
+            file_offset: seed.file_offset.wrapping_add(8),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!((low.index, high.index), (0, 1));
+    let low_key = plan::AttachKey::of(&low);
+    let high_key = plan::AttachKey::of(&high);
+    candidate.delta.new.push(low.clone());
+    candidate.delta.new.push(high.clone());
+    // The lower cell is semantic when the fd table exhausts: same key,
+    // same names, a real descriptor with authority.
+    let (descriptor, ambiguous) =
+        crate::kinds::descriptor_index(&["C_GetFunctionList".to_string()]);
+    assert!(
+        !ambiguous && descriptor != 0,
+        "the twin needs a semantic descriptor"
+    );
+    let semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+    for slot in [
+        &mut candidate.plan.slots[low.index as usize],
+        &mut candidate.delta.new[0],
+    ] {
+        slot.descriptor_index = descriptor;
+        slot.semantics = semantics;
+        slot.semantic_authorized = true;
+    }
+
+    let mut session = ScriptedSession::default();
+    session.fail_target_slots([low.index]);
+    session.exhaust_target_slots([low.index]);
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .unwrap();
+
+    assert!(outcome.required_complete());
+    assert_eq!(session.attached_slots, [2]);
+    assert_eq!(
+        engine.plan.slots.len(),
+        2,
+        "both cells survive, the hole stays a hole"
+    );
+    assert_eq!(
+        engine.plan.slot_index_for_key(high_key),
+        Some(1),
+        "the completed slot still publishes its submitted index"
+    );
+    assert_eq!(
+        engine.plan.slot_index_for_key(low_key),
+        None,
+        "the withheld key leaves the index for next-tick re-derivation"
+    );
+    assert!(
+        outcome.static_failures.is_empty(),
+        "the withheld slot pends, it did not fail: {:?}",
+        outcome.static_failures
+    );
+    // The N1 pin: the withheld semantic generation re-clears semantic,
+    // so the committed plan still validates for the next rebuild.
+    assert_eq!(
+        engine.plan.revivable().get(&low_key),
+        Some(&plan::RetiredPositions::at(true, 0)),
+        "a withheld semantic cell re-clears semantic"
+    );
+    engine
+        .plan
+        .validate_slot_index()
+        .expect("the withheld plan stays rebuildable");
 
     // Next-tick retry through the ordinary seed path: the withheld
     // endpoint re-derives IN PLACE at index 0 — no fresh cell is

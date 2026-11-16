@@ -988,6 +988,18 @@ stopped: a short-lived descendant that cold-loads the provider teaches
 the run its file for every later mapper, while the first mapper's own
 calls made before the attach stay missing and the run reports
 `PARTIAL` with `pid_descendant_gaps` plus the learned-file gap row.
+The run also learns the transient member's decoded provider tables,
+not just its file: when a short-lived descendant maps a getter-only
+provider (hidden table symbols, nothing to pre-arm), the owned-tree
+watch scans it and the decoded tables persist as run inputs, so
+later mappers' table calls attach without waiting for frame
+admission. Those per-function counts are standard-layout names, not
+proven: attribution stays withheld and nothing is decoded from the
+tables (no mechanisms, no arguments). Calls made before the tables
+attach stay missing inside the module's disclosed
+`late_discovery`/`mapped_unattached` window. The learned-table store
+holds 32 modules beside the 32 learned files; past either cap the
+refusal is named and counted (`learned_cap_skipped`).
 Pass `--prearm-module` for the provider when the very first mapper's
 calls must land then too. (`sudo`/`setuid` inside the command cannot elevate under the
 child's `no_new_privs` hardening, so privilege hops are not a

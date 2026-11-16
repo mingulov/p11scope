@@ -3209,6 +3209,32 @@ a silent drop.
   at run time inside its own data; it scans the program object as well,
   so the two may also be combined.
 
+### Default `run` learns short-lived members' tables, names-first
+
+- What the user sees: a default `run` (no manifest) over short-lived
+  descendants that map a getter-only provider (hidden table symbols,
+  nothing to pre-arm) learns the transient members' decoded tables
+  as run inputs, so later mappers' table calls are counted without
+  waiting for frame admission. The per-function counts are
+  standard-layout names, not proven: attribution is withheld
+  (`semantic_unverified_slots`) and nothing is decoded from the
+  tables (no mechanisms, no arguments). The report stays `PARTIAL`:
+  calls made before the tables attached stay missing inside the
+  module's disclosed `late_discovery`/`mapped_unattached` window,
+  and departed unadmitted members still count `pid_descendant_gaps`.
+  A member mapped for less than about a hundred milliseconds can
+  still leave nothing to scan, and a provider whose tables the scan
+  cannot decode stays getter-only; both keep their existing named
+  gaps.
+- Kernels/conditions: all kernels; short-lived descendants under
+  `run` with the pause chain disarmed (`--pause never`) or refused.
+- Disclosure: the windows and gap counts above, in text and JSON;
+  the learned-table store holds 32 modules beside the 32 learned
+  files, and either cap refusal is named and counted
+  (`learned_cap_skipped`).
+- Workaround: `--prearm-module` for the provider when the very first
+  mapper's calls must land too.
+
 ## Scopes (cgroup and pod)
 
 ### `inventory --cgroup` does not exist (DR-03)

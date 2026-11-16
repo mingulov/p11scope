@@ -486,6 +486,15 @@ pub struct Engine {
     /// outside the table by design (D2) and only file a row once
     /// their staging pin acquires through `DeferredReason::Learned`.
     pending_learned: Vec<crate::fanotify::LearnedCandidate>,
+    /// Run-persistent learned tables (E1): transient owned-run scans'
+    /// decoded tables and interfaces, unioned by file identity under
+    /// the reserved [`Self::RUN_LEARNED_VIEW_ID`] owner. Every live
+    /// candidate binds them as scan inputs, so a getter-only
+    /// provider (hidden symbols, nothing to pre-arm) attaches its
+    /// table functions without waiting for frame admission. Never
+    /// retired (no view owns them) and never rescanned; bounded by
+    /// the learned-file cap, with loud refusal past it.
+    run_learned_modules: Vec<ScannedModule>,
     /// Provider files the fanotify drain staged for attachment.
     learned_staged_files: u64,
     /// Learning loss: queue overflows, lost tails, drain deaths.
@@ -5044,9 +5053,6 @@ struct OwnedLearnProof {
     object: PinnedObjectId,
     loader_exe: Option<String>,
     loader_unknown_reason: Option<&'static str>,
-    /// Scaffolding: the run-table harvest reads this (the next
-    /// commit); until then it is carried, not consumed.
-    #[allow(dead_code)]
     module: ScannedModule,
 }
 
@@ -13671,6 +13677,7 @@ impl Engine {
             learned_settled: BTreeSet::new(),
             learned_waited: BTreeMap::new(),
             pending_learned: Vec::new(),
+            run_learned_modules: Vec::new(),
             learned_staged_files: 0,
             learned_event_loss: 0,
             learned_cap_skipped: 0,
@@ -17552,15 +17559,17 @@ impl Engine {
         counters.object_skips
     }
 
-    /// Merges a watch scan's counters without dirtying publication: a
-    /// transient watch scan changes no plan input, so its telemetry
-    /// (time, noise) must not invalidate the loader-plan cache nor
-    /// force a tail republish every 10 ms. Memory-refused races count
-    /// per cause in the merged scan noise (the scan already noted
-    /// each) and file no gap row: a transient member's mid-scan exit
-    /// is already counted exactly as an exit, and a live member's race
-    /// retries on backoff. Only a newly unavailable scan dirties the
-    /// revision.
+    /// Merges a watch scan's counters without dirtying publication:
+    /// the scan's telemetry (time, noise) must not invalidate the
+    /// loader-plan cache nor force a tail republish every 10 ms. A
+    /// harvest of the scan's decoded tables still dirties through
+    /// [`Self::harvest_run_learned_tables`] (new plan inputs need a
+    /// republish), but only when the store grows, never per scan.
+    /// Memory-refused races count per cause in the merged scan noise
+    /// (the scan already noted each) and file no gap row: a transient
+    /// member's mid-scan exit is already counted exactly as an exit,
+    /// and a live member's race retries on backoff. Only a newly
+    /// unavailable scan dirties the revision here.
     fn absorb_watch_scan_counters(&mut self, counters: DiscoveryCounters) {
         let unavailable_new =
             counters.scan_unavailable.is_some() && self.counters.scan_unavailable.is_none();
@@ -17860,6 +17869,12 @@ impl Engine {
             self.invalidate_causal_timing();
         }
         self.note_object_skips(skipped);
+        // Run-persistent learned tables (E1) join every live
+        // candidate ahead of the rejection filter, so they bind
+        // exactly like frame-scan tables. The reserved owner view
+        // is never retired, so their slots persist for the run and
+        // later mappers' calls attach without frame admission.
+        raw_modules.extend(self.run_learned_modules.iter().cloned());
         raw_modules.retain(|module| {
             !pinned.rejects(module.key)
                 && !module
@@ -22442,7 +22457,8 @@ impl Engine {
     }
 
     /// Scans one watched member through a fresh transient view and
-    /// stages any provider file the scan proves; the member then leaves
+    /// stages any provider file the scan proves, harvesting the
+    /// scan's decoded tables beside it; the member then leaves
     /// rotation (its file is learned). A view that cannot be opened
     /// means the member left (dropped at once, not at the next
     /// enumeration) — unless the capture budget refused the open, which
@@ -22657,7 +22673,11 @@ impl Engine {
     /// skipped); the shared learned machinery below pins, classifies,
     /// caps, gaps and attaches exactly like a fanotify-learned file,
     /// including the fixed first-use gap row and the loader note.
-    /// No-op outside owned `run` captures on their cgroup scope.
+    /// The proof's decoded tables harvest beside the file
+    /// ([`Self::harvest_run_learned_tables`]): file staging and
+    /// table harvest are independent, so tables persist even when
+    /// the file already staged (or was refused) through another
+    /// path. No-op outside owned `run` captures on their cgroup scope.
     fn learn_owned_proofs(&mut self, pins: &PinnedObjects, proofs: &[OwnedLearnProof]) {
         use std::os::unix::fs::MetadataExt as _;
         if self.owned_run_pid.is_none() || !matches!(self.scope, Scope::Cgroup { .. }) {
@@ -22672,6 +22692,7 @@ impl Engine {
             if self.owned_run_view(proof.view) {
                 continue;
             }
+            self.harvest_run_learned_tables(pins, proof);
             let Some(file) = pins.file_for(proof.object) else {
                 continue;
             };
@@ -22715,6 +22736,131 @@ impl Engine {
                 self.pending_learned.push(learned);
             }
         }
+    }
+
+    /// Persists one proof's decoded tables and interfaces as
+    /// run-persistent scan inputs ([`Self::run_learned_modules`]).
+    /// Without this, a transient prover teaches the run its file
+    /// only: a getter-only provider (hidden symbols, nothing to
+    /// pre-arm) then attaches its three getters and stays blind to
+    /// every table call. Harvested tables bind in every live
+    /// candidate exactly like frame-scan tables, so later mappers'
+    /// calls attach without waiting for frame admission.
+    ///
+    /// The proving view may already have exited (or never be
+    /// admitted), so the stored module is re-owned by the reserved
+    /// [`Self::RUN_LEARNED_VIEW_ID`]: no retirement ever drops it,
+    /// and same-file proofs from later provers union into it. The
+    /// proof's pins join the committed set first (absorb merges by
+    /// identity, so the later file staging and live applies resolve
+    /// the same objects); proofs that add no new object identity
+    /// union tables only, without re-absorbing. Bounded by the
+    /// learned-file cap: past it the tables refuse loudly through
+    /// the same finite cap row as the files. A harvest that grows
+    /// the store owes the expedited frame and the learned apply, so
+    /// members the first-map stop holds resume with table probes
+    /// attached instead of at their bound.
+    fn harvest_run_learned_tables(&mut self, pins: &PinnedObjects, proof: &OwnedLearnProof) {
+        if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
+            return;
+        }
+        let mut module = proof.module.clone();
+        module.view = Self::RUN_LEARNED_VIEW_ID;
+        let already_stored = self.run_learned_modules.iter().any(|known| {
+            known.view == module.view
+                && known.mount_namespace == module.mount_namespace
+                && known.key == module.key
+                && known.path == module.path
+                && known.pre_copy_up == module.pre_copy_up
+        });
+        if !already_stored
+            && self.run_learned_modules.len() >= crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP
+        {
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_CAP_REASON,
+            );
+            return;
+        }
+        // Absorb the proving scan's pins when they carry object
+        // identity the store has not seen: the candidate bind below
+        // resolves module and entry objects through the committed
+        // set. Re-absorbing every proof would stack duplicate bind
+        // claims; absorbing once per new identity keeps the join
+        // bounded while a later fuller proof still contributes its
+        // dependencies.
+        let mut wanted: BTreeSet<ObjectKey> = BTreeSet::from([module.key]);
+        wanted.extend(
+            module
+                .tables
+                .iter()
+                .flat_map(|table| &table.entries)
+                .map(|entry| entry.object),
+        );
+        let mut known: BTreeSet<ObjectKey> = BTreeSet::new();
+        for stored in &self.run_learned_modules {
+            if stored.mount_namespace == module.mount_namespace && stored.key == module.key {
+                known.insert(stored.key);
+                known.extend(
+                    stored
+                        .tables
+                        .iter()
+                        .flat_map(|table| &table.entries)
+                        .map(|entry| entry.object),
+                );
+            }
+        }
+        if !wanted.is_subset(&known) {
+            let absorbed = self.pinned.absorb(pins.clone());
+            attribution::note_all(&absorbed);
+            self.counters.object_skips.extend(absorbed);
+        }
+        let before = (
+            self.run_learned_modules.len(),
+            self.run_learned_modules
+                .iter()
+                .map(|stored| {
+                    (
+                        stored.tables.len(),
+                        stored.interfaces.len(),
+                        stored.exports.len(),
+                    )
+                })
+                .fold((0usize, 0usize, 0usize), |total, one| {
+                    (
+                        total.0.saturating_add(one.0),
+                        total.1.saturating_add(one.1),
+                        total.2.saturating_add(one.2),
+                    )
+                }),
+        );
+        merge_scanned_module(&mut self.run_learned_modules, module);
+        let after = (
+            self.run_learned_modules.len(),
+            self.run_learned_modules
+                .iter()
+                .map(|stored| {
+                    (
+                        stored.tables.len(),
+                        stored.interfaces.len(),
+                        stored.exports.len(),
+                    )
+                })
+                .fold((0usize, 0usize, 0usize), |total, one| {
+                    (
+                        total.0.saturating_add(one.0),
+                        total.1.saturating_add(one.1),
+                        total.2.saturating_add(one.2),
+                    )
+                }),
+        );
+        if after == before {
+            return;
+        }
+        self.plan_rebuild_stable = false;
+        self.learned_unapplied = true;
+        self.learned_frame_owed = true;
+        self.note_facts_mutated();
     }
 
     /// Drains the learn channel once per tick, before the discovery pass:
@@ -31253,6 +31399,15 @@ impl Engine {
     /// scan-result emptiness is ever read; modules, pins and the ID itself
     /// are discarded.
     const PROBATIONARY_VIEW_ID: ProcessViewId = ProcessViewId(u32::MAX);
+
+    /// Reserved owner for run-persistent learned tables (E1): never
+    /// allocated either, and distinct from the probationary
+    /// sentinel. Learned tables file their bind claims under it, so
+    /// no view retirement ever drops them; every live candidate
+    /// rebinds them as scan inputs. No `ProcessView` ever carries
+    /// this ID, and no engine path may open, retain, refresh or
+    /// retire it.
+    const RUN_LEARNED_VIEW_ID: ProcessViewId = ProcessViewId(u32::MAX - 1);
 
     /// Probationary provider probe for a pending newcomer with no view slot
     /// and no evictable view anywhere (Lane-A P3, the last resort). Opens

@@ -3940,7 +3940,11 @@ struct CompletedEntry {
     descriptor: u32,
     layout: u8,
     completed: u8,
-    reserved: u16,
+    /// The slot's `SLOT_COUNT_ONLY` bit at entry (0/1). The journal
+    /// root narrows only on this bit: the cookie descriptor alone
+    /// cannot tell a downgraded slot from a planned descriptor 0.
+    switched: u8,
+    reserved: u8,
 }
 
 #[cfg(not(feature = "inventory-only"))]
@@ -3955,6 +3959,7 @@ impl Default for CompletedEntry {
             descriptor: 0,
             layout: 0,
             completed: 0,
+            switched: 0,
             reserved: 0,
         }
     }
@@ -4368,15 +4373,17 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
             core::ptr::addr_of_mut!((*completed).key.pid_tgid).write(key.pid_tgid);
             core::ptr::addr_of_mut!((*completed).key.slot).write(key.slot);
             core::ptr::addr_of_mut!((*completed).key._pad).write(0);
-            core::ptr::addr_of_mut!((*completed).descriptor).write(if count_only {
-                0
-            } else {
-                cookie_descriptor(cookie_of(&ctx))
-            });
+            // The token carries the cookie descriptor unchanged plus
+            // the switch bit: the journal root needs the downgraded
+            // cookie for its class lookup, and a narrowed 0 here
+            // would be indistinguishable from a planned descriptor 0.
+            core::ptr::addr_of_mut!((*completed).descriptor)
+                .write(cookie_descriptor(cookie_of(&ctx)));
             core::ptr::addr_of_mut!((*completed).layout).write(match layout {
                 LinuxLayout::Lp64 => 1,
                 LinuxLayout::Ilp32 => 2,
             });
+            core::ptr::addr_of_mut!((*completed).switched).write(u8::from(count_only));
             core::ptr::addr_of_mut!((*completed).reserved).write(0);
             core::ptr::addr_of_mut!((*completed).completed).write(1);
         }

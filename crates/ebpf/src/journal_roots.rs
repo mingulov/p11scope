@@ -89,7 +89,9 @@ pub(crate) fn entry_context(
 /// Pure BEGIN custody decision shared by the BPF root and the host proof.
 /// Every valid context calls the native BEGIN function, including
 /// proved-irrelevant class zero; the native function's own validation
-/// decides. There is no skip arm.
+/// decides. The narrowed (switched-slot) arm lives in
+/// [`begin_action`], never here: this frozen decision keeps mapping
+/// descriptor 0 to Gap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BeginDecision {
     Call(EntryContext),
@@ -105,6 +107,45 @@ pub(crate) fn begin_decision(
     match entry_context(descriptor, configured_class, layout) {
         Some(context) => BeginDecision::Call(context),
         None => BeginDecision::Gap,
+    }
+}
+
+/// BEGIN custody action shared by the BPF root and the host proof:
+/// the frozen [`begin_decision`] plus the in-place downgrade (A′)
+/// narrowed arm. A switched slot skips silently only for a
+/// proved-irrelevant configured class; an affecting (or unknown)
+/// class gaps without semantic-capture-failure evidence, since an
+/// intended narrowing is not a capture failure but its history is
+/// honestly incomplete. Anything unswitched — including a planned
+/// descriptor 0, and a descriptor 0 seen with the bit set (a planned
+/// slot over a stale switch) — keeps the frozen decision, Gap with
+/// evidence included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BeginAction {
+    Skip,
+    Call(EntryContext),
+    Gap { evidence: bool },
+}
+
+#[inline(always)]
+pub(crate) fn begin_action(
+    switched: bool,
+    descriptor: u32,
+    configured_class: u32,
+    layout: LinuxLayout,
+) -> BeginAction {
+    // Only a downgraded cookie descriptor narrows: a set bit with
+    // descriptor 0 is a planned slot, never a downgrade (a downgrade
+    // keeps its nonzero link cookie), so it keeps today's Gap path.
+    if switched && descriptor != 0 {
+        return match configured_class {
+            1 => BeginAction::Skip,
+            _ => BeginAction::Gap { evidence: false },
+        };
+    }
+    match begin_decision(descriptor, configured_class, layout) {
+        BeginDecision::Call(context) => BeginAction::Call(context),
+        BeginDecision::Gap => BeginAction::Gap { evidence: true },
     }
 }
 
@@ -185,7 +226,7 @@ pub(crate) unsafe fn initialize_end(
 #[cfg(target_arch = "bpf")]
 pub(super) mod program {
     use super::{
-        BeginDecision, EntryContext, ReturnWords, RoutingWord, begin_decision, completion_reason,
+        BeginAction, EntryContext, ReturnWords, RoutingWord, begin_action, completion_reason,
         initialize_end,
     };
     use crate::*;
@@ -223,7 +264,12 @@ pub(super) mod program {
                     return 0;
                 }
             };
-            begin(&completed.key, completed.descriptor, layout);
+            begin(
+                &completed.key,
+                completed.descriptor,
+                layout,
+                completed.switched != 0,
+            );
         }
         stop_gate_leave();
         0
@@ -254,29 +300,32 @@ pub(super) mod program {
     }
 
     #[inline(never)]
-    pub(crate) fn begin(key: &StartKey, descriptor: u32, layout: LinuxLayout) {
-        // In-place downgrade (A′): a count-only call (descriptor 0,
-        // planned or downgraded) skips BEGIN without a scope gap and
-        // without semantic-capture-failure evidence. An intended
-        // count-only slot is not a capture failure: counts stay exact
-        // through STATS, and the call journals nothing (its return
-        // completes as an UNJOURNALED END, the pre-existing shape for
-        // count-only slots). Controller ruling 2026-11-16 07:43
-        // (REPLACE-INPLACE B1b).
-        if descriptor == 0 {
-            return;
-        }
+    pub(crate) fn begin(key: &StartKey, descriptor: u32, layout: LinuxLayout, switched: bool) {
+        // In-place downgrade (A′): the skip consults the slot's
+        // switch bit, never the descriptor alone. A switched slot
+        // skips BEGIN silently only for a proved-irrelevant class;
+        // an affecting class gaps without evidence (an intended
+        // narrowing is not a capture failure, but its history is
+        // honestly incomplete). A planned descriptor 0 keeps today's
+        // Gap path with evidence. Counts stay exact through STATS in
+        // every arm, and a never-begun call completes as an
+        // UNJOURNALED END, the pre-existing shape for count-only
+        // slots. Controller rulings 2026-11-16 07:43 (REPLACE-INPLACE
+        // B1b) and 14:57 (t3 B2/I1).
         let configured = JOURNAL_CLASSES.get(descriptor).copied().unwrap_or(0);
         // Irrelevant is configured explicitly and still takes the native
         // call; the native function's own validation decides. Unknown never
         // takes the Call arm.
-        match begin_decision(descriptor, configured, layout) {
-            BeginDecision::Call(context) => {
+        match begin_action(switched, descriptor, configured, layout) {
+            BeginAction::Skip => {}
+            BeginAction::Call(context) => {
                 unsafe { p11_journal_begin(key, &context) };
             }
-            BeginDecision::Gap => {
+            BeginAction::Gap { evidence } => {
                 gap();
-                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+                if evidence {
+                    bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+                }
             }
         }
     }

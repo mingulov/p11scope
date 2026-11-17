@@ -128,6 +128,13 @@ struct {
 
 extern unsigned char COUNTER_HEALTH;
 extern unsigned char RV_COUNTS;
+/* Kernel evidence cells this bridge counts into, mirroring
+ * crates/ebpf-common/src/lib.rs (EVIDENCE_*). The object_journal producer
+ * already spells indices literally; these defines keep the two bank
+ * bridges and their host harness on one spelling. */
+#define BANK_EVIDENCE_UNMATCHED_RETURNS 2U
+#define BANK_EVIDENCE_RV_UPDATE_FAILURES 3U
+extern unsigned char EVIDENCE;
 extern u32 p11_owner_start_aggregate(const struct owner_start_key *, u64);
 extern void *p11_owner_start_get(const struct owner_start_key *, u32);
 extern long p11_owner_start_remove(const struct owner_start_key *, u32);
@@ -138,6 +145,15 @@ static INLINE void fault(u64 reason)
     u64 *cell = owner_map_lookup(&COUNTER_BANK_FAULT, &zero);
     if (cell)
         __sync_fetch_and_or(cell, reason);
+}
+
+/* Per-item kernel evidence, mirroring bump_evidence: saturating, and a
+ * missing cell is never a fault (some harnesses stub no evidence map). */
+static INLINE void bump_evidence(u32 index)
+{
+    u64 *cell = owner_map_lookup(&EVIDENCE, &index);
+    if (cell && *(volatile u64 *)cell != ~0ULL)
+        __sync_fetch_and_add(cell, 1);
 }
 
 static INLINE void unhealthy(u32 disposition)

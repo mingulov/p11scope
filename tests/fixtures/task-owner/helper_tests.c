@@ -108,7 +108,7 @@ static int gate_ctl_present = 1;
 #endif
 #ifdef P11SCOPE_BANK_TIMING_SUITES
 /* Map identities for the timing bank producer (extern in its TU). */
-unsigned char COUNTER_HEALTH, RV_COUNTS;
+unsigned char COUNTER_HEALTH, RV_COUNTS, EVIDENCE;
 #endif
 struct task_struct { int index; };
 static struct task_struct tasks[3] = {{0}, {1}, {2}};
@@ -151,6 +151,9 @@ static u64 bank_health_cells[2];
  * skew (the row lands between lookup and insert), while fail_rv_insert
  * models a full table. */
 static int rv_lookup_miss_once, fail_rv_insert;
+/* Nine evidence cells (EVIDENCE_CELLS in crates/ebpf-common/src/lib.rs),
+ * addressed by the bridge's BANK_EVIDENCE_* indices. */
+static u64 evidence_cells[9];
 /* Models kernel use-after-delete: a removed START row's bytes are no
  * longer readable. The ts-order suite arms it; a read-after-remove then
  * observes zero instead of the retired timestamp. */
@@ -290,6 +293,10 @@ static void *lookup(void *map, const void *key)
     if (map == &COUNTER_HEALTH) {
         u32 disposition = *(const u32 *)key;
         return disposition < 2 ? &bank_health_cells[disposition] : NULL;
+    }
+    if (map == &EVIDENCE) {
+        u32 index = *(const u32 *)key;
+        return index < 9 ? &evidence_cells[index] : NULL;
     }
 #endif
 #ifdef P11SCOPE_HOST_OWNER_LOOP
@@ -507,6 +514,7 @@ static void reset(void)
     bank_health_cells[0] = bank_health_cells[1] = 0;
     scrub_start_on_delete = 0;
     rv_lookup_miss_once = fail_rv_insert = 0;
+    memset(evidence_cells, 0, sizeof(evidence_cells));
 #endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     fail_object_side_update = fail_object_side_delete = drop_zero_row = poison_zero_row = 0;
@@ -3133,8 +3141,7 @@ static void bank_timing_rv_insert_race_counts_into_peer_row(void)
 }
 
 /* A real RV insert failure (a full table) keeps endpoint counts exact,
- * latches the RV fault, and reports the lost row to the roots for
- * per-item evidence. */
+ * latches the RV fault, and counts the lost row as an RV update failure. */
 static void bank_timing_rv_insert_failure_reports_loss(void)
 {
     reset(); object_setup();
@@ -3142,13 +3149,14 @@ static void bank_timing_rv_insert_failure_reports_loss(void)
     bank_publish_route(7, 1, 0, 512);
     assert(!p11_bank_enter_timed(7, pid_tgid(), 1000));
     fail_rv_insert = 1;
-    assert(p11_bank_complete_timed(7, pid_tgid(), 0x600000001ULL, 1, 2500) == 2);
+    assert(!p11_bank_complete_timed(7, pid_tgid(), 0x600000001ULL, 1, 2500));
     fail_rv_insert = 0;
     struct owner_start_key key = start_key(7);
     assert(!p11_owner_start_get(&key, 0));
     assert(bank_cell(7)->returned == 1);
     assert(bank_cell(7)->errors == 1);
     assert(bank_fault_cell == BANK_RV_FAULT);
+    assert(evidence_cells[BANK_EVIDENCE_RV_UPDATE_FAILURES] == 1);
     struct bank_rv_key rv = { .slot = 7, .pad = 0, .rv = 0x600000001ULL };
     assert(!lookup(&RV_COUNTS, &rv));
     assert(!bank_health_cells[0] && !bank_health_cells[1]);

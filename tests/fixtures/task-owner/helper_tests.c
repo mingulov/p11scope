@@ -146,6 +146,11 @@ static struct {
 } bank_inners[16];
 static u64 bank_fault_cell;
 static u64 bank_health_cells[2];
+/* RV insert-outcome injection, scoped to RV_COUNTS so START/route traffic
+ * stays live: a one-shot first-lookup miss models the insert-race timing
+ * skew (the row lands between lookup and insert), while fail_rv_insert
+ * models a full table. */
+static int rv_lookup_miss_once, fail_rv_insert;
 /* Models kernel use-after-delete: a removed START row's bytes are no
  * longer readable. The ts-order suite arms it; a read-after-remove then
  * observes zero instead of the retired timestamp. */
@@ -307,12 +312,22 @@ static void *lookup(void *map, const void *key)
         return NULL;
 #endif
     struct row *r = row(map, key);
+#ifdef P11SCOPE_BANK_TIMING_SUITES
+    if (map == &RV_COUNTS && rv_lookup_miss_once) {
+        rv_lookup_miss_once = 0;
+        return NULL;
+    }
+#endif
     return r ? r->value : NULL;
 }
 static long update(void *map, const void *key, const void *data, u64 flags)
 {
     size_t width = 24;
     if (update_error) return update_error;
+#ifdef P11SCOPE_BANK_TIMING_SUITES
+    if (map == &RV_COUNTS && fail_rv_insert)
+        return -7; /* E2BIG: a full table, as the kernel reports it. */
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &OBJECT_START && fail_object_side_update) return fail_object_side_update;
 #endif
@@ -491,6 +506,7 @@ static void reset(void)
     bank_fault_cell = 0;
     bank_health_cells[0] = bank_health_cells[1] = 0;
     scrub_start_on_delete = 0;
+    rv_lookup_miss_once = fail_rv_insert = 0;
 #endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     fail_object_side_update = fail_object_side_delete = drop_zero_row = poison_zero_row = 0;
@@ -3093,6 +3109,50 @@ static void bank_timing_enter_stores_clock(void)
     assert(row);
     assert(*(u64 *)(row + OBJECT_CALL_START_TS_OFF) == 424242);
 }
+
+/* A peer RV insert that lands between our lookup and our insert is not a
+ * loss: the insert reports EEXIST, the re-lookup finds the peer's row,
+ * and the completion counts into it with no fault. */
+static void bank_timing_rv_insert_race_counts_into_peer_row(void)
+{
+    reset(); object_setup();
+    scrub_start_on_delete = 1;
+    bank_publish_route(7, 1, 0, 512);
+    assert(!p11_bank_enter_timed(7, pid_tgid(), 1000));
+    struct bank_rv_key rv = { .slot = 7, .pad = 0, .rv = 0x600000001ULL };
+    u64 peer = 5;
+    assert(!update(&RV_COUNTS, &rv, &peer, 1));
+    rv_lookup_miss_once = 1;
+    assert(!p11_bank_complete_timed(7, pid_tgid(), 0x600000001ULL, 1, 2500));
+    u64 *cell = lookup(&RV_COUNTS, &rv);
+    assert(cell && *cell == 6);
+    assert(bank_cell(7)->returned == 1);
+    assert(bank_cell(7)->errors == 1);
+    assert(bank_fault_cell == 0);
+    assert(!bank_health_cells[0] && !bank_health_cells[1]);
+}
+
+/* A real RV insert failure (a full table) keeps endpoint counts exact,
+ * latches the RV fault, and reports the lost row to the roots for
+ * per-item evidence. */
+static void bank_timing_rv_insert_failure_reports_loss(void)
+{
+    reset(); object_setup();
+    scrub_start_on_delete = 1;
+    bank_publish_route(7, 1, 0, 512);
+    assert(!p11_bank_enter_timed(7, pid_tgid(), 1000));
+    fail_rv_insert = 1;
+    assert(p11_bank_complete_timed(7, pid_tgid(), 0x600000001ULL, 1, 2500) == 2);
+    fail_rv_insert = 0;
+    struct owner_start_key key = start_key(7);
+    assert(!p11_owner_start_get(&key, 0));
+    assert(bank_cell(7)->returned == 1);
+    assert(bank_cell(7)->errors == 1);
+    assert(bank_fault_cell == BANK_RV_FAULT);
+    struct bank_rv_key rv = { .slot = 7, .pad = 0, .rv = 0x600000001ULL };
+    assert(!lookup(&RV_COUNTS, &rv));
+    assert(!bank_health_cells[0] && !bank_health_cells[1]);
+}
 #endif
 #endif
 #ifdef P11SCOPE_INVENTORY_ONLY
@@ -3590,6 +3650,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "bank_timing_ts_before_remove")) bank_timing_ts_before_remove();
         else if (!strcmp(argv[1], "bank_timing_enter_writes_no_buckets")) bank_timing_enter_writes_no_buckets();
         else if (!strcmp(argv[1], "bank_timing_enter_stores_clock")) bank_timing_enter_stores_clock();
+        else if (!strcmp(argv[1], "bank_timing_rv_insert_race_counts_into_peer_row")) bank_timing_rv_insert_race_counts_into_peer_row();
+        else if (!strcmp(argv[1], "bank_timing_rv_insert_failure_reports_loss")) bank_timing_rv_insert_failure_reports_loss();
 #endif
         else assert(0);
     } else {

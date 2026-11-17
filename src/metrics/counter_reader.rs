@@ -4096,6 +4096,44 @@ mod tests {
     }
 
     #[test]
+    fn counter_rv_exhaustion_publishes_a_named_lower_bound() {
+        use crate::attach::counter_banks::BANK_RV_FAULT;
+        let limits = CounterLimits {
+            rows: 3,
+            rv_keys: 12,
+        };
+        let generation = NonZeroU64::new(41).unwrap();
+        let (_dir, history, snapshot, pool) =
+            crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+        let mut source = Scripted::sample(CounterMode::Counts, false);
+        let last_stats = source.stats.remove(&1).unwrap();
+        source.stats.insert(2, last_stats);
+        source.fault_bits = BANK_RV_FAULT;
+        source.published = Some(snapshot);
+        let read = acquire(&source, generation, &history, limits, &pool.reserver()).unwrap();
+        assert!(
+            read.view().rows.is_ok(),
+            "rows stay readable under RV exhaustion"
+        );
+        assert!(
+            read.view().rv_lower_bound,
+            "an RV-only fault must publish the RV table as a lower bound"
+        );
+        let (_dir2, history2, snapshot2, _) =
+            crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+        let mut clean = Scripted::sample(CounterMode::Counts, false);
+        let last_stats = clean.stats.remove(&1).unwrap();
+        clean.stats.insert(2, last_stats);
+        clean.published = Some(snapshot2);
+        let read = acquire(&clean, generation, &history2, limits, &pool.reserver()).unwrap();
+        assert!(read.view().rows.is_ok());
+        assert!(
+            !read.view().rv_lower_bound,
+            "a read without an RV fault is not a lower bound"
+        );
+    }
+
+    #[test]
     fn counter_fatal_faults_route_bank_routing_with_rv_bit_only_exhaustion() {
         use crate::attach::counter_banks::{
             BANK_ROUTE_FAULT, BANK_RV_FAULT, BANK_SCOPE_FAULT, BANK_START_FAULT,

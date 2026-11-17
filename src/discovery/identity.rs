@@ -2152,9 +2152,13 @@ impl PinnedObjects {
     /// strict rule. Preserves engine-logic coverage whose inputs predate the
     /// absolute target-safety contract; bind strictness itself is pinned by
     /// the focused refusal twins, which never call this. Entries whose
-    /// target is not pinned here are skipped.
+    /// target is not pinned here are skipped. Batched per target (one
+    /// merge per pin): per-entry insert-and-sort is O(n^2 log n) and
+    /// burns seconds on thousand-entry tables, starving live-child
+    /// fixtures past their lifetime under load.
     #[cfg(test)]
     pub(crate) fn prove_scanned_entries_for_test(&mut self, modules: &[ScannedModule]) {
+        let mut by_target: BTreeMap<PinnedObjectId, Vec<u64>> = BTreeMap::new();
         for module in modules {
             for table in &module.tables {
                 for entry in &table.entries {
@@ -2162,21 +2166,18 @@ impl PinnedObjects {
                     else {
                         continue;
                     };
-                    let Some(pinned) = self.by_id.get_mut(&id) else {
-                        continue;
-                    };
-                    if pinned
-                        .function_starts
-                        .binary_search(&entry.file_offset)
-                        .is_err()
-                    {
-                        let mut starts = pinned.function_starts.to_vec();
-                        starts.push(entry.file_offset);
-                        starts.sort_unstable();
-                        pinned.function_starts = starts.into();
-                    }
+                    by_target.entry(id).or_default().push(entry.file_offset);
                 }
             }
+        }
+        for (id, mut offsets) in by_target {
+            let Some(pinned) = self.by_id.get_mut(&id) else {
+                continue;
+            };
+            offsets.extend(pinned.function_starts.iter().copied());
+            offsets.sort_unstable();
+            offsets.dedup();
+            pinned.function_starts = offsets.into();
         }
     }
 

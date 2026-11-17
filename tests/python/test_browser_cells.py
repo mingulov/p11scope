@@ -557,7 +557,7 @@ class BrowserCells(unittest.TestCase):
             departed = (modules_by_id.get(mid) or {}).get("departed_use") or {}
             for ident in departed.get("identities") or []:
                 exe = ((ident.get("exe") or {}).get("path") or "").lower()
-                if "firefox" in exe:
+                if _folded_exe_names_firefox(exe):
                     folded_browser_idents.append(ident)
         if not browser_instances:
             self.assertGreater(
@@ -601,7 +601,8 @@ class BrowserCells(unittest.TestCase):
         # Folded browsers (exited before Joint birth) report bootstrap with
         # S1 rows; bootstrap with no rows still means never covered.
         rows = observations.get("key_operations") or []
-        if observations.get("reason") == "bootstrap_unavailable" and not rows:
+        if (observations.get("reason") == "bootstrap_unavailable"
+                and _bootstrap_cover_missing(rows, browser_instances)):
             self.fail(
                 "late browser never covered (per-key tracking never started); "
                 f"birth refusals={birth_refusals}; "
@@ -639,7 +640,8 @@ class BrowserCells(unittest.TestCase):
                 "background caller must not sign; signs prove browser")
             folded_signs = [row for row in rows
                             if row.get("category") == "sign"
-                            and row.get("instance") not in bg_instances]
+                            and _folded_sign_instance_counts(row.get("instance"),
+                                                             bg_instances)]
             self.assertGreater(
                 len(folded_signs), 0,
                 "no sign rows outside background instances")
@@ -2151,6 +2153,86 @@ def healthy_sessions(opened=2, inherited=0, closed=1, async_opened=0,
     return {"opened": opened, "inherited": inherited, "closed": closed,
             "async_opened": async_opened, "peak_concurrent": peak,
             "balance": total - min(closed, total)}
+
+
+def _bootstrap_cover_missing(rows, browser_instances):
+    """True when a bootstrap refusal must fail the FF-FIRST-BG cell.
+
+    The caller has already established
+    ``reason == "bootstrap_unavailable"`` (kept inline so the
+    observer-first wiring twin still sees the literal).
+    """
+    return not rows
+
+
+def _folded_exe_names_firefox(exe_path):
+    """True when a departed-use exe path names a folded browser caller.
+
+    ``exe_path`` is the already-lowered ``exe.path`` string.
+    """
+    return "firefox" in exe_path
+
+
+def _folded_sign_instance_counts(instance, bg_instances):
+    """True when a sign row's instance counts as folded browser evidence."""
+    return instance not in bg_instances
+
+
+class BrowserFoldedLeg(unittest.TestCase):
+    """Folded-browser predicate twins: unprivileged, run everywhere.
+
+    The FF-FIRST-BG live cell accepts folded firefox callers when no
+    live browser instance survives; these twins pin the three
+    folded-leg predicates over synthetic inputs so a softening of any
+    of them fails here instead of silently widening the live cell.
+    """
+
+    def test_bootstrap_with_live_browser_instances_fails(self):
+        # Folded-leg-only allowance: bootstrap with S1 rows is
+        # tolerated for exited (folded) callers, but live browser
+        # instances with bootstrap mean per-key tracking never
+        # started for retained callers and must fail loud.
+        self.assertTrue(
+            _bootstrap_cover_missing([{"category": "sign"}], {"i0"}))
+
+    def test_bootstrap_with_rows_passes_without_live_instances(self):
+        # The folded leg keeps working: bootstrap with rows and no
+        # live browser instance is the tolerated folded shape.
+        self.assertFalse(
+            _bootstrap_cover_missing([{"category": "sign"}], set()))
+
+    def test_bootstrap_without_rows_fails(self):
+        # Bootstrap with zero rows still means never covered, with or
+        # without live browser instances.
+        self.assertTrue(_bootstrap_cover_missing([], set()))
+        self.assertTrue(_bootstrap_cover_missing([], {"i0"}))
+
+    def test_folded_exe_matches_basename_only(self):
+        # A firefox directory component must not count: only the
+        # binary basename names a folded browser caller.
+        self.assertFalse(_folded_exe_names_firefox(
+            "/tmp/firefox-profile-helper/python"))
+
+    def test_folded_exe_matches_firefox_binary(self):
+        # Saved RED shapes keep passing: basename firefox under a
+        # firefox-* directory, plus the firefox-bin variant; an empty
+        # path never matches.
+        self.assertTrue(_folded_exe_names_firefox(
+            "/home/u/.cache/mozilla/firefox-abc123/firefox"))
+        self.assertTrue(_folded_exe_names_firefox("firefox-bin"))
+        self.assertFalse(_folded_exe_names_firefox(""))
+
+    def test_folded_sign_requires_attributed_instance(self):
+        # An unattributed sign row (missing instance) must not count
+        # as folded browser evidence; the live leg's instance join
+        # would fail it.
+        self.assertFalse(_folded_sign_instance_counts(None, {"i1"}))
+
+    def test_folded_sign_counts_non_background_instance(self):
+        # Attributed signs outside background instances prove the
+        # folded browser; background signs never do.
+        self.assertTrue(_folded_sign_instance_counts("i0", {"i1"}))
+        self.assertFalse(_folded_sign_instance_counts("i1", {"i1"}))
 
 
 class BrowserS1Oracle(unittest.TestCase):

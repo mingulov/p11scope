@@ -734,7 +734,8 @@ class RunnerNoiseTests(unittest.TestCase):
     """Ruling CI-GAP-1: hosted host system cell discloses runner noise."""
     run_case = OracleTests.run_case
 
-    def run_case_mt_system(self, mutate=None, *, want=0, census=None):
+    def run_case_mt_system(self, mutate=None, *, want=0, census=None,
+                           allow_pid_descendant_gaps=False):
         report, ledger, receipt = inputs_mt_system()
         if mutate:
             mutate(report, ledger, receipt)
@@ -749,6 +750,8 @@ class RunnerNoiseTests(unittest.TestCase):
             args = [sys.executable, "-I", str(ORACLE),
                     "--cell", "mt-system", *sum((["--" + key, str(path)]
                                          for key, path in paths.items()), [])]
+            if allow_pid_descendant_gaps:
+                args.append("--allow-pid-descendant-gaps")
             if census is not None:
                 census_path = tmp / "census"
                 census_path.write_text(census)
@@ -1085,6 +1088,43 @@ class RunnerNoiseTests(unittest.TestCase):
             d["functions"][0]["calls"] = 39
         result = self.run_case_mt_system(mutate, want=1)
         self.assertIn("owned target count differs", result["detail"])
+
+    def test_loader_quiet_passes_on_system_in_strict_mode(self):
+        # The loader-quiet cell disjunct covers system too: the same
+        # transient shape (lone named skip, one unavailable, zero
+        # hits) qualifies on the system cell with exact owned counts.
+        # Shape mirrors the mt-system pass twin with 500-call totals.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "loader_discovery"]}
+            d["evidence"]["loader_discovery"]["strategies"]["unavailable"] = 1
+            d["evidence"]["loader_discovery"]["dlopen_timing"]["none"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system")
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_loader_quiet_passes_on_mt_system_when_allowed(self):
+        # Relaxed parity: the hosted public-cli leg runs mt-system
+        # relaxed, so the loader-quiet shape strict accepts must also
+        # pass relaxed (with the runner-noise qualification and exact
+        # owned counts); a strict-only lane would let the triaged
+        # failure recur on the relaxed leg.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "loader_discovery"]}
+            d["evidence"]["loader_discovery"]["strategies"]["unavailable"] = 1
+            d["evidence"]["loader_discovery"]["dlopen_timing"]["none"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
 
     def test_attribution_gap_without_noise_passes_in_both_modes(self):
         # The system counts cell never gated attribution/semantics gaps

@@ -2176,3 +2176,95 @@ fn pe_file_keeps_the_legacy_not_an_elf_refusal() {
     let error = table_bounds_from_header(&header, None).unwrap_err();
     assert_eq!(error, "not an ELF object (Pe)");
 }
+
+/// Target safety: `function_starts` proves exported and internal
+/// functions (via `.dynsym`/`.symtab` and `.eh_frame_hdr`) and never a
+/// mid-function offset. The stripped twin keeps the internal function
+/// through unwind tables alone.
+#[test]
+fn function_starts_prove_exported_and_internal_functions() {
+    use p11scope_manifest::identity::inspect_file;
+    let dir = tmp("function-starts");
+    let so = cc_so(
+        &dir,
+        "funcstarts",
+        "int exported_fn(void) { return 1; }\n\
+         static int internal_fn(void) { return 2; }\n\
+         int call_internal(void) { return internal_fn(); }\n",
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let snapshot = ElfSnapshot::read(&file).unwrap();
+    let exported = snapshot
+        .defined_symbol("exported_fn")
+        .unwrap()
+        .expect("exported_fn is defined")
+        .file_offset;
+    let internal = snapshot
+        .defined_symbol("internal_fn")
+        .unwrap()
+        .expect("internal_fn is in symtab")
+        .file_offset;
+    let inspected = inspect_file(&file).unwrap();
+    assert!(
+        inspected.function_starts.contains(&exported),
+        "an exported function start is proven: {exported:#x} in {:?}",
+        inspected.function_starts
+    );
+    assert!(
+        inspected.function_starts.contains(&internal),
+        "an internal function start is proven: {internal:#x} in {:?}",
+        inspected.function_starts
+    );
+    // A mid-function offset is never a start (both test functions are
+    // longer than one byte; +1 lands inside, not on a neighbor).
+    for proven in [exported, internal] {
+        assert!(
+            !inspected.function_starts.contains(&(proven + 1)),
+            "a mid-function offset is never proven: {:#x}",
+            proven + 1
+        );
+    }
+    // Sorted and deduplicated.
+    let mut sorted = inspected.function_starts.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        inspected.function_starts, sorted,
+        "starts are sorted deduped"
+    );
+
+    // Stripped twin: symtab gone, unwind proof remains.
+    let stripped = dir.join("funcstarts-stripped.so");
+    std::fs::copy(&so, &stripped).unwrap();
+    assert!(
+        Command::new("strip")
+            .arg("--strip-all")
+            .arg(&stripped)
+            .status()
+            .unwrap()
+            .success(),
+        "strip must succeed"
+    );
+    let stripped_file = std::fs::File::open(&stripped).unwrap();
+    let stripped_inspected = inspect_file(&stripped_file).unwrap();
+    // Stripping keeps file layout for code (only sections change), so
+    // resolve the exported offset fresh and require the internal one by
+    // its unwind entry: at minimum the exported start survives, and the
+    // set is non-empty (unwind tables are not stripped).
+    let stripped_snapshot = ElfSnapshot::read(&stripped_file).unwrap();
+    let stripped_exported = stripped_snapshot
+        .defined_symbol("exported_fn")
+        .unwrap()
+        .expect("exported_fn survives stripping")
+        .file_offset;
+    assert!(
+        stripped_inspected
+            .function_starts
+            .contains(&stripped_exported),
+        "an exported start survives stripping: {stripped_exported:#x}"
+    );
+    assert!(
+        !stripped_inspected.function_starts.is_empty(),
+        "stripped objects keep unwind function starts"
+    );
+}

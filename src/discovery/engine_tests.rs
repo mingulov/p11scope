@@ -92997,3 +92997,121 @@ fn discover_with_cancel_threads_the_stop_flag_to_the_teardown_wait() {
         "the discover_plan scan site must pass the cancel param, not None"
     );
 }
+
+#[test]
+fn live_candidate_refuses_uncorroborated_entries_without_function_proof() {
+    // Pins the live-site wiring: `live_candidate_with_pending` binds
+    // through the strict variant, so an uncorroborated table's entries
+    // without a function-entry proof refuse with named skips instead of
+    // becoming attach slots. Reverting the call site to the default
+    // bind must fail this test.
+    const DANGLING_OFFSET: u64 = 0x20;
+    let provider = overlay_key(60);
+    let dependency = overlay_key(61);
+    let mut module = overlay_module(provider);
+    module.tables[0].entries.push(ScannedEntry {
+        name: "C_Sign",
+        object: dependency,
+        object_path: OVERLAY_PATH.into(),
+        file_offset: DANGLING_OFFSET,
+    });
+    let mut pins = overlay_pins(&[(provider, OVERLAY_SHA, 1)]);
+    let dependency_module = overlay_module(dependency);
+    let dependency_pins = overlay_view_pin(&dependency_module, 2, OVERLAY_SHA, 1, false);
+    assert!(pins.absorb(dependency_pins).is_empty());
+    let mut engine = Engine::empty();
+    let candidate = engine
+        .live_candidate_with_pending(pins, vec![module], Vec::new(), None, &BTreeSet::new())
+        .expect("a live candidate builds over the refused table");
+    assert_eq!(candidate.modules.len(), 1);
+    let entries = &candidate.modules[0].scanned.tables[0].entries;
+    assert!(
+        entries.is_empty(),
+        "unproven live entries never bind: {entries:?}"
+    );
+    let skips = &engine.counters.object_skips;
+    assert_eq!(skips.len(), 2, "both unproven entries refuse: {skips:?}");
+    for skip in skips {
+        assert!(
+            skip.reason.contains("not attached"),
+            "the refusal names the outcome: {}",
+            skip.reason
+        );
+    }
+    assert!(
+        candidate.plan.slots.is_empty(),
+        "no attach slot for refused entries: {:?}",
+        candidate.plan.slots
+    );
+}
+
+#[test]
+fn rebuild_discovered_refuses_uncorroborated_entries_in_every_scope() {
+    // Pins the rebuild-site wiring in every scope: `rebuild_discovered`
+    // binds through the strict variant for pid, cgroup and system
+    // scopes alike (target safety is absolute), so uncorroborated
+    // entries without a function-entry proof refuse everywhere.
+    // Reverting the call site to the default bind must fail this test.
+    const DANGLING_OFFSET: u64 = 0x20;
+    let scopes: Vec<(&str, Scope)> = vec![
+        ("pid", Scope::Pid(std::process::id())),
+        (
+            "cgroup",
+            Scope::Cgroup {
+                id: 1,
+                path: PathBuf::from("/sys/fs/cgroup/test"),
+                dir: std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            },
+        ),
+        ("system", Scope::System),
+    ];
+    for (label, scope) in scopes {
+        let provider = overlay_key(62);
+        let dependency = overlay_key(63);
+        let mut module = overlay_module(provider);
+        module.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: dependency,
+            object_path: OVERLAY_PATH.into(),
+            file_offset: DANGLING_OFFSET,
+        });
+        let mut pins = overlay_pins(&[(provider, OVERLAY_SHA, 1)]);
+        let dependency_module = overlay_module(dependency);
+        let dependency_pins = overlay_view_pin(&dependency_module, 2, OVERLAY_SHA, 1, false);
+        assert!(pins.absorb(dependency_pins).is_empty());
+        let view = ProcessView::open(module.view, std::process::id()).unwrap();
+        let mut discovered = lifecycle_discovered(vec![view]);
+        discovered.scope = scope;
+        discovered.scan_inputs.insert(
+            module.view,
+            ScanInput {
+                modules: vec![module],
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        rebuild_discovered(&mut discovered).unwrap();
+        let skips = &discovered.counters.object_skips;
+        assert_eq!(
+            skips.len(),
+            2,
+            "both unproven entries refuse in {label} scope: {skips:?}"
+        );
+        for skip in skips {
+            assert!(
+                skip.reason.contains("not attached"),
+                "the {label} refusal names the outcome: {}",
+                skip.reason
+            );
+        }
+        assert!(
+            !discovered
+                .plan
+                .slots
+                .iter()
+                .any(|slot| slot.file_offset == DANGLING_OFFSET || slot.file_offset == 0x1000),
+            "no {label} attach slot for refused entries: {:?}",
+            discovered.plan.slots
+        );
+    }
+}

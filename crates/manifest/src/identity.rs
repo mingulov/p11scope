@@ -25,7 +25,10 @@ use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
 #[cfg(feature = "identify")]
-use crate::elf::{ElfAbi, ExportWalk, classified_validated_object, exports_matching_in_object};
+use crate::elf::{
+    ElfAbi, ExportWalk, classified_validated_object, exports_matching_in_object,
+    function_starts_in_object,
+};
 #[cfg(feature = "identify")]
 use crate::maps::{Device, ObjectKey};
 
@@ -95,6 +98,13 @@ pub struct InspectedObject {
     /// (unreadable name) or translate (a wanted definition outside every
     /// segment), so `exports` may be incomplete.
     pub witness_fault: bool,
+    /// File offsets of proven function entries (every `STT_FUNC`
+    /// definition plus every `.eh_frame_hdr` FDE start), sorted and
+    /// deduplicated. The target-safety witness for uncorroborated table
+    /// entries: a uprobe is only placed at an offset in this set (or at
+    /// an export-agreed offset) or the entry is refused. Empty when the
+    /// object carries no symbol or unwind proof.
+    pub function_starts: Vec<u64>,
 }
 
 #[cfg(feature = "identify")]
@@ -308,6 +318,7 @@ pub fn inspect_file_with_reader_exporting(
     } else {
         exports_matching_in_object(&object, wanted)
     };
+    let function_starts = function_starts_in_object(&object);
     Ok(InspectedObject {
         identity,
         executable_ranges,
@@ -315,6 +326,7 @@ pub fn inspect_file_with_reader_exporting(
         exports: walk.exports,
         getter_present: walk.getter_present,
         witness_fault: walk.witness_fault,
+        function_starts,
     })
 }
 

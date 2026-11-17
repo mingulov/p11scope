@@ -11583,15 +11583,12 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         crate::attach::monotonic_ns(),
     );
     let bind_start = crate::attach::monotonic_ns();
-    // Owned-run scope binds strictly (see the live candidate bind):
-    // the initial scan inputs already carry owned members' decodes.
-    let owned_run =
-        discovered.owned_run_pid.is_some() && matches!(discovered.scope, Scope::Cgroup { .. });
-    let (mut modules, differed) = if owned_run {
-        bind_scanned_modules_strict(&scan_modules, &mut pinned)
-    } else {
-        bind_scanned_modules(&scan_modules, &mut pinned)
-    };
+    // Every scope binds strictly: an uncorroborated decode of a
+    // table-mimicking provider must prove every entry is a function
+    // entry (see `bind_scanned_modules_strict`) instead of planting
+    // uprobes at garbage offsets. Target safety is absolute — owned
+    // run, pid, system, inventory and frame scopes alike.
+    let (mut modules, differed) = bind_scanned_modules_strict(&scan_modules, &mut pinned);
     discovered.stage_timings.span(
         crate::timing::StageKind::Bind,
         "bind_rebuild",
@@ -18051,19 +18048,12 @@ impl Engine {
             crate::attach::monotonic_ns(),
         );
         let bind_start = crate::attach::monotonic_ns();
-        // Owned-run scope binds strictly: members are short-lived and
-        // their scans serve fast attach, so an uncorroborated decode
-        // of a table-mimicking provider must prove export agreement
-        // for every cross-object entry (see
-        // `bind_scanned_modules_strict`) instead of planting uprobes
-        // at garbage offsets. Every other scope keeps the
-        // documented bind.
-        let owned_run = self.owned_run_pid.is_some() && matches!(self.scope, Scope::Cgroup { .. });
-        let (modules, binding_skips) = if owned_run {
-            bind_scanned_modules_strict(&raw_modules, &mut pinned)
-        } else {
-            bind_scanned_modules(&raw_modules, &mut pinned)
-        };
+        // Every scope binds strictly: an uncorroborated decode of a
+        // table-mimicking provider must prove every entry is a function
+        // entry (see `bind_scanned_modules_strict`) instead of planting
+        // uprobes at garbage offsets. Target safety is absolute — owned
+        // run, pid, system, inventory and frame scopes alike.
+        let (modules, binding_skips) = bind_scanned_modules_strict(&raw_modules, &mut pinned);
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(
                 "p11scope: candidate bind: {} raw -> {} bound ({} skips)",

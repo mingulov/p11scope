@@ -11,7 +11,10 @@ use crate::identity::{read_object_bytes, read_object_bytes_with};
 use object::read::elf::FileHeader as _;
 use object::read::elf::ProgramHeader as _;
 use object::read::elf::SectionHeader as _;
-use object::{Architecture, BinaryFormat, Object as _, ObjectSegment as _, ObjectSymbol as _, elf};
+use object::{
+    Architecture, BinaryFormat, Object as _, ObjectSection as _, ObjectSegment as _,
+    ObjectSymbol as _, SymbolKind, elf,
+};
 
 const MAX_INTERPRETER_BYTES: usize = 4096;
 
@@ -1308,6 +1311,208 @@ pub(crate) fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&s
         getter_present,
         witness_fault,
     }
+}
+
+/// File offsets of proven function entries: every `STT_FUNC` definition in
+/// `.dynsym`/`.symtab` plus every `.eh_frame_hdr` FDE start, mapped through
+/// the load segments. Sorted, deduplicated. Best-effort over already-parsed
+/// bytes: a corrupt unwind table contributes nothing (its symbols still
+/// count), and an absent `.eh_frame_hdr` is simply no FDE proof — the
+/// caller fails closed when the set is empty. No I/O.
+pub(crate) fn function_starts_in_object(object: &object::File<'_>) -> Vec<u64> {
+    let mut starts = Vec::new();
+    for symbol in object.dynamic_symbols().chain(object.symbols()) {
+        if !symbol.is_definition() || symbol.kind() != SymbolKind::Text {
+            continue;
+        }
+        if let Some(offset) = file_offset(object, symbol.address()) {
+            starts.push(offset);
+        }
+    }
+    if let Some(section) = object.section_by_name(".eh_frame_hdr")
+        && let Ok(data) = section.data()
+    {
+        starts.extend(eh_frame_hdr_starts(object, section.address(), data));
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
+/// FDE initial locations from `.eh_frame_hdr`'s binary-search table, as file
+/// offsets. Parses only the header's table (never the full `.eh_frame`):
+/// version, three pointer encodings, the frame pointer, the FDE count, then
+/// that many `(initial_location, fde_address)` pairs. Every read is
+/// bounds-checked; any corrupt/truncated/unsupported encoding yields the
+/// locations parsed so far (possibly none) instead of an error, so callers
+/// treat a missing proof as unproven rather than a parse failure.
+fn eh_frame_hdr_starts(object: &object::File<'_>, section_address: u64, data: &[u8]) -> Vec<u64> {
+    let mut starts = Vec::new();
+    if data.len() < 4 || data[0] != 1 {
+        return starts;
+    }
+    let eh_frame_ptr_enc = data[1];
+    let fde_count_enc = data[2];
+    let table_enc = data[3];
+    if table_enc == 0xff {
+        return starts;
+    }
+    // Indirect table entries point through runtime addresses the observer
+    // must not dereference; a table that needs them contributes no proof.
+    if table_enc & 0x80 != 0 {
+        return starts;
+    }
+    let address_size = match object.architecture() {
+        Architecture::X86_64 => 8,
+        Architecture::I386 => 4,
+        _ => return starts,
+    };
+    let mut pos = 4usize;
+    // The frame pointer itself is not a function start; skip it.
+    let Some(next) = eh_pe_skip(data, pos, eh_frame_ptr_enc, address_size) else {
+        return starts;
+    };
+    pos = next;
+    let Some((fde_count, next)) =
+        eh_pe_read(data, pos, section_address, fde_count_enc, address_size)
+    else {
+        return starts;
+    };
+    pos = next;
+    let Ok(fde_count) = usize::try_from(fde_count) else {
+        return starts;
+    };
+    for _ in 0..fde_count {
+        let Some((location, next)) =
+            eh_pe_read(data, pos, section_address, table_enc, address_size)
+        else {
+            break;
+        };
+        pos = next;
+        let Some(next) = eh_pe_skip(data, pos, table_enc, address_size) else {
+            break;
+        };
+        pos = next;
+        if let Some(offset) = file_offset(object, location) {
+            starts.push(offset);
+        }
+    }
+    starts
+}
+
+/// Size of one `DW_EH_PE_*` value, or `None` when the encoding is omitted,
+/// indirect, unknown, or runs past `data`.
+fn eh_pe_skip(data: &[u8], pos: usize, encoding: u8, address_size: usize) -> Option<usize> {
+    if encoding == 0xff || encoding & 0x80 != 0 {
+        return None;
+    }
+    match encoding & 0x0f {
+        0x00 => data
+            .len()
+            .checked_sub(pos)
+            .and_then(|left| (left >= address_size).then(|| pos + address_size)),
+        0x02 | 0x0a => (data.len() >= pos + 2).then(|| pos + 2),
+        0x03 | 0x0b => (data.len() >= pos + 4).then(|| pos + 4),
+        0x04 | 0x0c => (data.len() >= pos + 8).then(|| pos + 8),
+        0x01 | 0x09 => {
+            let mut end = pos;
+            loop {
+                let byte = *data.get(end)?;
+                end += 1;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                // A LEB128 longer than 10 bytes cannot be a 64-bit value.
+                if end - pos > 10 {
+                    return None;
+                }
+            }
+            Some(end)
+        }
+        _ => None,
+    }
+}
+
+/// One `DW_EH_PE_*` value plus the offset past it. `pcrel` is relative to
+/// the value's own address (`section_address + pos`); `datarel` in an
+/// `.eh_frame_hdr` table is relative to the header's own address.
+fn eh_pe_read(
+    data: &[u8],
+    pos: usize,
+    section_address: u64,
+    encoding: u8,
+    address_size: usize,
+) -> Option<(u64, usize)> {
+    if encoding == 0xff || encoding & 0x80 != 0 {
+        return None;
+    }
+    let raw: i64 = match encoding & 0x0f {
+        0x00 => {
+            if address_size == 8 {
+                i64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?)
+            } else {
+                i64::from(u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?))
+            }
+        }
+        0x02 => i64::from(u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?)),
+        0x03 => i64::from(u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?)),
+        0x04 => u64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?) as i64,
+        0x0a => i64::from(i16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?)),
+        0x0b => i64::from(i32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?)),
+        0x0c => i64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?),
+        0x01 => {
+            let mut value: u64 = 0;
+            let mut shift = 0;
+            let mut end = pos;
+            loop {
+                let byte = *data.get(end)?;
+                end += 1;
+                if shift < 64 {
+                    value |= u64::from(byte & 0x7f) << shift;
+                }
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+                if end - pos > 10 {
+                    return None;
+                }
+            }
+            value as i64
+        }
+        0x09 => {
+            let mut value: i64 = 0;
+            let mut shift = 0;
+            let mut end = pos;
+            let byte = loop {
+                let byte = *data.get(end)?;
+                end += 1;
+                if shift < 64 {
+                    value |= i64::from(byte & 0x7f) << shift;
+                }
+                shift += 7;
+                if byte & 0x80 == 0 {
+                    break byte;
+                }
+                if end - pos > 10 {
+                    return None;
+                }
+            };
+            if shift < 64 && byte & 0x40 != 0 {
+                value |= !0 << shift;
+            }
+            value
+        }
+        _ => return None,
+    };
+    let next = eh_pe_skip(data, pos, encoding, address_size)?;
+    let base: i64 = match encoding & 0x70 {
+        0x00 => 0,
+        0x10 => (section_address as i64).wrapping_add(pos as i64),
+        0x30 => section_address as i64,
+        _ => return None,
+    };
+    Some((base.wrapping_add(raw) as u64, next))
 }
 
 /// Structural bytes the export query logically consumed: the ELF header, the

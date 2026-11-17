@@ -272,6 +272,11 @@ struct Entry {
     /// Export linkage's witness (`scan::export_agreement`); file-derived, so
     /// every entry for one digest carries the same list.
     exports: Arc<[(String, u64)]>,
+    /// File offsets of proven function entries (every `STT_FUNC`
+    /// definition plus every `.eh_frame_hdr` FDE start), sorted and
+    /// deduplicated, read from the bytes that were hashed. The strict
+    /// bind's target-safety witness for uncorroborated entries.
+    function_starts: Arc<[u64]>,
     /// A 3.x interface getter name appears among the object's dynamic
     /// symbols in any symbol type, including non-definitions absent from
     /// `exports`. Refuses the legacy-prefix proof.
@@ -322,6 +327,7 @@ pub(crate) struct EntryMeta {
     pub(crate) build_id: Option<String>,
     pub(crate) abi: ElfAbi,
     pub(crate) exports: Arc<[(String, u64)]>,
+    pub(crate) function_starts: Arc<[u64]>,
     pub(crate) getter_present: bool,
     pub(crate) witness_fault: bool,
     pub(crate) overlay: bool,
@@ -351,6 +357,7 @@ impl EntryMeta {
             build_id: entry.build_id.clone(),
             abi: entry.abi,
             exports: entry.exports.clone(),
+            function_starts: entry.function_starts.clone(),
             getter_present: entry.getter_present,
             witness_fault: entry.witness_fault,
             overlay: entry.overlay,
@@ -418,6 +425,7 @@ impl ProvedEntry {
                 },
                 abi: inspected.abi,
                 exports: inspected.exports.clone().into(),
+                function_starts: inspected.function_starts.clone().into(),
                 getter_present: inspected.getter_present,
                 witness_fault: inspected.witness_fault,
                 verified_ns,
@@ -460,6 +468,7 @@ impl ProvedEntry {
                 build_id: None,
                 abi: ElfAbi::Lp64,
                 exports: Arc::from(Vec::new()),
+                function_starts: Arc::from(Vec::new()),
                 getter_present: false,
                 witness_fault: false,
                 overlay: false,
@@ -1282,6 +1291,7 @@ impl Entry {
             build_id: meta.build_id,
             abi: meta.abi,
             exports: meta.exports,
+            function_starts: meta.function_starts,
             getter_present: meta.getter_present,
             witness_fault: meta.witness_fault,
             overlay: meta.overlay,
@@ -1651,6 +1661,7 @@ impl PinnedObjects {
                 && entry.build_id == other_entry.build_id
                 && entry.abi == other_entry.abi
                 && entry.exports == other_entry.exports
+                && entry.function_starts == other_entry.function_starts
                 && entry.getter_present == other_entry.getter_present
                 && entry.witness_fault == other_entry.witness_fault
                 && entry.overlay == other_entry.overlay
@@ -1924,6 +1935,7 @@ impl PinnedObjects {
                 || old.build_id != new.build_id
                 || old.abi != new.abi
                 || old.exports != new.exports
+                || old.function_starts != new.function_starts
                 || old.overlay != new.overlay
                 || old.collapsed != new.collapsed
             {
@@ -2085,6 +2097,15 @@ impl PinnedObjects {
         self.by_id
             .get(&id)
             .map_or_else(|| Arc::from(Vec::new()), |entry| entry.exports.clone())
+    }
+
+    /// The pinned object's proven function-entry file offsets, sorted;
+    /// empty when the object is not pinned here or carries no proof.
+    pub(crate) fn function_starts_for(&self, id: PinnedObjectId) -> Arc<[u64]> {
+        self.by_id.get(&id).map_or_else(
+            || Arc::from(Vec::new()),
+            |entry| entry.function_starts.clone(),
+        )
     }
 
     /// The witness-completeness bits for the pinned object's exports:
@@ -2452,6 +2473,7 @@ impl PinnedObjects {
                 build_id: entry.build_id.clone(),
                 abi: entry.abi,
                 exports: entry.exports.clone(),
+                function_starts: entry.function_starts.clone(),
                 getter_present: entry.getter_present,
                 witness_fault: entry.witness_fault,
                 overlay: entry.overlay,
@@ -3818,6 +3840,7 @@ mod conservative_copy {
                     build_id: old.build_id.as_ref().map(|_| String::new()),
                     abi: old.abi,
                     exports: old.exports.clone(),
+                    function_starts: old.function_starts.clone(),
                     getter_present: old.getter_present,
                     witness_fault: old.witness_fault,
                     overlay: old.overlay,
@@ -4686,6 +4709,10 @@ mod conservative_copy {
                         add(
                             &mut self.measured,
                             bytes_for::<(String, u64)>(entry.exports.len())?,
+                        )?;
+                        add(
+                            &mut self.measured,
+                            bytes_for::<u64>(entry.function_starts.len())?,
                         )?;
                         self.index = 0;
                         self.phase = Phase::MeasureExports;
@@ -9847,8 +9874,10 @@ pub(crate) fn unverified_forward_refusal(name: &str) -> &'static str {
 /// exports `C_GetFunctionList`, and 3.x providers export the interface
 /// getters, so the first one loaded wins the relocation by name (seen
 /// live under p11-kit-proxy). Only these three names ever verify as
-/// forwards; any other cross-object entry is kept without proof and can
-/// never satisfy the layout exemption.
+/// forwards; any other cross-object entry is kept without proof by the
+/// default bind and can never satisfy the layout exemption. The strict
+/// bind additionally requires a function-entry proof for every
+/// uncorroborated entry (see `bind_scanned_modules_strict`).
 pub(crate) fn forwardable_getter(name: &str) -> bool {
     matches!(
         name,
@@ -9889,16 +9918,18 @@ pub fn bind_scanned_modules(
     bind_scanned_modules_inner(modules, pinned, false)
 }
 
-/// The owned-run-scope bind: like [`bind_scanned_modules`], but a table no
+/// The attach-path bind: like [`bind_scanned_modules`], but a table no
 /// corroboration stands behind (no live provider return, no manifest
-/// agreement) must prove export agreement for every cross-object entry —
-/// the pinned target's own `.dynsym` defining the same name at the same
-/// offset — or the entry is refused. Owned-run members are short-lived
-/// and their scans serve fast attach, so an uncorroborated decode of a
-/// table-mimicking provider (haskoki's GHC static data) would otherwise
-/// plant uprobes at garbage offsets in whatever file the decode resolved
-/// into, and the target dies executing them. Corroborated tables and
-/// same-file entries bind exactly as below.
+/// agreement) must prove every entry is a function entry — export
+/// agreement (the pinned target's own `.dynsym` defining the same name
+/// at the same offset) or a proven function start (any `STT_FUNC`
+/// definition or `.eh_frame_hdr` FDE start at that offset) — or the
+/// entry is refused with a named counted gap. An uncorroborated decode
+/// of a table-mimicking provider (haskoki's GHC static data) would
+/// otherwise plant uprobes at garbage offsets in whatever file the
+/// decode resolved into, and the target dies executing them. Corroborated
+/// tables bind exactly as below. Every engine candidate bind uses this;
+/// only the semantics snapshot keeps the default.
 pub(crate) fn bind_scanned_modules_strict(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,
@@ -10000,17 +10031,18 @@ fn bind_scanned_modules_inner(
                         // producer bypassed this check.
                         let verified_forward = entry.object != module.key
                             && forwarded_bootstrap_verified(&entry, &pinned.exports_for(id));
-                        // Strict owned-run scope only: an uncorroborated
-                        // table is a heuristic decode, so its
-                        // cross-object entries prove export agreement
-                        // like the bootstrap getters do — the pinned
-                        // target's own `.dynsym` defining the same name
-                        // at the same offset — whatever their name.
-                        // Anything else is refused (see
-                        // `bind_scanned_modules_strict`).
-                        let export_agreed = pinned.exports_for(id).iter().any(|(name, offset)| {
-                            name == entry.name && *offset == entry.file_offset
-                        });
+                        // Strict bind only: an uncorroborated table is a
+                        // heuristic decode, so every entry — cross-object
+                        // and same-file — proves it is a function entry:
+                        // export agreement (the pinned target's own
+                        // `.dynsym` defining the same name at the same
+                        // offset) or a proven function start (any
+                        // `STT_FUNC` definition or `.eh_frame_hdr` FDE
+                        // start at that offset). Anything else is refused
+                        // (see `bind_scanned_modules_strict`). The proof
+                        // lookups run only when the cheap strictness and
+                        // corroboration gates already passed, so the
+                        // default bind pays nothing here.
                         if entry.object != module.key
                             && forwardable_getter(entry.name)
                             && !verified_forward
@@ -10027,13 +10059,19 @@ fn bind_scanned_modules_inner(
                             lost.push(skip);
                         } else if strict_uncorroborated
                             && !corroborated
-                            && entry.object != module.key
-                            && !export_agreed
+                            && !{
+                                pinned.exports_for(id).iter().any(|(name, offset)| {
+                                    name == entry.name && *offset == entry.file_offset
+                                }) || pinned
+                                    .function_starts_for(id)
+                                    .binary_search(&entry.file_offset)
+                                    .is_ok()
+                            }
                         {
                             let skip = Skipped {
                                 subject: entry.name.to_string(),
                                 reason: format!(
-                                    "{} does not define {} at the uncorroborated offset; entry was not attached",
+                                    "{} does not define {} at the uncorroborated offset and the offset is not a proven function entry; entry was not attached",
                                     entry.object_path, entry.name
                                 ),
                             };
@@ -10840,6 +10878,7 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            function_starts: Arc::from(Vec::new()),
             getter_present: false,
             witness_fault: false,
             overlay: false,
@@ -10967,6 +11006,7 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            function_starts: Arc::from(Vec::new()),
             getter_present: false,
             witness_fault: false,
             overlay,
@@ -11194,6 +11234,7 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            function_starts: Arc::from(Vec::new()),
             getter_present: false,
             witness_fault: false,
             overlay: true,
@@ -11237,6 +11278,7 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            function_starts: Arc::from(Vec::new()),
             getter_present: false,
             witness_fault: false,
             overlay: true,
@@ -11281,6 +11323,7 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            function_starts: Arc::from(Vec::new()),
             getter_present: false,
             witness_fault: false,
             overlay: true,
@@ -11643,14 +11686,15 @@ mod tests {
     fn bind_refuses_run_learned_cross_object_entries_without_export_agreement() {
         // A run-learned table is an uncorroborated heuristic decode:
         // no live return, no manifest and no frame agreement stand
-        // behind it yet. A cross-object entry it carries must prove
-        // export agreement — the pinned target's own `.dynsym`
-        // defining the same name at the same offset — or the bind
-        // refuses it. Without this, a provider whose data mimics a
-        // table (haskoki's GHC static data) plants uprobes at garbage
-        // offsets in whatever file the decode resolved into (there:
-        // mid-instruction inside the python executable), and the
-        // target dies executing them.
+        // behind it yet. A cross-object entry it carries must prove it
+        // is a function entry — export agreement or a proven function
+        // start — or the bind refuses it. Without this, a provider
+        // whose data mimics a table (haskoki's GHC static data) plants
+        // uprobes at garbage offsets in whatever file the decode
+        // resolved into (there: mid-instruction inside the python
+        // executable), and the target dies executing them. The view
+        // field is inert at this helper level (strictness comes from
+        // the caller's bool); the engine test pins the wiring.
         const VERIFIED_OFFSET: u64 = 0xebe0;
         const DANGLING_OFFSET: u64 = 0x20;
         let provider = overlay(220);
@@ -11684,6 +11728,12 @@ mod tests {
             .expect("the dependency is pinned");
         pinned.by_id.get_mut(&target).unwrap().exports =
             Arc::from(vec![("C_Login".to_string(), VERIFIED_OFFSET)]);
+        // The provider proves its same-file entry as a function start,
+        // so this twin stays focused on the cross-object rule.
+        let provider_id = pinned
+            .id_for_scanned(&scanned, provider, &scanned.path)
+            .expect("the provider is pinned");
+        pinned.by_id.get_mut(&provider_id).unwrap().function_starts = Arc::from(vec![0x1000]);
 
         let (bound, skipped) = bind_scanned_modules_strict(&[scanned], &mut pinned);
 
@@ -11691,7 +11741,7 @@ mod tests {
         let entries = &bound[0].scanned.tables[0].entries;
         assert!(
             entries.iter().any(|entry| entry.name == "C_Initialize"),
-            "the same-file entry binds: {entries:?}"
+            "the proven same-file entry binds: {entries:?}"
         );
         assert!(
             entries
@@ -11719,7 +11769,8 @@ mod tests {
         // decode under its ordinary view, and binding it wins the
         // same fatal race whenever the candidate lands before the
         // prover exits. Corroboration, never the owning view, draws
-        // the line.
+        // the line. The view field is inert at this helper level; the
+        // engine test pins the wiring.
         const VERIFIED_OFFSET: u64 = 0xebe0;
         const DANGLING_OFFSET: u64 = 0x20;
         let provider = overlay(220);
@@ -11750,6 +11801,12 @@ mod tests {
             .expect("the dependency is pinned");
         pinned.by_id.get_mut(&target).unwrap().exports =
             Arc::from(vec![("C_Login".to_string(), VERIFIED_OFFSET)]);
+        // The provider proves its same-file entry as a function start,
+        // so this twin stays focused on the cross-object rule.
+        let provider_id = pinned
+            .id_for_scanned(&scanned, provider, &scanned.path)
+            .expect("the provider is pinned");
+        pinned.by_id.get_mut(&provider_id).unwrap().function_starts = Arc::from(vec![0x1000]);
 
         let (bound, skipped) = bind_scanned_modules_strict(&[scanned], &mut pinned);
 
@@ -11830,12 +11887,12 @@ mod tests {
 
     #[test]
     fn bind_without_strict_scope_keeps_uncorroborated_cross_object_entries() {
-        // The twin guard for the documented default bind: outside
-        // owned-run scope a non-getter cross-object entry binds
-        // without proof (forwarding providers and manifest-union
-        // conflicts need that; only the bootstrap getters refuse
-        // unverified forwards). The strict owned-run rule above must
-        // not leak into the default bind.
+        // The twin guard for the documented default bind helper (kept
+        // for the semantics snapshot, which attaches nothing): a
+        // non-getter cross-object entry binds without proof there
+        // (only the bootstrap getters refuse unverified forwards).
+        // Every engine candidate bind uses the strict variant above;
+        // the strict rule must not leak into this default helper.
         const VERIFIED_OFFSET: u64 = 0xebe0;
         const DANGLING_OFFSET: u64 = 0x20;
         let provider = overlay(220);
@@ -11876,6 +11933,143 @@ mod tests {
             "the unverified non-getter forward still binds by default: {entries:?}"
         );
         assert!(skipped.is_empty(), "no refusal by default: {skipped:?}");
+    }
+
+    #[test]
+    fn bind_refuses_uncorroborated_same_file_entries_without_function_proof() {
+        // F1: a same-file heuristic entry is as unproven as a cross-object
+        // one — garbage "pointers" landing inside the provider's own file
+        // still plant uprobes at unproven offsets. Strict bind must refuse
+        // same-file uncorroborated entries without a function-entry proof
+        // (export agreement or a proven function start), not bind them.
+        const DANGLING_OFFSET: u64 = 0x20;
+        let provider = overlay(220);
+        let mut scanned = module(provider);
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: provider,
+            object_path: PATH.into(),
+            file_offset: DANGLING_OFFSET,
+        });
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+
+        let (bound, skipped) = bind_scanned_modules_strict(&[scanned], &mut pinned);
+
+        assert_eq!(bound.len(), 1);
+        let entries = &bound[0].scanned.tables[0].entries;
+        assert!(
+            entries.is_empty(),
+            "unproven same-file entries never bind: {entries:?}"
+        );
+        assert_eq!(skipped.len(), 2, "both unproven same-file entries refuse");
+        for skip in &skipped {
+            assert!(
+                skip.reason.contains("not attached"),
+                "the refusal names the outcome: {}",
+                skip.reason
+            );
+        }
+    }
+
+    #[test]
+    fn bind_keeps_uncorroborated_same_file_entries_with_function_start_proof() {
+        // The positive twin: a same-file uncorroborated entry whose
+        // offset is a proven function start (an `STT_FUNC` definition
+        // or `.eh_frame_hdr` FDE start — the NSS/Rust internal-slot
+        // shape, where no standard-name export matches) binds. Only
+        // unproven offsets refuse.
+        const PROVEN_OFFSET: u64 = 0x1000;
+        const DANGLING_OFFSET: u64 = 0x20;
+        let provider = overlay(220);
+        let mut scanned = module(provider);
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: provider,
+            object_path: PATH.into(),
+            file_offset: DANGLING_OFFSET,
+        });
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        let provider_id = pinned
+            .id_for_scanned(&scanned, provider, &scanned.path)
+            .expect("the provider is pinned");
+        pinned.by_id.get_mut(&provider_id).unwrap().function_starts =
+            Arc::from(vec![PROVEN_OFFSET]);
+
+        let (bound, skipped) = bind_scanned_modules_strict(&[scanned], &mut pinned);
+
+        assert_eq!(bound.len(), 1);
+        let entries = &bound[0].scanned.tables[0].entries;
+        assert!(
+            entries.iter().any(|entry| entry.name == "C_Initialize"),
+            "the proven same-file entry binds: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.name == "C_Sign"),
+            "the unproven same-file entry never binds: {entries:?}"
+        );
+        assert_eq!(skipped.len(), 1, "exactly the unproven entry refuses");
+        assert_eq!(skipped[0].subject, "C_Sign");
+    }
+
+    #[test]
+    fn bind_keeps_uncorroborated_cross_object_entries_with_function_start_proof() {
+        // The cross-object positive twin: an uncorroborated entry whose
+        // offset is a proven function start in its target — but whose
+        // provisional name matches no export there (an internal-slot
+        // forward) — binds. Target safety needs a proven function
+        // entry, not a name match; the name stays provisional.
+        const PROVEN_OFFSET: u64 = 0xebe0;
+        const DANGLING_OFFSET: u64 = 0x20;
+        let provider = overlay(220);
+        let dependency = ObjectKey {
+            inode: provider.inode + 1,
+            ..provider
+        };
+        let mut scanned = module(provider);
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Login",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: PROVEN_OFFSET,
+        });
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: DANGLING_OFFSET,
+        });
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        let mut dependency_module = scanned.clone();
+        dependency_module.key = dependency;
+        let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
+        assert!(pinned.absorb(dependency_pins).is_empty());
+        // No export matches either name; only the login offset is a
+        // proven function start.
+        let target = pinned
+            .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
+            .expect("the dependency is pinned");
+        pinned.by_id.get_mut(&target).unwrap().function_starts = Arc::from(vec![PROVEN_OFFSET]);
+        let provider_id = pinned
+            .id_for_scanned(&scanned, provider, &scanned.path)
+            .expect("the provider is pinned");
+        pinned.by_id.get_mut(&provider_id).unwrap().function_starts = Arc::from(vec![0x1000]);
+
+        let (bound, skipped) = bind_scanned_modules_strict(&[scanned], &mut pinned);
+
+        assert_eq!(bound.len(), 1);
+        let entries = &bound[0].scanned.tables[0].entries;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { entry.name == "C_Login" && entry.file_offset == PROVEN_OFFSET }),
+            "the function-proven forward binds without export agreement: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.name == "C_Sign"),
+            "the unproven forward never binds: {entries:?}"
+        );
+        assert_eq!(skipped.len(), 1, "exactly the unproven forward refuses");
+        assert_eq!(skipped[0].subject, "C_Sign");
     }
 
     /// The Final candidate may reuse the First build only when the rescan

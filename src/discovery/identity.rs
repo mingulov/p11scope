@@ -2710,6 +2710,20 @@ impl PinnedObjects {
     /// manifest that still owns the same opened object. Returns the exact claims that
     /// were removed so the caller can rebuild its plan from the remaining modules.
     pub fn remove_view(&mut self, view: ProcessViewId) -> Option<ViewClaims> {
+        self.remove_view_except(view, &BTreeSet::new())
+    }
+
+    /// [`remove_view`](Self::remove_view), except ids in `keep` survive the
+    /// by-id/raw purge: their view claims still drop, but the pins stay
+    /// resolvable. The inventory candidate uses this to carry removed views'
+    /// modules for still-attached objects in generational scopes, where
+    /// unscanned successors may still map them; pid scope keeps plain
+    /// removal so an exited target retires.
+    pub fn remove_view_except(
+        &mut self,
+        view: ProcessViewId,
+        keep: &BTreeSet<PinnedObjectId>,
+    ) -> Option<ViewClaims> {
         let removed = self.ownership.remove(&view)?;
         self.bump_revision();
         let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
@@ -2749,11 +2763,16 @@ impl PinnedObjects {
                     .filter_map(|(raw, id)| raw.mount_namespace.is_none().then_some(*id)),
             )
             .collect();
-        let unowned: BTreeSet<_> = candidates.difference(&retained).copied().collect();
+        let unowned: BTreeSet<_> = candidates
+            .difference(&retained)
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
         self.scrub_proven_targets(unowned.iter().copied());
         self.by_id.retain(|id, _| !unowned.contains(id));
         self.raw_to_id.retain(|raw, id| {
-            !unowned.contains(id) && (!removed_raws.contains(raw) || retained_raws.contains(raw))
+            !unowned.contains(id)
+                && (!removed_raws.contains(raw) || retained_raws.contains(raw) || keep.contains(id))
         });
         Some(removed)
     }

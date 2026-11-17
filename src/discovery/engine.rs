@@ -31143,9 +31143,25 @@ impl Engine {
         }
         let assemble_start = crate::attach::monotonic_ns();
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();
+        // Generational carry: removed views' modules and pins for still-attached
+        // objects survive the tick. In scopes with churn and admission gaps
+        // (run/cgroup/system), unscanned successors may still map the file, so
+        // dropping on view exit alone retires live attachments with no removal
+        // decision and no gap. Pid scope keeps plain removal so an exited
+        // target retires (U-14).
+        let carry_objects: BTreeSet<PinnedObjectId> = if self.admits_generations() {
+            self.plan
+                .slots
+                .iter()
+                .filter(|slot| self.plan.is_active(slot.index))
+                .map(|slot| slot.object)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         let mut candidate_pins = self.pinned.clone();
         for view in removed {
-            candidate_pins.remove_view(*view);
+            candidate_pins.remove_view_except(*view, &carry_objects);
         }
         let mut raw_modules: Vec<_> = self
             .modules
@@ -31153,6 +31169,8 @@ impl Engine {
             .filter(|module| {
                 !removed.contains(&module.scanned.view)
                     && !refreshed_ids.contains(&module.scanned.view)
+                    || (removed.contains(&module.scanned.view)
+                        && carry_objects.contains(&module.object))
             })
             .map(|module| module.scanned.clone())
             .collect();
@@ -31184,6 +31202,19 @@ impl Engine {
         );
         let mut candidate =
             self.live_candidate_with_declined(candidate_pins, raw_modules, skipped, declined)?;
+        // Carried views are exited: their modules ride for the still-attached
+        // objects, but the views themselves must not enter currency, stale or
+        // admission checks (like declined views below, which are retained but
+        // never required).
+        let carried: BTreeSet<ProcessViewId> = self
+            .modules
+            .iter()
+            .filter(|module| {
+                removed.contains(&module.scanned.view) && carry_objects.contains(&module.object)
+            })
+            .map(|module| module.scanned.view)
+            .collect();
+        candidate.views.retain(|view| !carried.contains(view));
         candidate
             .views
             .extend(new_views.iter().map(|(view, _, _)| view.id()));

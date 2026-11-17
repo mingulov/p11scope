@@ -18678,6 +18678,24 @@ impl Engine {
         Ok((candidate, loader))
     }
 
+    /// Loader-assembly resolve set: the loader id plus committed provider
+    /// objects in cgroup scope. A validated loader scan assembles a global
+    /// candidate, so its pin purge must not drop the identity the
+    /// assembled modules need to bind; pins without modules are inert, so
+    /// this carries resolvability only, never coverage. Other scopes keep
+    /// loader-only behavior.
+    fn loader_resolve_set(&self, loader: PinnedObjectId) -> Vec<PinnedObjectId> {
+        let mut preserve = vec![loader];
+        if matches!(self.scope, Scope::Cgroup { .. }) {
+            for module in &self.modules {
+                if module.object != loader && !preserve.contains(&module.object) {
+                    preserve.push(module.object);
+                }
+            }
+        }
+        preserve
+    }
+
     fn conservative_candidate(
         &mut self,
         retirements: &BTreeSet<ProcessViewId>,
@@ -22258,7 +22276,8 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
+            let resolve = self.loader_resolve_set(loader);
+            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &resolve);
             (candidate_pins, raw_modules)
         } else if mode == LoaderScanMode::MetadataOnly && self.views[position].still_the_same() {
             // A metadata scan pinned its modules before their tables
@@ -22353,11 +22372,18 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
+            let resolve = self.loader_resolve_set(loader);
+            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &resolve);
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();
-            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &[loader]));
+            let resolve = self.loader_resolve_set(loader);
+            skipped.extend(candidate_pins.replace_view_pins_with_claims_for(
+                view_id,
+                fresh_pins,
+                &resolve,
+                &[loader],
+            ));
             let mut raw_modules: Vec<_> = self
                 .modules
                 .iter()
@@ -31177,10 +31203,12 @@ impl Engine {
         //
         // Proof-proportionate: removed views simply vanished (exit
         // unproven), so their pins carry freely; refreshed views were
-        // rescanned live, so their pins carry only while unadmitted
-        // newcomers wait (a successor generation may still map the file).
-        // Without successor evidence a rescanned-empty view's pins drop,
-        // and the loader ownership gate closes as before.
+        // rescanned live. Pins without modules are inert (bind needs raw
+        // modules), so refreshed pins carry in cgroup scope (a closed
+        // membership: turnover, not ambient churn) or while unadmitted
+        // newcomers wait anywhere; the modules carry below still needs
+        // successor evidence everywhere, and the loader ownership gate
+        // reads claims (dropped either way) and closes as before.
         let carry_objects: BTreeSet<PinnedObjectId> = if self.admits_generations() {
             self.plan
                 .slots
@@ -31191,11 +31219,13 @@ impl Engine {
         } else {
             BTreeSet::new()
         };
-        let preserve_refreshed: Vec<PinnedObjectId> = if self.newcomer_first_seen.is_empty() {
-            Vec::new()
-        } else {
-            carry_objects.iter().copied().collect()
-        };
+        let preserve_refreshed: Vec<PinnedObjectId> =
+            if matches!(self.scope, Scope::Cgroup { .. }) || !self.newcomer_first_seen.is_empty() {
+                carry_objects.iter().copied().collect()
+            } else {
+                Vec::new()
+            };
+        let preserve_modules_refreshed = !self.newcomer_first_seen.is_empty();
         if declined.is_empty()
             && self.plan_rebuild_stable
             && !fast_path_disabled
@@ -31270,9 +31300,10 @@ impl Engine {
                     || (removed.contains(&module.scanned.view)
                         && carry_objects.contains(&module.object))
                     // A rescanned-empty view's modules ride only with
-                    // successor evidence (see `preserve_refreshed` above):
-                    // without it the rescan authoritatively dropped them.
-                    || (!preserve_refreshed.is_empty()
+                    // successor evidence (see `preserve_modules_refreshed`
+                    // above): without it the rescan authoritatively dropped
+                    // them.
+                    || (preserve_modules_refreshed
                         && refreshed_ids.contains(&module.scanned.view)
                         && carry_objects.contains(&module.object))
             })

@@ -603,6 +603,8 @@
                   "a provider file was learned after its first use; its earlier calls were not observed",
                   "file-learning events were lost; some provider files may not have been learned",
                   "file learning reached its 32-file per-capture cap; further provider files were not learned",
+                  "table learning reached its 32-module per-capture cap; further provider tables were not learned",
+                  "a learned provider's tables lost their pinned identity; its calls were not observed",
                   "file learning was unavailable; short-lived first loads of new provider files were not learned",
                   "a provider file was replaced or deleted before staging; it was not learned",
                   "file learning was disabled by the operator; short-lived first loads of new provider files were not learned",

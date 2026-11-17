@@ -2282,10 +2282,7 @@ mod tests {
             "one live temp beside the final name during the capture"
         );
         let live_metadata = std::fs::symlink_metadata(&live_temps[0]).unwrap();
-        assert!(
-            live_metadata.is_file(),
-            "the live temp is a regular file"
-        );
+        assert!(live_metadata.is_file(), "the live temp is a regular file");
         assert_eq!(
             live_metadata.uid(),
             0,
@@ -2324,9 +2321,7 @@ mod tests {
                         libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC,
                     );
                     if fd < 0 {
-                        libc::_exit(
-                            std::io::Error::last_os_error().raw_os_error().unwrap_or(99),
-                        );
+                        libc::_exit(std::io::Error::last_os_error().raw_os_error().unwrap_or(99));
                     }
                     let injected = b"INJECTED";
                     let mut written = 0;

@@ -123,6 +123,11 @@ OBSERVER_WAIT_SECONDS = 20
 PUBLICATION_SECONDS = 10
 MAX_BYTES = dumper.TASK_STORAGE_MAX_BYTES
 MAX_LOG_BYTES = 4 * 1024 * 1024
+# One atomic metadata listing per inventory pass: ~3000 rows at current
+# bpftool widths, so foreign maps on a shared host never truncate the
+# observer's own rows, far below the 64 MB JSON ceiling. Membership still
+# comes only from the observer fdinfo census; the listing selects by id.
+INVENTORY_LISTING_MAX_BYTES = 1024 * 1024
 DIAGNOSTIC_SCRIPTS = {str(Path(__file__).resolve().parent / name): name for name in (
     'capture-stopped-canary.py', 'check-canary-evidence.py',
     'check-capture-evidence.py', 'canary_process_custody.py',
@@ -495,6 +500,24 @@ class LiveMaps:
             return dumper.run_json(args, require_list=item is not None, map_identity=item,
                                    timeout_seconds=remaining(deadline, dumper.JSON_TIMEOUT_SECONDS), max_bytes=bound)
 
+    def _show_all(self, deadline):
+        # One snapshot listing instead of one round-trip per map id: fewer
+        # spawns under the stopped-phase budget, and a single snapshot
+        # instead of dozens of sequential ones. Rows are indexed by their
+        # own claimed id; inventory() admits only observer-fdinfo ids, and a
+        # listing that is not identified per row fails closed here.
+        with self.owner.helper_wait():
+            rows = dumper.run_json(['bpftool', '-j', 'map', 'show'], require_list=True,
+                                   timeout_seconds=remaining(deadline, dumper.JSON_TIMEOUT_SECONDS),
+                                   max_bytes=INVENTORY_LISTING_MAX_BYTES)
+        index = {}
+        for row in rows:
+            require(isinstance(row, dict) and type(row.get('id')) is int and row['id'] > 0,
+                    'map snapshot listing row is not an identified map')
+            require(row['id'] not in index, f"duplicate map id in snapshot listing: {row['id']}")
+            index[row['id']] = row
+        return index
+
     def inventory(self, group, deadline):
         remaining(deadline)
         group.snapshot(deadline)
@@ -515,9 +538,15 @@ class LiveMaps:
                 after_names.append(entry.name)
         require(sorted(names) == sorted(after_names), 'observer fdinfo membership changed')
         ids = dumper.map_ids_from_fdinfo(texts)
-        fetched = [(map_id, dumper.one(self._json(
-            ['bpftool', '-j', 'map', 'show', 'id', str(map_id)], deadline, bound=65536)))
-                   for map_id in ids]
+        if ids:
+            listing = self._show_all(deadline)
+            fetched = []
+            for map_id in ids:
+                require(map_id in listing,
+                        f'map id from observer fdinfo missing from snapshot listing: {map_id}')
+                fetched.append((map_id, listing[map_id]))
+        else:
+            fetched = []
         kept, _ = partition_identity_maps(
             [row for _, row in fetched], self.config.workload_origin)
         held = {id(row) for row in kept}

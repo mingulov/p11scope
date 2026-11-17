@@ -9216,6 +9216,29 @@ fn stopped_canary_capture_lifecycle() {
 }
 
 #[test]
+fn snapshot_inventory_single_listing() {
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "tests/python/test_stopped_canary_capture.py",
+            "SnapshotInventoryTests",
+            "-v",
+        ])
+        .output()
+        .expect("run single-snapshot inventory tests");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "snapshot inventory tests failed: {report}"
+    );
+    assert_clean_python_suite(&report, "SnapshotInventoryTests", 5);
+}
+
+#[test]
 fn task_storage_canary_seed_lifecycle() {
     // About 9 s alone; the 60 s outer bound is a SLACK hang guard.
     let bound = slack_timeout(60);

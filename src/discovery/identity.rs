@@ -1403,6 +1403,22 @@ pub struct PinnedObjects {
     ambiguity_published: BTreeSet<ObjectKey>,
     ownership: BTreeMap<ProcessViewId, ViewClaims>,
     raw_ownership: BTreeMap<ProcessViewId, BTreeSet<RawObjectInstance>>,
+    /// Every `(target object, file offset)` the strict bind proved is a
+    /// function entry: export agreement or a proven function start for
+    /// an uncorroborated entry (see `bind_scanned_modules_strict`).
+    /// Corroborated entries record nothing (no proof was evaluated for
+    /// them) and the default bind records nothing (it keeps without
+    /// proof). Retention re-binds through the strict path consult this
+    /// set: a retained offset proven when first bound carries its
+    /// proof without re-proof and without a drop, while an offset
+    /// that was never proven must prove fresh or refuse with the
+    /// named counted gap. Keyed by capture-local ID lineage, so it
+    /// travels with the pins through clones; every site that drops an
+    /// ID scrubs its pairs, and absorbed incoming proofs are dropped
+    /// (the overlay heuristic can join different files under one ID,
+    /// so an incoming proof must re-prove here). A durable pin fact,
+    /// not a derived claim: claim resets never clear it.
+    proven_targets: BTreeSet<(PinnedObjectId, u64)>,
     next_id: u32,
     /// Sticky proof loss from either accepted scan-only overlay heuristic.
     overlay_uncertain: bool,
@@ -1429,6 +1445,7 @@ impl Clone for PinnedObjects {
             ambiguity_published: self.ambiguity_published.clone(),
             ownership: self.ownership.clone(),
             raw_ownership: self.raw_ownership.clone(),
+            proven_targets: self.proven_targets.clone(),
             next_id: self.next_id,
             overlay_uncertain: self.overlay_uncertain,
             changed: std::cell::Cell::new(self.changed.get()),
@@ -1564,6 +1581,7 @@ impl PinnedObjects {
             ambiguity_published: BTreeSet::new(),
             ownership: BTreeMap::new(),
             raw_ownership: BTreeMap::new(),
+            proven_targets: BTreeSet::new(),
             next_id: 0,
             overlay_uncertain: false,
             changed: std::cell::Cell::new(false),
@@ -1588,8 +1606,8 @@ impl PinnedObjects {
     /// Whether two scan-produced pin sets carry identical identity
     /// content: every raw observation resolves to an entry with the same
     /// mapping identity, held-fd device, pin, digest, ABI, exports and
-    /// proof flags, and the rejection, ambiguity, ownership and
-    /// raw-ownership layers agree. Scan-local object ids, the held
+    /// proof flags, and the rejection, ambiguity, ownership,
+    /// raw-ownership and carried-proof layers agree. Scan-local object ids, the held
     /// `File` handles and the per-object unchanged-check stamps are not
     /// content: ids are remapped by identity on absorb, and the stamps
     /// only ever move later under `check_unchanged`.
@@ -1640,6 +1658,19 @@ impl PinnedObjects {
                 .collect::<BTreeMap<_, _>>()
         };
         if claims_of(self) != claims_of(other) {
+            return false;
+        }
+        // Carried function-entry proofs are a bind input (the strict
+        // bind keeps carried offsets without re-proof), so the reuse
+        // fence compares them like bound targets: same raw-backed
+        // files at the same offsets, scan-local ids aside.
+        let proven_of = |pins: &Self| {
+            pins.proven_targets
+                .iter()
+                .map(|(id, offset)| (raws_of(pins, *id), *offset))
+                .collect::<BTreeSet<_>>()
+        };
+        if proven_of(self) != proven_of(other) {
             return false;
         }
         self.raw_to_id.iter().all(|(raw, id)| {
@@ -1720,6 +1751,13 @@ impl PinnedObjects {
     /// an equal raw `ObjectKey` with any unequal full identity rejects the whole group.
     pub fn absorb(&mut self, other: PinnedObjects) -> Vec<Skipped> {
         self.bump_revision();
+        // Incoming proofs never transfer: the overlay heuristic can
+        // join different files under one ID (the collapsed arm in
+        // `insert_entry_with_aliases`), so an incoming proof must
+        // re-prove here instead of remapping onto a possibly
+        // different file. Dropping is fail-closed; the strict bind
+        // re-proves. This set's own proofs are untouched.
+        drop(other.proven_targets);
         let other_overlay_uncertain = other.overlay_uncertain;
         let other_raw_ownership = other.raw_ownership;
         let mut entries = other.by_id;
@@ -2264,6 +2302,7 @@ impl PinnedObjects {
         // A no-op whenever raw ownership is complete, as production scans
         // always attach it at pin time.
         if !dropped.is_empty() {
+            self.scrub_proven_targets(dropped.iter().copied());
             for claims in self.ownership.values_mut() {
                 claims.remove(&dropped);
             }
@@ -2350,6 +2389,7 @@ impl PinnedObjects {
         // Dropping entries must not strand their claimants: scrub ownership
         // claims and owned raws for the dropped ids, mirroring remove_view.
         if !dropped.is_empty() {
+            self.scrub_proven_targets(dropped.iter().copied());
             for claims in self.ownership.values_mut() {
                 claims.remove(&dropped);
             }
@@ -2386,6 +2426,19 @@ impl PinnedObjects {
                 .filter_map(|raw| self.raw_to_id.get(raw).copied())
                 .filter(|id| self.by_id.contains_key(id))
                 .collect();
+        }
+    }
+
+    /// Scrubs carried function-entry proofs for dropped IDs. Every site
+    /// that drops an ID calls this with the same IDs it scrubs claims
+    /// for: a proof names its target by capture-local ID, so a dropped
+    /// ID's pairs must never survive to match a later bind. Scrubbing
+    /// is fail-closed (the entry re-proves fresh); every caller below
+    /// already bumps the revision for the membership change.
+    fn scrub_proven_targets(&mut self, ids: impl IntoIterator<Item = PinnedObjectId>) {
+        let ids: BTreeSet<PinnedObjectId> = ids.into_iter().collect();
+        if !ids.is_empty() {
+            self.proven_targets.retain(|(id, _)| !ids.contains(id));
         }
     }
 
@@ -2651,6 +2704,7 @@ impl PinnedObjects {
             )
             .collect();
         let unowned: BTreeSet<_> = candidates.difference(&retained).copied().collect();
+        self.scrub_proven_targets(unowned.iter().copied());
         self.by_id.retain(|id, _| !unowned.contains(id));
         self.raw_to_id.retain(|raw, id| {
             !unowned.contains(id) && (!removed_raws.contains(raw) || retained_raws.contains(raw))
@@ -2797,6 +2851,24 @@ impl PinnedObjects {
     /// its retained fd canonical for attach, exactly as on >= 6.8. Any
     /// ambiguity, any probe refusal, or an already-exact alias leaves the
     /// pins untouched, so a >= 6.8 capture never consults the probe here.
+    /// Retires a split-alias entry the refile just unlinked: when no raw
+    /// and no ownership claim references it anymore, its carried proofs
+    /// scrub with it and the entry is removed. Both split refiles share
+    /// this; a still-referenced entry stays untouched.
+    fn retire_unreferenced_alias(&mut self, id: PinnedObjectId) {
+        let referenced = self.raw_to_id.values().any(|kept| *kept == id)
+            || self.ownership.values().any(|claims| {
+                claims.tables.contains(&id)
+                    || claims.pins.contains(&id)
+                    || claims.targets.iter().any(|(kept, _)| *kept == id)
+            });
+        if !referenced {
+            self.scrub_proven_targets([id]);
+            self.by_id.remove(&id);
+            self.bump_revision();
+        }
+    }
+
     pub(crate) fn refile_split_manifest_alias(
         &mut self,
         recorded: ObjectKey,
@@ -2866,16 +2938,7 @@ impl PinnedObjects {
         }
         self.bump_copy_version();
         self.raw_to_id.remove(&manifest_raw);
-        let referenced = self.raw_to_id.values().any(|id| *id == manifest_id)
-            || self.ownership.values().any(|claims| {
-                claims.tables.contains(&manifest_id)
-                    || claims.pins.contains(&manifest_id)
-                    || claims.targets.iter().any(|(id, _)| *id == manifest_id)
-            });
-        if !referenced {
-            self.by_id.remove(&manifest_id);
-            self.bump_revision();
-        }
+        self.retire_unreferenced_alias(manifest_id);
         self.raw_to_id.insert(
             RawObjectInstance {
                 mount_namespace: None,
@@ -2969,16 +3032,7 @@ impl PinnedObjects {
         }
         self.bump_copy_version();
         self.raw_to_id.remove(&prearm_raw);
-        let referenced = self.raw_to_id.values().any(|id| *id == prearm_id)
-            || self.ownership.values().any(|claims| {
-                claims.tables.contains(&prearm_id)
-                    || claims.pins.contains(&prearm_id)
-                    || claims.targets.iter().any(|(id, _)| *id == prearm_id)
-            });
-        if !referenced {
-            self.by_id.remove(&prearm_id);
-            self.bump_revision();
-        }
+        self.retire_unreferenced_alias(prearm_id);
         self.raw_to_id.insert(prearm_raw, scan_id);
     }
 
@@ -3545,6 +3599,7 @@ impl PinnedObjects {
                         .is_some_and(|id| kept_pre.contains(id))
             });
         }
+        self.scrub_proven_targets(ids.iter().copied());
         for claims in self.ownership.values_mut() {
             claims.remove(&ids);
         }
@@ -9863,6 +9918,10 @@ pub fn canonicalize_scanned_overlays(pinned: &mut PinnedObjects) -> (usize, Vec<
     for claims in pinned.ownership.values_mut() {
         claims.remap(&canonical);
     }
+    // The folded-away IDs merge by identical bytes, so their entries
+    // re-prove against the kept entry; their carried pairs are
+    // scrubbed rather than remapped (fail-closed).
+    pinned.scrub_proven_targets(canonical.keys().copied());
     for (id, kept) in &canonical {
         pinned.by_id.remove(id);
         if let Some(kept) = pinned.by_id.get_mut(kept) {
@@ -10091,17 +10150,27 @@ fn bind_scanned_modules_inner(
                             };
                             table.unpinned.push(skip.clone());
                             lost.push(skip);
-                        } else if strict_uncorroborated
-                            && !corroborated
-                            && !{
-                                pinned.exports_for(id).iter().any(|(name, offset)| {
+                        } else if strict_uncorroborated && !corroborated && {
+                            // Carried proof (retention): this pin set
+                            // proved the offset when first bound, so a
+                            // retention re-bind keeps it without
+                            // re-proof and without a drop. Anything
+                            // else must prove fresh below or refuse.
+                            if pinned.proven_targets.contains(&(id, entry.file_offset)) {
+                                false
+                            } else {
+                                let fresh = pinned.exports_for(id).iter().any(|(name, offset)| {
                                     name == entry.name && *offset == entry.file_offset
                                 }) || pinned
                                     .function_starts_for(id)
                                     .binary_search(&entry.file_offset)
-                                    .is_ok()
+                                    .is_ok();
+                                if fresh {
+                                    pinned.proven_targets.insert((id, entry.file_offset));
+                                }
+                                !fresh
                             }
-                        {
+                        } {
                             let skip = Skipped {
                                 subject: entry.name.to_string(),
                                 reason: format!(
@@ -12106,6 +12175,346 @@ mod tests {
         assert_eq!(skipped[0].subject, "C_Sign");
     }
 
+    #[test]
+    fn bind_carries_proven_offsets_through_retention_and_refuses_never_proven() {
+        // Retention re-binds retained modules through the strict path: an
+        // offset the pin set proved when first bound carries that proof
+        // without re-proof (no re-verification against possibly
+        // disproved current evidence, no drop), while an offset that was
+        // never proven is refused with the named counted gap and the
+        // rest of the capture keeps its data (partial, never stop).
+        const PROVEN_OFFSET: u64 = 0xebe0;
+        const DANGLING_OFFSET: u64 = 0x20;
+        let provider = overlay(220);
+        let dependency = ObjectKey {
+            inode: provider.inode + 1,
+            ..provider
+        };
+        let mut scanned = module(provider);
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Login",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: PROVEN_OFFSET,
+        });
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        let mut dependency_module = scanned.clone();
+        dependency_module.key = dependency;
+        let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
+        assert!(pinned.absorb(dependency_pins).is_empty());
+        let target = pinned
+            .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
+            .expect("the dependency is pinned");
+        pinned.by_id.get_mut(&target).unwrap().function_starts = Arc::from(vec![PROVEN_OFFSET]);
+        let provider_id = pinned
+            .id_for_scanned(&scanned, provider, &scanned.path)
+            .expect("the provider is pinned");
+        pinned.by_id.get_mut(&provider_id).unwrap().function_starts = Arc::from(vec![0x1000]);
+
+        // First bind proves both entries (no export matches either
+        // name; the starts carry the proof).
+        let (bound, skipped) = bind_scanned_modules_strict(&[scanned], &mut pinned);
+        assert_eq!(bound.len(), 1);
+        assert!(
+            skipped.is_empty(),
+            "the first bind proves every entry: {skipped:?}"
+        );
+
+        // Retention against disproved current evidence (the E07 splice
+        // effect at bind level): the pins can no longer prove the
+        // retained offsets, so a re-proof would refuse them. The pin
+        // set travels through the retention clone first, proving the
+        // carried proof moves with the pins.
+        pinned.by_id.get_mut(&target).unwrap().function_starts = Arc::from(vec![]);
+        pinned.by_id.get_mut(&target).unwrap().exports = Arc::from(vec![]);
+        pinned.by_id.get_mut(&provider_id).unwrap().function_starts = Arc::from(vec![]);
+        let mut retained = pinned.clone();
+        // A fresh never-proven entry joins the retained module at the
+        // retention re-bind (the merge appends a table; bind-level the
+        // entry is the same input).
+        let mut rebound = bound[0].scanned.clone();
+        rebound.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: DANGLING_OFFSET,
+        });
+
+        let (rebound, skipped) = bind_scanned_modules_strict(&[rebound], &mut retained);
+
+        assert_eq!(
+            rebound.len(),
+            1,
+            "the capture continues: partial, never stop"
+        );
+        let entries = &rebound[0].scanned.tables[0].entries;
+        assert!(
+            entries.iter().any(|entry| entry.name == "C_Initialize"),
+            "the carried same-file entry keeps its data: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { entry.name == "C_Login" && entry.file_offset == PROVEN_OFFSET }),
+            "the carried cross-object entry binds without re-proof: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.name == "C_Sign"),
+            "the never-proven entry never binds: {entries:?}"
+        );
+        assert_eq!(skipped.len(), 1, "exactly the never-proven entry refuses");
+        assert_eq!(skipped[0].subject, "C_Sign");
+        assert!(
+            skipped[0].reason.contains("not a proven function entry")
+                && skipped[0].reason.contains("not attached"),
+            "the refusal is the named counted gap: {}",
+            skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn carried_proofs_follow_replace_absorb_remove() {
+        // Carried proofs are keyed by capture-local ID lineage (the
+        // strict bind above is their only producer): replacing a view's
+        // pins scrubs the replaced IDs' pairs (the rescan may name
+        // different files — fail closed, re-prove), absorbed incoming
+        // proofs never transfer (the overlay heuristic can join
+        // different files under one ID), and retiring a view scrubs
+        // its unowned IDs' pairs. Survivors keep theirs throughout.
+        let k1 = overlay(1);
+        let k2 = overlay(2);
+        let m1 = module(k1);
+        let m2 = module(k2);
+        let mut pins = image_pins(&[(k1, "aa", 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&m1), &mut pins);
+        let mut second = image_pins(&[(k2, "bb", 2)]);
+        reconcile_scanned_modules(std::slice::from_ref(&m2), &mut second);
+        assert!(pins.absorb(second).is_empty());
+        own_all_raws(&mut pins);
+        let id1 = pins
+            .id_for_scanned(&m1, k1, &m1.path)
+            .expect("view 1 resolves");
+        let id2 = pins
+            .id_for_scanned(&m2, k2, &m2.path)
+            .expect("view 2 resolves");
+        pins.proven_targets.insert((id1, 0x100));
+        pins.proven_targets.insert((id2, 0x200));
+
+        pins.replace_view_pins(m1.view, PinnedObjects::empty(), &[]);
+        assert!(
+            !pins.by_id.contains_key(&id1),
+            "the replaced view loses its pin"
+        );
+        assert!(
+            pins.proven_targets.iter().all(|(id, _)| *id != id1),
+            "the replaced ID's proof scrubs with it: {:?}",
+            pins.proven_targets
+        );
+        assert!(
+            pins.proven_targets.contains(&(id2, 0x200)),
+            "the survivor keeps its proof: {:?}",
+            pins.proven_targets
+        );
+
+        let k3 = overlay(3);
+        let mut incoming = image_pins(&[(k3, "cc", 3)]);
+        let incoming_id = incoming
+            .id_for_scanned(&module(k3), k3, PATH)
+            .expect("the incoming pin resolves");
+        incoming.proven_targets.insert((incoming_id, 0x300));
+        assert!(pins.absorb(incoming).is_empty());
+        assert!(
+            pins.proven_targets.iter().all(|(_, off)| *off != 0x300),
+            "an absorbed incoming proof never transfers: {:?}",
+            pins.proven_targets
+        );
+        assert!(
+            pins.proven_targets.contains(&(id2, 0x200)),
+            "the absorb keeps this set's own proofs: {:?}",
+            pins.proven_targets
+        );
+
+        pins.remove_view(m2.view);
+        assert!(
+            !pins.by_id.contains_key(&id2),
+            "the retired view loses its pin"
+        );
+        assert!(
+            pins.proven_targets.is_empty(),
+            "the retired ID's proof scrubs with it: {:?}",
+            pins.proven_targets
+        );
+    }
+
+    #[test]
+    fn carried_proofs_scrub_on_overlay_canonicalization() {
+        // The folded-away overlay twin merges by identical bytes, so its
+        // entries re-prove against the kept entry; its carried pairs
+        // scrub rather than remap (fail-closed). The kept twin's pairs
+        // stay valid (its file is unchanged).
+        let mut pins = pins(&[
+            (overlay(1), SHA, 1),
+            (overlay(2), SHA, 1),
+            (overlay(3), "cc", 9),
+        ]);
+        let id_of = |pins: &PinnedObjects, key: ObjectKey| {
+            pins.raw_to_id
+                .iter()
+                .find_map(|(raw, id)| (raw.key == key).then_some(*id))
+                .expect("the raw resolves")
+        };
+        let kept = id_of(&pins, overlay(1));
+        let folded = id_of(&pins, overlay(2));
+        let third = id_of(&pins, overlay(3));
+        pins.proven_targets.insert((kept, 0x100));
+        pins.proven_targets.insert((folded, 0x200));
+        pins.proven_targets.insert((third, 0x300));
+
+        let (count, _) = canonicalize_scanned_overlays(&mut pins);
+
+        assert_eq!(count, 1, "the identical-bytes twin folds");
+        assert!(
+            pins.proven_targets.iter().all(|(id, _)| *id != folded),
+            "the folded ID's proof scrubs: {:?}",
+            pins.proven_targets
+        );
+        assert!(
+            pins.proven_targets.contains(&(kept, 0x100)),
+            "the kept twin's proof survives: {:?}",
+            pins.proven_targets
+        );
+        assert!(
+            pins.proven_targets.contains(&(third, 0x300)),
+            "the untouched pin's proof survives: {:?}",
+            pins.proven_targets
+        );
+    }
+
+    #[test]
+    fn carried_proofs_scrub_on_key_rejection() {
+        // A rejected key refutes its entries' identities, so their
+        // carried proofs scrub with them. The surviving key's proofs stay.
+        let k1 = overlay(1);
+        let k2 = overlay(2);
+        let mut pins = image_pins(&[(k1, SHA, 1), (k2, SHA, 2)]);
+        let id1 = pins
+            .id_for_scanned(&module(k1), k1, PATH)
+            .expect("key 1 resolves");
+        let id2 = pins
+            .id_for_scanned(&module(k2), k2, PATH)
+            .expect("key 2 resolves");
+        pins.proven_targets.insert((id1, 0x100));
+        pins.proven_targets.insert((id2, 0x200));
+
+        pins.reject_key(k1);
+
+        assert!(
+            !pins.by_id.contains_key(&id1),
+            "the rejected key loses its pin"
+        );
+        assert!(
+            pins.proven_targets.iter().all(|(id, _)| *id != id1),
+            "the rejected ID's proof scrubs: {:?}",
+            pins.proven_targets
+        );
+        assert!(
+            pins.proven_targets.contains(&(id2, 0x200)),
+            "the surviving key's proof stays: {:?}",
+            pins.proven_targets
+        );
+    }
+
+    #[test]
+    fn carried_proofs_scrub_on_prune_view_pins() {
+        // Pruning a view to its surviving modules reclaims the retired
+        // module's pin; its carried proof scrubs with it while the
+        // survivor's proof stays.
+        let ka = ObjectKey {
+            device: Device { major: 0, minor: 1 },
+            inode: 101,
+        };
+        let kb = ObjectKey {
+            device: Device { major: 0, minor: 1 },
+            inode: 102,
+        };
+        let ma = module(ka);
+        let mb = module(kb);
+        assert_eq!(ma.view, mb.view, "both modules share the pruned view");
+        let mut pins = image_pins(&[(ka, "aa", 1), (kb, "bb", 2)]);
+        reconcile_scanned_modules(&[ma.clone(), mb.clone()], &mut pins);
+        own_all_raws(&mut pins);
+        let ida = pins
+            .id_for_scanned(&ma, ka, &ma.path)
+            .expect("module a resolves");
+        let idb = pins
+            .id_for_scanned(&mb, kb, &mb.path)
+            .expect("module b resolves");
+        pins.proven_targets.insert((ida, 0x100));
+        pins.proven_targets.insert((idb, 0x200));
+
+        pins.prune_view_pins_to_modules(ma.view, &[ma], &[]);
+
+        assert!(
+            !pins.by_id.contains_key(&idb),
+            "the retired module loses its pin"
+        );
+        assert!(
+            pins.proven_targets.iter().all(|(id, _)| *id != idb),
+            "the retired ID's proof scrubs: {:?}",
+            pins.proven_targets
+        );
+        assert!(
+            pins.proven_targets.contains(&(ida, 0x100)),
+            "the surviving module's proof stays: {:?}",
+            pins.proven_targets
+        );
+    }
+
+    #[test]
+    fn carried_proofs_retire_with_unreferenced_alias() {
+        // Both split refiles retire their unlinked alias through this
+        // step: an entry no raw and no claim references anymore takes
+        // its carried proofs with it, while a still-referenced entry
+        // stays untouched with its proofs.
+        let k1 = overlay(1);
+        let k2 = overlay(2);
+        let mut pins = image_pins(&[(k1, SHA, 1), (k2, SHA, 2)]);
+        let id1 = pins
+            .id_for_scanned(&module(k1), k1, PATH)
+            .expect("id 1 resolves");
+        let id2 = pins
+            .id_for_scanned(&module(k2), k2, PATH)
+            .expect("id 2 resolves");
+        pins.proven_targets.insert((id1, 0x100));
+        pins.proven_targets.insert((id2, 0x200));
+        // The refile already moved id 1's alias away: unlink its raw.
+        let raw1 = pins
+            .raw_to_id
+            .iter()
+            .find_map(|(raw, id)| (*id == id1).then(|| raw.clone()))
+            .expect("id 1 files a raw");
+        pins.raw_to_id.remove(&raw1);
+
+        pins.retire_unreferenced_alias(id1);
+        assert!(
+            !pins.by_id.contains_key(&id1),
+            "the unreferenced alias retires"
+        );
+        assert!(
+            pins.proven_targets.iter().all(|(id, _)| *id != id1),
+            "the retired alias's proof scrubs: {:?}",
+            pins.proven_targets
+        );
+
+        pins.retire_unreferenced_alias(id2);
+        assert!(pins.by_id.contains_key(&id2), "the referenced entry stays");
+        assert!(
+            pins.proven_targets.contains(&(id2, 0x200)),
+            "the referenced entry keeps its proof: {:?}",
+            pins.proven_targets
+        );
+    }
+
     /// The Final candidate may reuse the First build only when the rescan
     /// produced pin content identical to the first scan's, so the content
     /// comparison must see through scan-local id assignment (insertion
@@ -12182,6 +12591,34 @@ mod tests {
         assert!(
             !one.same_pin_content(&changed),
             "a changed-byte latch is content"
+        );
+
+        let mut proven = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
+        {
+            let id = proven
+                .raw_to_id
+                .iter()
+                .find_map(|(raw, id)| (raw.key == overlay(102)).then_some(*id))
+                .expect("the raw resolves");
+            proven.proven_targets.insert((id, 0x100));
+        }
+        assert!(
+            !one.same_pin_content(&proven),
+            "a carried proof is content: the strict bind keeps it without re-proof"
+        );
+        let mut reordered_proven =
+            pin_set(&[(overlay(104), SHA, 9), (overlay(102), SHA, 7)], false);
+        {
+            let id = reordered_proven
+                .raw_to_id
+                .iter()
+                .find_map(|(raw, id)| (raw.key == overlay(102)).then_some(*id))
+                .expect("the raw resolves");
+            reordered_proven.proven_targets.insert((id, 0x100));
+        }
+        assert!(
+            proven.same_pin_content(&reordered_proven),
+            "carried proofs compare by raw-backed file, not scan-local id"
         );
     }
 

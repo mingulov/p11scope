@@ -50595,7 +50595,12 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_module() {
 /// The dependency leg of the incomplete-scan refusal: the owning module
 /// still reproves, but a fresh table entry target contradicts its
 /// retained dependency identity. The fresh target must not bind to the
-/// disproved retained dependency ID either.
+/// disproved retained dependency ID either. Retention re-binds through
+/// the strict path, and the retained offset was proven a function entry
+/// when first bound, so its proof carries through retention without
+/// re-proof against the spliced pin and without a drop: the capture
+/// keeps its data (partial, never stop) while never-proven offsets
+/// still refuse with the named counted gap (pinned at the bind seam).
 #[test]
 fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
     const TEST: &str =
@@ -50670,10 +50675,32 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
         &mut pending,
     );
 
+    // Non-vacuity: the spliced pin's proof evidence comes from the
+    // provider file, not the dependency, so it cannot prove the
+    // retained offset — this keep exercises the carried proof, not a
+    // fresh re-proof (without the carry, `after` is empty).
+    let (_, retained_offset) = before.iter().next().copied().expect("one covered target");
+    assert!(
+        !engine
+            .pinned
+            .exports_for(dep_id)
+            .iter()
+            .any(|(_, offset)| *offset == retained_offset),
+        "the spliced pin exports nothing at the retained offset"
+    );
+    assert!(
+        engine
+            .pinned
+            .function_starts_for(dep_id)
+            .binary_search(&retained_offset)
+            .is_err(),
+        "the spliced pin proves no function start at the retained offset"
+    );
+
     let after = e07_active_targets(&engine);
     assert_eq!(
         after, before,
-        "disproved fresh facts must not bind to the retained dependency: before={before:?} after={after:?}"
+        "disproved fresh facts must not bind to the retained dependency while its proven offsets carry their proof: before={before:?} after={after:?}"
     );
 }
 

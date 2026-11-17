@@ -123,11 +123,13 @@ OBSERVER_WAIT_SECONDS = 20
 PUBLICATION_SECONDS = 10
 MAX_BYTES = dumper.TASK_STORAGE_MAX_BYTES
 MAX_LOG_BYTES = 4 * 1024 * 1024
-# One atomic metadata listing per inventory pass: ~3000 rows at current
-# bpftool widths, so foreign maps on a shared host never truncate the
-# observer's own rows, far below the 64 MB JSON ceiling. Membership still
-# comes only from the observer fdinfo census; the listing selects by id.
-INVENTORY_LISTING_MAX_BYTES = 1024 * 1024
+# One metadata listing per inventory pass, sized for busy shared hosts:
+# 8 MiB holds tens of thousands of rows at measured bpftool widths while
+# the observer needs ~50 (~18 KiB), far below the 64 MB JSON ceiling. Past
+# the bound the listing refuses and the inventory pages per map id instead
+# of failing, so success never depends on the host-wide map count.
+# Membership still comes only from the observer fdinfo census.
+INVENTORY_LISTING_MAX_BYTES = 8 * 1024 * 1024
 DIAGNOSTIC_SCRIPTS = {str(Path(__file__).resolve().parent / name): name for name in (
     'capture-stopped-canary.py', 'check-canary-evidence.py',
     'check-capture-evidence.py', 'canary_process_custody.py',
@@ -500,21 +502,57 @@ class LiveMaps:
             return dumper.run_json(args, require_list=item is not None, map_identity=item,
                                    timeout_seconds=remaining(deadline, dumper.JSON_TIMEOUT_SECONDS), max_bytes=bound)
 
-    def _show_all(self, deadline):
-        # One snapshot listing instead of one round-trip per map id: fewer
-        # spawns under the stopped-phase budget, and a single snapshot
-        # instead of dozens of sequential ones. Rows are indexed by their
-        # own claimed id; inventory() admits only observer-fdinfo ids, and a
-        # listing that is not identified per row fails closed here.
-        with self.owner.helper_wait():
-            rows = dumper.run_json(['bpftool', '-j', 'map', 'show'], require_list=True,
-                                   timeout_seconds=remaining(deadline, dumper.JSON_TIMEOUT_SECONDS),
-                                   max_bytes=INVENTORY_LISTING_MAX_BYTES)
+    def _show_all(self, ids, deadline):
+        # One listing instead of one round-trip per map id: fewer spawns
+        # under the stopped-phase budget, and one bpftool pass instead of
+        # dozens of sequential ones. "Single snapshot" is relative, not
+        # atomic: bpftool still walks maps one by one, so concurrent churn
+        # can skew the listing; churn fails closed via the missing check
+        # plus validate_inventory in inventory(). Only observer-fdinfo ids
+        # are selected, so foreign rows (even malformed ones) can neither
+        # pass nor fail the lane. A listing that overflows its bound pages
+        # per map id instead of failing; any other listing failure refuses.
+        try:
+            with self.owner.helper_wait():
+                rows = dumper.run_json(['bpftool', '-j', 'map', 'show'], require_list=True,
+                                       timeout_seconds=remaining(deadline, dumper.JSON_TIMEOUT_SECONDS),
+                                       max_bytes=INVENTORY_LISTING_MAX_BYTES)
+        except RuntimeError as error:
+            if str(error) != ('bpftool JSON acquisition exceeded output bound '
+                              f'{INVENTORY_LISTING_MAX_BYTES}'):
+                raise
+            return self._show_per_id(ids, deadline)
+        want = set(ids)
         index = {}
         for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_id = row.get('id')
+            if type(row_id) is not int or row_id <= 0 or row_id not in want:
+                continue
+            require(row_id not in index, f"duplicate map id in snapshot listing: {row_id}")
+            index[row_id] = row
+        return index
+
+    def _show_per_id(self, ids, deadline):
+        # Overflow fallback for _show_all: one bounded per-id query per
+        # observer map, so a host holding more maps than the listing bound
+        # still inventories exactly the observer's own rows. Cost scales
+        # with the observer's map count, never the host's. Row checks match
+        # the listing path; a bpftool failure here names the fallback stage
+        # with a fixed message instead of surfacing raw tool output.
+        index = {}
+        for map_id in ids:
+            try:
+                row = dumper.one(self._json(
+                    ['bpftool', '-j', 'map', 'show', 'id', str(map_id)], deadline, bound=65536))
+            except CaptureError:
+                raise
+            except RuntimeError:
+                raise CaptureError('map inventory per-id fallback unavailable') from None
             require(isinstance(row, dict) and type(row.get('id')) is int and row['id'] > 0,
-                    'map snapshot listing row is not an identified map')
-            require(row['id'] not in index, f"duplicate map id in snapshot listing: {row['id']}")
+                    'map snapshot per-id row is not an identified map')
+            require(row['id'] not in index, f"duplicate map id in per-id inventory: {row['id']}")
             index[row['id']] = row
         return index
 
@@ -539,7 +577,7 @@ class LiveMaps:
         require(sorted(names) == sorted(after_names), 'observer fdinfo membership changed')
         ids = dumper.map_ids_from_fdinfo(texts)
         if ids:
-            listing = self._show_all(deadline)
+            listing = self._show_all(ids, deadline)
             fetched = []
             for map_id in ids:
                 require(map_id in listing,

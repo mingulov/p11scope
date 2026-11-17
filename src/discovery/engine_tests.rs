@@ -1332,6 +1332,10 @@ fn generational_stale_retirement_drops_claimed_sources() {
 
 #[test]
 fn generational_rescan_drops_without_successor_evidence() {
+    // No unadmitted newcomer waits: the rescanned-empty view's drop is
+    // authoritative (unload), not a scan gap — modules and slots retire.
+    // In cgroup scope the pin stays resolvable (inert without modules);
+    // system scope drops it too.
     let dir = tempfile::tempdir().expect("scope dir");
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
     let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
@@ -1346,8 +1350,6 @@ fn generational_rescan_drops_without_successor_evidence() {
             engine.plan.is_active(0),
             "the fixture starts attached for {scope:?}"
         );
-        // No unadmitted newcomer waits: the rescanned-empty view's drop is
-        // authoritative (unload), not a scan gap.
         assert!(
             engine.newcomer_first_seen.is_empty(),
             "the fixture stages no successor ({scope:?})"
@@ -1366,10 +1368,17 @@ fn generational_rescan_drops_without_successor_evidence() {
             dropped.plan.modules.is_empty(),
             "the dropped module leaves the plan ({scope:?})"
         );
-        assert!(
-            dropped.pinned.summary(object).is_none(),
-            "the dropped pin leaves with the slots ({scope:?})"
-        );
+        if matches!(scope, crate::attach::Scope::Cgroup { .. }) {
+            assert!(
+                dropped.pinned.summary(object).is_some(),
+                "cgroup scope keeps the pin resolvable (inert without modules)"
+            );
+        } else {
+            assert!(
+                dropped.pinned.summary(object).is_none(),
+                "system scope drops the pin with the slots"
+            );
+        }
     }
 }
 
@@ -1566,6 +1575,37 @@ fn replay_freshen_marks_unadmitted_listing_pids_only() {
     assert!(
         engine.newcomer_first_seen.contains_key(&424242),
         "unadmitted listing pids mark"
+    );
+}
+
+#[test]
+fn loader_resolve_set_adds_committed_objects_in_cgroup_scope() {
+    // Loader assembly keeps the loader id plus committed provider objects
+    // resolvable in cgroup scope (a validated scan assembles a global
+    // candidate, so its purge must not drop the identity assembled
+    // modules need to bind); other scopes keep loader-only.
+    let loader = PinnedObjectId(99);
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let (mut engine, _, object, _) = engine_with_overlay(80);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert_ne!(object, loader, "fixture ids are distinct");
+    engine.scope = cgroup;
+    let preserve = engine.loader_resolve_set(loader);
+    assert!(preserve.contains(&loader), "loader always resolves");
+    assert!(
+        preserve.contains(&object),
+        "cgroup scope also resolves committed providers"
+    );
+    engine.scope = crate::attach::Scope::System;
+    assert_eq!(
+        engine.loader_resolve_set(loader),
+        vec![loader],
+        "system scope resolves loader-only"
     );
 }
 

@@ -771,18 +771,53 @@ fn prove_original_file_inner(
     WitnessOutcome { verdict, diagnosis }
 }
 
-fn load_witness_session_diagnosed() -> Result<IdentitySession, WitnessDiagnosis> {
-    if let Err(deny) = crate::attach::identity_iter::ensure_kernel_identity_btf() {
+/// The witness session's BTF from the process-wide share: the raw
+/// selection deny runs over the shared parse's own bytes, before any
+/// loader or BPF call, and the shared parse loads the session. One
+/// read and one parse serve the witness and the attach path together;
+/// every stage matches the pre-share raw-first order.
+fn check_shared_host(
+    host: &crate::attach::host_btf::HostBtf,
+) -> Result<&aya::Btf, WitnessDiagnosis> {
+    let raw = host
+        .original_bytes_for(host.btf())
+        .expect("the shared parse binds its own raw bytes");
+    if let Err(deny) = crate::attach::identity_iter::check_kernel_identity_btf(raw) {
         return Err(diagnosis_for_deny(&deny));
     }
-    let parsed = match aya::Btf::from_sys_fs() {
-        Ok(parsed) => parsed,
+    Ok(host.btf())
+}
+
+/// Classify a shared-cache load failure exactly as the pre-share
+/// raw-first order did: re-run the raw selection deny over one fresh
+/// read (this already-failed path remembers its diagnosis, so the
+/// re-read runs at most once per process); a blob the scan accepts
+/// stays a parse failure.
+fn diagnosis_for_shared_failure(
+    read_raw: impl FnOnce() -> Result<Vec<u8>, crate::attach::identity_iter::KernelDeny>,
+) -> WitnessDiagnosis {
+    let raw = match read_raw() {
+        Ok(raw) => raw,
+        Err(deny) => return diagnosis_for_deny(&deny),
+    };
+    match crate::attach::identity_iter::check_kernel_identity_btf(&raw) {
+        Ok(()) => WitnessDiagnosis {
+            stage: WitnessStage::BtfParse,
+        },
+        Err(deny) => diagnosis_for_deny(&deny),
+    }
+}
+
+fn load_witness_session_diagnosed() -> Result<IdentitySession, WitnessDiagnosis> {
+    let host = match crate::attach::host_btf::shared() {
+        Ok(host) => host,
         Err(_) => {
-            return Err(WitnessDiagnosis {
-                stage: WitnessStage::BtfParse,
-            });
+            return Err(diagnosis_for_shared_failure(
+                crate::attach::identity_iter::read_vmlinux_btf,
+            ));
         }
     };
+    let parsed = check_shared_host(host)?;
     let dir = match crate::inspect_system::ProbeDir::create("p11scope-witness-probe") {
         Ok(dir) => dir,
         Err(_) => {
@@ -791,7 +826,7 @@ fn load_witness_session_diagnosed() -> Result<IdentitySession, WitnessDiagnosis>
             });
         }
     };
-    IdentitySession::probe_and_load_detailed(&parsed, dir.path())
+    IdentitySession::probe_and_load_detailed(parsed, dir.path())
         .map_err(|failure| diagnosis_for_identity_load_failure(&failure))
 }
 

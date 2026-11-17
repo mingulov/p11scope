@@ -108,7 +108,10 @@ fn load(read_btf: impl FnOnce() -> Result<Vec<u8>, aya::BtfError>) -> Result<Hos
     })
 }
 
-pub(super) fn cached(
+/// Fill a cell on first use. Crate-visible so the witness sharing
+/// seams (overlay, pre-arm) can pin their deny mapping against local
+/// fixture cells; production always uses [`shared`].
+pub(crate) fn cached(
     cell: &OnceLock<Result<HostBtf, CachedError>>,
     read_btf: impl FnOnce() -> Result<Vec<u8>, aya::BtfError>,
 ) -> Result<&HostBtf, CachedError> {

@@ -1521,6 +1521,42 @@ pub(crate) fn finalize_with<B: FinalizeBackend>(
         .collect()
 }
 
+/// The witness load's BTF from the process-wide share: prototype
+/// checks run over the shared parse's own raw bytes, then the shared
+/// parse loads the programs. One read and one parse serve the witness
+/// and the attach path together.
+fn btf_for_start(
+    host: &super::host_btf::HostBtf,
+    need_migrate: bool,
+) -> Result<(DepartFamily, &aya::Btf), Unavailable> {
+    let raw_btf = host
+        .original_bytes_for(host.btf())
+        .expect("the shared parse binds its own raw bytes");
+    check_target_protos(raw_btf, need_migrate)?;
+    let family = resolve_depart_family(raw_btf)?;
+    Ok((family, host.btf()))
+}
+
+/// Classify a shared-cache load failure exactly as the pre-share
+/// raw-first order did: unreadable, then prototype, then the preserved
+/// parse text. The re-read runs only on this already-failed path.
+fn unavailable_for_shared_failure(
+    error: &super::host_btf::CachedError,
+    need_migrate: bool,
+    read_raw: impl FnOnce() -> std::io::Result<Vec<u8>>,
+) -> Unavailable {
+    let raw_btf = match read_raw() {
+        Ok(raw_btf) => raw_btf,
+        Err(io) => return Unavailable::Btf(format!("host BTF unreadable: {io}")),
+    };
+    if let Err(unavailable) = check_target_protos(&raw_btf, need_migrate) {
+        return unavailable;
+    }
+    // The re-read passes every prototype check (which subsumes family
+    // resolution), so the shared failure is the parse itself.
+    Unavailable::Btf(format!("{error:?}"))
+}
+
 /// Top-level start (engine entry): gates, BTF resolve, load, calibrate,
 /// activate. Returns Unavailable (never fatal) when the witness cannot
 /// run on this kernel/scope; the capture proceeds with today's windows.
@@ -1533,21 +1569,25 @@ pub(crate) fn start(
     let ftrace = std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled").ok();
     let lto = super::instance::lto_refusal();
     gate_startup(paths.len(), pidns_initial, ftrace, lto)?;
-    let raw_btf = std::fs::read("/sys/kernel/btf/vmlinux")
-        .map_err(|error| Unavailable::Btf(format!("host BTF unreadable: {error}")))?;
     let (scope_kind, target_tgid, cgroup_id, need_migrate) = match scope {
         crate::attach::Scope::Pid(pid) => (1u32, *pid, 0u64, false),
         crate::attach::Scope::Cgroup { id, .. } => (2u32, 0, *id, true),
         crate::attach::Scope::System => (3u32, 0, 0, false),
     };
-    check_target_protos(&raw_btf, need_migrate)?;
-    let family = resolve_depart_family(&raw_btf)?;
-    let btf = aya::Btf::from_sys_fs().map_err(|error| Unavailable::Btf(format!("{error:?}")))?;
+    let host = match super::host_btf::shared() {
+        Ok(host) => host,
+        Err(error) => {
+            return Err(unavailable_for_shared_failure(&error, need_migrate, || {
+                std::fs::read("/sys/kernel/btf/vmlinux")
+            }));
+        }
+    };
+    let (family, btf) = btf_for_start(host, need_migrate)?;
     let depart: &[&'static str] = match family {
         DepartFamily::Pair => &[PROGRAM_DEPART_EXIT, PROGRAM_DEPART_EXEC],
         DepartFamily::Single => &[PROGRAM_DEPART],
     };
-    let loaded = load_witness_programs(&btf, depart, need_migrate)
+    let loaded = load_witness_programs(btf, depart, need_migrate)
         .map_err(|error| Unavailable::Btf(format!("{error}")))?;
     let mut backend = LiveBackend::from_loaded(loaded.ebpf);
     // --pid walks use a pidfd link; cgroup/system walk whole-system.

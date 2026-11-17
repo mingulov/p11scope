@@ -2676,7 +2676,9 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            !create.contains("handover_new_file") && !create.contains("fchown"),
+            !create.contains("handover_new_file")
+                && !create.contains("fchown")
+                && !create.contains("chown"),
             "AtomicFile::create must not hand the live temp over: it stays creator-owned until commit"
         );
         let commit = production

@@ -175,7 +175,7 @@ Avoid it with `--prearm-module PATH`, `run`, or a narrower
 `--pid`/`--cgroup` scope. A newcomer-priority scheduling fix is
 planned for 0.8.0.
 
-### Manifest captures at very large endpoint counts shed calls in v0.7.0 (fixed in 0.7.1)
+### Manifest captures at very large endpoint counts shed calls in v0.7.0 (fixed in v0.7.1)
 
 An `inventory --system --manifest ...` capture watching around four
 thousand endpoints or more (measured at 4,097 with `--max-endpoints
@@ -849,6 +849,13 @@ on the four affected cells, while overcounts, unwitnessed misses and
 any other failure stay failed. Timing the interval and disclosing the
 window is planned (the `PLAN-REPLACE-GAP` fix lane). Rerunning the
 capture usually lands a clean run.
+
+### `run` with many short-lived children can rarely miss seconds of calls
+
+On several kernels (seen on 6.6 and 7.3.1), a `p11scope run` capture
+with many short-lived child processes can rarely (about 1 in 15–30
+runs in our tests) miss a few seconds of calls without recording a
+gap row for the interval. A fix is planned for 0.8.0.
 
 ### Stub-pool provider manifests cover one getter-call order
 

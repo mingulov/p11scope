@@ -6,7 +6,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [0.7.1] - 2026-11-16
+## [0.7.1] - 2026-11-17
 
 ### Added
 
@@ -247,6 +247,11 @@ versioned separately and are opaque, exact dispatch keys.
   anything else stays loud: a reused pid, an exec, live members, an
   unresolvable member walk, mapping changes, empty snapshots and every
   budget stop.
+- Processes that exit while p11scope scans them no longer mark the
+  capture partial: a large process shutting down mid-scan (for example
+  Firefox or Thunderbird exiting) is re-checked once within a short
+  shared wait, and only reported when it is still running afterwards.
+  Genuinely live processes still report at once and never wait.
 - Exits are named only on a proven whole-group proof: snapshots call
   a process exited only when its entire thread group is shown gone —
   members pinned through held task directories and re-validated, in
@@ -376,6 +381,10 @@ versioned separately and are opaque, exact dispatch keys.
   short-lived descendants) trip this intermittently; rerunning the
   capture usually lands a clean run. Timing the interval and disclosing
   the window is planned for 0.8.0.
+- On several kernels (seen on 6.6 and 7.3.1), `p11scope run` with many
+  short-lived child processes can rarely (about 1 in 15–30 runs in our
+  tests) miss a few seconds of calls without a gap row; a fix is
+  planned for 0.8.0.
 - Stub-pool provider manifests cover one getter-call order: since
   0.7.1 the manifest records the first-mint v3 slots
   (`C_GetInterfaceList`/`C_GetInterface`) because every measured

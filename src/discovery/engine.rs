@@ -18641,7 +18641,6 @@ impl Engine {
             candidate
         };
         candidate.views.insert(view);
-        Self::exclude_carried_views_from_candidate(&mut candidate, view);
         let loader = candidate
             .pinned
             .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
@@ -18677,66 +18676,6 @@ impl Engine {
             loader
         };
         Ok((candidate, loader))
-    }
-
-    /// Loader-assembly preserve set: the loader id plus every attached
-    /// object the scanned view does not solely own. A validated loader
-    /// scan assembles a global candidate, so without the carry its pin
-    /// purge drops the provider identity the assembled modules need to
-    /// bind and the plan replaces on every turnover. Sole ownership is
-    /// the gate (no scope or newcomer state: marks are consumed by
-    /// admission before validation scans run): objects only the scanned
-    /// view references are authoritatively replaced by its scan, while
-    /// shared or module-less objects ride.
-    fn loader_scan_preserve(
-        &self,
-        loader: PinnedObjectId,
-        view: ProcessViewId,
-    ) -> Vec<PinnedObjectId> {
-        let mut preserve = vec![loader];
-        for slot in self
-            .plan
-            .slots
-            .iter()
-            .filter(|slot| self.plan.is_active(slot.index))
-        {
-            if slot.object == loader || preserve.contains(&slot.object) {
-                continue;
-            }
-            let owned: Vec<_> = self
-                .modules
-                .iter()
-                .filter(|module| module.object == slot.object)
-                .collect();
-            let sole = !owned.is_empty() && owned.iter().all(|module| module.scanned.view == view);
-            if !sole {
-                preserve.push(slot.object);
-            }
-        }
-        preserve
-    }
-
-    /// Drops carried dead coverage from a loader candidate's view set so
-    /// apply-time stale checks don't undo the carry: a view whose pins
-    /// stay resolvable without ownership claims is carried (mirrors the
-    /// inventory/conservative carried-view exclusion). The scanned view
-    /// itself is always kept, as are views with claims and views whose
-    /// pins are fully gone (those still retire).
-    fn exclude_carried_views_from_candidate(candidate: &mut LiveCandidate, keep: ProcessViewId) {
-        let carried: BTreeSet<ProcessViewId> = candidate
-            .modules
-            .iter()
-            .map(|module| module.scanned.view)
-            .filter(|view| {
-                *view != keep
-                    && candidate.pinned.view_claims(*view).is_none()
-                    && candidate.modules.iter().any(|module| {
-                        module.scanned.view == *view
-                            && candidate.pinned.summary(module.object).is_some()
-                    })
-            })
-            .collect();
-        candidate.views.retain(|view| !carried.contains(view));
     }
 
     fn conservative_candidate(
@@ -20998,19 +20937,23 @@ impl Engine {
                 binding.coverage.retire();
             }
         }
-        // No generational carry here: stale retirement also serves
-        // unpublished newcomers (U-07), and carrying would commit modules
-        // for views the engine never admitted. Proven-dead views' sources
-        // always retire; wave turnover is covered by the inventory and
-        // conservative carries, which never see unpublished views.
+        // Carried coverage survives stale retirement: ids that stay
+        // resolvable without ownership claims anywhere were carried by an
+        // earlier candidate for still-attached objects, so dropping them
+        // here would undo the carry on the very next apply. Claimed or
+        // fully dropped sources still retire (U-07's unpublished
+        // newcomers are claimed, so they still drop).
+        let carried = candidate.pinned.carried_ids();
         let mut cleaned_pins = candidate.pinned.clone();
         for view in stale_views {
-            cleaned_pins.remove_view(*view);
+            cleaned_pins.remove_view_except(*view, &carried);
         }
         let cleaned_modules: Vec<_> = candidate
             .modules
             .iter()
-            .filter(|module| !stale_views.contains(&module.scanned.view))
+            .filter(|module| {
+                !stale_views.contains(&module.scanned.view) || carried.contains(&module.object)
+            })
             .cloned()
             .collect();
         let prior_selection_keys: BTreeSet<_> =
@@ -21525,7 +21468,6 @@ impl Engine {
         merge_scanned_module_counted(&mut raw_modules, lowered, &mut self.merge_tables_dropped);
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
-        Self::exclude_carried_views_from_candidate(&mut candidate, self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
         self.observe_causal_timing(&observed, hook_ts_ns);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
@@ -22316,8 +22258,7 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            let preserve = self.loader_scan_preserve(loader, view_id);
-            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &preserve);
+            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
             (candidate_pins, raw_modules)
         } else if mode == LoaderScanMode::MetadataOnly && self.views[position].still_the_same() {
             // A metadata scan pinned its modules before their tables
@@ -22412,18 +22353,11 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            let preserve = self.loader_scan_preserve(loader, view_id);
-            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &preserve);
+            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();
-            let preserve = self.loader_scan_preserve(loader, view_id);
-            skipped.extend(candidate_pins.replace_view_pins_with_claims_for(
-                view_id,
-                fresh_pins,
-                &preserve,
-                &[loader],
-            ));
+            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &[loader]));
             let mut raw_modules: Vec<_> = self
                 .modules
                 .iter()
@@ -22448,7 +22382,6 @@ impl Engine {
         }
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
-        Self::exclude_carried_views_from_candidate(&mut candidate, self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
         if let Some(hook_ts_ns) = hook_ts_ns {
             self.observe_causal_timing(&observed, hook_ts_ns);

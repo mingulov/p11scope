@@ -2325,6 +2325,9 @@ impl PinnedObjects {
         preserve_claims: &[PinnedObjectId],
     ) -> Vec<Skipped> {
         self.bump_revision();
+        // Carried coverage first: the remove below would make this view's
+        // own ids look carried.
+        let carried = self.carried_ids();
         self.ownership.remove(&view);
         let resolve: BTreeSet<_> = preserve_resolve.iter().copied().collect();
         let claim_ids: BTreeSet<_> = preserve_claims.iter().copied().collect();
@@ -2371,6 +2374,8 @@ impl PinnedObjects {
             .filter(|id| self.by_id.contains_key(id))
             .copied()
             .collect();
+        // Carried coverage (resolvable, claimless) survives every purge.
+        let preserved_present: BTreeSet<_> = preserved_present.union(&carried).copied().collect();
         // Claims restore exactly as before (raw-ownership-gated): only the
         // by-id/raw survival below is broadened, so preserved ids stay
         // resolvable without raw mappings.
@@ -2446,6 +2451,7 @@ impl PinnedObjects {
         preserve: &[PinnedObjectId],
     ) {
         self.bump_revision();
+        let carried = self.carried_ids();
         let mut live: BTreeSet<RawObjectInstance> = BTreeSet::new();
         for module in surviving {
             if let Some(own) = RawObjectInstance::scanned(module, module.key, &module.path) {
@@ -2488,6 +2494,8 @@ impl PinnedObjects {
             .filter(|id| self.by_id.contains_key(id))
             .copied()
             .collect();
+        // Carried coverage (resolvable, claimless) survives every purge.
+        let preserved_present: BTreeSet<_> = preserved_present.union(&carried).copied().collect();
         let retained_raws: BTreeSet<_> = self
             .raw_ownership
             .values()
@@ -2783,6 +2791,30 @@ impl PinnedObjects {
 
     pub fn view_claims(&self, view: ProcessViewId) -> Option<&ViewClaims> {
         self.ownership.get(&view)
+    }
+
+    /// Ids that stay resolvable without ownership claims anywhere: the
+    /// except-carry shape. Global purges spare them (one view's replace
+    /// or prune must not drop another view's carried coverage); fully
+    /// dropped ids stay dropped.
+    pub(crate) fn carried_ids(&self) -> BTreeSet<PinnedObjectId> {
+        let claimed: BTreeSet<PinnedObjectId> = self
+            .ownership
+            .values()
+            .flat_map(|claims| {
+                claims
+                    .tables
+                    .iter()
+                    .chain(claims.targets.iter().map(|(id, _)| id))
+                    .chain(&claims.pins)
+            })
+            .copied()
+            .collect();
+        self.by_id
+            .keys()
+            .copied()
+            .filter(|id| !claimed.contains(id))
+            .collect()
     }
 
     /// Whole-store ownership equality: every view's claims and raw

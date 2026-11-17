@@ -1165,8 +1165,9 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         !condition.exited.contains(&churn_b_pid),
         "churn-B (pid {churn_b_pid}) stays alive to run end"
     );
-    // Terminal settlement over our pids: exactly one incarnation each,
-    // the killed two exited and retired, the survivor mapped.
+    // Terminal settlement over our pids: the survivor stays mapped
+    // with one live incarnation; the killed two retire and fold into
+    // departed_use with their exit state preserved.
     let incarnations = |pid: u32| {
         doc["callers"]
             .as_array()
@@ -1175,19 +1176,32 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
             .filter(|caller| caller["pid"] == u64::from(pid))
             .collect::<Vec<_>>()
     };
-    for (pid, name) in [
-        (anchor_pid, "anchor"),
-        (churn_a_pid, "churn-A"),
-        (churn_b_pid, "churn-B"),
-    ] {
-        assert_eq!(incarnations(pid).len(), 1, "one {name} incarnation");
+    let folded = |pid: u32| {
+        doc["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|module| module["departed_use"]["identities"].as_array())
+            .flat_map(|identities| identities.iter())
+            .filter(|ident| ident["pid"] == u64::from(pid))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        incarnations(churn_b_pid).len(),
+        1,
+        "one churn-B incarnation"
+    );
+    for (pid, name) in [(anchor_pid, "anchor"), (churn_a_pid, "churn-A")] {
+        assert!(
+            incarnations(pid).is_empty(),
+            "{name} (pid {pid}) retired and folded"
+        );
+        assert_eq!(folded(pid).len(), 1, "one folded {name} incarnation");
     }
-    let anchor = incarnations(anchor_pid)[0];
+    let anchor = folded(anchor_pid)[0];
     assert_eq!(anchor["lifecycle"], "exited");
-    assert_eq!(anchor["retired"], true);
-    let churn_a = incarnations(churn_a_pid)[0];
+    let churn_a = folded(churn_a_pid)[0];
     assert_eq!(churn_a["lifecycle"], "exited");
-    assert_eq!(churn_a["retired"], true);
     let churn_b = incarnations(churn_b_pid)[0];
     assert_eq!(churn_b["lifecycle"], "mapped");
     assert_eq!(churn_b["retired"], false);
@@ -1239,11 +1253,16 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
             "churn-C (pid {churn_c_pid}) born mid-run but never enumerated must be named by the stop disclosure"
         );
     } else if churn_c_admitted {
-        // Died after admission: settled dead, never silently dropped.
-        assert_eq!(churn_c_incarnations.len(), 1, "one churn-C incarnation");
-        let churn_c = churn_c_incarnations[0];
+        // Died after admission: retired and folded, never silently
+        // dropped.
+        assert!(
+            churn_c_incarnations.is_empty(),
+            "churn-C (pid {churn_c_pid}) retired and folded"
+        );
+        let churn_c_folded = folded(churn_c_pid);
+        assert_eq!(churn_c_folded.len(), 1, "one churn-C incarnation");
+        let churn_c = churn_c_folded[0];
         assert_eq!(churn_c["lifecycle"], "exited");
-        assert_eq!(churn_c["retired"], true);
         assert!(churn_c["lifecycle_reason"].is_string());
     } else {
         // Died before admission: never a caller row, counted in its

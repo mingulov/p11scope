@@ -22190,7 +22190,7 @@ fn run_learned_harvest_aliases_survive_candidate_commit() {
         module,
     }];
     // Production apply harvests with the candidate pins
-    // (apply_candidate_inner passes &candidate.pinned).
+    // (apply_candidate_inner passes &mut candidate.pinned).
     engine.learn_owned_proofs(&mut candidate_pins, &proofs);
     assert_eq!(
         learned_candidate_module_count(&mut engine),

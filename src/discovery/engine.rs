@@ -23123,10 +23123,11 @@ impl Engine {
                 .alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
             // The apply path harvests after the candidate cloned
             // committed pins, and the commit installs that clone: file
-            // the same aliases into the candidate pins (the caller
-            // passes &mut candidate.pinned) or the commit drops the
-            // harvest and the next gap tick unbinds the run-learned
-            // modules and retires every slot.
+            // the same aliases into the candidate pins (the apply path
+            // passes &mut candidate.pinned; other callers pass scratch
+            // pins) or the commit drops the harvest and the next gap
+            // tick unbinds the run-learned modules and retires every
+            // slot.
             pins.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
         }
         let before = self.run_learned_modules.clone();

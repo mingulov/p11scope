@@ -379,25 +379,11 @@ fn e2_exec_retires_and_admits_incarnations() {
     assert_eq!(doc["scope"], format!("pid:{}", dance.pid));
     assert!(doc["observation"]["passes"].as_u64().unwrap() >= 2);
 
-    // Two incarnations, one pid: the pre-exec driver and post-exec sleep.
+    // Two incarnations, one pid: the pre-exec driver (retired, folded
+    // into departed_use after rendering) and post-exec sleep (live).
     let callers = caller_for(doc, u64::from(dance.pid));
-    assert_eq!(callers.len(), 2, "exec must split incarnations");
-    let (old, new) = if callers[0]["incarnation"] == 0 {
-        (callers[0], callers[1])
-    } else {
-        (callers[1], callers[0])
-    };
-    assert_eq!(old["incarnation"], 0);
-    assert_eq!(old["lifecycle"], "exec_retired");
-    assert_eq!(old["retired"], true);
-    assert!(
-        old["image"]["exe"]["path"]
-            .as_str()
-            .unwrap()
-            .ends_with("exec-driver"),
-        "old exe: {}",
-        old["image"]["exe"]["path"]
-    );
+    assert_eq!(callers.len(), 1, "exec must split incarnations");
+    let new = callers[0];
     assert_eq!(new["incarnation"], 1);
     assert_eq!(new["lifecycle"], "mapped");
     assert_eq!(new["retired"], false);
@@ -409,20 +395,33 @@ fn e2_exec_retires_and_admits_incarnations() {
         "new exe: {}",
         new["image"]["exe"]["path"]
     );
-    assert_ne!(old["id"], new["id"]);
-
-    // The old incarnation's usage evidence is retained: its edge ends
-    // but stays in the document, and the module is unknown (no unload
-    // was proven — the new image simply never mapped it).
+    // The retired pre-exec incarnation folds into the module's
+    // departed_use aggregate with its identity preserved.
     let module = module_for(doc, "ic-exec.so");
-    let old_edges = edges_for(
-        doc,
-        old["id"].as_str().unwrap(),
-        module["id"].as_str().unwrap(),
+    let departed = module["departed_use"].as_object().expect("departed_use");
+    assert_eq!(departed["callers"], 1);
+    let identities = departed["identities"].as_array().expect("identities");
+    let old: Vec<&serde_json::Value> = identities
+        .iter()
+        .filter(|ident| ident["pid"] == u64::from(dance.pid))
+        .collect();
+    assert_eq!(old.len(), 1, "folded exec incarnation");
+    assert_eq!(old[0]["incarnation"], 0);
+    assert_eq!(old[0]["lifecycle"], "exec_retired");
+    assert!(
+        old[0]["exe"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("exec-driver"),
+        "old exe: {}",
+        old[0]["exe"]
     );
-    assert_eq!(old_edges.len(), 1);
-    assert_eq!(old_edges[0]["mapping"]["state"], "ended");
-    assert_eq!(old_edges[0]["entries"]["count"], 0);
+    assert_eq!(doc["budgets"]["callers"]["retired"], 1);
+
+    // The old incarnation's edge folds with it: the live document
+    // carries no edge for either incarnation, and the module is
+    // unknown (no unload was proven — the new image simply never
+    // mapped it).
     assert!(
         edges_for(
             doc,
@@ -431,6 +430,7 @@ fn e2_exec_retires_and_admits_incarnations() {
         )
         .is_empty()
     );
+    assert_eq!(departed["edges"], 1);
     assert_eq!(module["lifecycle"], "unknown");
     assert_eq!(module["unloaded_observed"], false);
     drop(dance.guard.take());
@@ -665,22 +665,25 @@ fn b3_sigkill_freezes_evidence_with_exit_state() {
         "death passes must gap: {}",
         dance.doc["gaps"]
     );
+    // The suicided caller retires and folds: no live row, one folded
+    // identity with exit state frozen in departed_use.
     let callers = caller_for(&dance.doc, u64::from(dance.pid));
-    assert_eq!(callers.len(), 1);
-    assert_eq!(callers[0]["lifecycle"], "exited");
-    assert_eq!(callers[0]["retired"], true);
+    assert!(callers.is_empty());
+    assert_eq!(dance.doc["budgets"]["callers"]["retired"], 1);
     let module = module_for(&dance.doc, "ic-suicide.so");
-    let edge = edges_for(
-        &dance.doc,
-        callers[0]["id"].as_str().unwrap(),
-        module["id"].as_str().unwrap(),
-    );
-    assert_eq!(edge.len(), 1);
-    assert_eq!(edge[0]["mapping"]["state"], "ended");
-    // Frozen: zero entries, no recency, and the module is unknown (a
-    // dead caller's absence proves no unload).
-    assert_eq!(edge[0]["entries"]["count"], 0);
-    assert!(edge[0]["entries"]["last_seen_ns"].is_null());
+    let departed = module["departed_use"].as_object().expect("departed_use");
+    assert_eq!(departed["callers"], 1);
+    assert_eq!(departed["edges"], 1);
+    let identities = departed["identities"].as_array().expect("identities");
+    let folded: Vec<&Value> = identities
+        .iter()
+        .filter(|ident| ident["pid"] == u64::from(dance.pid))
+        .collect();
+    assert_eq!(folded.len(), 1);
+    assert_eq!(folded[0]["lifecycle"], "exited");
+    // Frozen: zero entries, and the module is unknown (a dead caller's
+    // absence proves no unload).
+    assert_eq!(departed["entries"]["count"], 0);
     assert_eq!(module["lifecycle"], "unknown");
     assert_eq!(module["unloaded_observed"], false);
     // `-o` holds the same document stdout carried.

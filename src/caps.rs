@@ -927,7 +927,7 @@ mod tests {
             );
         }
         // Inventory file sinks share the `-o` sudo handover
-        // (`create_private_stream`/`AtomicFile::create` plus `fchown`),
+        // (`create_private_stream` at-create plus `AtomicFile` commit-time `fchown`),
         // and event-log rotation reopens mid-run, so the bits last the
         // whole run: `--event-log` (scan and auto) and `--diagnostics`
         // (auto) need the file-output bits even without `-o`.

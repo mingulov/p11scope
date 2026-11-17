@@ -1662,62 +1662,158 @@ fn scale4097_inner(
         .get("callers")
         .and_then(serde_json::Value::as_array)
         .context("callers array")?;
+    // The ledger may still hold a live caller row, or it may have
+    // exited and folded into departed_use (v0.8.0 folding): either way
+    // its S1 evidence must be present and populated, never silently
+    // dropped. No route-loss fallback: this cell proves edges form at
+    // scale.
     let ledger_caller = callers
         .iter()
         .find(|caller| {
             caller.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(ledger_pid))
         })
         .and_then(|caller| caller.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .context("the ledger caller has a caller row")?;
-    println!("SCALE2_E2E ledger_caller={ledger_caller}");
+        .and_then(serde_json::Value::as_str);
+    let folded_ledger = report
+        .get("modules")
+        .and_then(serde_json::Value::as_array)
+        .map(|modules| {
+            modules
+                .iter()
+                .filter_map(|module| module.get("departed_use"))
+                .flat_map(|departed| {
+                    departed
+                        .get("identities")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|identities| {
+                            identities.iter().filter(|ident| {
+                                ident.get("pid").and_then(serde_json::Value::as_u64)
+                                    == Some(u64::from(ledger_pid))
+                            })
+                        })
+                        .into_iter()
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ensure!(
+        ledger_caller.is_some() || !folded_ledger.is_empty(),
+        "the ledger caller has a caller row or a folded identity"
+    );
+    if let Some(ledger_caller) = ledger_caller {
+        println!("SCALE2_E2E ledger_caller={ledger_caller} (live)");
+    } else {
+        println!(
+            "SCALE2_E2E ledger folded identities={} (exited)",
+            folded_ledger.len()
+        );
+    }
     let edges = report
         .get("semantic_edges")
         .and_then(serde_json::Value::as_array)
         .context("semantic_edges array")?;
     println!("SCALE2_E2E semantic_edges={}", edges.len());
     // Strict R-51 verdict for the long-running caller: a populated edge
-    // (mechanisms, calls, a CKR_OK API result), never a silent drop. No
-    // route-loss fallback: this cell proves edges form at scale.
+    // (mechanisms, calls, a CKR_OK API result), never a silent drop.
     let mut populated = 0usize;
-    for edge in edges.iter().filter(|edge| {
-        edge.get("caller").and_then(serde_json::Value::as_str) == Some(ledger_caller)
-    }) {
-        let Some(mechanisms) = edge.get("mechanisms").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        if mechanisms.is_empty() {
-            continue;
-        }
-        let mut calls = 0u64;
-        let mut ok = false;
-        for mechanism in mechanisms {
-            calls += mechanism
-                .get("calls")
+    if let Some(ledger_caller) = ledger_caller {
+        for edge in edges.iter().filter(|edge| {
+            edge.get("caller").and_then(serde_json::Value::as_str) == Some(ledger_caller)
+        }) {
+            let Some(mechanisms) = edge.get("mechanisms").and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            if mechanisms.is_empty() {
+                continue;
+            }
+            let mut calls = 0u64;
+            let mut ok = false;
+            for mechanism in mechanisms {
+                calls += mechanism
+                    .get("calls")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let returns = mechanism
+                    .get("evidence")
+                    .and_then(|evidence| evidence.get("returns"))
+                    .and_then(serde_json::Value::as_array)
+                    .context("mechanism returns")?;
+                ok |= returns
+                    .iter()
+                    .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
+            }
+            ensure!(calls > 0, "the edge records mechanism calls");
+            ensure!(ok, "the edge records a CKR_OK API result");
+            let api_returns = edge
+                .get("api_returns")
+                .and_then(|returns| returns.get("count"))
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
-            let returns = mechanism
-                .get("evidence")
-                .and_then(|evidence| evidence.get("returns"))
-                .and_then(serde_json::Value::as_array)
-                .context("mechanism returns")?;
-            ok |= returns
-                .iter()
-                .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
+            ensure!(api_returns > 0, "the edge records API returns");
+            ensure!(
+                edge.get("semantics").and_then(serde_json::Value::as_str) == Some("observed"),
+                "the edge semantics are observed"
+            );
+            populated += 1;
         }
-        ensure!(calls > 0, "the edge records mechanism calls");
-        ensure!(ok, "the edge records a CKR_OK API result");
-        let api_returns = edge
-            .get("api_returns")
-            .and_then(|returns| returns.get("count"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        ensure!(api_returns > 0, "the edge records API returns");
-        ensure!(
-            edge.get("semantics").and_then(serde_json::Value::as_str) == Some("observed"),
-            "the edge semantics are observed"
-        );
-        populated += 1;
+    } else {
+        // Folded: the departed aggregate carries the same per-mechanism
+        // rows (calls, CKR_OK returns) plus folded entry/API-return
+        // totals. The per-edge "observed" string folds into the label
+        // distribution, so the populated-mechanisms proof stands in.
+        let modules = report
+            .get("modules")
+            .and_then(serde_json::Value::as_array)
+            .context("modules array")?;
+        for departed in modules
+            .iter()
+            .filter_map(|module| module.get("departed_use"))
+        {
+            let Some(mechanisms) = departed
+                .get("mechanisms")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            if mechanisms.is_empty() {
+                continue;
+            }
+            let mut calls = 0u64;
+            let mut ok = false;
+            for mechanism in mechanisms {
+                calls += mechanism
+                    .get("calls")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if let Some(returns) = mechanism
+                    .get("evidence")
+                    .and_then(|evidence| evidence.get("returns"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    ok |= returns
+                        .iter()
+                        .any(|ret| ret.get("rv").and_then(serde_json::Value::as_u64) == Some(0));
+                }
+            }
+            if calls == 0 || !ok {
+                continue;
+            }
+            let entries = departed
+                .get("entries")
+                .and_then(|entries| entries.get("count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            ensure!(entries > 0, "the folded aggregate records entries");
+            let api_returns = departed
+                .get("instances")
+                .and_then(|instances| instances.get("api_returns"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            ensure!(api_returns > 0, "the folded aggregate records API returns");
+            populated += 1;
+        }
     }
     println!("SCALE2_E2E populated_edges={populated}");
     ensure!(

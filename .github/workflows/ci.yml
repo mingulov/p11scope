@@ -562,6 +562,14 @@ jobs:
       # Inventory objects keep exactly the transition-10 code sizes
       # (.text +112/+176 B, uprobe +128 B, maps +28 B, .BTF +37 B);
       # only DWARF bytes move with the added source lines.
+      # A twelfth recorded transition covers the v0.8.0 integration
+      # batch 1 shape (keymeta R2 plus the in-place downgrade switch
+      # and journal plumbing plus the banked-RV evidence): the
+      # SLOT_COUNT_ONLY map and count-only branches plus EVIDENCE
+      # references join the Detailed object (.text +208 B over R2,
+      # cumulative +2248; uprobe +408, maps +28, .BTF +132 grow;
+      # no section added or removed). Both Inventory objects keep
+      # exactly the R2 code sizes; only DWARF bytes move.
       # Allowed-change process: when kernel code changes on purpose, run
       # scripts/check-bpf-noninterference.py locally for the baseline tag
       # versus the candidate, take the per-section size deltas of the two

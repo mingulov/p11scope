@@ -197,9 +197,10 @@ def join_fact(left, right):
         for flags, zero in ((left, right), (right, left)):
             if flags[0] == "contribution" and zero == ("constant", 0):
                 return flags
-        # Count-only seed join: 0 and the current-cookie marker are both
-        # allowed seed values, so their disjunction stays proven. Any
-        # third value (or a foreign marker) falls through to None.
+        # Count-only seed join: 0 joined with a marker of identity I forms
+        # the exact ('seed_value', I) disjunction (a foreign I is rejected
+        # at the store by the identity match); third values and
+        # cross-identity seed/marker pairs fall through to None.
         for first, second in ((left, right), (right, left)):
             if first == ("constant", 0) and second[0] == "entry_marker":
                 return ("seed_value", second[1])

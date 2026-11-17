@@ -320,3 +320,58 @@ fn replace_view_pins_preserve_survives_without_raw_ownership() {
         "the view's own claims still drop"
     );
 }
+
+/// `prune_view_pins_to_modules` preserve means preserve: a preserved id
+/// survives the global purge even with no ownership anywhere (like
+/// except-kept pins after a conservative replay).
+#[test]
+fn prune_view_pins_to_modules_preserve_survives_global_purge() {
+    let mut pins = pin_set(&distinct_keys(2), true);
+    let kept = PinnedObjectId(0);
+    let dropped = PinnedObjectId(1);
+    assert!(pins.summary(kept).is_some(), "fixture pins resolve");
+    assert!(pins.summary(dropped).is_some(), "fixture pins resolve");
+    pins.prune_view_pins_to_modules(ProcessViewId(1), &[], &[kept]);
+    assert!(
+        pins.summary(kept).is_some(),
+        "the preserved id survives the purge"
+    );
+    assert!(
+        pins.summary(dropped).is_none(),
+        "the unpreserved id still drops"
+    );
+}
+
+/// `replace_view_pins_with_claims_for` splits the sets: every preserved
+/// id stays resolvable, but only `claims_for` restore ownership claims.
+#[test]
+fn replace_view_pins_with_claims_for_splits_resolve_and_claims() {
+    let entries = distinct_keys(3);
+    let mut pins = pin_set(&entries, true);
+    let loader = PinnedObjectId(0);
+    let carried = PinnedObjectId(1);
+    let dropped = PinnedObjectId(2);
+    for (key, _, _) in &entries {
+        record_scan_ownership(&mut pins, ProcessViewId(1), *key, PATH);
+    }
+    pins.replace_view_pins_with_claims_for(
+        ProcessViewId(1),
+        PinnedObjects::empty(),
+        &[loader, carried],
+        &[loader],
+    );
+    assert!(pins.summary(loader).is_some(), "loader stays resolvable");
+    assert!(pins.summary(carried).is_some(), "carried stays resolvable");
+    assert!(pins.summary(dropped).is_none(), "other still drops");
+    let claims = pins
+        .view_claims(ProcessViewId(1))
+        .expect("the view keeps claims");
+    assert!(
+        claims.pins.contains(&loader),
+        "the loader id restores its claim"
+    );
+    assert!(
+        !claims.pins.contains(&carried),
+        "the carried id stays merely resolvable"
+    );
+}

@@ -1494,6 +1494,48 @@ fn pid_conservative_replay_retires_when_the_named_view_exits() {
 }
 
 #[test]
+fn loader_scan_preserve_carries_active_providers_in_cgroup_turnover() {
+    // Loader assembly keeps the loader id plus carried provider ids, but
+    // only for cgroup member turnover (closed membership + waiting
+    // newcomers); every other scope or quiet tick preserves loader-only.
+    let loader = PinnedObjectId(99);
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let (mut engine, _, object, _) = engine_with_overlay(80);
+    engine.scope = cgroup;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+    assert_ne!(object, loader, "fixture ids are distinct");
+    engine.mark_newcomer_arrival(424242, Some(1));
+    let preserve = engine.loader_scan_preserve(loader);
+    assert!(
+        preserve.contains(&loader),
+        "the loader id is always preserved"
+    );
+    assert!(
+        preserve.contains(&object),
+        "cgroup turnover also preserves the attached provider"
+    );
+    engine.scope = crate::attach::Scope::System;
+    assert_eq!(
+        engine.loader_scan_preserve(loader),
+        vec![loader],
+        "system scope preserves loader-only despite waiting newcomers"
+    );
+    engine.scope = crate::scope::cgroup(dir.path()).expect("scope");
+    engine.newcomer_first_seen.clear();
+    assert_eq!(
+        engine.loader_scan_preserve(loader),
+        vec![loader],
+        "a quiet cgroup tick preserves loader-only"
+    );
+}
+
+#[test]
 fn bind_drops_an_active_slot_whose_module_vanished_instead_of_aborting() {
     let mut facts = CaptureFacts::default();
     let mut plan = plan_with(1, 0);

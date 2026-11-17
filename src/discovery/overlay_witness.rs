@@ -809,6 +809,7 @@ fn diagnosis_for_shared_failure(
 }
 
 fn load_witness_session_diagnosed() -> Result<IdentitySession, WitnessDiagnosis> {
+    // Fill parses before the deny scan: one parse on deny kernels, reused by attach.
     let host = match crate::attach::host_btf::shared() {
         Ok(host) => host,
         Err(_) => {
@@ -1831,5 +1832,51 @@ mod tests {
                 stage: WitnessStage::BtfParse
             }
         );
+    }
+
+    #[test]
+    fn witness_session_load_shares_the_one_host_parse() {
+        // Source guard for the lane's core property (same `split_once`
+        // precedent as `witness_preload_sits_before_owned_spawn`): the
+        // production loader routes through the shared cache, never a
+        // second sysfs read. The helper twins above pin the helpers;
+        // this pins the wiring — a revert to the raw read plus
+        // `from_sys_fs` must fail here.
+        fn contract(body: &str) -> std::result::Result<(), String> {
+            for marker in [
+                "host_btf::shared()",
+                "check_shared_host",
+                "diagnosis_for_shared_failure",
+            ] {
+                if !body.contains(marker) {
+                    return Err(format!("witness session load lacks {marker}"));
+                }
+            }
+            for banned in ["from_sys_fs", "ensure_kernel_identity_btf"] {
+                if body.contains(banned) {
+                    return Err(format!(
+                        "witness session load keeps a second BTF read ({banned})"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        let source = include_str!("overlay_witness.rs");
+        let body = source
+            .split_once("fn load_witness_session_diagnosed()")
+            .expect("the witness session loader exists")
+            .1
+            .split_once("\n}\n")
+            .expect("the witness session loader ends")
+            .0;
+        contract(body).expect("the witness session load shares the one host parse");
+        // Non-vacuity: a redundant parse alongside the helpers is
+        // rejected, as is an unshared loader body.
+        let redundant = format!("{body}\n    let _redundant = aya::Btf::from_sys_fs();\n");
+        assert_ne!(redundant, body, "the mutation changes the loader body");
+        contract(&redundant).expect_err("the redundant parse must be rejected");
+        let unshared = body.replacen("check_shared_host", "check_legacy_host", 1);
+        assert_ne!(unshared, body, "the mutation changes the loader body");
+        contract(&unshared).expect_err("the unshared loader must be rejected");
     }
 }

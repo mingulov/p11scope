@@ -131,7 +131,7 @@ fn read_btf(path: &std::path::Path) -> Result<Vec<u8>, aya::BtfError> {
 /// result: no per-query clone of the parse and no repeated name lookup.
 pub(crate) fn shared() -> Result<&'static HostBtf, CachedError> {
     cached(&HOST_BTF, || {
-        read_btf(std::path::Path::new("/sys/kernel/btf/vmlinux"))
+        read_btf(std::path::Path::new(super::identity_iter::VMLINUX_BTF_PATH))
     })
 }
 
@@ -382,5 +382,34 @@ mod tests {
                 "one shared allocation"
             );
         });
+    }
+
+    #[test]
+    fn shared_fill_uses_the_single_sysfs_path_constant() {
+        // The process-wide fill opens the one path constant, never a
+        // duplicated literal that drifts silently (same `split_once`
+        // source-guard precedent as the witness sharing guards).
+        fn contract(body: &str) -> std::result::Result<(), String> {
+            if !body.contains("VMLINUX_BTF_PATH") {
+                return Err("the shared fill lacks VMLINUX_BTF_PATH".to_string());
+            }
+            if body.contains("\"/sys/kernel/btf/vmlinux\"") {
+                return Err("the shared fill keeps a duplicated path literal".to_string());
+            }
+            Ok(())
+        }
+        let source = include_str!("host_btf.rs");
+        let body = source
+            .split_once("pub(crate) fn shared()")
+            .expect("the shared fill exists")
+            .1
+            .split_once("\n}\n")
+            .expect("the shared fill ends")
+            .0;
+        contract(body).expect("the shared fill opens the single path constant");
+        // Non-vacuity: the duplicated literal is rejected.
+        let duplicated = body.replacen("VMLINUX_BTF_PATH", "\"/sys/kernel/btf/vmlinux\"", 1);
+        assert_ne!(duplicated, body, "the mutation changes the fill body");
+        contract(&duplicated).expect_err("the duplicated literal must be rejected");
     }
 }

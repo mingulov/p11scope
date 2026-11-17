@@ -1574,11 +1574,12 @@ pub(crate) fn start(
         crate::attach::Scope::Cgroup { id, .. } => (2u32, 0, *id, true),
         crate::attach::Scope::System => (3u32, 0, 0, false),
     };
+    // Fill parses before the prototype checks: one parse on deny kernels, reused by attach.
     let host = match super::host_btf::shared() {
         Ok(host) => host,
         Err(error) => {
             return Err(unavailable_for_shared_failure(&error, need_migrate, || {
-                std::fs::read("/sys/kernel/btf/vmlinux")
+                std::fs::read(crate::attach::identity_iter::VMLINUX_BTF_PATH)
             }));
         }
     };
@@ -3283,7 +3284,8 @@ mod tests {
     #[ignore = "privileged: live witness start on the host"]
     fn privileged_start_activates_on_host() {
         let path = probe_softhsm_path();
-        let raw_btf = std::fs::read("/sys/kernel/btf/vmlinux").expect("host BTF bytes");
+        let raw_btf =
+            std::fs::read(crate::attach::identity_iter::VMLINUX_BTF_PATH).expect("host BTF bytes");
         let family = super::resolve_depart_family(&raw_btf).expect("depart family");
         super::check_target_protos(&raw_btf, false).expect("target protos");
         let btf = aya::Btf::from_sys_fs().expect("host BTF");
@@ -3973,7 +3975,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("witness-clean.so");
         std::fs::write(&path, vec![0x7f, b'E', b'L', b'F', 0, 1, 2, 3]).expect("write");
-        let raw_btf = std::fs::read("/sys/kernel/btf/vmlinux").expect("host BTF bytes");
+        let raw_btf =
+            std::fs::read(crate::attach::identity_iter::VMLINUX_BTF_PATH).expect("host BTF bytes");
         let family = super::resolve_depart_family(&raw_btf).expect("depart family");
         super::check_target_protos(&raw_btf, false).expect("target protos");
         let btf = aya::Btf::from_sys_fs().expect("host BTF");
@@ -4026,7 +4029,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("witness-churn.so");
         std::fs::write(&path, vec![0x7f, b'E', b'L', b'F', 4, 5, 6, 7]).expect("write");
-        let raw_btf = std::fs::read("/sys/kernel/btf/vmlinux").expect("host BTF bytes");
+        let raw_btf =
+            std::fs::read(crate::attach::identity_iter::VMLINUX_BTF_PATH).expect("host BTF bytes");
         let family = super::resolve_depart_family(&raw_btf).expect("depart family");
         super::check_target_protos(&raw_btf, false).expect("target protos");
         let btf = aya::Btf::from_sys_fs().expect("host BTF");
@@ -4219,5 +4223,49 @@ mod tests {
         let reported = super::unavailable_for_shared_failure(&cached, true, || Ok(good));
         assert_eq!(reported.class(), "btf");
         assert_eq!(reported, super::Unavailable::Btf(format!("{cached:?}")));
+    }
+
+    #[test]
+    fn start_shares_the_one_host_parse() {
+        // Source guard for the lane's core property (same `split_once`
+        // precedent as `witness_preload_sits_before_owned_spawn`): `start`
+        // routes through the shared cache and the single sysfs path
+        // constant, never a second BTF read. A revert to `fs::read` plus
+        // `from_sys_fs` must fail here.
+        fn contract(body: &str) -> std::result::Result<(), String> {
+            for marker in [
+                "host_btf::shared()",
+                "btf_for_start",
+                "unavailable_for_shared_failure",
+                "VMLINUX_BTF_PATH",
+            ] {
+                if !body.contains(marker) {
+                    return Err(format!("witness start lacks {marker}"));
+                }
+            }
+            for banned in ["from_sys_fs", "\"/sys/kernel/btf/vmlinux\""] {
+                if body.contains(banned) {
+                    return Err(format!("witness start keeps a second BTF read ({banned})"));
+                }
+            }
+            Ok(())
+        }
+        let source = include_str!("prearm_witness.rs");
+        let body = source
+            .split_once("pub(crate) fn start(")
+            .expect("the witness start exists")
+            .1
+            .split_once("\n}\n")
+            .expect("the witness start ends")
+            .0;
+        contract(body).expect("the witness start shares the one host parse");
+        // Non-vacuity: a redundant parse alongside the helpers is
+        // rejected, as is an unshared start body.
+        let redundant = format!("{body}\n    let _redundant = aya::Btf::from_sys_fs();\n");
+        assert_ne!(redundant, body, "the mutation changes the start body");
+        contract(&redundant).expect_err("the redundant parse must be rejected");
+        let unshared = body.replacen("btf_for_start", "btf_for_legacy_start", 1);
+        assert_ne!(unshared, body, "the mutation changes the start body");
+        contract(&unshared).expect_err("the unshared start must be rejected");
     }
 }

@@ -11584,6 +11584,132 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bind_refuses_run_learned_cross_object_entries_without_export_agreement() {
+        // A run-learned table is an uncorroborated heuristic decode:
+        // no live return, no manifest and no frame agreement stand
+        // behind it yet. A cross-object entry it carries must prove
+        // export agreement — the pinned target's own `.dynsym`
+        // defining the same name at the same offset — or the bind
+        // refuses it. Without this, a provider whose data mimics a
+        // table (haskoki's GHC static data) plants uprobes at garbage
+        // offsets in whatever file the decode resolved into (there:
+        // mid-instruction inside the python executable), and the
+        // target dies executing them.
+        const VERIFIED_OFFSET: u64 = 0xebe0;
+        const DANGLING_OFFSET: u64 = 0x20;
+        let provider = overlay(220);
+        let dependency = ObjectKey {
+            inode: provider.inode + 1,
+            ..provider
+        };
+        let mut scanned = module(provider);
+        scanned.view = crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID;
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Login",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: VERIFIED_OFFSET,
+        });
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: DANGLING_OFFSET,
+        });
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        let mut dependency_module = scanned.clone();
+        dependency_module.key = dependency;
+        let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
+        assert!(pinned.absorb(dependency_pins).is_empty());
+        // The pinned target defines the login forward at the verified
+        // offset only; the sign offset is unproven.
+        let target = pinned
+            .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
+            .expect("the dependency is pinned");
+        pinned.by_id.get_mut(&target).unwrap().exports =
+            Arc::from(vec![("C_Login".to_string(), VERIFIED_OFFSET)]);
+
+        let (bound, skipped) = bind_scanned_modules(&[scanned], &mut pinned);
+
+        assert_eq!(bound.len(), 1);
+        let entries = &bound[0].scanned.tables[0].entries;
+        assert!(
+            entries.iter().any(|entry| entry.name == "C_Initialize"),
+            "the same-file entry binds: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|entry| {
+                entry.name == "C_Login" && entry.file_offset == VERIFIED_OFFSET
+            }),
+            "the export-verified run-learned forward binds: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.name == "C_Sign"),
+            "the unverified run-learned forward never binds: {entries:?}"
+        );
+        assert_eq!(skipped.len(), 1, "exactly the unverified forward refuses");
+        assert_eq!(skipped[0].subject, "C_Sign");
+        assert!(
+            skipped[0].reason.contains("not attached"),
+            "the refusal names the outcome: {}",
+            skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn bind_keeps_uncorroborated_cross_object_entries_outside_run_learned() {
+        // The twin guard: outside the run-learned fast path the
+        // binder keeps its documented behavior — a non-getter
+        // cross-object entry binds without proof (forwarding
+        // providers need that; only the bootstrap getters refuse
+        // unverified forwards). The run-learned rule above must not
+        // leak onto ordinary frame-scan modules.
+        const VERIFIED_OFFSET: u64 = 0xebe0;
+        const DANGLING_OFFSET: u64 = 0x20;
+        let provider = overlay(220);
+        let dependency = ObjectKey {
+            inode: provider.inode + 1,
+            ..provider
+        };
+        let mut scanned = module(provider);
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Login",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: VERIFIED_OFFSET,
+        });
+        scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: dependency,
+            object_path: PATH.into(),
+            file_offset: DANGLING_OFFSET,
+        });
+        let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        let mut dependency_module = scanned.clone();
+        dependency_module.key = dependency;
+        let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
+        assert!(pinned.absorb(dependency_pins).is_empty());
+        let target = pinned
+            .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
+            .expect("the dependency is pinned");
+        pinned.by_id.get_mut(&target).unwrap().exports =
+            Arc::from(vec![("C_Login".to_string(), VERIFIED_OFFSET)]);
+
+        let (bound, skipped) = bind_scanned_modules(&[scanned], &mut pinned);
+
+        assert_eq!(bound.len(), 1);
+        let entries = &bound[0].scanned.tables[0].entries;
+        assert!(
+            entries.iter().any(|entry| entry.name == "C_Sign"),
+            "the unverified non-getter forward still binds outside run-learned: {entries:?}"
+        );
+        assert!(
+            skipped.is_empty(),
+            "no refusal outside run-learned: {skipped:?}"
+        );
+    }
+
     /// The Final candidate may reuse the First build only when the rescan
     /// produced pin content identical to the first scan's, so the content
     /// comparison must see through scan-local id assignment (insertion

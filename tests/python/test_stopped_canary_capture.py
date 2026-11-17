@@ -2837,7 +2837,12 @@ class SnapshotInventoryTests(unittest.TestCase):
             time.sleep(0.005)
         raise AssertionError('sleeper fds never settled')
 
-    def run_inventory(self, canned, ids, calls, *, listing_error=None, per_id_error=None):
+    def overflow_error(self):
+        return RuntimeError(
+            f'bpftool JSON acquisition exceeded output bound {capture.INVENTORY_LISTING_MAX_BYTES}')
+
+    def run_inventory(self, canned, ids, calls, *, listing_error=None, per_id_error=None,
+                      per_id_stub=None):
         def fake_run_json(args, require_list=False, map_identity=None, *, timeout_seconds, max_bytes):
             calls.append((list(args), require_list, timeout_seconds, max_bytes))
             if list(args) == ['bpftool', '-j', 'map', 'show']:
@@ -2848,6 +2853,8 @@ class SnapshotInventoryTests(unittest.TestCase):
                 raise AssertionError(f'unexpected bpftool argv: {args}')
             if per_id_error is not None:
                 raise per_id_error
+            if per_id_stub is not None:
+                return per_id_stub(int(args[5]))
             return copy.deepcopy(next(
                 (row for row in canned if isinstance(row, dict) and row.get('id') == int(args[5])), None))
 
@@ -2961,6 +2968,7 @@ class SnapshotInventoryTests(unittest.TestCase):
             self.run_inventory(canned, ids, [], listing_error=overflow, per_id_error=tool_failure)
         self.assertIn('per-id fallback', str(raised.exception))
         self.assertNotIn('boom-marker', str(raised.exception))
+        self.assertIn(f'map id={ids[0]}', str(raised.exception))
 
     def test_inventory_does_not_page_when_the_listing_fails_for_another_reason(self):
         canned = self.canned_rows()
@@ -2971,6 +2979,106 @@ class SnapshotInventoryTests(unittest.TestCase):
                 canned, ids, calls,
                 listing_error=RuntimeError('bpftool JSON acquisition timed out after 8s'))
         self.assertEqual([argv for argv, _, _, _ in calls], [['bpftool', '-j', 'map', 'show']])
+
+    def test_inventory_refuses_a_duplicate_map_id_in_the_per_id_fallback(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        calls = []
+        first = copy.deepcopy(canned[0])
+
+        def stub(map_id):
+            return copy.deepcopy(first)
+
+        with self.assertRaisesRegex(capture.CaptureError, 'duplicate map id in per-id inventory'):
+            self.run_inventory(canned, ids, calls, listing_error=self.overflow_error(),
+                               per_id_stub=stub)
+        self.assertEqual([argv for argv, _, _, _ in calls],
+                         [['bpftool', '-j', 'map', 'show'],
+                          ['bpftool', '-j', 'map', 'show', 'id', str(ids[0])],
+                          ['bpftool', '-j', 'map', 'show', 'id', str(ids[1])]])
+
+    def test_inventory_refuses_a_malformed_row_in_the_per_id_fallback(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        calls = []
+        by_id = {row['id']: row for row in canned}
+
+        def stub(map_id):
+            if map_id == ids[0]:
+                return None
+            return copy.deepcopy(by_id[map_id])
+
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map snapshot per-id row is not an identified map'):
+            self.run_inventory(canned, ids, calls, listing_error=self.overflow_error(),
+                               per_id_stub=stub)
+        self.assertEqual([argv for argv, _, _, _ in calls],
+                         [['bpftool', '-j', 'map', 'show'],
+                          ['bpftool', '-j', 'map', 'show', 'id', str(ids[0])]])
+
+    def test_inventory_overflow_matcher_fires_on_the_real_dumper_error(self):
+        bound = capture.INVENTORY_LISTING_MAX_BYTES
+        try:
+            capture.dumper._run_bounded_bytes(
+                [sys.executable, '-c',
+                 f"import sys; sys.stdout.write('x' * ({bound} + 1))"],
+                timeout_seconds=8, max_bytes=bound, label='bpftool JSON acquisition')
+        except RuntimeError as error:
+            real_error = error
+        else:
+            self.fail('real bounded acquisition did not overflow')
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        calls = []
+        maps = self.run_inventory(canned, ids, calls, listing_error=real_error)
+        self.assertEqual([argv for argv, _, _, _ in calls],
+                         [['bpftool', '-j', 'map', 'show']]
+                         + [['bpftool', '-j', 'map', 'show', 'id', str(map_id)] for map_id in ids])
+        self.assertEqual(maps, self.expected_maps(canned))
+
+    def test_inventory_listing_deadline_propagates_without_fallback(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        calls = []
+        with self.assertRaises(capture.CaptureError) as raised:
+            self.run_inventory(canned, ids, calls,
+                               listing_error=capture.CaptureError('phase deadline expired'))
+        self.assertRegex(str(raised.exception), 'phase deadline expired')
+        self.assertIs(type(raised.exception), capture.CaptureError)
+        self.assertEqual([argv for argv, _, _, _ in calls], [['bpftool', '-j', 'map', 'show']])
+
+    def test_inventory_per_id_deadline_aborts_the_fallback(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        calls = []
+        with self.assertRaises(capture.CaptureError) as raised:
+            self.run_inventory(canned, ids, calls, listing_error=self.overflow_error(),
+                               per_id_error=capture.CaptureError('phase deadline expired'))
+        self.assertRegex(str(raised.exception), 'phase deadline expired')
+        self.assertIs(type(raised.exception), capture.CaptureError)
+        self.assertEqual([argv for argv, _, _, _ in calls],
+                         [['bpftool', '-j', 'map', 'show'],
+                          ['bpftool', '-j', 'map', 'show', 'id', str(ids[0])]])
+
+    def test_inventory_per_id_wrong_row_names_the_fallback_stage(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        calls = []
+        by_id = {row['id']: row for row in canned}
+        wrong = {'id': 99999, 'name': 'WRONG', 'type': 'hash',
+                 'bytes_key': 4, 'bytes_value': 8, 'max_entries': 1, 'flags': 0}
+
+        def stub(map_id):
+            if map_id == ids[0]:
+                return copy.deepcopy(wrong)
+            return copy.deepcopy(by_id[map_id])
+
+        with self.assertRaisesRegex(capture.CaptureError, 'differs from requested map id'):
+            self.run_inventory(canned, ids, calls, listing_error=self.overflow_error(),
+                               per_id_stub=stub)
+        self.assertEqual([argv for argv, _, _, _ in calls],
+                         [['bpftool', '-j', 'map', 'show'],
+                          ['bpftool', '-j', 'map', 'show', 'id', str(ids[0])]])
 
     def test_snapshot_listing_matches_the_per_id_path_on_the_same_maps(self):
         canned = self.canned_rows()

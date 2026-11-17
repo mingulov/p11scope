@@ -1604,6 +1604,44 @@ mod tests {
         );
     }
 
+    /// The commit gate is identity/owner/mode-only: it re-verifies the
+    /// temp's dev/ino, owner and mode, never its bytes. Anyone who can
+    /// open the live temp for writing can therefore append bytes that
+    /// the commit accepts and publishes. (This is why the handover
+    /// timing matters: whoever owns the live temp during the capture
+    /// can append to the report.)
+    #[test]
+    fn commit_accepts_bytes_appended_through_a_reopened_temp_path() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"legit\":true}").unwrap();
+        // Reopen the live temp by name — the same open+append any
+        // owner-capable writer can issue — and append injected bytes.
+        let temp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".p11scope.")
+            })
+            .expect("the live temp exists beside the final name during the capture");
+        let mut reopened = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&temp)
+            .unwrap();
+        std::io::Write::write_all(&mut reopened, b"INJECTED").unwrap();
+        drop(reopened);
+        a.commit().unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"legit\":true}INJECTED",
+            "the commit publishes whatever the live temp holds"
+        );
+    }
+
     fn mkfifo(path: &Path) {
         let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
@@ -2224,6 +2262,116 @@ mod tests {
         let report_path = user_dir.join("report.json");
         let mut report = AtomicFile::create(&report_path).unwrap();
         std::io::Write::write_all(report.file(), b"{\"ok\":true}").unwrap();
+        // The live temp stays root-owned 0600 for the whole capture;
+        // the invoker gains it only at commit. A temp already owned by
+        // the invoker here is the at-create handover window: the
+        // recipient could append bytes the commit-time checks accept.
+        let live_temps: Vec<PathBuf> = std::fs::read_dir(&user_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".p11scope.")
+            })
+            .collect();
+        assert_eq!(
+            live_temps.len(),
+            1,
+            "one live temp beside the final name during the capture"
+        );
+        let live_metadata = std::fs::symlink_metadata(&live_temps[0]).unwrap();
+        assert!(
+            live_metadata.is_file(),
+            "the live temp is a regular file"
+        );
+        assert_eq!(
+            live_metadata.uid(),
+            0,
+            "the live temp stays root-owned until commit"
+        );
+        assert_eq!(
+            live_metadata.permissions().mode() & 0o777,
+            0o600,
+            "the live temp stays private until commit"
+        );
+        // The future owner must not be able to write the live temp: fork
+        // a child that becomes the invoker and tries to append to it.
+        // The open must fail EACCES; an appended INJECTED would pass the
+        // commit checks. (Under fakeroot ownership is faked while DAC is
+        // real, so only the ownership assertion above runs there.)
+        if std::env::var_os("FAKEROOTKEY").is_none() {
+            let temp_name = CString::new(live_temps[0].as_os_str().as_bytes()).unwrap();
+            // SAFETY: the child only calls async-signal-safe libc, then
+            // _exit on every path; all inputs were built before forking.
+            // The parent reaps it below.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork for the invoker write probe");
+            if pid == 0 {
+                unsafe {
+                    if libc::setgroups(0, std::ptr::null()) != 0 {
+                        libc::_exit(41);
+                    }
+                    if libc::setgid(gid) != 0 {
+                        libc::_exit(42);
+                    }
+                    if libc::setuid(uid) != 0 {
+                        libc::_exit(43);
+                    }
+                    let fd = libc::open(
+                        temp_name.as_ptr(),
+                        libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC,
+                    );
+                    if fd < 0 {
+                        libc::_exit(
+                            std::io::Error::last_os_error().raw_os_error().unwrap_or(99),
+                        );
+                    }
+                    let injected = b"INJECTED";
+                    let mut written = 0;
+                    while written < injected.len() {
+                        let done = libc::write(
+                            fd,
+                            injected[written..].as_ptr().cast(),
+                            (injected.len() - written) as _,
+                        );
+                        if done <= 0 {
+                            libc::_exit(
+                                std::io::Error::last_os_error().raw_os_error().unwrap_or(99),
+                            );
+                        }
+                        written += done as usize;
+                    }
+                    libc::close(fd);
+                    libc::_exit(10);
+                }
+            }
+            let mut status = 0;
+            loop {
+                // SAFETY: waiting for our own forked child; retry on EINTR.
+                let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if waited == pid {
+                    break;
+                }
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINTR),
+                    "waitpid for the invoker write probe"
+                );
+            }
+            assert!(
+                libc::WIFEXITED(status),
+                "the invoker write probe exited, status {status}"
+            );
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                libc::EACCES,
+                "the live report refuses the invoker's write with EACCES"
+            );
+        } else {
+            eprintln!("fakeroot: skipping the invoker EACCES probe (DAC is real, ownership faked)");
+        }
         report.commit().unwrap();
         assert_eq!(std::fs::read(&report_path).unwrap(), b"{\"ok\":true}");
         assert_handed(&report_path);
@@ -2451,6 +2599,40 @@ mod tests {
         assert_eq!(
             calls, 5,
             "expected verify + Drop temp stats, the final check, retained destination identity and the unbegun-stream Drop"
+        );
+    }
+
+    /// The at-create handover window, pinned structurally: the live
+    /// temp stays creator-owned for the whole capture, and the handover
+    /// to the recipient happens at commit, on the fd, just before
+    /// publication. `AtomicFile::create` must therefore never call the
+    /// fchown helper, while `commit` must hand the file over. (Streams
+    /// keep their at-create handover: they have no commit point.)
+    #[test]
+    fn handover_happens_at_commit_not_at_create() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let create = production
+            .split_once("pub fn create(path: &Path) -> Result<AtomicFile, String>")
+            .unwrap()
+            .1
+            .split_once("pub fn file(")
+            .unwrap()
+            .0;
+        assert!(
+            !create.contains("handover_new_file") && !create.contains("fchown"),
+            "AtomicFile::create must not hand the live temp over: it stays creator-owned until commit"
+        );
+        let commit = production
+            .split_once("pub fn commit(mut self)")
+            .unwrap()
+            .1
+            .split_once("fn publish(")
+            .unwrap()
+            .0;
+        assert!(
+            commit.contains("hand_over_at_commit"),
+            "AtomicFile::commit must hand the finished report over before publishing it"
         );
     }
 }

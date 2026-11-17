@@ -176,8 +176,9 @@ impl AtomicFile {
 
     /// Re-verifies the temp identity (regular file, same dev/ino, owner ==
     /// creator, mode & 0o077 == 0), `sync_all`, hands the finished file to
-    /// the handover target decided at creation, re-checks the final name,
-    /// then renames over it. On any error the temp file is unlinked by `Drop`.
+    /// the handover target decided at creation and syncs the new
+    /// owner/mode, re-checks the final name, then renames over it. On any
+    /// error the temp file is unlinked by `Drop`.
     pub fn commit(mut self) -> Result<(), String> {
         self.verify_temp_identity()?;
         self.temp_file.sync_all().map_err(|error| {
@@ -236,10 +237,12 @@ impl AtomicFile {
 
     /// Hands the finished report to the handover target decided at
     /// creation: `fchown` plus an explicit `0600` on the open
-    /// descriptor, never by path, so no symlink can redirect it.
-    /// Without a target this keeps the creator's ownership. Once the
-    /// `fchown` succeeds the recorded owner is the target, so a later
-    /// failure still unlinks this run's file through `Drop`.
+    /// descriptor, never by path, so no symlink can redirect it, then a
+    /// sync of the new owner/mode so a crash cannot persist the later
+    /// rename with pre-handover ownership. Without a target this keeps
+    /// the creator's ownership. Once the `fchown` succeeds the recorded
+    /// owner is the target, so a later failure still unlinks this run's
+    /// file through `Drop`.
     fn hand_over_at_commit(&mut self) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt as _;
         let Some((uid, gid)) = self.handover else {
@@ -255,6 +258,15 @@ impl AtomicFile {
                     self.final_path.display()
                 )
             })?;
+        // Persist the new owner/mode before publication: without this
+        // sync an OS crash between commit and inode writeback could
+        // persist the rename with pre-handover ownership.
+        self.temp_file.sync_all().map_err(|error| {
+            format!(
+                "syncing output {} after handing it to uid {uid}, gid {gid} failed: {error}",
+                self.final_path.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -2610,6 +2622,75 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().count(),
             0,
             "no leftover temp on handover failure"
+        );
+    }
+
+    /// Post-handover durability pin: the commit-time `fchown`/`fchmod`
+    /// must be followed by a fail-closed file sync before publication,
+    /// or an OS crash could persist the rename with pre-handover
+    /// ownership. Structural: `fsync` success is invisible, so the
+    /// ordering and the named error are pinned on the source; the
+    /// healthy twin below proves the pinned path executes.
+    #[test]
+    fn commit_handover_syncs_the_handed_over_file_before_publish() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let handover = production
+            .split_once("fn hand_over_at_commit(")
+            .unwrap()
+            .1
+            .split_once("fn verify_temp_identity(")
+            .unwrap()
+            .0;
+        let fchown = handover
+            .find("handover_new_file")
+            .expect("hand_over_at_commit must fchown the finished file");
+        let chmod = handover
+            .find("set_permissions")
+            .expect("hand_over_at_commit must chmod the finished file private");
+        let sync = handover
+            .find("sync_all")
+            .expect("hand_over_at_commit must sync the handed-over file");
+        assert!(
+            fchown < sync && chmod < sync,
+            "the post-handover sync must run after fchown/fchmod"
+        );
+        assert!(
+            handover.contains("syncing output"),
+            "the post-handover sync failure must carry a named error"
+        );
+        assert!(
+            !handover.contains("let _"),
+            "the post-handover sync must fail closed, never `let _`-ignored"
+        );
+    }
+
+    /// Healthy twin of the handover-failure test above: handing to the
+    /// caller's own uid/gid succeeds unprivileged, so the full handover
+    /// path — fchown, chmod, post-handover sync, publish — runs here and
+    /// must publish a private, owner-correct final with no leftover.
+    #[test]
+    fn commit_handover_to_self_publishes_a_private_final() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: needs a non-root caller (root hands over for real)");
+            return;
+        }
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let mut a = atomic_file_test_fixture(&path);
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        a.handover = Some((uid, gid));
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.commit().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"ok\":true}");
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "only the final remains, no temp leftover"
         );
     }
 

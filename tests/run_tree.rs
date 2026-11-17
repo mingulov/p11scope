@@ -1845,7 +1845,7 @@ fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves()
 }
 
 /// Arming-exhaustion run: 280 short-lived sleepers in 14 waves of 20
-/// (each `sleep 5`, ~70 s total) to spend the member loader contexts,
+/// (each `sleep 7`, ~98 s total) to spend the member loader contexts,
 /// then 32 sequential SoftHSM grandchildren (each 1 iteration, 150 ms
 /// linger) with NO prearm hint — all under `--pause never`. Every owned
 /// member arms a loader context (E1, even provider-free sleepers), and
@@ -1872,6 +1872,7 @@ fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves()
 fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     const SLEEPER_WAVES: u32 = 14;
     const SLEEPERS_PER_WAVE: u32 = 20;
+    const SLEEPER_LIFE_SECS: u32 = 7;
     const PROVIDER_WORKERS: u32 = 32;
     let dir = tempfile::tempdir().expect("cell dir");
     let module = softhsm_path();
@@ -1881,7 +1882,7 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     let (_outdir, out) = out_dir();
     let mut script = String::new();
     // Phase 1: 280 sleepers to spend every member loader context. Each
-    // wave's 20 sleepers run concurrently for ~5 s, then join: 14 waves
+    // wave's 20 sleepers run concurrently for ~7 s, then join: 14 waves
     // admit ~280 members and exhaust past the reserve line mid-run. A
     // member spends its context only once the observer has scanned and
     // armed it before it exits, so the per-member scan must stay cheap:
@@ -1889,10 +1890,17 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     // `sleep` may be a multicall binary mapping a dozen libraries (uutils
     // on Ubuntu); on a busy host's 4-CPU vng guest with a debug observer
     // it admitted 73-85 members, the C sleeper 200-224.
+    // Seven-second lives (not five) give slow guests room to admit and
+    // arm each wave before it exits: at five seconds a busy guest converts
+    // ~190/280 and the reserve never names itself, while seven seconds
+    // convert ~260 with the same assertions below. Eight seconds would
+    // push the run past this file's 120 s harness bound, so seven is the
+    // longest life that fits; the reserve, staging and exact-accounting
+    // assertions are unchanged.
     let sleeper = build_c(dir.path(), "rt-sleeper", SLEEPER_C);
     for _ in 0..SLEEPER_WAVES {
         for _ in 0..SLEEPERS_PER_WAVE {
-            script.push_str(&format!("{} 5 & ", sleeper.display()));
+            script.push_str(&format!("{} {SLEEPER_LIFE_SECS} & ", sleeper.display()));
         }
         script.push_str("wait; ");
     }

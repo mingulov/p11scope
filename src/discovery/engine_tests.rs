@@ -991,6 +991,9 @@ fn typed_prearm_attach_unavailability_is_the_only_fallback() {
 fn engine_with_overlay(minor: u64) -> (Engine, ScannedModule, PinnedObjectId, PinnedTimingKey) {
     let module = overlay_module(overlay_key(minor));
     let mut pins = overlay_pins(&[(module.key, OVERLAY_SHA, 1)]);
+    // Synthetic entries use fake offsets; prove them so strict live binds
+    // keep working for engine-logic tests (default bind ignores proofs).
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
     let object = pins
         .id_for_scanned(&module, module.key, &module.path)
         .unwrap();
@@ -3550,6 +3553,7 @@ fn named_capture_starts_beside_an_unpublished_closure_alone() {
     provider.tables[0].entries = overlay_entries(&provider, first_offsets(68));
     let mut candidate_pins = engine.pinned.clone();
     let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    candidate_pins.prove_scanned_entries_for_test(&[closure.clone(), provider.clone()]);
     let candidate = engine
         .live_candidate(
             candidate_pins,
@@ -3735,6 +3739,9 @@ fn engine_admitting_overlay(minor: u64, admitted: u32) -> (Engine, ScannedModule
     let mut raw = overlay_module(overlay_key(minor));
     raw.tables[0].entries = overlay_entries(&raw, first_offsets(admitted));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    // Synthetic entries use fake offsets; prove them so strict live binds
+    // keep working for engine-logic tests.
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&raw));
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let mut engine = Engine::empty();
@@ -3771,6 +3778,11 @@ fn retained_publication_engine(minor: u64, admitted: u32) -> (Engine, ScannedMod
 }
 
 fn apply_publication_candidate(engine: &mut Engine, raw: &ScannedModule) -> ApplyOutcome {
+    // Synthetic entries use fake offsets; prove them so the strict live bind
+    // accepts this candidate the way the test intends.
+    engine
+        .pinned
+        .prove_scanned_entries_for_test(std::slice::from_ref(raw));
     let candidate = engine
         .live_candidate(engine.pinned.clone(), vec![raw.clone()], Vec::new())
         .unwrap();
@@ -4175,6 +4187,11 @@ fn ambiguity_latch_clears_rebuild_stability() {
 /// One live rebuild of `raw`, committed and published the way an accepted
 /// candidate is; returns its link delta.
 fn commit_live_rebuild(engine: &mut Engine, raw: &ScannedModule) -> plan::AttachDelta {
+    // Synthetic entries use fake offsets; prove them so the strict live bind
+    // accepts this candidate the way the test intends.
+    engine
+        .pinned
+        .prove_scanned_entries_for_test(std::slice::from_ref(raw));
     let candidate = engine
         .live_candidate(engine.pinned.clone(), vec![raw.clone()], Vec::new())
         .unwrap();
@@ -4971,6 +4988,7 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
     }
     let mut candidate_pins = engine.pinned.clone();
     let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    candidate_pins.prove_scanned_entries_for_test(&[published.clone(), provider.clone()]);
     let candidate = engine
         .live_candidate(
             candidate_pins,
@@ -5187,7 +5205,8 @@ fn capacity_refused_provider_seed_without_owner_stays_incomplete() {
         &provider,
         first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1),
     );
-    let pins = overlay_pins(&[(provider.key, OVERLAY_SHA, 1)]);
+    let mut pins = overlay_pins(&[(provider.key, OVERLAY_SHA, 1)]);
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&provider));
     let mut engine = Engine::empty();
     let candidate = engine
         .live_candidate(pins, vec![provider.clone()], Vec::new())
@@ -5253,7 +5272,8 @@ fn unpublished_closure_seed() -> (Engine, LiveCandidate, CountOnlySeedWork) {
     let published_source = p11kit_like_64_table_module();
     let mut closure = published_source.clone();
     closure.interfaces.clear();
-    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&closure));
     let mut engine = Engine::empty();
     let candidate = engine
         .live_candidate(pins, vec![closure.clone()], Vec::new())
@@ -5303,6 +5323,7 @@ fn refused_closure_seed() -> (Engine, LiveCandidate, CountOnlySeedWork) {
     let mut engine = Engine::empty();
     let mut candidate_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
     let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    candidate_pins.prove_scanned_entries_for_test(&[published.clone(), provider.clone()]);
     let candidate = engine
         .live_candidate(candidate_pins, vec![published, provider], skipped)
         .expect("the crowded rebuild");
@@ -5502,6 +5523,7 @@ fn live_overlay_peer_keeps_one_stable_slot_without_new_attach_work() {
     let second = overlay_module(overlay_key(102));
     let mut candidate_pins = engine.pinned.clone();
     let skipped = candidate_pins.absorb(overlay_pins(&[(second.key, OVERLAY_SHA, 1)]));
+    candidate_pins.prove_scanned_entries_for_test(&[first.clone(), second.clone()]);
 
     let candidate = engine
         .live_candidate(candidate_pins, vec![first.clone(), second.clone()], skipped)
@@ -21943,6 +21965,9 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
         flags: 0,
         table: Some(0),
     }];
+    // Synthetic entries use fake offsets; prove them so the strict live bind
+    // accepts the learned tables.
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
     let proofs = vec![OwnedLearnProof {
         view: ProcessViewId(9),
         path: path.clone(),
@@ -22097,6 +22122,9 @@ fn learned_tables_engine_with(
         flags: 0,
         table: Some(0),
     }];
+    // Synthetic entries use fake offsets; prove them so the strict live bind
+    // accepts the learned tables.
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
     let proofs = vec![OwnedLearnProof {
         view: ProcessViewId(9),
         path: path.clone(),
@@ -30623,8 +30651,11 @@ fn pin_test_modules(view: &ProcessView, modules: &[ScannedModule]) -> PinnedObje
         per_object_bytes: u64::MAX,
         total_bytes: u64::MAX,
     });
-    let (pins, skipped) = pin_scanned_view_objects(view, modules, &mut budget).unwrap();
+    let (mut pins, skipped) = pin_scanned_view_objects(view, modules, &mut budget).unwrap();
     assert!(skipped.is_empty(), "{skipped:?}");
+    // Synthetic entries use fake offsets; prove them so engine-logic tests
+    // keep binding under the strict rule.
+    pins.prove_scanned_entries_for_test(modules);
     pins
 }
 
@@ -34562,9 +34593,12 @@ fn pin_test_module(view: &ProcessView, module: &ScannedModule) -> PinnedObjects 
         per_object_bytes: u64::MAX,
         total_bytes: u64::MAX,
     });
-    let (pins, skipped) =
+    let (mut pins, skipped) =
         pin_scanned_view_objects(view, std::slice::from_ref(module), &mut budget).unwrap();
     assert!(skipped.is_empty(), "{skipped:?}");
+    // Synthetic entries use fake offsets; prove them so strict binds keep
+    // working for engine-logic tests.
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(module));
     pins
 }
 
@@ -34624,6 +34658,9 @@ impl LoaderPlanningFixture {
         let (loader, loader_pins, local_loader) = make_loader(221, "loader.so");
         let (warm_loader, warm_loader_pins, local_warm_loader) =
             make_loader(226, "initial-loader.so");
+        // Synthetic entries use fake offsets; prove them so strict binds keep
+        // working for engine-logic tests.
+        provider_pins.prove_scanned_entries_for_test(&raw);
         Self {
             dir,
             raw,
@@ -36837,6 +36874,9 @@ fn clean_deferral_pair(fixture: &LoaderPlanningFixture) -> (Engine, Engine) {
         assert!(base_pins.absorb(step).is_empty());
         raw.push(module);
     }
+    // Synthetic entries use fake offsets; prove them so strict live binds
+    // keep working for engine-logic tests.
+    base_pins.prove_scanned_entries_for_test(&raw);
     let build = || {
         let mut pins = base_pins.clone();
         let (modules, skips) = bind_scanned_modules(&raw, &mut pins);
@@ -41983,7 +42023,7 @@ fn same_object_scan_and_manifest(
 ) {
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let mut modules = vec![fixture.scanned_module(&view)];
-    let pins = pin_test_module(&view, &modules[0]);
+    let mut pins = pin_test_module(&view, &modules[0]);
     assert_eq!(modules.len(), 1);
     let summary = pins.pinned().next().unwrap();
     modules[0].decoder_abi = Some(pins.abi_for(summary.id).unwrap());
@@ -42009,6 +42049,8 @@ fn same_object_scan_and_manifest(
         manifest_supported: false,
         extension_impossible: false,
     });
+    // The pushed entry postdates pinning; prove it too.
+    pins.prove_scanned_entries_for_test(&modules);
     let manifest = manifest_naming(&path, Some(sha256));
     let input = ManifestInput {
         path: PathBuf::from("manifest.json"),
@@ -42224,13 +42266,16 @@ fn manifest_input_from_pinning(path: &str, manifest: Manifest) -> ManifestInput 
 }
 
 fn pin_scan(module: &ScannedModule) -> PinnedObjects {
-    let (pins, skipped) = pin_scanned_objects(
+    let (mut pins, skipped) = pin_scanned_objects(
         std::process::id(),
         std::slice::from_ref(module),
         &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     assert!(skipped.is_empty(), "{skipped:?}");
+    // Synthetic entries use fake offsets; prove them so engine-logic tests
+    // keep binding under the strict rule.
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(module));
     pins
 }
 
@@ -42829,13 +42874,16 @@ fn discovery_fallback_fails_when_the_proof_module_is_refused_at_capacity() {
         );
     let unrelated_module = scanned_manifest_replacement(&[unrelated, replaced], &targets);
     let modules = vec![proof_module, unrelated_module];
-    let (pins, skipped) = pin_scanned_objects(
+    let (mut pins, skipped) = pin_scanned_objects(
         std::process::id(),
         &modules,
         &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     assert!(skipped.is_empty(), "{skipped:?}");
+    // Synthetic entries use fake offsets; prove them so the strict rebuild
+    // binds and the capacity-refusal logic under test is reached.
+    pins.prove_scanned_entries_for_test(&modules);
     let input = manifest_input_from_pinning("capacity-proof.json", manifest);
     let mut discovered = lifecycle_discovered(vec![
         ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
@@ -43678,13 +43726,16 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
         }],
         interfaces: vec![],
     };
-    let (scan_pins, skipped) = pin_scanned_objects(
+    let (mut scan_pins, skipped) = pin_scanned_objects(
         std::process::id(),
         std::slice::from_ref(&module),
         &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     assert!(skipped.is_empty(), "{skipped:?}");
+    // Synthetic entry uses a fake offset; prove it so the strict rebuild
+    // keeps capture viable the way the test intends.
+    scan_pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
     let stale = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let stable = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
     let stale_id = stale.id();

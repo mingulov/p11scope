@@ -656,10 +656,17 @@ fn counter_start_state_with_owning_modules_survives_loader_arming() {
     let pid = child.pid();
     let view = crate::process::ProcessView::open(crate::process::ProcessViewId(0), pid).unwrap();
     let exe = child.exe_path();
-    let pins = fixture::real_scan_pin(&exe, None, 1, &"ab".repeat(32));
+    let mut pins = fixture::real_scan_pin(&exe, None, 1, &"ab".repeat(32));
     let object = pins.pinned().next().expect("one pin").id;
     let plan = counters_plan_on(8, object);
     let modules = vec![owning_module_for_test(&exe, &pins, object, &plan.slots)];
+    // Synthetic entries use slot offsets no real ELF proves; prove them so
+    // the strict arming rebuild keeps the retained plan.
+    let scanned = modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect::<Vec<_>>();
+    pins.prove_scanned_entries_for_test(&scanned);
     engine.inject_counter_start_state_for_test(
         crate::attach::Scope::Pid(pid),
         vec![view],

@@ -2108,6 +2108,40 @@ impl PinnedObjects {
         )
     }
 
+    /// Test-only proof backfill: record every entry offset of `modules` as
+    /// a proven function start in its reconciled target pin, so synthetic
+    /// fixtures (which use fake offsets no real ELF proves) bind under the
+    /// strict rule. Preserves engine-logic coverage whose inputs predate the
+    /// absolute target-safety contract; bind strictness itself is pinned by
+    /// the focused refusal twins, which never call this. Entries whose
+    /// target is not pinned here are skipped.
+    #[cfg(test)]
+    pub(crate) fn prove_scanned_entries_for_test(&mut self, modules: &[ScannedModule]) {
+        for module in modules {
+            for table in &module.tables {
+                for entry in &table.entries {
+                    let Some(id) = self.id_for_scanned(module, entry.object, &entry.object_path)
+                    else {
+                        continue;
+                    };
+                    let Some(pinned) = self.by_id.get_mut(&id) else {
+                        continue;
+                    };
+                    if pinned
+                        .function_starts
+                        .binary_search(&entry.file_offset)
+                        .is_err()
+                    {
+                        let mut starts = pinned.function_starts.to_vec();
+                        starts.push(entry.file_offset);
+                        starts.sort_unstable();
+                        pinned.function_starts = starts.into();
+                    }
+                }
+            }
+        }
+    }
+
     /// The witness-completeness bits for the pinned object's exports:
     /// `(getter_present, witness_fault)`. False when the object is not
     /// pinned here (whose empty exports can never prove anyway).

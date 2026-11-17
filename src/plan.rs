@@ -18724,6 +18724,61 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn extend_exact_keeps_a_manifest_only_getter_valid_when_its_scan_retires() {
+        // A getter-only manifest's getter slot outliving its program's
+        // scanned table keeps its live descriptor (count-only, so no probe
+        // churn) and stays valid: the kept descriptor keeps its sole
+        // authorized owner instead of becoming a descriptor without
+        // authorization. Deterministic twin for the live pass-1 drop
+        // (slot 3 C_GetFunctionList, descriptor 4, authorized false) seen
+        // when a rescan transiently misses the scanned table and the
+        // rebuild carries only the manifest getter.
+        let object = PinnedObjectId(1);
+        let descriptor = crate::kinds::function_id("C_GetFunctionList").unwrap() + 1;
+        assert_eq!(
+            crate::kinds::DESCRIPTORS[descriptor as usize],
+            SlotSemantics::COUNT_ONLY,
+            "the getter descriptor decodes nothing"
+        );
+        let getter_slot = |descriptor_index: u32, authorized: bool| Slot {
+            index: 0,
+            descriptor_index,
+            object,
+            object_path: "/proc/self/fd/1".into(),
+            file_offset: 0x10,
+            names: vec!["C_GetFunctionList".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: authorized,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(0)],
+        };
+        let mut scan_module = exact_module(0, object);
+        scan_module.source = "scan";
+        let mut plan = exact_plan(vec![getter_slot(descriptor, true)], vec![scan_module]);
+        plan.validate_slot_index().unwrap();
+        let manifest_module = exact_module(0, object);
+        assert_eq!(manifest_module.source, "manifest");
+        let rebuilt = exact_plan(vec![getter_slot(0, false)], vec![manifest_module]);
+        rebuilt.validate_slot_index().unwrap();
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(
+            delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty(),
+            "the kept getter spares its probe: {delta:?}"
+        );
+        assert_eq!(plan.slots[0].descriptor_index, descriptor);
+        assert!(
+            plan.slots[0].semantic_authorized,
+            "the kept descriptor keeps its authorization: {:?}",
+            plan.slots[0]
+        );
+        plan.validate_slot_index().unwrap();
+    }
+
+    #[test]
     fn extend_exact_refuses_an_over_capacity_snapshot_without_a_prefix_mutation() {
         let object = PinnedObjectId(1);
         let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;

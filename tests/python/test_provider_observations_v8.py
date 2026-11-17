@@ -12,7 +12,7 @@ and one proved instance attachment. These tests validate the golden
 against the schema (exact keys, enums, integer bounds and sort orders)
 with a small dependency-free checker for the frozen subset, so the
 schema cannot drift from its example. The Rust suite
-(provider_info_schema_v8_pins_task7_section_contract) separately proves
+(info_schema_v8_pins_task7_section_contract) separately proves
 the renderer emits exactly these keys and enums.
 
 Run: python3 -I tests/python/test_provider_observations_v8.py -v

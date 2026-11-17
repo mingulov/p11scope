@@ -2234,10 +2234,12 @@ New section body (normative):
 > **Status: PROPOSED (v0.8.0 keymeta Task 7 2026-11-14);
 > owner/Opus privacy review and Codex re-review required before
 > activation.** This section scopes the Task 7 schema section
-> (§17.5): the per-instance `provider_info`, per-slot `tokens[]`
-> and per-mechanism `mechanisms[]` keys. Reads are fixed-size
-> struct/range reads at return on `CKR_OK` only (§17.1); entry
-> retains the info pointer with a full-span guard.
+> (§17.5): the per-module `provider_info`, per-(module, caller,
+> slot) `tokens[]` and per-(module, caller, slot, mechanism)
+> `mechanisms[]` keys. Reads are fixed-size struct/range reads at
+> return on `CKR_OK` only (§17.1); entry retains the info pointer
+> with a full-span guard. Evidence reads ride already-admitted
+> entries only (the §8.4 rule, never provider-gating).
 > `CK_TOKEN_INFO.serialNumber`, `label`, session counts, memory
 > sizes and `utcTime` are never fetched (§17.2); there is no
 > opt-in flag for the serial in v0.8.0, and the schema has no keys

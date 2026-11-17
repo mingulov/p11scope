@@ -24,7 +24,8 @@ discovery-listed providers only). Anything else is refused with exit 1.
 | Mechanism limit rows (`provider_observations.mechanisms[]`) | limit properties on the mechanism id's `algorithm` component |
 
 `bom-ref` values (`p11scope:caller:N`, `p11scope:module:N`,
-`p11scope:mechanism:<hex>`, `p11scope:key:<object>`) are minted by this
+`p11scope:mechanism:<hex>`, `p11scope:key:<object>`,
+`p11scope:token:N`) are minted by this
 report only, like the diff report's local references. `dependencies[]`
 carries only joins the input proves: application → its modules,
 application/module → mechanisms observed on their edges, key object →

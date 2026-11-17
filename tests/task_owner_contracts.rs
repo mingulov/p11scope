@@ -363,8 +363,8 @@ fn production_counter_bank_timing_helpers() {
 /// no scope latch. Host-only; no BPF load, no attach.
 #[test]
 fn production_counter_bank_timing_per_item_loss_outcomes() {
-    let temporary = tempfile::tempdir().expect("counter timing RV test directory");
-    let binary = temporary.path().join("counter-bank-timing-rv");
+    let temporary = tempfile::tempdir().expect("counter timing loss test directory");
+    let binary = temporary.path().join("counter-bank-timing-loss");
     let output = Command::new("clang-18")
         .args([
             "-O2",
@@ -385,7 +385,7 @@ fn production_counter_bank_timing_per_item_loss_outcomes() {
         .expect("compile actual counter-bank timing helpers");
     assert!(
         output.status.success(),
-        "native counter timing RV compile: {}",
+        "native counter timing loss compile: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     for selector in [

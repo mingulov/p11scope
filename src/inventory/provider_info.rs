@@ -250,8 +250,13 @@ fn parse_ck_info(payload: &[u8], layout: u8) -> CkInfoValues {
 }
 
 fn parse_token(payload: &[u8], layout: u8) -> TokenValues {
+    // The PIN window packs ulMaxPinLen before ulMinPinLen (struct
+    // address order, spec §17.1): LP64 payload+56 is struct
+    // ulMaxPinLen@136 and payload+64 is ulMinPinLen@144; ia32
+    // payload+52 is struct ulMaxPinLen@116 and payload+56 is
+    // ulMinPinLen@120.
     let word = layout == INFO_LAYOUT_LP64;
-    let (flags, pin_min_len, pin_max_len, versions) = if word {
+    let (flags, pin_max_len, pin_min_len, versions) = if word {
         (
             le_u64(payload, 48),
             le_u64(payload, 56),

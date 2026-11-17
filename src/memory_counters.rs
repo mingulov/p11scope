@@ -1432,6 +1432,7 @@ mod tests {
                     skips: cap(65_536, 32),
                     losses: cap(65_536, 32),
                     refusals: cap(65_536, 32),
+                    lowerings: cap(65_536, 32),
                     fallbacks: cap(65_536, 32),
                     recorroborated: cap(65_536, 32),
                     conflicted: cap(65_536, 32),

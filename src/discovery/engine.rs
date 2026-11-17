@@ -28790,12 +28790,33 @@ impl Engine {
     /// rebuilt or applied, one that is refused or retired, and one whose
     /// failed detach leaves ownership uncertain. Either way its batch never
     /// confirms pause completeness: the caller fails the closure.
+    /// Marks listing pids no view admits yet, so the conservative
+    /// carry gate sees successors spawned since the last admission
+    /// window (getter-debt passes replay before the window marks).
+    /// Cgroup scope only (matching the gate); admitted pids are never
+    /// re-marked. One listing read per replay; listing failures simply
+    /// mark nothing (the gate then reads last tick's marks).
+    fn freshen_newcomer_marks(&mut self) {
+        if !matches!(self.scope, Scope::Cgroup { .. }) {
+            return;
+        }
+        let admitted: BTreeSet<u32> = self.views.iter().map(ProcessView::pid).collect();
+        let (pids, _) = scope_pids(&self.scope);
+        let now = crate::attach::monotonic_ns();
+        for pid in pids {
+            if !admitted.contains(&pid) {
+                self.mark_newcomer_arrival(pid, now);
+            }
+        }
+    }
+
     fn replay_pending_conservative(
         &mut self,
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> ApplyOutcome {
+        self.freshen_newcomer_marks();
         let retirements = self.pending_retirements.clone();
         let keys = self.pending_rejected_keys.clone();
         let candidate = match self.conservative_candidate(&retirements, &keys) {

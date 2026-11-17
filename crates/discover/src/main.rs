@@ -774,6 +774,60 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A temp name swapped for attacker bytes between the write and the
+    /// rename must fail closed: nothing attacker-controlled is published.
+    #[test]
+    fn a_temp_name_swapped_before_publish_is_refused() {
+        let directory =
+            std::env::temp_dir().join(format!("discover-publish-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let name = directory.join("manifest.json");
+        let error = write_private_atomically_with(&name, b"{}", || {
+            let temp = std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().starts_with(".p11scope-discover."))
+                .collect::<Vec<_>>();
+            assert_eq!(temp.len(), 1, "one temp file mid-publish: {temp:?}");
+            let temp_path = directory.join(&temp[0]);
+            std::fs::rename(&temp_path, directory.join("original.tmp")).unwrap();
+            std::fs::write(&temp_path, b"{\"attacker\":true}").unwrap();
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("replaced") || error.contains("re-check"),
+            "names the swapped temp: {error}"
+        );
+        assert!(!name.exists(), "swapped bytes must never publish");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Squatting the predictable temp names must not block publishing:
+    /// allocation retries with fresh randomness instead of failing on
+    /// someone else's entries.
+    #[test]
+    fn squatted_predictable_temp_names_do_not_block_publish() {
+        let directory =
+            std::env::temp_dir().join(format!("discover-publish-squat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        for sequence in 0..128u32 {
+            std::fs::write(
+                directory.join(format!(
+                    ".p11scope-discover.{}.{sequence}.tmp",
+                    std::process::id()
+                )),
+                b"squat",
+            )
+            .unwrap();
+        }
+        let name = directory.join("manifest.json");
+        super::write_private_atomically(&name, b"{}").expect("publish beside squatted names");
+        assert_eq!(std::fs::read(&name).unwrap(), b"{}");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[test]
     fn overflowing_fd_name_fails_snapshot() {
         let directory =

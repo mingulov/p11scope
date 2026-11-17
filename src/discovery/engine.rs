@@ -18678,24 +18678,38 @@ impl Engine {
         Ok((candidate, loader))
     }
 
-    /// Loader-assembly preserve set: the loader id plus carried provider
-    /// ids for still-attached objects. Same scope gate as the conservative
-    /// carry (cgroup member turnover only): a validated loader scan
-    /// assembles a global candidate, so without the carry its pin purge
-    /// drops the provider identity the assembled modules need to bind and
-    /// the plan replaces on every turnover.
-    fn loader_scan_preserve(&self, loader: PinnedObjectId) -> Vec<PinnedObjectId> {
+    /// Loader-assembly preserve set: the loader id plus every attached
+    /// object the scanned view does not solely own. A validated loader
+    /// scan assembles a global candidate, so without the carry its pin
+    /// purge drops the provider identity the assembled modules need to
+    /// bind and the plan replaces on every turnover. Sole ownership is
+    /// the gate (no scope or newcomer state: marks are consumed by
+    /// admission before validation scans run): objects only the scanned
+    /// view references are authoritatively replaced by its scan, while
+    /// shared or module-less objects ride.
+    fn loader_scan_preserve(
+        &self,
+        loader: PinnedObjectId,
+        view: ProcessViewId,
+    ) -> Vec<PinnedObjectId> {
         let mut preserve = vec![loader];
-        if matches!(self.scope, Scope::Cgroup { .. }) && !self.newcomer_first_seen.is_empty() {
-            for slot in self
-                .plan
-                .slots
+        for slot in self
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| self.plan.is_active(slot.index))
+        {
+            if slot.object == loader || preserve.contains(&slot.object) {
+                continue;
+            }
+            let owned: Vec<_> = self
+                .modules
                 .iter()
-                .filter(|slot| self.plan.is_active(slot.index))
-            {
-                if slot.object != loader && !preserve.contains(&slot.object) {
-                    preserve.push(slot.object);
-                }
+                .filter(|module| module.object == slot.object)
+                .collect();
+            let sole = !owned.is_empty() && owned.iter().all(|module| module.scanned.view == view);
+            if !sole {
+                preserve.push(slot.object);
             }
         }
         preserve
@@ -22277,7 +22291,7 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            let preserve = self.loader_scan_preserve(loader);
+            let preserve = self.loader_scan_preserve(loader, view_id);
             candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &preserve);
             (candidate_pins, raw_modules)
         } else if mode == LoaderScanMode::MetadataOnly && self.views[position].still_the_same() {
@@ -22373,12 +22387,12 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            let preserve = self.loader_scan_preserve(loader);
+            let preserve = self.loader_scan_preserve(loader, view_id);
             candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &preserve);
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();
-            let preserve = self.loader_scan_preserve(loader);
+            let preserve = self.loader_scan_preserve(loader, view_id);
             skipped.extend(candidate_pins.replace_view_pins_with_claims_for(
                 view_id,
                 fresh_pins,

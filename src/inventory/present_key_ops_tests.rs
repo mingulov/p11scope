@@ -2848,6 +2848,60 @@ fn provider_lines_absent_without_task7_content() {
 }
 
 #[test]
+fn provider_lines_absent_from_quiet_head() {
+    let presentation = provider_presentation();
+    let snapshot = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Quiet);
+    assert!(
+        !snapshot.lines().any(|line| line.starts_with("provider:")),
+        "no provider line in quiet, got:\n{snapshot}"
+    );
+    assert!(
+        !snapshot
+            .lines()
+            .any(|line| line.starts_with("  token slot")),
+        "no token line in quiet, got:\n{snapshot}"
+    );
+    assert!(
+        !snapshot
+            .lines()
+            .any(|line| line.starts_with("  mechanism 0x")),
+        "no mechanism line in quiet, got:\n{snapshot}"
+    );
+    assert!(
+        !snapshot.contains("provider info gaps:"),
+        "got:\n{snapshot}"
+    );
+}
+
+#[test]
+fn provider_token_only_module_lists_rows_in_verbose_only() {
+    // R13 token-only arm: a module with token/mechanism rows but no
+    // completed C_GetInfo renders no provider line; verbose still
+    // lists its rows, concise stays silent about them.
+    let mut presentation = provider_presentation();
+    presentation.modules[0].provider_info = None;
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !concise.lines().any(|line| line.starts_with("provider:")),
+        "no provider line without C_GetInfo facts, got:\n{concise}"
+    );
+    assert!(!concise.contains("token slot 0:"), "got:\n{concise}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose
+            .lines()
+            .any(|line| line == "  token slot 0: TokenMfr Model-X fw 2.7 hw 2.6 pin 4-255"),
+        "token row without provider line, got:\n{verbose}"
+    );
+    assert!(
+        verbose
+            .lines()
+            .any(|line| line == "  mechanism 0x43a slot 0: limits 1024-4096, flags 0x1"),
+        "mechanism row without provider line, got:\n{verbose}"
+    );
+}
+
+#[test]
 fn provider_verbose_adds_token_and_mechanism_lines() {
     let presentation = provider_presentation();
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);

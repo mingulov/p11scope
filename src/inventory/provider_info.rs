@@ -791,6 +791,18 @@ mod tests {
         info
     }
 
+    fn full_ck_info_ilp32() -> [u8; 76] {
+        let mut info = [0xAAu8; 76];
+        info[0..2].copy_from_slice(&[3, 1]);
+        info[2..34].copy_from_slice(&padded(b"SoftHSM", 32));
+        // Pad [34..36) stays sentinel: never fetched.
+        info[36..40].copy_from_slice(&0u32.to_le_bytes());
+        info[40..72].copy_from_slice(&padded(b"SoftHSM v2", 32));
+        info[72..74].copy_from_slice(&[2, 6]);
+        // Tail pad [74..76) stays sentinel: never fetched.
+        info
+    }
+
     fn full_token_lp64() -> [u8; 208] {
         let mut token = [0xAAu8; 208];
         // Excluded §17.2 bytes stay sentinel: label, serial, session
@@ -798,8 +810,11 @@ mod tests {
         token[32..64].copy_from_slice(&padded(b"TokenMfr", 32));
         token[64..80].copy_from_slice(&padded(b"Model-X", 16));
         token[96..104].copy_from_slice(&0x06u64.to_le_bytes());
-        token[136..144].copy_from_slice(&4u64.to_le_bytes());
-        token[144..152].copy_from_slice(&255u64.to_le_bytes());
+        // Realistic asymmetric PIN policy: ulMaxPinLen @136, then
+        // ulMinPinLen @144 (spec §17.1; max > min, so a min/max
+        // swap fails the exact asserts below).
+        token[136..144].copy_from_slice(&255u64.to_le_bytes());
+        token[144..152].copy_from_slice(&4u64.to_le_bytes());
         token[184..186].copy_from_slice(&[2, 6]);
         token[186..188].copy_from_slice(&[2, 7]);
         token
@@ -818,8 +833,9 @@ mod tests {
         token[32..64].copy_from_slice(&padded(b"TokenMfr", 32));
         token[64..80].copy_from_slice(&padded(b"Model-X", 16));
         token[96..100].copy_from_slice(&0x06u32.to_le_bytes());
-        token[116..120].copy_from_slice(&4u32.to_le_bytes());
-        token[120..124].copy_from_slice(&255u32.to_le_bytes());
+        // ia32 mirrors LP64: ulMaxPinLen @116, ulMinPinLen @120.
+        token[116..120].copy_from_slice(&255u32.to_le_bytes());
+        token[120..124].copy_from_slice(&4u32.to_le_bytes());
         token[140..142].copy_from_slice(&[2, 6]);
         token[142..144].copy_from_slice(&[2, 7]);
         token
@@ -866,6 +882,13 @@ mod tests {
         record_bytes(INFO_KIND_PROVIDER, INFO_LAYOUT_LP64, &payload, 0, 0, 11)
     }
 
+    fn provider_record_ilp32() -> Vec<u8> {
+        let full = full_ck_info_ilp32();
+        let payload = payload_of(&full, &CK_INFO_RANGES_ILP32);
+        assert_eq!(payload.len(), 72);
+        record_bytes(INFO_KIND_PROVIDER, INFO_LAYOUT_ILP32, &payload, 0, 0, 11)
+    }
+
     fn token_record_ilp32() -> Vec<u8> {
         let full = full_token_ilp32();
         let payload = payload_of(&full, &TOKEN_RANGES_ILP32);
@@ -898,6 +921,23 @@ mod tests {
         assert_eq!(record.host_tgid, 4242);
         assert_eq!(record.task_cookie, 11);
         assert_eq!(record.exec_id, 9);
+        let InfoValues::Provider(values) = parse_info_payload(&record) else {
+            panic!("provider kind parses provider values");
+        };
+        assert_eq!((values.cryptoki_major, values.cryptoki_minor), (3, 1));
+        assert_eq!(values.manufacturer, Ok("SoftHSM".to_string()));
+        assert_eq!(values.flags, 0);
+        assert_eq!(values.description, Ok("SoftHSM v2".to_string()));
+        assert_eq!((values.library_major, values.library_minor), (2, 6));
+    }
+
+    #[test]
+    fn info_decode_accepts_provider_ia32_with_exact_fields() {
+        let bytes = provider_record_ilp32();
+        let record = decode_info_record(&bytes).expect("ia32 provider record decodes");
+        assert_eq!(record.kind, INFO_KIND_PROVIDER);
+        assert_eq!(record.layout, INFO_LAYOUT_ILP32);
+        assert_eq!(record.payload_len, 72);
         let InfoValues::Provider(values) = parse_info_payload(&record) else {
             panic!("provider kind parses provider values");
         };
@@ -1002,13 +1042,16 @@ mod tests {
         let mut reserved = good.clone();
         reserved[6] = 1;
         cases.push(("header-reserved", reserved, "nonzero_reserved"));
+        let mut reserved_high = good.clone();
+        reserved_high[12] = 1;
+        cases.push(("header-reserved-high", reserved_high, "nonzero_reserved"));
         let mut trailer_reserved = good.clone();
         trailer_reserved[55] = 1;
         cases.push(("trailer-reserved", trailer_reserved, "nonzero_reserved"));
         let mut status = good.clone();
         status[51] = 2;
         cases.push(("status", status, "unknown_status"));
-        assert_eq!(cases.len(), 12);
+        assert_eq!(cases.len(), 13);
         for (name, bytes, reason) in cases {
             assert_eq!(
                 decode_info_record(&bytes),
@@ -1088,6 +1131,46 @@ mod tests {
         assert_eq!(values.flags, 0xA5A5);
         assert_eq!(values.pin_min_len, 4);
         assert_eq!(values.pin_max_len, 255);
+    }
+
+    #[test]
+    fn info_token_pin_lens_match_cryptoki_sys_field_assignment() {
+        // Oracle-connected twin: the PIN lengths are assigned by
+        // cryptoki-sys field name (never by numeric offset), so a
+        // parser min/max swap cannot hide behind a mirrored fixture
+        // the way hand-placed bytes once did.
+        use cryptoki_sys::CK_TOKEN_INFO;
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(offset_of!(CK_TOKEN_INFO, ulMaxPinLen), 136);
+        assert_eq!(offset_of!(CK_TOKEN_INFO, ulMinPinLen), 144);
+        let mut token: CK_TOKEN_INFO = unsafe { std::mem::zeroed() };
+        token.ulMaxPinLen = 255;
+        token.ulMinPinLen = 4;
+        token.flags = 0x06;
+        let raw = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&token).cast::<u8>(),
+                size_of::<CK_TOKEN_INFO>(),
+            )
+        };
+        let payload = payload_of(raw, &TOKEN_RANGES_LP64);
+        assert_eq!(payload.len(), 76);
+        let record = decode_info_record(&record_bytes(
+            INFO_KIND_TOKEN,
+            INFO_LAYOUT_LP64,
+            &payload,
+            0,
+            0,
+            11,
+        ))
+        .expect("token record decodes");
+        let InfoValues::Token(values) = parse_info_payload(&record) else {
+            panic!("token kind parses token values");
+        };
+        assert_eq!(values.pin_min_len, 4);
+        assert_eq!(values.pin_max_len, 255);
+        assert_eq!(values.flags, 0x06);
     }
 
     #[test]
@@ -1312,6 +1395,61 @@ mod tests {
     }
 
     #[test]
+    fn info_join_repoll_without_instance_keeps_proved_instance() {
+        // Attribution sticks once proved: re-polling the SAME row
+        // without an instance never clears it (token and mechanism).
+        let full = full_token_lp64();
+        let payload = payload_of(&full, &TOKEN_RANGES_LP64);
+        let record = decode_info_record(&record_bytes(
+            INFO_KIND_TOKEN,
+            INFO_LAYOUT_LP64,
+            &payload,
+            0,
+            0,
+            100,
+        ))
+        .expect("token record decodes");
+        let mut join = InfoJoin::new();
+        join.ingest(
+            &record,
+            ModuleId(0),
+            CallerId(0),
+            Some(RegistryInstanceId::from_raw(7)),
+        );
+        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        let mech = full_mech_lp64();
+        let record = decode_info_record(&record_bytes(
+            INFO_KIND_MECHANISM,
+            INFO_LAYOUT_LP64,
+            &mech,
+            0,
+            1082,
+            100,
+        ))
+        .expect("mechanism record decodes");
+        join.ingest(
+            &record,
+            ModuleId(0),
+            CallerId(0),
+            Some(RegistryInstanceId::from_raw(9)),
+        );
+        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        let (_, observations) = join.finish();
+        assert_eq!(observations.tokens.len(), 1);
+        assert_eq!(observations.tokens[0].completions, 2);
+        assert_eq!(
+            observations.tokens[0].instance,
+            Some(RegistryInstanceId::from_raw(7))
+        );
+        assert_eq!(observations.mechanisms.len(), 1);
+        assert_eq!(observations.mechanisms[0].completions, 2);
+        assert_eq!(
+            observations.mechanisms[0].instance,
+            Some(RegistryInstanceId::from_raw(9))
+        );
+    }
+
+    #[test]
     fn info_join_zero_identity_refuses_rows_with_named_gap() {
         // Zero caller identity: provider_info still publishes, but
         // token/mechanism rows are refused (never keyed under a
@@ -1442,7 +1580,9 @@ mod tests {
         );
         join.note_aliased_endpoint();
         join.note_return_deferred();
-        let (_, observations) = join.finish();
+        let provider = decode_info_record(&provider_record()).expect("provider record decodes");
+        join.ingest(&provider, ModuleId(0), CallerId(0), None);
+        let (providers, observations) = join.finish();
         let section = provider_observations_json(&observations);
         assert_eq!(section["version"], 8);
         let mut keys: Vec<&str> = section
@@ -1488,6 +1628,94 @@ mod tests {
         assert_eq!(mechanism["instance"], "i9");
         assert!(mechanism["min_key_size"].is_u64());
         assert!(mechanism["max_key_size"].is_u64());
+        let mut mechanism_keys: Vec<&str> = mechanism
+            .as_object()
+            .expect("mechanism object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        mechanism_keys.sort_unstable();
+        assert_eq!(
+            mechanism_keys,
+            vec![
+                "caller",
+                "changes",
+                "completions",
+                "flags",
+                "instance",
+                "max_key_size",
+                "mechanism",
+                "min_key_size",
+                "module",
+                "slot",
+            ]
+        );
+        let info = provider_info_json(&providers[&ModuleId(0)]);
+        let mut info_keys: Vec<&str> = info
+            .as_object()
+            .expect("provider info object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        info_keys.sort_unstable();
+        assert_eq!(
+            info_keys,
+            vec![
+                "cryptoki_major",
+                "cryptoki_minor",
+                "description",
+                "flags",
+                "library_major",
+                "library_minor",
+                "manufacturer",
+            ]
+        );
+        // The exact key sets above pin the producer output itself: a
+        // `serial` (or label/session/memory/clock) key injected into
+        // any Task 7 renderer fails this test, not just the schema or
+        // golden twins.
+        fn walk_keys(value: &serde_json::Value, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        found.push(key.clone());
+                        walk_keys(child, found);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        walk_keys(child, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk_keys(&section, &mut found);
+        walk_keys(&info, &mut found);
+        for key in &found {
+            let lowered = key.to_lowercase();
+            for forbidden in [
+                "serial",
+                "label",
+                "utctime",
+                "sessioncount",
+                "session_count",
+                "memory",
+                "password",
+            ] {
+                assert!(
+                    !lowered.contains(forbidden),
+                    "excluded key {key:?} in producer output"
+                );
+            }
+            if lowered.contains("pin") {
+                assert!(
+                    ["pin_min_len", "pin_max_len"].contains(&lowered.as_str()),
+                    "unexpected pin key {key:?} in producer output"
+                );
+            }
+        }
         let gaps = section["gaps"].as_array().expect("gaps array");
         let reasons: Vec<&str> = gaps
             .iter()

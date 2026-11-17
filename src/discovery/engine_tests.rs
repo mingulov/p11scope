@@ -1428,7 +1428,7 @@ fn generational_candidate_carries_active_provider_across_empty_rescan() {
 }
 
 #[test]
-fn cgroup_conservative_replay_carries_active_provider_across_retirement() {
+fn owned_run_conservative_replay_carries_active_provider_across_retirement() {
     // A conservative replay that retires the last offering view (wave
     // turnover: the old generation exited before the successor was
     // admitted) must not take the attached slots down with it. Cgroup
@@ -1439,13 +1439,12 @@ fn cgroup_conservative_replay_carries_active_provider_across_retirement() {
     let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
     let (mut engine, _, object, _) = engine_with_overlay(75);
     engine.scope = cgroup;
+    engine.owned_run_pid = Some(424242);
     engine
         .capture_facts
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
         .unwrap();
     assert!(engine.plan.is_active(0), "the fixture starts attached");
-    // Successor evidence: an unadmitted newcomer waits.
-    engine.mark_newcomer_arrival(424242, Some(1));
     let view = engine.modules[0].scanned.view;
     let retirements: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
     let keys: BTreeSet<ObjectKey> = BTreeSet::new();
@@ -1496,30 +1495,28 @@ fn system_conservative_replay_retires_despite_waiting_newcomers() {
 }
 
 #[test]
-fn cgroup_conservative_replay_retires_without_waiting_newcomers() {
-    // No unadmitted newcomer waits: the authoritative departure retires
-    // natively as before (async native-retirement handoff intact).
+fn plain_cgroup_conservative_replay_retires_despite_waiting_newcomers() {
+    // No owned run: the authoritative departure retires natively even
+    // while newcomers wait (async native-retirement handoff intact).
     let dir = tempfile::tempdir().expect("scope dir");
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
     let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
     let (mut engine, _, _, _) = engine_with_overlay(79);
     engine.scope = cgroup;
+    assert!(engine.owned_run_pid.is_none(), "plain cgroup, no owned run");
     engine
         .capture_facts
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
         .unwrap();
     assert!(engine.plan.is_active(0), "the fixture starts attached");
-    assert!(
-        engine.newcomer_first_seen.is_empty(),
-        "the fixture stages no successor"
-    );
+    engine.mark_newcomer_arrival(424242, Some(1));
     let view = engine.modules[0].scanned.view;
     let retirements: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
     let keys: BTreeSet<ObjectKey> = BTreeSet::new();
     let replayed = engine.conservative_candidate(&retirements, &keys).unwrap();
     assert!(
         !replayed.plan.is_active(0),
-        "no waiting newcomer retires the departed view's slots"
+        "a plain cgroup departure retires its slots"
     );
     assert!(
         !replayed.delta.retire.is_empty(),

@@ -91346,3 +91346,389 @@ fn owned_run_reused_view_id_starts_a_fresh_incomplete_scan_budget() {
         "the newcomer's incomplete first scan owes its own prompt rescan"
     );
 }
+
+/// A 1 GiB child that touches every page, signals readiness, then sleeps
+/// until killed: its teardown after `SIGKILL` stays non-zombie with
+/// `PF_EXITING` and empty maps for ~160 ms (measured on 7.0.0-43), the
+/// window a scan must not turn into loud gaps.
+const TEARDOWN_1GIB_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/mman.h>
+int main(int argc, char **argv) {
+    size_t gb = argc > 1 ? strtoul(argv[1], 0, 10) : 1;
+    size_t n = gb << 30;
+    char *p = mmap(0, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 1;
+    for (size_t i = 0; i < n; i += 4096) p[i] = 1;
+    if (write(STDOUT_FILENO, "R", 1) != 1) return 2;
+    for (;;) pause();
+    return 0;
+}
+"#;
+
+struct TeardownChild {
+    child: std::process::Child,
+    _temp: tempfile::TempDir,
+}
+
+impl Drop for TeardownChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl TeardownChild {
+    fn spawn_1gib() -> Self {
+        use std::io::Read as _;
+        use std::os::unix::io::AsRawFd as _;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("mt-1gib.c");
+        let executable = dir.path().join("mt-1gib");
+        std::fs::write(&source, TEARDOWN_1GIB_SOURCE).unwrap();
+        let built = std::process::Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-O1"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(built.success(), "fixture build failed: {built}");
+        let mut child = std::process::Command::new(&executable)
+            .arg("1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut poll = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        assert_eq!(
+            unsafe { libc::poll(&mut poll, 1, 30_000) },
+            1,
+            "the 1 GiB child never signalled readiness"
+        );
+        let mut ready = [0u8; 1];
+        stdout.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, *b"R");
+        Self { child, _temp: dir }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+fn teardown_stat_state_and_flags(pid: u32) -> Option<(String, u32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    let mut fields = stat[end + 1..].split_whitespace();
+    let state = fields.next()?.to_string();
+    let flags = stat[end + 1..]
+        .split_whitespace()
+        .nth(6)?
+        .parse::<u32>()
+        .ok()?;
+    Some((state, flags))
+}
+
+fn teardown_wait_zombie(pid: u32) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !crate::process::process_is_zombie(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "pid {pid} never reached Z after SIGKILL"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A real 1 GiB child killed mid-scan: the scan starts in the
+/// `PF_EXITING`-not-zombie window (empty maps, pidfd unready, `kill`
+/// succeeds, whole-group proof false) and must file no loud record once
+/// the group proves exited as a zombie and after the reap.
+#[test]
+fn teardown_large_child_scan_during_exit_holds_refusals_until_proven() {
+    const PF_EXITING: u32 = 0x0000_0004;
+    let mut holder = TeardownChild::spawn_1gib();
+    let pid = holder.pid();
+    let view = ProcessView::open(ProcessViewId(9100), pid).unwrap();
+    assert!(view.still_the_same(), "the 1 GiB group is live at open");
+    assert_eq!(view.original_exited(), Ok(false));
+    assert!(
+        !crate::process::process_is_zombie(pid),
+        "live at open, not Z"
+    );
+    assert!(
+        !proc_tgid_maps_is_empty(pid),
+        "a live 1 GiB child holds its maps"
+    );
+    holder.child.kill().unwrap();
+    // The window opens within a millisecond of SIGKILL and lasts ~160 ms:
+    // wait for its entry (non-Z, PF_EXITING, empty maps) so the scan below
+    // deterministically starts inside it rather than before do_exit.
+    let entered = {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let shape = teardown_stat_state_and_flags(pid);
+            let exiting = shape.as_ref().is_some_and(|(state, flags)| {
+                state != "Z" && state != "X" && state != "x" && flags & PF_EXITING != 0
+            });
+            if exiting && proc_tgid_maps_is_empty(pid) {
+                break shape.unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pid {pid} never entered the PF_EXITING-not-zombie window"
+            );
+            assert!(
+                !crate::process::process_is_zombie(pid),
+                "pid {pid} reached Z before the window was observed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let (state, flags) = entered;
+    assert!(
+        state != "Z" && state != "X" && state != "x" && flags & PF_EXITING != 0,
+        "the scan starts in the teardown window: {state} {flags:#x}"
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(false),
+        "the pidfd is not ready during teardown"
+    );
+    assert!(
+        !crate::process::process_proven_exited(pid),
+        "kill still succeeds during teardown"
+    );
+    assert!(
+        !crate::process::whole_group_proven_exited(&view),
+        "the census is unproven before the zombie (control)"
+    );
+    // The exact refusal a real scan files when its initial maps read races
+    // the teardown (empty snapshot, exe still present): ending-shaped, but
+    // outside the mid-scan exit details, so only the teardown deferral
+    // silences it. Scripted so the test does not race the exe's own
+    // disappearance (~10 ms) against the 160 ms window.
+    let refusal = Skipped {
+        subject: "capture discovery".into(),
+        reason: "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot".into(),
+    };
+    assert!(
+        skip_is_ending_refusal(&refusal),
+        "the teardown refusal is one the ending excuse covers"
+    );
+    assert!(
+        !skip_is_mid_scan_exit_refusal(&refusal),
+        "empty snapshots stay outside the mid-scan exit details"
+    );
+    let mut counters = DiscoveryCounters::default();
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: vec![refusal.clone()],
+                scan_ms: 0,
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    );
+    assert!(
+        result.is_ok(),
+        "the scripted teardown scan runs: {result:?}"
+    );
+    teardown_wait_zombie(pid);
+    assert!(
+        crate::process::whole_group_proven_exited(&view) || view.original_exited() == Ok(true),
+        "the zombie proves the exit by the verdict"
+    );
+    holder.child.wait().unwrap();
+    assert!(
+        crate::process::process_proven_exited(pid),
+        "the reaped pid names no process"
+    );
+    assert!(
+        counters.object_skips.is_empty(),
+        "a teardown scan files no loud record once proven: {:?}",
+        counters.object_skips
+    );
+    assert_eq!(
+        counters.scan_unavailable, None,
+        "a teardown scan latches no memory-unavailable loss"
+    );
+    assert!(
+        counters.ending_suppressed_skips > 0,
+        "the held teardown refusal counts as suppressed, not dropped: {counters:?}"
+    );
+}
+
+/// The mem-`gone` latch takes the same deferred proof: a scripted
+/// `Unavailable("gone")` against a real tearing-down 1 GiB group must not
+/// latch capture-wide loss once the zombie proves the exit.
+#[test]
+fn teardown_mem_gone_holds_latch_until_proven() {
+    const PF_EXITING: u32 = 0x0000_0004;
+    let mut holder = TeardownChild::spawn_1gib();
+    let pid = holder.pid();
+    let view = ProcessView::open(ProcessViewId(9101), pid).unwrap();
+    assert!(view.still_the_same(), "the 1 GiB group is live at open");
+    holder.child.kill().unwrap();
+    {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exiting = teardown_stat_state_and_flags(pid).is_some_and(|(state, flags)| {
+                state != "Z" && state != "X" && state != "x" && flags & PF_EXITING != 0
+            });
+            if exiting && proc_tgid_maps_is_empty(pid) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pid {pid} never entered the PF_EXITING-not-zombie window"
+            );
+            assert!(
+                !crate::process::process_is_zombie(pid),
+                "pid {pid} reached Z before the window was observed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        !crate::process::whole_group_proven_exited(&view),
+        "the census is unproven during teardown (control)"
+    );
+    let mut counters = DiscoveryCounters::default();
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Unavailable {
+                reason: "gone",
+                modules: Vec::new(),
+                skipped: Vec::new(),
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    );
+    assert!(result.is_ok(), "the scripted gone scan runs: {result:?}");
+    teardown_wait_zombie(pid);
+    holder.child.wait().unwrap();
+    assert!(
+        crate::process::process_proven_exited(pid),
+        "the reaped pid names no process"
+    );
+    assert_eq!(
+        counters.scan_unavailable, None,
+        "a teardown gone latches nothing once proven: {:?}",
+        counters.scan_unavailable
+    );
+    assert!(
+        counters.object_skips.is_empty(),
+        "a teardown gone files no record: {:?}",
+        counters.object_skips
+    );
+}
+
+/// Loud twin: a zombie leader with a live member never takes the teardown
+/// deferral — its ending-shaped refusal and its mem-`gone` latch both stay
+/// loud, since the group can still run user code.
+#[test]
+fn teardown_deferral_keeps_zombie_leader_with_live_member_loud() {
+    use crate::process::cold_view_tests::ColdLeaderSubject;
+    let mut group = ColdLeaderSubject::spawn(1);
+    group.leave_leader();
+    let pid = group.pid();
+    assert!(
+        crate::process::process_is_zombie(pid),
+        "the leader is a real zombie"
+    );
+    let member = group.tids[0];
+    assert!(proc_task_is_live(pid, member), "the member thread is live");
+    assert!(
+        proc_tgid_maps_is_empty(pid),
+        "a zombie leader shows empty TGID maps while alive"
+    );
+    let view = ProcessView::open(ProcessViewId(9102), pid).unwrap();
+    assert_eq!(
+        view.original_exited(),
+        Ok(false),
+        "the pin proves the group alive"
+    );
+    assert!(
+        !crate::process::whole_group_proven_exited(&view),
+        "a live member keeps the group unproven"
+    );
+    let refusal = Skipped {
+        subject: "capture discovery".into(),
+        reason: "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot".into(),
+    };
+    assert!(
+        skip_is_ending_refusal(&refusal),
+        "the twin refusal is one the ending excuse covers"
+    );
+    let mut counters = DiscoveryCounters::default();
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Unavailable {
+                reason: "gone",
+                modules: Vec::new(),
+                skipped: vec![refusal.clone()],
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    );
+    assert!(result.is_ok(), "the scripted loud scan runs: {result:?}");
+    assert_eq!(
+        counters.scan_unavailable,
+        Some("gone"),
+        "a live member keeps its gone latch loud"
+    );
+    assert!(
+        counters.object_skips.iter().any(|skip| skip == &refusal),
+        "a live member keeps its ending refusal loud: {:?}",
+        counters.object_skips
+    );
+    assert_eq!(
+        counters.ending_suppressed_skips, 0,
+        "the deferral claims nothing for a live group"
+    );
+    assert!(
+        crate::process::process_is_zombie(pid) && proc_task_is_live(pid, member),
+        "leader and member are still in their loud shape at the verdict"
+    );
+    group.call_three();
+}

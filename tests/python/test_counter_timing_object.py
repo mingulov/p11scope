@@ -37,6 +37,7 @@ HARNESS_SOURCE = ROOT / "tests/fixtures/task-owner/helper_tests.c"
 STUB_HARNESS = """#include "counter_bank_timing.c"
 unsigned char COUNTER_HEALTH SEC(".maps");
 unsigned char RV_COUNTS SEC(".maps");
+unsigned char EVIDENCE SEC(".maps");
 unsigned char START SEC(".maps");
 __attribute__((noinline)) void *p11_owner_start_get(const struct owner_start_key *key, u32 required)
 { (void)required; return owner_map_lookup(&START, key); }
@@ -69,6 +70,7 @@ PROOF_MAPS = {
     "COUNTER_BANK_FAULT": (6, 4, 8, 1),
     "COUNTER_HEALTH": (6, 4, 8, 2),
     "RV_COUNTS": (5, 16, 8, 65536),
+    "EVIDENCE": (6, 4, 8, 9),
     "START": (1, 16, 288, 16384),
 }
 PROOF_MODES = (("TIMESTAMPS", "timestamps"), ("LATENCY", "latency"))

@@ -18703,28 +18703,27 @@ impl Engine {
     ) -> Result<LiveCandidate> {
         let assemble_start = crate::attach::monotonic_ns();
         // Generational carry, same shape as the inventory assembly but
-        // scope-proportionate: conservative retirements are authoritative
+        // owned-run only: conservative retirements are authoritative
         // departures, so retired views' modules and pins for still-attached
-        // objects survive the replay only in cgroup scope while unadmitted
-        // newcomers wait. A cgroup is a closed membership, so waiting
-        // newcomers are member turnover (a successor generation may still
-        // map the file); system scope has ambient churn, so its waiting
-        // newcomers prove nothing and its departures retire natively as
-        // before. Between waves the old generation exits before the
-        // successor is admitted, so dropping on retirement alone rebuilds
-        // a provider-less plan with no removal decision and no gap. Pid
-        // scope keeps plain removal so an exited target retires (U-14).
-        let carry_objects: BTreeSet<PinnedObjectId> =
-            if matches!(self.scope, Scope::Cgroup { .. }) && !self.newcomer_first_seen.is_empty() {
-                self.plan
-                    .slots
-                    .iter()
-                    .filter(|slot| self.plan.is_active(slot.index))
-                    .map(|slot| slot.object)
-                    .collect()
-            } else {
-                BTreeSet::new()
-            };
+        // objects survive the replay only when the capture owns its run
+        // tree. An owned run's member turnover is expected by design
+        // (short-lived descendants dlopen between frame passes), and
+        // newcomer marks race the spawn they would gate on; every other
+        // scope retires natively as before (async handoff, midfinal
+        // release, U-07 publication intact). Between waves the old
+        // generation exits before the successor is admitted, so dropping
+        // on retirement alone rebuilds a provider-less plan with no
+        // removal decision and no gap.
+        let carry_objects: BTreeSet<PinnedObjectId> = if self.owned_run_pid.is_some() {
+            self.plan
+                .slots
+                .iter()
+                .filter(|slot| self.plan.is_active(slot.index))
+                .map(|slot| slot.object)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         let mut pinned = self.pinned.clone();
         for view in retirements {
             pinned.remove_view_except(*view, &carry_objects);

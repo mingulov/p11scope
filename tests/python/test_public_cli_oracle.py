@@ -1002,6 +1002,90 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
+    def test_loader_quiet_passes_on_mt_system_in_strict_mode(self):
+        # K1 (v0.8.0 integration): a short-lived workload view recorded
+        # unbound (loader arming raced its exit) with no loader hits and
+        # exact owned counts. Strict accepts the disclosed transient gap
+        # with the lone named discovery skip; any other class still fails.
+        # Shape mirrors v7.3.1 run 44081691677 (lossy
+        # [skipped, loader_discovery], 1 skip, unavailable=1, hits=0).
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "loader_discovery"]}
+            d["evidence"]["loader_discovery"]["strategies"]["unavailable"] = 1
+            d["evidence"]["loader_discovery"]["dlopen_timing"]["none"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_loader_quiet_with_two_unbound_fails_on_mt_system_in_strict_mode(self):
+        # The loader-quiet ceiling is exactly one unbound context: two
+        # unavailable strategies still fail strict, with exact counts.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "loader_discovery"]}
+            d["evidence"]["loader_discovery"]["strategies"]["unavailable"] = 2
+            d["evidence"]["loader_discovery"]["dlopen_timing"]["none"] = 2
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_loader_quiet_with_hits_fails_on_mt_system_in_strict_mode(self):
+        # A loader gap with observed hits is not quiet: loads happened
+        # while a view was unbound, so the gap could hide calls and
+        # still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "loader_discovery"]}
+            d["evidence"]["loader_discovery"]["strategies"]["unavailable"] = 1
+            d["evidence"]["loader_discovery"]["dlopen_timing"]["none"] = 1
+            d["evidence"]["loader_discovery"]["hits"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_loader_quiet_with_other_class_fails_on_mt_system_in_strict_mode(self):
+        # The loader-quiet arm stays narrow: the transient gap bundled
+        # with any other observation class still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy",
+                "causes": ["skipped", "loader_discovery", "multi_rebuild_gaps"]}
+            d["evidence"]["loader_discovery"]["strategies"]["unavailable"] = 1
+            d["evidence"]["loader_discovery"]["dlopen_timing"]["none"] = 1
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_loader_quiet_with_count_mismatch_fails_on_mt_system_in_strict_mode(self):
+        # The loader arm never waives exact owned counts: the disclosed
+        # gap with a 39/40 deficit still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "loader_discovery"]}
+            d["evidence"]["loader_discovery"]["strategies"]["unavailable"] = 1
+            d["evidence"]["loader_discovery"]["dlopen_timing"]["none"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 39
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
     def test_attribution_gap_without_noise_passes_in_both_modes(self):
         # The system counts cell never gated attribution/semantics gaps
         # (strict discloses them via PARTIAL); relaxed mode must accept

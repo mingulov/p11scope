@@ -18641,6 +18641,7 @@ impl Engine {
             candidate
         };
         candidate.views.insert(view);
+        Self::exclude_carried_views_from_candidate(&mut candidate, view);
         let loader = candidate
             .pinned
             .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
@@ -18713,6 +18714,29 @@ impl Engine {
             }
         }
         preserve
+    }
+
+    /// Drops carried dead coverage from a loader candidate's view set so
+    /// apply-time stale checks don't undo the carry: a view whose pins
+    /// stay resolvable without ownership claims is carried (mirrors the
+    /// inventory/conservative carried-view exclusion). The scanned view
+    /// itself is always kept, as are views with claims and views whose
+    /// pins are fully gone (those still retire).
+    fn exclude_carried_views_from_candidate(candidate: &mut LiveCandidate, keep: ProcessViewId) {
+        let carried: BTreeSet<ProcessViewId> = candidate
+            .modules
+            .iter()
+            .map(|module| module.scanned.view)
+            .filter(|view| {
+                *view != keep
+                    && candidate.pinned.view_claims(*view).is_none()
+                    && candidate.modules.iter().any(|module| {
+                        module.scanned.view == *view
+                            && candidate.pinned.summary(module.object).is_some()
+                    })
+            })
+            .collect();
+        candidate.views.retain(|view| !carried.contains(view));
     }
 
     fn conservative_candidate(
@@ -21501,6 +21525,7 @@ impl Engine {
         merge_scanned_module_counted(&mut raw_modules, lowered, &mut self.merge_tables_dropped);
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
+        Self::exclude_carried_views_from_candidate(&mut candidate, self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
         self.observe_causal_timing(&observed, hook_ts_ns);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
@@ -22423,6 +22448,7 @@ impl Engine {
         }
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
+        Self::exclude_carried_views_from_candidate(&mut candidate, self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
         if let Some(hook_ts_ns) = hook_ts_ns {
             self.observe_causal_timing(&observed, hook_ts_ns);

@@ -37,6 +37,15 @@ class TaskStoragePopulationError(RuntimeError):
         super().__init__("stopped map: foreign identity")
 
 
+class OutputBoundExceeded(RuntimeError):
+    """Stdout exceeded the caller's max_bytes bound (structured overflow signal)."""
+
+    def __init__(self, label: str, max_bytes: int):
+        self.label = label
+        self.max_bytes = max_bytes
+        super().__init__(f"{label} exceeded output bound {max_bytes}")
+
+
 def population_diagnostic(error: BaseException) -> str | None:
     """Publish only revalidated fields of this module's exact trusted error."""
     if type(error) is not TaskStoragePopulationError:
@@ -258,7 +267,7 @@ def _run_bounded_bytes(args, *, timeout_seconds, max_bytes, label):
         while streams.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                failure = f"{label} timed out after {timeout_seconds:g}s"
+                failure = RuntimeError(f"{label} timed out after {timeout_seconds:g}s")
                 break
             for key, _events in streams.select(min(0.05, remaining)):
                 chunk = os.read(key.fileobj.fileno(), 65536)
@@ -269,7 +278,7 @@ def _run_bounded_bytes(args, *, timeout_seconds, max_bytes, label):
                 if target is output:
                     target.extend(chunk[:max_bytes + 1 - len(target)])
                     if len(target) > max_bytes:
-                        failure = f"{label} exceeded output bound {max_bytes}"
+                        failure = OutputBoundExceeded(label, max_bytes)
                         break
                 else:
                     # stderr: retain a bounded head and a bounded tail, and
@@ -288,7 +297,7 @@ def _run_bounded_bytes(args, *, timeout_seconds, max_bytes, label):
             if failure is not None:
                 break
         if failure is not None:
-            raise RuntimeError(failure)
+            raise failure
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError(

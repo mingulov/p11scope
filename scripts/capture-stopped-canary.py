@@ -127,7 +127,8 @@ MAX_LOG_BYTES = 4 * 1024 * 1024
 # 8 MiB holds tens of thousands of rows at measured bpftool widths while
 # the observer needs ~50 (~18 KiB), far below the 64 MB JSON ceiling. Past
 # the bound the listing refuses and the inventory pages per map id instead
-# of failing, so success never depends on the host-wide map count.
+# of failing, so success past the bound never depends on the host-wide map
+# count via output size; a listing timeout still refuses without paging.
 # Membership still comes only from the observer fdinfo census.
 INVENTORY_LISTING_MAX_BYTES = 8 * 1024 * 1024
 DIAGNOSTIC_SCRIPTS = {str(Path(__file__).resolve().parent / name): name for name in (
@@ -517,10 +518,7 @@ class LiveMaps:
                 rows = dumper.run_json(['bpftool', '-j', 'map', 'show'], require_list=True,
                                        timeout_seconds=remaining(deadline, dumper.JSON_TIMEOUT_SECONDS),
                                        max_bytes=INVENTORY_LISTING_MAX_BYTES)
-        except RuntimeError as error:
-            if str(error) != ('bpftool JSON acquisition exceeded output bound '
-                              f'{INVENTORY_LISTING_MAX_BYTES}'):
-                raise
+        except dumper.OutputBoundExceeded:
             return self._show_per_id(ids, deadline)
         want = set(ids)
         index = {}
@@ -539,8 +537,10 @@ class LiveMaps:
         # observer map, so a host holding more maps than the listing bound
         # still inventories exactly the observer's own rows. Cost scales
         # with the observer's map count, never the host's. Row checks match
-        # the listing path; a bpftool failure here names the fallback stage
-        # with a fixed message instead of surfacing raw tool output.
+        # the listing path plus a requested-id match (a wrong row names the
+        # fallback stage); a bpftool failure here names the fallback stage
+        # and the failing map id with a fixed message instead of surfacing
+        # raw tool output.
         index = {}
         for map_id in ids:
             try:
@@ -549,10 +549,13 @@ class LiveMaps:
             except CaptureError:
                 raise
             except RuntimeError:
-                raise CaptureError('map inventory per-id fallback unavailable') from None
+                raise CaptureError(
+                    f'map inventory per-id fallback unavailable for map id={map_id}') from None
             require(isinstance(row, dict) and type(row.get('id')) is int and row['id'] > 0,
                     'map snapshot per-id row is not an identified map')
             require(row['id'] not in index, f"duplicate map id in per-id inventory: {row['id']}")
+            require(row['id'] == map_id,
+                    f"map snapshot per-id row id {row['id']} differs from requested map id {map_id}")
             index[row['id']] = row
         return index
 

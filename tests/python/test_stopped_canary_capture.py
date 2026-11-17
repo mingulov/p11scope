@@ -2796,9 +2796,10 @@ class SnapshotInventoryTests(unittest.TestCase):
     reach the frozen validator, foreign rows (even malformed or duplicated
     ones) stay excluded by observer-fdinfo membership, and a listing that
     loses an observer row fails closed. Past the listing bound the
-    inventory pages per map id instead of failing, so success never depends
-    on the host-wide map count. The acquisition re-verify shares this path,
-    so both passes stay consistent.
+    inventory pages per map id instead of failing, so success past the bound
+    never depends on the host-wide map count via output size; a listing
+    timeout still refuses without paging. The acquisition re-verify shares
+    this path, so both passes stay consistent.
     """
 
     maxDiff = None
@@ -2838,8 +2839,8 @@ class SnapshotInventoryTests(unittest.TestCase):
         raise AssertionError('sleeper fds never settled')
 
     def overflow_error(self):
-        return RuntimeError(
-            f'bpftool JSON acquisition exceeded output bound {capture.INVENTORY_LISTING_MAX_BYTES}')
+        return capture.dumper.OutputBoundExceeded(
+            'bpftool JSON acquisition', capture.INVENTORY_LISTING_MAX_BYTES)
 
     def run_inventory(self, canned, ids, calls, *, listing_error=None, per_id_error=None,
                       per_id_stub=None):
@@ -2946,8 +2947,8 @@ class SnapshotInventoryTests(unittest.TestCase):
                 for extra in range(50)]
         ids = [row['id'] for row in canned]
         calls = []
-        overflow = RuntimeError(
-            f'bpftool JSON acquisition exceeded output bound {capture.INVENTORY_LISTING_MAX_BYTES}')
+        overflow = capture.dumper.OutputBoundExceeded(
+            'bpftool JSON acquisition', capture.INVENTORY_LISTING_MAX_BYTES)
         maps = self.run_inventory(canned + busy, ids, calls, listing_error=overflow)
         self.assertEqual([argv for argv, _, _, _ in calls],
                          [['bpftool', '-j', 'map', 'show']]
@@ -2961,8 +2962,8 @@ class SnapshotInventoryTests(unittest.TestCase):
     def test_inventory_fallback_failure_names_the_fallback_stage(self):
         canned = self.canned_rows()
         ids = [row['id'] for row in canned]
-        overflow = RuntimeError(
-            f'bpftool JSON acquisition exceeded output bound {capture.INVENTORY_LISTING_MAX_BYTES}')
+        overflow = capture.dumper.OutputBoundExceeded(
+            'bpftool JSON acquisition', capture.INVENTORY_LISTING_MAX_BYTES)
         tool_failure = RuntimeError('bpftool -j map show id 100 failed: boom-marker')
         with self.assertRaises(capture.CaptureError) as raised:
             self.run_inventory(canned, ids, [], listing_error=overflow, per_id_error=tool_failure)
@@ -3027,6 +3028,7 @@ class SnapshotInventoryTests(unittest.TestCase):
             real_error = error
         else:
             self.fail('real bounded acquisition did not overflow')
+        self.assertIsInstance(real_error, capture.dumper.OutputBoundExceeded)
         canned = self.canned_rows()
         ids = [row['id'] for row in canned]
         calls = []

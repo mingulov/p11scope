@@ -773,8 +773,9 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # binding records a single unbound loader context with no hits. The gap
     # is honestly disclosed (PARTIAL/concrete_gap) with exact owned counts
     # (checked below), zero loss (checked above) and the lone named
-    # discovery skip. Strict accepts exactly that transient shape: one
-    # unavailable strategy, zero hits, no descendant gaps, no other class.
+    # discovery skip. Strict and relaxed accept exactly that transient
+    # shape: one unavailable strategy, zero hits, no descendant gaps, no
+    # other class.
     # Two unbound contexts, any hit, or any further cause still fails.
     _loader = evidence.get("loader_discovery")
     _loader = _loader if isinstance(_loader, dict) else {}
@@ -840,7 +841,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
             and all(skip == DISCLOSABLE_DISCOVERY_SKIP or
                     (isinstance(skip, dict) and skip.get("reason") == "null pointer")
                     for skip in evidence.get("skipped", [])))
-        require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet,
+        require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet
+                or ok_loader_quiet,
                 "lossy or unknown observation gap class")
     elif gap66:
         ok_gap = (observation.get("status") == "lossy" and

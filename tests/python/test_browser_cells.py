@@ -2160,22 +2160,31 @@ def _bootstrap_cover_missing(rows, browser_instances):
 
     The caller has already established
     ``reason == "bootstrap_unavailable"`` (kept inline so the
-    observer-first wiring twin still sees the literal).
+    observer-first wiring twin still sees the literal). Bootstrap
+    with rows is tolerated only on the folded leg: live browser
+    instances mean per-key tracking never started for retained
+    callers, and bootstrap with no rows still means never covered.
     """
-    return not rows
+    return not rows or bool(browser_instances)
 
 
 def _folded_exe_names_firefox(exe_path):
     """True when a departed-use exe path names a folded browser caller.
 
-    ``exe_path`` is the already-lowered ``exe.path`` string.
+    ``exe_path`` is the already-lowered ``exe.path`` string. The
+    match anchors to the binary basename: a firefox directory
+    component alone must not count as a folded browser caller.
     """
-    return "firefox" in exe_path
+    return exe_path.rsplit("/", 1)[-1].startswith("firefox")
 
 
 def _folded_sign_instance_counts(instance, bg_instances):
-    """True when a sign row's instance counts as folded browser evidence."""
-    return instance not in bg_instances
+    """True when a sign row's instance counts as folded browser evidence.
+
+    The instance must be attributed and outside the background
+    instances: an unattributed row carries no browser proof.
+    """
+    return instance is not None and instance not in bg_instances
 
 
 class BrowserFoldedLeg(unittest.TestCase):

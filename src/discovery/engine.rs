@@ -7616,26 +7616,44 @@ fn skip_is_mid_scan_exit_refusal(skip: &Skipped) -> bool {
 }
 
 /// Whether the view's original thread group provably exited during its
-/// scan: a positive whole-group proof only — the retained pidfd reports
-/// the group gone, the leader and every member are past user mode, or
-/// `kill` answers `ESRCH` for the pid. Pidfd authority only for the pin
-/// arm: a start-time fallback pin's mismatch means the pid was reused by
-/// a live process, which is not an exit. A reused pid, an exec, live
-/// members, an unresolved member walk, an exhausted proof budget, a
-/// transient check failure and an unprovable pin all read false and stay
-/// loud. Empty `/proc` maps never prove an exit here: a zombie leader
-/// shows empty maps while its members are alive.
+/// scan: the shared whole-group proof
+/// ([`process::whole_group_proven_exited`]), evaluated lazily and once
+/// after the scan. A reused pid, an exec, live members, an unresolved
+/// member walk, an exhausted proof budget, a transient check failure and
+/// an unprovable pin all read false and stay loud. Empty `/proc` maps
+/// never prove an exit here: a zombie leader shows empty maps while its
+/// members are alive.
 fn mid_scan_exit_proven(view: &ProcessView) -> bool {
-    // Pidfd authority only: without it a mismatch is pid reuse.
-    if view.retained_pin().pidfd().is_ok() && view.original_exited() == Ok(true) {
-        return true;
+    process::whole_group_proven_exited(view)
+}
+
+/// A teardown in flight: the leader is `PF_EXITING`-not-zombie, so the
+/// census is unproven now but will prove once the page teardown lands.
+/// Holds the scan's refusals and its mem-`gone` latch across one bounded
+/// wait (lightweight exit polling, then the shared whole-group proof
+/// once), so a large child killed mid-scan files no loud gap. Returns
+/// whether the re-proof proves the exit; live groups never enter (their
+/// leader carries no `PF_EXITING`) and stay loud without waiting.
+fn teardown_wait_and_reprove(view: &ProcessView) -> bool {
+    use std::time::{Duration, Instant};
+    // The page-teardown window scales with touched memory (~160 ms at
+    // 1 GiB, ~520 ms at 4 GiB on 7.0.0-43): 1 s covers ordinary sizes
+    // with margin, polling cheaply so small teardowns return early.
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    let pid = view.pid();
+    loop {
+        if view.original_exited() == Ok(true)
+            || crate::process::process_is_zombie(pid)
+            || crate::process::process_proven_exited(pid)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    // Leader and every member past user mode. Pidfd only inside: a
-    // fallback pin never qualifies, and an exhausted budget is false.
-    if view.final_exit_in_progress() {
-        return true;
-    }
-    process::process_proven_exited(view.pid())
+    process::whole_group_proven_exited(view)
 }
 
 /// One scan plus its pins plus its shape proof: the modules, the pins,
@@ -7710,6 +7728,27 @@ fn scan_and_pin_with_proof(
             }
         }
     });
+    // A leader torn down between the scan-start proof and the scan's
+    // own reads (`PF_EXITING`-not-zombie, empty maps, pidfd unready)
+    // proves nothing yet but will prove within its page-teardown window:
+    // hold its refusals and its mem-`gone` latch across one bounded wait
+    // and re-proof, recording only if still unproven. Live groups never
+    // enter — their leader carries no `PF_EXITING` — and stay loud
+    // without waiting. The census itself is unchanged: a non-zombie
+    // leader still proves nothing, the engine only waits for the zombie.
+    let mut deferred_proven = false;
+    let mut deferral_ran = false;
+    if !ending_at_start {
+        let has_gone = outcome.unavailable_reason() == Some("gone");
+        let has_deferrable_skip = outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip_is_ending_refusal(skip) || skip_is_mid_scan_exit_refusal(skip));
+        if (has_gone || has_deferrable_skip) && process::leader_exiting_not_zombie(view) {
+            deferral_ran = true;
+            deferred_proven = teardown_wait_and_reprove(view);
+        }
+    }
     let complete = outcome.unavailable_reason().is_none()
         && stop_before.is_none()
         && budget.stopped_reason().is_none()
@@ -7718,7 +7757,21 @@ fn scan_and_pin_with_proof(
             .skipped()
             .iter()
             .any(|skip| scan_skip_truncates(&skip.reason));
-    counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
+    // The mem-`gone` latch takes the same lazy post-scan proof as the
+    // mid-scan exit races: a `gone` that proves post-scan (zombie or
+    // reaped by now, or the teardown wait just proved it) is the ordinary
+    // end of the process, not capture-wide loss. Only a `gone` pays for
+    // the proof read; any other unavailable reason stays latched either
+    // way, and a live group (unproven, no teardown wait) stays loud.
+    let gone_silenced = outcome.unavailable_reason() == Some("gone")
+        && if deferral_ran {
+            deferred_proven
+        } else {
+            process::whole_group_proven_exited(view)
+        };
+    if !gone_silenced {
+        counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
+    }
     // Retain acquisition losses before pinning can fail on an exited
     // generation. Refusals an ending group may excuse are held until the
     // pins are done: a capture-wide stop set during this scan can hide
@@ -7729,13 +7782,17 @@ fn scan_and_pin_with_proof(
     // no record (an exit is not undisclosed loss), but the class still
     // counts in the retry breakdown like every other skip. Evaluated
     // lazily and once: only an exit-shaped refusal pays for the fresh
-    // proof read.
-    let mut mid_scan_exit: Option<bool> = None;
+    // proof read. When the teardown wait already ran, its verdict is
+    // reused — the same proof, moments old — instead of a second read.
+    let mut mid_scan_exit: Option<bool> = deferral_ran.then_some(deferred_proven);
     for skipped in outcome.skipped() {
-        if ending_at_start && skip_is_ending_refusal(skipped) {
+        if (ending_at_start || deferred_proven) && skip_is_ending_refusal(skipped) {
             held.push(skipped.clone());
             continue;
         }
+        // When the teardown wait ran, `mid_scan_exit` already holds its
+        // verdict — the same whole-group proof, moments old — so no
+        // second proof read runs here.
         if skip_is_mid_scan_exit_refusal(skipped)
             && *mid_scan_exit.get_or_insert_with(|| mid_scan_exit_proven(view))
         {
@@ -7769,7 +7826,7 @@ fn scan_and_pin_with_proof(
         pin_start,
         crate::attach::monotonic_ns(),
     );
-    let excuse = ending_at_start && budget.stopped_reason() == stop_before;
+    let excuse = (ending_at_start || deferred_proven) && budget.stopped_reason() == stop_before;
     if excuse {
         counters.ending_suppressed_skips += held.len() as u64;
     } else {
@@ -24746,17 +24803,17 @@ impl Engine {
     /// coverage.
     ///
     /// An attach that linked also receipts itself on stderr under
-    /// capture diagnostics ([`Self::note_dynamic_export_attached`]):
-    /// committed, or generation-lost-but-linked, including idempotent
-    /// re-attaches. The getter cells gate their programs on those
-    /// per-offset lines, since an fdinfo small-cookie count cannot
-    /// tell a count-only static slot from the getter hook at the same
-    /// offset.
+    /// `P11SCOPE_CAPTURE_DIAGNOSTICS=1` only
+    /// ([`Self::note_dynamic_export_attached`]): committed, or
+    /// generation-lost-but-linked, including idempotent re-attaches. The
+    /// getter cells set that switch and gate their programs on those
+    /// per-offset lines, since an fdinfo small-cookie count cannot tell a
+    /// count-only static slot from the getter hook at the same offset.
     ///
     /// No identity rides the line: the ABI plus the file offset cannot
     /// name a process, a path, or a proof.
     fn note_dynamic_export_attached(work: &DynamicExportWork) {
-        if crate::run::capture_diagnostics_on() {
+        if crate::run::capture_diagnostics_env_on() {
             eprintln!(
                 "p11scope: dynamic export attached file_offset={:#x} abi={:?}",
                 work.file_offset, work.abi,

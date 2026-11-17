@@ -8645,6 +8645,12 @@ pub(crate) fn capture_diagnostics_on() -> bool {
         || std::env::var("P11SCOPE_CAPTURE_DIAGNOSTICS").as_deref() == Ok("1")
 }
 
+/// The explicit opt-in switch alone, without `-v`: hook-attach receipts
+/// gate on this so verbose text never carries them.
+pub(crate) fn capture_diagnostics_env_on() -> bool {
+    std::env::var("P11SCOPE_CAPTURE_DIAGNOSTICS").as_deref() == Ok("1")
+}
+
 /// A0 assembly: the profile/trace capture lens over the live owners.
 /// The R10/R12 sample is O(entries): call only on the 60 s emit path
 /// and at end of capture, never on the hot path. The RSS is read

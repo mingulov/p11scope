@@ -562,11 +562,10 @@ fn run_cell_with(
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
         .die_with_parent();
-    if scope == CellScope::DynamicCgroup {
-        // The hook-attach receipts the cgroup cell gates on print only
-        // under capture diagnostics.
-        command.env("P11SCOPE_CAPTURE_DIAGNOSTICS", "1");
-    }
+    // The hook-attach receipts print only under the explicit opt-in
+    // switch (never under `-v`): every getter cell sets it, the cgroup
+    // cell gates on the per-offset lines.
+    command.env("P11SCOPE_CAPTURE_DIAGNOSTICS", "1");
     let mut child = command.spawn().context("spawning the observer")?;
     let result = (|| -> Result<serde_json::Value> {
         wait_for_text(&log, "p11scope: capturing:", &mut child)?;

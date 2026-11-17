@@ -1880,9 +1880,9 @@ pub(crate) fn process_proven_exited(pid: u32) -> bool {
 ///
 /// Two documented exceptions keep their own proof: the cold-churn
 /// mem arm (a zombie-aware leader read, not a whole-group proof) and
-/// the engine's `generation_dead` silence (owned by MT-EXIT-SCAN; this
-/// helper governs the exit decision, not that path's per-class
-/// accounting, which is not implemented in this lane). Silent paths
+/// the engine's `generation_dead` silence for unreadable members
+/// (owned by MT-EXIT-SCAN; this helper governs the mid-scan exit
+/// decision, that path owns its per-class accounting). Silent paths
 /// must use this proof or a documented exception, never an empty maps
 /// re-read alone: a zombie-leader group shows empty TGID maps while
 /// alive, and a leader running `exit_mm` empties its TGID maps while
@@ -1898,6 +1898,39 @@ pub(crate) fn whole_group_proven_exited(view: &ProcessView) -> bool {
         return true;
     }
     process_proven_exited(view.pid())
+}
+
+/// Whether the view's leader is inside its own teardown: the same
+/// generation (birth match), not yet a zombie or dead, but already in
+/// `do_exit` (`PF_EXITING`). Such a group proves nothing yet — the census
+/// needs the zombie — but it is not live either: it will prove within its
+/// page-teardown window (~160 ms at 1 GiB), so the engine holds its
+/// refusals and re-proves once after a bounded wait instead of filing
+/// loud gaps. A live leader (no `PF_EXITING`), a zombie or dead leader, a
+/// reused pid, an unreadable stat and a fallback pin without a retained
+/// birth all read false and stay on the immediate loud path.
+pub(crate) fn leader_exiting_not_zombie(view: &ProcessView) -> bool {
+    let Some(retained) = view.start_time() else {
+        return false;
+    };
+    let Ok(stat) = read_proc_stat(view.pid()) else {
+        return false;
+    };
+    let Ok(birth) = start_time_from_stat(&stat) else {
+        return false;
+    };
+    if birth != retained {
+        return false;
+    };
+    let Some(end) = stat.rfind(')') else {
+        return false;
+    };
+    let mut fields = stat[end + 1..].split_whitespace();
+    let state = fields.next().unwrap_or("");
+    if stat_state_is_dead(state) {
+        return false;
+    }
+    stat_flags_from_stat_text(&stat).is_some_and(|flags| flags & leader_exit::PF_EXITING != 0)
 }
 
 /// The whole `/proc/<pid>/stat` in (almost always) one `read`:

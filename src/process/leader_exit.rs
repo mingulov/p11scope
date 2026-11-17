@@ -6,7 +6,7 @@ use super::*;
 use std::io::Read;
 use std::time::{Duration, Instant};
 
-const PF_EXITING: u32 = 0x0000_0004;
+pub(crate) const PF_EXITING: u32 = 0x0000_0004;
 const STAT_BYTES: u64 = 4096;
 const STATUS_BYTES: u64 = 8192;
 
@@ -32,7 +32,7 @@ impl LeaderExitReadBudget {
     /// One final-exit proof after a failed per-process operation: rare
     /// (failures only), so it may walk a few hundred task entries.
     pub(crate) fn for_final_exit_proof() -> Self {
-        Self::new(512, Instant::now() + Duration::from_millis(20))
+        Self::new(1024, Instant::now() + Duration::from_millis(20))
     }
 
     fn new(remaining: u32, deadline: Instant) -> Self {

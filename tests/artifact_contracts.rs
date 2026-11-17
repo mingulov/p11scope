@@ -1748,14 +1748,8 @@ fn assert_static_descriptor_cookie_contract(
             "template-second START slot",
         ),
         ("owned_start_mut(&key)", "template-second START lookup"),
-        (
-            "slot_count_only(slot)",
-            "template-second count-only switch",
-        ),
-        (
-            "semantics_of(&ctx)",
-            "template-second descriptor consumer",
-        ),
+        ("slot_count_only(slot)", "template-second count-only switch"),
+        ("semantics_of(&ctx)", "template-second descriptor consumer"),
     ] {
         require_contract_marker(template_second, marker, contract)?;
     }
@@ -1772,14 +1766,8 @@ fn assert_static_descriptor_cookie_contract(
             "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "entry START slot",
         ),
-        (
-            "let semantics = if count_only {",
-            "entry count-only switch",
-        ),
-        (
-            "semantics_of(&ctx)",
-            "entry descriptor consumer",
-        ),
+        ("let semantics = if count_only {", "entry count-only switch"),
+        ("semantics_of(&ctx)", "entry descriptor consumer"),
     ] {
         require_contract_marker(entry, marker, contract)?;
     }
@@ -1811,14 +1799,8 @@ fn assert_static_descriptor_cookie_contract(
             "(*raw).base.event),\n                &*start,\n                key.slot,\n                &facts,",
             "object Event.slot",
         ),
-        (
-            "slot_count_only(slot_of(ctx))",
-            "return count-only switch",
-        ),
-        (
-            "semantics_of(ctx)",
-            "return descriptor consumer",
-        ),
+        ("slot_count_only(slot_of(ctx))", "return count-only switch"),
+        ("semantics_of(ctx)", "return descriptor consumer"),
     ] {
         require_contract_marker(returned, marker, contract)?;
     }

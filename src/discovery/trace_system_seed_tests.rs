@@ -859,6 +859,8 @@ fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
                     &mut capture.engine.budget,
                     false,
                     &mut capture.engine.stage_timings,
+                    &mut TeardownDeferralBudget::new(),
+                    None,
                     None,
                     crate::discovery::handle_table::Filing::Untracked,
                 );

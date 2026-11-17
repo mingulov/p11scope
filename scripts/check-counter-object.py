@@ -1767,8 +1767,12 @@ class BankExecution:
         self.memory, self.regions, self.cells = {}, [], {}
         self.cursor = 0x1000000
         self.bank_names = tuple(f"bank{index}" for index in range(16 if growth else 2))
+        # EVIDENCE stays unpopulated: per-item bumps land in the kernel,
+        # while fault scenarios execute past the empty lookup. Appended
+        # last so every existing handle keeps its value.
         names = ("COUNTER_BANK_META", "COUNTER_BANK_COMMIT", "COUNTER_BANKS",
-                 "COUNTER_BANK_FAULT", "COUNTER_HEALTH", "RV_COUNTS", *self.bank_names)
+                 "COUNTER_BANK_FAULT", "COUNTER_HEALTH", "RV_COUNTS", *self.bank_names,
+                 "EVIDENCE")
         self.handles = {name: 0x10000 + index * 0x100 for index, name in enumerate(names)}
         self.by_handle = {value: name for name, value in self.handles.items()}
         self.starts, self.debt = {}, 0

@@ -202,11 +202,16 @@ static INLINE void completed_rv(u32 slot, u64 rv)
     u64 one = 1;
     if (!update(&RV_COUNTS, &key, &one, 1)) /* BPF_NOEXIST */
         return;
+    /* A failed insert usually lost a race: the winner's row is already
+     * readable, so count into it. Only a re-lookup miss is a real loss,
+     * latched and counted per item like the legacy rv_count_add. */
     cell = lookup(&RV_COUNTS, &key);
     if (cell)
         increment(cell);
-    else
+    else {
         fault(BANK_RV_FAULT);
+        bump_evidence(BANK_EVIDENCE_RV_UPDATE_FAILURES);
+    }
 }
 
 __attribute__((noinline)) u32 p11_bank_complete(u32 slot, u64 pid_tgid,

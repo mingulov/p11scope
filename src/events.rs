@@ -5948,6 +5948,220 @@ mod tests {
         assert_eq!(drain.consumed(), 3);
         assert_eq!(drain.ring_exited(), 3);
     }
+
+    // ------------------------------------------------------------------
+    // END+length dispatch twins (v0.8.0 keymeta Task 2, spec §8.3).
+    // ------------------------------------------------------------------
+
+    /// A tracked absent-tail C_Sign END (632 bytes) extended with a valid
+    /// S trailer into the 648-byte END+length form, via the actual
+    /// journal fixtures (no hand-built payload).
+    fn length_end_wire_twin() -> Vec<u8> {
+        use crate::semantics_objects::journal::tests;
+        use p11scope_ebpf_common::evidence_table::{
+            LENGTH_KIND_SCELL, LENGTH_STATUS_OK, LENGTH_TRAILER_VERSION,
+        };
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_END_FULL_BYTES, JOURNAL_END_LENGTH_BYTES, LengthTrailer,
+        };
+        let function = tests::function_id("C_Sign");
+        let begin = tests::begin_bytes(1, 1, function, 0);
+        let full = tests::end_bytes_absent(&begin, 0, tests::ENTRY_NS + 100);
+        let trailer = LengthTrailer {
+            version: LENGTH_TRAILER_VERSION,
+            kind: LENGTH_KIND_SCELL,
+            status: LENGTH_STATUS_OK,
+            reserved: [0; 4],
+            value: 256,
+        };
+        // SAFETY: the frozen repr(C) trailer holds only initialized
+        // integer fields; its exact 16-byte layout is pinned in
+        // ebpf-common, and the journal validator re-checks it below.
+        let trailer_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                (&trailer as *const LengthTrailer).cast::<u8>(),
+                16,
+            )
+        };
+        let mut wire = vec![0u8; JOURNAL_END_LENGTH_BYTES];
+        wire[..JOURNAL_END_FULL_BYTES].copy_from_slice(&full);
+        wire[2..4].copy_from_slice(&(JOURNAL_END_LENGTH_BYTES as u16).to_le_bytes());
+        wire[JOURNAL_END_FULL_BYTES..].copy_from_slice(trailer_bytes);
+        wire
+    }
+
+    /// The 648 form dispatches to the journal consumer (once, never
+    /// ordinary, never malformed) on both poll paths; its projected
+    /// payload equals the base END's payload.
+    #[test]
+    fn journal_dispatch_accepts_end_length_form() {
+        use p11scope_ebpf_common::object_journal::decode_journal_record;
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        let wire = length_end_wire_twin();
+        // Decode-level positive control first.
+        let Some(JournalRecord::End(end)) = decode_journal_record(&wire, &rows) else {
+            panic!("the 648 form decodes");
+        };
+        assert!(end.length());
+        assert_eq!(end.length_trailer().unwrap().value, 256);
+        let expected = project_journal_end_payload(&end, &rows).unwrap();
+        // Unbounded poll routes to journal.
+        let source = CursorScript::scripted([wire.clone()]);
+        let mut drain = EventDrain::over(source);
+        let mut journaled = 0;
+        let poll = drain.poll_dispatched_quantum(
+            Some(2),
+            &rows,
+            |_| panic!("a tracked 648 END never routes ordinary"),
+            |record| {
+                let JournalRecord::End(record) = record else {
+                    panic!("648 routes as END");
+                };
+                assert!(record.length());
+                assert_eq!(record.length_trailer().unwrap().value, 256);
+                let projected = project_journal_end_payload(&record, &rows).unwrap();
+                assert!(projected.same_decoded_payload(&expected));
+                journaled += 1;
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(poll, DispatchPoll { attempted: 1, backlog: false });
+        assert_eq!(journaled, 1);
+        assert_eq!(drain.malformed(), 0);
+        // Bounded poll routes identically.
+        let source = CursorScript::scripted([wire]);
+        let mut drain = EventDrain::over(source);
+        let mut journaled = 0;
+        let (reached, backlog) = poll_dispatched_records_to_position(
+            &mut drain,
+            8,
+            Some(2),
+            &rows,
+            |_| panic!("a tracked 648 END never routes ordinary"),
+            |record| {
+                let JournalRecord::End(record) = record else {
+                    panic!("648 routes as END");
+                };
+                assert!(record.length());
+                journaled += 1;
+                ControlFlow::Continue(())
+            },
+        )
+        .unwrap();
+        assert!(!reached && !backlog);
+        assert_eq!(journaled, 1);
+        assert_eq!(drain.malformed(), 0);
+    }
+
+    /// The dropped carriers (488/760/600) and every neighbor stay
+    /// malformed on both poll paths: they reach neither consumer and
+    /// count exactly once each.
+    #[test]
+    fn journal_dispatch_rejects_dropped_carriers_and_neighbors() {
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        let good = length_end_wire_twin();
+        let mut wires = Vec::new();
+        for len in [488usize, 760, 600, 487, 489, 647, 649] {
+            let mut wire = vec![0u8; len];
+            let kept = len.min(good.len());
+            wire[..kept].copy_from_slice(&good[..kept]);
+            wire[2..4].copy_from_slice(&(len as u16).to_le_bytes());
+            wires.push(wire);
+        }
+        for bounded in [false, true] {
+            let source = CursorScript::scripted(wires.clone());
+            let mut drain = EventDrain::over(source);
+            if bounded {
+                let (reached, backlog) = poll_dispatched_records_to_position(
+                    &mut drain,
+                    8 * wires.len(),
+                    Some(wires.len() + 1),
+                    &rows,
+                    |_| panic!("malformed records never route ordinary"),
+                    |_| panic!("malformed records never route journal"),
+                )
+                .unwrap();
+                assert!(!reached && !backlog);
+            } else {
+                let poll = drain.poll_dispatched_quantum(
+                    Some(wires.len() + 1),
+                    &rows,
+                    |_| panic!("malformed records never route ordinary"),
+                    |_| panic!("malformed records never route journal"),
+                );
+                assert_eq!(
+                    poll,
+                    DispatchPoll { attempted: wires.len(), backlog: false }
+                );
+            }
+            assert_eq!(drain.malformed(), wires.len() as u64, "bounded={bounded}");
+        }
+    }
+
+    /// Legacy forms route exactly as before: BEGIN/END/compact ENDs to
+    /// journal, 368/608 records to ordinary, malformed 0. The 648 arm
+    /// adds a form without moving any existing one.
+    #[test]
+    fn journal_dispatch_keeps_legacy_forms() {
+        use crate::semantics_objects::journal::tests;
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_BEGIN_BYTES, JOURNAL_END_COMPACT_BYTES, JOURNAL_END_FULL_BYTES,
+            pack_compact_end,
+        };
+        use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+        let rows = publish_object_descriptors();
+        let function = tests::function_id("C_Sign");
+        let begin = tests::begin_bytes(1, 1, function, 0).to_vec();
+        assert_eq!(begin.len(), JOURNAL_BEGIN_BYTES);
+        let full = tests::end_bytes_absent(&begin_bytes_for_legacy(), 0, tests::ENTRY_NS + 100);
+        assert_eq!(full.len(), JOURNAL_END_FULL_BYTES);
+        let compact = pack_compact_end(1, 1, full[5], &full[24..])
+            .expect("the absent-tail payload is compact eligible")
+            .to_vec();
+        assert_eq!(compact.len(), JOURNAL_END_COMPACT_BYTES);
+        let event_368 = event_bytes(&Event {
+            event_type: event_type::CALL,
+            slot: 12,
+            ..Default::default()
+        });
+        assert_eq!(event_368.len(), 368);
+        let record_608 = ordinary_object_transport_record(12);
+        assert_eq!(record_608.len(), 608);
+        let source = CursorScript::scripted([
+            begin,
+            full.to_vec(),
+            compact,
+            event_368,
+            record_608,
+        ]);
+        let mut drain = EventDrain::over(source);
+        let mut journaled = 0;
+        let mut ordinaries = 0;
+        let poll = drain.poll_dispatched_quantum(
+            Some(8),
+            &rows,
+            |_| {
+                ordinaries += 1;
+                ControlFlow::Continue(())
+            },
+            |_| {
+                journaled += 1;
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(poll, DispatchPoll { attempted: 5, backlog: false });
+        assert_eq!(journaled, 3, "BEGIN + END + compact END route journal");
+        assert_eq!(ordinaries, 2, "368 + 608 route ordinary");
+        assert_eq!(drain.malformed(), 0);
+    }
+
+    fn begin_bytes_for_legacy() -> [u8; 224] {
+        use crate::semantics_objects::journal::tests;
+        let function = tests::function_id("C_Sign");
+        tests::begin_bytes(1, 1, function, 0)
+    }
 }
 
 #[cfg(test)]

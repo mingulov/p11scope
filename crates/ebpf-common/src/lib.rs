@@ -6,6 +6,7 @@
 #![no_std]
 
 pub mod counter_policy;
+pub mod evidence_table;
 pub mod inventory_callers;
 pub mod inventory_info;
 pub mod object_capture;

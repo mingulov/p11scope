@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn journal_expected_programs_swap_the_pair() {
         let expected = super::super::expected_programs(false);
-        let journal = journal_expected_programs();
+        let journal = journal_expected_programs(false);
         assert_eq!(journal.len(), expected.len());
         for name in PROGRAMS {
             assert!(journal.contains(name), "{name}");
@@ -599,5 +599,176 @@ mod tests {
             .collect();
         swapped.extend(PROGRAMS);
         assert_eq!(journal, swapped);
+    }
+
+    // ------------------------------------------------------------------
+    // Length routing + opt-in selection (v0.8.0 keymeta Task 2, §8.6).
+    // ------------------------------------------------------------------
+
+    /// Non-interference snapshot (Task 2 pins, modifies nothing): the 11
+    /// length endpoints keep their classes (the 7 neutral calls stay
+    /// Neutral-modeled, Wrap/Unwrap/KEM stay descriptor-modeled) and
+    /// the 3 info endpoints stay proved-irrelevant. Any classification,
+    /// census or descriptor drift fails here first.
+    #[test]
+    fn journal_length_classes_snapshot_keymeta_task2() {
+        use crate::semantics_objects::journal::{endpoint_class, is_neutral_function, EndpointClass};
+        let neutral_length = [
+            "C_Sign",
+            "C_SignRecover",
+            "C_SignFinal",
+            "C_Verify",
+            "C_VerifyFinal",
+            "C_Encrypt",
+            "C_Decrypt",
+        ];
+        for name in neutral_length {
+            let function = crate::kinds::function_id(name).expect("catalog holds the length call");
+            assert!(
+                is_neutral_function(function),
+                "{name} stays Neutral (no object protocol)"
+            );
+            assert_eq!(
+                endpoint_class(function),
+                Some(EndpointClass::ModeledAffecting),
+                "{name} stays Neutral-modeled"
+            );
+            assert_eq!(super::journal_class_for_descriptor(function + 1), 2, "{name}");
+        }
+        for name in ["C_WrapKey", "C_UnwrapKey", "C_EncapsulateKey", "C_DecapsulateKey"] {
+            let function = crate::kinds::function_id(name).expect("catalog holds the length call");
+            assert!(
+                !is_neutral_function(function),
+                "{name} stays descriptor-modeled, never neutral"
+            );
+            assert_eq!(
+                endpoint_class(function),
+                Some(EndpointClass::ModeledAffecting),
+                "{name} stays modeled"
+            );
+            assert_eq!(super::journal_class_for_descriptor(function + 1), 2, "{name}");
+        }
+        for name in ["C_GetInfo", "C_GetTokenInfo", "C_GetMechanismInfo"] {
+            let function = crate::kinds::function_id(name).expect("catalog holds the info call");
+            assert_eq!(
+                endpoint_class(function),
+                Some(EndpointClass::ProvedIrrelevant),
+                "{name} stays proved-irrelevant"
+            );
+            assert_eq!(super::journal_class_for_descriptor(function + 1), 1, "{name}");
+        }
+    }
+
+    /// Length entry selection: with the flag on, the 11 length
+    /// endpoints link the length entry; every other endpoint (base
+    /// functions, info endpoints, count-only zero, out-of-range) links
+    /// the base entry in both modes.
+    #[test]
+    fn journal_length_entry_program_selects_pair_per_endpoint() {
+        use super::{LENGTH_PROGRAMS, PROGRAMS, is_length_endpoint, journal_entry_program};
+        assert_eq!(LENGTH_PROGRAMS, ["p11_entry_journal_length", "p11_return_journal_length"]);
+        let length = [
+            "C_Sign",
+            "C_SignRecover",
+            "C_SignFinal",
+            "C_Verify",
+            "C_VerifyFinal",
+            "C_Encrypt",
+            "C_Decrypt",
+            "C_WrapKey",
+            "C_UnwrapKey",
+            "C_EncapsulateKey",
+            "C_DecapsulateKey",
+        ];
+        for name in length {
+            let descriptor = crate::kinds::function_id(name).unwrap() + 1;
+            assert!(is_length_endpoint(descriptor), "{name} is a length endpoint");
+            assert_eq!(
+                journal_entry_program(descriptor, true),
+                LENGTH_PROGRAMS[0],
+                "{name}: flag on links the length entry"
+            );
+            assert_eq!(
+                journal_entry_program(descriptor, false),
+                PROGRAMS[0],
+                "{name}: flag off links the base entry"
+            );
+        }
+        let mut base = vec![0, MAX_DESCRIPTORS, MAX_DESCRIPTORS + 1, u32::MAX];
+        for name in [
+            "C_Initialize",
+            "C_SignInit",
+            "C_Digest",
+            "C_GenerateKey",
+            "C_GetInfo",
+            "C_GetTokenInfo",
+            "C_GetMechanismInfo",
+        ] {
+            base.push(crate::kinds::function_id(name).unwrap() + 1);
+        }
+        for descriptor in base {
+            assert!(!is_length_endpoint(descriptor), "descriptor {descriptor} is not length");
+            for key_sizes in [false, true] {
+                assert_eq!(
+                    journal_entry_program(descriptor, key_sizes),
+                    PROGRAMS[0],
+                    "descriptor {descriptor}: base entry in both modes"
+                );
+            }
+        }
+    }
+
+    /// Per-group returns derive from the group's entry program, and a
+    /// mixed pair (entry+return never mixed) is refused loudly: a mixed
+    /// plan would strand the stash and is a planner bug.
+    #[test]
+    fn journal_length_return_derives_from_entry_and_refuses_mixed() {
+        use super::{
+            LENGTH_PROGRAMS, PROGRAMS, journal_return_program, validate_journal_group_pair,
+        };
+        assert_eq!(journal_return_program(PROGRAMS[0]), PROGRAMS[1]);
+        assert_eq!(journal_return_program(LENGTH_PROGRAMS[0]), LENGTH_PROGRAMS[1]);
+        validate_journal_group_pair(PROGRAMS[0], PROGRAMS[1]).unwrap();
+        validate_journal_group_pair(LENGTH_PROGRAMS[0], LENGTH_PROGRAMS[1]).unwrap();
+        for (entry, ret) in [
+            (PROGRAMS[0], LENGTH_PROGRAMS[1]),
+            (LENGTH_PROGRAMS[0], PROGRAMS[1]),
+        ] {
+            let error = validate_journal_group_pair(entry, ret).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains(entry), "{text}");
+            assert!(text.contains(ret), "{text}");
+            assert!(text.contains("mixed"), "{text}");
+        }
+    }
+
+    /// Program-inventory growth (§8.5): flag off is exactly today's set
+    /// (length pair absent); flag on adds exactly the length pair.
+    #[test]
+    fn journal_expected_programs_grows_with_flag() {
+        use super::{LENGTH_PROGRAMS, PROGRAMS, journal_expected_programs};
+        let off = journal_expected_programs(false);
+        let on = journal_expected_programs(true);
+        for name in PROGRAMS {
+            assert!(off.contains(name) && on.contains(name), "{name}");
+        }
+        for name in LENGTH_PROGRAMS {
+            assert!(!off.contains(name), "{name} never loads with the flag off");
+            assert!(on.contains(name), "{name} loads with the flag on");
+        }
+        assert_eq!(on.len(), off.len() + LENGTH_PROGRAMS.len());
+        let mut grown = off.clone();
+        grown.extend(LENGTH_PROGRAMS);
+        assert_eq!(on, grown);
+    }
+
+    /// The `EVIDENCE_START` reservation follows the flag: the full
+    /// 16384-row stash with the flag on, exactly one row with the flag
+    /// off (the loader overrides `max_entries` to 1).
+    #[test]
+    fn journal_evidence_start_entries_follow_flag() {
+        use super::evidence_start_entries;
+        assert_eq!(evidence_start_entries(true), 16_384);
+        assert_eq!(evidence_start_entries(false), 1);
     }
 }

@@ -1010,6 +1010,32 @@ fn frames_expected_marker_enabled() -> bool {
 }
 
 #[test]
+fn object_producer_compiled_journal_frames_are_bounded() {
+    // Journal-object frame bound (v0.8.0 keymeta Task 2, spec §8.5):
+    // the same unmodified 512-byte chain limit covers the base pair
+    // plus the length pair. P0 journal builds carry the base pair
+    // only; builds that omit the journal object assert the omission.
+    if p11scope::EBPF_JOURNAL_OBJECT.is_empty() {
+        assert_ne!(
+            env!("P11SCOPE_JOURNAL_ENABLED"),
+            "1",
+            "a journal-enabled build must embed the journal object"
+        );
+        return;
+    }
+    let directory = tempfile::tempdir().expect("temporary journal frame check");
+    let object = directory.path().join("p11scope-ebpf-journal");
+    std::fs::write(&object, p11scope::EBPF_JOURNAL_OBJECT).expect("write actual journal object");
+    let mode = if cfg!(feature = "stub-object-attributes") {
+        "journal-frames-p0"
+    } else {
+        "journal-frames"
+    };
+    let report = run_object_checker(&object, mode);
+    println!("{report}");
+}
+
+#[test]
 fn object_producer_compiled_frames_are_bounded() {
     let directory = tempfile::tempdir().expect("temporary object custody frame check");
     let object = embedded_object(directory.path());

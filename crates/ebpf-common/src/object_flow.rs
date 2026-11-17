@@ -3571,4 +3571,759 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // Length-evidence adapters (v0.8.0 keymeta Task 2, spec §5.1/§8.2).
+    // ------------------------------------------------------------------
+
+    use crate::evidence_table::{
+        LENGTH_CAPACITY_MAX, LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR,
+    };
+    use crate::object_capture::{CKR_BUFFER_TOO_SMALL, CKR_OK, CKR_PENDING};
+    use crate::object_wire::{OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64};
+
+    /// Scripted entry-argument table plus fetch/read spies for the length
+    /// adapters. `word` scripts the single target-word read each phase
+    /// performs at most (entry capacity, return value); `reads` logs every
+    /// read address in order, `fetches` every argument fetch.
+    struct LengthSpy {
+        args: [(u8, Option<u64>); 7],
+        fetches: Vec<u8>,
+        reads: Vec<u64>,
+        word: Result<u64, ()>,
+    }
+
+    impl LengthSpy {
+        fn new(args: [(u8, Option<u64>); 7], word: Result<u64, ()>) -> Self {
+            Self {
+                args,
+                fetches: Vec::new(),
+                reads: Vec::new(),
+                word,
+            }
+        }
+
+        fn run_entry(
+            &mut self,
+            out: &mut EvidenceStart,
+            descriptor: u32,
+            layout: LinuxLayout,
+            start_ts_ns: u64,
+        ) -> bool {
+            let args = &self.args;
+            let word = self.word;
+            let fetches = &mut self.fetches;
+            let reads = &mut self.reads;
+            let mut fetch = |index: u8| {
+                fetches.push(index);
+                args.iter()
+                    .find(|(slot, _)| *slot == index)
+                    .and_then(|(_, value)| *value)
+            };
+            let reader = crate::FnReader(|address: u64, _layout: LinuxLayout| {
+                reads.push(address);
+                word
+            });
+            adapter_length_entry(out, descriptor, layout, start_ts_ns, &mut fetch, reader)
+        }
+
+        fn run_return(
+            &mut self,
+            evidence: &EvidenceStart,
+            start_ts_ns: Option<u64>,
+            rv: u64,
+            layout: LinuxLayout,
+            joined: bool,
+        ) -> LengthReturnVerdict {
+            let reads = &mut self.reads;
+            let word = self.word;
+            let reader = crate::FnReader(|address: u64, _layout: LinuxLayout| {
+                reads.push(address);
+                word
+            });
+            adapter_length_return(evidence, start_ts_ns, rv, layout, joined, reader)
+        }
+    }
+
+    fn length_args(pairs: &[(u8, Option<u64>)]) -> [(u8, Option<u64>); 7] {
+        let mut args = [
+            (0, None),
+            (1, None),
+            (2, None),
+            (3, None),
+            (4, None),
+            (5, None),
+            (6, None),
+        ];
+        for (index, value) in pairs {
+            args[*index as usize] = (*index, *value);
+        }
+        args
+    }
+
+    fn length_function_ordinal(name: &str) -> u32 {
+        (0..crate::MAX_DESCRIPTORS)
+            .find(|index| pkcs11_module::function_name(*index as usize) == Some(name))
+            .expect("the frozen catalog contains the length function")
+    }
+
+    fn length_descriptor(name: &str) -> u32 {
+        length_function_ordinal(name) + 1
+    }
+
+    fn layout_code(layout: LinuxLayout) -> u8 {
+        match layout {
+            LinuxLayout::Lp64 => OBJECT_LAYOUT_LP64,
+            LinuxLayout::Ilp32 => OBJECT_LAYOUT_ILP32,
+        }
+    }
+
+    /// Every S-shape (LP64 + ia32): a disjoint cell with an admitted
+    /// capacity retains (one capacity read at the cell), stamping the
+    /// cell pointer, the START timestamp and the S kind. The heap-buffer/
+    /// stack-word layout (cell above the buffer, the NSS and
+    /// pkcs11-provider shape) is the accepted control.
+    #[test]
+    fn length_entry_accepts_s_cell_shapes() {
+        let shapes = [
+            ("C_Sign", 4, 3),
+            ("C_SignRecover", 4, 3),
+            ("C_SignFinal", 2, 1),
+            ("C_Encrypt", 4, 3),
+            ("C_WrapKey", 5, 4),
+            ("C_EncapsulateKey", 6, 5),
+        ];
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for (name, cell_arg, base_arg) in shapes {
+                let cell = 0x20_0000u64;
+                let base = 0x10_0000u64;
+                let capacity = 256u64;
+                let mut spy = LengthSpy::new(
+                    length_args(&[
+                        (cell_arg, Some(cell)),
+                        (base_arg, Some(base)),
+                    ]),
+                    Ok(capacity),
+                );
+                let mut out = EvidenceStart::default();
+                assert!(
+                    spy.run_entry(
+                        &mut out,
+                        length_descriptor(name),
+                        layout,
+                        0x3030,
+                    ),
+                    "{name} {layout:?}: disjoint cell retains"
+                );
+                assert_eq!(out.ev_cell, cell, "{name} {layout:?}: retained cell");
+                assert_eq!(out.ev_ts_ns, 0x3030, "{name} {layout:?}: START stamp");
+                assert_eq!(out.ev_kind, LENGTH_KIND_SCELL, "{name} {layout:?}: S kind");
+                assert_eq!(out.ev_layout, layout_code(layout), "{name} {layout:?}: layout");
+                assert_eq!(spy.reads.as_slice(), &[cell], "{name} {layout:?}: one capacity read");
+                // The below-buffer layout is equally disjoint and retains.
+                let mut spy = LengthSpy::new(
+                    length_args(&[
+                        (cell_arg, Some(base - 0x1000)),
+                        (base_arg, Some(base)),
+                    ]),
+                    Ok(capacity),
+                );
+                let mut out = EvidenceStart::default();
+                assert!(
+                    spy.run_entry(&mut out, length_descriptor(name), layout, 0x3030),
+                    "{name} {layout:?}: below-buffer cell retains"
+                );
+            }
+        }
+    }
+
+    /// Every V-shape (LP64 + ia32): the scalar snapshots with no
+    /// dereference and no read, stamping the snapshot and the V kind.
+    #[test]
+    fn length_entry_accepts_v_scalar_shapes() {
+        let shapes = [
+            ("C_Verify", 4, 256u64),
+            ("C_VerifyFinal", 2, 64u64),
+            ("C_Decrypt", 2, 256u64),
+            ("C_UnwrapKey", 4, 296u64),
+            ("C_DecapsulateKey", 6, 1088u64),
+        ];
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for (name, scalar_arg, scalar) in shapes {
+                let mut spy = LengthSpy::new(
+                    length_args(&[(scalar_arg, Some(scalar))]),
+                    Err(()),
+                );
+                let mut out = EvidenceStart::default();
+                assert!(
+                    spy.run_entry(
+                        &mut out,
+                        length_descriptor(name),
+                        layout,
+                        0x4040,
+                    ),
+                    "{name} {layout:?}: scalar snapshots"
+                );
+                assert_eq!(out.ev_cell, scalar, "{name} {layout:?}: snapshot held");
+                assert_eq!(out.ev_ts_ns, 0x4040, "{name} {layout:?}: START stamp");
+                assert_eq!(out.ev_kind, LENGTH_KIND_VSCALAR, "{name} {layout:?}: V kind");
+                assert_eq!(out.ev_layout, layout_code(layout), "{name} {layout:?}: layout");
+                assert!(spy.reads.is_empty(), "{name} {layout:?}: V snapshots read nothing");
+            }
+        }
+    }
+
+    /// Null and unreadable cells retain nothing with zero reads; the
+    /// refused shape retains zero (`length_query_no_cell`).
+    #[test]
+    fn length_entry_refuses_null_and_unreadable_cells() {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for cell in [None, Some(0)] {
+                let mut spy = LengthSpy::new(
+                    length_args(&[(4, cell), (3, Some(0x10_0000))]),
+                    Ok(256),
+                );
+                let mut out = EvidenceStart::default();
+                assert!(
+                    !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
+                    "{layout:?} cell {cell:?}: no retention"
+                );
+                assert_eq!(out, EvidenceStart::default(), "{layout:?}: refused retains zero");
+                assert!(spy.reads.is_empty(), "{layout:?}: null cell reads nothing");
+            }
+            // An unreadable capacity word refuses the same way.
+            let mut spy = LengthSpy::new(
+                length_args(&[(4, Some(0x20_0000)), (3, Some(0x10_0000))]),
+                Err(()),
+            );
+            let mut out = EvidenceStart::default();
+            assert!(
+                !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
+                "{layout:?}: unreadable capacity refuses"
+            );
+            assert_eq!(out, EvidenceStart::default());
+            assert_eq!(spy.reads.as_slice(), &[0x20_0000]);
+        }
+    }
+
+    /// Absurd capacities (above 1 MiB, the anti-bulk bound) and faulting
+    /// cell spans refuse with a named unavailable, never a guessed bound.
+    #[test]
+    fn length_entry_refuses_absurd_capacity_and_span_faults() {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for capacity in [LENGTH_CAPACITY_MAX + 1, u64::from(u32::MAX) + 1, u64::MAX] {
+                // ia32 words never exceed 32 bits from a real reader; the
+                // hostile-width twin below pins the injected case, so skip
+                // the unrepresentable capacities here.
+                if layout == LinuxLayout::Ilp32 && capacity > u64::from(u32::MAX) {
+                    continue;
+                }
+                let mut spy = LengthSpy::new(
+                    length_args(&[(4, Some(0x20_0000)), (3, Some(0x10_0000))]),
+                    Ok(capacity),
+                );
+                let mut out = EvidenceStart::default();
+                assert!(
+                    !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
+                    "{layout:?} capacity {capacity}: absurd refuses"
+                );
+                assert_eq!(out, EvidenceStart::default());
+            }
+            // Exactly 1 MiB is admitted (the bound is inclusive): the
+            // span [base, base + 1MiB) ends exactly where the disjoint
+            // cell starts, so this shape retains.
+            let mut spy = LengthSpy::new(
+                length_args(&[(4, Some(0x20_0000)), (3, Some(0x10_0000))]),
+                Ok(LENGTH_CAPACITY_MAX),
+            );
+            let mut out = EvidenceStart::default();
+            assert!(
+                spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
+                "{layout:?}: exactly 1 MiB is admitted"
+            );
+            assert_eq!(out.ev_cell, 0x20_0000);
+            // A cell whose own word span faults refuses before any read.
+            let cell = u64::MAX - 3;
+            let mut spy = LengthSpy::new(
+                length_args(&[(4, Some(cell)), (3, Some(0x10_0000))]),
+                Ok(256),
+            );
+            let mut out = EvidenceStart::default();
+            assert!(
+                !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
+                "{layout:?}: faulting cell span refuses"
+            );
+            assert_eq!(out, EvidenceStart::default());
+            assert!(spy.reads.is_empty(), "{layout:?}: faulting span reads nothing");
+        }
+    }
+
+    /// Disjointness twins (§5.1): a cell on or inside
+    /// `[base, base+C)` refuses, `base+C` overflow refuses, either-side
+    /// disjointness retains. Overlap never guesses a bound.
+    #[test]
+    fn length_entry_disjointness_guards() {
+        let word = LinuxLayout::Lp64.word_bytes() as u64;
+        let base = 0x10_0000u64;
+        let capacity = 256u64;
+        // Inside, at the base, one byte inside the end, and straddling
+        // the end by one byte: all overlap, all refuse.
+        for cell in [base, base + 1, base + capacity - 1, base + capacity - word + 1] {
+            let mut spy = LengthSpy::new(
+                length_args(&[(4, Some(cell)), (3, Some(base))]),
+                Ok(capacity),
+            );
+            let mut out = EvidenceStart::default();
+            assert!(
+                !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
+                "cell {cell:#x} overlaps and refuses"
+            );
+            assert_eq!(out, EvidenceStart::default());
+            assert_eq!(spy.reads.as_slice(), &[cell], "overlap refuses after the capacity read");
+        }
+        // Exactly adjacent on either side is disjoint and retains.
+        for cell in [base - word, base + capacity] {
+            let mut spy = LengthSpy::new(
+                length_args(&[(4, Some(cell)), (3, Some(base))]),
+                Ok(capacity),
+            );
+            let mut out = EvidenceStart::default();
+            assert!(
+                spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
+                "adjacent cell {cell:#x} retains"
+            );
+        }
+        // `base + C` overflow refuses (never a saturating bound).
+        let mut spy = LengthSpy::new(
+            length_args(&[(4, Some(0x20_0000)), (3, Some(u64::MAX - 10))]),
+            Ok(256),
+        );
+        let mut out = EvidenceStart::default();
+        assert!(
+            !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
+            "base+C overflow refuses"
+        );
+        assert_eq!(out, EvidenceStart::default());
+        // An unreadable base fetch refuses: disjointness against an
+        // unknown base is unprovable (fail closed, unlike NULL).
+        let mut spy = LengthSpy::new(length_args(&[(4, Some(0x20_0000))]), Ok(256));
+        let mut out = EvidenceStart::default();
+        assert!(
+            !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
+            "unreadable base refuses"
+        );
+        assert_eq!(out, EvidenceStart::default());
+    }
+
+    /// Null-base rule (§5.1): a NULL base skips the disjointness check
+    /// and the cell still reads — query shapes read at BPF (userspace
+    /// drops the value, never classifies it). All six S-shapes,
+    /// including encapsulate, where this diverges deliberately from the
+    /// T0 null-ciphertext withhold (T0 needs the extent as a bound;
+    /// the length cell needs only disjointness).
+    #[test]
+    fn length_entry_null_base_reads_query_shapes() {
+        let shapes = [
+            ("C_Sign", 4, 3),
+            ("C_SignRecover", 4, 3),
+            ("C_SignFinal", 2, 1),
+            ("C_Encrypt", 4, 3),
+            ("C_WrapKey", 5, 4),
+            ("C_EncapsulateKey", 6, 5),
+        ];
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for (name, cell_arg, base_arg) in shapes {
+                let cell = 0x20_0000u64;
+                let mut spy = LengthSpy::new(
+                    length_args(&[(cell_arg, Some(cell)), (base_arg, Some(0))]),
+                    Ok(256),
+                );
+                let mut out = EvidenceStart::default();
+                assert!(
+                    spy.run_entry(&mut out, length_descriptor(name), layout, 1),
+                    "{name} {layout:?}: NULL base reads (query shape)"
+                );
+                assert_eq!(out.ev_cell, cell);
+                assert_eq!(spy.reads.as_slice(), &[cell]);
+            }
+        }
+    }
+
+    /// Hostile-width twins: ia32 words with high bits refuse (never a
+    /// truncated snapshot), while LP64 words pass full-width and
+    /// unmasked so userspace equality refuses OR-aliases (`1<<16` /
+    /// `1<<32`) instead of the adapter guessing.
+    #[test]
+    fn length_entry_refuses_hostile_widths() {
+        // ia32 V-scalar with high bits: refused, nothing retained.
+        let mut spy = LengthSpy::new(
+            length_args(&[(4, Some(256 | (1 << 32)))]),
+            Err(()),
+        );
+        let mut out = EvidenceStart::default();
+        assert!(
+            !spy.run_entry(
+                &mut out,
+                length_descriptor("C_Verify"),
+                LinuxLayout::Ilp32,
+                1
+            ),
+            "ia32 high-bit scalar refuses"
+        );
+        assert_eq!(out, EvidenceStart::default());
+        assert!(spy.reads.is_empty());
+        // ia32 S-cell capacity with high bits (injected reader): refused.
+        let mut spy = LengthSpy::new(
+            length_args(&[(4, Some(0x20_0000)), (3, Some(0x10_0000))]),
+            Ok(256 | (1 << 32)),
+        );
+        let mut out = EvidenceStart::default();
+        assert!(
+            !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Ilp32, 1),
+            "ia32 high-bit capacity refuses"
+        );
+        assert_eq!(out, EvidenceStart::default());
+        // LP64 V-scalar passes full-width and unmasked: the OR-aliased
+        // word is held exactly, and finite classification (userspace)
+        // refuses it by equality — the adapter never truncates.
+        for scalar in [256 | (1 << 16), 256 | (1 << 32)] {
+            let mut spy = LengthSpy::new(length_args(&[(4, Some(scalar))]), Err(()));
+            let mut out = EvidenceStart::default();
+            assert!(
+                spy.run_entry(
+                    &mut out,
+                    length_descriptor("C_Verify"),
+                    LinuxLayout::Lp64,
+                    1
+                ),
+                "LP64 scalar {scalar:#x} passes unmasked"
+            );
+            assert_eq!(out.ev_cell, scalar);
+        }
+        // LP64 S-cell capacity above the bound refuses even when the
+        // low word alone names a classifiable length (no masking to
+        // manufacture a small capacity).
+        let mut spy = LengthSpy::new(
+            length_args(&[(4, Some(0x20_0000)), (3, Some(0x10_0000))]),
+            Ok(256 | (1 << 32)),
+        );
+        let mut out = EvidenceStart::default();
+        assert!(
+            !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
+            "LP64 OR-aliased capacity refuses by bound, never masked"
+        );
+        assert_eq!(out, EvidenceStart::default());
+    }
+
+    /// Non-evidence descriptors (count-only zero, unlisted functions,
+    /// info endpoints, out-of-range) retain nothing with zero reads.
+    #[test]
+    fn length_entry_rejects_non_evidence_descriptors() {
+        use crate::MAX_DESCRIPTORS;
+        let mut cases = vec![0, MAX_DESCRIPTORS, MAX_DESCRIPTORS + 1, u32::MAX];
+        for name in ["C_Initialize", "C_SignInit", "C_GetInfo", "C_GetTokenInfo", "C_GetMechanismInfo"] {
+            cases.push(length_descriptor(name));
+        }
+        for descriptor in cases {
+            for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+                let mut spy = LengthSpy::new(
+                    length_args(&[
+                        (2, Some(0x20_0000)),
+                        (3, Some(0x10_0000)),
+                        (4, Some(0x20_0000)),
+                        (5, Some(0x10_0000)),
+                        (6, Some(0x20_0000)),
+                    ]),
+                    Ok(256),
+                );
+                let mut out = EvidenceStart::default();
+                assert!(
+                    !spy.run_entry(&mut out, descriptor, layout, 1),
+                    "descriptor {descriptor} {layout:?}: no retention"
+                );
+                assert_eq!(out, EvidenceStart::default());
+                assert!(spy.reads.is_empty(), "descriptor {descriptor}: zero reads");
+            }
+        }
+    }
+
+    /// Terminal CKR_OK reads: S-cells read the word once at the
+    /// retained cell (query shapes included — BPF cannot tell, so it
+    /// reads and userspace drops the value); V-scalars resolve to the
+    /// snapshot with zero reads.
+    #[test]
+    fn length_return_reads_terminal_ok() {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let cell = 0x20_0000u64;
+            let evidence = EvidenceStart {
+                ev_cell: cell,
+                ev_ts_ns: 0x3030,
+                ev_kind: LENGTH_KIND_SCELL,
+                ev_layout: layout_code(layout),
+                ev_flags: 0,
+                reserved: [0; 12],
+            };
+            let mut spy = LengthSpy::new(length_args(&[]), Ok(256));
+            assert_eq!(
+                spy.run_return(&evidence, Some(0x3030), CKR_OK, layout, true),
+                LengthReturnVerdict::Value(256),
+                "{layout:?}: S-cell OK reads"
+            );
+            assert_eq!(spy.reads.as_slice(), &[cell]);
+            // A failed cell read at return is unavailable, never guessed.
+            let mut spy = LengthSpy::new(length_args(&[]), Err(()));
+            assert_eq!(
+                spy.run_return(&evidence, Some(0x3030), CKR_OK, layout, true),
+                LengthReturnVerdict::Unavailable,
+                "{layout:?}: unreadable cell is unavailable"
+            );
+            let snapshot = EvidenceStart {
+                ev_cell: 256,
+                ev_ts_ns: 0x3030,
+                ev_kind: LENGTH_KIND_VSCALAR,
+                ev_layout: layout_code(layout),
+                ev_flags: 0,
+                reserved: [0; 12],
+            };
+            let mut spy = LengthSpy::new(length_args(&[]), Err(()));
+            assert_eq!(
+                spy.run_return(&snapshot, Some(0x3030), CKR_OK, layout, true),
+                LengthReturnVerdict::Value(256),
+                "{layout:?}: V-scalar OK resolves the snapshot"
+            );
+            assert!(spy.reads.is_empty(), "{layout:?}: V return reads nothing");
+        }
+    }
+
+    /// BUFFER_TOO_SMALL reads on S-cells only (the provider wrote the
+    /// exact required length — kept as corroboration userspace-side,
+    /// never as a completion); V-scalars admit CKR_OK alone.
+    #[test]
+    fn length_return_reads_buffer_too_small_on_cells_only() {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let cell = 0x20_0000u64;
+            let evidence = EvidenceStart {
+                ev_cell: cell,
+                ev_ts_ns: 0x3030,
+                ev_kind: LENGTH_KIND_SCELL,
+                ev_layout: layout_code(layout),
+                ev_flags: 0,
+                reserved: [0; 12],
+            };
+            let mut spy = LengthSpy::new(length_args(&[]), Ok(512));
+            assert_eq!(
+                spy.run_return(&evidence, Some(0x3030), CKR_BUFFER_TOO_SMALL, layout, true),
+                LengthReturnVerdict::Value(512),
+                "{layout:?}: S-cell BUFFER_TOO_SMALL reads"
+            );
+            assert_eq!(spy.reads.as_slice(), &[cell]);
+            let snapshot = EvidenceStart {
+                ev_cell: 256,
+                ev_ts_ns: 0x3030,
+                ev_kind: LENGTH_KIND_VSCALAR,
+                ev_layout: layout_code(layout),
+                ev_flags: 0,
+                reserved: [0; 12],
+            };
+            let mut spy = LengthSpy::new(length_args(&[]), Ok(512));
+            assert_eq!(
+                spy.run_return(&snapshot, Some(0x3030), CKR_BUFFER_TOO_SMALL, layout, true),
+                LengthReturnVerdict::Unavailable,
+                "{layout:?}: V-scalar admits CKR_OK alone"
+            );
+            assert!(spy.reads.is_empty());
+        }
+    }
+
+    /// PENDING never reads (async results stay unavailable); failure
+    /// RVs never read; SIGNATURE_INVALID never admits a verify scalar
+    /// (K2: a provider may fail fast on a length mismatch, so a
+    /// rejected input length is ambiguous evidence).
+    #[test]
+    fn length_return_refuses_pending_failures_and_signature_invalid() {
+        use super::CKR_SIGNATURE_INVALID;
+        // PKCS#11 v2.40 CKR values used below: 5 GENERAL_ERROR,
+        // 0x30 ARGUMENTS_BAD, 0xC0 SIGNATURE_INVALID, 516 PENDING.
+        assert_eq!(CKR_SIGNATURE_INVALID, 192);
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for kind in [LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR] {
+                let evidence = EvidenceStart {
+                    ev_cell: if kind == LENGTH_KIND_SCELL { 0x20_0000 } else { 256 },
+                    ev_ts_ns: 0x3030,
+                    ev_kind: kind,
+                    ev_layout: layout_code(layout),
+                    ev_flags: 0,
+                    reserved: [0; 12],
+                };
+                for rv in [CKR_PENDING, 5, 0x30, CKR_SIGNATURE_INVALID] {
+                    let mut spy = LengthSpy::new(length_args(&[]), Ok(256));
+                    assert_eq!(
+                        spy.run_return(&evidence, Some(0x3030), rv, layout, true),
+                        LengthReturnVerdict::Unavailable,
+                        "{layout:?} kind {kind}: RV {rv:#x} never reads"
+                    );
+                    assert!(spy.reads.is_empty(), "{layout:?} kind {kind}: RV {rv:#x} zero reads");
+                }
+            }
+        }
+    }
+
+    /// A refused owned-lifetime join maps to unavailable with zero
+    /// reads on every RV, however the adapter was reached.
+    #[test]
+    fn length_return_requires_owned_lifetime() {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for kind in [LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR] {
+                let evidence = EvidenceStart {
+                    ev_cell: 0x20_0000,
+                    ev_ts_ns: 0x3030,
+                    ev_kind: kind,
+                    ev_layout: layout_code(layout),
+                    ev_flags: 0,
+                    reserved: [0; 12],
+                };
+                for rv in [CKR_OK, CKR_BUFFER_TOO_SMALL] {
+                    let mut spy = LengthSpy::new(length_args(&[]), Ok(256));
+                    assert_eq!(
+                        spy.run_return(&evidence, Some(0x3030), rv, layout, false),
+                        LengthReturnVerdict::Unavailable,
+                        "{layout:?} kind {kind}: unjoined never reads"
+                    );
+                    assert!(spy.reads.is_empty());
+                }
+            }
+        }
+    }
+
+    /// The stash binds on the START row `ts_ns` (fix9 R4): a match
+    /// reads, while a mismatch, a missing START row or a layout skew
+    /// reports `StashMismatch` with zero reads (delete + count, never
+    /// a guessed length).
+    #[test]
+    fn length_return_binds_start_timestamp() {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let evidence = EvidenceStart {
+                ev_cell: 0x20_0000,
+                ev_ts_ns: 0x3030,
+                ev_kind: LENGTH_KIND_SCELL,
+                ev_layout: layout_code(layout),
+                ev_flags: 0,
+                reserved: [0; 12],
+            };
+            // Match reads.
+            let mut spy = LengthSpy::new(length_args(&[]), Ok(256));
+            assert_eq!(
+                spy.run_return(&evidence, Some(0x3030), CKR_OK, layout, true),
+                LengthReturnVerdict::Value(256)
+            );
+            // Mismatch, missing START row, and layout skew mismatch.
+            for start in [Some(0x3031), Some(0), None] {
+                let mut spy = LengthSpy::new(length_args(&[]), Ok(256));
+                assert_eq!(
+                    spy.run_return(&evidence, start, CKR_OK, layout, true),
+                    LengthReturnVerdict::StashMismatch,
+                    "{layout:?} start {start:?}: mismatch"
+                );
+                assert!(spy.reads.is_empty(), "{layout:?}: mismatch reads nothing");
+            }
+            let other = match layout {
+                LinuxLayout::Lp64 => LinuxLayout::Ilp32,
+                LinuxLayout::Ilp32 => LinuxLayout::Lp64,
+            };
+            let mut spy = LengthSpy::new(length_args(&[]), Ok(256));
+            assert_eq!(
+                spy.run_return(&evidence, Some(0x3030), CKR_OK, other, true),
+                LengthReturnVerdict::StashMismatch,
+                "{layout:?}: layout skew mismatches"
+            );
+            assert!(spy.reads.is_empty());
+            // V-scalars bind the same stamp.
+            let snapshot = EvidenceStart {
+                ev_cell: 256,
+                ev_ts_ns: 0x3030,
+                ev_kind: LENGTH_KIND_VSCALAR,
+                ev_layout: layout_code(layout),
+                ev_flags: 0,
+                reserved: [0; 12],
+            };
+            let mut spy = LengthSpy::new(length_args(&[]), Err(()));
+            assert_eq!(
+                spy.run_return(&snapshot, Some(0x9999), CKR_OK, layout, true),
+                LengthReturnVerdict::StashMismatch,
+                "{layout:?}: V mismatch"
+            );
+        }
+    }
+
+    /// Return-side hostile widths: an ia32 value with high bits is
+    /// unavailable (never truncated), while LP64 values pass
+    /// full-width — no return cap manufactures small lengths.
+    #[test]
+    fn length_return_refuses_hostile_widths() {
+        let cell = 0x20_0000u64;
+        let evidence = EvidenceStart {
+            ev_cell: cell,
+            ev_ts_ns: 0x3030,
+            ev_kind: LENGTH_KIND_SCELL,
+            ev_layout: OBJECT_LAYOUT_ILP32,
+            ev_flags: 0,
+            reserved: [0; 12],
+        };
+        let mut spy = LengthSpy::new(length_args(&[]), Ok(256 | (1 << 32)));
+        assert_eq!(
+            spy.run_return(&evidence, Some(0x3030), CKR_OK, LinuxLayout::Ilp32, true),
+            LengthReturnVerdict::Unavailable,
+            "ia32 high-bit value refuses"
+        );
+        let evidence = EvidenceStart {
+            ev_layout: OBJECT_LAYOUT_LP64,
+            ..evidence
+        };
+        for value in [256 | (1 << 16), 256 | (1 << 32), 1 << 40] {
+            let mut spy = LengthSpy::new(length_args(&[]), Ok(value));
+            assert_eq!(
+                spy.run_return(&evidence, Some(0x3030), CKR_OK, LinuxLayout::Lp64, true),
+                LengthReturnVerdict::Value(value),
+                "LP64 value {value:#x} passes full-width"
+            );
+        }
+        // Unknown stash kinds refuse with zero reads.
+        for kind in [0, 3, 99, u8::MAX] {
+            let evidence = EvidenceStart {
+                ev_kind: kind,
+                ..evidence
+            };
+            let mut spy = LengthSpy::new(length_args(&[]), Ok(256));
+            assert_eq!(
+                spy.run_return(&evidence, Some(0x3030), CKR_OK, LinuxLayout::Lp64, true),
+                LengthReturnVerdict::Unavailable,
+                "kind {kind} refuses"
+            );
+            assert!(spy.reads.is_empty());
+        }
+    }
+
+    /// The stash row is exactly 32 bytes with pinned offsets: the
+    /// retained cell/snapshot, the START stamp, kind + layout + flags,
+    /// and zero reserved. The BPF map and the stop scrub share this
+    /// shape; any drift fails here first.
+    #[test]
+    fn evidence_start_layout_is_32_bytes() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<EvidenceStart>(), 32);
+        assert_eq!(align_of::<EvidenceStart>(), 8);
+        assert_eq!(offset_of!(EvidenceStart, ev_cell), 0);
+        assert_eq!(offset_of!(EvidenceStart, ev_ts_ns), 8);
+        assert_eq!(offset_of!(EvidenceStart, ev_kind), 16);
+        assert_eq!(offset_of!(EvidenceStart, ev_layout), 17);
+        assert_eq!(offset_of!(EvidenceStart, ev_flags), 18);
+        assert_eq!(offset_of!(EvidenceStart, reserved), 20);
+        let zeroed = EvidenceStart::default();
+        assert_eq!(zeroed.ev_cell, 0);
+        assert_eq!(zeroed.ev_ts_ns, 0);
+        assert_eq!(zeroed.ev_kind, 0);
+        assert_eq!(zeroed.ev_layout, 0);
+        assert_eq!(zeroed.ev_flags, 0);
+        assert_eq!(zeroed.reserved, [0; 12]);
+    }
 }

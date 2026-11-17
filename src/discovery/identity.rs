@@ -2287,7 +2287,7 @@ impl PinnedObjects {
         incoming: PinnedObjects,
         preserve: &[PinnedObjectId],
     ) -> Vec<Skipped> {
-        self.replace_view_pins_inner(view, incoming, preserve, true)
+        self.replace_view_pins_inner(view, incoming, preserve, preserve)
     }
 
     /// [`replace_view_pins`](Self::replace_view_pins), except preserved ids
@@ -2300,43 +2300,73 @@ impl PinnedObjects {
         incoming: PinnedObjects,
         preserve: &[PinnedObjectId],
     ) -> Vec<Skipped> {
-        self.replace_view_pins_inner(view, incoming, preserve, false)
+        self.replace_view_pins_inner(view, incoming, preserve, &[])
+    }
+
+    /// [`replace_view_pins`](Self::replace_view_pins) with split sets:
+    /// `preserve` ids stay resolvable, but only `claims_for` restore
+    /// ownership claims. Loader assembly uses this: the loader id keeps
+    /// its claims while carried provider ids stay merely resolvable.
+    pub(crate) fn replace_view_pins_with_claims_for(
+        &mut self,
+        view: ProcessViewId,
+        incoming: PinnedObjects,
+        preserve: &[PinnedObjectId],
+        claims_for: &[PinnedObjectId],
+    ) -> Vec<Skipped> {
+        self.replace_view_pins_inner(view, incoming, preserve, claims_for)
     }
 
     fn replace_view_pins_inner(
         &mut self,
         view: ProcessViewId,
         incoming: PinnedObjects,
-        preserve: &[PinnedObjectId],
-        restore_claims: bool,
+        preserve_resolve: &[PinnedObjectId],
+        preserve_claims: &[PinnedObjectId],
     ) -> Vec<Skipped> {
         self.bump_revision();
         self.ownership.remove(&view);
-        let preserved: BTreeSet<_> = preserve.iter().copied().collect();
-        let preserved_raws: BTreeSet<_> = self
-            .raw_ownership
-            .remove(&view)
-            .unwrap_or_default()
+        let resolve: BTreeSet<_> = preserve_resolve.iter().copied().collect();
+        let claim_ids: BTreeSet<_> = preserve_claims.iter().copied().collect();
+        let view_raws = self.raw_ownership.remove(&view).unwrap_or_default();
+        let resolve_raws: BTreeSet<_> = view_raws
+            .iter()
+            .filter(|raw| {
+                self.raw_to_id
+                    .get(raw)
+                    .is_some_and(|id| resolve.contains(id))
+            })
+            .cloned()
+            .collect();
+        let claim_raws: BTreeSet<_> = view_raws
             .into_iter()
             .filter(|raw| {
                 self.raw_to_id
                     .get(raw)
-                    .is_some_and(|id| preserved.contains(id))
+                    .is_some_and(|id| claim_ids.contains(id))
             })
             .collect();
         let skipped = self.absorb(incoming);
-        let preserved_raws: BTreeSet<_> = preserved_raws
+        let resolve_raws: BTreeSet<_> = resolve_raws
             .into_iter()
             .filter(|raw| {
                 self.raw_to_id
                     .get(raw)
-                    .is_some_and(|id| preserved.contains(id))
+                    .is_some_and(|id| resolve.contains(id))
+            })
+            .collect();
+        let claim_raws: BTreeSet<_> = claim_raws
+            .into_iter()
+            .filter(|raw| {
+                self.raw_to_id
+                    .get(raw)
+                    .is_some_and(|id| claim_ids.contains(id))
             })
             .collect();
         // Preserved ids survive even without raw ownership for the view
         // (their claims were recorded without raw mappings): like
         // `remove_view_except`, preserve means preserve.
-        let preserved_present: BTreeSet<_> = preserved
+        let preserved_present: BTreeSet<_> = resolve
             .iter()
             .filter(|id| self.by_id.contains_key(id))
             .copied()
@@ -2344,19 +2374,19 @@ impl PinnedObjects {
         // Claims restore exactly as before (raw-ownership-gated): only the
         // by-id/raw survival below is broadened, so preserved ids stay
         // resolvable without raw mappings.
-        let restore_ownership = restore_claims && !preserved_raws.is_empty();
-        if !preserved_raws.is_empty() {
+        let restore_ownership = !claim_raws.is_empty();
+        if !resolve_raws.is_empty() {
             self.raw_ownership
                 .entry(view)
                 .or_default()
-                .extend(preserved_raws);
+                .extend(resolve_raws);
         }
         if restore_ownership {
             self.ownership
                 .entry(view)
                 .or_default()
                 .pins
-                .extend(preserved.iter().filter(|id| self.by_id.contains_key(id)));
+                .extend(claim_ids.iter().filter(|id| self.by_id.contains_key(id)));
         }
 
         let retained_raws: BTreeSet<_> = self
@@ -2450,6 +2480,14 @@ impl PinnedObjects {
                 owned.remove(raw);
             }
         }
+        // Preserved ids survive the global purge even with no ownership
+        // anywhere (like `replace_view_pins_inner`): preserve means
+        // preserve.
+        let preserved_present: BTreeSet<_> = preserved
+            .iter()
+            .filter(|id| self.by_id.contains_key(id))
+            .copied()
+            .collect();
         let retained_raws: BTreeSet<_> = self
             .raw_ownership
             .values()
@@ -2462,15 +2500,17 @@ impl PinnedObjects {
                     .cloned(),
             )
             .collect();
-        self.raw_to_id.retain(|raw, _| retained_raws.contains(raw));
+        self.raw_to_id
+            .retain(|raw, id| retained_raws.contains(raw) || preserved_present.contains(id));
         let retained_ids: BTreeSet<_> = self.raw_to_id.values().copied().collect();
         let dropped: BTreeSet<_> = self
             .by_id
             .keys()
             .copied()
-            .filter(|id| !retained_ids.contains(id))
+            .filter(|id| !retained_ids.contains(id) && !preserved_present.contains(id))
             .collect();
-        self.by_id.retain(|id, _| retained_ids.contains(id));
+        self.by_id
+            .retain(|id, _| retained_ids.contains(id) || preserved_present.contains(id));
         // Dropping entries must not strand their claimants: scrub ownership
         // claims and owned raws for the dropped ids, mirroring remove_view.
         if !dropped.is_empty() {

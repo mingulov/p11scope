@@ -18678,6 +18678,29 @@ impl Engine {
         Ok((candidate, loader))
     }
 
+    /// Loader-assembly preserve set: the loader id plus carried provider
+    /// ids for still-attached objects. Same scope gate as the conservative
+    /// carry (cgroup member turnover only): a validated loader scan
+    /// assembles a global candidate, so without the carry its pin purge
+    /// drops the provider identity the assembled modules need to bind and
+    /// the plan replaces on every turnover.
+    fn loader_scan_preserve(&self, loader: PinnedObjectId) -> Vec<PinnedObjectId> {
+        let mut preserve = vec![loader];
+        if matches!(self.scope, Scope::Cgroup { .. }) && !self.newcomer_first_seen.is_empty() {
+            for slot in self
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| self.plan.is_active(slot.index))
+            {
+                if slot.object != loader && !preserve.contains(&slot.object) {
+                    preserve.push(slot.object);
+                }
+            }
+        }
+        preserve
+    }
+
     fn conservative_candidate(
         &mut self,
         retirements: &BTreeSet<ProcessViewId>,
@@ -22254,7 +22277,8 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
+            let preserve = self.loader_scan_preserve(loader);
+            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &preserve);
             (candidate_pins, raw_modules)
         } else if mode == LoaderScanMode::MetadataOnly && self.views[position].still_the_same() {
             // A metadata scan pinned its modules before their tables
@@ -22349,11 +22373,18 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
+            let preserve = self.loader_scan_preserve(loader);
+            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &preserve);
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();
-            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &[loader]));
+            let preserve = self.loader_scan_preserve(loader);
+            skipped.extend(candidate_pins.replace_view_pins_with_claims_for(
+                view_id,
+                fresh_pins,
+                &preserve,
+                &[loader],
+            ));
             let mut raw_modules: Vec<_> = self
                 .modules
                 .iter()

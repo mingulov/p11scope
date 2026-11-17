@@ -538,13 +538,31 @@ class BrowserCells(unittest.TestCase):
         }
         self.assertGreater(
             len(browser_modules), 0, "browser softokn module missing")
+        # v0.8.0 inventory-rss: exited callers fold into departed_use. The
+        # browser exits before the report (context closed, observer runs to
+        # duration), so its callers fold; live instances hold only the
+        # background softhsm caller. Live browser instances (retained) or
+        # folded firefox identities (exited) prove observation; both missing
+        # means an empty capture.
         browser_instances = {
             instance.get("id")
             for instance in report.get("instances") or []
             if instance.get("module") in browser_modules
         }
-        self.assertGreater(
-            len(browser_instances), 0, "browser softokn instance missing")
+        modules_by_id = {
+            module.get("id"): module for module in report.get("modules") or []
+        }
+        folded_browser_idents = []
+        for mid in browser_modules:
+            departed = (modules_by_id.get(mid) or {}).get("departed_use") or {}
+            for ident in departed.get("identities") or []:
+                exe = ((ident.get("exe") or {}).get("path") or "").lower()
+                if "firefox" in exe:
+                    folded_browser_idents.append(ident)
+        if not browser_instances:
+            self.assertGreater(
+                len(folded_browser_idents), 0,
+                "browser softokn instance missing (neither live nor folded)")
         # Wide-default build (v0.7.0): the production journal is omitted
         # (docs/known-limitations.md "Counter and journal companions at
         # the wide profile"), so `inventory --key-operations` refuses
@@ -580,25 +598,51 @@ class BrowserCells(unittest.TestCase):
             for gap in report.get("gaps") or []
             if isinstance(gap, dict)
             and gap.get("subject") == "Joint birth unavailable; retained S1")
-        self.assertNotEqual(
-            observations.get("reason"), "bootstrap_unavailable",
-            "late browser never covered (per-key tracking never started); "
-            f"birth refusals={birth_refusals}; "
-            f"observation gaps={observations.get('gaps')}")
+        # Folded browsers (exited before Joint birth) report bootstrap with
+        # S1 rows; bootstrap with no rows still means never covered.
         rows = observations.get("key_operations") or []
+        if observations.get("reason") == "bootstrap_unavailable" and not rows:
+            self.fail(
+                "late browser never covered (per-key tracking never started); "
+                f"birth refusals={birth_refusals}; "
+                f"observation gaps={observations.get('gaps')}")
         self.assertGreater(len(rows), 0, "no key-operation rows at all")
         completed_signs = sum(
             row.get("completed", 0) for row in rows
             if row.get("category") == "sign")
         self.assertGreaterEqual(
             completed_signs, 1, "no completed client-cert signs observed")
-        # browser_modules/browser_instances were proven above (both
-        # legs share that data proof); the rows below join against them.
+        # Live leg: rows join to live browser instances (proven above).
+        # Folded leg: rows reference folded instance IDs; the background
+        # slot-lister never signs, so signs outside background instances
+        # prove browser coverage with a folded browser (proven above).
         browser_rows = [row for row in rows
                         if row.get("instance") in browser_instances]
-        self.assertGreater(
-            len(browser_rows), 0,
-            "no key-operation rows on the browser instance")
+        if browser_instances:
+            self.assertGreater(
+                len(browser_rows), 0,
+                "no key-operation rows on the browser instance")
+        else:
+            self.assertGreater(
+                len(folded_browser_idents), 0,
+                "no live browser rows and no folded browser callers")
+            bg_instances = {
+                instance.get("id")
+                for instance in report.get("instances") or []
+                if instance.get("module") not in browser_modules
+            }
+            bg_signs = [row for row in rows
+                        if row.get("category") == "sign"
+                        and row.get("instance") in bg_instances]
+            self.assertEqual(
+                len(bg_signs), 0,
+                "background caller must not sign; signs prove browser")
+            folded_signs = [row for row in rows
+                            if row.get("category") == "sign"
+                            and row.get("instance") not in bg_instances]
+            self.assertGreater(
+                len(folded_signs), 0,
+                "no sign rows outside background instances")
         capture = (report.get("observation") or {}).get("semantic_capture") or {}
         self.assertEqual(capture.get("events_lost"), 0, "semantic events lost")
         # The settle gap is diagnostic, not a failure leg: seating over an

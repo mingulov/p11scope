@@ -2579,6 +2579,40 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Failure twin for the commit-time handover: if the `fchown` at
+    /// commit fails, `commit` fails closed and the creator-owned temp is
+    /// unlinked — no half-handed file, no leftover, no final. Runs
+    /// unprivileged: handing to a foreign uid fails EPERM without root.
+    #[test]
+    fn commit_handover_failure_unlinks_the_creator_owned_temp() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: needs a non-root caller (fchown must fail)");
+            return;
+        }
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let mut a = atomic_file_test_fixture(&path);
+        // A uid that is never the caller; fchown needs no passwd entry.
+        let foreign = if unsafe { libc::geteuid() } == 65534 {
+            65533
+        } else {
+            65534
+        };
+        a.handover = Some((foreign, foreign));
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        let error = a.commit().unwrap_err();
+        assert!(
+            error.contains("handing output"),
+            "fail-closed handover error, got: {error}"
+        );
+        assert!(!path.exists(), "no final on handover failure");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no leftover temp on handover failure"
+        );
+    }
+
     // RB-1/HIGH-3 supersede SYSPLAN residual F-48's "never stat the final
     // name": the final name is checked, but only through the retained
     // trusted directory with AT_SYMLINK_NOFOLLOW (`metadata_at`), never by a

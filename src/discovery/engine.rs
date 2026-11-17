@@ -18837,7 +18837,7 @@ impl Engine {
                     proofs.len(),
                 );
             }
-            self.learn_owned_proofs(&candidate.pinned, &proofs);
+            self.learn_owned_proofs(&mut candidate.pinned, &proofs);
         }
         if generation_stale {
             outcome.static_failures = target_modules;
@@ -22774,7 +22774,7 @@ impl Engine {
         let exited = view.original_exited().unwrap_or(false);
         let image_changed =
             image.is_some() && owned_watch_member_image(&self.proc_root, pid) != image;
-        let (modules, pins, _complete) = match scan_result {
+        let (modules, mut pins, _complete) = match scan_result {
             Ok(scan) => scan,
             Err(_) => {
                 self.release_view_id(id);
@@ -22865,7 +22865,7 @@ impl Engine {
             self.backoff_owned_watch_member(pid, now_ns, scan_bytes);
             return;
         }
-        self.learn_owned_proofs(&pins, &proofs);
+        self.learn_owned_proofs(&mut pins, &proofs);
         self.owned_watch_unproven.remove(&pid);
     }
 
@@ -22964,7 +22964,7 @@ impl Engine {
     /// table harvest are independent, so tables persist even when
     /// the file already staged (or was refused) through another
     /// path. No-op outside owned `run` captures on their cgroup scope.
-    fn learn_owned_proofs(&mut self, pins: &PinnedObjects, proofs: &[OwnedLearnProof]) {
+    fn learn_owned_proofs(&mut self, pins: &mut PinnedObjects, proofs: &[OwnedLearnProof]) {
         use std::os::unix::fs::MetadataExt as _;
         if self.owned_run_pid.is_none() || !matches!(self.scope, Scope::Cgroup { .. }) {
             return;
@@ -22978,7 +22978,7 @@ impl Engine {
             if self.owned_run_view(proof.view) {
                 continue;
             }
-            self.harvest_run_learned_tables(pins, proof);
+            self.harvest_run_learned_tables(&mut *pins, proof);
             let Some(file) = pins.file_for(proof.object) else {
                 continue;
             };
@@ -23051,7 +23051,7 @@ impl Engine {
     /// changes the store owes the expedited frame and the learned
     /// apply, so members the first-map stop holds resume with table
     /// probes attached instead of at their bound.
-    fn harvest_run_learned_tables(&mut self, pins: &PinnedObjects, proof: &OwnedLearnProof) {
+    fn harvest_run_learned_tables(&mut self, pins: &mut PinnedObjects, proof: &OwnedLearnProof) {
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
             return;
         }
@@ -23121,6 +23121,13 @@ impl Engine {
             }
             self.pinned
                 .alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
+            // The apply path harvests after the candidate cloned
+            // committed pins, and the commit installs that clone: file
+            // the same aliases into the candidate pins (the caller
+            // passes &mut candidate.pinned) or the commit drops the
+            // harvest and the next gap tick unbinds the run-learned
+            // modules and retires every slot.
+            pins.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
         }
         let before = self.run_learned_modules.clone();
         merge_scanned_module(&mut self.run_learned_modules, module);

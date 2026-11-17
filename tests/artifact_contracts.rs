@@ -1749,7 +1749,11 @@ fn assert_static_descriptor_cookie_contract(
         ),
         ("owned_start_mut(&key)", "template-second START lookup"),
         (
-            "let semantics = semantics_of(&ctx);",
+            "slot_count_only(slot)",
+            "template-second count-only switch",
+        ),
+        (
+            "semantics_of(&ctx)",
             "template-second descriptor consumer",
         ),
     ] {
@@ -1769,7 +1773,11 @@ fn assert_static_descriptor_cookie_contract(
             "entry START slot",
         ),
         (
-            "let semantics = semantics_of(&ctx);",
+            "let semantics = if count_only {",
+            "entry count-only switch",
+        ),
+        (
+            "semantics_of(&ctx)",
             "entry descriptor consumer",
         ),
     ] {
@@ -1804,7 +1812,11 @@ fn assert_static_descriptor_cookie_contract(
             "object Event.slot",
         ),
         (
-            "let semantics = semantics_of(ctx);",
+            "slot_count_only(slot_of(ctx))",
+            "return count-only switch",
+        ),
+        (
+            "semantics_of(ctx)",
             "return descriptor consumer",
         ),
     ] {
@@ -6711,7 +6723,7 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         &ebpf[template_second_end..]
     );
     let bypassed_primary_semantics = ebpf.replacen(
-        "    let semantics = semantics_of(&ctx);\n    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {",
+        "    let semantics = if count_only {\n        SlotSemantics::COUNT_ONLY\n    } else {\n        semantics_of(&ctx)\n    };\n    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {",
         "    let semantics = SlotSemantics::COUNT_ONLY;\n    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {",
         1,
     );

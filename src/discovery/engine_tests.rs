@@ -92322,108 +92322,156 @@ fn teardown_spawn_until_window_hit(id: ProcessViewId) -> (TeardownChild, u32, Pr
     panic!("no teardown window hit in 5 attempts; the host descheduled >160 ms every time");
 }
 
+/// How many `teardown_wait` spans a stage accumulator recorded. The
+/// deferral gate records exactly one per scan whose teardown wait ran
+/// (`scan_and_pin_with_proof`), so the count proves `deferral_ran`
+/// without trusting the silence alone: a scan that silenced via the
+/// pre-existing scan-start excuse records none.
+fn teardown_wait_span_count(stage: &crate::timing::StageTimings) -> u64 {
+    stage
+        .ops()
+        .iter()
+        .find(|(op, _, _)| *op == "teardown_wait")
+        .map_or(0, |(_, _, count)| *count)
+}
+
 /// A real 1 GiB child killed mid-scan: the scan starts in the
 /// `PF_EXITING`-not-zombie window (empty maps, pidfd unready, `kill`
 /// succeeds, whole-group proof false) and must file no loud record once
 /// the group proves exited as a zombie and after the reap. Retries the
 /// setup until the window is hit (bounded, 5 attempts) with strict
 /// controls restored, so the silence deterministically exercises the
-/// deferral, never the tolerant miss path.
+/// deferral, never the tolerant miss path. The `teardown_wait` span
+/// proves the deferral ran (a scan-start-excuse silence records none);
+/// a spanless silence retries with a fresh child (bounded, 3 attempts)
+/// instead of passing vacuously.
 #[test]
 fn teardown_large_child_scan_during_exit_holds_refusals_until_proven() {
-    let (mut holder, pid, view) = teardown_spawn_until_window_hit(ProcessViewId(9100));
-    // Strict controls restored on the hit attempt (the helper already
-    // verified them to select this attempt; re-assert the window shape
-    // here so the test fails, not the helper, if the shape regresses).
-    assert!(
-        crate::process::leader_exiting_not_zombie(&view),
-        "the scan starts in the teardown window"
-    );
-    assert_eq!(
-        view.original_exited(),
-        Ok(false),
-        "the pidfd is not ready during teardown"
-    );
-    assert!(
-        !crate::process::process_proven_exited(pid),
-        "kill still succeeds during teardown"
-    );
-    assert!(
-        !crate::process::whole_group_proven_exited(&view),
-        "the census is unproven before the zombie (control)"
-    );
-    // The exact refusal a real scan files when its initial maps read races
-    // the teardown (empty snapshot, exe still present): ending-shaped, but
-    // outside the mid-scan exit details, so only the teardown deferral
-    // silences it. Scripted so the test does not race the exe's own
-    // disappearance (~10 ms) against the 160 ms window.
-    let refusal = Skipped {
-        subject: "capture discovery".into(),
-        reason: "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot".into(),
-    };
-    assert!(
-        skip_is_ending_refusal(&refusal),
-        "the teardown refusal is one the ending excuse covers"
-    );
-    assert!(
-        !skip_is_mid_scan_exit_refusal(&refusal),
-        "empty snapshots stay outside the mid-scan exit details"
-    );
-    let mut counters = DiscoveryCounters::default();
-    let result = scan_and_pin_with(
-        &view,
-        &[],
-        &HookRegistry::builtin(),
-        &mut CaptureWorkBudget::default(),
-        &mut counters,
-        false,
-        &mut crate::timing::StageTimings::default(),
-        &mut TeardownDeferralBudget::new(),
-        None,
-        |_, _, _| {
-            Ok::<_, String>(ScanOutcome::Scanned {
-                modules: Vec::new(),
-                skipped: vec![refusal.clone()],
-                scan_ms: 0,
-            })
-        },
-        None,
-        crate::discovery::handle_table::Filing::Untracked,
-    );
-    // After the deferral wait the view is a zombie (pidfd ready), so the
-    // pin step fails its still-same check: production callers silence
-    // that pinning exit via their gone check, like any post-exit pin.
-    // What must not happen is a loud record in the counters.
-    if let Err(error) = &result {
+    use std::time::Duration;
+    // A deschedule between the pre-scan asserts and the scan gate lets the
+    // zombie land first: the scan then silences via the pre-existing
+    // scan-start excuse with no `teardown_wait` span. Such a miss retries
+    // with a fresh child (bounded, 3 attempts); only a span-proven
+    // deferral may pass, so the silence is never vacuous.
+    for attempt in 1..=3 {
+        let (mut holder, pid, view) = teardown_spawn_until_window_hit(ProcessViewId(9100));
+        // Strict controls restored on the hit attempt (the helper already
+        // verified them to select this attempt; re-assert the window shape
+        // here so the test fails, not the helper, if the shape regresses).
         assert!(
-            error.to_string().contains("process generation exited")
-                || error.to_string().contains("pinning process view"),
-            "a teardown pin fails only on the proven exit: {error:?}"
+            crate::process::leader_exiting_not_zombie(&view),
+            "the scan starts in the teardown window"
         );
+        assert_eq!(
+            view.original_exited(),
+            Ok(false),
+            "the pidfd is not ready during teardown"
+        );
+        assert!(
+            !crate::process::process_proven_exited(pid),
+            "kill still succeeds during teardown"
+        );
+        assert!(
+            !crate::process::whole_group_proven_exited(&view),
+            "the census is unproven before the zombie (control)"
+        );
+        // The exact refusal a real scan files when its initial maps read races
+        // the teardown (empty snapshot, exe still present): ending-shaped, but
+        // outside the mid-scan exit details, so only the teardown deferral
+        // silences it. Scripted so the test does not race the exe's own
+        // disappearance (~10 ms) against the 160 ms window.
+        let refusal = Skipped {
+            subject: "capture discovery".into(),
+            reason: "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot".into(),
+        };
+        assert!(
+            skip_is_ending_refusal(&refusal),
+            "the teardown refusal is one the ending excuse covers"
+        );
+        assert!(
+            !skip_is_mid_scan_exit_refusal(&refusal),
+            "empty snapshots stay outside the mid-scan exit details"
+        );
+        let mut counters = DiscoveryCounters::default();
+        let mut stage = crate::timing::StageTimings::default();
+        let mut teardown = TeardownDeferralBudget::new();
+        let result = scan_and_pin_with(
+            &view,
+            &[],
+            &HookRegistry::builtin(),
+            &mut CaptureWorkBudget::default(),
+            &mut counters,
+            false,
+            &mut stage,
+            &mut teardown,
+            None,
+            |_, _, _| {
+                Ok::<_, String>(ScanOutcome::Scanned {
+                    modules: Vec::new(),
+                    skipped: vec![refusal.clone()],
+                    scan_ms: 0,
+                })
+            },
+            None,
+            crate::discovery::handle_table::Filing::Untracked,
+        );
+        // After the deferral wait the view is a zombie (pidfd ready), so the
+        // pin step fails its still-same check: production callers silence
+        // that pinning exit via their gone check, like any post-exit pin.
+        // What must not happen is a loud record in the counters.
+        if let Err(error) = &result {
+            assert!(
+                error.to_string().contains("process generation exited")
+                    || error.to_string().contains("pinning process view"),
+                "a teardown pin fails only on the proven exit: {error:?}"
+            );
+        }
+        teardown_wait_zombie(pid);
+        assert!(
+            crate::process::whole_group_proven_exited(&view) || view.original_exited() == Ok(true),
+            "the zombie proves the exit by the verdict"
+        );
+        holder.child.wait().unwrap();
+        assert!(
+            crate::process::process_proven_exited(pid),
+            "the reaped pid names no process"
+        );
+        // A silence with no span came from the scan-start excuse (zombie
+        // before the gate), not the deferral: retry while attempts remain.
+        // A miss consumes no budget (no wait ran). Loud is never a miss —
+        // it fails below, immediately.
+        let deferral_ran = teardown_wait_span_count(&stage) == 1;
+        let silent = counters.object_skips.is_empty()
+            && counters.scan_unavailable.is_none()
+            && counters.ending_suppressed_skips > 0;
+        if !deferral_ran && silent && attempt < 3 {
+            continue;
+        }
+        assert!(
+            deferral_ran,
+            "the silence must come from the teardown deferral (exactly one teardown_wait span), not the scan-start excuse: {stage:?} {counters:?}"
+        );
+        assert!(
+            teardown.remaining() < Duration::from_millis(1000),
+            "the deferral wait charges the budget: {:?}",
+            teardown.remaining()
+        );
+        assert!(
+            counters.object_skips.is_empty(),
+            "a teardown scan files no loud record once proven: {:?}",
+            counters.object_skips
+        );
+        assert_eq!(
+            counters.scan_unavailable, None,
+            "a teardown scan latches no memory-unavailable loss"
+        );
+        assert!(
+            counters.ending_suppressed_skips > 0,
+            "the held teardown refusal counts as suppressed, not dropped: {counters:?}"
+        );
+        return;
     }
-    teardown_wait_zombie(pid);
-    assert!(
-        crate::process::whole_group_proven_exited(&view) || view.original_exited() == Ok(true),
-        "the zombie proves the exit by the verdict"
-    );
-    holder.child.wait().unwrap();
-    assert!(
-        crate::process::process_proven_exited(pid),
-        "the reaped pid names no process"
-    );
-    assert!(
-        counters.object_skips.is_empty(),
-        "a teardown scan files no loud record once proven: {:?}",
-        counters.object_skips
-    );
-    assert_eq!(
-        counters.scan_unavailable, None,
-        "a teardown scan latches no memory-unavailable loss"
-    );
-    assert!(
-        counters.ending_suppressed_skips > 0,
-        "the held teardown refusal counts as suppressed, not dropped: {counters:?}"
-    );
+    panic!("no deferral hit in 3 tries; the host descheduled every scan start past the window");
 }
 
 /// The mem-`gone` latch takes the same deferred proof: a scripted
@@ -92528,6 +92576,7 @@ fn teardown_deferral_keeps_zombie_leader_with_live_member_loud() {
         "the twin refusal is one the ending excuse covers"
     );
     let mut counters = DiscoveryCounters::default();
+    let mut stage = crate::timing::StageTimings::default();
     let result = scan_and_pin_with(
         &view,
         &[],
@@ -92535,7 +92584,7 @@ fn teardown_deferral_keeps_zombie_leader_with_live_member_loud() {
         &mut CaptureWorkBudget::default(),
         &mut counters,
         false,
-        &mut crate::timing::StageTimings::default(),
+        &mut stage,
         &mut TeardownDeferralBudget::new(),
         None,
         |_, _, _| {
@@ -92562,6 +92611,11 @@ fn teardown_deferral_keeps_zombie_leader_with_live_member_loud() {
     assert_eq!(
         counters.ending_suppressed_skips, 0,
         "the deferral claims nothing for a live group"
+    );
+    assert_eq!(
+        teardown_wait_span_count(&stage),
+        0,
+        "a live group never enters the deferral, so it records no teardown_wait span: {stage:?}"
     );
     assert!(
         crate::process::process_is_zombie(pid) && proc_task_is_live(pid, member),
@@ -92591,7 +92645,10 @@ fn teardown_deferral_budget_consumes_and_exhausts() {
 /// (deterministically too small for a 1 GiB teardown on any host, quiet or
 /// loaded) and stays loud. Total measured waiting stays within the budget
 /// plus overhead — never 2 x 1 s. Deterministic under parallel load: no
-/// timing race, only the budget arithmetic.
+/// timing race, only the budget arithmetic. The first scan must charge
+/// (remaining assert before the drain) and record its span; the second
+/// retry tells a budget-ignored silence (span present, targeted failure)
+/// from a window miss (no span, retry).
 #[test]
 fn teardown_shared_budget_caps_total_wait_and_keeps_later_loud() {
     use std::time::{Duration, Instant};
@@ -92602,38 +92659,67 @@ fn teardown_shared_budget_caps_total_wait_and_keeps_later_loud() {
     let mut teardown = TeardownDeferralBudget::new();
     // First teardown: hits its window, silences, charges the shared budget.
     // (Scan waits only are measured; child spawns are outside the budget.)
-    let (mut holder1, pid1, view1) = teardown_spawn_until_window_hit(ProcessViewId(9103));
-    let mut counters1 = DiscoveryCounters::default();
-    let mut stage1 = crate::timing::StageTimings::default();
-    let first_start = Instant::now();
-    let result1 = scan_and_pin_with(
-        &view1,
-        &[],
-        &HookRegistry::builtin(),
-        &mut CaptureWorkBudget::default(),
-        &mut counters1,
-        false,
-        &mut stage1,
-        &mut teardown,
-        None,
-        |_, _, _| {
-            Ok::<_, String>(ScanOutcome::Scanned {
-                modules: Vec::new(),
-                skipped: vec![refusal.clone()],
-                scan_ms: 0,
-            })
-        },
-        None,
-        crate::discovery::handle_table::Filing::Untracked,
+    // Retries (bounded, 3 attempts) when a parallel-load deschedule lets
+    // the zombie arrive before the scan starts: such a miss would silence
+    // via the scan-start excuse with no span and no charge, hiding a
+    // first scan that never waited. Loud is never a miss and fails below.
+    let (mut holder1, pid1, counters1, stage1, first_elapsed) = 'first: {
+        for attempt in 1..=3 {
+            let (mut holder, pid, view) = teardown_spawn_until_window_hit(ProcessViewId(9103));
+            let mut counters = DiscoveryCounters::default();
+            let mut stage = crate::timing::StageTimings::default();
+            let first_start = Instant::now();
+            let result = scan_and_pin_with(
+                &view,
+                &[],
+                &HookRegistry::builtin(),
+                &mut CaptureWorkBudget::default(),
+                &mut counters,
+                false,
+                &mut stage,
+                &mut teardown,
+                None,
+                |_, _, _| {
+                    Ok::<_, String>(ScanOutcome::Scanned {
+                        modules: Vec::new(),
+                        skipped: vec![refusal.clone()],
+                        scan_ms: 0,
+                    })
+                },
+                None,
+                crate::discovery::handle_table::Filing::Untracked,
+            );
+            let elapsed = first_start.elapsed();
+            if let Err(error) = &result {
+                assert!(
+                    error.to_string().contains("process generation exited")
+                        || error.to_string().contains("pinning process view"),
+                    "a teardown pin fails only on the proven exit: {error:?}"
+                );
+            }
+            let loud = counters.object_skips.iter().any(|skip| skip == &refusal);
+            let deferral_ran = teardown_wait_span_count(&stage) == 1;
+            // A hit (silent with a span), loud (a bug — the first must
+            // silence), or the last attempt's evidence all break; only a
+            // spanless silence retries. Misses consume no budget.
+            if (!loud && deferral_ran) || loud || attempt == 3 {
+                break 'first (holder, pid, counters, stage, elapsed);
+            }
+            teardown_wait_zombie(pid);
+            holder.child.wait().unwrap();
+        }
+        unreachable!("the bounded loop above always breaks");
+    };
+    assert!(
+        teardown.remaining() < Duration::from_millis(1000),
+        "the first scan charges the shared budget (a scan-start-excuse silence would leave it full): {:?}",
+        teardown.remaining()
     );
-    if let Err(error) = &result1 {
-        assert!(
-            error.to_string().contains("process generation exited")
-                || error.to_string().contains("pinning process view"),
-            "a teardown pin fails only on the proven exit: {error:?}"
-        );
-    }
-    let first_elapsed = first_start.elapsed();
+    assert_eq!(
+        teardown_wait_span_count(&stage1),
+        1,
+        "the first silence must come from the deferral, not the scan-start excuse: {stage1:?} {counters1:?}"
+    );
     // Simulate the busy-host pass: N-1 other teardowns already spent the
     // shared budget down to a 5 ms remainder. The second teardown below
     // therefore waits at most 5 ms — deterministically too small — and
@@ -92690,13 +92776,31 @@ fn teardown_shared_budget_caps_total_wait_and_keeps_later_loud() {
                     "a teardown pin fails only on the proven exit: {error:?}"
                 );
             }
-            // A silence here is a missed window (zombie before the wait),
-            // not a budget failure: retry while attempts remain.
-            if counters.object_skips.iter().any(|skip| skip == &refusal) {
+            // Loud with a span: the 5 ms wait ran and stayed loud — the
+            // expected budget-spent shape. Loud is never a miss (a miss
+            // silences via the scan-start excuse), so the span must be
+            // present.
+            let loud = counters.object_skips.iter().any(|skip| skip == &refusal);
+            if loud {
+                assert_eq!(
+                    teardown_wait_span_count(&stage),
+                    1,
+                    "the loud second attempt must have waited out its 5 ms remainder (the span proves the wait ran): {stage:?} {counters:?}"
+                );
                 break 'second (holder, pid, counters, elapsed);
             }
-            teardown_wait_zombie(pid);
-            holder.child.wait().unwrap();
+            // Silent without a span: a missed window (zombie before the
+            // wait), not a budget failure — retry while attempts remain.
+            // A miss consumes no budget. Silent WITH a span means the
+            // 5 ms remainder was ignored: fail targeted, never retry.
+            if teardown_wait_span_count(&stage) == 0 {
+                teardown_wait_zombie(pid);
+                holder.child.wait().unwrap();
+            } else {
+                panic!(
+                    "the budget-spent second teardown silenced after a wait (span present): the 5 ms remainder was ignored: {counters:?} {stage:?}"
+                );
+            }
         }
         panic!(
             "no loud second attempt in 3 tries; the host descheduled every scan start past the window"
@@ -92820,5 +92924,76 @@ fn teardown_wait_breaks_on_stop_and_stays_loud() {
     }
     panic!(
         "no stop-broken attempt in 3 tries; the host descheduled every scan start past the window"
+    );
+}
+
+/// Needle: `discover_plan` builds its teardown budget once per pass and
+/// passes that same object to every scan. The scripted shared twin proves
+/// the shared mechanics (cap + loud); this pins the threading so a
+/// per-scan fresh budget (a relocated `new()` or a pass-by-value) fails
+/// here. No behavioral pass-level twin: post-kill real scans return Err
+/// before the gate (the exe link is gone in <1 ms, measured on 7.0.0-43),
+/// so a real scan never reaches the wait on demand.
+#[test]
+fn discover_plan_shares_one_teardown_budget_across_its_scans() {
+    let source = include_str!("engine.rs");
+    let plan = source
+        .split_once("fn discover_plan(")
+        .unwrap()
+        .1
+        .split_once("fn build_current_plan(")
+        .unwrap()
+        .0;
+    assert_eq!(
+        plan.matches("TeardownDeferralBudget::new()").count(),
+        1,
+        "one pass budget construction per discover_plan, never per scan"
+    );
+    let reset = plan
+        .find("discovered.teardown_deferral = TeardownDeferralBudget::new();")
+        .expect("the pass budget reset");
+    let scan_loop = plan
+        .find("for (index, pid) in selected.iter().enumerate()")
+        .expect("the pass scan loop");
+    let shared = plan
+        .find("&mut discovered.teardown_deferral,")
+        .expect("the shared pass budget passed to each scan");
+    assert!(
+        reset < scan_loop && scan_loop < shared,
+        "reset once before the loop, share the field inside it"
+    );
+}
+
+/// Needle: the operator stop flag reaches the teardown wait through
+/// `discover_with_cancel` (`Some`) and the `discover_plan` scan site (the
+/// `cancel` param, not `None`). The stop twin proves the wait honors the
+/// flag behaviorally and M-1 pins the `run.rs` call site; this pins the
+/// two threading joints between them so a dropped flag fails here. No
+/// behavioral `discover_with_cancel` twin: like the pass budget, it would
+/// need a real scan to reach the wait on demand (see above).
+#[test]
+fn discover_with_cancel_threads_the_stop_flag_to_the_teardown_wait() {
+    let source = include_str!("engine.rs");
+    let with_cancel = source
+        .split_once("fn discover_with_cancel(")
+        .unwrap()
+        .1
+        .split_once("}")
+        .unwrap()
+        .0;
+    assert!(
+        with_cancel.contains("Some(cancel)"),
+        "discover_with_cancel must pass Some(cancel), never None"
+    );
+    let plan = source
+        .split_once("fn discover_plan(")
+        .unwrap()
+        .1
+        .split_once("fn build_current_plan(")
+        .unwrap()
+        .0;
+    assert!(
+        plan.contains("&mut discovered.teardown_deferral,\n            cancel,"),
+        "the discover_plan scan site must pass the cancel param, not None"
     );
 }

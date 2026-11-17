@@ -2789,6 +2789,120 @@ CASES = (
        'policy:ignored', 'policy:blocked', 'terminal_restore', 'cookie', 'fifo:ready', 'fifo:done',
        'missing_privacy', 'idle_owner']
     + ['boundary:' + point for point in ('pin', 'open_rings', 'ring_records', 'fsync', 'ring_close')])
+class SnapshotInventoryTests(unittest.TestCase):
+    """The live map inventory takes one atomic snapshot listing per pass.
+
+    One `bpftool -j map show` replaces N per-id round-trips: identical rows
+    reach the frozen validator, foreign maps stay excluded by observer-fdinfo
+    membership, and a corrupt listing fails closed. The acquisition
+    re-verify shares this path, so both passes stay consistent.
+    """
+
+    maxDiff = None
+
+    def canned_rows(self):
+        definitions = capture.live_expected_maps('wide')
+        return [{'id': 100 + index, 'name': name, 'type': capture.MAP_TYPES[row['type']],
+                 'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
+                 'max_entries': row['max_entries'],
+                 'flags': capture.LIVE_IMAGE_MAP_FLAGS.get(name, row['flags'])}
+                for index, (name, row) in enumerate(sorted(definitions.items()))]
+
+    def foreign_rows(self):
+        return [{'id': 99991 + extra, 'name': f'FOREIGN_{extra}', 'type': 'hash',
+                 'bytes_key': 4, 'bytes_value': 8, 'max_entries': 1, 'flags': 0}
+                for extra in range(2)]
+
+    def expected_maps(self, rows):
+        return sorted((capture.dumper.normalize_map_metadata(dict(row), row['id'])
+                       for row in rows), key=lambda item: item['name'])
+
+    def settle_child_fds(self, pid, ready):
+        # The sleeper's own startup I/O opens transient fds after spawn, so a
+        # bare fd census can pass in a quiet gap and then change mid-scan.
+        # The child publishes readiness after its last open; only then is the
+        # {0, 1, 2} census frozen for the membership check below.
+        end = time.monotonic() + 10
+        while not ready.exists():
+            if time.monotonic() >= end:
+                raise AssertionError('sleeper never published readiness')
+            time.sleep(0.005)
+        while time.monotonic() < end:
+            first = sorted(os.listdir(f'/proc/{pid}/fd'))
+            if first == ['0', '1', '2'] and sorted(os.listdir(f'/proc/{pid}/fd')) == first:
+                return
+            time.sleep(0.005)
+        raise AssertionError('sleeper fds never settled')
+
+    def run_inventory(self, canned, ids, calls):
+        def fake_run_json(args, require_list=False, map_identity=None, *, timeout_seconds, max_bytes):
+            calls.append((list(args), require_list, timeout_seconds, max_bytes))
+            if list(args) == ['bpftool', '-j', 'map', 'show']:
+                return copy.deepcopy(canned)
+            if list(args)[:5] != ['bpftool', '-j', 'map', 'show', 'id']:
+                raise AssertionError(f'unexpected bpftool argv: {args}')
+            return copy.deepcopy(next((row for row in canned if row.get('id') == int(args[5])), None))
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = config_for(os.getpid(), directory, lane='default-safe-profile')
+            config.workload_origin = 'external'
+            source = capture.LiveMaps(config)
+            source.owner = SimpleNamespace(helper_wait=contextlib.nullcontext)
+            ready = Path(directory) / 'sleeper.ready'
+            child = subprocess.Popen(
+                [sys.executable, '-c',
+                 'import sys, time; open(sys.argv[1], "w").close(); time.sleep(30)',
+                 str(ready)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                self.settle_child_fds(child.pid, ready)
+                group = SimpleNamespace(pid=child.pid, snapshot=lambda deadline: None)
+                with patch.object(capture.dumper, 'map_ids_from_fdinfo',
+                                  return_value=list(ids)), \
+                        patch.object(capture.dumper, 'run_json', side_effect=fake_run_json):
+                    return source.inventory(group, time.monotonic() + 30)
+            finally:
+                child.terminate()
+                child.wait(timeout=10)
+
+    def test_inventory_takes_all_maps_from_one_snapshot_listing(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        calls = []
+        maps = self.run_inventory(canned + self.foreign_rows(), ids, calls)
+        self.assertEqual([argv for argv, _, _, _ in calls], [['bpftool', '-j', 'map', 'show']])
+        _, require_list, timeout_seconds, max_bytes = calls[0]
+        self.assertTrue(require_list)
+        self.assertTrue(0 < timeout_seconds <= capture.dumper.JSON_TIMEOUT_SECONDS)
+        self.assertEqual(max_bytes, 1024 * 1024)
+        self.assertEqual(maps, self.expected_maps(canned))
+
+    def test_inventory_refuses_a_duplicate_map_id_in_the_listing(self):
+        canned = self.canned_rows()
+        canned.append(copy.deepcopy(canned[0]))
+        ids = [row['id'] for row in self.canned_rows()]
+        with self.assertRaisesRegex(capture.CaptureError, 'duplicate map id'):
+            self.run_inventory(canned, ids, [])
+
+    def test_inventory_refuses_an_fdinfo_map_missing_from_the_listing(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned] + [424242]
+        with self.assertRaisesRegex(capture.CaptureError, 'missing from snapshot listing'):
+            self.run_inventory(canned, ids, [])
+
+    def test_inventory_refuses_a_listing_row_without_a_map_identity(self):
+        canned = self.canned_rows() + [{'error': "can't get next map: Operation not permitted"}]
+        ids = [row['id'] for row in self.canned_rows()]
+        with self.assertRaisesRegex(capture.CaptureError, 'not an identified map'):
+            self.run_inventory(canned, ids, [])
+
+    def test_inventory_with_no_fdinfo_maps_makes_no_bpftool_call(self):
+        calls = []
+        with self.assertRaisesRegex(capture.CaptureError, 'map inventory mismatch'):
+            self.run_inventory(self.canned_rows(), [], calls)
+        self.assertEqual(calls, [])
+
+
 for case in CASES:
     def test(self, case=case):
         self.probe('case:' + case)

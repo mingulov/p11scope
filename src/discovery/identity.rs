@@ -2287,6 +2287,29 @@ impl PinnedObjects {
         incoming: PinnedObjects,
         preserve: &[PinnedObjectId],
     ) -> Vec<Skipped> {
+        self.replace_view_pins_inner(view, incoming, preserve, true)
+    }
+
+    /// [`replace_view_pins`](Self::replace_view_pins), except preserved ids
+    /// stay resolvable without restoring the view's ownership claims (like
+    /// `remove_view_except`). The generational carry uses this: carried
+    /// coverage must not re-own the rescanned view.
+    pub(crate) fn replace_view_pins_without_claims(
+        &mut self,
+        view: ProcessViewId,
+        incoming: PinnedObjects,
+        preserve: &[PinnedObjectId],
+    ) -> Vec<Skipped> {
+        self.replace_view_pins_inner(view, incoming, preserve, false)
+    }
+
+    fn replace_view_pins_inner(
+        &mut self,
+        view: ProcessViewId,
+        incoming: PinnedObjects,
+        preserve: &[PinnedObjectId],
+        restore_claims: bool,
+    ) -> Vec<Skipped> {
         self.bump_revision();
         self.ownership.remove(&view);
         let preserved: BTreeSet<_> = preserve.iter().copied().collect();
@@ -2310,11 +2333,25 @@ impl PinnedObjects {
                     .is_some_and(|id| preserved.contains(id))
             })
             .collect();
+        // Preserved ids survive even without raw ownership for the view
+        // (their claims were recorded without raw mappings): like
+        // `remove_view_except`, preserve means preserve.
+        let preserved_present: BTreeSet<_> = preserved
+            .iter()
+            .filter(|id| self.by_id.contains_key(id))
+            .copied()
+            .collect();
+        // Claims restore exactly as before (raw-ownership-gated): only the
+        // by-id/raw survival below is broadened, so preserved ids stay
+        // resolvable without raw mappings.
+        let restore_ownership = restore_claims && !preserved_raws.is_empty();
         if !preserved_raws.is_empty() {
             self.raw_ownership
                 .entry(view)
                 .or_default()
                 .extend(preserved_raws);
+        }
+        if restore_ownership {
             self.ownership
                 .entry(view)
                 .or_default()
@@ -2334,15 +2371,17 @@ impl PinnedObjects {
                     .cloned(),
             )
             .collect();
-        self.raw_to_id.retain(|raw, _| retained_raws.contains(raw));
+        self.raw_to_id
+            .retain(|raw, id| retained_raws.contains(raw) || preserved_present.contains(id));
         let retained_ids: BTreeSet<_> = self.raw_to_id.values().copied().collect();
         let dropped: BTreeSet<_> = self
             .by_id
             .keys()
             .copied()
-            .filter(|id| !retained_ids.contains(id))
+            .filter(|id| !retained_ids.contains(id) && !preserved_present.contains(id))
             .collect();
-        self.by_id.retain(|id, _| retained_ids.contains(id));
+        self.by_id
+            .retain(|id, _| retained_ids.contains(id) || preserved_present.contains(id));
         // Dropping entries must not strand their claimants: scrub ownership
         // claims and owned raws for the dropped ids, mirroring remove_view.
         // A no-op whenever raw ownership is complete, as production scans
@@ -2704,6 +2743,13 @@ impl PinnedObjects {
 
     pub fn view_claims(&self, view: ProcessViewId) -> Option<&ViewClaims> {
         self.ownership.get(&view)
+    }
+
+    /// Whole-store ownership equality: every view's claims and raw
+    /// mappings identical. The inventory fast path uses this (with pin
+    /// identity) to decide whether its candidate moved anything at all.
+    pub(crate) fn ownership_matches(&self, other: &Self) -> bool {
+        self.ownership == other.ownership && self.raw_ownership == other.raw_ownership
     }
 
     /// Retires one accepted process generation without disturbing another view or a

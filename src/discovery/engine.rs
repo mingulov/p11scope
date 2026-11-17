@@ -18678,21 +18678,55 @@ impl Engine {
         Ok((candidate, loader))
     }
 
+    /// Whether loader work is still in flight: undispatched discovery
+    /// records, deferred loader memory scans, or unresolved loader arm
+    /// scans. A conservative replay retiring the last offering views
+    /// carries its coverage only then; a quiet departure retires natively.
+    fn loader_work_pending(&self) -> bool {
+        !self.pending_discovery_records.is_empty()
+            || !self.pending_loader_scans.is_empty()
+            || !self.pending_loader_arm_scans.is_empty()
+    }
+
     fn conservative_candidate(
         &mut self,
         retirements: &BTreeSet<ProcessViewId>,
         keys: &BTreeSet<ObjectKey>,
     ) -> Result<LiveCandidate> {
         let assemble_start = crate::attach::monotonic_ns();
+        // Generational carry, same shape as the inventory assembly but
+        // proof-proportionate: conservative retirements are authoritative
+        // departures, so retired views' modules and pins for still-attached
+        // objects survive the replay only while loader work is still in
+        // flight (a successor generation may still map the file). Between
+        // waves the old generation exits before the successor is admitted,
+        // so dropping on retirement alone rebuilds a provider-less plan
+        // with no removal decision and no gap. A quiet departure retires
+        // natively as before. Pid scope keeps plain removal so an exited
+        // target retires (U-14).
+        let carry_objects: BTreeSet<PinnedObjectId> =
+            if self.admits_generations() && self.loader_work_pending() {
+                self.plan
+                    .slots
+                    .iter()
+                    .filter(|slot| self.plan.is_active(slot.index))
+                    .map(|slot| slot.object)
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
         let mut pinned = self.pinned.clone();
         for view in retirements {
-            pinned.remove_view(*view);
+            pinned.remove_view_except(*view, &carry_objects);
         }
         let skipped = pinned.reapply_rejected_keys(keys);
         let raw_modules = self
             .modules
             .iter()
-            .filter(|module| !retirements.contains(&module.scanned.view))
+            .filter(|module| {
+                !retirements.contains(&module.scanned.view)
+                    || carry_objects.contains(&module.object)
+            })
             .map(|module| module.scanned.clone())
             .collect();
         self.stage_timings.span(
@@ -18701,7 +18735,21 @@ impl Engine {
             assemble_start,
             crate::attach::monotonic_ns(),
         );
-        self.live_candidate(pinned, raw_modules, skipped)
+        let mut candidate = self.live_candidate(pinned, raw_modules, skipped)?;
+        // Carried views are exited: their modules ride for the still-attached
+        // objects, but the views themselves must not enter currency, stale or
+        // admission checks (like the inventory carry's declined-views
+        // precedent).
+        let carried: BTreeSet<ProcessViewId> = self
+            .modules
+            .iter()
+            .filter(|module| {
+                retirements.contains(&module.scanned.view) && carry_objects.contains(&module.object)
+            })
+            .map(|module| module.scanned.view)
+            .collect();
+        candidate.views.retain(|view| !carried.contains(view));
+        Ok(candidate)
     }
 
     fn lower_registered_retries(&self, session: &dyn EngineSession, candidate: &mut LiveCandidate) {
@@ -20897,6 +20945,11 @@ impl Engine {
                 binding.coverage.retire();
             }
         }
+        // No generational carry here: stale retirement also serves
+        // unpublished newcomers (U-07), and carrying would commit modules
+        // for views the engine never admitted. Proven-dead views' sources
+        // always retire; wave turnover is covered by the inventory and
+        // conservative carries, which never see unpublished views.
         let mut cleaned_pins = candidate.pinned.clone();
         for view in stale_views {
             cleaned_pins.remove_view(*view);
@@ -31097,6 +31150,35 @@ impl Engine {
         // pins_match_for_stability, so committing this candidate clears
         // plan_rebuild_stable and the next tick takes the full path from
         // the committed moved pins.
+        //
+        // Generational carry: pins for still-attached objects survive view
+        // churn on both paths below. In scopes with churn and admission gaps
+        // (run/cgroup/system), unscanned successors may still map the file,
+        // so dropping on view exit alone retires live attachments with no
+        // removal decision and no gap. Pid scope keeps plain removal so an
+        // exited target retires (U-14).
+        //
+        // Proof-proportionate: removed views simply vanished (exit
+        // unproven), so their pins carry freely; refreshed views were
+        // rescanned live, so their pins carry only while unadmitted
+        // newcomers wait (a successor generation may still map the file).
+        // Without successor evidence a rescanned-empty view's pins drop,
+        // and the loader ownership gate closes as before.
+        let carry_objects: BTreeSet<PinnedObjectId> = if self.admits_generations() {
+            self.plan
+                .slots
+                .iter()
+                .filter(|slot| self.plan.is_active(slot.index))
+                .map(|slot| slot.object)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let preserve_refreshed: Vec<PinnedObjectId> = if self.newcomer_first_seen.is_empty() {
+            Vec::new()
+        } else {
+            carry_objects.iter().copied().collect()
+        };
         if declined.is_empty()
             && self.plan_rebuild_stable
             && !fast_path_disabled
@@ -31117,11 +31199,15 @@ impl Engine {
         {
             let mut candidate_pins = self.pinned.clone();
             for view in removed {
-                candidate_pins.remove_view(*view);
+                candidate_pins.remove_view_except(*view, &carry_objects);
             }
             let mut pin_skipped = Vec::new();
             for (view, _, pins) in refreshed {
-                pin_skipped.extend(candidate_pins.replace_view_pins(*view, pins.clone(), &[]));
+                pin_skipped.extend(candidate_pins.replace_view_pins_without_claims(
+                    *view,
+                    pins.clone(),
+                    &preserve_refreshed,
+                ));
             }
             for (_, _, pins) in new_views {
                 pin_skipped.extend(candidate_pins.absorb(pins.clone()));
@@ -31129,7 +31215,15 @@ impl Engine {
             let (folds, lost) = canonicalize_scanned_overlays(&mut candidate_pins);
             if folds == 0 && lost.is_empty() {
                 skipped.extend(pin_skipped);
+                // The fast path skips the rebuild, so a candidate that
+                // moved pins or dropped claims must not re-establish
+                // rebuild stability; a pin- and ownership-identical
+                // candidate changes nothing and the tick stays stable
+                // tick-for-tick with a full rebuild.
+                let pins_moved = !Self::pins_match_for_stability(&candidate_pins, &self.pinned)
+                    || !candidate_pins.ownership_matches(&self.pinned);
                 let mut candidate = self.inventory_candidate_unchanged(candidate_pins, skipped)?;
+                candidate.built_by_full_rebuild = !pins_moved;
                 candidate
                     .views
                     .extend(new_views.iter().map(|(view, _, _)| view.id()));
@@ -31143,22 +31237,9 @@ impl Engine {
         }
         let assemble_start = crate::attach::monotonic_ns();
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();
-        // Generational carry: removed views' modules and pins for still-attached
-        // objects survive the tick. In scopes with churn and admission gaps
-        // (run/cgroup/system), unscanned successors may still map the file, so
-        // dropping on view exit alone retires live attachments with no removal
-        // decision and no gap. Pid scope keeps plain removal so an exited
-        // target retires (U-14).
-        let carry_objects: BTreeSet<PinnedObjectId> = if self.admits_generations() {
-            self.plan
-                .slots
-                .iter()
-                .filter(|slot| self.plan.is_active(slot.index))
-                .map(|slot| slot.object)
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+        // `carry_objects` is hoisted above the fast path: both paths carry
+        // pins for still-attached objects; the full path additionally carries
+        // removed views' modules below.
         let mut candidate_pins = self.pinned.clone();
         for view in removed {
             candidate_pins.remove_view_except(*view, &carry_objects);
@@ -31171,11 +31252,21 @@ impl Engine {
                     && !refreshed_ids.contains(&module.scanned.view)
                     || (removed.contains(&module.scanned.view)
                         && carry_objects.contains(&module.object))
+                    // A rescanned-empty view's modules ride only with
+                    // successor evidence (see `preserve_refreshed` above):
+                    // without it the rescan authoritatively dropped them.
+                    || (!preserve_refreshed.is_empty()
+                        && refreshed_ids.contains(&module.scanned.view)
+                        && carry_objects.contains(&module.object))
             })
             .map(|module| module.scanned.clone())
             .collect();
         for (view, modules, pins) in refreshed {
-            skipped.extend(candidate_pins.replace_view_pins(*view, pins.clone(), &[]));
+            skipped.extend(candidate_pins.replace_view_pins_without_claims(
+                *view,
+                pins.clone(),
+                &preserve_refreshed,
+            ));
             for module in modules {
                 merge_scanned_module_counted(
                     &mut raw_modules,

@@ -84,6 +84,8 @@ APPROVED and IMPLEMENTED (owner/Opus privacy reviews
 controller KEYMETA-T1 rulings 2026-11-16; Opus tier 3 is the final
 privacy review and no separate re-review is outstanding). The
 [Key metadata: inferred family and size class (v0.8.0 keymeta)](#key-metadata-inferred-family-and-size-class-v080-keymeta)
+section stays PROPOSED and carries no capture authority until reviewed. The
+[Provider, token and mechanism info (v0.8.0 keymeta Task 7)](#provider-token-and-mechanism-info-v080-keymeta-task-7)
 section stays PROPOSED and carries no capture authority until reviewed.
 The R2 section also amends in place, APPROVED under the same reviews
 (outside OD11's 2026-10-24 scope, which never covered these rows):
@@ -350,6 +352,9 @@ explicit, narrow internal exceptions, not finite attribute values.
 | Operation length cell (S-protocol) | Named out positions only (the §5.1 S-cells); entry retention with an entry capacity read plus the `1<<20` cap, full-span validation of the cell word and disjointness against the call's own output buffer (NULL base skips the check: query shapes read); return read on terminal CKR_OK, BUFFER_TOO_SMALL and query-shape OK only; PENDING and every other return never. | Private in-flight plus completed-call transport; cleared on every terminal path; public numeric value only from CLASSIFIED shapes per §5.2 — query values never classify, BUFFER_TOO_SMALL corroborates only (§5.4). | Null cell, absurd capacity, overlap, overflow or refused shape: unavailable with a named reason, never a guessed bound. Gated by `--key-sizes` (off by default, §10.5): without the flag no length word is acquired on any path. |
 | Operation length scalar (V-protocol) | Named in positions only (the §5.1 V-scalars); entry snapshot of the register or stack word; no dereference, no pointer retention. | Private in-flight plus completed-call transport; cleared on every terminal path; admitted userspace-side on CKR_OK only (SIGNATURE_INVALID excluded); same publication as the S-cell row. | Non-OK or ambiguous evidence: unavailable, never classified. Gated by `--key-sizes` as above. |
 | KEM length lift | `C_EncapsulateKey` arg 6 cell and `C_DecapsulateKey` arg 6 scalar snapshot as evidence under the S/V guards above; T0 stays for template headers, values, ciphertext bytes and bounds — arg 6 as a bound stays forbidden, as evidence it is snapshotted. | Same retention and publication as the S/V rows. | Same failure rules; T0 withholds still apply. Gated by `--key-sizes` as above. |
+| Provider info struct (`C_GetInfo`) | Named position only (arg 0); entry retention with a full-span guard of the per-ABI struct size (LP64 88, ia32 76); return read of the two §17.1 field ranges on CKR_OK only (§17.1). The struct pads are never fetched, not read-and-scrubbed. | Private in-flight plus info-record transport; clear on every terminal path; public parsed fields only: cryptoki/library versions, manufacturer, description, flags. | Null/unreadable pointer or a non-OK return: unavailable, never a guessed value. Ships in default inventory and CBOM (§17.7), independent of `--key-sizes`. |
+| Token info ranges (`C_GetTokenInfo`) | Named positions only (slot scalar arg 0, pointer arg 1); entry retention with a full-span guard of the per-ABI struct size (LP64 208, ia32 160) plus the slot-scalar snapshot; return read of the four §17.1 ranges on CKR_OK only. §17.2 bytes (serial, label, session counts, memory sizes, utcTime) are never fetched, not read-and-scrubbed. | Private in-flight plus info-record transport with the slot scalar from the record header; clear on every terminal path; public parsed fields only: manufacturer, model, flags (incl. the PIN-state bits), PIN min/max lens, hardware/firmware versions. | Null/unreadable pointer or a non-OK return: unavailable, never a guessed value. Ships in default inventory and CBOM (§17.7), independent of `--key-sizes`. |
+| Mechanism info struct (`C_GetMechanismInfo`) | Named positions only (slot scalar arg 0, mechanism scalar arg 1, pointer arg 2); entry retention with a full-span guard of the per-ABI struct size (LP64 24, ia32 12) plus the slot/mechanism-scalar snapshot; return read of the whole `CK_MECHANISM_INFO` on CKR_OK only. | Private in-flight plus info-record transport with the slot/mechanism scalars from the record header; clear on every terminal path; public min/max key size as raw mechanism-dependent numbers and flags (incl. `CKF_HW`). | Null/unreadable pointer or a non-OK return: unavailable, never a guessed value. Ships in default inventory and CBOM (§17.7), independent of `--key-sizes`. |
 
 ## Finite attribute vocabulary
 
@@ -2421,3 +2426,34 @@ AES-GCM canary) publish nowhere, verifier headroom + `bpf loads`
 for base journal AND length programs (§8.5), full
 `artifact_contracts`, and the Task 5 live matrix
 (Firefox/Chromium/pkcs11-tool/OpenSSL provider, ≥5 runs each, 6.6+).
+
+## Provider, token and mechanism info (v0.8.0 keymeta Task 7)
+
+**Status: PROPOSED (v0.8.0 keymeta Task 7 2026-11-14);
+owner/Opus privacy review and Codex re-review required before
+activation.** This section scopes the Task 7 schema section
+(§17.5): the per-instance `provider_info`, per-slot `tokens[]`
+and per-mechanism `mechanisms[]` keys. Reads are fixed-size
+struct/range reads at return on `CKR_OK` only (§17.1); entry
+retains the info pointer with a full-span guard.
+`CK_TOKEN_INFO.serialNumber`, `label`, session counts, memory
+sizes and `utcTime` are never fetched (§17.2); there is no
+opt-in flag for the serial in v0.8.0, and the schema has no keys
+for any excluded byte. Padded fixed-width strings publish
+trimmed (§17.1). Provider build metadata, token
+manufacturer/model/versions/flags (incl. PIN-state bits),
+PIN min/max lengths, and mechanism limits/flags are not secrets
+(owner stance 2026-11-14 — policy state, not PINs). Terminal
+states, `CKA_ID`/payload/PIN prohibitions and every other
+exclusion stay in force. Allowlist-v1 bytes are unchanged.
+Task 7 ships in default inventory and CBOM, not only under
+`--key-operations`, and independent of `--key-sizes` (§17.7).
+
+Required evidence before activation: the §17.6 host twins
+(LP64+ia32 layouts, sentinel non-publication, 129th-mechanism
+cap, CBOM serial-absence), canary lanes with Task 7 sentinel
+positions proving no excluded byte reaches output/maps/logs,
+verifier headroom + `bpf loads` (§17.4), full
+`artifact_contracts`, and the Task 5 live positives (SoftHSM
+info calls with parsed fields matching the provider's own
+reports).

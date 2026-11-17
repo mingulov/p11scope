@@ -578,6 +578,12 @@ def inspect_process(args):
     except FileNotFoundError:
         return {"pid": args.pid, "starttime": args.starttime,
                 "state": "terminal", "reason": "absent"}
+    except ProcessLookupError:
+        # ESRCH: the stat open found the PID but the task was reaped
+        # before the read. No task holds the PID, so the expected birth
+        # is provably dead, exactly like the absent shape.
+        return {"pid": args.pid, "starttime": args.starttime,
+                "state": "terminal", "reason": "reaped-during-read"}
     except (OSError, UnicodeError, ReceiptError, ValueError) as error:
         return {"pid": args.pid, "starttime": args.starttime,
                 "state": "unknown",

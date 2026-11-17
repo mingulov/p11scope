@@ -1125,6 +1125,44 @@ class ProcessCustodyTest(unittest.TestCase):
                 process.kill()
                 process.wait()
 
+    def test_inspect_process_treats_esrch_as_terminal(self):
+        # A /proc/<pid>/stat read that opens but then finds the task
+        # reaped raises ESRCH (ProcessLookupError), not ENOENT: the PID
+        # holds no task, so the expected birth is provably dead, exactly
+        # like the absent shape. The pid-profile cell of CI 43984857494
+        # failed on this: the observer's supervisor was reaped inside an
+        # inspect poll's open-to-read window and the harness read state
+        # unknown instead of terminal.
+        def esrch(proc_root, pid):
+            del proc_root, pid
+            raise ProcessLookupError(3, "No such process")
+        args = types.SimpleNamespace(proc_root="/proc", pid=424242,
+                                     starttime=987654)
+        with mock.patch.dict(RECEIPT_NS["inspect_process"].__globals__,
+                             {"read_process": esrch}):
+            result = RECEIPT_NS["inspect_process"](args)
+        self.assertEqual(result["state"], "terminal")
+        self.assertEqual(result["reason"], "reaped-during-read")
+        self.assertEqual(result["pid"], 424242)
+        self.assertEqual(result["starttime"], 987654)
+
+    def test_inspect_process_keeps_other_read_errors_unknown(self):
+        # Only ESRCH joins the absent shape: any other read error still
+        # refuses to call the birth dead.
+        def denied(proc_root, pid):
+            del proc_root, pid
+            raise PermissionError(13, "Permission denied")
+        args = types.SimpleNamespace(proc_root="/proc", pid=424243,
+                                     starttime=987655)
+        with mock.patch.dict(RECEIPT_NS["inspect_process"].__globals__,
+                             {"read_process": denied}):
+            result = RECEIPT_NS["inspect_process"](args)
+        self.assertEqual(result["state"], "unknown")
+        self.assertTrue(result["reason"].startswith("PermissionError"),
+                        result)
+        self.assertEqual(result["pid"], 424243)
+        self.assertEqual(result["starttime"], 987655)
+
 
 class VerifyGroupTest(unittest.TestCase):
     """verify-group names why a launch could not be verified."""

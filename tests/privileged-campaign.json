@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 264,
+  "default_floor": 272,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -121,6 +121,14 @@
     "attach::tests::revival_probe_clears_a_live_detached_slot_lp64",
     "attach::tests::revival_probe_never_clears_a_singles_slot_lp64",
     "attach::tests::revival_probe_skips_a_quarantined_slot_after_a_failed_detach_lp64",
+    "attach::tests::downgrade_in_place_tight_loop_keeps_exact_counts_lp64",
+    "attach::instance_tests::privileged_downgrade_in_place_object_straddle_keeps_exact_rows_lp64",
+    "attach::instance_tests::privileged_reattach_mid_object_call_faults_instead_of_straddling_lp64",
+    "attach::instance_tests::privileged_downgrade_in_place_journal_skips_begin_lp64",
+    "attach::instance_tests::privileged_downgrade_in_place_journal_irrelevant_skips_silently_lp64",
+    "attach::instance_tests::privileged_planned_count_only_journal_call_gaps_with_evidence_lp64",
+    "attach::tests::attach_over_a_set_switch_refuses_semantic_admits_count_only_lp64",
+    "attach::tests::refused_downgrade_commit_disputes_identical_slot_revalidation_lp64",
     "attach::tests::sealed_session_drain_linkage_is_behavioral",
     "attach::tests::gate_session_binds_live_gate_and_bank_cells",
     "attach::counter_banks::tests::counter_object_preflight_loads_all_modes",

@@ -2303,20 +2303,6 @@ impl PinnedObjects {
         self.replace_view_pins_inner(view, incoming, preserve, &[])
     }
 
-    /// [`replace_view_pins`](Self::replace_view_pins) with split sets:
-    /// `preserve` ids stay resolvable, but only `claims_for` restore
-    /// ownership claims. Loader assembly uses this: the loader id keeps
-    /// its claims while carried provider ids stay merely resolvable.
-    pub(crate) fn replace_view_pins_with_claims_for(
-        &mut self,
-        view: ProcessViewId,
-        incoming: PinnedObjects,
-        preserve: &[PinnedObjectId],
-        claims_for: &[PinnedObjectId],
-    ) -> Vec<Skipped> {
-        self.replace_view_pins_inner(view, incoming, preserve, claims_for)
-    }
-
     fn replace_view_pins_inner(
         &mut self,
         view: ProcessViewId,

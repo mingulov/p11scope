@@ -920,6 +920,61 @@ class EntryObjectTests(unittest.TestCase):
                         with self.subTest(function=name, mutation=reason, pc=pc):
                             with self.assertRaisesRegex(RuntimeError, "(?:seeded|aggregate) START.*("+reason+")"):
                                 CHECKER["seeded_start_contract"](mutate(disassembly, name, pc, old, new))
+                    # 1051 count-only join arms: corrupting either incoming value
+                    # (the pre-begin zero or the marker call) must lose the seed
+                    # proof. p11_entry carries the join; other entries keep their
+                    # existing memset/guard pins.
+                    if name == "p11_entry":
+                        identity = ("uprobe", name)
+                        foreign_identity = ("uprobe", "other")
+                        marker_off = report["seed"]+24
+                        seed_stores = []
+                        for scan_pc, scan_text in insns:
+                            scan_store = CHECKER["STORE"].fullmatch(scan_text)
+                            if not scan_store or scan_pc >= begin:
+                                continue
+                            scan_width, scan_base, scan_sign, scan_offset, scan_source = scan_store.groups()
+                            if scan_width != "64" or scan_source != "r0":
+                                continue
+                            if CHECKER["address"](facts.get(scan_pc, {}), scan_base, scan_sign, scan_offset) == ("stack", marker_off):
+                                seed_stores.append(scan_pc)
+                        self.assertEqual(len(seed_stores), 1, f"{name} has one 64-bit seed store to seed+24")
+                        seed_store = seed_stores[0]
+                        predecessors = [pred for pred, successors in consumer.graph.items() if seed_store in successors]
+                        self.assertEqual(len(predecessors), 2, f"{name}:{seed_store} joins two arms")
+                        arm_values = {consumer.step(pred, facts.get(pred, {}).copy()).get("r0") for pred in predecessors}
+                        self.assertEqual(arm_values, {("constant", 0), ("entry_marker", identity)},
+                                         f"{name}:{seed_store} joins 0 and the current marker")
+                        goto_pred = next(pred for pred in predecessors if texts[pred].startswith("goto "))
+                        zero_pc = max(pc for pc, text in insns if pc < goto_pred and text == "r0 = 0x0")
+                        self.assertEqual(consumer.step(zero_pc, facts.get(zero_pc, {}).copy()).get("r0"), ("constant", 0),
+                                         f"{name}:{zero_pc} defines the zero arm")
+                        self.assertFalse(any("r0 =" in text or text.startswith("call ") for pc, text in insns if zero_pc < pc < goto_pred),
+                                         f"{name}:{zero_pc} flows to the join without clobbering r0")
+                        marker_join_call = max(pc for pc, target in consumer.calls.items()
+                                              if target.endswith("object_marker_for") and pc < seed_store)
+                        self.assertEqual(consumer.step(marker_join_call, facts.get(marker_join_call, {}).copy()).get("r0"),
+                                         ("entry_marker", identity), f"{name}:{marker_join_call} defines the marker arm")
+                        for join_pc, join_old, join_new, join_arm in (
+                                (zero_pc, "r0 = 0x0", "r0 = 0x1", "count-only zero arm"),
+                                (marker_join_call, texts[marker_join_call], "r0 = 0x1", "marker arm")):
+                            with self.subTest(function=name, mutation="marker", pc=join_pc, arm=join_arm):
+                                with self.assertRaisesRegex(RuntimeError, "(?:seeded|aggregate) START.*(marker)"):
+                                    CHECKER["seeded_start_contract"](mutate(disassembly, name, join_pc, join_old, join_new))
+                        for store_r0, store_sets, store_case in (
+                                (("seed_value", identity), True, "current seed value sets the marker"),
+                                (("seed_value", foreign_identity), False, "foreign seed value misses the store"),
+                                (("constant", 0), True, "zero sets the marker"),
+                                (("constant", 1), False, "third value misses the store"),
+                                (("entry_marker", identity), True, "current marker sets the marker"),
+                                (("entry_marker", foreign_identity), False, "foreign marker misses the store"),
+                                ((("finite", frozenset({0, 1}))), False, "folded zero/one misses the store")):
+                            with self.subTest(function=name, store=store_case):
+                                stepped = consumer.step(seed_store, {"r10": ("stack", 0), "r0": store_r0})
+                                self.assertEqual(stepped.get(("seed_marker", marker_off)) is True, store_sets)
+                        with self.subTest(function=name, store="unknown register misses the store"):
+                            stepped = consumer.step(seed_store, {"r10": ("stack", 0)})
+                            self.assertNotIn(("seed_marker", marker_off), stepped)
                     # Turn a real pre-construction policy-mask instruction into
                     # a genuine user-read helper. Seed fields and guards survive;
                     # only the private-read boundary must reject this mutation.
@@ -929,6 +984,61 @@ class EntryObjectTests(unittest.TestCase):
                     changed = mutate(disassembly, name, pc, old, "call 0x70", helper_call=True)
                     with self.assertRaisesRegex(RuntimeError, "private read before construction"):
                         CHECKER["seeded_start_contract"](changed)
+        # Count-only join rejection pins (variant-independent): the 1051
+        # disjunction accepts exactly 0 and the current-cookie marker for
+        # one identity. Every broader join falls through to None; a foreign
+        # disjunction forms its own identity and misses the store above.
+        join = CHECKER["join_fact"]
+        mine = ("uprobe", "p11_entry")
+        foreign = ("uprobe", "other")
+        stale = ("uprobe", "stale")
+        for left, right, want, case in (
+                (("constant", 0), ("entry_marker", mine), ("seed_value", mine), "zero plus current marker stays proven"),
+                ((("seed_value", mine)), (("constant", 0)), (("seed_value", mine)), "seed plus zero keeps the proof"),
+                ((("seed_value", mine)), (("entry_marker", mine)), (("seed_value", mine)), "seed plus same marker keeps the proof"),
+                ((("seed_value", mine)), (("seed_value", mine)), (("seed_value", mine)), "same seed value stays proven"),
+                ((("constant", 1)), (("entry_marker", mine)), None, "third value plus marker falls through"),
+                ((("seed_value", mine)), (("constant", 1)), None, "seed plus third value falls through"),
+                ((("finite", frozenset({0}))), (("entry_marker", mine)), None, "folded zero plus marker falls through"),
+                ((("finite", frozenset({0, 1}))), (("entry_marker", mine)), None, "folded zero/one plus marker falls through"),
+                ((("seed_value", mine)), (("entry_marker", foreign)), None, "seed plus foreign marker falls through"),
+                ((("seed_value", mine)), (("seed_value", foreign)), None, "seed plus foreign seed falls through"),
+                ((("seed_value", mine)), (("seed_value", stale)), None, "seed plus stale seed falls through"),
+                ((("entry_marker", mine)), (("entry_marker", foreign)), None, "current plus foreign marker falls through")):
+            with self.subTest(join=case):
+                self.assertEqual(join(left, right), want)
+                self.assertEqual(join(right, left), want)
+        with self.subTest(join="zero plus foreign marker forms foreign disjunction"):
+            self.assertEqual(join(("constant", 0), ("entry_marker", foreign)), ("seed_value", foreign))
+            self.assertEqual(join(("entry_marker", foreign), ("constant", 0)), ("seed_value", foreign))
+        with self.subTest(join="zero plus one folds to finite, never seed"):
+            self.assertEqual(join(("constant", 0), ("constant", 1)), ("finite", frozenset({0, 1})))
+            self.assertEqual(join(("constant", 1), ("constant", 0)), ("finite", frozenset({0, 1})))
+        for triple, want, case in (
+                (((("constant", 0)), (("entry_marker", mine)), (("constant", 0))), ("seed_value", mine), "loop keeps zero/marker/zero proven"),
+                (((("constant", 0)), (("entry_marker", mine)), (("entry_marker", mine))), ("seed_value", mine), "loop keeps zero/marker/marker proven"),
+                (((("seed_value", mine)), (("constant", 0)), (("entry_marker", mine))), ("seed_value", mine), "loop keeps seed/zero/marker proven"),
+                (((("constant", 0)), (("entry_marker", mine)), (("constant", 1))), None, "loop drops a third value"),
+                (((("constant", 0)), (("constant", 1)), (("entry_marker", mine))), None, "loop drops an early third value"),
+                (((("constant", 0)), (("entry_marker", mine)), (("entry_marker", foreign))), None, "loop drops a foreign marker"),
+                (((("constant", 0)), (("entry_marker", mine)), (("seed_value", foreign))), None, "loop drops a stale seed")):
+            with self.subTest(fold=case):
+                self.assertEqual(join(join(triple[0], triple[1]), triple[2]), want)
+                self.assertEqual(join(triple[0], join(triple[1], triple[2])), want)
+        merge = CHECKER["Consumer"].merge_facts
+        with self.subTest(merge="same seed survives"):
+            self.assertEqual(merge({"r0": ("seed_value", mine)}, {"r0": ("seed_value", mine)}), {"r0": ("seed_value", mine)})
+        for other, case in (((("constant", 1)), "third value"), (("entry_marker", foreign), "foreign marker"),
+                            ((("seed_value", foreign)), "stale seed"), (None, "missing arm")):
+            with self.subTest(merge=f"merge drops {case}"):
+                incoming = {} if other is None else {"r0": other}
+                self.assertNotIn("r0", merge({"r0": ("seed_value", mine)}, incoming))
+        with self.subTest(narrow="seed value is 64-bit only"):
+            self.assertEqual(CHECKER["narrow"](("seed_value", mine), 64), ("seed_value", mine))
+            self.assertIsNone(CHECKER["narrow"](("seed_value", mine), 32))
+            self.assertIsNone(CHECKER["narrow"](("seed_value", mine), 8))
+        with self.subTest(address="seed value is never a pointer"):
+            self.assertIsNone(CHECKER["address"]({"r1": ("seed_value", mine)}, "1", "+", "0x0"))
 
     def test_ia32_span_rejection_edge_is_causal(self):
         for variant in OBJECTS:

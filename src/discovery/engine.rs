@@ -18678,16 +18678,6 @@ impl Engine {
         Ok((candidate, loader))
     }
 
-    /// Whether loader work is still in flight: undispatched discovery
-    /// records, deferred loader memory scans, or unresolved loader arm
-    /// scans. A conservative replay retiring the last offering views
-    /// carries its coverage only then; a quiet departure retires natively.
-    fn loader_work_pending(&self) -> bool {
-        !self.pending_discovery_records.is_empty()
-            || !self.pending_loader_scans.is_empty()
-            || !self.pending_loader_arm_scans.is_empty()
-    }
-
     fn conservative_candidate(
         &mut self,
         retirements: &BTreeSet<ProcessViewId>,
@@ -18695,17 +18685,19 @@ impl Engine {
     ) -> Result<LiveCandidate> {
         let assemble_start = crate::attach::monotonic_ns();
         // Generational carry, same shape as the inventory assembly but
-        // proof-proportionate: conservative retirements are authoritative
+        // scope-proportionate: conservative retirements are authoritative
         // departures, so retired views' modules and pins for still-attached
-        // objects survive the replay only while loader work is still in
-        // flight (a successor generation may still map the file). Between
-        // waves the old generation exits before the successor is admitted,
-        // so dropping on retirement alone rebuilds a provider-less plan
-        // with no removal decision and no gap. A quiet departure retires
-        // natively as before. Pid scope keeps plain removal so an exited
-        // target retires (U-14).
+        // objects survive the replay only in cgroup scope while unadmitted
+        // newcomers wait. A cgroup is a closed membership, so waiting
+        // newcomers are member turnover (a successor generation may still
+        // map the file); system scope has ambient churn, so its waiting
+        // newcomers prove nothing and its departures retire natively as
+        // before. Between waves the old generation exits before the
+        // successor is admitted, so dropping on retirement alone rebuilds
+        // a provider-less plan with no removal decision and no gap. Pid
+        // scope keeps plain removal so an exited target retires (U-14).
         let carry_objects: BTreeSet<PinnedObjectId> =
-            if self.admits_generations() && self.loader_work_pending() {
+            if matches!(self.scope, Scope::Cgroup { .. }) && !self.newcomer_first_seen.is_empty() {
                 self.plan
                     .slots
                     .iter()

@@ -1577,6 +1577,32 @@ fn loader_candidate_excludes_resolvable_but_claimless_views() {
 }
 
 #[test]
+fn replay_freshen_marks_unadmitted_listing_pids_only() {
+    // A conservative replay freshens newcomer marks from a live listing
+    // (getter-debt passes replay before the admission window marks), so
+    // the carry gate sees successors spawned since the last window.
+    // Admitted pids are never re-marked.
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "424241\n424242\n").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let (mut engine, _, _, _) = engine_with_overlay(82);
+    engine.scope = cgroup;
+    assert!(
+        engine.newcomer_first_seen.is_empty(),
+        "the fixture starts unmarked"
+    );
+    engine.freshen_newcomer_marks();
+    assert!(
+        engine.newcomer_first_seen.contains_key(&424241),
+        "unadmitted listing pids mark"
+    );
+    assert!(
+        engine.newcomer_first_seen.contains_key(&424242),
+        "unadmitted listing pids mark"
+    );
+}
+
+#[test]
 fn bind_drops_an_active_slot_whose_module_vanished_instead_of_aborting() {
     let mut facts = CaptureFacts::default();
     let mut plan = plan_with(1, 0);

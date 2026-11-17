@@ -7650,4 +7650,123 @@ mod tests {
         drop(releaser);
         assert!(paths.is_empty(), "a FIFO attests no paths: {paths:?}");
     }
+
+    // ------------------------------------------------------------------
+    // --key-sizes opt-in (v0.8.0 keymeta Task 2, spec §10.5).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn inventory_key_sizes_defaults_off() {
+        // Absent means off, on every scope and in every build flavor.
+        for scope in [
+            vec!["--pid", "7"],
+            vec!["--cgroup", "/sys/fs/cgroup/p11scope.slice"],
+            vec!["--system"],
+        ] {
+            let mut argv = vec!["inventory"];
+            argv.extend(scope);
+            let Command::Inventory(parsed) = parse(args(&argv)).unwrap() else {
+                panic!("{argv:?} should parse as inventory");
+            };
+            assert!(!parsed.key_sizes, "{argv:?} should default off");
+        }
+        // --key-operations alone never implies --key-sizes.
+        let Command::Inventory(parsed) =
+            parse(args(&["inventory", "--pid", "7", "--key-operations"])).unwrap()
+        else {
+            panic!("expected inventory");
+        };
+        assert!(!parsed.key_sizes, "key-operations alone leaves sizes off");
+    }
+
+    #[test]
+    #[cfg(not(feature = "stub-object-attributes"))]
+    fn inventory_key_sizes_parses_with_key_operations_full() {
+        // FULL builds accept the flag beside --key-operations, on every
+        // scope, whichever order the flags arrive in.
+        for scope in [
+            vec!["--pid", "7"],
+            vec!["--cgroup", "/sys/fs/cgroup/p11scope.slice"],
+            vec!["--system"],
+        ] {
+            for extra in [
+                vec!["--key-operations", "--key-sizes"],
+                vec!["--key-sizes", "--key-operations"],
+            ] {
+                let mut argv = vec!["inventory"];
+                argv.extend(scope.clone());
+                argv.extend(extra);
+                let Command::Inventory(parsed) = parse(args(&argv)).unwrap() else {
+                    panic!("{argv:?} should parse as inventory");
+                };
+                assert!(parsed.key_operations, "{argv:?} should opt into operations");
+                assert!(parsed.key_sizes, "{argv:?} should opt into sizes");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "stub-object-attributes"))]
+    fn inventory_key_sizes_without_key_operations_refused_full() {
+        // FULL builds refuse the exact shape: sizes need operations.
+        for argv in [
+            vec!["inventory", "--pid", "7", "--key-sizes"],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--key-sizes",
+                "--capture",
+                "native",
+            ],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
+                    if message.contains("--key-sizes requires --key-operations")),
+                "{argv:?} should refuse --key-sizes without --key-operations"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "stub-object-attributes")]
+    fn inventory_key_sizes_refused_under_p0() {
+        // P0 builds omit the length programs, so the flag refuses with
+        // the named FULL-only reason — alone (precedence over the
+        // requires-key-operations refusal) and beside --key-operations.
+        for argv in [
+            vec!["inventory", "--pid", "7", "--key-sizes"],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--key-operations",
+                "--key-sizes",
+            ],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
+                    if message.contains("--key-sizes requires a FULL build (P0 omits length capture)")),
+                "{argv:?} should refuse --key-sizes under P0"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_help_names_key_sizes_flag() {
+        // The flag, its usage slot beside --key-operations, and the
+        // exact §10.5 sentence are pinned where the inventory flag
+        // surface is pinned.
+        let help = HelpTopic::Inventory.text();
+        assert!(help.contains("[--key-sizes]"), "{help}");
+        assert!(
+            help.contains(
+                "--key-sizes also infers key sizes from operation lengths \
+                 (needs --key-operations; off by default — token-reported and \
+                 creation-template sizes and inferred families are still shown \
+                 without it)."
+            ),
+            "{help}"
+        );
+    }
 }

@@ -98,6 +98,18 @@ mod tests {
         Ok(MapData::create(definition, name, None)?)
     }
 
+    fn create_journal_map(name: &str, max_entries: u32) -> Result<MapData> {
+        // The journal object's actual emitted definition (the stash map
+        // lives in the journal object only).
+        let mut object = aya_obj::Object::parse(crate::EBPF_JOURNAL_OBJECT)?;
+        let mut definition = object
+            .maps
+            .remove(name)
+            .context("actual journal object map definition")?;
+        definition.set_max_entries(max_entries);
+        Ok(MapData::create(definition, name, None)?)
+    }
+
     /// Pinned OBJECT_START/STOP_GATE scratch for the quiescence tests.
     type StopFixture = (Map, Map, StopGate, HashMap<MapData, [u8; 16], [u8; 432]>);
 
@@ -132,6 +144,54 @@ mod tests {
                 &mut Map::HashMap(create_map("OBJECT_START", 2)?),
                 &gate,
                 2
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    /// Stop-scrub coverage (v0.8.0 keymeta Task 2, spec §8.2): the
+    /// quiescence scrub empties `EVIDENCE_START` on journal objects
+    /// (zero-verify-remove, like `OBJECT_START`) and leaves ordinary
+    /// objects at `OBJECT_START` alone. The table below drives the
+    /// scrub; the default suite pins it exactly.
+    #[test]
+    fn stop_scrub_table_pins_evidence_start_on_journal() {
+        assert_eq!(
+            super::STOP_SCRUB_TABLE,
+            [
+                ("OBJECT_START", 432usize, false, false),
+                ("EVIDENCE_START", 32usize, true, true),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "privileged: creates an actual EVIDENCE_START map and retains map FDs"]
+    fn evidence_stop_scrubs_real_stash_after_q() -> Result<()> {
+        use aya::maps::HashMap;
+        let mut stash = Map::HashMap(create_journal_map("EVIDENCE_START", 2)?);
+        let gate_data = create_map("STOP_GATE", 1)?;
+        let gate = StopGate::from_map_fd(gate_data.fd().as_fd())?;
+        {
+            let mut table: HashMap<_, [u8; 16], [u8; 32]> = HashMap::try_from(&mut stash)?;
+            table.insert([0x11; 16], [0xa5; 32], 0)?;
+            table.insert([0x22; 16], [0x5a; 32], 0)?;
+        }
+        gate.request_stop();
+        assert!(gate.quiescent());
+        assert_eq!(
+            super::scrub_named_map_after_quiescence::<32>(&mut stash, &gate, 2, "EVIDENCE_START")?,
+            2
+        );
+        let table: HashMap<_, [u8; 16], [u8; 32]> = HashMap::try_from(&mut stash)?;
+        assert_eq!(table.keys().count(), 0, "the stash scrubs empty");
+        assert_eq!(
+            super::scrub_named_map_after_quiescence::<32>(
+                &mut Map::HashMap(create_journal_map("EVIDENCE_START", 2)?),
+                &gate,
+                2,
+                "EVIDENCE_START"
             )?,
             0
         );

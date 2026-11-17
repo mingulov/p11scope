@@ -26744,4 +26744,167 @@ mod tests {
             "the test resealer rebuilds through the test sealer"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Length per-group routing (v0.8.0 keymeta Task 2, spec §8.6).
+    // ------------------------------------------------------------------
+
+    fn length_group_slot(index: u32, function: &str) -> crate::plan::Slot {
+        let mut slot = group_slot(index, 0, SlotSemantics::COUNT_ONLY);
+        slot.descriptor_index = crate::kinds::function_id(function).unwrap() + 1;
+        slot
+    }
+
+    /// Multi routing twin (§8.6, §12.1): flag on splits the length
+    /// endpoints out of their base groups into length groups (entry +
+    /// return always paired, never mixed) while every other group
+    /// keeps the base pair; flag off links the base pair everywhere
+    /// and selects no length program at any endpoint.
+    #[test]
+    fn journal_length_grouping_splits_length_endpoints_multi() {
+        use super::journal::{LENGTH_PROGRAMS, PROGRAMS};
+        let slots = vec![
+            length_group_slot(0, "C_Sign"),
+            length_group_slot(1, "C_Encrypt"),
+            length_group_slot(2, "C_SignInit"),
+            length_group_slot(3, "C_Verify"),
+        ];
+        // Slots 0-2 share one provider path; slot 3 is a second path.
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/a.so", ElfAbi::Lp64),
+            (3, "/b.so", ElfAbi::Lp64),
+        ]);
+        // Flag on: length endpoints split into their own groups per path.
+        let groups = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            &targets,
+            StaticRoots::Detailed,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 3, "length splits /a.so, /b.so keeps one group");
+        for group in &groups {
+            super::journal::validate_journal_group_pair(
+                group.entry_program,
+                group.return_program,
+            )
+            .unwrap();
+        }
+        let length_groups: Vec<_> = groups
+            .iter()
+            .filter(|group| group.entry_program == LENGTH_PROGRAMS[0])
+            .collect();
+        assert_eq!(length_groups.len(), 2, "one length group per length path");
+        for group in &length_groups {
+            assert_eq!(group.return_program, LENGTH_PROGRAMS[1]);
+        }
+        assert_eq!(group_member_indices(length_groups[0]), vec![0, 1]);
+        assert_eq!(group_member_indices(length_groups[1]), vec![3]);
+        let base_groups: Vec<_> = groups
+            .iter()
+            .filter(|group| group.entry_program == PROGRAMS[0])
+            .collect();
+        assert_eq!(base_groups.len(), 1);
+        assert_eq!(base_groups[0].return_program, PROGRAMS[1]);
+        assert_eq!(group_member_indices(base_groups[0]), vec![2]);
+        // Flag off: every group links the base pair; no endpoint links
+        // a length program in either backend selection.
+        let groups = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            &targets,
+            StaticRoots::Detailed,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 2, "flag off groups by path only");
+        for group in &groups {
+            assert_eq!(group.entry_program, PROGRAMS[0]);
+            assert_eq!(group.return_program, PROGRAMS[1]);
+        }
+    }
+
+    /// Per-backend link deltas (§8.3): on Multi the flag adds +G entry
+    /// links and +G return links (G = distinct length-endpoint paths);
+    /// on Singles the length pair substitutes the base pair at
+    /// already-linked sites (+0/+0, same link count, different
+    /// programs). Count-only descriptor-zero slots never take the
+    /// length pair in any mode.
+    #[test]
+    fn journal_length_grouping_counts_link_deltas() {
+        use super::journal::{LENGTH_PROGRAMS, PROGRAMS};
+        let mut slots = vec![
+            length_group_slot(0, "C_Sign"),
+            length_group_slot(1, "C_SignInit"),
+            length_group_slot(2, "C_Decrypt"),
+        ];
+        slots.push(group_slot(3, 0, SlotSemantics::COUNT_ONLY));
+        assert_eq!(slots[3].descriptor_index, 0);
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Lp64),
+            (2, "/b.so", ElfAbi::Lp64),
+            (3, "/a.so", ElfAbi::Lp64),
+        ]);
+        let count_links = |groups: &[StaticGroup]| {
+            (groups.len(), groups.len()) // one entry + one return link per group
+        };
+        let off = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            &targets,
+            StaticRoots::Detailed,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let on = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            &targets,
+            StaticRoots::Detailed,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        // Two distinct length-endpoint paths (/a.so, /b.so): +2/+2.
+        assert_eq!(count_links(&off), (2, 2));
+        assert_eq!(count_links(&on), (4, 4));
+        for group in on.iter().filter(|group| group_member_indices(group).contains(&3u32)) {
+            assert_eq!(group.entry_program, PROGRAMS[0], "count-only stays base");
+            assert_eq!(group.return_program, PROGRAMS[1]);
+        }
+        // Singles substitution: the same slots take the same link
+        // count in both modes, with per-slot program substitution.
+        let off_plan = singles_journal_link_plan(&slots, false);
+        let on_plan = singles_journal_link_plan(&slots, true);
+        assert_eq!(off_plan.len(), slots.len());
+        assert_eq!(on_plan.len(), slots.len(), "Singles +0/+0 links");
+        for (index, entry, ret) in &off_plan {
+            assert_eq!(*entry, PROGRAMS[0], "slot {index}: flag off entry");
+            assert_eq!(*ret, PROGRAMS[1], "slot {index}: flag off return");
+        }
+        for (index, entry, ret) in &on_plan {
+            let (want_entry, want_return) = if [0u32, 2u32].contains(index) {
+                (LENGTH_PROGRAMS[0], LENGTH_PROGRAMS[1])
+            } else {
+                (PROGRAMS[0], PROGRAMS[1])
+            };
+            assert_eq!(*entry, want_entry, "slot {index}: flag on entry");
+            assert_eq!(*ret, want_return, "slot {index}: flag on return");
+        }
+    }
 }

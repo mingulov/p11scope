@@ -1087,4 +1087,285 @@ mod tests {
         assert_eq!(COMPACT_OMIT_END - COMPACT_OMIT_START, 160);
         assert_eq!(OBJECT_ATTR_STATUS_MAX, 10);
     }
+
+    // ------------------------------------------------------------------
+    // END+length trailers (v0.8.0 keymeta Task 2, spec §8.3).
+    // ------------------------------------------------------------------
+
+    use crate::evidence_table::{
+        LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR, LENGTH_STATUS_OK, LENGTH_STATUS_UNAVAILABLE,
+        LENGTH_TRAILER_VERSION,
+    };
+
+    fn trailer_bytes_twin(trailer: &LengthTrailer) -> &[u8] {
+        // SAFETY: the frozen repr(C) trailer holds only initialized
+        // integer fields; its exact no-padding layout is pinned below.
+        unsafe { core::slice::from_raw_parts(core::ptr::from_ref(trailer).cast::<u8>(), 16) }
+    }
+
+    fn end_length_bytes_twin(
+        record: &JournalEndFull,
+        trailer: &LengthTrailer,
+    ) -> [u8; JOURNAL_END_LENGTH_BYTES] {
+        let mut record = *record;
+        record.header.length = JOURNAL_END_LENGTH_BYTES as u16;
+        let mut bytes = [0u8; JOURNAL_END_LENGTH_BYTES];
+        bytes[..JOURNAL_END_FULL_BYTES].copy_from_slice(full_end_bytes(&record));
+        bytes[JOURNAL_END_FULL_BYTES..].copy_from_slice(trailer_bytes_twin(trailer));
+        bytes
+    }
+
+    fn tracked_absent_end_for_twin(name: &str) -> JournalEndFull {
+        let function = function_named(name);
+        let mut record = unjournaled_absent_full_end();
+        record.payload.base.event.target_function = function;
+        record.header.flags = JOURNAL_END_TAIL_ABSENT;
+        record.header.thread = 0x1111_2222_3333_4444;
+        record.header.sequence = 0x5555_6666_7777_8888;
+        record
+    }
+
+    fn tracked_wrap_end_twin() -> (JournalEndFull, ObjectDescriptorWire) {
+        use crate::object_wire::{OBJECT_DERIVE_UNAVAILABLE, OBJECT_LAYOUT_LP64};
+        let function = function_named("C_WrapKey");
+        let descriptor = canonical_object_wire(function);
+        let (mut record, _) = tracked_full_end();
+        record.payload.base.event.target_function = function;
+        record.payload.object = ObjectCallWire {
+            version: OBJECT_CALL_VERSION,
+            bytes: OBJECT_CALL_BYTES,
+            descriptor_index: function + 1,
+            layout: OBJECT_LAYOUT_LP64,
+            action: descriptor.action,
+            entry_derive: OBJECT_DERIVE_UNAVAILABLE,
+            input_handles: [0x7070, 0x8080],
+            input_status: [1, 1],
+            ..Default::default()
+        };
+        (record, descriptor)
+    }
+
+    fn ok_trailer_twin(kind: u8, value: u64) -> LengthTrailer {
+        LengthTrailer {
+            version: LENGTH_TRAILER_VERSION,
+            kind,
+            status: LENGTH_STATUS_OK,
+            reserved: [0; 4],
+            value,
+        }
+    }
+
+    /// The 648-byte END+length form validates: exact header, the
+    /// unchanged 608-byte payload (byte-identical to the base form),
+    /// and the carried trailer. Both tail shapes (absent-tail C_Sign,
+    /// present-tail C_WrapKey) dispatch through the actual decoder.
+    #[test]
+    fn end_length_form_validates_with_trailer() {
+        let rows = publish_object_descriptors();
+        // Absent-tail S endpoint (C_Sign, tracked).
+        let record = tracked_absent_end_for_twin("C_Sign");
+        let trailer = ok_trailer_twin(LENGTH_KIND_SCELL, 256);
+        let bytes = end_length_bytes_twin(&record, &trailer);
+        let end = validate_end(&bytes, None).expect("trailered absent-tail END validates");
+        assert!(!end.compact());
+        assert!(end.length());
+        assert!(end.tail_absent());
+        assert!(!end.unjournaled());
+        assert_eq!(end.thread(), record.header.thread);
+        assert_eq!(end.sequence(), record.header.sequence);
+        let carried = end.length_trailer().expect("the trailer rides the validated END");
+        assert_eq!(carried.version, LENGTH_TRAILER_VERSION);
+        assert_eq!(carried.kind, LENGTH_KIND_SCELL);
+        assert_eq!(carried.status, LENGTH_STATUS_OK);
+        assert_eq!(carried.value, 256);
+        assert_eq!(carried.reserved, [0; 4]);
+        assert_eq!(end.raw_bytes(), bytes.as_slice());
+        assert_eq!(
+            end.payload_bytes().as_slice(),
+            &full_end_bytes(&record)[JOURNAL_COMMON_BYTES..],
+            "the 608-byte payload is byte-identical to the base form"
+        );
+        let Some(JournalRecord::End(decoded)) = decode_journal_record(&bytes, &rows) else {
+            panic!("the actual dispatcher accepts the 648 form");
+        };
+        assert!(decoded.length());
+        assert_eq!(decoded.length_trailer().unwrap().value, 256);
+        // Base forms carry no trailer.
+        let base = validate_end(full_end_bytes(&record), None).unwrap();
+        assert!(!base.length());
+        assert!(base.length_trailer().is_none());
+        // Present-tail S endpoint (C_WrapKey, tracked).
+        let (wrap, descriptor) = tracked_wrap_end_twin();
+        assert!(
+            validate_end(full_end_bytes(&wrap), Some(&descriptor)).is_some(),
+            "the Wrap base END is valid first (positive control)"
+        );
+        let wrap_bytes = end_length_bytes_twin(&wrap, &ok_trailer_twin(LENGTH_KIND_SCELL, 40));
+        let wrap_end = validate_end(&wrap_bytes, Some(&descriptor))
+            .expect("trailered present-tail END validates");
+        assert!(wrap_end.length());
+        assert!(!wrap_end.tail_absent());
+        assert_eq!(wrap_end.length_trailer().unwrap().value, 40);
+        let Some(JournalRecord::End(decoded)) = decode_journal_record(&wrap_bytes, &rows) else {
+            panic!("the actual dispatcher accepts the trailered Wrap END");
+        };
+        assert_eq!(decoded.length_trailer().unwrap().value, 40);
+        // Absent-tail V endpoint (C_Verify, tracked).
+        let verify = tracked_absent_end_for_twin("C_Verify");
+        let verify_bytes = end_length_bytes_twin(&verify, &ok_trailer_twin(LENGTH_KIND_VSCALAR, 64));
+        let verify_end =
+            validate_end(&verify_bytes, None).expect("trailered V END validates");
+        assert_eq!(verify_end.length_trailer().unwrap().kind, LENGTH_KIND_VSCALAR);
+        // An unavailable trailer (status 0, zero value) validates: the
+        // completion stands, the length is unknown.
+        let unavailable = LengthTrailer {
+            version: LENGTH_TRAILER_VERSION,
+            kind: LENGTH_KIND_SCELL,
+            status: LENGTH_STATUS_UNAVAILABLE,
+            reserved: [0; 4],
+            value: 0,
+        };
+        let unavailable_bytes = end_length_bytes_twin(&record, &unavailable);
+        let unavailable_end = validate_end(&unavailable_bytes, None)
+            .expect("unavailable trailer validates with a zero value");
+        assert_eq!(
+            unavailable_end.length_trailer().unwrap().status,
+            LENGTH_STATUS_UNAVAILABLE
+        );
+    }
+
+    /// Trailer-validator twins (version/kind/row/zero-reserved): every
+    /// violation refuses the record loudly, never a silent misparse.
+    /// A 648-byte record whose header still says 632 refuses, and a
+    /// trailer on a function without a length row refuses.
+    #[test]
+    fn end_length_trailer_violations_refuse() {
+        let record = tracked_absent_end_for_twin("C_Sign");
+        let good = ok_trailer_twin(LENGTH_KIND_SCELL, 256);
+        assert!(validate_end(&end_length_bytes_twin(&record, &good), None).is_some());
+        let cases: [(&str, LengthTrailer); 9] = [
+            ("version 0", LengthTrailer { version: 0, ..good }),
+            ("version 2", LengthTrailer { version: 2, ..good }),
+            ("kind 0", LengthTrailer { kind: 0, ..good }),
+            ("kind 3", LengthTrailer { kind: 3, ..good }),
+            ("kind 99", LengthTrailer { kind: 99, ..good }),
+            (
+                "V kind at an S endpoint",
+                LengthTrailer { kind: LENGTH_KIND_VSCALAR, ..good },
+            ),
+            ("status 2", LengthTrailer { status: 2, ..good }),
+            ("status 99", LengthTrailer { status: 99, ..good }),
+            (
+                "nonzero value on unavailable",
+                LengthTrailer { status: LENGTH_STATUS_UNAVAILABLE, value: 1, ..good },
+            ),
+        ];
+        for (name, trailer) in cases {
+            assert!(
+                validate_end(&end_length_bytes_twin(&record, &trailer), None).is_none(),
+                "{name} refuses"
+            );
+        }
+        // Each reserved byte must be zero.
+        for offset in 0..4 {
+            let mut trailer = good;
+            trailer.reserved[offset] = 1;
+            assert!(
+                validate_end(&end_length_bytes_twin(&record, &trailer), None).is_none(),
+                "reserved byte {offset} refuses"
+            );
+        }
+        // An S trailer at a V endpoint refuses (row mismatch, other way).
+        let verify = tracked_absent_end_for_twin("C_Verify");
+        assert!(
+            validate_end(&end_length_bytes_twin(&verify, &good), None).is_none(),
+            "S kind at a V endpoint refuses"
+        );
+        // A trailer on a function without a length row refuses.
+        let create = tracked_full_end().0;
+        assert!(
+            validate_end(&end_length_bytes_twin(&create, &good), None).is_none(),
+            "trailer at a non-length function refuses"
+        );
+        let init = tracked_absent_end_for_twin("C_Initialize");
+        assert!(
+            validate_end(&end_length_bytes_twin(&init, &good), None).is_none(),
+            "trailer at C_Initialize refuses"
+        );
+        // A 648-byte record whose header still says 632 refuses.
+        let mut mislabeled = end_length_bytes_twin(&record, &good);
+        mislabeled[2..4].copy_from_slice(&(JOURNAL_END_FULL_BYTES as u16).to_le_bytes());
+        assert!(
+            validate_end(&mislabeled, None).is_none(),
+            "648 bytes with a 632 length field refuse"
+        );
+    }
+
+    /// Dispatch twins: 648 accepts; the dropped carriers (488/760/600)
+    /// and every neighbor stay malformed; the legacy forms
+    /// (224/632/472/368/608) are unchanged.
+    #[test]
+    fn end_length_dispatch_pins_form_lengths() {
+        let rows = publish_object_descriptors();
+        let record = tracked_absent_end_for_twin("C_Sign");
+        let good = ok_trailer_twin(LENGTH_KIND_SCELL, 256);
+        let bytes = end_length_bytes_twin(&record, &good);
+        assert!(matches!(
+            decode_journal_record(&bytes, &rows),
+            Some(JournalRecord::End(_))
+        ));
+        // Dropped carriers and neighbors: malformed, never decoded.
+        for len in [488usize, 760, 600, 647, 649, 640, 656] {
+            let mut truncated = [0u8; 760];
+            let kept = len.min(JOURNAL_END_LENGTH_BYTES);
+            truncated[..kept].copy_from_slice(&bytes[..kept]);
+            // A resized record keeps a 648 length field, so even the
+            // length-prefix alone refuses; fix the field to isolate the
+            // dispatch-by-length rule.
+            truncated[2..4].copy_from_slice(&(len as u16).to_le_bytes());
+            assert!(
+                decode_journal_record(&truncated[..len], &rows).is_none(),
+                "{len}-byte record stays malformed"
+            );
+        }
+        // Legacy forms still dispatch exactly as before.
+        let base = full_end_bytes(&record);
+        assert!(matches!(
+            decode_journal_record(base, &rows),
+            Some(JournalRecord::End(_))
+        ));
+        // The 648 prefix is not a 632 record: its length field says 648.
+        assert!(decode_journal_record(&bytes[..JOURNAL_END_FULL_BYTES], &rows).is_none());
+    }
+
+    /// The trailer is exactly 16 bytes with pinned offsets; the
+    /// END+length form is exactly 648 bytes (632 + 16).
+    #[test]
+    fn end_length_wire_sizes_are_exact() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<LengthTrailer>(), 16);
+        assert_eq!(size_of::<JournalEndLength>(), JOURNAL_END_LENGTH_BYTES);
+        assert_eq!(JOURNAL_END_LENGTH_BYTES, 648);
+        assert_eq!(
+            JOURNAL_END_LENGTH_RING_BYTES,
+            JOURNAL_END_LENGTH_BYTES + 8
+        );
+        assert_eq!(offset_of!(LengthTrailer, version), 0);
+        assert_eq!(offset_of!(LengthTrailer, kind), 2);
+        assert_eq!(offset_of!(LengthTrailer, status), 3);
+        assert_eq!(offset_of!(LengthTrailer, reserved), 4);
+        assert_eq!(offset_of!(LengthTrailer, value), 8);
+        assert_eq!(align_of::<LengthTrailer>(), 8);
+        assert_eq!(align_of::<JournalEndLength>(), 8);
+        assert_eq!(offset_of!(JournalEndLength, header), 0);
+        assert_eq!(offset_of!(JournalEndLength, payload), JOURNAL_COMMON_BYTES);
+        assert_eq!(
+            offset_of!(JournalEndLength, trailer),
+            JOURNAL_COMMON_BYTES + 608
+        );
+        assert_eq!(
+            offset_of!(JournalEndLength, trailer) + size_of::<LengthTrailer>(),
+            size_of::<JournalEndLength>()
+        );
+    }
 }

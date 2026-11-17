@@ -17069,3 +17069,139 @@ fn architecture_guards_run_in_ci() {
         "the tests job no longer runs the rest partition as `{expected}`"
     );
 }
+
+/// Keymeta Task 2 off-mode identity + routing contract (spec §8.5,
+/// §8.6, §12.1): the FULL journal object carries the base pair plus
+/// the length pair with the `EVIDENCE_START` stash (P0 carries the
+/// base pair only); the base roots reference no length code, so
+/// their linked instruction streams cannot move through
+/// shared-helper growth; the length wrappers carry the insert-failure
+/// bump and the stash delete; the P0 flavor omits the length
+/// programs by feature gate. Builds that omit the journal object
+/// carry no length surface; the positive runs in journal builds.
+#[test]
+fn keymeta_task2_length_capture_off_mode_identity_and_routing() {
+    if p11scope::EBPF_JOURNAL_OBJECT.is_empty() {
+        assert_ne!(
+            env!("P11SCOPE_JOURNAL_ENABLED"),
+            "1",
+            "a journal-enabled build must embed the journal object"
+        );
+        return;
+    }
+    let p0 = cfg!(feature = "stub-object-attributes");
+    let object =
+        aya_obj::Object::parse(p11scope::EBPF_JOURNAL_OBJECT).expect("journal bytes parse");
+    let programs: BTreeSet<&str> = object.programs.keys().map(String::as_str).collect();
+    for root in ["p11_entry_journal", "p11_return_journal"] {
+        assert!(
+            programs.contains(root),
+            "the journal object carries the base pair ({root} missing)"
+        );
+    }
+    for root in ["p11_entry", "p11_return"] {
+        assert!(
+            !programs.contains(root),
+            "no ordinary root leaks into the journal object ({root} present)"
+        );
+    }
+    let length = [
+        "p11_entry_journal_length",
+        "p11_return_journal_length",
+    ];
+    if p0 {
+        for root in length {
+            assert!(
+                !programs.contains(root),
+                "the P0 journal flavor omits the length programs ({root} present)"
+            );
+        }
+    } else {
+        for root in length {
+            assert!(
+                programs.contains(root),
+                "the FULL journal object carries the length pair ({root} missing)"
+            );
+        }
+    }
+    let stash = object
+        .maps
+        .get("EVIDENCE_START")
+        .expect("the journal object carries the EVIDENCE_START stash");
+    assert_eq!(
+        (
+            stash.map_type(),
+            stash.key_size(),
+            stash.value_size(),
+            stash.max_entries(),
+            stash.map_flags()
+        ),
+        (1, 16, 32, 16_384, 0),
+        "EVIDENCE_START shape is exact (Hash, 16, 32, 16384, 0)"
+    );
+    // The length evidence counters ride the shared EVIDENCE cells
+    // (spec §8.2: new cells beside the existing accounting).
+    let evidence = object
+        .maps
+        .get("EVIDENCE")
+        .expect("the journal object carries EVIDENCE");
+    assert_eq!(
+        evidence.max_entries(),
+        11,
+        "EVIDENCE carries the two length cells"
+    );
+    // Base-region purity: no length reference (adapter or stash) may
+    // appear before the length-programs marker, so base-program
+    // instruction streams cannot gain length code through shared
+    // growth. The length region carries the full discipline: both
+    // adapters, the stash insert/remove, and both evidence bumps.
+    let roots = read("crates/ebpf/src/journal_roots.rs");
+    assert!(
+        roots.contains("#[cfg(not(feature = \"stub-object-attributes\"))]"),
+        "the length programs sit behind the P0 feature gate"
+    );
+    let marker = "// Length programs (v0.8.0 keymeta Task 2";
+    let at = roots
+        .find(marker)
+        .unwrap_or_else(|| panic!("journal_roots.rs carries the length-programs marker"));
+    let (base_region, length_region) = roots.split_at(at);
+    for banned in ["adapter_length_", "EVIDENCE_START"] {
+        assert!(
+            !base_region.contains(banned),
+            "the base region references no length code ({banned} leaked)"
+        );
+    }
+    for required in [
+        "p11_entry_journal_length",
+        "p11_return_journal_length",
+        "adapter_length_entry",
+        "adapter_length_return",
+        "EVIDENCE_START",
+        "EVIDENCE_LENGTH_INSERT_FAILURES",
+        "EVIDENCE_LENGTH_STASH_MISMATCHES",
+    ] {
+        assert!(
+            length_region.contains(required),
+            "the length region carries {required}"
+        );
+    }
+    // The stash map is journal-gated in the loader object.
+    let main = read("crates/ebpf/src/main.rs");
+    let stash_line = main
+        .lines()
+        .position(|line| line.contains("static EVIDENCE_START"))
+        .expect("main.rs defines the EVIDENCE_START map");
+    assert!(
+        main.lines()
+            .skip(stash_line.saturating_sub(3))
+            .take(3)
+            .any(|line| line.contains("p11scope_journal_roots")),
+        "EVIDENCE_START is journal-gated"
+    );
+    // The shared evidence vocabulary pins the grown cell count.
+    assert!(
+        read("crates/ebpf-common/src/lib.rs")
+            .contains("pub const EVIDENCE_CELLS: u32 = 11;"),
+        "EVIDENCE_CELLS pins the two length cells"
+    );
+}

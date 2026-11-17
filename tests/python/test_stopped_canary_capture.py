@@ -2790,12 +2790,15 @@ CASES = (
        'missing_privacy', 'idle_owner']
     + ['boundary:' + point for point in ('pin', 'open_rings', 'ring_records', 'fsync', 'ring_close')])
 class SnapshotInventoryTests(unittest.TestCase):
-    """The live map inventory takes one atomic snapshot listing per pass.
+    """The live map inventory takes one snapshot listing per pass.
 
     One `bpftool -j map show` replaces N per-id round-trips: identical rows
-    reach the frozen validator, foreign maps stay excluded by observer-fdinfo
-    membership, and a corrupt listing fails closed. The acquisition
-    re-verify shares this path, so both passes stay consistent.
+    reach the frozen validator, foreign rows (even malformed or duplicated
+    ones) stay excluded by observer-fdinfo membership, and a listing that
+    loses an observer row fails closed. Past the listing bound the
+    inventory pages per map id instead of failing, so success never depends
+    on the host-wide map count. The acquisition re-verify shares this path,
+    so both passes stay consistent.
     """
 
     maxDiff = None
@@ -2834,14 +2837,19 @@ class SnapshotInventoryTests(unittest.TestCase):
             time.sleep(0.005)
         raise AssertionError('sleeper fds never settled')
 
-    def run_inventory(self, canned, ids, calls):
+    def run_inventory(self, canned, ids, calls, *, listing_error=None, per_id_error=None):
         def fake_run_json(args, require_list=False, map_identity=None, *, timeout_seconds, max_bytes):
             calls.append((list(args), require_list, timeout_seconds, max_bytes))
             if list(args) == ['bpftool', '-j', 'map', 'show']:
+                if listing_error is not None:
+                    raise listing_error
                 return copy.deepcopy(canned)
             if list(args)[:5] != ['bpftool', '-j', 'map', 'show', 'id']:
                 raise AssertionError(f'unexpected bpftool argv: {args}')
-            return copy.deepcopy(next((row for row in canned if row.get('id') == int(args[5])), None))
+            if per_id_error is not None:
+                raise per_id_error
+            return copy.deepcopy(next(
+                (row for row in canned if isinstance(row, dict) and row.get('id') == int(args[5])), None))
 
         with tempfile.TemporaryDirectory() as directory:
             config = config_for(os.getpid(), directory, lane='default-safe-profile')
@@ -2874,7 +2882,7 @@ class SnapshotInventoryTests(unittest.TestCase):
         _, require_list, timeout_seconds, max_bytes = calls[0]
         self.assertTrue(require_list)
         self.assertTrue(0 < timeout_seconds <= capture.dumper.JSON_TIMEOUT_SECONDS)
-        self.assertEqual(max_bytes, 1024 * 1024)
+        self.assertEqual(max_bytes, 8 * 1024 * 1024)
         self.assertEqual(maps, self.expected_maps(canned))
 
     def test_inventory_refuses_a_duplicate_map_id_in_the_listing(self):
@@ -2890,10 +2898,32 @@ class SnapshotInventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(capture.CaptureError, 'missing from snapshot listing'):
             self.run_inventory(canned, ids, [])
 
-    def test_inventory_refuses_a_listing_row_without_a_map_identity(self):
-        canned = self.canned_rows() + [{'error': "can't get next map: Operation not permitted"}]
+    def test_inventory_ignores_malformed_rows_for_foreign_maps(self):
+        canned = self.canned_rows()
+        junk = [{'error': "can't get next map: Operation not permitted"},
+                {'id': 'not-an-integer', 'name': 'FOREIGN_STR', 'type': 'hash',
+                 'bytes_key': 4, 'bytes_value': 8, 'max_entries': 1, 'flags': 0},
+                {'id': True, 'name': 'FOREIGN_BOOL', 'type': 'hash',
+                 'bytes_key': 4, 'bytes_value': 8, 'max_entries': 1, 'flags': 0},
+                {'id': 0, 'name': 'FOREIGN_ZERO', 'type': 'hash',
+                 'bytes_key': 4, 'bytes_value': 8, 'max_entries': 1, 'flags': 0},
+                {'id': -7, 'name': 'FOREIGN_NEGATIVE', 'type': 'hash',
+                 'bytes_key': 4, 'bytes_value': 8, 'max_entries': 1, 'flags': 0},
+                'stray-string-row', None, 42,
+                {'id': 99991, 'name': 'FOREIGN_0', 'type': 'hash',
+                 'bytes_key': 4, 'bytes_value': 8, 'max_entries': 1, 'flags': 0}]
+        ids = [row['id'] for row in canned]
+        calls = []
+        maps = self.run_inventory(canned + self.foreign_rows() + junk, ids, calls)
+        self.assertEqual([argv for argv, _, _, _ in calls], [['bpftool', '-j', 'map', 'show']])
+        self.assertEqual(maps, self.expected_maps(canned))
+
+    def test_inventory_refuses_an_observer_map_lost_behind_an_error_row(self):
+        canned = self.canned_rows()
+        canned.pop(0)
+        canned = canned + [{'error': "can't get next map: Operation not permitted"}]
         ids = [row['id'] for row in self.canned_rows()]
-        with self.assertRaisesRegex(capture.CaptureError, 'not an identified map'):
+        with self.assertRaisesRegex(capture.CaptureError, 'missing from snapshot listing'):
             self.run_inventory(canned, ids, [])
 
     def test_inventory_with_no_fdinfo_maps_makes_no_bpftool_call(self):
@@ -2901,6 +2931,77 @@ class SnapshotInventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(capture.CaptureError, 'map inventory mismatch'):
             self.run_inventory(self.canned_rows(), [], calls)
         self.assertEqual(calls, [])
+
+    def test_inventory_pages_per_id_when_the_snapshot_listing_overflows(self):
+        canned = self.canned_rows()
+        busy = [{'id': 50000 + extra, 'name': f'BUSY_{extra}', 'type': 'hash',
+                 'bytes_key': 4, 'bytes_value': 8, 'max_entries': 1, 'flags': 0}
+                for extra in range(50)]
+        ids = [row['id'] for row in canned]
+        calls = []
+        overflow = RuntimeError(
+            f'bpftool JSON acquisition exceeded output bound {capture.INVENTORY_LISTING_MAX_BYTES}')
+        maps = self.run_inventory(canned + busy, ids, calls, listing_error=overflow)
+        self.assertEqual([argv for argv, _, _, _ in calls],
+                         [['bpftool', '-j', 'map', 'show']]
+                         + [['bpftool', '-j', 'map', 'show', 'id', str(map_id)] for map_id in ids])
+        for _, require_list, timeout_seconds, max_bytes in calls[1:]:
+            self.assertFalse(require_list)
+            self.assertTrue(0 < timeout_seconds <= capture.dumper.JSON_TIMEOUT_SECONDS)
+            self.assertEqual(max_bytes, 65536)
+        self.assertEqual(maps, self.expected_maps(canned))
+
+    def test_inventory_fallback_failure_names_the_fallback_stage(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        overflow = RuntimeError(
+            f'bpftool JSON acquisition exceeded output bound {capture.INVENTORY_LISTING_MAX_BYTES}')
+        tool_failure = RuntimeError('bpftool -j map show id 100 failed: boom-marker')
+        with self.assertRaises(capture.CaptureError) as raised:
+            self.run_inventory(canned, ids, [], listing_error=overflow, per_id_error=tool_failure)
+        self.assertIn('per-id fallback', str(raised.exception))
+        self.assertNotIn('boom-marker', str(raised.exception))
+
+    def test_inventory_does_not_page_when_the_listing_fails_for_another_reason(self):
+        canned = self.canned_rows()
+        ids = [row['id'] for row in canned]
+        calls = []
+        with self.assertRaisesRegex(RuntimeError, 'timed out'):
+            self.run_inventory(
+                canned, ids, calls,
+                listing_error=RuntimeError('bpftool JSON acquisition timed out after 8s'))
+        self.assertEqual([argv for argv, _, _, _ in calls], [['bpftool', '-j', 'map', 'show']])
+
+    def test_snapshot_listing_matches_the_per_id_path_on_the_same_maps(self):
+        canned = self.canned_rows()
+        listing_rows = (canned + self.foreign_rows()
+                        + [{'error': "can't get next map: Operation not permitted"}, None])
+        ids = [row['id'] for row in canned]
+        calls = []
+
+        def fake_run_json(args, require_list=False, map_identity=None, *, timeout_seconds, max_bytes):
+            calls.append((list(args), require_list, timeout_seconds, max_bytes))
+            if list(args) == ['bpftool', '-j', 'map', 'show']:
+                return copy.deepcopy(listing_rows)
+            if list(args)[:5] != ['bpftool', '-j', 'map', 'show', 'id']:
+                raise AssertionError(f'unexpected bpftool argv: {args}')
+            return copy.deepcopy(next(
+                (row for row in canned if isinstance(row, dict) and row.get('id') == int(args[5])), None))
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = config_for(os.getpid(), directory, lane='default-safe-profile')
+            config.workload_origin = 'external'
+            source = capture.LiveMaps(config)
+            source.owner = SimpleNamespace(helper_wait=contextlib.nullcontext)
+            with patch.object(capture.dumper, 'run_json', side_effect=fake_run_json):
+                deadline = time.monotonic() + 30
+                from_listing = source._show_all(ids, deadline)
+                from_per_id = source._show_per_id(ids, deadline)
+        self.assertEqual(from_listing, from_per_id)
+        self.assertEqual(set(from_listing), set(ids))
+        self.assertEqual([argv for argv, _, _, _ in calls],
+                         [['bpftool', '-j', 'map', 'show']]
+                         + [['bpftool', '-j', 'map', 'show', 'id', str(map_id)] for map_id in ids])
 
 
 for case in CASES:

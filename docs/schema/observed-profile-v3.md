@@ -859,7 +859,7 @@ positions are not standard names). The key is present exactly on
 unknown rows (absent, never null or empty, on named rows): an
 authorized name displaces both `unknown` and its reasons. Earlier
 documents predate the key — v2 documents never carry it, and v3
-documents written before 0.8.0 are indistinguishable from current
+documents written before 0.7.1 are indistinguishable from current
 ones — so consumers accept its absence on unknown rows too. Like
 `initialization`, this is a v3-additive disclosure that introduces no
 new schema revision: the `functions[]` item shape stays open and the

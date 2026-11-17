@@ -55,6 +55,24 @@ versioned separately and are opaque, exact dispatch keys.
   mid-capture is briefly detached and reattached, and calls in that
   moment can be missed without a disclosed window (a known issue;
   a gapless replacement is planned for 0.8.0).
+- Function rows that stay `unknown` now say why: every `functions[]`
+  row whose names never resolved carries `unnamed_reasons`, sorted
+  tokens from a closed vocabulary — `heuristic_table` (a scan-decoded
+  table with no interface linkage, live return, manifest or export
+  proof) or `selection_without_standard_proof` (a manifest table no
+  exact v3 query proved). The key appears only on unknown rows, never
+  null or empty; a proven name displaces both the label and its
+  reasons, which survive plan rebuilds, slot reclaim and prune. The
+  disclosure is additive (no new schema revision); consumers still
+  accept its absence, since v3 documents written before 0.7.1 never
+  carry it.
+- Skipped discovery views now explain their retries: reports carry
+  `discovery_retry_classes`, the per-class retry breakdown behind the
+  generic `skipped` rows (`process-ended`, `maps-snapshot`,
+  `object-missing`, `process-view`, `stale-view`, `other`), and
+  verbose text names the dominant class beside the listing. The key
+  appears only when a view was skipped and folded into the noise
+  accumulator, never null, and never feeds verdicts by itself.
 
 ### Fixed
 
@@ -114,15 +132,191 @@ versioned separately and are opaque, exact dispatch keys.
   `loader_discovery` context plus "discovery unavailable" skips). A
   refused memory scan, or a pin refused on the process's namespace,
   root or mappings, is excused only when the group was already in that
-  state when its scan started; a process that was running at scan start
-  keeps the refusal as a gap even if it exits mid-scan. Capture-wide
-  budget stops, handle-budget waits and other skips always stay, and
-  the same failures on a live process stay named gaps. A tick that
+  state when its scan started. A process that was running at scan start
+  and exits mid-scan keeps other refusals as gaps, but a memory-scan
+  refusal that names the exit itself is counted quietly once the exit
+  is proven (a held pidfd, a final exit, or `kill` answering `ESRCH`);
+  unproven exits stay loud. Capture-wide budget stops, handle-budget
+  waits and other skips always stay, and the same failures on a live
+  process stay named gaps. A tick that
   stops only to finish cleaning up such ended processes no longer files
   a postponement gap either, and a tick deep-scan deferral is withdrawn
   at capture end once every deferred process was rescanned (it stays
   when any rescan is still owed, or when a rescan ran only after the
   process began exiting and excused a refusal).
+- Kernel file-open learning under `--system` no longer reports lost
+  learning on a healthy busy host: the group uses an unlimited kernel
+  queue with an 8 MiB user-space backlog bound, the stop tail is
+  decided from the measured queued-event count on both 24- and 32-byte
+  kernels, FIFO opens and read errors no longer stall the drain, and
+  negative-file ignore marks expire every 30 s. Any real overflow,
+  parse or read loss is counted and attributed to its source.
+- Provider objects are examined without a fixed object-size gate:
+  large mapped providers are read through bounded progress windows
+  instead of being refused by size, while crafted ELF header tables or
+  spans beyond the window are refused with named gaps. A starved scan
+  bracket keeps its already decoded modules and refused rows and names
+  the ceiling plainly.
+- `inventory --system --manifest` captures no longer starve late
+  providers at thousands of endpoints. Library-handle pins for every
+  lane now go through one bounded capture-owned table (1,000
+  concurrent files) with a single acquire step, and count manifests
+  reserve their rows before member scans; waits and refusals are
+  named, one-shot runs name the terminal wait, and deferred learned
+  candidates stay retryable.
+- Per-key tracking re-arms after a transient refusal at the audit
+  step, whether it strikes while a batch is being checked or right
+  after, instead of stopping for the rest of the run. Re-arms are
+  limited to 32 per rolling 2 minutes; a refusal at another step or
+  past the limit still stops the lane, and the stop gap names the step
+  and reason. Verbose output names the audit check and refusal code.
+- Process generations are tracked apart more reliably: fork events
+  carry the kernel timestamp, exit ties drop immediately with a
+  counted outcome, a full exit-tap queue keeps the newest tap for a
+  reused PID, and unmatched exits at the terminal drain drop counted
+  instead of stalling it. Session numbering and retired-session
+  labels survive a leader exit, a reopened handle prints its fresh
+  label, and rows left by late events on exited processes are reaped.
+- `--module` matching now checks every recorded path of a module and
+  tolerates a ` (deleted)` suffix, so a replaced provider admitted
+  from its still-mapped copy is not reported unmatched. An input that
+  matches no mapped file is named in text and JSON
+  (`unmatched_modules`) while the capture still exits 0, and a
+  repeated `--system` is refused as a usage error.
+- A pre-armed module no longer silently loses its attach instant
+  when a named `--pid` original ends: when the retirement of an
+  ended process deactivates a pre-arm declared slot that shares its
+  attach group, the slot's real attach stamp is kept, so the module
+  keeps its `attached_at_ns` and unobserved windows (was: null with
+  no windows and no gap). Only the ended original's disturbed
+  groups retire; kept slots outside them stay linked and active.
+- A stale ingest no longer refuses a whole claim scan: an admission
+  collected in a newer quantum than the supplied ingest, one
+  without a collected origin, or one from another native domain is
+  retained as a plain row with one counted caller-named gap, and
+  the lane keeps capturing. The retained plain-row gap is counted
+  whether or not any feed has entered per-key tracking yet.
+- An owned `run` now finishes its initial arming and endpoint
+  selection before the `p11scope: capturing: ` line (like `--pid`),
+  so a child that waits for that line is counted from its first
+  call with no post-ready window — including the counter
+  `--select-endpoint` detail window, whose selection-time read used
+  to happen only after the child was released. A child that calls
+  without waiting can still leave early calls outside the window.
+- Small output wording fixes: a CBOM conversion of a profile report
+  without a scope note no longer doubles the scope word, the gap
+  for a scan pid that exited before admission loses its doubled
+  prefix and stale advice, the seal line follows the sealed lane,
+  and the forwarding-layer closure line reads as a conditional.
+- Calls through a stub-pool provider's versioned getters are no
+  longer missed: the offline helper now mints the interface
+  enumeration before the legacy table, so the manifest records the
+  first-mint v3 slots (`C_GetInterfaceList`/`C_GetInterface`) that a
+  workload's first getter call uses (was: mint 0 spent on the legacy
+  table, first-mint v3 calls unattached). Static providers return the
+  same tables whatever the order, so their manifests are unchanged.
+  The reverse order stays a disclosed trade-off; see known limitations.
+- Per-key rows survive provider load/unload churn: a module that
+  leaves and returns keeps its key rows — module identity follows the
+  verified file across pins, a returning exact table reoccupies its
+  retired slots, and retired semantic and count-only generations are
+  kept per key so a returning target revives with its history (was: a
+  returning module could lose its key rows or file a migration gap).
+- Slot reuse on repeated provider loads now keys on exact file
+  identity, so churn on a busy host ends partially covered less
+  often: a returning provider reoccupies its own retired slots
+  one-to-one, in-place reuses never count against the capacity
+  omission, and a new module that does not fit is omitted instead of
+  displacing attached endpoints.
+- The coverage line counts distinct files: a module with two records
+  (an omission or refusal beside a capacity lowering) counts once, as
+  not watched when either record refuses it (was: counted twice, once
+  per record). The gaps listing still shows every record verbatim.
+- On a busy host, the pre-arm witness no longer freezes draining
+  exits and execs as `Pending` at deactivate time: their completions
+  drain after the freeze (1 s bound, verdict-neutral), so a capture
+  with no provider activity in the window no longer keeps a spurious
+  pre-attach window. Each watched file's finalize verdict also prints
+  on the diagnostics channel, telling a voided witness from a later
+  proof failure.
+- A process that exits in the middle of a scan no longer files a loud
+  memory-scan refusal when its exit is proven: the refusal is counted
+  quietly in the noise counters instead of appearing as a skip. Proof
+  is strict — the held pidfd reports the group gone, the leader and
+  every member are past user mode, or `kill` answers `ESRCH` — and
+  anything else stays loud: a reused pid, an exec, live members, an
+  unresolvable member walk, mapping changes, empty snapshots and every
+  budget stop.
+- Exits are named only on a proven whole-group proof: snapshots call
+  a process exited only when its entire thread group is shown gone —
+  members pinned through held task directories and re-validated, in
+  TGID scope, with a final thread census closing the proof — so a
+  recycled pid, a non-leader exec or a half-exited group is never
+  mistaken for an exit. Memory failures stay loud until that proof
+  lands, memory-open failures take the exited-scan path with a fresh
+  proof instead of latching their verdict, exits the pin cannot see
+  are named through emptied maps and zero-byte snapshots, and unproven
+  exits and partial snapshots fail closed.
+- On pre-6.8 kernels with overlayfs, a scan that arrives mid-run no
+  longer splits a staged provider into a second pinned object: the
+  scan pin merges into the kept pre-arm object when the pin-time
+  self-mapping proof names the same file, so attached slots stay put
+  instead of retiring and re-attaching about a second later while
+  short-lived workers keep calling (was: exact-accounting failures
+  with a replace witness on 6.6). Anything the proof does not cover
+  keeps the split behavior.
+
+### Changed
+
+- Cgroup inventory passes reuse file-derived facts from the previous
+  pass, keyed and pinned by file identity and change time: an
+  unchanged large object is read once instead of every pass, changed
+  files are re-read, and the single 64 MiB attempted-read window is
+  shared across the pass.
+- Inventory attach work continues on service ticks between passes (up
+  to 64 Singles or 1,024 Multi entries per 10 ms) and the Multi pass
+  bound rises to 32,768 entries, so large providers attach within a
+  run. A stop, `--duration` deadline or cancelled collection prevents
+  new extends, and the post-report Singles detach wait is stated as an
+  upper bound.
+- The deep-scan cap now counts user processes only for both inventory
+  and profile/trace discovery, so kernel threads no longer push a host
+  over it. `inventory --cgroup` pins at most 128 members per
+  transaction, deep-scans 32 by default, and names a clamp gap when a
+  larger cgroup exceeds one transaction.
+- The default stderr no longer prints the routine instant cleanup
+  receipt (`p11scope: cleanup completed, N/N links released, 0 s`);
+  slow, partial or uncertain receipts and receipts after cleanup
+  narrative still print, and `-v` or
+  `P11SCOPE_CAPTURE_DIAGNOSTICS=1` restore every line.
+- `doctor` recognizes Podman containers (`/run/.containerenv`),
+  reports a capability set covered by `CAP_SYS_ADMIN` as sufficient,
+  marks loader rows not applicable without `--pid`, and names the
+  extra `DAC_OVERRIDE`, `CHOWN` and `FOWNER` grants needed for `-o`
+  into a host-owned mount. A proven user namespace is named as the
+  refusal cause instead of suggesting setcap or container grants.
+- `--output-owner UID[:GID]` is now accepted by `-o` for root: it
+  trusts an output directory owned by UID and hands the report to
+  UID:GID (GID defaults to UID), for a container bind mount owned by
+  the host user. Without the flag the existing untrusted-owner
+  refusal is unchanged.
+- Concise text output groups identical proxy-closure refusals once,
+  counts operator exclusions in the empty heading and coverage,
+  singularizes one-file headers, names module content in diff
+  top-changed rows, words folded kernel-thread notes as examinations,
+  and recommends `--manifest` only when observed calls could use one.
+  `run` no longer promises a report when view opening degrades.
+- `-v` captures print one `p11scope: memory {json}` line every 60 s
+  and at the end, with per-structure sizes; reports stay
+  byte-identical. The trace failing-caller roll-up keeps at most 4,096
+  callers and folds the rest into a counted `(other callers)` row with
+  an evidence gap.
+- Capture diagnostics receipt each linked dynamic-export attach:
+  `p11scope: dynamic export attached file_offset=0x… abi=…` prints for
+  committed attaches, generation-lost-but-linked attaches and
+  idempotent re-attaches alike (diagnostics only: `-v` or
+  `P11SCOPE_CAPTURE_DIAGNOSTICS=1`). The line carries no identity —
+  offset plus ABI cannot name a process, path or proof.
 
 ### Known limitations
 
@@ -140,7 +334,7 @@ versioned separately and are opaque, exact dispatch keys.
 - On a busy host, a long `inventory --system --key-operations`
   capture can stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Since
-  0.8.0 the lane continues past a transient interruption at the
+  0.7.1 the lane continues past a transient interruption at the
   audit step, while a batch of calls is being checked or right after
   (up to 32 interruptions per rolling 2 minutes, named once with
   a count):
@@ -167,11 +361,28 @@ versioned separately and are opaque, exact dispatch keys.
   the observer, or `SIGCONT` to the member. A suspended (Ctrl-Z)
   observer is not dead: a held member stays stopped until the
   observer runs again.
-- On a busy host, a system-wide capture can report a few `discovery
-  unavailable` skips when short-lived processes exit in the middle
-  of a scan; when the provider is already attached, call counts
+- On a busy host, a system-wide capture can still report a few skips
+  when short-lived processes exit in the middle of a scan and the exit
+  cannot be proven; when the provider is already attached, call counts
   stay exact and nothing is lost — the report still reads `PARTIAL`
-  because those scans never completed.
+  because those scans never completed. Exits the observer proves are
+  counted quietly instead of filed as skips.
+- A mid-load plan rebuild can lose first calls in its replace window:
+  when a new worker's view arrives while the attach plan is still
+  loading, the rebuilt plan replaces every probe (detach, then
+  reattach; 33–59 ms measured), and calls entering in that window are
+  lost without a disclosed gap row — the report carries only the
+  replace evidence. The run-tree learned-provider cells (including
+  short-lived descendants) trip this intermittently; rerunning the
+  capture usually lands a clean run. Timing the interval and disclosing
+  the window is planned for 0.8.0.
+- Stub-pool provider manifests cover one getter-call order: since
+  0.7.1 the manifest records the first-mint v3 slots
+  (`C_GetInterfaceList`/`C_GetInterface`) because every measured
+  p11-kit workload calls a v3 getter first. A workload that calls
+  `C_GetFunctionList` first instead spends its first pool mint on the
+  legacy table, so its second-table v3-only calls land on unrecorded
+  stubs and stay unattached. Static providers are unaffected.
 
 ## [0.7.0] - 2026-11-13
 
@@ -482,10 +693,9 @@ The v0.7.0 limits live in
 [docs/known-limitations.md](docs/known-limitations.md#known-limitations-in-070).
 
 - A manifest capture watching around four thousand endpoints or more
-  can shed calls with exact counted causes while per-endpoint detail
-  stays empty, and the run can exit nonzero. This is a known bug in
-  v0.7.0, not a host problem; a fix is planned for 0.8.0. Narrow the
-  scope (`--pid` or `--cgroup`) to avoid it.
+  could shed calls with exact counted causes while per-endpoint detail
+  stayed empty, and the run could exit nonzero. This was a known bug in
+  v0.7.0, not a host problem; it is fixed in 0.7.1.
 - On a busy host, a multi-threaded program that exits during a
   `--system` capture may be counted as one lost library-load link
   (`task_uprobe_link_losses`); the count errs on the side of reporting
@@ -506,10 +716,11 @@ The v0.7.0 limits live in
   reader (some lines dropped without a count). Capture data and the
   report file are unaffected; fixes are planned for 0.8.0.
 - On a busy host, a long `inventory --system --key-operations`
-  capture can stop recording key operations partway through; the
+  capture could stop recording key operations partway through; the
   report stays PARTIAL with exact counts and no lost calls. Rerun
-  the capture or narrow the scope (`--pid`); a fix is planned
-  for 0.8.0.
+  the capture or narrow the scope (`--pid`). The lane continues past
+  transient audit-step interruptions since 0.7.1; see the 0.7.1
+  limitations.
 
 ### Qualification of this release
 

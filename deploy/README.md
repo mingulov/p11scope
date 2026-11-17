@@ -58,7 +58,7 @@ docker run --rm --pid=host --cap-drop ALL --cap-add BPF --cap-add PERFMON \
 add `--security-opt apparmor=p11scope-observer` (`apparmor=unconfined`
 also works but drops the confinement); on SELinux-enforcing hosts no
 extra flag is needed (measured 2026-11-11, below). The example tag is
-published with the 0.7.0 release.)
+published with the 0.7.1 release.)
 It still needs host PID and named capabilities, so rootless Docker,
 Podman and Docker Desktop's VM boundary stay unsupported (see
 [Rootless containers](#rootless-containers)), as in [the

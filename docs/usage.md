@@ -162,9 +162,9 @@ window. It is never proof of what the application *cannot* do — see
 
 ## Installing system packages
 
-The v0.7.0 release will provide `p11scope_0.7.0_amd64.deb` (Debian/Ubuntu) and
-`p11scope-0.7.0-1.x86_64.rpm` (Fedora/RHEL) alongside the tarballs. The 0.7.0
-packages appear under the release tag when the release is published. Each
+The v0.7.1 release provides `p11scope_0.7.1_amd64.deb` (Debian/Ubuntu) and
+`p11scope-0.7.1-1.x86_64.rpm` (Fedora/RHEL) alongside the tarballs. The 0.7.1
+packages appear under the release tag. Each
 installs the same static observer plus the glibc discovery helper to
 `/usr/bin`, with licenses and provenance under `/usr/share/doc/p11scope`,
 and carries no file capabilities, set-id bits, services or maintainer
@@ -177,18 +177,18 @@ package and `SHA256SUMS`, verify both, then install the file:
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/p11scope_0.7.0_amd64.deb
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/p11scope_0.7.1_amd64.deb
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-gh attestation verify p11scope_0.7.0_amd64.deb --repo mingulov/p11scope
-sudo apt install ./p11scope_0.7.0_amd64.deb
+gh attestation verify p11scope_0.7.1_amd64.deb --repo mingulov/p11scope
+sudo apt install ./p11scope_0.7.1_amd64.deb
 p11scope --version
 sudo p11scope doctor
 ```
 
-On Fedora/RHEL, download `p11scope-0.7.0-1.x86_64.rpm` instead, verify it
-with `gh attestation verify p11scope-0.7.0-1.x86_64.rpm --repo mingulov/p11scope`,
-and install with `sudo dnf install ./p11scope-0.7.0-1.x86_64.rpm`.
+On Fedora/RHEL, download `p11scope-0.7.1-1.x86_64.rpm` instead, verify it
+with `gh attestation verify p11scope-0.7.1-1.x86_64.rpm --repo mingulov/p11scope`,
+and install with `sudo dnf install ./p11scope-0.7.1-1.x86_64.rpm`.
 
 ## PKCS #11 versions and interface names
 

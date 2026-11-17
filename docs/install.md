@@ -6,13 +6,13 @@ p11scope v0.4.0 was an [intermediate source tag](https://github.com/mingulov/p11
 with no binary bundles. v0.5.0 was published on 2026-10-29
 ([release tag](https://github.com/mingulov/p11scope/releases/tag/v0.5.0)).
 The [v0.6.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.6.0)
-provides the bundle set below, and the v0.7.0 release will provide the same set:
+provides the bundle set below, and the v0.7.0 and v0.7.1 releases provide the same set:
 a static x86-64 Linux observer bundle, optional glibc and musl discovery
-helper bundles, DEB and RPM system packages, and a source export. The examples below install **v0.7.0**;
-the 0.7.0 files appear on the
-[Releases page](https://github.com/mingulov/p11scope/releases) when the release
-is published. Download `SHA256SUMS` with the bundle you
-choose. The release will also provide `RELEASE.json` with curated provenance;
+helper bundles, DEB and RPM system packages, and a source export. The examples below install **v0.7.1**;
+the 0.7.1 files are listed under the v0.7.1 release on the
+[Releases page](https://github.com/mingulov/p11scope/releases).
+Download `SHA256SUMS` with the bundle you
+choose. The release also provides `RELEASE.json` with curated provenance;
 each bundle contains its license notices and a copy of that record.
 Every release file carries a GitHub build-provenance attestation, and
 so does the container image.
@@ -23,11 +23,11 @@ described below (Building from source).
 
 | Bundle | Use |
 | --- | --- |
-| `p11scope-0.7.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
-| `p11scope-discover-0.7.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
-| `p11scope-discover-0.7.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
-| `p11scope_0.7.0_amd64.deb` | System package for Debian/Ubuntu: observer plus glibc helper. |
-| `p11scope-0.7.0-1.x86_64.rpm` | System package for Fedora/RHEL: observer plus glibc helper. |
+| `p11scope-0.7.1-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
+| `p11scope-discover-0.7.1-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
+| `p11scope-discover-0.7.1-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
+| `p11scope_0.7.1_amd64.deb` | System package for Debian/Ubuntu: observer plus glibc helper. |
+| `p11scope-0.7.1-1.x86_64.rpm` | System package for Fedora/RHEL: observer plus glibc helper. |
 
 For example, download the observer and `SHA256SUMS` into a private directory,
 then verify the archive before extraction:
@@ -35,11 +35,11 @@ then verify the archive before extraction:
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/p11scope-0.7.0-x86_64-linux-musl.tar.gz
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/p11scope-0.7.1-x86_64-linux-musl.tar.gz
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf p11scope-0.7.0-x86_64-linux-musl.tar.gz
-sudo install -m 0755 p11scope-0.7.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
+tar -xzf p11scope-0.7.1-x86_64-linux-musl.tar.gz
+sudo install -m 0755 p11scope-0.7.1-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
 p11scope --version
 sudo p11scope doctor
 ```
@@ -64,20 +64,20 @@ the file (Debian/Ubuntu shown; Fedora/RHEL uses `dnf install` with the
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/p11scope_0.7.0_amd64.deb
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/p11scope_0.7.1_amd64.deb
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify p11scope_0.7.0_amd64.deb --repo mingulov/p11scope
-sudo apt install ./p11scope_0.7.0_amd64.deb
+gh attestation verify p11scope_0.7.1_amd64.deb --repo mingulov/p11scope
+sudo apt install ./p11scope_0.7.1_amd64.deb
 p11scope --version
 sudo p11scope doctor
 p11scope-discover --version
 ```
 
 On Fedora/RHEL, replace the download with
-`p11scope-0.7.0-1.x86_64.rpm`, verify it with
-`gh attestation verify p11scope-0.7.0-1.x86_64.rpm --repo mingulov/p11scope`,
-and install with `sudo dnf install ./p11scope-0.7.0-1.x86_64.rpm`.
+`p11scope-0.7.1-1.x86_64.rpm`, verify it with
+`gh attestation verify p11scope-0.7.1-1.x86_64.rpm --repo mingulov/p11scope`,
+and install with `sudo dnf install ./p11scope-0.7.1-1.x86_64.rpm`.
 
 To use attested semantic capture, download and verify the helper bundle for
 the provider's C library, then extract and install its `p11scope-discover`
@@ -87,7 +87,7 @@ The observer needs Linux x86-64 and the kernel and privilege requirements
 below. The helper needs the matching provider ABI and libc; a 32-bit provider
 requires a separately built 32-bit helper.
 
-The v0.7.0 release will also include `p11scope-0.7.0-source.tar.gz`. It will contain the
+The v0.7.1 release also includes `p11scope-0.7.1-source.tar.gz`. It contains the
 committed source and the two pinned Aya archives needed to reconstruct the
 local patches. Building it still needs network access for the remaining
 locked Cargo dependencies, plus the Rust/BPF and host build tools described
@@ -96,12 +96,12 @@ full export assembled separately.
 
 ### Container image
 
-The release publishes `ghcr.io/mingulov/p11scope:0.7.0` (plus `:latest`
-when 0.7.0 is the newest stable). One build-provenance attestation covers
+The release publishes `ghcr.io/mingulov/p11scope:0.7.1` (plus `:latest`
+when 0.7.1 is the newest stable). One build-provenance attestation covers
 the pushed digest, so both tags verify with one command:
 
 ```sh
-gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.0 -R mingulov/p11scope
+gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.1 -R mingulov/p11scope
 ```
 
 Run `doctor` through it with the narrow five-capability set (Docker
@@ -150,7 +150,7 @@ first, then the build provenance of each file you install:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify p11scope-0.7.0-x86_64-linux-musl.tar.gz --repo mingulov/p11scope
+gh attestation verify p11scope-0.7.1-x86_64-linux-musl.tar.gz --repo mingulov/p11scope
 ```
 
 `gh` must be logged in first (`gh auth login`). A passing attestation
@@ -158,20 +158,20 @@ check is quiet: exit 0 means the file is covered. Add `--format json`
 to see the details, or pin the expected builder for a stricter check:
 
 ```sh
-gh attestation verify p11scope-0.7.0-x86_64-linux-musl.tar.gz --repo mingulov/p11scope \
+gh attestation verify p11scope-0.7.1-x86_64-linux-musl.tar.gz --repo mingulov/p11scope \
   --signer-workflow mingulov/p11scope/.github/workflows/package-preview.yml
 ```
 
 Verify the container image the same way, by tag or pinned by digest:
 
 ```sh
-gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.0 --repo mingulov/p11scope
-docker buildx imagetools inspect ghcr.io/mingulov/p11scope:0.7.0 --format '{{.Manifest.Digest}}'
+gh attestation verify oci://ghcr.io/mingulov/p11scope:0.7.1 --repo mingulov/p11scope
+docker buildx imagetools inspect ghcr.io/mingulov/p11scope:0.7.1 --format '{{.Manifest.Digest}}'
 gh attestation verify oci://ghcr.io/mingulov/p11scope@sha256:<digest> --repo mingulov/p11scope
 ```
 
 (After a pull, `docker inspect --format '{{index .RepoDigests 0}}'
-ghcr.io/mingulov/p11scope:0.7.0` prints the same digest.)
+ghcr.io/mingulov/p11scope:0.7.1` prints the same digest.)
 
 One surprise to know: the v0.7.0 file attestations name the build
 branch `refs/heads/tmp/ci/v070/rel-cand` — the release build ran on
@@ -200,7 +200,7 @@ sudo rm -f /usr/local/bin/p11scope /usr/local/bin/p11scope-discover
 Remove a pulled observer image with:
 
 ```sh
-docker rmi ghcr.io/mingulov/p11scope:0.7.0
+docker rmi ghcr.io/mingulov/p11scope:0.7.1
 ```
 
 The observer keeps no configuration or state files. Delete any `-o`

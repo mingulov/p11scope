@@ -158,7 +158,7 @@ the report: p11scope counts the calls (`C_Login`, `C_GenerateKeyPair`,
 the `capturing:` line are not counted. The report aggregates the
 whole machine, so it does not name which program made each call.
 
-Prefer a system package? Install v0.7.0 as on the [front
+Prefer a system package? Install v0.7.1 as on the [front
 page](README.md), then run `sudo p11scope profile --system --duration
 90s` instead of the `docker run` line (keep the step 2 keeper line:
 it makes one-shot tools count reliably).

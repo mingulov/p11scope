@@ -111,6 +111,6 @@ only which cryptographic functions ran, how often and how long they
 took. Calls from before the `capturing:` line are not counted, and a
 site you already had open may reuse its connection and stay quiet.
 
-Prefer a system package? Install v0.7.0 as on the [front
+Prefer a system package? Install v0.7.1 as on the [front
 page](README.md), then run `sudo p11scope profile --pid "$FFPID"
 --duration 60s` instead of the `docker run` line.

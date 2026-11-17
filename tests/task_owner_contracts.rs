@@ -356,6 +356,50 @@ fn production_counter_bank_timing_helpers() {
     }
 }
 
+/// Banked RV insert outcomes over the actual C bridge: a peer insert that
+/// wins the race still gets counted (no loss), while a real insert
+/// failure latches the RV fault and reports the lost row. Host-only;
+/// no BPF load, no attach.
+#[test]
+fn production_counter_bank_timing_rv_insert_outcomes() {
+    let temporary = tempfile::tempdir().expect("counter timing RV test directory");
+    let binary = temporary.path().join("counter-bank-timing-rv");
+    let output = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-DP11SCOPE_COUNTER_BANK_PROOF",
+            "-DP11SCOPE_BANK_MODE_LATENCY",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/task-owner/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile actual counter-bank timing helpers");
+    assert!(
+        output.status.success(),
+        "native counter timing RV compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for selector in [
+        "bank_timing_rv_insert_race_counts_into_peer_row",
+        "bank_timing_rv_insert_failure_reports_loss",
+    ] {
+        let output = Command::new(&binary).arg(selector).output().unwrap();
+        assert!(
+            output.status.success(),
+            "native counter timing {selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// Timing producer compiles warning-free in both modes under the exact BPF
 /// object flags, so a caller-less mode can never rot. Host-only; emits LLVM
 /// bitcode to a temp dir, no BPF load, no attach.

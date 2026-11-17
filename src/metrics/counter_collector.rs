@@ -340,6 +340,7 @@ pub(super) struct CounterRead {
     health: CounterHealth,
     kernel: KernelEvidence,
     gaps: CounterGaps,
+    rv_lower_bound: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -351,6 +352,7 @@ pub(super) struct CounterReadView<'a> {
     pub(super) health: CounterHealth,
     pub(super) kernel: KernelEvidence,
     pub(super) gaps: CounterGaps,
+    pub(super) rv_lower_bound: bool,
 }
 
 impl CounterRead {
@@ -367,6 +369,7 @@ impl CounterRead {
             health: self.health,
             kernel: self.kernel,
             gaps: self.gaps,
+            rv_lower_bound: self.rv_lower_bound,
         }
     }
 
@@ -374,6 +377,13 @@ impl CounterRead {
     /// Exact acquisitions keep the default clean gaps.
     pub(super) fn set_gaps(&mut self, gaps: CounterGaps) {
         self.gaps = gaps;
+    }
+
+    /// Mark the RV table of this acquisition as a lower bound: at least one
+    /// RV insert failed in the kernel, so per-RV counts undercount while
+    /// endpoint counts stay exact. Set from `rv_exhausted`, never cleared.
+    pub(super) fn set_rv_lower_bound(&mut self, exhausted: bool) {
+        self.rv_lower_bound = exhausted;
     }
 
     /// A known-generation fold/limit failure is an explicit loss input. An
@@ -412,6 +422,7 @@ impl CounterRead {
             health,
             kernel,
             gaps: CounterGaps::default(),
+            rv_lower_bound: false,
         })
     }
 

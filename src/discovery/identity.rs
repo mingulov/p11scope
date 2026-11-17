@@ -9984,13 +9984,11 @@ pub fn bind_scanned_modules(
                         // dies executing them. Same-file entries and
                         // every non-run-learned module keep the
                         // existing behavior.
-                        let run_learned = module.view
-                            == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID;
-                        let export_agreed = pinned.exports_for(id).iter().any(
-                            |(name, offset)| {
-                                name == entry.name && *offset == entry.file_offset
-                            },
-                        );
+                        let run_learned =
+                            module.view == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID;
+                        let export_agreed = pinned.exports_for(id).iter().any(|(name, offset)| {
+                            name == entry.name && *offset == entry.file_offset
+                        });
                         if entry.object != module.key
                             && forwardable_getter(entry.name)
                             && !verified_forward
@@ -11670,9 +11668,9 @@ mod tests {
             "the same-file entry binds: {entries:?}"
         );
         assert!(
-            entries.iter().any(|entry| {
-                entry.name == "C_Login" && entry.file_offset == VERIFIED_OFFSET
-            }),
+            entries
+                .iter()
+                .any(|entry| { entry.name == "C_Login" && entry.file_offset == VERIFIED_OFFSET }),
             "the export-verified run-learned forward binds: {entries:?}"
         );
         assert!(

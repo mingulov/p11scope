@@ -48,13 +48,13 @@ unsafe extern "C" {
             .map(|layout| normalize_target_word(ctx.ret::<u64>(), layout))
             .unwrap_or(0);
         // The native return first performs optional START lookup, before
-        // publication/route checks. Refusal still retires a present START.
+        // publication/route checks (bit0 account, bit1 layout_ok).
         unsafe {
             p11_bank_complete(
                 slot,
                 helpers::bpf_get_current_pid_tgid(),
                 rv,
-                u32::from(scoped && layout.is_some()),
+                u32::from(scoped && layout.is_some()) | (u32::from(layout.is_some()) << 1),
             )
         };
     }
@@ -117,7 +117,7 @@ pub fn p11_counter_bank_return(ctx: RetProbeContext) -> u32 {
             .map(|layout| normalize_target_word(ctx.ret::<u64>(), layout))
             .unwrap_or(0);
         // The native return first performs optional START lookup, before
-        // publication/route checks. Refusal still retires a present START.
+        // publication/route checks (bit0 account, bit1 layout_ok).
         // The clock is read last so it reaches the bridge unspilled.
         let pid_tgid = helpers::bpf_get_current_pid_tgid();
         let now = unsafe { helpers::bpf_ktime_get_ns() };
@@ -126,7 +126,7 @@ pub fn p11_counter_bank_return(ctx: RetProbeContext) -> u32 {
                 slot,
                 pid_tgid,
                 rv,
-                u32::from(scoped && layout.is_some()),
+                u32::from(scoped && layout.is_some()) | (u32::from(layout.is_some()) << 1),
                 now,
             )
         };

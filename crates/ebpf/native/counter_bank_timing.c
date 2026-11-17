@@ -397,8 +397,14 @@ __attribute__((noinline)) u32 p11_bank_complete_timed(u32 slot, u64 pid_tgid,
         fault(BANK_ROUTE_FAULT);
         return 0;
     }
-    if (!account) {
-        fault(BANK_SCOPE_FAULT);
+    /* Bit0 is the account gate (scoped with a readable return layout);
+     * bit1 repeats layout_ok so a scope-only loss counts an unmatched
+     * return, like a legacy mid-call migration, while a refused layout
+     * (already counted as an ABI refusal by the roots) neither latches a
+     * scope fault nor double-counts here. */
+    if (!(account & 1U)) {
+        if ((account >> 1) & 1U)
+            bump_evidence(BANK_EVIDENCE_UNMATCHED_RETURNS);
         return 0;
     }
     increment(&stats->returned);

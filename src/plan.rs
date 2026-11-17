@@ -3815,9 +3815,10 @@ impl AttachPlan {
                         // manifest's getter slot outliving its program's
                         // scanned table) keeps its live descriptor: both
                         // descriptors decode nothing, so a replacement
-                        // would detach the probe for nothing. Authority
-                        // follows the rebuilt evidence: the kept index
-                        // only spares the attached probe. A rescan that
+                        // would detach the probe for nothing. The kept
+                        // descriptor keeps its authorization: a descriptor
+                        // without its owner is invalid, and the rebuilt
+                        // manifest names the same sole owner. A rescan that
                         // still contributes (a forged or rival table)
                         // replaces as before.
                         let sources = |plan: &AttachPlan, ids: &[ModuleId]| -> Vec<&'static str> {
@@ -3841,6 +3842,8 @@ impl AttachPlan {
                             && slot.names == old.names;
                         if count_only_same {
                             updated.descriptor_index = old.descriptor_index;
+                            updated.semantic_authorized = old.semantic_authorized;
+                            updated.semantic_ambiguous = old.semantic_ambiguous;
                         } else if carry_verified {
                             updated.descriptor_index = old.descriptor_index;
                             updated.semantics = old.semantics;

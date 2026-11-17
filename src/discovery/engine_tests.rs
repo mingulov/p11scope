@@ -1236,12 +1236,10 @@ fn generational_fast_path_carries_pins_for_active_slots_across_view_removal() {
 }
 
 #[test]
-fn generational_stale_retirement_drops_dead_view_pins_and_slots() {
-    // Stale views are proven dead, and stale retirement also serves
-    // unpublished newcomers (U-07): carrying here would commit modules for
-    // views the engine never admitted, so proven-dead views' sources always
-    // retire, even while unadmitted newcomers wait. This guards that
-    // fail-closed contract: the generational carry never applies here.
+fn generational_stale_retirement_keeps_carried_coverage() {
+    // Carried coverage (resolvable pins without ownership claims) survives
+    // stale retirement: dropping it here would undo the generational
+    // carry on the very next apply.
     let dir = tempfile::tempdir().expect("scope dir");
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
     let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
@@ -1256,28 +1254,80 @@ fn generational_stale_retirement_drops_dead_view_pins_and_slots() {
             engine.plan.is_active(0),
             "the fixture starts attached for {scope:?}"
         );
-        // Successor evidence present but rightly ignored: stale still drops.
-        engine.mark_newcomer_arrival(424242, Some(1));
         let mut candidate = seed_loop_candidate(engine.plan.clone(), engine.pinned.clone());
         candidate.modules = engine.modules.clone();
         let view = engine.modules[0].scanned.view;
+        // Except-carry shape: resolvable, claimless.
+        candidate
+            .pinned
+            .remove_view_except(view, &BTreeSet::from([object]));
+        assert!(
+            candidate.pinned.view_claims(view).is_none(),
+            "the fixture stages carried coverage ({scope:?})"
+        );
+        assert!(
+            candidate.pinned.summary(object).is_some(),
+            "the fixture keeps it resolvable ({scope:?})"
+        );
         let stale: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
         let mut session = ScriptedSession::default();
         let mut outcome = super::ApplyOutcome::default();
         engine.retire_stale_candidate_sources(&mut session, &mut candidate, &stale, &mut outcome);
         assert!(
-            !candidate.plan.is_active(0),
-            "stale retirement retires dead views' slots ({scope:?})"
+            candidate.plan.is_active(0),
+            "stale retirement keeps carried slots ({scope:?})"
         );
         assert!(
-            candidate.pinned.summary(object).is_none(),
-            "stale retirement drops the dead pin ({scope:?})"
+            candidate.pinned.summary(object).is_some(),
+            "stale retirement keeps the carried pin ({scope:?})"
         );
         assert!(
-            candidate.modules.is_empty(),
-            "stale retirement drops the dead module ({scope:?})"
+            !candidate.modules.is_empty(),
+            "stale retirement keeps the carried module ({scope:?})"
         );
     }
+}
+
+#[test]
+fn generational_stale_retirement_drops_claimed_sources() {
+    // Claimed sources still retire (U-07's unpublished newcomers are
+    // claimed, so they still drop): only carried (resolvable, claimless)
+    // coverage survives.
+    let (mut engine, module, object, _) = engine_with_overlay(83);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+    let view = engine.modules[0].scanned.view;
+    let mut candidate = seed_loop_candidate(engine.plan.clone(), engine.pinned.clone());
+    candidate.modules = engine.modules.clone();
+    crate::discovery::identity::test_fixture::record_scan_ownership(
+        &mut candidate.pinned,
+        view,
+        module.key,
+        &module.path,
+    );
+    assert!(
+        candidate.pinned.view_claims(view).is_some(),
+        "the fixture stages claimed sources"
+    );
+    let stale: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+    let mut session = ScriptedSession::default();
+    let mut outcome = super::ApplyOutcome::default();
+    engine.retire_stale_candidate_sources(&mut session, &mut candidate, &stale, &mut outcome);
+    assert!(
+        !candidate.plan.is_active(0),
+        "stale retirement retires claimed slots"
+    );
+    assert!(
+        candidate.pinned.summary(object).is_none(),
+        "stale retirement drops the claimed pin"
+    );
+    assert!(
+        candidate.modules.is_empty(),
+        "stale retirement drops the claimed module"
+    );
 }
 
 #[test]
@@ -1490,89 +1540,6 @@ fn pid_conservative_replay_retires_when_the_named_view_exits() {
     assert!(
         !replayed.delta.retire.is_empty(),
         "the exit retires through the delta"
-    );
-}
-
-#[test]
-fn loader_scan_preserve_carries_unless_scanned_view_solely_owns() {
-    // Loader assembly keeps the loader id plus every attached object the
-    // scanned view does not solely own: its scan authoritatively replaces
-    // only sole-owned objects, while shared or module-less objects ride.
-    let loader = PinnedObjectId(99);
-    let (mut engine, _, object, _) = engine_with_overlay(80);
-    engine
-        .capture_facts
-        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
-        .unwrap();
-    assert!(engine.plan.is_active(0), "the fixture starts attached");
-    assert_ne!(object, loader, "fixture ids are distinct");
-    let view = engine.modules[0].scanned.view;
-    assert_eq!(
-        engine.loader_scan_preserve(loader, view),
-        vec![loader],
-        "a sole-owned object is authoritatively replaced by its view's scan"
-    );
-    assert!(
-        engine
-            .loader_scan_preserve(loader, ProcessViewId(999))
-            .contains(&object),
-        "another view's scan preserves the attached provider"
-    );
-    // Shared ownership rides even for the scanned view.
-    let mut shared = engine.modules[0].clone();
-    shared.scanned.view = ProcessViewId(999);
-    engine.modules.push(shared);
-    assert!(
-        engine.loader_scan_preserve(loader, view).contains(&object),
-        "a shared object rides its owner's scan"
-    );
-    // Module-less attached objects ride any scan.
-    engine.modules.clear();
-    assert!(
-        engine.plan.is_active(0),
-        "clearing modules keeps the plan attached"
-    );
-    assert!(
-        engine.loader_scan_preserve(loader, view).contains(&object),
-        "a module-less object rides any scan"
-    );
-}
-
-#[test]
-fn loader_candidate_excludes_resolvable_but_claimless_views() {
-    // Carried dead coverage (resolvable pins, dropped claims) must not
-    // enter currency/stale/admission checks: apply-time stale retirement
-    // would otherwise undo the carry. Views with claims, unresolvable
-    // views, and the scanned view itself are always kept.
-    let (engine, _, object, _) = engine_with_overlay(81);
-    let view = engine.modules[0].scanned.view;
-    let mut candidate = seed_loop_candidate(engine.plan.clone(), engine.pinned.clone());
-    candidate.modules = engine.modules.clone();
-    candidate.views.insert(view);
-    candidate.views.insert(ProcessViewId(999));
-    // Drop the view's claims but keep resolvability (except-carry shape).
-    let mut pins = engine.pinned.clone();
-    pins.remove_view_except(view, &BTreeSet::from([object]));
-    assert!(
-        pins.view_claims(view).is_none(),
-        "the fixture drops the carried view's claims"
-    );
-    assert!(
-        pins.summary(object).is_some(),
-        "the fixture keeps the carried pin resolvable"
-    );
-    let mut candidate = LiveCandidate {
-        pinned: pins,
-        ..candidate
-    };
-    Engine::exclude_carried_views_from_candidate(&mut candidate, ProcessViewId(999));
-    assert!(
-        !candidate.views.contains(&view),
-        "resolvable-but-claimless views leave the checks"
-    );
-    assert!(
-        candidate.views.contains(&ProcessViewId(999)),
-        "the scanned view itself stays"
     );
 }
 

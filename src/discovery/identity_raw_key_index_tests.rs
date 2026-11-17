@@ -326,19 +326,24 @@ fn replace_view_pins_preserve_survives_without_raw_ownership() {
 /// except-kept pins after a conservative replay).
 #[test]
 fn prune_view_pins_to_modules_preserve_survives_global_purge() {
-    let mut pins = pin_set(&distinct_keys(2), true);
+    let entries = distinct_keys(2);
+    let mut pins = pin_set(&entries, true);
     let kept = PinnedObjectId(0);
     let dropped = PinnedObjectId(1);
-    assert!(pins.summary(kept).is_some(), "fixture pins resolve");
+    record_scan_ownership(&mut pins, ProcessViewId(1), entries[0].0, PATH);
+    record_scan_ownership(&mut pins, ProcessViewId(2), entries[1].0, PATH);
+    // View 1 retires carried: resolvable, claimless.
+    pins.remove_view_except(ProcessViewId(1), &BTreeSet::from([kept]));
+    assert!(pins.summary(kept).is_some(), "carried stays resolvable");
     assert!(pins.summary(dropped).is_some(), "fixture pins resolve");
-    pins.prune_view_pins_to_modules(ProcessViewId(1), &[], &[kept]);
+    pins.prune_view_pins_to_modules(ProcessViewId(2), &[], &[kept]);
     assert!(
         pins.summary(kept).is_some(),
-        "the preserved id survives the purge"
+        "the purge spares carried coverage"
     );
     assert!(
         pins.summary(dropped).is_none(),
-        "the unpreserved id still drops"
+        "the pruned view's pins still drop"
     );
 }
 
@@ -373,5 +378,41 @@ fn replace_view_pins_with_claims_for_splits_resolve_and_claims() {
     assert!(
         !claims.pins.contains(&carried),
         "the carried id stays merely resolvable"
+    );
+}
+
+/// Global purges spare carried coverage: ids that stay resolvable
+/// without ownership claims anywhere (the except-carry shape) survive
+/// another view's replace, while fully dropped ids stay dropped.
+#[test]
+fn global_purge_spares_resolvable_but_claimless_ids() {
+    let entries = distinct_keys(3);
+    let mut pins = pin_set(&entries, true);
+    let kept = PinnedObjectId(0);
+    let owned = PinnedObjectId(1);
+    let doomed = PinnedObjectId(2);
+    record_scan_ownership(&mut pins, ProcessViewId(1), entries[0].0, PATH);
+    record_scan_ownership(&mut pins, ProcessViewId(2), entries[1].0, PATH);
+    record_scan_ownership(&mut pins, ProcessViewId(3), entries[2].0, PATH);
+    // View 1 retires carried: resolvable, claimless.
+    pins.remove_view_except(ProcessViewId(1), &BTreeSet::from([kept]));
+    assert!(pins.summary(kept).is_some(), "carried stays resolvable");
+    assert!(
+        pins.view_claims(ProcessViewId(1)).is_none(),
+        "carried drops its claims"
+    );
+    // An unrelated view's empty replace globally purges.
+    pins.replace_view_pins(ProcessViewId(3), PinnedObjects::empty(), &[]);
+    assert!(
+        pins.summary(kept).is_some(),
+        "the purge spares carried coverage"
+    );
+    assert!(
+        pins.summary(owned).is_some(),
+        "claimed pins survive the purge"
+    );
+    assert!(
+        pins.summary(doomed).is_none(),
+        "the replaced view's pins still drop"
     );
 }

@@ -2176,7 +2176,7 @@ impl CallerRegistry {
         if record.state != InstanceLifecycle::Observed {
             return false;
         }
-        if self.retired.contains_key(&record.caller) {
+        if self.retired.contains(record.caller) {
             return false;
         }
         let Some(semantics) = self.instance_state.semantics.get(&id) else {

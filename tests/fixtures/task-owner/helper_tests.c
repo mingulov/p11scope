@@ -3044,13 +3044,16 @@ static void bank_timing_ts_before_remove(void)
     assert(!p11_bank_complete_timed(7, pid_tgid(), 0, 1, 9999));
     assert(bank_cell(7)->returned == 2);
     assert(bank_fault_cell == 0);
-    /* An unscouted return retires START and faults scope, uncounted. */
+    /* An unscouted return retires START, uncounted and unfaulted: with a
+     * refused layout the roots already count the ABI refusal, so the
+     * bridge must neither latch scope nor double-count it unmatched. */
     assert(!p11_bank_enter_timed(7, pid_tgid(), 100));
     assert(bank_cell(7)->entered == 3);
     assert(!p11_bank_complete_timed(7, pid_tgid(), 0, 0, 200));
     assert(!p11_owner_start_get(&key, 0));
     assert(bank_cell(7)->returned == 2);
-    assert(bank_fault_cell == BANK_SCOPE_FAULT);
+    assert(bank_fault_cell == 0);
+    assert(evidence_cells[BANK_EVIDENCE_UNMATCHED_RETURNS] == 0);
     assert(!bank_health_cells[0] && !bank_health_cells[1]);
     /* Bank-1 geometry: extent 512..1024 routes slot 513 to bank 1, cell 1. */
     reset(); object_setup();
@@ -3159,6 +3162,24 @@ static void bank_timing_rv_insert_failure_reports_loss(void)
     assert(evidence_cells[BANK_EVIDENCE_RV_UPDATE_FAILURES] == 1);
     struct bank_rv_key rv = { .slot = 7, .pad = 0, .rv = 0x600000001ULL };
     assert(!lookup(&RV_COUNTS, &rv));
+    assert(!bank_health_cells[0] && !bank_health_cells[1]);
+}
+
+/* A scope-only loss (layout readable) retires START and counts one
+ * unmatched return, without faulting the bank or voiding later reads. */
+static void bank_timing_unaccounted_scope_loss_counts_unmatched(void)
+{
+    reset(); object_setup();
+    scrub_start_on_delete = 1;
+    bank_publish_route(7, 1, 0, 512);
+    assert(!p11_bank_enter_timed(7, pid_tgid(), 1000));
+    assert(!p11_bank_complete_timed(7, pid_tgid(), 0, 2, 2500));
+    struct owner_start_key key = start_key(7);
+    assert(!p11_owner_start_get(&key, 0));
+    assert(bank_cell(7)->entered == 1);
+    assert(bank_cell(7)->returned == 0);
+    assert(bank_fault_cell == 0);
+    assert(evidence_cells[BANK_EVIDENCE_UNMATCHED_RETURNS] == 1);
     assert(!bank_health_cells[0] && !bank_health_cells[1]);
 }
 #endif
@@ -3660,6 +3681,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "bank_timing_enter_stores_clock")) bank_timing_enter_stores_clock();
         else if (!strcmp(argv[1], "bank_timing_rv_insert_race_counts_into_peer_row")) bank_timing_rv_insert_race_counts_into_peer_row();
         else if (!strcmp(argv[1], "bank_timing_rv_insert_failure_reports_loss")) bank_timing_rv_insert_failure_reports_loss();
+        else if (!strcmp(argv[1], "bank_timing_unaccounted_scope_loss_counts_unmatched")) bank_timing_unaccounted_scope_loss_counts_unmatched();
 #endif
         else assert(0);
     } else {

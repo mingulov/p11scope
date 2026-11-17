@@ -872,9 +872,14 @@ fn native_semantic_resource_final_types_pinned() {
     // +48 (v0.8.0 departed-retention publication): five inline budget
     // scalars — late retired-caller refusals and the exact pair
     // row/base plus pair/EXEC overflow counters — with padding.
+    // +48 (folded-counters publication): six more inline BudgetView
+    // u64s — retired-with-calls, folded edges plus entries, folded
+    // mechanism and identity overflow, folded instances. The
+    // folded-claims bool packs with the pre-existing bool, adding
+    // nothing; the per-module departed aggregate sits behind a Vec.
     pin!(
         crate::inventory_present::Presentation,
-        1336 + size_of::<crate::inventory_present::PresentationRenderIndex>()
+        1384 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 5 * size_of::<Vec<u8>>()
             // a2 re-arm rate: joint_audit_subjects
             + size_of::<

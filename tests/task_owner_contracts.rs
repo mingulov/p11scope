@@ -356,12 +356,13 @@ fn production_counter_bank_timing_helpers() {
     }
 }
 
-/// Banked RV insert outcomes over the actual C bridge: a peer insert that
-/// wins the race still gets counted (no loss), while a real insert
-/// failure latches the RV fault and reports the lost row. Host-only;
-/// no BPF load, no attach.
+/// Banked per-item loss outcomes over the actual C bridge: a peer RV
+/// insert that wins the race still gets counted (no loss), a real RV
+/// insert failure latches the RV fault and counts the lost row, and an
+/// unaccounted return retires START with a per-item unmatched count and
+/// no scope latch. Host-only; no BPF load, no attach.
 #[test]
-fn production_counter_bank_timing_rv_insert_outcomes() {
+fn production_counter_bank_timing_per_item_loss_outcomes() {
     let temporary = tempfile::tempdir().expect("counter timing RV test directory");
     let binary = temporary.path().join("counter-bank-timing-rv");
     let output = Command::new("clang-18")
@@ -390,6 +391,7 @@ fn production_counter_bank_timing_rv_insert_outcomes() {
     for selector in [
         "bank_timing_rv_insert_race_counts_into_peer_row",
         "bank_timing_rv_insert_failure_reports_loss",
+        "bank_timing_unaccounted_scope_loss_counts_unmatched",
     ] {
         let output = Command::new(&binary).arg(selector).output().unwrap();
         assert!(

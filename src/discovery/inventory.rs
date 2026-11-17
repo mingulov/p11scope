@@ -975,6 +975,7 @@ impl Engine {
         // pending under the named budget gap, the receipt stays
         // partial, and the next pass rescans — never a silent over-cap
         // adoption.
+        let cancel = self.cancel_flag.as_deref();
         let result = scan_and_pin_with(
             view,
             &self.module_hints,
@@ -983,6 +984,8 @@ impl Engine {
             &mut counters,
             false,
             &mut self.stage_timings,
+            &mut self.teardown_deferral,
+            cancel,
             scan,
             None,
             Filing::Acquire(&mut self.handle_table, DeferredReason::Live),

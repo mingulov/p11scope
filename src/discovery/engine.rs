@@ -805,6 +805,10 @@ pub struct Engine {
     polled_pids: BTreeSet<u32>,
     /// The capture's operator-stop flag, checked between work items.
     cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Shared teardown-deferral budget for the current pass / tick: at most
+    /// 1 s of teardown waiting in total. Reset at each pass/tick entry;
+    /// scans charge it via `scan_and_pin_with_proof`.
+    teardown_deferral: TeardownDeferralBudget,
     scope: Scope,
     hooks: HookRegistry,
     module_hints: Vec<PathBuf>,
@@ -7509,6 +7513,8 @@ fn scan_and_pin(
         counters,
         broad_admit,
         stage,
+        &mut TeardownDeferralBudget::new(),
+        None,
         scan_process_view,
         None,
         Filing::Untracked,
@@ -7531,6 +7537,8 @@ fn scan_and_pin_with(
     counters: &mut DiscoveryCounters,
     broad_admit: bool,
     stage: &mut crate::timing::StageTimings,
+    teardown: &mut TeardownDeferralBudget,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     scan: impl FnOnce(
         &ScanRequest<'_>,
         &ProcessView,
@@ -7547,6 +7555,8 @@ fn scan_and_pin_with(
         counters,
         broad_admit,
         stage,
+        teardown,
+        cancel,
         |request, view, budget| {
             scan(request, view, budget).map(|outcome| (outcome, Vec::new(), BTreeSet::new()))
         },
@@ -7642,6 +7652,47 @@ fn mid_scan_exit_proven(view: &ProcessView) -> bool {
     process::whole_group_proven_exited(view)
 }
 
+/// One shared teardown-deferral budget per discovery pass / live tick:
+/// at most 1 s of teardown waiting in total across every scan in the pass.
+/// When spent, remaining teardown cases skip the wait and stay loud as
+/// before (their whole-group proof runs once, unproven, without waiting).
+/// Busy home desktops are the target: N simultaneous teardowns must not
+/// stall discovery N x 1 s.
+#[derive(Debug, Clone)]
+pub(crate) struct TeardownDeferralBudget {
+    remaining: std::time::Duration,
+}
+
+/// Total teardown waiting one pass / tick may spend, across all its scans.
+const TEARDOWN_DEFERRAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
+
+impl TeardownDeferralBudget {
+    fn new() -> Self {
+        Self {
+            remaining: TEARDOWN_DEFERRAL_BUDGET,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_remaining(remaining: std::time::Duration) -> Self {
+        Self { remaining }
+    }
+
+    fn remaining(&self) -> std::time::Duration {
+        self.remaining
+    }
+
+    fn consume(&mut self, elapsed: std::time::Duration) {
+        self.remaining = self.remaining.saturating_sub(elapsed);
+    }
+}
+
+impl Default for TeardownDeferralBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A teardown in flight: the leader is `PF_EXITING`-not-zombie, so the
 /// census is unproven now but will prove once the page teardown lands.
 /// Holds the scan's refusals and its mem-`gone` latch across one bounded
@@ -7649,25 +7700,83 @@ fn mid_scan_exit_proven(view: &ProcessView) -> bool {
 /// once), so a large child killed mid-scan files no loud gap. Returns
 /// whether the re-proof proves the exit; live groups never enter (their
 /// leader carries no `PF_EXITING`) and stay loud without waiting.
-fn teardown_wait_and_reprove(view: &ProcessView) -> bool {
+///
+/// The wait charges the pass's shared [`TeardownDeferralBudget`] (at most
+/// its remaining allowance; exhausted means no wait, loud as before) and
+/// breaks early on the operator stop flag or a capture-budget stop.
+/// Pidfd pins wait via one timed `wait_ready` (immediate wake); fallback
+/// pins keep the stat poll.
+fn teardown_wait_and_reprove(
+    view: &ProcessView,
+    teardown: &mut TeardownDeferralBudget,
+    budget: &CaptureWorkBudget,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> bool {
     use std::time::{Duration, Instant};
     // The page-teardown window scales with touched memory (~160 ms at
-    // 1 GiB, ~520 ms at 4 GiB on 7.0.0-43): 1 s covers ordinary sizes
-    // with margin, polling cheaply so small teardowns return early.
-    let deadline = Instant::now() + Duration::from_millis(1000);
-    let pid = view.pid();
-    loop {
-        if view.original_exited() == Ok(true)
-            || crate::process::process_is_zombie(pid)
-            || crate::process::process_proven_exited(pid)
-        {
-            break;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    // 1 GiB, ~520 ms at 4 GiB on 7.0.0-43): the pass's shared 1 s budget
+    // covers ordinary sizes with margin. When spent, skip the wait and run
+    // the proof once unproven — loud as before.
+    let allowed = teardown.remaining();
+    if allowed.is_zero() {
+        return process::whole_group_proven_exited(view);
     }
+    // A stop already set, or a budget already stopped, before the wait:
+    // skip it (the excuse will be false anyway, so the wait would only
+    // delay a loud record that is already decided).
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        || budget.stopped_reason().is_some()
+    {
+        return process::whole_group_proven_exited(view);
+    }
+    let start = Instant::now();
+    let deadline = start + allowed;
+    let pid = view.pid();
+    let cancelled = || {
+        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            || budget.stopped_reason().is_some()
+    };
+    // Pidfd pins: one timed wait per slice (immediate wake on exit), so no
+    // 10 ms sleep-poll churn. Fallback pins (no pidfd): the stat poll.
+    if view.retained_pin().pidfd().is_ok() {
+        loop {
+            if view.original_exited() == Ok(true)
+                || crate::process::process_is_zombie(pid)
+                || crate::process::process_proven_exited(pid)
+                || cancelled()
+            {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let slice = (deadline - now).min(Duration::from_millis(50));
+            match view.retained_pin().wait_ready(Some(slice)) {
+                Ok(true) => break,
+                Ok(false) => continue,
+                // A poll error (other than the pidfd itself vanishing, which
+                // the exit checks above already cover) ends the wait: run the
+                // proof once rather than spinning on a refusing kernel.
+                Err(_) => break,
+            }
+        }
+    } else {
+        loop {
+            if view.original_exited() == Ok(true)
+                || crate::process::process_is_zombie(pid)
+                || crate::process::process_proven_exited(pid)
+                || cancelled()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    teardown.consume(start.elapsed());
     process::whole_group_proven_exited(view)
 }
 
@@ -7695,6 +7804,8 @@ fn scan_and_pin_with_proof(
     counters: &mut DiscoveryCounters,
     broad_admit: bool,
     stage: &mut crate::timing::StageTimings,
+    teardown: &mut TeardownDeferralBudget,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     scan: impl FnOnce(
         &ScanRequest<'_>,
         &ProcessView,
@@ -7761,7 +7872,14 @@ fn scan_and_pin_with_proof(
             .any(|skip| skip_is_ending_refusal(skip) || skip_is_mid_scan_exit_refusal(skip));
         if (has_gone || has_deferrable_skip) && process::leader_exiting_not_zombie(view) {
             deferral_ran = true;
-            deferred_proven = teardown_wait_and_reprove(view);
+            let wait_start = crate::attach::monotonic_ns();
+            deferred_proven = teardown_wait_and_reprove(view, teardown, budget, cancel);
+            stage.span(
+                crate::timing::StageKind::Scan,
+                "teardown_wait",
+                wait_start,
+                crate::attach::monotonic_ns(),
+            );
         }
     }
     let complete = outcome.unavailable_reason().is_none()
@@ -9213,6 +9331,7 @@ fn discover_plan(
     a: &CaptureArgs,
     scope: &Scope,
     mut named_view: Option<ProcessView>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Engine> {
     let mut discovered = Engine::empty();
     discovered.broad_admit = broad_admit_from_env();
@@ -9403,6 +9522,9 @@ fn discover_plan(
     // that the next pass admits.
     let library_cap = discovered.library_handle_cap();
     discovered.handle_table.prune(usize::MAX);
+    // One shared teardown-deferral budget for this pass: at most 1 s of
+    // teardown waiting in total, however many processes tear down at once.
+    discovered.teardown_deferral = TeardownDeferralBudget::new();
     for (index, pid) in selected.iter().enumerate() {
         // The pass counts its own opens against the snapshot (conservative
         // within the pass: drops are not subtracted; the fresh snapshot
@@ -9548,6 +9670,8 @@ fn discover_plan(
             &mut counters,
             broad_admit,
             &mut discovered.stage_timings,
+            &mut discovered.teardown_deferral,
+            cancel,
             |request, view, budget| {
                 scan_process_view_examined(request, view, budget)
                     .map(|(outcome, examined, _, own_shape)| (outcome, examined, own_shape))
@@ -13773,6 +13897,7 @@ impl Engine {
             polling_rescans_queued: 0,
             polled_pids: BTreeSet::new(),
             cancel_flag: None,
+            teardown_deferral: TeardownDeferralBudget::new(),
             scope: Scope::Pid(std::process::id()),
             hooks: HookRegistry::builtin(),
             module_hints: Vec::new(),
@@ -16839,6 +16964,8 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
         stage: &mut crate::timing::StageTimings,
+        teardown: &mut TeardownDeferralBudget,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
         reserve: Option<&crate::fd_budget::FdReserveTick>,
         filing: Filing<'_>,
     ) -> (
@@ -16854,6 +16981,8 @@ impl Engine {
                 counters,
                 broad_admit,
                 stage,
+                teardown,
+                cancel,
                 scan_process_view,
                 reserve,
                 filing,
@@ -16869,6 +16998,8 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
         stage: &mut crate::timing::StageTimings,
+        teardown: &mut TeardownDeferralBudget,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
         filing: Filing<'_>,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
@@ -16883,6 +17014,8 @@ impl Engine {
                 counters,
                 broad_admit,
                 stage,
+                teardown,
+                cancel,
                 scan_process_view_without_memory,
                 None,
                 filing,
@@ -21590,6 +21723,7 @@ impl Engine {
         }
         let broad_admit = self.broad_admit;
         let record_path = catchup_authority.is_none();
+        let cancel = self.cancel_flag.as_deref();
         let (scan_result, scan_counters) = match mode {
             LoaderScanMode::Memory => Self::scan_retained_view(
                 &self.views[position],
@@ -21598,6 +21732,8 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
+                &mut self.teardown_deferral,
+                cancel,
                 None,
                 Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
             ),
@@ -21608,6 +21744,8 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
+                &mut self.teardown_deferral,
+                cancel,
                 Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
             ),
         };
@@ -22541,6 +22679,8 @@ impl Engine {
         let io_start = self.budget.attempted_io_bytes();
         let wall_start = crate::attach::monotonic_ns();
         let budget_ns = self.owned_watch_run_budget_ns;
+        // One shared teardown-deferral budget for this watch run.
+        self.teardown_deferral = TeardownDeferralBudget::new();
         for (index, pid) in picks.into_iter().enumerate() {
             let wall_now = wall_start.and_then(|_| crate::attach::monotonic_ns());
             if index > 0
@@ -22609,6 +22749,7 @@ impl Engine {
         };
         let io_before = self.budget.attempted_io_bytes();
         let broad_admit = self.broad_admit;
+        let cancel = self.cancel_flag.as_deref();
         let (scan_result, scan_counters) = Self::scan_retained_view(
             &view,
             &self.module_hints,
@@ -22616,6 +22757,8 @@ impl Engine {
             &mut self.budget,
             broad_admit,
             &mut self.stage_timings,
+            &mut self.teardown_deferral,
+            cancel,
             None,
             Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
         );
@@ -30399,6 +30542,7 @@ impl Engine {
             };
             self.scheduler.note_retained_view_attempt(view_id.0);
             let broad_admit = self.broad_admit;
+            let cancel = self.cancel_flag.as_deref();
             let (scan_result, counters) = Self::scan_retained_view(
                 &self.views[position],
                 &self.module_hints,
@@ -30406,6 +30550,8 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
+                &mut self.teardown_deferral,
+                cancel,
                 None,
                 Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
             );
@@ -31603,6 +31749,7 @@ impl Engine {
         // `ProvedEntry`s in a dropped-at-return scratch that builds no
         // entries and inserts no rows. Modules and completeness still
         // flow for the provider-freedom verdict below.
+        let cancel = self.cancel_flag.as_deref();
         let (scan_result, counters) = Self::scan_retained_view(
             &view,
             &self.module_hints,
@@ -31610,6 +31757,8 @@ impl Engine {
             &mut self.budget,
             broad_admit,
             &mut self.stage_timings,
+            &mut self.teardown_deferral,
+            cancel,
             None,
             Filing::Scratch,
         );
@@ -32079,6 +32228,7 @@ impl Engine {
             // scan can no longer retain past the cap; shares file no
             // new row.
             let admits_before = self.handle_table.stats().admits;
+            let cancel = self.cancel_flag.as_deref();
             let (scan_result, counters) = Self::scan_retained_view(
                 &view,
                 &self.module_hints,
@@ -32086,6 +32236,8 @@ impl Engine {
                 &mut self.budget,
                 broad_admit,
                 &mut self.stage_timings,
+                &mut self.teardown_deferral,
+                cancel,
                 // Fix7 F1: the tick's reserve budgets the pin loop itself.
                 reserve_tick.as_ref(),
                 Filing::Acquire(&mut self.handle_table, DeferredReason::Live),
@@ -32272,6 +32424,9 @@ impl Engine {
         });
         let mut new_views = Vec::new();
         self.inventory_passes = self.inventory_passes.saturating_add(1);
+        // One shared teardown-deferral budget for this tick: at most 1 s of
+        // teardown waiting in total across every scan the tick runs.
+        self.teardown_deferral = TeardownDeferralBudget::new();
         // Fix7: the handle baseline for the end-of-tick
         // release observation — only while a handles-deferred retry
         // pends, so idle ticks pay one `is_empty` for the whole round.
@@ -38851,7 +39006,19 @@ impl Engine {
         scope: &Scope,
         named_view: Option<ProcessView>,
     ) -> Result<Self> {
-        discover_plan(args, scope, named_view)
+        discover_plan(args, scope, named_view, None)
+    }
+
+    /// [`Self::discover`] with the operator stop flag: teardown waits break
+    /// early when it is set, so Ctrl-C during a busy-host discovery pass
+    /// does not wait out the deferral budget.
+    pub fn discover_with_cancel(
+        args: &CaptureArgs,
+        scope: &Scope,
+        named_view: Option<ProcessView>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self> {
+        discover_plan(args, scope, named_view, Some(cancel))
     }
 
     pub fn plan(&self) -> &plan::AttachPlan {

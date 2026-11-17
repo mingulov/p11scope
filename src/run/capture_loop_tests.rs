@@ -2824,6 +2824,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
                 detail: "semantic lane unavailable".into(),
             },
             operator_forwarding: false,
+            provider_info: None,
         }],
         edges: vec![EdgeView {
             caller: CallerId(0),
@@ -2880,6 +2881,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         key_operations_requested: false,
         manifests_present: false,
         joint_audit_subjects: None,
+        provider_observations: None,
         budgets: BudgetView {
             callers_limit: 8,
             callers_occupied: 1,

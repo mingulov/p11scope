@@ -1,0 +1,101 @@
+{
+  "modules": [
+    {
+      "id": "m0",
+      "provider_info": {
+        "cryptoki_major": 3,
+        "cryptoki_minor": 1,
+        "manufacturer": "SoftHSM",
+        "description": "SoftHSM v2",
+        "flags": 0,
+        "library_major": 2,
+        "library_minor": 6
+      }
+    },
+    {
+      "id": "m1"
+    }
+  ],
+  "provider_observations": {
+    "version": 8,
+    "tokens": [
+      {
+        "module": "m0",
+        "caller": "c0",
+        "slot": 0,
+        "manufacturer": "SoftHSM",
+        "model": "SoftHSM v2",
+        "hardware_major": 2,
+        "hardware_minor": 6,
+        "firmware_major": 2,
+        "firmware_minor": 6,
+        "flags": 6,
+        "pin_min_len": 4,
+        "pin_max_len": 255,
+        "completions": 12,
+        "changes": 1,
+        "instance": "i7"
+      },
+      {
+        "module": "m0",
+        "caller": "c1",
+        "slot": 0,
+        "manufacturer": null,
+        "manufacturer_reason": "non_utf8_bytes",
+        "model": "",
+        "hardware_major": 2,
+        "hardware_minor": 6,
+        "firmware_major": 2,
+        "firmware_minor": 6,
+        "flags": 6,
+        "pin_min_len": 4,
+        "pin_max_len": 255,
+        "completions": 3,
+        "changes": 0
+      }
+    ],
+    "mechanisms": [
+      {
+        "module": "m0",
+        "caller": "c0",
+        "slot": 0,
+        "mechanism": 1082,
+        "min_key_size": 1024,
+        "max_key_size": 4096,
+        "flags": 1,
+        "completions": 2,
+        "changes": 0
+      },
+      {
+        "module": "m0",
+        "caller": "c1",
+        "slot": 1,
+        "mechanism": 1082,
+        "min_key_size": 1024,
+        "max_key_size": 4096,
+        "flags": 1,
+        "completions": 1,
+        "changes": 0,
+        "instance": "i9"
+      }
+    ],
+    "gaps": [
+      {
+        "reason": "info_aliased_endpoint",
+        "count": 1
+      },
+      {
+        "reason": "info_return_deferred",
+        "count": 2
+      },
+      {
+        "reason": "info_caller_unavailable",
+        "count": 1
+      },
+      {
+        "reason": "mechanism_info_refused",
+        "count": 3
+      }
+    ]
+  }
+}

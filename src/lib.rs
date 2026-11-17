@@ -96,6 +96,8 @@ pub(crate) mod inventory_output;
 pub mod inventory_present;
 #[path = "inventory/promotion.rs"]
 pub(crate) mod inventory_promotion;
+#[path = "inventory/provider_info.rs"]
+pub(crate) mod inventory_provider_info;
 #[path = "inventory/semantics.rs"]
 pub(crate) mod inventory_semantics;
 pub(crate) mod key_operation_projection;

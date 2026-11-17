@@ -2736,3 +2736,287 @@ fn pqc_label_rank_matches_v5_order() {
         assert_eq!(pqc_label_rank(label), None, "{label}");
     }
 }
+
+// Task 7 (spec §17.5) provider/token/mechanism text twins: the concise
+// provider line, the verbose token/mechanism lines, control escaping
+// and per-caller slot disambiguation.
+
+use crate::discovery::caller_registry::CallerId as InfoCallerId;
+use crate::discovery::caller_registry::ModuleId as InfoModuleId;
+use crate::inventory_provider_info::{
+    MechanismRow as InfoMechanismRow, ProviderGaps as InfoGaps, ProviderInfo, ProviderObservations,
+    TokenRow as InfoTokenRow,
+};
+
+fn provider_info_fixture() -> ProviderInfo {
+    ProviderInfo {
+        cryptoki_major: 3,
+        cryptoki_minor: 1,
+        manufacturer: Some("SoftHSM".to_string()),
+        manufacturer_reason: None,
+        description: Some("SoftHSM v2".to_string()),
+        description_reason: None,
+        flags: 0,
+        library_major: 2,
+        library_minor: 6,
+    }
+}
+
+fn info_token_row(caller: u32, slot: u64) -> InfoTokenRow {
+    InfoTokenRow {
+        module: InfoModuleId(0),
+        caller: InfoCallerId(caller),
+        slot,
+        manufacturer: Some("TokenMfr".to_string()),
+        manufacturer_reason: None,
+        model: Some("Model-X".to_string()),
+        model_reason: None,
+        hardware_major: 2,
+        hardware_minor: 6,
+        firmware_major: 2,
+        firmware_minor: 7,
+        flags: 6,
+        pin_min_len: 4,
+        pin_max_len: 255,
+        completions: 12,
+        changes: 1,
+        instance: None,
+    }
+}
+
+fn info_mechanism_row(caller: u32, slot: u64, mechanism: u64) -> InfoMechanismRow {
+    InfoMechanismRow {
+        module: InfoModuleId(0),
+        caller: InfoCallerId(caller),
+        slot,
+        mechanism,
+        min_key_size: 1024,
+        max_key_size: 4096,
+        flags: 1,
+        completions: 2,
+        changes: 0,
+        instance: None,
+    }
+}
+
+fn provider_presentation() -> Presentation {
+    let mut presentation = key_ops_presentation(populated(1));
+    presentation.modules[0].provider_info = Some(provider_info_fixture());
+    presentation.provider_observations = Some(ProviderObservations {
+        tokens: vec![info_token_row(0, 0)],
+        mechanisms: vec![info_mechanism_row(0, 0, 1082)],
+        gaps: InfoGaps::default(),
+    });
+    presentation
+}
+
+#[test]
+fn provider_line_renders_pinned_wording() {
+    let presentation = provider_presentation();
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        snapshot
+            .lines()
+            .any(|line| line == "provider: SoftHSM v2 2.6 (cryptoki 3.1, SoftHSM)"),
+        "pinned provider line, got:\n{snapshot}"
+    );
+}
+
+#[test]
+fn provider_lines_absent_without_task7_content() {
+    let presentation = key_ops_presentation(populated(1));
+    for verbosity in [
+        crate::cli::TextVerbosity::Concise,
+        crate::cli::TextVerbosity::Verbose,
+    ] {
+        let snapshot = render_snapshot_with_verbosity(&presentation, verbosity);
+        assert!(
+            !snapshot.lines().any(|line| line.starts_with("provider:")),
+            "no provider line without Task 7 content, got:\n{snapshot}"
+        );
+    }
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert!(document.get("provider_observations").is_none());
+    assert!(
+        document["modules"][0]
+            .as_object()
+            .expect("module object")
+            .get("provider_info")
+            .is_none()
+    );
+}
+
+#[test]
+fn provider_verbose_adds_token_and_mechanism_lines() {
+    let presentation = provider_presentation();
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose
+            .lines()
+            .any(|line| line == "  token slot 0: TokenMfr Model-X fw 2.7 hw 2.6 pin 4-255"),
+        "pinned token line, got:\n{verbose}"
+    );
+    assert!(
+        verbose
+            .lines()
+            .any(|line| line == "  mechanism 0x43a slot 0: limits 1024-4096, flags 0x1"),
+        "pinned mechanism line, got:\n{verbose}"
+    );
+    let task7: Vec<&str> = verbose
+        .lines()
+        .filter(|line| {
+            line.starts_with("provider:")
+                || line.starts_with("  token slot")
+                || line.starts_with("  mechanism 0x")
+        })
+        .collect();
+    assert!(!task7.is_empty());
+    assert!(
+        task7.iter().all(|line| !line.contains("bits")),
+        "raw numbers, never bits, got:\n{verbose}"
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(!concise.contains("token slot 0:"));
+    assert!(!concise.contains("mechanism 0x43a"));
+}
+
+#[test]
+fn provider_text_escapes_controls_json_keeps_raw() {
+    let mut presentation = provider_presentation();
+    let info = presentation.modules[0]
+        .provider_info
+        .as_mut()
+        .expect("provider info");
+    info.manufacturer = Some("A\x1b[0m".to_string());
+    info.description = Some("B\u{9b}0m".to_string());
+    let observations = presentation
+        .provider_observations
+        .as_mut()
+        .expect("observations");
+    observations.tokens[0].model = Some("C\x07D".to_string());
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let task7: Vec<&str> = verbose
+        .lines()
+        .filter(|line| {
+            line.starts_with("provider:")
+                || line.starts_with("  token slot")
+                || line.starts_with("  mechanism 0x")
+        })
+        .collect();
+    assert!(!task7.is_empty());
+    assert!(
+        task7.iter().all(|line| !line.contains('\x1b')),
+        "ESC escaped, got:\n{verbose}"
+    );
+    assert!(
+        task7.iter().all(|line| !line.contains('\u{9b}')),
+        "C1 escaped, got:\n{verbose}"
+    );
+    assert!(
+        task7.iter().any(|line| line.contains("\\u{1b}")),
+        "escape_default spelling, got:\n{verbose}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(
+        document["modules"][0]["provider_info"]["manufacturer"],
+        "A\x1b[0m"
+    );
+    assert_eq!(
+        document["provider_observations"]["tokens"][0]["model"],
+        "C\x07D"
+    );
+}
+
+#[test]
+fn provider_text_disambiguates_shared_slots_per_caller() {
+    let mut presentation = provider_presentation();
+    let observations = presentation
+        .provider_observations
+        .as_mut()
+        .expect("observations");
+    observations.tokens.push(info_token_row(1, 0));
+    observations.mechanisms.push(info_mechanism_row(1, 0, 1082));
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose
+            .lines()
+            .any(|line| line
+                == "  token slot 0: TokenMfr Model-X fw 2.7 hw 2.6 pin 4-255 (caller c0)"),
+        "caller suffix on shared slot, got:\n{verbose}"
+    );
+    assert!(
+        verbose
+            .lines()
+            .any(|line| line
+                == "  token slot 0: TokenMfr Model-X fw 2.7 hw 2.6 pin 4-255 (caller c1)"),
+        "caller suffix on shared slot, got:\n{verbose}"
+    );
+
+    let single = provider_presentation();
+    let verbose = render_snapshot_with_verbosity(&single, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        !verbose.contains("(caller c0)"),
+        "no suffix when unambiguous, got:\n{verbose}"
+    );
+}
+
+#[test]
+fn provider_refused_strings_render_unknown_marker() {
+    let mut presentation = provider_presentation();
+    let info = presentation.modules[0]
+        .provider_info
+        .as_mut()
+        .expect("provider info");
+    info.manufacturer = None;
+    info.manufacturer_reason = Some("non_utf8_bytes");
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise
+            .lines()
+            .any(|line| line == "provider: SoftHSM v2 2.6 (cryptoki 3.1, ?)"),
+        "refused manufacturer reads ?, got:\n{concise}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert!(document["modules"][0]["provider_info"]["manufacturer"].is_null());
+    assert_eq!(
+        document["modules"][0]["provider_info"]["manufacturer_reason"],
+        "non_utf8_bytes"
+    );
+}
+
+#[test]
+fn provider_gaps_render_verbose_only() {
+    let mut presentation = provider_presentation();
+    presentation
+        .provider_observations
+        .as_mut()
+        .expect("observations")
+        .gaps
+        .return_deferred = 2;
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose
+            .lines()
+            .any(|line| line == "  provider info gaps: info_return_deferred=2"),
+        "gaps line, got:\n{verbose}"
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(!concise.contains("provider info gaps:"));
+}
+
+#[test]
+fn provider_json_emits_v8_section_through_render_path() {
+    let presentation = provider_presentation();
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let section = &document["provider_observations"];
+    assert_eq!(section["version"], 8);
+    assert_eq!(section["tokens"][0]["slot"], 0);
+    assert_eq!(section["tokens"][0]["manufacturer"], "TokenMfr");
+    assert_eq!(section["mechanisms"][0]["mechanism"], 1082);
+    assert_eq!(section["mechanisms"][0]["min_key_size"], 1024);
+    assert_eq!(
+        document["modules"][0]["provider_info"]["description"],
+        "SoftHSM v2"
+    );
+}

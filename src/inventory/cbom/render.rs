@@ -10,8 +10,12 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use super::classify::classify;
-use super::input::{JOIN_LIMIT, Projection, TEXT_LIST_LIMIT, join_bounded};
+use super::input::{JOIN_LIMIT, MechanismLimit, Projection, TEXT_LIST_LIMIT, join_bounded};
 use crate::render::escape_controls;
+
+/// Task 7 per-reporter limit properties, capped at 16 reporters per
+/// mechanism id (spec §17.5).
+const LIMIT_REPORTERS: usize = 16;
 
 pub(super) fn render_json(projection: &Projection) -> Value {
     let mut document = Map::new();
@@ -37,6 +41,69 @@ fn prop(name: &str, value: String) -> Value {
         ("name".to_string(), Value::String(name.to_string())),
         ("value".to_string(), Value::String(value)),
     ]))
+}
+
+/// Task 7 per-reporter limit properties for one mechanism id: plain
+/// names for exactly one reporter, `p11scope:slot-<slot>:` suffixed
+/// names beyond that. Reporters past the 16 cap and reporters
+/// colliding on a slot suffix report nothing; both set
+/// `p11scope:slot-limits-truncated` instead of merging.
+fn limit_properties(reporters: &[MechanismLimit]) -> Vec<Value> {
+    if reporters.is_empty() {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&MechanismLimit> = reporters.iter().collect();
+    ordered.sort_by(|left, right| {
+        (&left.module, left.slot, &left.caller).cmp(&(&right.module, right.slot, &right.caller))
+    });
+    if ordered.len() == 1 {
+        let reporter = ordered[0];
+        return vec![
+            prop("p11scope:min-key-size", reporter.min_key_size.to_string()),
+            prop("p11scope:max-key-size", reporter.max_key_size.to_string()),
+            prop("p11scope:mechanism-flags", reporter.flags.to_string()),
+            prop("p11scope:mechanism-hw", hw_label(reporter.flags)),
+        ];
+    }
+    let mut properties = Vec::new();
+    let mut seen_slots = BTreeSet::new();
+    let mut truncated = ordered.len() > LIMIT_REPORTERS;
+    for reporter in ordered.into_iter().take(LIMIT_REPORTERS) {
+        if !seen_slots.insert(reporter.slot) {
+            truncated = true;
+            continue;
+        }
+        let prefix = format!("p11scope:slot-{}:", reporter.slot);
+        properties.push(prop(
+            &format!("{prefix}min-key-size"),
+            reporter.min_key_size.to_string(),
+        ));
+        properties.push(prop(
+            &format!("{prefix}max-key-size"),
+            reporter.max_key_size.to_string(),
+        ));
+        properties.push(prop(
+            &format!("{prefix}mechanism-flags"),
+            reporter.flags.to_string(),
+        ));
+        properties.push(prop(
+            &format!("{prefix}mechanism-hw"),
+            hw_label(reporter.flags),
+        ));
+    }
+    if truncated {
+        properties.push(prop("p11scope:slot-limits-truncated", "true".to_string()));
+    }
+    properties
+}
+
+/// `CKF_HW` (bit 0) of a `CK_MECHANISM_INFO` flags word.
+fn hw_label(flags: u64) -> String {
+    if flags & 1 == 1 {
+        "true".to_string()
+    } else {
+        "false".to_string()
+    }
 }
 
 fn render_metadata(projection: &Projection) -> Value {
@@ -186,7 +253,46 @@ fn render_components(projection: &Projection) -> Vec<Value> {
                 ]))]),
             );
         }
+        // Task 7: the library keeps its name and gains the
+        // OrganizationalEntity supplier object plus the version.
+        if let Some(supplier) = &provider.supplier {
+            component.insert(
+                "supplier".to_string(),
+                Value::Object(Map::from_iter([(
+                    "name".to_string(),
+                    Value::String(supplier.clone()),
+                )])),
+            );
+        }
+        if let Some(version) = &provider.library_version {
+            component.insert("version".to_string(), Value::String(version.clone()));
+        }
         components.push(Value::Object(component));
+    }
+    for token in &projection.tokens {
+        components.push(Value::Object(Map::from_iter([
+            ("bom-ref".to_string(), Value::String(token.bom_ref.clone())),
+            ("type".to_string(), Value::String("device".to_string())),
+            ("name".to_string(), Value::String(token.name.clone())),
+            (
+                "description".to_string(),
+                Value::String(
+                    "Token observed in application calls; only manufacturer, model, versions, flags and PIN lengths are published."
+                        .to_string(),
+                ),
+            ),
+            (
+                "properties".to_string(),
+                Value::Array(vec![
+                    prop("p11scope:slot", token.slot.to_string()),
+                    prop("p11scope:hardware-version", token.hardware.clone()),
+                    prop("p11scope:firmware-version", token.firmware.clone()),
+                    prop("p11scope:token-flags", token.flags.to_string()),
+                    prop("p11scope:pin-min-len", token.pin_min_len.to_string()),
+                    prop("p11scope:pin-max-len", token.pin_max_len.to_string()),
+                ]),
+            ),
+        ])));
     }
     for mechanism in &projection.mechanisms {
         let classified = classify(
@@ -221,7 +327,7 @@ fn render_components(projection: &Projection) -> Vec<Value> {
         let operations: BTreeSet<String> = mechanism.operations.iter().cloned().collect();
         let functions: BTreeSet<String> = mechanism.functions.iter().cloned().collect();
         let returns: BTreeSet<String> = mechanism.returns.iter().cloned().collect();
-        let properties = vec![
+        let mut properties = vec![
             prop("p11scope:mechanism_id", mechanism.id.to_string()),
             prop("p11scope:mechanism_hex", format!("0x{:x}", mechanism.id)),
             prop("p11scope:calls", mechanism.calls.to_string()),
@@ -231,6 +337,14 @@ fn render_components(projection: &Projection) -> Vec<Value> {
             prop("p11scope:returns", join_bounded(&returns, JOIN_LIMIT)),
             prop("p11scope:rows", mechanism.rows.to_string()),
         ];
+        properties.extend(limit_properties(&mechanism.limits));
+        let description = if mechanism.limits.is_empty() {
+            "Mechanism observed initializing operations; carries no key size, curve or parameters."
+                .to_string()
+        } else {
+            "Mechanism observed initializing operations; carries no key size, curve or parameters; provider key-size limits in properties."
+                .to_string()
+        };
         let name = mechanism
             .name
             .clone()
@@ -245,13 +359,7 @@ fn render_components(projection: &Projection) -> Vec<Value> {
                 Value::String("cryptographic-asset".to_string()),
             ),
             ("name".to_string(), Value::String(name)),
-            (
-                "description".to_string(),
-                Value::String(
-                    "Mechanism observed initializing operations; carries no key size, curve or parameters."
-                        .to_string(),
-                ),
-            ),
+            ("description".to_string(), Value::String(description)),
             (
                 "cryptoProperties".to_string(),
                 Value::Object(Map::from_iter([
@@ -259,10 +367,7 @@ fn render_components(projection: &Projection) -> Vec<Value> {
                         "assetType".to_string(),
                         Value::String("algorithm".to_string()),
                     ),
-                    (
-                        "algorithmProperties".to_string(),
-                        Value::Object(algorithm),
-                    ),
+                    ("algorithmProperties".to_string(), Value::Object(algorithm)),
                 ])),
             ),
             ("properties".to_string(), Value::Array(properties)),
@@ -416,7 +521,7 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
 
 fn head_line(projection: &Projection) -> String {
     let scope = projection.scope_note.as_deref().unwrap_or("unknown");
-    format!(
+    let mut head = format!(
         "CBOM from {} (scope {scope}): {}, {}, {}, {}",
         escape_controls(&projection.source_schema),
         counted(projection.applications.len(), "application", "applications"),
@@ -427,7 +532,14 @@ fn head_line(projection: &Projection) -> String {
             "cryptographic algorithms"
         ),
         counted(projection.keys.len(), "key object", "key objects"),
-    )
+    );
+    if !projection.tokens.is_empty() {
+        head.push_str(&format!(
+            ", {}",
+            counted(projection.tokens.len(), "token", "tokens")
+        ));
+    }
+    head
 }
 
 fn capped_list(items: &[String], limit: usize) -> String {
@@ -691,6 +803,22 @@ pub(super) fn render_verbose(projection: &Projection, out: &mut Vec<u8>) -> std:
         plural(projection.keys.len(), "key", "keys"),
         projection.keys.len()
     );
+    if !projection.tokens.is_empty() {
+        let _ = writeln!(
+            text,
+            "{} ({}):",
+            plural(projection.tokens.len(), "token", "tokens"),
+            projection.tokens.len()
+        );
+        for token in &projection.tokens {
+            let _ = writeln!(
+                text,
+                "  {} (slot {})",
+                escape_controls(&token.name),
+                token.slot,
+            );
+        }
+    }
     for key in &projection.keys {
         let kind = match key.class {
             Some(2) => "public-key",

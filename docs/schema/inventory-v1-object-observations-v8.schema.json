@@ -1,0 +1,284 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://p11scope/inventory/v1-object-observations-v8.schema.json",
+  "title": "p11scope/inventory/v1 Task 7 provider/token/mechanism section (version 8)",
+  "description": "Consumer contract for section version 8 (v0.8.0 keymeta Task 7, spec section 17.5; the v8 number comes from the shared section-version allocator, spec section 10.1, and versions 1-7 stay frozen). Covers the per-module provider_info key on modules[] rows (see #/$defs/provider_info) and the top-level provider_observations section: per-(module, caller, slot) token rows, per-(module, caller, slot, mechanism) mechanism rows with raw mechanism-dependent limit numbers, and the four named gap counters. The section is emitted exactly when Task 7 content is present. Every object is closed: additionalProperties is false at every level, and every enum is exact. There are no keys for excluded bytes anywhere: no serial number, token label, session count, memory size or clock reading key exists in this contract. Rows carry module + caller references resolving in modules[]/edges[]; the instance id rides a row only when the semantic lane proved it, never synthesized. Row counters are cumulative within their row: completions counts polls, changes counts value transitions (first observation sets the value with changes 0); repeats are last-wins, never second entries and never merges.",
+  "type": "object",
+  "required": [
+    "version",
+    "tokens",
+    "mechanisms",
+    "gaps"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 8,
+      "description": "Section version. Additive versioned section; consumers must reject unknown versions, never guess."
+    },
+    "tokens": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/token_row"
+      },
+      "description": "Token rows, sorted by (module, caller, slot). One row per (module, caller incarnation, slot) by construction; slot ids are per-process, so two callers' same-slot tokens are separate rows."
+    },
+    "mechanisms": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mechanism_row"
+      },
+      "description": "Mechanism rows, sorted by (module, caller, slot, mechanism). Capped at 128 rows per (module, caller, slot); extras refuse with the mechanism_info_refused gap counter."
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/gap_row"
+      },
+      "description": "Named section gaps with counts, in fixed reason order, nonzero rows only."
+    }
+  },
+  "$defs": {
+    "provider_info": {
+      "type": "object",
+      "description": "Per-module provider facts from completed C_GetInfo calls; rides the modules[] row as provider_info, absent without a completed call. Repeats are last-wins with no counters.",
+      "required": [
+        "cryptoki_major",
+        "cryptoki_minor",
+        "manufacturer",
+        "description",
+        "flags",
+        "library_major",
+        "library_minor"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "cryptoki_major": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "cryptoki_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "manufacturer": {
+          "type": ["string", "null"],
+          "description": "Trimmed CK_INFO.manufacturerID; null when refused (non-UTF8), with manufacturer_reason naming why."
+        },
+        "manufacturer_reason": {
+          "enum": ["non_utf8_bytes"]
+        },
+        "description": {
+          "type": ["string", "null"],
+          "description": "Trimmed CK_INFO.libraryDescription; null when refused (non-UTF8), with description_reason naming why."
+        },
+        "description_reason": {
+          "enum": ["non_utf8_bytes"]
+        },
+        "flags": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "library_major": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "library_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    },
+    "token_row": {
+      "type": "object",
+      "required": [
+        "module",
+        "caller",
+        "slot",
+        "manufacturer",
+        "model",
+        "hardware_major",
+        "hardware_minor",
+        "firmware_major",
+        "firmware_minor",
+        "flags",
+        "pin_min_len",
+        "pin_max_len",
+        "completions",
+        "changes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "module": {
+          "type": "string",
+          "description": "Module id label resolving in modules[] (m0, m1, ...)."
+        },
+        "caller": {
+          "type": "string",
+          "description": "Caller incarnation id label resolving in callers[] (c0, c1, ...)."
+        },
+        "slot": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "manufacturer": {
+          "type": ["string", "null"],
+          "description": "Trimmed CK_TOKEN_INFO.manufacturerID; null when refused (non-UTF8), with manufacturer_reason naming why."
+        },
+        "manufacturer_reason": {
+          "enum": ["non_utf8_bytes"]
+        },
+        "model": {
+          "type": ["string", "null"],
+          "description": "Trimmed CK_TOKEN_INFO.model; null when refused (non-UTF8), with model_reason naming why."
+        },
+        "model_reason": {
+          "enum": ["non_utf8_bytes"]
+        },
+        "hardware_major": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "hardware_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "firmware_major": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "firmware_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "flags": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Whole CK_TOKEN_INFO flags word, including PIN-state bits (policy state, not secrets)."
+        },
+        "pin_min_len": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "pin_max_len": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "completions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "changes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "instance": {
+          "type": "string",
+          "description": "Instance id label (i0, i1, ...) attached only when the semantic lane proved it; absent otherwise, never synthesized."
+        }
+      }
+    },
+    "mechanism_row": {
+      "type": "object",
+      "required": [
+        "module",
+        "caller",
+        "slot",
+        "mechanism",
+        "min_key_size",
+        "max_key_size",
+        "flags",
+        "completions",
+        "changes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "module": {
+          "type": "string",
+          "description": "Module id label resolving in modules[] (m0, m1, ...)."
+        },
+        "caller": {
+          "type": "string",
+          "description": "Caller incarnation id label resolving in callers[] (c0, c1, ...)."
+        },
+        "slot": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "mechanism": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Numeric mechanism type; no name key exists in this section."
+        },
+        "min_key_size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Raw CK_MECHANISM_INFO.ulMinKeySize: a mechanism-dependent number (bits or bytes), never a unit claim."
+        },
+        "max_key_size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Raw CK_MECHANISM_INFO.ulMaxKeySize: a mechanism-dependent number (bits or bytes), never a unit claim."
+        },
+        "flags": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "completions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "changes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "instance": {
+          "type": "string",
+          "description": "Instance id label (i0, i1, ...) attached only when the semantic lane proved it; absent otherwise, never synthesized."
+        }
+      }
+    },
+    "gap_row": {
+      "type": "object",
+      "required": ["reason", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "enum": [
+            "info_aliased_endpoint",
+            "info_return_deferred",
+            "info_caller_unavailable",
+            "mechanism_info_refused"
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    }
+  }
+}

@@ -19,6 +19,9 @@ discovery-listed providers only). Anything else is refused with exit 1.
 | Provider module (`modules[]`: paths, device/inode, SHA-256, admission, lifecycle) | `type: library`, `name` = first recorded path; SHA-256 becomes a `hashes[]` entry when it is 64 hex digits |
 | Mechanism id (`edges[].mechanisms[]`, profile `mechanisms[]`), unioned by id | `type: cryptographic-asset`, `cryptoProperties.assetType: algorithm` |
 | Key object (`object_observations.objects[]` with established metadata or a label) | `type: cryptographic-asset`, `cryptoProperties.assetType: related-crypto-material` |
+| Provider facts (`modules[].provider_info`) | `supplier` object + `version` on the provider's `type: library` component |
+| Token row (`provider_observations.tokens[]`) | `type: device`, linked to its library via `dependencies[]` |
+| Mechanism limit rows (`provider_observations.mechanisms[]`) | limit properties on the mechanism id's `algorithm` component |
 
 `bom-ref` values (`p11scope:caller:N`, `p11scope:module:N`,
 `p11scope:mechanism:<hex>`, `p11scope:key:<object>`) are minted by this
@@ -28,6 +31,45 @@ application/module → mechanisms observed on their edges, key object →
 its provider module and caller application via the key-operation →
 instance → module/caller join (when joinable, otherwise no edge and
 a named note).
+
+## Provider, token and mechanism info (Task 7, v1 only)
+
+When the input carries Task 7 content (`modules[].provider_info`
+and/or the top-level `provider_observations` section, section
+version 8 — any other section version refuses the conversion), the
+projection re-projects it; profile inputs never carry it.
+
+- The `type: library` provider component keeps its `name` (first
+  recorded path) and gains `supplier` as an object
+  (`{"name": <manufacturerID>}` — never a string) plus `version`
+  (`<library major>.<library minor>`). A refused (non-UTF8)
+  manufacturer omits the supplier; malformed provider detail
+  degrades to no supplier/version while the component renders.
+- Each token row projects to a `type: device` component named
+  `<manufacturerID> <model>` (available parts only; `token slot
+  <N>` when both strings were refused) with hardware/firmware
+  versions, flags and PIN lengths in `properties[]`, linked to its
+  library via `dependencies[]`. Serial numbers, labels, session
+  counts, memory sizes and clock readings have no key anywhere in
+  this output.
+- Per-slot mechanism limits map onto the global-per-id `algorithm`
+  components by reporter count: exactly one (module, caller, slot)
+  reporter reads plain properties (`p11scope:min-key-size`,
+  `p11scope:max-key-size`, `p11scope:mechanism-flags`,
+  `p11scope:mechanism-hw` from the `CKF_HW` bit); more than one
+  reads per-reporter properties suffixed
+  `p11scope:slot-<slot>:<base>`, capped at 16 reporters per
+  mechanism id, with `p11scope:slot-limits-truncated: true` instead
+  of merging when reporters share a slot suffix or exceed the cap.
+  Limit numbers are the raw provider words, never a unit claim.
+  When limit properties are present the algorithm `description`
+  gains `; provider key-size limits in properties`. A mechanism id
+  with limits but no observed operation row mints an algorithm
+  component from the limits alone (zero calls, no observed
+  operations); it stays out of the unknown-primitive count.
+- Text: the head counts tokens only when devices exist; `-v` adds a
+  tokens block. Section gaps (`info_*`, `mechanism_info_refused`)
+  have no CBOM mapping and are not projected.
 
 ## Algorithm properties (name-determined only)
 

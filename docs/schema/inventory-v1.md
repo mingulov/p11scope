@@ -498,6 +498,13 @@ and never proves an app identity. See the app identity rows of
   is correct (same file → same loaded object → one session
   namespace). The additive instance projection below separates proven
   semantic instances; physical module and entry meanings stay the same.
+  `provider_info` (additive within v1, Task 7 section version 8) is the
+  per-module provider record `{cryptoki_major, cryptoki_minor,
+  manufacturer, description, flags, library_major, library_minor}`
+  from completed `C_GetInfo` calls, absent without a completed call.
+  A refused (non-UTF8) string reads `null` with a `<field>_reason`
+  reason beside it. Repeats are last-wins with no counters. See
+  `Provider observations` below for the token/mechanism rows.
   An overlayfs copy-up pair is the converse: one merged path names two
   kernel files — the stale pre-copy-up lower file and the fresh upper
   file — and the identity key keeps them two records, each with the
@@ -1409,6 +1416,69 @@ never imply S1 loss.
   in this section. Key values, moduli, EC points, labels, IDs and PINs
   are never read or carried. Initialize arguments (including `pInitArgs`)
   are never read.
+
+## Provider observations (additive within v1)
+
+The additive `provider_observations` section (Task 7 section version
+8) carries provider, token and mechanism facts observed from
+application `C_GetInfo`, `C_GetTokenInfo` and `C_GetMechanismInfo`
+calls. The frozen consumer contract is
+[inventory-v1-object-observations-v8.schema.json](inventory-v1-object-observations-v8.schema.json)
+(the v8 number comes from the shared section-version allocator;
+object-observations versions 1–7 stay frozen); consumers must reject
+unknown section versions, never guess. The section is emitted exactly
+when Task 7 content is present, in default inventory as well as under
+`--key-operations`, and identically with `--key-sizes` on or off.
+
+- `version` is 8. `tokens[]` (sorted by module, caller, slot) holds
+  one row per (module, caller incarnation, slot):
+  `{module, caller, slot, manufacturer, model, hardware_major,
+  hardware_minor, firmware_major, firmware_minor, flags,
+  pin_min_len, pin_max_len, completions, changes}`, plus `instance`
+  only when the semantic lane proved it (attached, never
+  synthesized, never required). Slot ids are per-process: two
+  callers' same-slot tokens are separate rows under one (module,
+  caller) each.
+- `mechanisms[]` (sorted by module, caller, slot, mechanism) holds
+  one row per (module, caller incarnation, slot, mechanism):
+  `{module, caller, slot, mechanism, min_key_size, max_key_size,
+  flags, completions, changes}`, plus `instance` as above. Limit
+  numbers are the raw `CK_MECHANISM_INFO` words (bits or bytes,
+  mechanism-dependent), never a unit claim. At most 128 rows per
+  (module, caller, slot); extras refuse with the
+  `mechanism_info_refused` gap counter.
+- Repeat rule: last-wins per key. `completions` counts polls;
+  `changes` counts value transitions (first observation sets the
+  value with `changes: 0`). A different token in the same slot is
+  last-wins plus one `changes` bump — never a second entry, never a
+  merge. A provider with no completed Task 7 calls has no
+  `provider_info` block; "never watched" needs no marker.
+- `gaps[]` (`{reason, count}`, fixed reason order, nonzero rows
+  only) names section refusals: `info_aliased_endpoint` (an
+  endpoint whose slot set is not exactly one info function keeps
+  its usage entry), `info_return_deferred` (an EMFILE-deferred info
+  return link), `info_caller_unavailable` (a refused row whose
+  caller identity the return could not obtain) and
+  `mechanism_info_refused` (the 128-row cap).
+- Padded fixed-width strings publish trimmed (trailing spaces and
+  NULs removed, truncated at the first embedded NUL; all-spaces
+  publishes as the empty string). A non-UTF8 field reads `null`
+  with a `<field>_reason` (`non_utf8_bytes`) beside it; the row
+  still publishes its numeric fields. Text renders a refused string
+  as `?` and escapes controls; JSON keeps raw strings.
+- Text: concise gains one provider line per module with completed
+  `C_GetInfo` facts — `provider: <description> <library version>
+  (cryptoki <cryptoki version>, <manufacturer>)` — and `-v` adds
+  per-slot token lines (`token slot <N>: <manufacturer> <model> fw
+  <firmware> hw <hardware> pin <min>-<max>`) and per-mechanism
+  limit lines (`mechanism 0x<id> slot <N>: limits <min>-<max>,
+  flags 0x<flags>`, raw numbers, never "bits"). Rows sharing a
+  slot within a module name their caller (`(caller cN)`).
+- Privacy: no serial number, token label, session count, memory
+  size or clock reading key exists anywhere in this section, and no
+  other section carries them either. PIN-state flag bits and PIN
+  min/max lengths are published policy state, not secrets. No raw
+  handles, pointers, PIDs/TIDs or arbitrary bytes appear.
 
 ## Caller metadata (additive within v1)
 

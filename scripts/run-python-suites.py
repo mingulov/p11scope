@@ -162,6 +162,7 @@ RUN = [
     ("test_prepared_dependency_metadata.py", []),
     ("test_prepared_dependency_tools.py", []),
     ("test_provider_matrix_cell.py", []),
+    ("test_provider_observations_v8.py", []),
     ("test_public_cli_breadth.py", []),
     ("test_public_cli_oracle.py", []),
     ("test_public_cli_qualifier.py", []),

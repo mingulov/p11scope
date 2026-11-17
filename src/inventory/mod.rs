@@ -9835,7 +9835,7 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
         .clone()
         .map(serde_json::Value::from)
         .unwrap_or(serde_json::Value::Null);
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "id": record.id.label(),
         "paths": record.paths.iter().collect::<Vec<_>>(),
         "identity": {
@@ -9917,7 +9917,13 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
         // callers (their edges and instances left the snapshot).
         // `null` until the first fold.
         "departed_use": record.departed_use.as_ref().map(departed_use_json),
-    })
+    });
+    // Additive (v1, Task 7 section version 8): completed `C_GetInfo`
+    // facts for this module. Absent without a completed call.
+    if let Some(info) = &record.provider_info {
+        value["provider_info"] = crate::inventory_provider_info::provider_info_json(info);
+    }
+    value
 }
 
 /// One module's departed aggregate: per-module truth (one caller's
@@ -10361,6 +10367,15 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         // numbering; the kernel's are the initial namespace's.
         "pid_namespace": crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
     });
+    // Additive (v1, Task 7 section version 8): the joined
+    // provider/token/mechanism projection. Emitted exactly when Task 7
+    // content is present.
+    if let Some(observations) = &presentation.provider_observations
+        && !observations.is_empty()
+    {
+        document["provider_observations"] =
+            crate::inventory_provider_info::provider_observations_json(observations);
+    }
     // Additive (v0.6.0): files skipped by `--exclude-module`, a declared
     // operator choice, never a loss. Omitted when empty.
     if !presentation.excluded_modules.is_empty() {

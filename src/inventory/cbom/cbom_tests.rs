@@ -566,3 +566,484 @@ fn projection_refuses_unsupported_schemas() {
         .to_string();
     assert!(error.contains("no schema string"), "{error}");
 }
+
+// Task 7 (spec §17.5) CBOM twins: supplier/version on the library,
+// device token components, per-reporter mechanism limit properties,
+// and the serial-absence proof.
+
+fn provider_info_value() -> Value {
+    json!({
+        "cryptoki_major": 3,
+        "cryptoki_minor": 1,
+        "manufacturer": "SoftHSM",
+        "description": "SoftHSM v2",
+        "flags": 0,
+        "library_major": 2,
+        "library_minor": 6
+    })
+}
+
+fn module_with_info(id: &str, path: &str, sha256: Option<&str>) -> Value {
+    let mut module = module(id, path, sha256);
+    module["provider_info"] = provider_info_value();
+    module
+}
+
+fn token_row(caller: &str, slot: u64) -> Value {
+    json!({
+        "module": "m0",
+        "caller": caller,
+        "slot": slot,
+        "manufacturer": "TokenMfr",
+        "model": "Model-X",
+        "hardware_major": 2,
+        "hardware_minor": 6,
+        "firmware_major": 2,
+        "firmware_minor": 7,
+        "flags": 6,
+        "pin_min_len": 4,
+        "pin_max_len": 255,
+        "completions": 12,
+        "changes": 1
+    })
+}
+
+fn mechanism_limit_row(caller: &str, slot: u64, mechanism: u64) -> Value {
+    json!({
+        "module": "m0",
+        "caller": caller,
+        "slot": slot,
+        "mechanism": mechanism,
+        "min_key_size": 1024,
+        "max_key_size": 4096,
+        "flags": 1,
+        "completions": 2,
+        "changes": 0
+    })
+}
+
+fn inventory_document_with_info(
+    callers: Vec<Value>,
+    modules: Vec<Value>,
+    edges: Vec<Value>,
+    tokens: Vec<Value>,
+    mechanisms: Vec<Value>,
+) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schema": "p11scope/inventory/v1",
+        "scope": "pid:4242",
+        "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+        "observation": {"started_ns": 100, "ended_ns": 200, "passes": 1, "usage_feed": true},
+        "budgets": {},
+        "callers": callers,
+        "modules": modules,
+        "edges": edges,
+        "provider_observations": {
+            "version": 8,
+            "tokens": tokens,
+            "mechanisms": mechanisms,
+            "gaps": []
+        },
+        "gaps": [],
+        "gaps_suppressed": 0
+    }))
+    .unwrap()
+}
+
+fn library_component(document: &Value, bom_ref: &str) -> Value {
+    document["components"]
+        .as_array()
+        .expect("components array")
+        .iter()
+        .find(|component| component["bom-ref"] == bom_ref)
+        .unwrap_or_else(|| panic!("component {bom_ref}"))
+        .clone()
+}
+
+fn walk_keys(node: &Value, found: &mut Vec<String>) {
+    match node {
+        Value::Object(map) => {
+            for (key, value) in map {
+                found.push(key.clone());
+                walk_keys(value, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                walk_keys(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn cbom_provider_gains_supplier_object_and_version() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module_with_info("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+        vec![],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.providers.len(), 1);
+    assert_eq!(projection.providers[0].name, "/lib/p.so");
+    let document = super::render::render_json(&projection);
+    let library = library_component(&document, "p11scope:module:0");
+    assert_eq!(library["name"], "/lib/p.so");
+    assert_eq!(library["supplier"], json!({"name": "SoftHSM"}));
+    assert_eq!(library["version"], "2.6");
+}
+
+#[test]
+fn cbom_refused_manufacturer_omits_supplier() {
+    let mut info = provider_info_value();
+    info["manufacturer"] = Value::Null;
+    info["manufacturer_reason"] = json!("non_utf8_bytes");
+    let mut module = module("m0", "/lib/p.so", Some(&"a".repeat(64)));
+    module["provider_info"] = info;
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module],
+        vec![edge("c0", "m0", None)],
+        vec![],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.providers[0].supplier, None);
+    let document = super::render::render_json(&projection);
+    let library = library_component(&document, "p11scope:module:0");
+    assert!(library.get("supplier").is_none());
+    assert_eq!(library["version"], "2.6");
+}
+
+#[test]
+fn cbom_projection_rejects_unknown_info_version() {
+    let bytes = serde_json::to_vec(&json!({
+        "schema": "p11scope/inventory/v1",
+        "scope": "pid:4242",
+        "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+        "observation": {"started_ns": 100, "ended_ns": 200, "passes": 1, "usage_feed": true},
+        "budgets": {},
+        "callers": [caller("c0", Some("/bin/driver"))],
+        "modules": [module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        "edges": [edge("c0", "m0", None)],
+        "provider_observations": {
+            "version": 9,
+            "tokens": [],
+            "mechanisms": [],
+            "gaps": []
+        },
+        "gaps": [],
+        "gaps_suppressed": 0
+    }))
+    .unwrap();
+    let error = parse_input(&bytes).unwrap_err().to_string();
+    assert!(error.contains("provider_observations"), "{error}");
+}
+
+#[test]
+fn cbom_token_projects_device_component() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module_with_info("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+        vec![token_row("c0", 0)],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.tokens.len(), 1);
+    let document = super::render::render_json(&projection);
+    let device = library_component(&document, "p11scope:token:0");
+    assert_eq!(device["type"], "device");
+    assert_eq!(device["name"], "TokenMfr Model-X");
+    let properties = device["properties"].as_array().expect("properties");
+    let prop = |name: &str| {
+        properties
+            .iter()
+            .find(|property| property["name"] == name)
+            .unwrap_or_else(|| panic!("property {name}"))
+            .get("value")
+            .expect("value")
+            .clone()
+    };
+    assert_eq!(prop("p11scope:hardware-version"), "2.6");
+    assert_eq!(prop("p11scope:firmware-version"), "2.7");
+    assert_eq!(prop("p11scope:token-flags"), "6");
+    assert_eq!(prop("p11scope:pin-min-len"), "4");
+    assert_eq!(prop("p11scope:pin-max-len"), "255");
+    assert_eq!(prop("p11scope:slot"), "0");
+    let dependencies = document["dependencies"].as_array().expect("dependencies");
+    assert!(
+        dependencies.iter().any(|dependency| {
+            dependency["ref"] == "p11scope:token:0"
+                && dependency["dependsOn"]
+                    .as_array()
+                    .expect("dependsOn")
+                    .contains(&json!("p11scope:module:0"))
+        }),
+        "device links its library, got: {dependencies:?}"
+    );
+}
+
+#[test]
+fn cbom_never_emits_serial_keys() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module_with_info("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge(
+            "c0",
+            "m0",
+            Some(vec![mechanism_row(
+                1082,
+                Some("CKM_SHA256_RSA_PKCS"),
+                &["sign"],
+                4,
+            )]),
+        )],
+        vec![token_row("c0", 0)],
+        vec![mechanism_limit_row("c0", 0, 1082)],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    let document = super::render::render_json(&projection);
+    let mut keys = Vec::new();
+    walk_keys(&document, &mut keys);
+    for key in &keys {
+        let lowered = key.to_lowercase();
+        for forbidden in ["serial", "label", "utctime"] {
+            assert!(
+                !lowered.contains(forbidden),
+                "excluded key {key:?} in CBOM output"
+            );
+        }
+    }
+    let serialized = serde_json::to_string(&document).expect("serialize");
+    assert!(!serialized.to_lowercase().contains("serial"));
+}
+
+#[test]
+fn cbom_single_reporter_limits_are_plain() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge(
+            "c0",
+            "m0",
+            Some(vec![mechanism_row(
+                1082,
+                Some("CKM_SHA256_RSA_PKCS"),
+                &["sign"],
+                4,
+            )]),
+        )],
+        vec![],
+        vec![mechanism_limit_row("c0", 0, 1082)],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.mechanisms.len(), 1);
+    let document = super::render::render_json(&projection);
+    let algorithm = library_component(&document, "p11scope:mechanism:0x43a");
+    let properties = algorithm["properties"].as_array().expect("properties");
+    let values: Vec<(&str, &str)> = properties
+        .iter()
+        .map(|property| {
+            (
+                property["name"].as_str().expect("name"),
+                property["value"].as_str().expect("value"),
+            )
+        })
+        .collect();
+    assert!(values.contains(&("p11scope:min-key-size", "1024")));
+    assert!(values.contains(&("p11scope:max-key-size", "4096")));
+    assert!(values.contains(&("p11scope:mechanism-flags", "1")));
+    assert!(values.contains(&("p11scope:mechanism-hw", "true")));
+    assert!(
+        !values
+            .iter()
+            .any(|(name, _)| name.contains("slot-limits-truncated"))
+    );
+    assert!(
+        algorithm["description"]
+            .as_str()
+            .expect("description")
+            .ends_with("; provider key-size limits in properties.")
+    );
+}
+
+#[test]
+fn cbom_multi_reporter_limits_are_suffixed() {
+    let bytes = inventory_document_with_info(
+        vec![
+            caller("c0", Some("/bin/driver")),
+            caller("c1", Some("/bin/other")),
+        ],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge(
+            "c0",
+            "m0",
+            Some(vec![mechanism_row(
+                1082,
+                Some("CKM_SHA256_RSA_PKCS"),
+                &["sign"],
+                4,
+            )]),
+        )],
+        vec![],
+        vec![
+            mechanism_limit_row("c0", 0, 1082),
+            mechanism_limit_row("c1", 1, 1082),
+        ],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    let document = super::render::render_json(&projection);
+    let algorithm = library_component(&document, "p11scope:mechanism:0x43a");
+    let properties = algorithm["properties"].as_array().expect("properties");
+    let names: Vec<&str> = properties
+        .iter()
+        .map(|property| property["name"].as_str().expect("name"))
+        .collect();
+    assert!(names.contains(&"p11scope:slot-0:min-key-size"));
+    assert!(names.contains(&"p11scope:slot-1:min-key-size"));
+    assert!(!names.contains(&"p11scope:min-key-size"));
+    assert!(!names.contains(&"p11scope:slot-limits-truncated"));
+}
+
+#[test]
+fn cbom_limit_reporters_truncate_on_collision_and_cap() {
+    // Two reporters sharing a slot id: no merge, truncation flag.
+    let bytes = inventory_document_with_info(
+        vec![
+            caller("c0", Some("/bin/driver")),
+            caller("c1", Some("/bin/other")),
+        ],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge(
+            "c0",
+            "m0",
+            Some(vec![mechanism_row(
+                1082,
+                Some("CKM_SHA256_RSA_PKCS"),
+                &["sign"],
+                4,
+            )]),
+        )],
+        vec![],
+        vec![
+            mechanism_limit_row("c0", 0, 1082),
+            mechanism_limit_row("c1", 0, 1082),
+        ],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    let document = super::render::render_json(&projection);
+    let algorithm = library_component(&document, "p11scope:mechanism:0x43a");
+    let properties = algorithm["properties"].as_array().expect("properties");
+    let truncated = properties
+        .iter()
+        .find(|property| property["name"] == "p11scope:slot-limits-truncated")
+        .expect("truncation flag")
+        .get("value")
+        .expect("value");
+    assert_eq!(truncated, "true");
+
+    // Seventeen reporters: sixteen report, truncation flag.
+    let mut callers = Vec::new();
+    let mut rows = Vec::new();
+    for index in 0..17u64 {
+        let id = format!("c{index}");
+        callers.push(caller(&id, Some(&format!("/bin/app{index}"))));
+        rows.push(mechanism_limit_row(&id, index, 1082));
+    }
+    let bytes = inventory_document_with_info(
+        callers,
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge(
+            "c0",
+            "m0",
+            Some(vec![mechanism_row(
+                1082,
+                Some("CKM_SHA256_RSA_PKCS"),
+                &["sign"],
+                4,
+            )]),
+        )],
+        vec![],
+        rows,
+    );
+    let projection = parse_input(&bytes).unwrap();
+    let document = super::render::render_json(&projection);
+    let algorithm = library_component(&document, "p11scope:mechanism:0x43a");
+    let properties = algorithm["properties"].as_array().expect("properties");
+    let names: Vec<&str> = properties
+        .iter()
+        .map(|property| property["name"].as_str().expect("name"))
+        .collect();
+    assert!(names.contains(&"p11scope:slot-15:min-key-size"));
+    assert!(!names.contains(&"p11scope:slot-16:min-key-size"));
+    assert!(names.contains(&"p11scope:slot-limits-truncated"));
+}
+
+#[test]
+fn cbom_limit_only_mechanism_mints_algorithm_component() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+        vec![],
+        vec![mechanism_limit_row("c0", 0, 4231)],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.mechanisms.len(), 1);
+    assert_eq!(projection.mechanisms[0].id, 4231);
+    assert_eq!(projection.unknowns.mechanisms_unnamed, 0);
+    assert_eq!(projection.unknowns.mechanisms_unknown_primitive, 0);
+    let document = super::render::render_json(&projection);
+    let algorithm = library_component(&document, "p11scope:mechanism:0x1087");
+    assert_eq!(algorithm["name"], "PKCS#11 mechanism 0x1087");
+    let properties = algorithm["properties"].as_array().expect("properties");
+    assert!(
+        properties
+            .iter()
+            .any(|property| property["name"] == "p11scope:min-key-size")
+    );
+}
+
+#[test]
+fn cbom_text_names_tokens_verbose_only() {
+    let bytes = inventory_document_with_info(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module_with_info("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+        vec![token_row("c0", 0)],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    let mut verbose = Vec::new();
+    super::render::render_verbose(&projection, &mut verbose).unwrap();
+    let verbose = String::from_utf8(verbose).expect("utf8");
+    assert!(
+        verbose.contains("TokenMfr Model-X"),
+        "verbose names the token, got:\n{verbose}"
+    );
+    let mut concise = Vec::new();
+    super::render::render_concise(&projection, &mut concise).unwrap();
+    let concise = String::from_utf8(concise).expect("utf8");
+    assert!(
+        concise.lines().next().expect("head").contains("1 token"),
+        "head counts the token, got:\n{concise}"
+    );
+
+    let plain = inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+    );
+    let projection = parse_input(&plain).unwrap();
+    let mut concise = Vec::new();
+    super::render::render_concise(&projection, &mut concise).unwrap();
+    let concise = String::from_utf8(concise).expect("utf8");
+    assert!(
+        !concise.lines().next().expect("head").contains("token"),
+        "head byte-stable without tokens, got:\n{concise}"
+    );
+}

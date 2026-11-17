@@ -296,6 +296,9 @@ pub(crate) struct ModuleView {
     /// `--forwarding-module`: its edges split out exactly like a closure
     /// array under the same per-caller gates.
     pub operator_forwarding: bool,
+    /// Task 7 provider facts from completed `C_GetInfo` calls, if any
+    /// completed for this module (rides `modules[].provider_info`).
+    pub provider_info: Option<crate::inventory_provider_info::ProviderInfo>,
 }
 
 /// One module's `C_Initialize` evidence (S1-adjacent), owned for
@@ -695,6 +698,11 @@ pub(crate) struct Presentation {
     /// observed nothing. Counts only, never authority.
     pub joint_audit_subjects:
         Option<crate::discovery::engine::inventory_coordinator::JointAuditSubjectDiagnosis>,
+    /// Task 7 provider/token/mechanism projection (additive,
+    /// section version 8): `Some` exactly when Task 7 content is
+    /// present. Renders as the top-level `provider_observations`
+    /// section; absent when `None`.
+    pub provider_observations: Option<crate::inventory_provider_info::ProviderObservations>,
 }
 
 /// What an edge's activity label answers (Choice 3).
@@ -866,6 +874,9 @@ impl Presentation {
                 departed_use: record.departed_use.clone(),
                 init: ModuleInitView::capture(registry, *id),
                 operator_forwarding: false,
+                // TODO(Task 7 BPF half): fill from the INFO drain's
+                // join once the inventory session drains INFO records.
+                provider_info: None,
             });
         }
         let mut edge_keys: Vec<(CallerId, ModuleId)> = registry
@@ -1142,6 +1153,9 @@ impl Presentation {
                 let diagnosis = coordinator.joint_audit_subject_diagnosis();
                 (!diagnosis.is_empty()).then_some(diagnosis)
             },
+            // TODO(Task 7 BPF half): fill from the INFO drain's join
+            // once the inventory session drains INFO records.
+            provider_observations: None,
         })
     }
 
@@ -4019,6 +4033,146 @@ fn render_concise_caller_scope_lines(out: &mut String, presentation: &Presentati
     }
 }
 
+/// Task 7 (§17.5) provider/token/mechanism text: one concise
+/// provider line per module with completed `C_GetInfo` facts, plus
+/// verbose-only token, mechanism and gap lines. Provider-controlled
+/// strings pass through [`escape_controls`]; refused (non-UTF8)
+/// strings read `?`. Slot numbers are per-process, so rows sharing
+/// a slot within a module name their caller.
+fn render_provider_info_lines(out: &mut String, presentation: &Presentation, verbose: bool) {
+    use std::fmt::Write as _;
+    let observations = presentation.provider_observations.as_ref();
+    for module in &presentation.modules {
+        let rows_for_module = observations.is_some_and(|observations| {
+            observations
+                .tokens
+                .iter()
+                .any(|row| row.module == module.id)
+                || observations
+                    .mechanisms
+                    .iter()
+                    .any(|row| row.module == module.id)
+        });
+        let Some(info) = &module.provider_info else {
+            if verbose
+                && rows_for_module
+                && let Some(observations) = observations
+            {
+                render_provider_info_rows(out, observations, module.id);
+            }
+            continue;
+        };
+        let _ = writeln!(
+            out,
+            "provider: {} {}.{} (cryptoki {}.{}, {})",
+            info.description
+                .as_deref()
+                .map(|text| escape_controls(text).into_owned())
+                .unwrap_or_else(|| "?".to_string()),
+            info.library_major,
+            info.library_minor,
+            info.cryptoki_major,
+            info.cryptoki_minor,
+            info.manufacturer
+                .as_deref()
+                .map(|text| escape_controls(text).into_owned())
+                .unwrap_or_else(|| "?".to_string()),
+        );
+        if verbose && let Some(observations) = observations {
+            render_provider_info_rows(out, observations, module.id);
+        }
+    }
+    if verbose && let Some(observations) = observations {
+        let gaps = &observations.gaps;
+        let mut parts = Vec::new();
+        for (reason, count) in [
+            ("info_aliased_endpoint", gaps.aliased),
+            ("info_return_deferred", gaps.return_deferred),
+            ("info_caller_unavailable", gaps.caller_unavailable),
+            ("mechanism_info_refused", gaps.mechanism_refused),
+        ] {
+            if count > 0 {
+                parts.push(format!("{reason}={count}"));
+            }
+        }
+        if !parts.is_empty() {
+            let _ = writeln!(out, "  provider info gaps: {}", parts.join(", "));
+        }
+    }
+}
+
+/// Verbose-only token/mechanism rows for one module, in (slot,
+/// caller[, mechanism]) order.
+fn render_provider_info_rows(
+    out: &mut String,
+    observations: &crate::inventory_provider_info::ProviderObservations,
+    module: ModuleId,
+) {
+    use std::fmt::Write as _;
+    let mut tokens: Vec<_> = observations
+        .tokens
+        .iter()
+        .filter(|row| row.module == module)
+        .collect();
+    tokens.sort_by_key(|row| (row.slot, row.caller));
+    for row in &tokens {
+        let shared_slot = tokens
+            .iter()
+            .filter(|other| other.slot == row.slot)
+            .take(2)
+            .count()
+            > 1;
+        let caller = if shared_slot {
+            format!(" (caller {})", row.caller.label())
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            out,
+            "  token slot {}: {} {} fw {}.{} hw {}.{} pin {}-{}{caller}",
+            row.slot,
+            row.manufacturer
+                .as_deref()
+                .map(|text| escape_controls(text).into_owned())
+                .unwrap_or_else(|| "?".to_string()),
+            row.model
+                .as_deref()
+                .map(|text| escape_controls(text).into_owned())
+                .unwrap_or_else(|| "?".to_string()),
+            row.firmware_major,
+            row.firmware_minor,
+            row.hardware_major,
+            row.hardware_minor,
+            row.pin_min_len,
+            row.pin_max_len,
+        );
+    }
+    let mut mechanisms: Vec<_> = observations
+        .mechanisms
+        .iter()
+        .filter(|row| row.module == module)
+        .collect();
+    mechanisms.sort_by_key(|row| (row.slot, row.mechanism, row.caller));
+    for row in &mechanisms {
+        let shared = mechanisms
+            .iter()
+            .filter(|other| other.slot == row.slot && other.mechanism == row.mechanism)
+            .take(2)
+            .count()
+            > 1;
+        let caller = if shared {
+            format!(" (caller {})", row.caller.label())
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            out,
+            "  mechanism 0x{:x} slot {}: limits {}-{}, flags 0x{:x}{caller}",
+            row.mechanism, row.slot, row.min_key_size, row.max_key_size, row.flags,
+        );
+    }
+}
+
 fn render_snapshot_inner(
     presentation: &Presentation,
     summary_only: bool,
@@ -4497,6 +4651,13 @@ fn render_snapshot_inner(
                 );
             }
         }
+    }
+    // Task 7 (§17.5): one concise provider line per module with
+    // completed `C_GetInfo` facts, verbose-only per-slot token and
+    // per-mechanism limit lines. Absent without Task 7 content, and
+    // never in the quiet head.
+    if !summary_only {
+        render_provider_info_lines(&mut out, presentation, verbose);
     }
     {
         let layers = forwarding_entry_layers(presentation);

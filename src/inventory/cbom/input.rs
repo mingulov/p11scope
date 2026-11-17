@@ -87,7 +87,39 @@ pub(super) struct Provider {
     pub device: Option<String>,
     pub inode: Option<u64>,
     pub endpoints: Option<u64>,
+    /// Task 7 `CK_INFO.manufacturerID`: `None` without a completed
+    /// `C_GetInfo` or when the field was refused (non-UTF8).
+    pub supplier: Option<String>,
+    /// Task 7 `<library major>.<library minor>`, when published.
+    pub library_version: Option<String>,
     pub bom_ref: String,
+}
+
+/// One Task 7 per-(module, caller, slot) token row: manufacturer,
+/// model, versions, flags and PIN lengths. Serials, labels, session
+/// counts, memory sizes and clock readings never reach this struct
+/// (no such key exists in the section contract).
+#[derive(Debug)]
+pub(super) struct TokenDevice {
+    pub name: String,
+    pub hardware: String,
+    pub firmware: String,
+    pub flags: u64,
+    pub pin_min_len: u64,
+    pub pin_max_len: u64,
+    pub slot: u64,
+    pub bom_ref: String,
+}
+
+/// One Task 7 per-(module, caller, slot) mechanism-limit reporter.
+#[derive(Debug, Clone)]
+pub(super) struct MechanismLimit {
+    pub module: String,
+    pub caller: String,
+    pub slot: u64,
+    pub min_key_size: u64,
+    pub max_key_size: u64,
+    pub flags: u64,
 }
 
 #[derive(Debug)]
@@ -100,6 +132,11 @@ pub(super) struct Mechanism {
     pub functions: Vec<String>,
     pub returns: Vec<String>,
     pub rows: u64,
+    /// Task 7 per-reporter limits for this mechanism id.
+    pub limits: Vec<MechanismLimit>,
+    /// True when no edge/profile row claimed this id: the component
+    /// is minted from provider-reported limits alone.
+    pub limit_only: bool,
     pub bom_ref: String,
 }
 
@@ -133,6 +170,8 @@ pub(super) struct Projection {
     pub providers: Vec<Provider>,
     pub mechanisms: Vec<Mechanism>,
     pub keys: Vec<KeyObject>,
+    /// Task 7 token devices, in input row order.
+    pub tokens: Vec<TokenDevice>,
     /// Proven joins only: (from `bom_ref`, to `bom_ref`).
     pub dependencies: Vec<(String, String)>,
     pub unknowns: Unknowns,
@@ -144,6 +183,13 @@ fn str_of(value: &Value) -> Option<&str> {
 
 fn u64_of(value: &Value) -> Option<u64> {
     value.as_u64()
+}
+
+/// `<major>.<minor>` dotted version from two numeric keys.
+fn dotted_version(row: &Value, major: &str, minor: &str) -> Option<String> {
+    let major = row.get(major).and_then(u64_of)?;
+    let minor = row.get(minor).and_then(u64_of)?;
+    Some(format!("{major}.{minor}"))
 }
 
 /// Combined converted-row count, under the shared per-input row bound.
@@ -190,6 +236,15 @@ fn count_rows(value: &Value, limits: InputLimits) -> Result<()> {
             "key_operations",
             "unknown_key_operations",
         ] {
+            add(section
+                .get(key)
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0))?;
+        }
+    }
+    if let Some(section) = value.get("provider_observations") {
+        for key in ["tokens", "mechanisms"] {
             add(section
                 .get(key)
                 .and_then(Value::as_array)
@@ -363,6 +418,19 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             .get("admission")
             .and_then(|admission| admission.get("endpoints"))
             .and_then(u64_of);
+        // Task 7: a refused (null) manufacturer omits the supplier;
+        // malformed provider_info degrades to no supplier/version
+        // while the component itself still renders.
+        let provider_info = module.get("provider_info");
+        let supplier = provider_info
+            .and_then(|info| info.get("manufacturer"))
+            .and_then(str_of)
+            .map(str::to_string);
+        let library_version = provider_info.and_then(|info| {
+            let major = info.get("library_major").and_then(u64_of)?;
+            let minor = info.get("library_minor").and_then(u64_of)?;
+            Some(format!("{major}.{minor}"))
+        });
         out.providers.push(Provider {
             name,
             sha256,
@@ -372,6 +440,8 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             device,
             inode,
             endpoints,
+            supplier,
+            library_version,
             bom_ref,
         });
     }
@@ -490,6 +560,8 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             functions: accum.functions.iter().cloned().collect(),
             returns: accum.returns.iter().cloned().collect(),
             rows: accum.rows,
+            limits: Vec::new(),
+            limit_only: false,
             bom_ref: bom_ref.clone(),
         });
         for app_path in &accum.callers {
@@ -500,6 +572,128 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
         for provider in &accum.modules {
             add_dependency(&mut out.dependencies, provider, &bom_ref);
         }
+    }
+
+    // Task 7 provider/token/mechanism rows (section version 8).
+    // Unknown section versions refuse the conversion, never guess.
+    if let Some(section) = value.get("provider_observations") {
+        let version = section.get("version").and_then(u64_of);
+        ensure!(
+            version == Some(8),
+            "unsupported provider_observations section version: {}",
+            version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "missing".to_string())
+        );
+        for row in arr_of(section, "tokens") {
+            let (Some(module), Some(caller)) = (
+                row.get("module").and_then(str_of),
+                row.get("caller").and_then(str_of),
+            ) else {
+                continue;
+            };
+            let (Some(provider), true) = (module_ref.get(module), caller_known.contains(caller))
+            else {
+                out.unknowns.dangling_edge_refs += 1;
+                continue;
+            };
+            let (
+                Some(slot),
+                Some(hardware),
+                Some(firmware),
+                Some(flags),
+                Some(pin_min),
+                Some(pin_max),
+            ) = (
+                row.get("slot").and_then(u64_of),
+                dotted_version(row, "hardware_major", "hardware_minor"),
+                dotted_version(row, "firmware_major", "firmware_minor"),
+                row.get("flags").and_then(u64_of),
+                row.get("pin_min_len").and_then(u64_of),
+                row.get("pin_max_len").and_then(u64_of),
+            )
+            else {
+                continue;
+            };
+            let mut parts = Vec::new();
+            if let Some(manufacturer) = row.get("manufacturer").and_then(str_of) {
+                parts.push(manufacturer.to_string());
+            }
+            if let Some(model) = row.get("model").and_then(str_of) {
+                parts.push(model.to_string());
+            }
+            let name = if parts.is_empty() {
+                format!("token slot {slot}")
+            } else {
+                parts.join(" ")
+            };
+            let bom_ref = format!("p11scope:token:{}", out.tokens.len());
+            add_dependency(&mut out.dependencies, &bom_ref, provider);
+            out.tokens.push(TokenDevice {
+                name,
+                hardware,
+                firmware,
+                flags,
+                pin_min_len: pin_min,
+                pin_max_len: pin_max,
+                slot,
+                bom_ref,
+            });
+        }
+        // Mechanism limits group by id; reporters keep input order
+        // here and the renderer sorts them deterministically.
+        let mut limits: BTreeMap<u64, Vec<MechanismLimit>> = BTreeMap::new();
+        for row in arr_of(section, "mechanisms") {
+            let (Some(module), Some(caller), Some(id)) = (
+                row.get("module").and_then(str_of),
+                row.get("caller").and_then(str_of),
+                row.get("mechanism").and_then(u64_of),
+            ) else {
+                continue;
+            };
+            if !caller_known.contains(caller) || !module_ref.contains_key(module) {
+                out.unknowns.dangling_edge_refs += 1;
+                continue;
+            }
+            let (Some(min), Some(max), Some(flags)) = (
+                row.get("min_key_size").and_then(u64_of),
+                row.get("max_key_size").and_then(u64_of),
+                row.get("flags").and_then(u64_of),
+            ) else {
+                continue;
+            };
+            let Some(slot) = row.get("slot").and_then(u64_of) else {
+                continue;
+            };
+            limits.entry(id).or_default().push(MechanismLimit {
+                module: module.to_string(),
+                caller: caller.to_string(),
+                slot,
+                min_key_size: min,
+                max_key_size: max,
+                flags,
+            });
+        }
+        for (id, reporters) in &limits {
+            if let Some(mechanism) = out.mechanisms.iter_mut().find(|row| row.id == *id) {
+                mechanism.limits.clone_from(reporters);
+            } else {
+                out.mechanisms.push(Mechanism {
+                    id: *id,
+                    name: None,
+                    calls: 0,
+                    errors: 0,
+                    operations: Vec::new(),
+                    functions: Vec::new(),
+                    returns: Vec::new(),
+                    rows: 0,
+                    limits: reporters.clone(),
+                    limit_only: true,
+                    bom_ref: format!("p11scope:mechanism:0x{id:x}"),
+                });
+            }
+        }
+        out.mechanisms.sort_by_key(|mechanism| mechanism.id);
     }
 
     // Instances join key operations to their caller and module.
@@ -624,7 +818,12 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
     }
 
     // Count unknown primitives after the classifier ran.
+    // Limit-only mechanisms are provider-reported support, not
+    // observed uses without a name, so they stay out of this count.
     for mechanism in &out.mechanisms {
+        if mechanism.limit_only {
+            continue;
+        }
         let operations = mechanism.operations.clone();
         let classified =
             super::classify::classify(mechanism.name.as_deref().unwrap_or(""), &operations);
@@ -706,6 +905,8 @@ fn convert_profile(value: &Value, schema: &str) -> Result<Projection> {
                 device,
                 inode,
                 endpoints: None,
+                supplier: None,
+                library_version: None,
                 bom_ref: format!("p11scope:module:{index}"),
             });
         }
@@ -747,6 +948,8 @@ fn convert_profile(value: &Value, schema: &str) -> Result<Projection> {
             functions: Vec::new(),
             returns: Vec::new(),
             rows: *rows,
+            limits: Vec::new(),
+            limit_only: false,
             bom_ref: format!("p11scope:mechanism:0x{id:x}"),
         });
     }

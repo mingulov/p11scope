@@ -197,6 +197,17 @@ def join_fact(left, right):
         for flags, zero in ((left, right), (right, left)):
             if flags[0] == "contribution" and zero == ("constant", 0):
                 return flags
+        # Count-only seed join: 0 and the current-cookie marker are both
+        # allowed seed values, so their disjunction stays proven. Any
+        # third value (or a foreign marker) falls through to None.
+        for first, second in ((left, right), (right, left)):
+            if first == ("constant", 0) and second[0] == "entry_marker":
+                return ("seed_value", second[1])
+            if first[0] == "seed_value" and second == ("constant", 0):
+                return first
+            if (first[0] == "seed_value" and second[0] == "entry_marker"
+                    and second[1] == first[1]):
+                return first
         for pointer, zero in ((left, right), (right, left)):
             if pointer[0] in ("owned", "side", "function_value") and pointer[2] == 0 and zero == ("constant", 0):
                 return pointer
@@ -1620,7 +1631,8 @@ class _SeedCaller(Consumer):
                     if isinstance(key, tuple) and key[0] == "seed_marker" and key[1] < pointer[1]+size and pointer[1] < key[1]+8:
                         del state[key]
                 fact = value(incoming, source)
-                if width == "64" and fact in (("constant", 0), ("entry_marker", identity)):
+                if width == "64" and fact in (("constant", 0), ("entry_marker", identity),
+                                              ("seed_value", identity)):
                     state[("seed_marker", pointer[1])] = True
             elif pointer is None and incoming.get("r"+base, (None,))[0] != "result":
                 for key in list(state):

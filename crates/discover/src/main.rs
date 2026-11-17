@@ -404,7 +404,11 @@ fn drop_privileges_and_open_self_memory(target: DropTarget) -> Result<File, Stri
 /// link (dangling or not), FIFO, socket, device or directory — is refused
 /// and left as it was, never followed or replaced. The parent directory is
 /// the operator's choice and is resolved normally; this process already
-/// runs as the dropped, unprivileged identity.
+/// runs as the dropped, unprivileged identity. The temp name carries fresh
+/// randomness per attempt so a hostile provider sharing the directory
+/// cannot squat it, and the temp entry is re-checked against the written
+/// file (device and inode) immediately before the rename, so a swapped
+/// entry fails closed with the final name untouched.
 fn write_private_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     write_private_atomically_with(path, bytes, || {})
 }
@@ -496,13 +500,46 @@ fn write_private_atomically_with(
         Err(format!("it exists and is {kind}; refusing to replace it"))
     };
     check_final()?;
+    // Fresh randomness per attempt: temp names beside the output are
+    // visible to a hostile provider sharing the directory, so predictable
+    // names would let it squat every candidate and block publishing.
+    let random_name = || -> Result<CString, io::Error> {
+        let mut bytes = [0u8; 8];
+        let mut filled = 0;
+        while filled < bytes.len() {
+            let got = unsafe {
+                libc::getrandom(
+                    bytes[filled..].as_mut_ptr() as *mut libc::c_void,
+                    (bytes.len() - filled) as libc::size_t,
+                    0,
+                )
+            };
+            if got == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if got == 0 {
+                // The call asked for bytes; an empty answer is unusable.
+                return Err(io::Error::other("getrandom returned no bytes"));
+            }
+            filled += got as usize;
+        }
+        Ok(CString::new(format!(
+            ".p11scope-discover.{}.{:016x}.tmp",
+            std::process::id(),
+            u64::from_ne_bytes(bytes)
+        ))
+        .expect("a generated name has no NUL"))
+    };
     let (temp_name, mut temp) = (0..128u32)
-        .find_map(|sequence| {
-            let temp_name = CString::new(format!(
-                ".p11scope-discover.{}.{sequence}.tmp",
-                std::process::id()
-            ))
-            .expect("a generated name has no NUL");
+        .find_map(|_| {
+            let temp_name = match random_name() {
+                Ok(name) => name,
+                Err(error) => return Some(Err(error)),
+            };
             let fd = unsafe {
                 libc::openat(
                     directory.as_raw_fd(),
@@ -523,13 +560,49 @@ fn write_private_atomically_with(
         })
         .ok_or_else(|| "cannot allocate a temporary file beside it".to_string())?
         .map_err(|error| error.to_string())?;
+    // The rename publishes by name, so re-check that the name still refers
+    // to the file just written: anything else (a swapped, replaced or
+    // removed entry) fails closed before the final name is touched. Only
+    // the raw descriptor is captured: the file itself stays mutably owned
+    // by the write below.
+    let temp_fd = temp.as_raw_fd();
+    let check_temp = || -> Result<(), String> {
+        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                named.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == -1
+        {
+            return Err(format!(
+                "cannot re-check the temporary file before publishing: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let mut open = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(temp_fd, open.as_mut_ptr()) } == -1 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let (named, open) = unsafe { (named.assume_init(), open.assume_init()) };
+        if named.st_dev != open.st_dev || named.st_ino != open.st_ino {
+            return Err(
+                "the temporary file was replaced before publishing; refusing to publish it"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    };
     let published = temp
         .write_all(bytes)
         .and_then(|()| temp.sync_all())
         .map_err(|error| error.to_string())
         .and_then(|()| {
             before_publish();
-            check_final()
+            check_final()?;
+            check_temp()
         })
         .and_then(|()| {
             if unsafe {

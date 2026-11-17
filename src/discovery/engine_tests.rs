@@ -21634,9 +21634,10 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     let dir = tempfile::tempdir().expect("learned backing dir");
     let backing = dir.path().join("libprov.so");
     std::fs::write(&backing, "p11scope-fixture:shared-provider-bytes").expect("write backing");
-    let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    let mut pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
     let pin = pins.pinned().next().expect("one pin");
     let object = pin.id;
+    let key = pin.key;
     let me = std::process::id();
     let mut sleeper = std::process::Command::new("sleep")
         .arg("30")
@@ -21666,9 +21667,9 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         // below); staging itself is naming-agnostic.
         loader_exe: None,
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
-        module: owned_proof_module_without_tables(pin.key),
+        module: owned_proof_module_without_tables(key),
     }];
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.pending_learned.len(),
         1,
@@ -21680,7 +21681,7 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         "the staging carries the scanned spelling"
     );
     // A second proof of the same file stages nothing more.
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.pending_learned.len(),
         1,
@@ -21689,7 +21690,7 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     // Settled identities stay silent even with an empty pending queue.
     let staged = engine.pending_learned.pop().expect("one staged");
     engine.learned_settled.insert((staged.dev, staged.ino));
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert!(
         engine.pending_learned.is_empty(),
         "a settled identity never re-stages"
@@ -21697,7 +21698,7 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     // Scopes the run does not own stage nothing.
     engine.owned_run_pid = None;
     engine.learned_settled.clear();
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert!(
         engine.pending_learned.is_empty(),
         "an unowned scope stages nothing"
@@ -21711,9 +21712,9 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         object,
         loader_exe: None,
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
-        module: owned_proof_module_without_tables(pin.key),
+        module: owned_proof_module_without_tables(key),
     }];
-    engine.learn_owned_proofs(&pins, &child_proofs);
+    engine.learn_owned_proofs(&mut pins, &child_proofs);
     assert!(
         engine.pending_learned.is_empty(),
         "the direct child's files need no learning"
@@ -21742,8 +21743,8 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
         "p11scope-fixture:transient-provider-bytes",
     )
     .expect("write transient backing");
-    let retained_pins = real_scan_pin(&retained_backing, None, 400, &"ab".repeat(32));
-    let transient_pins = real_scan_pin(&transient_backing, None, 400, &"cd".repeat(32));
+    let mut retained_pins = real_scan_pin(&retained_backing, None, 400, &"ab".repeat(32));
+    let mut transient_pins = real_scan_pin(&transient_backing, None, 400, &"cd".repeat(32));
     let retained_pin = retained_pins.pinned().next().expect("one pin");
     let transient_pin = transient_pins.pinned().next().expect("one pin");
     let retained_object = retained_pin.id;
@@ -21786,8 +21787,8 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module: owned_proof_module_without_tables(transient_pin.key),
     }];
-    engine.learn_owned_proofs(&retained_pins, &retained_proofs);
-    engine.learn_owned_proofs(&transient_pins, &transient_proofs);
+    engine.learn_owned_proofs(&mut retained_pins, &retained_proofs);
+    engine.learn_owned_proofs(&mut transient_pins, &transient_proofs);
     assert_eq!(
         engine.pending_learned.len(),
         2,
@@ -21817,7 +21818,7 @@ fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
     let dir = tempfile::tempdir().expect("learned backing dir");
     let backing = dir.path().join("libprov.so");
     std::fs::write(&backing, "p11scope-fixture:shared-provider-bytes").expect("write backing");
-    let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    let mut pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
     let object = pins.pinned().next().expect("one pin").id;
     let me = std::process::id();
     let mut sleeper = std::process::Command::new("sleep")
@@ -21850,7 +21851,7 @@ fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module: owned_proof_module_without_tables(pin.key),
     }];
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.pending_learned.len(),
         1,
@@ -21883,7 +21884,7 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
     let dir = tempfile::tempdir().expect("learned backing dir");
     let backing = dir.path().join("libgetteronly.so");
     std::fs::write(&backing, "p11scope-fixture:getter-only-provider-bytes").expect("write backing");
-    let pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
+    let mut pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
     let pin = pins.pinned().next().expect("one pin");
     let key = pin.key;
     let object = pin.id;
@@ -21950,7 +21951,7 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module,
     }];
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.pending_learned.len(),
         1,
@@ -21971,7 +21972,7 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module: relocated,
     }];
-    engine.learn_owned_proofs(&pins, &second);
+    engine.learn_owned_proofs(&mut pins, &second);
     let candidate = engine
         .live_candidate_with_pending(
             engine.pinned.clone(),
@@ -22104,7 +22105,7 @@ fn learned_tables_engine_with(
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module,
     }];
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.pending_learned.len(),
         1,
@@ -22172,7 +22173,7 @@ fn run_learned_harvest_aliases_survive_candidate_commit() {
         "the fixture harvest filed reserved aliases to strip"
     );
     // Tick assembly clones committed pins before the new harvest.
-    let candidate_pins = engine.pinned.clone();
+    let mut candidate_pins = engine.pinned.clone();
     // A later prover re-proves the same file (same identity; the
     // generation-local addresses normalize away at harvest).
     let mut module = engine.run_learned_modules[0].clone();
@@ -22190,7 +22191,7 @@ fn run_learned_harvest_aliases_survive_candidate_commit() {
     }];
     // Production apply harvests with the candidate pins
     // (apply_candidate_inner passes &candidate.pinned).
-    engine.learn_owned_proofs(&candidate_pins, &proofs);
+    engine.learn_owned_proofs(&mut candidate_pins, &proofs);
     assert_eq!(
         learned_candidate_module_count(&mut engine),
         1,
@@ -22414,7 +22415,7 @@ fn run_learned_table_harvest_cap_refusal_is_counted_and_named() {
     );
     let backing = dir.path().join("libcapover.so");
     std::fs::write(&backing, "p11scope-fixture:cap-over").expect("write over-cap backing");
-    let pins = real_scan_pin(&backing, None, 400, &"12".repeat(32));
+    let mut pins = real_scan_pin(&backing, None, 400, &"12".repeat(32));
     let pin = pins.pinned().next().expect("one pin");
     let key = pin.key;
     let object = pin.id;
@@ -22447,7 +22448,7 @@ fn run_learned_table_harvest_cap_refusal_is_counted_and_named() {
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module,
     }];
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.run_learned_modules.len(),
         cap,
@@ -22490,7 +22491,7 @@ fn run_learned_harvest_dirties_flag_only_union_changes() {
     engine.learned_frame_owed = false;
     engine.plan_rebuild_stable = true;
     let backing = dir.path().join("libgetteronly.so");
-    let pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
+    let mut pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
     let object = pins.pinned().next().expect("one pin").id;
     let mut module = engine.run_learned_modules[0].clone();
     module.view = ProcessViewId(11);
@@ -22503,7 +22504,7 @@ fn run_learned_harvest_dirties_flag_only_union_changes() {
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module,
     }];
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.run_learned_modules[0].decoder_abi,
         Some(p11scope_manifest::elf::ElfAbi::Lp64),

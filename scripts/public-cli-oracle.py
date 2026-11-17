@@ -767,6 +767,28 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("modules_skipped") == []
         and type(evidence.get("pid_descendant_gaps", 0)) is int
         and evidence.get("pid_descendant_gaps", 0) == 1)
+    # Loader-quiet lane 2026-11-17 (K1, v0.8.0 integration): system-scope
+    # captures of short-lived workloads (mt-system's forked children) race
+    # loader arming against exit: a view alive at arm time but gone before
+    # binding records a single unbound loader context with no hits. The gap
+    # is honestly disclosed (PARTIAL/concrete_gap) with exact owned counts
+    # (checked below), zero loss (checked above) and the lone named
+    # discovery skip. Strict accepts exactly that transient shape: one
+    # unavailable strategy, zero hits, no descendant gaps, no other class.
+    # Two unbound contexts, any hit, or any further cause still fails.
+    _loader = evidence.get("loader_discovery")
+    _loader = _loader if isinstance(_loader, dict) else {}
+    _strategies = _loader.get("strategies")
+    _strategies = _strategies if isinstance(_strategies, dict) else {}
+    ok_loader_quiet = (
+        cell in ("system", "mt-system")
+        and observation.get("status") == "lossy"
+        and observation.get("causes") == ["skipped", "loader_discovery"]
+        and skip_entries == [DISCLOSABLE_DISCOVERY_SKIP]
+        and evidence.get("modules_skipped") == []
+        and evidence.get("pid_descendant_gaps", 0) == 0
+        and _strategies.get("unavailable") == 1
+        and _loader.get("hits") == 0)
     # Ambient-burst lane, evidence-only: count cover is not proof, so
     # the census join annotates the failure detail below and never
     # accepts a cell (a real gap-for-gap join needs per-gap identity
@@ -831,7 +853,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         gap_detail = "lossy or unknown observation gap class"
         if burst_note is not None:
             gap_detail += "; " + burst_note
-        require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap,
+        require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet,
                 gap_detail)
     else:
         require(ok_exact, "lossy or unknown observation gap class")
@@ -846,12 +868,12 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         report)
     terminal(evidence, profile=mode == "profile")
     # Past the gap gate above, an accepted ambient shape is exactly
-    # ok_ambient, ok_quiet or ok_lone_gap: any other cause set failed
-    # already, so the flags (not re-spelled causes) decide the
+    # ok_ambient, ok_quiet, ok_lone_gap or ok_loader_quiet: any other cause
+    # set failed already, so the flags (not re-spelled causes) decide the
     # qualification. Metrics evidence carries no gaps keys, which read
     # as zero below; profile-cgroup/run cells carry them and must
     # read 0.
-    ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap))
+    ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet))
     if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps

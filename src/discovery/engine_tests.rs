@@ -1194,6 +1194,129 @@ fn generational_candidate_carries_active_provider_across_view_removal() {
 }
 
 #[test]
+fn generational_fast_path_carries_pins_for_active_slots_across_view_removal() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    for scope in [crate::attach::Scope::System, cgroup] {
+        let (mut engine, _, object, _) = engine_with_overlay(72);
+        engine.scope = scope.clone();
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert!(
+            engine.plan.is_active(0),
+            "the fixture starts attached for {scope:?}"
+        );
+        // Module-less churn: the removed view owns no modules (its scan
+        // yielded no tables) but still claims the provider pin, so the tick
+        // takes the fast path that skips the plan rebuild.
+        let view = engine.modules[0].scanned.view;
+        engine.modules.clear();
+        engine.plan_rebuild_stable = true;
+        let removed: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+        let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+        let carried = engine
+            .inventory_candidate(&removed, &[], &[], Vec::new(), &empty)
+            .unwrap();
+        assert!(
+            !carried.built_by_full_rebuild,
+            "module-less churn takes the fast path ({scope:?})"
+        );
+        assert!(
+            carried.pinned.summary(object).is_some(),
+            "the fast path keeps pins for attached objects ({scope:?})"
+        );
+        assert!(
+            carried.plan.is_active(0),
+            "no retire on the fast path ({scope:?})"
+        );
+    }
+}
+
+#[test]
+fn generational_stale_retirement_carries_active_provider_pins_and_slots() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    for scope in [crate::attach::Scope::System, cgroup] {
+        let (mut engine, _, object, _) = engine_with_overlay(73);
+        engine.scope = scope.clone();
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert!(
+            engine.plan.is_active(0),
+            "the fixture starts attached for {scope:?}"
+        );
+        let mut candidate = seed_loop_candidate(engine.plan.clone(), engine.pinned.clone());
+        candidate.modules = engine.modules.clone();
+        let view = engine.modules[0].scanned.view;
+        let stale: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+        let mut session = ScriptedSession::default();
+        let mut outcome = super::ApplyOutcome::default();
+        engine.retire_stale_candidate_sources(&mut session, &mut candidate, &stale, &mut outcome);
+        assert!(
+            candidate.plan.is_active(0),
+            "stale retirement keeps attached slots in generational scopes ({scope:?})"
+        );
+        assert!(
+            candidate.pinned.summary(object).is_some(),
+            "stale retirement keeps the attached pin ({scope:?})"
+        );
+        assert!(
+            !candidate.modules.is_empty(),
+            "stale retirement keeps the provider module ({scope:?})"
+        );
+    }
+}
+
+#[test]
+fn generational_candidate_carries_active_provider_across_empty_rescan() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    for scope in [crate::attach::Scope::System, cgroup] {
+        let (mut engine, _, object, _) = engine_with_overlay(74);
+        engine.scope = scope.clone();
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert!(
+            engine.plan.is_active(0),
+            "the fixture starts attached for {scope:?}"
+        );
+        // A rescan that yields no tables (scan gap): the refreshed view's old
+        // modules must not take the attached slots down with them.
+        let view = engine.modules[0].scanned.view;
+        let refreshed = vec![(view, Vec::new(), PinnedObjects::empty())];
+        let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+        let carried = engine
+            .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
+            .unwrap();
+        assert!(
+            carried.plan.is_active(0),
+            "generational scope keeps attached slots across an empty rescan ({scope:?})"
+        );
+        assert!(
+            !carried.plan.modules.is_empty(),
+            "the provider module survives the rescan ({scope:?})"
+        );
+        assert!(
+            carried.pinned.summary(object).is_some(),
+            "the pin survives with the slots ({scope:?})"
+        );
+        assert!(
+            carried.delta.retire.is_empty(),
+            "no retire on a scan gap ({scope:?})"
+        );
+    }
+}
+
+#[test]
 fn bind_drops_an_active_slot_whose_module_vanished_instead_of_aborting() {
     let mut facts = CaptureFacts::default();
     let mut plan = plan_with(1, 0);

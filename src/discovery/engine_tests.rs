@@ -1539,6 +1539,44 @@ fn loader_scan_preserve_carries_unless_scanned_view_solely_owns() {
 }
 
 #[test]
+fn loader_candidate_excludes_resolvable_but_claimless_views() {
+    // Carried dead coverage (resolvable pins, dropped claims) must not
+    // enter currency/stale/admission checks: apply-time stale retirement
+    // would otherwise undo the carry. Views with claims, unresolvable
+    // views, and the scanned view itself are always kept.
+    let (engine, _, object, _) = engine_with_overlay(81);
+    let view = engine.modules[0].scanned.view;
+    let mut candidate = seed_loop_candidate(engine.plan.clone(), engine.pinned.clone());
+    candidate.modules = engine.modules.clone();
+    candidate.views.insert(view);
+    candidate.views.insert(ProcessViewId(999));
+    // Drop the view's claims but keep resolvability (except-carry shape).
+    let mut pins = engine.pinned.clone();
+    pins.remove_view_except(view, &BTreeSet::from([object]));
+    assert!(
+        pins.view_claims(view).is_none(),
+        "the fixture drops the carried view's claims"
+    );
+    assert!(
+        pins.summary(object).is_some(),
+        "the fixture keeps the carried pin resolvable"
+    );
+    let mut candidate = LiveCandidate {
+        pinned: pins,
+        ..candidate
+    };
+    Engine::exclude_carried_views_from_candidate(&mut candidate, ProcessViewId(999));
+    assert!(
+        !candidate.views.contains(&view),
+        "resolvable-but-claimless views leave the checks"
+    );
+    assert!(
+        candidate.views.contains(&ProcessViewId(999)),
+        "the scanned view itself stays"
+    );
+}
+
+#[test]
 fn bind_drops_an_active_slot_whose_module_vanished_instead_of_aborting() {
     let mut facts = CaptureFacts::default();
     let mut plan = plan_with(1, 0);

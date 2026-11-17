@@ -9970,6 +9970,27 @@ pub fn bind_scanned_modules(
                         // producer bypassed this check.
                         let verified_forward = entry.object != module.key
                             && forwarded_bootstrap_verified(&entry, &pinned.exports_for(id));
+                        // A run-learned module is an uncorroborated
+                        // heuristic decode (no live return, no manifest,
+                        // no frame agreement yet), so its cross-object
+                        // entries prove export agreement like the
+                        // bootstrap getters do — the pinned target's
+                        // own `.dynsym` defining the same name at the
+                        // same offset — whatever their name. Anything
+                        // else is refused: a provider whose data mimics
+                        // a table (haskoki's GHC static data) otherwise
+                        // plants uprobes at garbage offsets in whatever
+                        // file the decode resolved into, and the target
+                        // dies executing them. Same-file entries and
+                        // every non-run-learned module keep the
+                        // existing behavior.
+                        let run_learned = module.view
+                            == crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID;
+                        let export_agreed = pinned.exports_for(id).iter().any(
+                            |(name, offset)| {
+                                name == entry.name && *offset == entry.file_offset
+                            },
+                        );
                         if entry.object != module.key
                             && forwardable_getter(entry.name)
                             && !verified_forward
@@ -9980,6 +10001,16 @@ pub fn bind_scanned_modules(
                                     "{}{}",
                                     entry.object_path,
                                     unverified_forward_refusal(entry.name)
+                                ),
+                            };
+                            table.unpinned.push(skip.clone());
+                            lost.push(skip);
+                        } else if run_learned && entry.object != module.key && !export_agreed {
+                            let skip = Skipped {
+                                subject: entry.name.to_string(),
+                                reason: format!(
+                                    "{} does not define {} at the run-learned offset; entry was not attached",
+                                    entry.object_path, entry.name
                                 ),
                             };
                             table.unpinned.push(skip.clone());

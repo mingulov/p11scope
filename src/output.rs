@@ -64,10 +64,13 @@ pub struct AtomicFile {
     final_name: CString,
     final_path: PathBuf,
     identity: FileIdentity,
-    /// The temp file's owner: the sudo invoker when the sink was
-    /// handed over at creation, otherwise the creator. Identity
-    /// checks compare against this, never against a fresh `geteuid`.
+    /// The temp file's owner: the creator until commit hands it over,
+    /// then the handover target. Identity checks compare against this,
+    /// never against a fresh `geteuid`.
     owner: u32,
+    /// The handover target decided at creation from the retained
+    /// directory, applied at commit on the open descriptor.
+    handover: Option<(u32, u32)>,
     cleanup: bool,
 }
 
@@ -75,7 +78,9 @@ impl AtomicFile {
     /// Opens the parent directory, refuses a final name that exists and is
     /// not a regular file, and creates `.p11scope.<pid>.<seq>.tmp` beside
     /// `path` with `openat(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC, 0o600)`,
-    /// retrying seq 0..128 on collision.
+    /// retrying seq 0..128 on collision. The handover target is decided
+    /// here but applied at commit, so the live temp stays creator-owned
+    /// 0600 for the whole capture.
     pub fn create(path: &Path) -> Result<AtomicFile, String> {
         if path.as_os_str().as_bytes().last() == Some(&b'/') {
             return Err(format!(
@@ -102,10 +107,6 @@ impl AtomicFile {
                     .expect("generated temporary output name has no NUL");
             match openat_profile(&directory, &temp_name) {
                 Ok(temp_file) => {
-                    if let Err(error) = handover_new_file(&temp_file, handover, &final_path) {
-                        let _ = unlinkat(&directory, &temp_name);
-                        return Err(error);
-                    }
                     let metadata = temp_file.metadata().map_err(|error| {
                         format!(
                             "checking temporary output beside {} failed: {error}",
@@ -120,9 +121,7 @@ impl AtomicFile {
                         ));
                     }
                     let identity = FileIdentity::from_metadata(&metadata);
-                    let owner = handover
-                        .map(|(uid, _)| uid)
-                        .unwrap_or_else(|| unsafe { libc::geteuid() });
+                    let owner = unsafe { libc::geteuid() };
                     return Ok(Self {
                         directory,
                         temp_file,
@@ -131,6 +130,7 @@ impl AtomicFile {
                         final_path,
                         identity,
                         owner,
+                        handover,
                         cleanup: true,
                     });
                 }
@@ -175,8 +175,9 @@ impl AtomicFile {
     }
 
     /// Re-verifies the temp identity (regular file, same dev/ino, owner ==
-    /// euid, mode & 0o077 == 0), `sync_all`, re-checks the final name, then
-    /// renames over it. On any error the temp file is unlinked by `Drop`.
+    /// creator, mode & 0o077 == 0), `sync_all`, hands the finished file to
+    /// the handover target decided at creation, re-checks the final name,
+    /// then renames over it. On any error the temp file is unlinked by `Drop`.
     pub fn commit(mut self) -> Result<(), String> {
         self.verify_temp_identity()?;
         self.temp_file.sync_all().map_err(|error| {
@@ -185,6 +186,7 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
+        self.hand_over_at_commit()?;
         self.publish()?;
         // The report is published at this point; a directory fsync that the
         // filesystem cannot honour must not turn a complete run into a failure.
@@ -232,6 +234,30 @@ impl AtomicFile {
         .map_err(failed)
     }
 
+    /// Hands the finished report to the handover target decided at
+    /// creation: `fchown` plus an explicit `0600` on the open
+    /// descriptor, never by path, so no symlink can redirect it.
+    /// Without a target this keeps the creator's ownership. Once the
+    /// `fchown` succeeds the recorded owner is the target, so a later
+    /// failure still unlinks this run's file through `Drop`.
+    fn hand_over_at_commit(&mut self) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some((uid, gid)) = self.handover else {
+            return Ok(());
+        };
+        handover_new_file(&self.temp_file, Some((uid, gid)), &self.final_path)?;
+        self.owner = uid;
+        self.temp_file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                format!(
+                    "setting output {} private after handing it to uid {uid}, gid {gid} failed: {error}",
+                    self.final_path.display()
+                )
+            })?;
+        Ok(())
+    }
+
     fn verify_temp_identity(&self) -> Result<(), String> {
         let metadata = metadata_at(&self.directory, &self.temp_name).map_err(|error| {
             format!(
@@ -239,8 +265,8 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
-        // The owner recorded at creation: the handover target after a
-        // handover, otherwise the creator.
+        // The owner recorded at creation: the creator (the handover
+        // target only after commit hands the finished file over).
         if !metadata.is_file()
             || metadata.identity != self.identity
             || metadata.owner != self.owner
@@ -992,11 +1018,11 @@ fn handover_target_for(
     Ok(handover_target(euid, invoker, parent_owner, named))
 }
 
-/// Hands a newly created sink file to its handover target: `fchown`
-/// on the open descriptor, never by path, so no symlink can redirect
-/// it. The creation mode (`0600`) is unchanged by `fchown`. `None`
-/// keeps the caller's ownership. Callers unlink a file they just
-/// created when this fails.
+/// Hands a sink file to its handover target: `fchown` on the open
+/// descriptor, never by path, so no symlink can redirect it. The file
+/// mode (`0600`) is unchanged by `fchown`. `None` keeps the caller's
+/// ownership. Callers unlink on failure: `AtomicFile` through `Drop`,
+/// streams directly.
 fn handover_new_file(
     file: &std::fs::File,
     target: Option<(u32, u32)>,
@@ -1325,6 +1351,7 @@ mod tests {
             final_path: path.to_path_buf(),
             identity,
             owner: unsafe { libc::geteuid() },
+            handover: None,
             cleanup: true,
         }
     }

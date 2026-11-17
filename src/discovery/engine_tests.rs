@@ -22154,6 +22154,64 @@ fn learned_tables_survive_proving_view_retirement() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// A candidate commit must not drop run-persistent learned-table pins
+/// harvested after the candidate cloned committed pins: the apply path
+/// harvests into committed pins while the candidate predates the
+/// harvest, so a plain overwrite unbinds the run-learned modules on
+/// the next gap tick and retires every slot.
+#[test]
+fn run_learned_harvest_aliases_survive_candidate_commit() {
+    let (_dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    // Post-clobber steady state: the store kept its module while an
+    // earlier commit dropped the reserved aliases.
+    assert!(
+        engine
+            .pinned
+            .remove_view(Engine::RUN_LEARNED_VIEW_ID)
+            .is_some(),
+        "the fixture harvest filed reserved aliases to strip"
+    );
+    // Tick assembly clones committed pins before the new harvest.
+    let candidate_pins = engine.pinned.clone();
+    // A later prover re-proves the same file (same identity; the
+    // generation-local addresses normalize away at harvest).
+    let mut module = engine.run_learned_modules[0].clone();
+    module.view = ProcessViewId(9);
+    let object = candidate_pins
+        .id_for_scanned(&module, key, &path)
+        .expect("the proving view still owns the file pre-gap");
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    }];
+    // Production apply harvests with the candidate pins
+    // (apply_candidate_inner passes &candidate.pinned).
+    engine.learn_owned_proofs(&candidate_pins, &proofs);
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "the re-harvest binds pre-commit"
+    );
+    // Production finalize installs the pre-harvest candidate clone.
+    engine.pinned = candidate_pins;
+    // Churn gap: the proving view retires with no successor.
+    assert!(
+        engine.pinned.remove_view(ProcessViewId(9)).is_some(),
+        "the proving view owned pins to retire"
+    );
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "the harvested aliases survive the commit and still bind with no live owner"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// The recycled-id shape: the released proving view id is reused by
 /// an unrelated file's scan pins and then retired. The learned
 /// module's pins must not retire with the reused id.

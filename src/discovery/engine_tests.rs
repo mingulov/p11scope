@@ -1153,6 +1153,47 @@ fn unchanged_rebuild_after_module_removal_keeps_retired_history_without_aborting
 }
 
 #[test]
+fn generational_candidate_carries_active_provider_across_view_removal() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    for scope in [crate::attach::Scope::System, cgroup] {
+        let (mut engine, _, object, _) = engine_with_overlay(71);
+        engine.scope = scope.clone();
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert!(
+            engine.plan.is_active(0),
+            "the fixture starts attached for {scope:?}"
+        );
+        let view = engine.modules[0].scanned.view;
+        let removed: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+        let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+        let carried = engine
+            .inventory_candidate(&removed, &[], &[], Vec::new(), &empty)
+            .unwrap();
+        assert!(
+            carried.plan.is_active(0),
+            "generational scope keeps attached slots when only their scan view exits ({scope:?})"
+        );
+        assert!(
+            !carried.plan.modules.is_empty(),
+            "the provider module survives the exit ({scope:?})"
+        );
+        assert!(
+            carried.pinned.summary(object).is_some(),
+            "the pin survives with the slots ({scope:?})"
+        );
+        assert!(
+            carried.delta.retire.is_empty(),
+            "no retire without an accepted removal decision ({scope:?})"
+        );
+    }
+}
+
+#[test]
 fn bind_drops_an_active_slot_whose_module_vanished_instead_of_aborting() {
     let mut facts = CaptureFacts::default();
     let mut plan = plan_with(1, 0);

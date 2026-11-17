@@ -2245,7 +2245,7 @@ def bank_scenarios(graph, optional_get, optimized_aggregate):
     vm = new_vm()
     vm.run("p11_bank_enter", (0, 9))
     vm.run("p11_bank_complete", (0, 9, 0, 0))
-    check("scope_refusal_retires_without_credit", vm, ((1, 0, 0), (0, 0, 0)), 0, 8)
+    check("scope_refusal_retires_without_credit", vm, ((1, 0, 0), (0, 0, 0)), 0, 0)
     vm = new_vm()
     vm.run("p11_bank_enter", (1, 9))
     pointer = vm.starts[struct.pack("<QII", 9, 1, 0)]
@@ -2435,7 +2435,7 @@ def bank_growth_scenarios(graph, optional_get, optimized_aggregate):
     vm = new_vm()
     vm.run("p11_bank_enter", (512, 9))
     vm.run("p11_bank_complete", (512, 9, 0, 0))
-    check("scope_refusal_retires_without_credit", vm, {512: (1, 0, 0)}, fault=8)
+    check("scope_refusal_retires_without_credit", vm, {512: (1, 0, 0)}, fault=0)
     vm = new_vm()
     vm.failed_admission = True
     vm.run("p11_bank_enter", (0, 9))
@@ -2653,7 +2653,7 @@ def bank_timing_growth_scenarios(graph, optional_get, optimized_aggregate, mode)
     vm = new_vm()
     vm.run(timed_enter, (512, 9, 1000))
     vm.run(timed_complete, (512, 9, 0, 0, 2000))
-    check("scope_refusal_retires_without_credit", vm, {512: (1, 0, 0)}, fault=8)
+    check("scope_refusal_retires_without_credit", vm, {512: (1, 0, 0)}, fault=0)
     vm = new_vm()
     vm.failed_admission = True
     vm.run(timed_enter, (0, 9, 1000))

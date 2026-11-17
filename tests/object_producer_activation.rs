@@ -1053,11 +1053,12 @@ fn object_marker_arms_only_under_allowlisted_policy() {
         "entry must assign seed.object_required exactly once (the guarded arm)"
     );
     // That site is exactly the allowlisted-policy branch body: match
-    // the full three-line block so moving the call below the `if`
-    // block's closing brace fails.
+    // the full branch block so moving the call below the `if`
+    // block's closing brace fails. Count-only calls keep the zero
+    // seed (no marker); only ordinary calls arm it.
     assert!(
         entry.contains(
-            "if flags & FLAG_POLICY_ALLOWLISTED != 0 {\n        seed.object_required = object_marker_for(cookie_of(&ctx));\n    }"
+            "if flags & FLAG_POLICY_ALLOWLISTED != 0 {\n        seed.object_required = if count_only {\n            0\n        } else {\n            object_marker_for(cookie_of(&ctx))\n        };\n    }"
         ),
         "the marker call must be the body of the allowlisted-policy branch"
     );
@@ -1154,7 +1155,7 @@ fn object_kem_policy_and_flavor_zero_new_reads() {
     );
     assert!(
         entry.contains(
-            "if flags & FLAG_POLICY_ALLOWLISTED != 0 {\n        seed.object_required = object_marker_for(cookie_of(&ctx));\n    }"
+            "if flags & FLAG_POLICY_ALLOWLISTED != 0 {\n        seed.object_required = if count_only {\n            0\n        } else {\n            object_marker_for(cookie_of(&ctx))\n        };\n    }"
         ),
         "the marker call must be the body of the allowlisted-policy branch"
     );
@@ -3352,6 +3353,13 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// comment lines stripped to indentation/newlines): 150857 B, measured
 /// with this same lexer on the integrated source; the earlier pins
 /// match their parent commits.
+/// Re-baselined for the in-place count-only downgrade (the only BPF
+/// source change: the SLOT_COUNT_ONLY per-slot switch map with its
+/// reader, one switch read per entry path narrowing downgraded calls
+/// to count-only, the marker arm guarded to non-count-only calls, and
+/// the completed-entry switched bit, plus their comment lines):
+/// 152253 B, measured with this same lexer on the integrated source;
+/// the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3361,8 +3369,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            150857,
-            "a2d61c6a9953df996f90f6fced18a89d6acdf18d007507586f12b77c2b9562c3"
+            152253,
+            "ca116a0809f161fe26b7c89486a36495e85f68b05a815c90e469e30ac786e08f"
         ),
         "stripped BPF dump must stay byte-identical"
     );

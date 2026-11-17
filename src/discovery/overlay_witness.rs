@@ -1637,4 +1637,164 @@ mod tests {
              capture deadline clock unreadable"
         );
     }
+
+    // -- BTF-once: the witness shares the process-wide host parse --------
+
+    /// Minimal vmlinux-shaped blob for the shared-host check: INT id 1,
+    /// the task_vma seq struct id 2 (with or without `mm`), and the
+    /// pidfd attach witness. Must parse under `aya::Btf::parse` (the
+    /// shared cache parses what it caches) and scan under the raw
+    /// selection deny. Pure synthetic bytes; no sysfs read.
+    fn shared_host_fixture(with_mm: bool, with_func: bool) -> Vec<u8> {
+        use crate::attach::identity_iter::{
+            TASK_ITER_ATTACH_FUNC, TASK_VMA_INFO_MM_MEMBER, TASK_VMA_INFO_STRUCT,
+        };
+        fn intern(strings: &mut Vec<u8>, text: &str) -> u32 {
+            let offset = strings.len() as u32;
+            strings.extend_from_slice(text.as_bytes());
+            strings.push(0);
+            offset
+        }
+        fn header(types: &mut Vec<u8>, name_off: u32, kind: u32, vlen: u32, size_or_type: u32) {
+            types.extend_from_slice(&name_off.to_le_bytes());
+            types.extend_from_slice(&((kind << 24) | vlen).to_le_bytes());
+            types.extend_from_slice(&size_or_type.to_le_bytes());
+        }
+        let mut types = Vec::new();
+        let mut strings = vec![0u8];
+        header(&mut types, intern(&mut strings, "unsigned int"), 1, 0, 4);
+        types.extend_from_slice(&0x0100_0020u32.to_le_bytes());
+        let mut members = vec![(intern(&mut strings, "task"), 1u32, 0u32)];
+        if with_mm {
+            members.push((intern(&mut strings, TASK_VMA_INFO_MM_MEMBER), 1, 64));
+        }
+        header(
+            &mut types,
+            intern(&mut strings, TASK_VMA_INFO_STRUCT),
+            4,
+            members.len() as u32,
+            16,
+        );
+        for (name_off, type_id, offset) in members {
+            types.extend_from_slice(&name_off.to_le_bytes());
+            types.extend_from_slice(&type_id.to_le_bytes());
+            types.extend_from_slice(&offset.to_le_bytes());
+        }
+        if with_func {
+            header(
+                &mut types,
+                intern(&mut strings, TASK_ITER_ATTACH_FUNC),
+                12,
+                0,
+                1,
+            );
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xE_B9Fu16.to_le_bytes());
+        out.extend_from_slice(&[0x01, 0x00]);
+        out.extend_from_slice(&24u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        out.extend_from_slice(&types);
+        out.extend_from_slice(&strings);
+        out
+    }
+
+    #[test]
+    fn shared_host_with_fix_passes_on_the_shared_parse() {
+        // Healthy twin: the deny check runs over the shared parse's own
+        // raw bytes and hands back that same parse for the load — one
+        // read and one parse serve the witness and the attach path.
+        let cell = std::sync::OnceLock::new();
+        let blob = shared_host_fixture(true, true);
+        let raw_allocation = blob.as_ptr();
+        let host =
+            crate::attach::host_btf::cached(&cell, || Ok(blob)).expect("byte fixture parses");
+        let parsed = super::check_shared_host(host).expect("fix present passes");
+        assert!(
+            std::ptr::eq(parsed, host.btf()),
+            "the check hands back the shared parse, never a re-read"
+        );
+        parsed
+            .id_by_type_name_kind(
+                crate::attach::identity_iter::TASK_ITER_ATTACH_FUNC,
+                aya_obj::btf::BtfKind::Func,
+            )
+            .expect("the shared parse resolves witness names");
+        let raw = host
+            .original_bytes_for(parsed)
+            .expect("the shared parse binds its raw bytes");
+        assert_eq!(
+            raw.as_ptr(),
+            raw_allocation,
+            "the deny scan reads the cached bytes"
+        );
+    }
+
+    #[test]
+    fn shared_host_without_fix_denies_before_any_load() {
+        // Failure twin: a blob without the mm fix keeps its exact stage.
+        let cell = std::sync::OnceLock::new();
+        let host = crate::attach::host_btf::cached(&cell, || Ok(shared_host_fixture(false, true)))
+            .expect("byte fixture parses");
+        assert_eq!(
+            super::check_shared_host(host).expect_err("missing fix must deny"),
+            WitnessDiagnosis {
+                stage: WitnessStage::BtfFixMissing
+            }
+        );
+    }
+
+    #[test]
+    fn shared_host_without_selector_denies_before_any_load() {
+        // Failure twin: a blob without the pidfd witness keeps its stage.
+        let cell = std::sync::OnceLock::new();
+        let host = crate::attach::host_btf::cached(&cell, || Ok(shared_host_fixture(true, false)))
+            .expect("byte fixture parses");
+        assert_eq!(
+            super::check_shared_host(host).expect_err("missing selector must deny"),
+            WitnessDiagnosis {
+                stage: WitnessStage::BtfNoTaskIterPidfd
+            }
+        );
+    }
+
+    #[test]
+    fn shared_failure_replays_unreadable_as_btf_unreadable() {
+        // The shared read failed and the re-read agrees: unreadable,
+        // exactly as the pre-share raw-first order reported it.
+        assert_eq!(
+            super::diagnosis_for_shared_failure(|| Err(
+                crate::attach::identity_iter::KernelDeny::NoBtf("gone".into())
+            )),
+            WitnessDiagnosis {
+                stage: WitnessStage::BtfUnreadable
+            }
+        );
+    }
+
+    #[test]
+    fn shared_failure_replays_raw_deny_before_parse() {
+        // A blob the raw scan refuses keeps its deny stage even though
+        // the shared parse failed: raw checks ran before parsing.
+        assert_eq!(
+            super::diagnosis_for_shared_failure(|| Ok(shared_host_fixture(false, true))),
+            WitnessDiagnosis {
+                stage: WitnessStage::BtfFixMissing
+            }
+        );
+    }
+
+    #[test]
+    fn shared_failure_with_clean_raw_reports_parse() {
+        // The re-read scans clean, so the shared failure is the parse.
+        assert_eq!(
+            super::diagnosis_for_shared_failure(|| Ok(shared_host_fixture(true, true))),
+            WitnessDiagnosis {
+                stage: WitnessStage::BtfParse
+            }
+        );
+    }
 }

@@ -4072,4 +4072,112 @@ mod tests {
             }
         }
     }
+
+    // -- BTF-once: start shares the process-wide host parse --------------
+
+    /// A cached shared-cache failure: malformed bytes never parse, so the
+    /// cell holds the parse error the classifier must preserve.
+    fn malformed_cached_error() -> crate::attach::host_btf::CachedError {
+        let cell = std::sync::OnceLock::new();
+        crate::attach::host_btf::cached(&cell, || Ok(vec![0x7f; 64])).expect_err("must not parse")
+    }
+
+    #[test]
+    fn shared_host_resolves_pair_family_on_the_shared_parse() {
+        // Healthy twin: prototype checks run over the shared parse's own
+        // raw bytes and `start` loads from that same parse — one read
+        // and one parse serve the witness and the attach path.
+        let cell = std::sync::OnceLock::new();
+        let blob = witness_btf_fixture(1, None);
+        let expected = blob.clone();
+        let host =
+            crate::attach::host_btf::cached(&cell, || Ok(blob)).expect("byte fixture parses");
+        let (family, parsed) = super::btf_for_start(host, true).expect("pair fixture passes");
+        assert_eq!(family, super::DepartFamily::Pair);
+        assert!(
+            std::ptr::eq(parsed, host.btf()),
+            "start loads from the shared parse, never a re-read"
+        );
+        parsed
+            .id_by_type_name_kind("exit_mm_release", aya_obj::btf::BtfKind::Func)
+            .expect("the shared parse resolves witness names");
+        assert_eq!(
+            host.original_bytes_for(parsed)
+                .expect("the shared parse binds its raw bytes"),
+            expected.as_slice(),
+            "the prototype checks read the cached bytes"
+        );
+    }
+
+    #[test]
+    fn shared_host_resolves_single_family_for_start() {
+        // The 7.3+ departure shape resolves through the share too.
+        let cell = std::sync::OnceLock::new();
+        let host = crate::attach::host_btf::cached(&cell, || Ok(witness_btf_fixture(2, None)))
+            .expect("byte fixture parses");
+        let (family, parsed) = super::btf_for_start(host, true).expect("single fixture passes");
+        assert_eq!(family, super::DepartFamily::Single);
+        parsed
+            .id_by_type_name_kind("mm_exit_exec_release", aya_obj::btf::BtfKind::Func)
+            .expect("the shared parse resolves witness names");
+    }
+
+    #[test]
+    fn shared_host_refuses_broken_migrate_only_for_cgroup() {
+        // Twin: a broken migrate prototype refuses `--cgroup` with the
+        // exact pre-share message, while pid/system skip migrate on the
+        // same shared bytes.
+        let broken = witness_btf_fixture(1, Some(("cgroup_migrate", 0)));
+        let cell = std::sync::OnceLock::new();
+        let host = crate::attach::host_btf::cached(&cell, || Ok(broken.clone()))
+            .expect("byte fixture parses");
+        let refused = super::btf_for_start(host, true).expect_err("cgroup needs migrate");
+        assert_eq!(refused.class(), "btf");
+        assert_eq!(
+            refused,
+            super::check_target_protos(&broken, true).expect_err("same refusal")
+        );
+        let cell = std::sync::OnceLock::new();
+        let host =
+            crate::attach::host_btf::cached(&cell, || Ok(broken)).expect("byte fixture parses");
+        let (family, _) = super::btf_for_start(host, false).expect("pid/system skip migrate");
+        assert_eq!(family, super::DepartFamily::Pair);
+    }
+
+    #[test]
+    fn shared_failure_replays_unreadable_first_for_start() {
+        // The shared read failed and the re-read agrees: the exact
+        // pre-share unreadable refusal, not the parse error.
+        let cached = malformed_cached_error();
+        assert_eq!(
+            super::unavailable_for_shared_failure(&cached, true, || Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "gone"
+            ))),
+            super::Unavailable::Btf("host BTF unreadable: gone".into())
+        );
+    }
+
+    #[test]
+    fn shared_failure_replays_proto_before_parse_for_start() {
+        // Bytes the prototype checks refuse keep their exact refusal
+        // even though the shared parse failed: raw checks ran first.
+        let bad = witness_btf_fixture(1, Some(("exit_mmap", 0)));
+        let cached = malformed_cached_error();
+        assert_eq!(
+            super::unavailable_for_shared_failure(&cached, true, || Ok(bad.clone())),
+            super::check_target_protos(&bad, true).expect_err("same refusal")
+        );
+    }
+
+    #[test]
+    fn shared_failure_with_clean_raw_reports_parse_for_start() {
+        // The re-read passes every prototype check, so the shared
+        // failure is the parse: its text is preserved exactly.
+        let good = witness_btf_fixture(1, None);
+        let cached = malformed_cached_error();
+        let reported = super::unavailable_for_shared_failure(&cached, true, || Ok(good));
+        assert_eq!(reported.class(), "btf");
+        assert_eq!(reported, super::Unavailable::Btf(format!("{cached:?}")));
+    }
 }

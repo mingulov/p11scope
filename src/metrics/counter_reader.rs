@@ -457,6 +457,9 @@ fn acquire(
         }
     };
     let rows = source.routing()?.map_or(rows, Err);
+    // An RV-only fault is not a routing failure: the endpoint counts stay
+    // exact while the RV table is a lower bound, published as such.
+    let rv_lower_bound = source.rv_exhausted()?;
     let window = ReadWindow::new(started, source.now());
     let mut read = CounterRead::new(
         generation,
@@ -468,6 +471,7 @@ fn acquire(
         storage,
     )?;
     read.set_gaps(gaps);
+    read.set_rv_lower_bound(rv_lower_bound);
     Ok(read)
 }
 

@@ -286,3 +286,37 @@ fn summary_matches_the_linear_pinned_find_for_every_id() {
         "live id has a summary"
     );
 }
+
+/// `replace_view_pins_without_claims` preserve means preserve: a preserved
+/// id stays resolvable even when the view recorded ownership claims
+/// without raw mappings (like `remove_view_except`, the generational
+/// carry's other half), while the view's own claims still drop.
+#[test]
+fn replace_view_pins_preserve_survives_without_raw_ownership() {
+    let mut pins = pin_set(&distinct_keys(2), true);
+    let kept = PinnedObjectId(0);
+    let dropped = PinnedObjectId(1);
+    // Claims without raw mappings (no `record_scan_ownership` call).
+    for id in [kept, dropped] {
+        pins.ownership
+            .entry(ProcessViewId(1))
+            .or_default()
+            .pins
+            .push(id);
+    }
+    assert!(pins.summary(kept).is_some(), "fixture pins resolve");
+    assert!(pins.summary(dropped).is_some(), "fixture pins resolve");
+    pins.replace_view_pins_without_claims(ProcessViewId(1), PinnedObjects::empty(), &[kept]);
+    assert!(
+        pins.summary(kept).is_some(),
+        "the preserved id stays resolvable without raw ownership"
+    );
+    assert!(
+        pins.summary(dropped).is_none(),
+        "the unpreserved id still drops"
+    );
+    assert!(
+        pins.view_claims(ProcessViewId(1)).is_none(),
+        "the view's own claims still drop"
+    );
+}

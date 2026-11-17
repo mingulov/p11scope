@@ -1236,7 +1236,12 @@ fn generational_fast_path_carries_pins_for_active_slots_across_view_removal() {
 }
 
 #[test]
-fn generational_stale_retirement_carries_active_provider_pins_and_slots() {
+fn generational_stale_retirement_drops_dead_view_pins_and_slots() {
+    // Stale views are proven dead, and stale retirement also serves
+    // unpublished newcomers (U-07): carrying here would commit modules for
+    // views the engine never admitted, so proven-dead views' sources always
+    // retire, even while unadmitted newcomers wait. This guards that
+    // fail-closed contract: the generational carry never applies here.
     let dir = tempfile::tempdir().expect("scope dir");
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
     let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
@@ -1251,6 +1256,8 @@ fn generational_stale_retirement_carries_active_provider_pins_and_slots() {
             engine.plan.is_active(0),
             "the fixture starts attached for {scope:?}"
         );
+        // Successor evidence present but rightly ignored: stale still drops.
+        engine.mark_newcomer_arrival(424242, Some(1));
         let mut candidate = seed_loop_candidate(engine.plan.clone(), engine.pinned.clone());
         candidate.modules = engine.modules.clone();
         let view = engine.modules[0].scanned.view;
@@ -1259,16 +1266,59 @@ fn generational_stale_retirement_carries_active_provider_pins_and_slots() {
         let mut outcome = super::ApplyOutcome::default();
         engine.retire_stale_candidate_sources(&mut session, &mut candidate, &stale, &mut outcome);
         assert!(
-            candidate.plan.is_active(0),
-            "stale retirement keeps attached slots in generational scopes ({scope:?})"
+            !candidate.plan.is_active(0),
+            "stale retirement retires dead views' slots ({scope:?})"
         );
         assert!(
-            candidate.pinned.summary(object).is_some(),
-            "stale retirement keeps the attached pin ({scope:?})"
+            candidate.pinned.summary(object).is_none(),
+            "stale retirement drops the dead pin ({scope:?})"
         );
         assert!(
-            !candidate.modules.is_empty(),
-            "stale retirement keeps the provider module ({scope:?})"
+            candidate.modules.is_empty(),
+            "stale retirement drops the dead module ({scope:?})"
+        );
+    }
+}
+
+#[test]
+fn generational_rescan_drops_without_successor_evidence() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    for scope in [crate::attach::Scope::System, cgroup] {
+        let (mut engine, _, object, _) = engine_with_overlay(78);
+        engine.scope = scope.clone();
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert!(
+            engine.plan.is_active(0),
+            "the fixture starts attached for {scope:?}"
+        );
+        // No unadmitted newcomer waits: the rescanned-empty view's drop is
+        // authoritative (unload), not a scan gap.
+        assert!(
+            engine.newcomer_first_seen.is_empty(),
+            "the fixture stages no successor ({scope:?})"
+        );
+        let view = engine.modules[0].scanned.view;
+        let refreshed = vec![(view, Vec::new(), PinnedObjects::empty())];
+        let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+        let dropped = engine
+            .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
+            .unwrap();
+        assert!(
+            !dropped.plan.is_active(0),
+            "no successor evidence retires the rescanned-empty slots ({scope:?})"
+        );
+        assert!(
+            dropped.plan.modules.is_empty(),
+            "the dropped module leaves the plan ({scope:?})"
+        );
+        assert!(
+            dropped.pinned.summary(object).is_none(),
+            "the dropped pin leaves with the slots ({scope:?})"
         );
     }
 }
@@ -1291,6 +1341,8 @@ fn generational_candidate_carries_active_provider_across_empty_rescan() {
         );
         // A rescan that yields no tables (scan gap): the refreshed view's old
         // modules must not take the attached slots down with them.
+        // Successor evidence: an unadmitted newcomer waits.
+        engine.mark_newcomer_arrival(424242, Some(1));
         let view = engine.modules[0].scanned.view;
         let refreshed = vec![(view, Vec::new(), PinnedObjects::empty())];
         let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
@@ -1314,6 +1366,117 @@ fn generational_candidate_carries_active_provider_across_empty_rescan() {
             "no retire on a scan gap ({scope:?})"
         );
     }
+}
+
+#[test]
+fn generational_conservative_replay_carries_active_provider_across_retirement() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    for scope in [crate::attach::Scope::System, cgroup] {
+        let (mut engine, _, object, _) = engine_with_overlay(75);
+        engine.scope = scope.clone();
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert!(
+            engine.plan.is_active(0),
+            "the fixture starts attached for {scope:?}"
+        );
+        // A conservative replay that retires the last offering view (wave
+        // turnover: the old generation exited before the successor was
+        // admitted) must not take the attached slots down with it.
+        // Successor evidence: loader work is still in flight.
+        let view = engine.modules[0].scanned.view;
+        engine
+            .pending_loader_arm_scans
+            .insert(PendingLoaderScanKey {
+                view,
+                context: LoaderContextId::from_case_id(0),
+            });
+        let retirements: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+        let keys: BTreeSet<ObjectKey> = BTreeSet::new();
+        let carried = engine.conservative_candidate(&retirements, &keys).unwrap();
+        assert!(
+            carried.plan.is_active(0),
+            "generational scope keeps attached slots when a replay retires their view ({scope:?})"
+        );
+        assert!(
+            !carried.plan.modules.is_empty(),
+            "the provider module survives the replay ({scope:?})"
+        );
+        assert!(
+            carried.pinned.summary(object).is_some(),
+            "the pin survives with the slots ({scope:?})"
+        );
+        assert!(
+            carried.delta.retire.is_empty(),
+            "no retire without an accepted removal decision ({scope:?})"
+        );
+    }
+}
+
+#[test]
+fn generational_conservative_replay_retires_without_successor_evidence() {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    for scope in [crate::attach::Scope::System, cgroup] {
+        let (mut engine, _, _, _) = engine_with_overlay(77);
+        engine.scope = scope.clone();
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert!(
+            engine.plan.is_active(0),
+            "the fixture starts attached for {scope:?}"
+        );
+        // No loader work in flight: the authoritative departure retires
+        // natively as before (async native-retirement handoff intact).
+        assert!(
+            !engine.loader_work_pending(),
+            "the fixture stages no successor ({scope:?})"
+        );
+        let view = engine.modules[0].scanned.view;
+        let retirements: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+        let keys: BTreeSet<ObjectKey> = BTreeSet::new();
+        let replayed = engine.conservative_candidate(&retirements, &keys).unwrap();
+        assert!(
+            !replayed.plan.is_active(0),
+            "no successor evidence retires the departed view's slots ({scope:?})"
+        );
+        assert!(
+            !replayed.delta.retire.is_empty(),
+            "the departure retires through the delta ({scope:?})"
+        );
+    }
+}
+
+#[test]
+fn pid_conservative_replay_retires_when_the_named_view_exits() {
+    let (mut engine, _, _, _) = engine_with_overlay(76);
+    engine.scope = Scope::Pid(std::process::id());
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+    // Pid scope keeps plain removal so an exited target retires (U-14):
+    // no generational carry applies here.
+    let view = engine.modules[0].scanned.view;
+    let retirements: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+    let keys: BTreeSet<ObjectKey> = BTreeSet::new();
+    let replayed = engine.conservative_candidate(&retirements, &keys).unwrap();
+    assert!(
+        !replayed.plan.is_active(0),
+        "pid scope retires the named target's slots"
+    );
+    assert!(
+        !replayed.delta.retire.is_empty(),
+        "the exit retires through the delta"
+    );
 }
 
 #[test]

@@ -27058,6 +27058,8 @@ int main(int argc, char **argv) {
         &mut engine.budget,
         engine.broad_admit,
         &mut engine.stage_timings,
+        &mut TeardownDeferralBudget::new(),
+        None,
         crate::discovery::handle_table::Filing::Untracked,
     );
     let (modules, _, _) = metadata.unwrap();
@@ -43967,6 +43969,8 @@ fn p2_refuse_then_exit(
         counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, view, budget| {
             let outcome = crate::discovery::scan::bracket_refusal_for_test(view, budget);
             assert!(outcome.modules().is_empty());
@@ -49018,6 +49022,8 @@ fn e07_unchanged_complete_loader_rescan_retires_nothing() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
+        &mut TeardownDeferralBudget::new(),
+        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     );
@@ -49743,6 +49749,8 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_module() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
+        &mut TeardownDeferralBudget::new(),
+        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     );
@@ -49828,6 +49836,8 @@ fn e07_incomplete_rescan_refuses_facts_for_disproved_dependency() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
+        &mut TeardownDeferralBudget::new(),
+        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     );
@@ -50366,6 +50376,8 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
+        &mut TeardownDeferralBudget::new(),
+        None,
         crate::discovery::handle_table::Filing::Untracked,
     );
     let (found, _, complete) = scan_result.expect("the metadata snapshot scans");
@@ -50407,6 +50419,8 @@ fn review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan() {
         &mut engine.budget,
         false,
         &mut engine.stage_timings,
+        &mut TeardownDeferralBudget::new(),
+        None,
         None,
         crate::discovery::handle_table::Filing::Untracked,
     );
@@ -51205,6 +51219,8 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         clean,
         None,
         crate::discovery::handle_table::Filing::Untracked,
@@ -51223,6 +51239,8 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Scanned {
                 modules: Vec::new(),
@@ -51250,6 +51268,8 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Scanned {
                 modules: Vec::new(),
@@ -51277,6 +51297,8 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Unavailable {
                 reason: "ptrace",
@@ -51302,6 +51324,8 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         clean,
         None,
         crate::discovery::handle_table::Filing::Untracked,
@@ -51323,6 +51347,8 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, budget| {
             assert!(!budget.admit_table(1), "the 513th candidate refuses");
             Ok::<_, String>(ScanOutcome::Scanned {
@@ -54132,6 +54158,8 @@ fn intra_scan_budget_stop_defers_whole_view_for_retry() {
             &mut budget,
             false,
             &mut timings,
+            &mut TeardownDeferralBudget::new(),
+            None,
             None,
             crate::discovery::handle_table::Filing::Untracked,
         );
@@ -86951,6 +86979,8 @@ fn handle_table_probe_pins_file_nothing() {
         &mut budget,
         false,
         &mut timings,
+        &mut TeardownDeferralBudget::new(),
+        None,
         None,
         crate::discovery::handle_table::Filing::Scratch,
     );
@@ -87709,6 +87739,8 @@ fn scan_refusal_on_a_group_ended_before_its_scan_files_no_gap() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Scanned {
                 modules: Vec::new(),
@@ -87799,6 +87831,8 @@ fn scan_child_with_forced_ending(
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Scanned {
                 modules: vec![module],
@@ -87960,6 +87994,8 @@ fn scan_view_with_outcome_skips(
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             before();
             Ok::<_, String>(ScanOutcome::Scanned {
@@ -88958,6 +88994,8 @@ fn ending_scan_that_set_a_capture_stop_excuses_nothing() {
             &mut counters,
             false,
             &mut crate::timing::StageTimings::default(),
+            &mut TeardownDeferralBudget::new(),
+            None,
             |_, _, budget| {
                 if stop {
                     budget.set_deadline(Some(1));
@@ -91482,33 +91520,76 @@ fn teardown_wait_window_or_zombie(pid: u32) -> bool {
     }
 }
 
+/// Spawn-kill-observe until the teardown window is hit with strict controls
+/// passing, up to 5 attempts with a fresh child each time. A miss (zombie
+/// first, or a control failing because the zombie landed between reads)
+/// cleans up and retries; only a child that never hits in 5 attempts fails.
+/// A miss needs a >160 ms deschedule, so the retry loop is stable and the
+/// returned scan deterministically exercises the deferral, never the
+/// tolerant miss path. Returns the holder, pid and view on the hit attempt.
+fn teardown_spawn_until_window_hit(id: ProcessViewId) -> (TeardownChild, u32, ProcessView) {
+    for attempt in 1..=5 {
+        let mut holder = TeardownChild::spawn_1gib();
+        let pid = holder.pid();
+        let view = ProcessView::open(id, pid).unwrap();
+        assert!(
+            view.still_the_same(),
+            "attempt {attempt}: the 1 GiB group is live at open"
+        );
+        holder.child.kill().unwrap();
+        if !teardown_wait_window_or_zombie(pid) {
+            // Zombie arrived first under descheduling: retry with a fresh child.
+            teardown_wait_zombie(pid);
+            holder.child.wait().unwrap();
+            continue;
+        }
+        // Strict controls on the hit attempt: the window is observed AND the
+        // census is unproven, the pidfd unready, kill succeeding. If the
+        // zombie landed between the window observation and these reads, treat
+        // as a miss and retry rather than failing.
+        let pidfd_unready = view.original_exited() == Ok(false);
+        let kill_succeeds = !crate::process::process_proven_exited(pid);
+        let census_unproven = !crate::process::whole_group_proven_exited(&view);
+        let still_window = crate::process::leader_exiting_not_zombie(&view);
+        if pidfd_unready && kill_succeeds && census_unproven && still_window {
+            return (holder, pid, view);
+        }
+        teardown_wait_zombie(pid);
+        holder.child.wait().unwrap();
+    }
+    panic!("no teardown window hit in 5 attempts; the host descheduled >160 ms every time");
+}
+
 /// A real 1 GiB child killed mid-scan: the scan starts in the
 /// `PF_EXITING`-not-zombie window (empty maps, pidfd unready, `kill`
 /// succeeds, whole-group proof false) and must file no loud record once
-/// the group proves exited as a zombie and after the reap.
+/// the group proves exited as a zombie and after the reap. Retries the
+/// setup until the window is hit (bounded, 5 attempts) with strict
+/// controls restored, so the silence deterministically exercises the
+/// deferral, never the tolerant miss path.
 #[test]
 fn teardown_large_child_scan_during_exit_holds_refusals_until_proven() {
-    let mut holder = TeardownChild::spawn_1gib();
-    let pid = holder.pid();
-    let view = ProcessView::open(ProcessViewId(9100), pid).unwrap();
-    assert!(view.still_the_same(), "the 1 GiB group is live at open");
-    assert_eq!(view.original_exited(), Ok(false));
+    let (mut holder, pid, view) = teardown_spawn_until_window_hit(ProcessViewId(9100));
+    // Strict controls restored on the hit attempt (the helper already
+    // verified them to select this attempt; re-assert the window shape
+    // here so the test fails, not the helper, if the shape regresses).
     assert!(
-        !crate::process::process_is_zombie(pid),
-        "live at open, not Z"
+        crate::process::leader_exiting_not_zombie(&view),
+        "the scan starts in the teardown window"
+    );
+    assert_eq!(
+        view.original_exited(),
+        Ok(false),
+        "the pidfd is not ready during teardown"
     );
     assert!(
-        !proc_tgid_maps_is_empty(pid),
-        "a live 1 GiB child holds its maps"
+        !crate::process::process_proven_exited(pid),
+        "kill still succeeds during teardown"
     );
-    holder.child.kill().unwrap();
-    // Observe the teardown in flight. The scan below must file no loud
-    // record either way: via the deferral when it starts inside the
-    // window (the usual interleaving — the window lasts ~160 ms), or via
-    // the scan-start excuse when a deschedule let the zombie arrive first.
-    // No hard pre-scan controls: the zombie may legitimately land between
-    // any two reads under parallel load.
-    let _hit_window = teardown_wait_window_or_zombie(pid);
+    assert!(
+        !crate::process::whole_group_proven_exited(&view),
+        "the census is unproven before the zombie (control)"
+    );
     // The exact refusal a real scan files when its initial maps read races
     // the teardown (empty snapshot, exe still present): ending-shaped, but
     // outside the mid-scan exit details, so only the teardown deferral
@@ -91535,6 +91616,8 @@ fn teardown_large_child_scan_during_exit_holds_refusals_until_proven() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Scanned {
                 modules: Vec::new(),
@@ -91606,6 +91689,8 @@ fn teardown_mem_gone_holds_latch_until_proven() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Unavailable {
                 reason: "gone",
@@ -91689,6 +91774,8 @@ fn teardown_deferral_keeps_zombie_leader_with_live_member_loud() {
         &mut counters,
         false,
         &mut crate::timing::StageTimings::default(),
+        &mut TeardownDeferralBudget::new(),
+        None,
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Unavailable {
                 reason: "gone",
@@ -91719,4 +91806,257 @@ fn teardown_deferral_keeps_zombie_leader_with_live_member_loud() {
         "leader and member are still in their loud shape at the verdict"
     );
     group.call_three();
+}
+
+/// Unit: the shared deferral budget consumes elapsed waits and saturates
+/// at zero (exhausted means later teardowns skip the wait and stay loud).
+#[test]
+fn teardown_deferral_budget_consumes_and_exhausts() {
+    use std::time::Duration;
+    let mut budget = TeardownDeferralBudget::with_remaining(Duration::from_millis(100));
+    assert_eq!(budget.remaining(), Duration::from_millis(100));
+    budget.consume(Duration::from_millis(30));
+    assert_eq!(budget.remaining(), Duration::from_millis(70));
+    budget.consume(Duration::from_millis(100));
+    assert!(budget.remaining().is_zero());
+}
+
+/// Shared-budget twin: two teardowns share one production-size (1 s)
+/// deferral budget. The first hits its window and silences, charging the
+/// budget; the test then drains the budget to a 5 ms remainder (simulating
+/// the N-1 other teardowns a busy-host pass already waited out), so the
+/// second — fresh child, hits its own window — waits only 5 ms
+/// (deterministically too small for a 1 GiB teardown on any host, quiet or
+/// loaded) and stays loud. Total measured waiting stays within the budget
+/// plus overhead — never 2 x 1 s. Deterministic under parallel load: no
+/// timing race, only the budget arithmetic.
+#[test]
+fn teardown_shared_budget_caps_total_wait_and_keeps_later_loud() {
+    use std::time::{Duration, Instant};
+    let refusal = Skipped {
+        subject: "capture discovery".into(),
+        reason: "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot".into(),
+    };
+    let mut teardown = TeardownDeferralBudget::new();
+    // First teardown: hits its window, silences, charges the shared budget.
+    // (Scan waits only are measured; child spawns are outside the budget.)
+    let (mut holder1, pid1, view1) = teardown_spawn_until_window_hit(ProcessViewId(9103));
+    let mut counters1 = DiscoveryCounters::default();
+    let mut stage1 = crate::timing::StageTimings::default();
+    let first_start = Instant::now();
+    let result1 = scan_and_pin_with(
+        &view1,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters1,
+        false,
+        &mut stage1,
+        &mut teardown,
+        None,
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: vec![refusal.clone()],
+                scan_ms: 0,
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    );
+    if let Err(error) = &result1 {
+        assert!(
+            error.to_string().contains("process generation exited")
+                || error.to_string().contains("pinning process view"),
+            "a teardown pin fails only on the proven exit: {error:?}"
+        );
+    }
+    let first_elapsed = first_start.elapsed();
+    // Simulate the busy-host pass: N-1 other teardowns already spent the
+    // shared budget down to a 5 ms remainder. The second teardown below
+    // therefore waits at most 5 ms — deterministically too small — and
+    // stays loud. The drain is budget arithmetic only, not timing.
+    let remaining = teardown.remaining();
+    teardown.consume(remaining.saturating_sub(Duration::from_millis(5)));
+    assert!(
+        teardown.remaining() <= Duration::from_millis(5),
+        "the drain leaves a 5 ms remainder: {:?}",
+        teardown.remaining()
+    );
+    // Second teardown: fresh child, hits its own window with the budget
+    // nearly spent. Retries (bounded, 3 attempts) when a parallel-load
+    // deschedule lets the zombie arrive before the scan starts (then the
+    // scan would silence via the scan-start excuse, not the 5 ms wait).
+    // A miss consumes no budget (no wait runs), so retries reuse the same
+    // 5 ms remainder.
+    let (mut holder2, pid2, counters2, second_elapsed) = 'second: {
+        for _ in 1..=3 {
+            let (mut holder, pid, view) = teardown_spawn_until_window_hit(ProcessViewId(9104));
+            if !crate::process::leader_exiting_not_zombie(&view) || view.final_exit_in_progress() {
+                teardown_wait_zombie(pid);
+                holder.child.wait().unwrap();
+                continue;
+            }
+            let mut counters = DiscoveryCounters::default();
+            let mut stage = crate::timing::StageTimings::default();
+            let second_start = Instant::now();
+            let result = scan_and_pin_with(
+                &view,
+                &[],
+                &HookRegistry::builtin(),
+                &mut CaptureWorkBudget::default(),
+                &mut counters,
+                false,
+                &mut stage,
+                &mut teardown,
+                None,
+                |_, _, _| {
+                    Ok::<_, String>(ScanOutcome::Scanned {
+                        modules: Vec::new(),
+                        skipped: vec![refusal.clone()],
+                        scan_ms: 0,
+                    })
+                },
+                None,
+                crate::discovery::handle_table::Filing::Untracked,
+            );
+            let elapsed = second_start.elapsed();
+            if let Err(error) = &result {
+                assert!(
+                    error.to_string().contains("process generation exited")
+                        || error.to_string().contains("pinning process view"),
+                    "a teardown pin fails only on the proven exit: {error:?}"
+                );
+            }
+            // A silence here is a missed window (zombie before the wait),
+            // not a budget failure: retry while attempts remain.
+            if counters.object_skips.iter().any(|skip| skip == &refusal) {
+                break 'second (holder, pid, counters, elapsed);
+            }
+            teardown_wait_zombie(pid);
+            holder.child.wait().unwrap();
+        }
+        panic!(
+            "no loud second attempt in 3 tries; the host descheduled every scan start past the window"
+        );
+    };
+    let total = first_elapsed + second_elapsed;
+    teardown_wait_zombie(pid1);
+    teardown_wait_zombie(pid2);
+    holder1.child.wait().unwrap();
+    holder2.child.wait().unwrap();
+    assert!(
+        counters1.object_skips.is_empty(),
+        "the first teardown silences within the shared budget: {:?}",
+        counters1.object_skips
+    );
+    assert!(
+        counters1.ending_suppressed_skips > 0,
+        "the first held refusal counts as suppressed: {counters1:?}"
+    );
+    assert!(
+        counters2.object_skips.iter().any(|skip| skip == &refusal),
+        "the budget-spent second teardown stays loud: {:?}",
+        counters2.object_skips
+    );
+    assert!(
+        total <= Duration::from_millis(1000) + Duration::from_millis(200),
+        "two teardowns share one 1 s budget, never 2 x 1 s: {total:?}"
+    );
+}
+
+/// Stop twin: the operator stop set during the teardown wait breaks the
+/// wait promptly and the scan stays loud (unproven, no silence on a
+/// cancelled wait). Retries the setup (bounded, 3 attempts) when a
+/// parallel-load deschedule lets the zombie arrive before the scan starts
+/// (then the scan would silence via the scan-start excuse, not the wait).
+#[test]
+fn teardown_wait_breaks_on_stop_and_stays_loud() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let refusal = Skipped {
+        subject: "capture discovery".into(),
+        reason: "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot".into(),
+    };
+    for attempt in 1..=3 {
+        let (mut holder, pid, view) = teardown_spawn_until_window_hit(ProcessViewId(9105));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter_cancel = Arc::clone(&cancel);
+        // 10 ms lands during the teardown on any host (1 GiB needs tens of
+        // ms even on the fastest host, ~160 ms on 7.0.0-43), so the wait
+        // breaks on the stop, not on the zombie.
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            setter_cancel.store(true, Ordering::SeqCst);
+        });
+        // A deschedule between the window observation and the scan start
+        // may have let the zombie arrive: then this attempt would silence
+        // via the scan-start excuse. Retry with a fresh child instead.
+        if !crate::process::leader_exiting_not_zombie(&view) || view.final_exit_in_progress() {
+            setter.join().unwrap();
+            teardown_wait_zombie(pid);
+            holder.child.wait().unwrap();
+            continue;
+        }
+        let mut counters = DiscoveryCounters::default();
+        let mut stage = crate::timing::StageTimings::default();
+        let mut teardown = TeardownDeferralBudget::new();
+        let start = Instant::now();
+        let result = scan_and_pin_with(
+            &view,
+            &[],
+            &HookRegistry::builtin(),
+            &mut CaptureWorkBudget::default(),
+            &mut counters,
+            false,
+            &mut stage,
+            &mut teardown,
+            Some(&cancel),
+            |_, _, _| {
+                Ok::<_, String>(ScanOutcome::Scanned {
+                    modules: Vec::new(),
+                    skipped: vec![refusal.clone()],
+                    scan_ms: 0,
+                })
+            },
+            None,
+            crate::discovery::handle_table::Filing::Untracked,
+        );
+        let elapsed = start.elapsed();
+        setter.join().unwrap();
+        if let Err(error) = &result {
+            assert!(
+                error.to_string().contains("process generation exited")
+                    || error.to_string().contains("pinning process view"),
+                "a teardown pin fails only on the proven exit: {error:?}"
+            );
+        }
+        teardown_wait_zombie(pid);
+        holder.child.wait().unwrap();
+        // A silence here means the zombie won the race against the stop
+        // (descheduled scan start under parallel load): retry while attempts
+        // remain, fail only when every attempt silences.
+        let loud = counters.object_skips.iter().any(|skip| skip == &refusal);
+        if !loud && attempt < 3 {
+            continue;
+        }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a stop during the wait returns promptly, not after the 1 s budget: {elapsed:?}"
+        );
+        assert!(
+            loud,
+            "a stop-broken wait stays loud: {:?}",
+            counters.object_skips
+        );
+        assert_eq!(
+            counters.ending_suppressed_skips, 0,
+            "a stop-broken wait suppresses nothing: {counters:?}"
+        );
+        return;
+    }
+    panic!(
+        "no stop-broken attempt in 3 tries; the host descheduled every scan start past the window"
+    );
 }

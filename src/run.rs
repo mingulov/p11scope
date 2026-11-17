@@ -3672,7 +3672,8 @@ fn capture_with_host(
     // stderr line first so the run never looks hung. After the fast
     // fail-fast checks above, before the first slow step.
     emit_capture_diagnostic(&capture_starting_line());
-    let discovered = Engine::discover(a, &scope, named_view);
+    let cancel = stop.cancel_flag();
+    let discovered = Engine::discover_with_cancel(a, &scope, named_view, &cancel);
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
     engine.retain_return_probe_admission(return_admission);
@@ -6607,7 +6608,8 @@ fn run_owned_inner_with_host(
     // this stamp is the report's capture start, as the loop's own stamp is
     // on the terminal path.
     let wall_start = SystemTime::now();
-    let mut engine = Engine::discover(&capture_args, &scope, Some(view))
+    let cancel = stop.cancel_flag();
+    let mut engine = Engine::discover_with_cancel(&capture_args, &scope, Some(view), &cancel)
         .map_err(|error| combine_setup_failure(error, &mut child))?;
     // On the run-tree scope discovery opens its own member views: the
     // held child must be among them, or the run would capture an empty
@@ -6631,7 +6633,7 @@ fn run_owned_inner_with_host(
         let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
             combine_setup_failure(anyhow!("run: opening the owned child: {error}"), &mut child)
         })?;
-        engine = Engine::discover(&capture_args, &scope, Some(view))
+        engine = Engine::discover_with_cancel(&capture_args, &scope, Some(view), &cancel)
             .map_err(|error| combine_setup_failure(error, &mut child))?;
     }
     if let Some(reason) = run_tree_gap {
@@ -30134,7 +30136,10 @@ int main(int argc, char **argv) {
         };
         let install = at("install_stop_flag()");
         let open = at("OutputSink::open(");
-        let discover = at("Engine::discover(");
+        // The discovery pass threads the stop flag (fix1 F1.2), so the call
+        // is `discover_with_cancel`; the M-1 ordering (install < open <
+        // discover < refuse < attach) is unchanged.
+        let discover = at("Engine::discover_with_cancel(");
         let refuse = at("refuse_if_interrupted_before_attach(&stop)");
         let attach = at("start_session(");
         assert!(install < open, "stop flag after the output sink opened");

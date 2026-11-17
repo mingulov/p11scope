@@ -1494,44 +1494,47 @@ fn pid_conservative_replay_retires_when_the_named_view_exits() {
 }
 
 #[test]
-fn loader_scan_preserve_carries_active_providers_in_cgroup_turnover() {
-    // Loader assembly keeps the loader id plus carried provider ids, but
-    // only for cgroup member turnover (closed membership + waiting
-    // newcomers); every other scope or quiet tick preserves loader-only.
+fn loader_scan_preserve_carries_unless_scanned_view_solely_owns() {
+    // Loader assembly keeps the loader id plus every attached object the
+    // scanned view does not solely own: its scan authoritatively replaces
+    // only sole-owned objects, while shared or module-less objects ride.
     let loader = PinnedObjectId(99);
-    let dir = tempfile::tempdir().expect("scope dir");
-    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
-    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
     let (mut engine, _, object, _) = engine_with_overlay(80);
-    engine.scope = cgroup;
     engine
         .capture_facts
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
         .unwrap();
     assert!(engine.plan.is_active(0), "the fixture starts attached");
     assert_ne!(object, loader, "fixture ids are distinct");
-    engine.mark_newcomer_arrival(424242, Some(1));
-    let preserve = engine.loader_scan_preserve(loader);
-    assert!(
-        preserve.contains(&loader),
-        "the loader id is always preserved"
-    );
-    assert!(
-        preserve.contains(&object),
-        "cgroup turnover also preserves the attached provider"
-    );
-    engine.scope = crate::attach::Scope::System;
+    let view = engine.modules[0].scanned.view;
     assert_eq!(
-        engine.loader_scan_preserve(loader),
+        engine.loader_scan_preserve(loader, view),
         vec![loader],
-        "system scope preserves loader-only despite waiting newcomers"
+        "a sole-owned object is authoritatively replaced by its view's scan"
     );
-    engine.scope = crate::scope::cgroup(dir.path()).expect("scope");
-    engine.newcomer_first_seen.clear();
-    assert_eq!(
-        engine.loader_scan_preserve(loader),
-        vec![loader],
-        "a quiet cgroup tick preserves loader-only"
+    assert!(
+        engine
+            .loader_scan_preserve(loader, ProcessViewId(999))
+            .contains(&object),
+        "another view's scan preserves the attached provider"
+    );
+    // Shared ownership rides even for the scanned view.
+    let mut shared = engine.modules[0].clone();
+    shared.scanned.view = ProcessViewId(999);
+    engine.modules.push(shared);
+    assert!(
+        engine.loader_scan_preserve(loader, view).contains(&object),
+        "a shared object rides its owner's scan"
+    );
+    // Module-less attached objects ride any scan.
+    engine.modules.clear();
+    assert!(
+        engine.plan.is_active(0),
+        "clearing modules keeps the plan attached"
+    );
+    assert!(
+        engine.loader_scan_preserve(loader, view).contains(&object),
+        "a module-less object rides any scan"
     );
 }
 

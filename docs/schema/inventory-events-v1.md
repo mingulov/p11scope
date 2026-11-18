@@ -55,7 +55,7 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   the rows whose last record retention deleted (0 unless the retention
   cannot hold them; when all three unretained counts are 0, every last
   retained record equals its snapshot row).
-  Folded instances (additive within v1, v0.8.0): a streamed instance
+  Folded instances (additive within v1, v0.7.2): a streamed instance
   may be absent from the final snapshot `instances[]` and
   `semantic_edges[]` when the departed fold removed it after it
   streamed (every folded instance streamed at least one record of
@@ -275,7 +275,7 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     for the `ended` line's own length, so it includes a rotation that
     line causes (when `--event-rotate-bytes` is too small for even a
     fresh file to take it) and only that.
-  - Folded edges (additive within v1, v0.8.0): a streamed edge may
+  - Folded edges (additive within v1, v0.7.2): a streamed edge may
     be absent from the final snapshot `edges[]` when the departed fold
     removed it after it streamed (every folded edge streamed at least
     once: the fold waits for the first record). The streamed keys are

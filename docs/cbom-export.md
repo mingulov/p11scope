@@ -32,12 +32,15 @@ carries only joins the input proves: application → its modules,
 application/module → mechanisms observed on their edges, key object →
 its provider module and caller application via the key-operation →
 instance → module/caller join (when joinable, otherwise no edge and
-a named note). Folded joins follow the same rule: each departed
-application joins the provider it folded at, and folded mechanisms
-join that provider, but per-application mechanism pairs survive the
-fold only when every folded caller at the module is named and all
-share one executable path — otherwise the pairs are withheld and the
-module counts into `p11scope:departed_links_withheld`, never guessed.
+a named note). One caller folded at several providers counts one
+incarnation under its path: the per-module identity copies
+deduplicate by caller. Folded joins follow the same rule: each
+departed application joins the provider it folded at, and folded
+mechanisms join that provider, but per-application mechanism pairs
+survive the fold only when every folded caller at the module is named
+and all share one executable path — otherwise the pairs are withheld
+and the module counts into `p11scope:departed_links_withheld`, never
+guessed.
 
 ## Provider, token and mechanism info (Task 7, v1 only)
 

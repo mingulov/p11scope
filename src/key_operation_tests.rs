@@ -16315,6 +16315,50 @@ impl FoldScene {
     }
 }
 
+/// The provider segment of a concise tally line normalized away:
+/// `  {name}: {segment}` becomes `  <provider>: {segment}`. Header
+/// and reason lines pass through untouched for exact comparison.
+fn normalize_key_provider(line: &str) -> String {
+    let Some(rest) = line.strip_prefix("  ") else {
+        return line.to_string();
+    };
+    let Some((_, segment)) = rest.split_once(": ") else {
+        return line.to_string();
+    };
+    format!("  <provider>: {segment}")
+}
+
+/// Per-category completed/failed/active totals across a concise
+/// block's tally lines: `  {name}: {category} {c} completed, {f}
+/// returned ..., {a} active {unit}`.
+fn key_tally_totals(block: &[String]) -> std::collections::BTreeMap<String, (u64, u64, u64)> {
+    let mut totals = std::collections::BTreeMap::new();
+    for line in block {
+        let Some(rest) = line.strip_prefix("  ") else {
+            continue;
+        };
+        let Some((_, segment)) = rest.split_once(": ") else {
+            continue;
+        };
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let (Some(completed_at), Some(active_at)) = (
+            words.iter().position(|word| *word == "completed,"),
+            words.iter().position(|word| *word == "active"),
+        ) else {
+            continue;
+        };
+        let category = words[0].to_string();
+        let completed = words[completed_at - 1].parse::<u64>().expect("tally count");
+        let failed = words[completed_at + 1].parse::<u64>().expect("tally count");
+        let active = words[active_at - 1].parse::<u64>().expect("tally count");
+        let slot = totals.entry(category).or_insert((0u64, 0u64, 0u64));
+        slot.0 = slot.0.saturating_add(completed);
+        slot.1 = slot.1.saturating_add(failed);
+        slot.2 = slot.2.saturating_add(active);
+    }
+    totals
+}
+
 /// The concise `key operations:` block: the header plus its indented
 /// tallies, the exact lines a folded row must not hide.
 fn key_ops_text_block(text: &str) -> Vec<String> {
@@ -16436,23 +16480,37 @@ fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
         jsonl_after.known, jsonl_before.known,
         "JSONL keeps proved rows"
     );
-    // Concise text keeps the populated header and the exact tallies.
-    // (The provider display name may degrade once the instance row
-    // folds — the proved instance outliving its instances[] row is
-    // the escalated CBOM-join question, not this fix — so the name
-    // itself is not pinned here.)
+    // Concise text keeps the block exactly apart from the provider
+    // display name, which degrades once the instance row folds (the
+    // proved instance outliving its instances[] row is the escalated
+    // CBOM-join question, not this fix). The raw blocks must differ
+    // — that pins the degradation as real — while the normalized
+    // blocks compare exactly and the degraded name reads explicitly.
     let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
     let block_after = key_ops_text_block(&text_after);
+    assert_ne!(
+        block_after, block_before,
+        "the fold degrades the provider display name: {block_after:?}"
+    );
+    let normalized_before: Vec<String> =
+        block_before.iter().map(|line| normalize_key_provider(line)).collect();
+    let normalized_after: Vec<String> =
+        block_after.iter().map(|line| normalize_key_provider(line)).collect();
     assert_eq!(
-        block_after.first(),
-        block_before.first(),
-        "concise header stays populated: {block_after:?}"
+        normalized_after, normalized_before,
+        "concise text keeps the proved rows exactly: {block_after:?} vs {block_before:?}"
     );
     assert!(
         block_after
             .iter()
-            .any(|line| line.contains("sign 1 completed, 0 returned errors, 0 active operations")),
-        "concise text keeps the proved tally: {block_after:?}"
+            .any(|line| line.contains("unidentified provider")),
+        "the folded instance reads as an unidentified provider: {block_after:?}"
+    );
+    assert!(
+        !block_before
+            .iter()
+            .any(|line| line.contains("unidentified provider")),
+        "the live instance names its provider: {block_before:?}"
     );
     assert!(
         !block_after
@@ -16533,6 +16591,14 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
     let json_before = render_json_from_presentation(&before);
     let section_before = json_before["object_observations"].clone();
     let (_, jsonl_before) = jsonl_reconstruction(&before.object_observations);
+    let text_before = render_snapshot_with_verbosity(&before, TextVerbosity::Concise);
+    let block_before = key_ops_text_block(&text_before);
+    assert!(
+        block_before
+            .first()
+            .is_some_and(|line| line.contains("partial")),
+        "concise text names the partial section: {block_before:?}"
+    );
 
     scene.retire_pid(pid_a);
     assert_eq!(scene.fold(caller_a), 1, "the lossy row folds");
@@ -16589,28 +16655,65 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
         jsonl_after.known, jsonl_before.known,
         "JSONL keeps proved rows exactly"
     );
-    // Concise text keeps the partial header, the completed tally and
-    // the named loss beside exact rows (provider display names are
-    // not pinned: grouping may split once the instance row folds).
+    // Concise text keeps the partial header counts, the exact loss
+    // line and the per-category tally totals; the folded feed's line
+    // degrades to the unidentified provider while the sibling keeps
+    // its provider name. The grouping split is the escalated
+    // CBOM-join question, so the split is pinned, not hidden.
     let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
     let block_after = key_ops_text_block(&text_after);
+    assert_ne!(
+        block_after, block_before,
+        "the fold splits the provider grouping: {block_after:?}"
+    );
+    let totals_before = key_tally_totals(&block_before);
     assert!(
-        block_after
-            .first()
-            .is_some_and(|line| line.contains("partial")),
+        !totals_before.is_empty(),
+        "the twin parses tallies before the fold: {block_before:?}"
+    );
+    assert_eq!(
+        key_tally_totals(&block_after),
+        totals_before,
+        "concise keeps exact tally totals across the split: {block_after:?}"
+    );
+    let header_before = block_before.first().expect("partial header");
+    let header_after = block_after.first().expect("partial header");
+    assert!(
+        header_after.contains("partial"),
         "concise text stays partial, never hidden: {block_after:?}"
     );
+    assert_eq!(
+        header_without_provider_count(header_after),
+        header_without_provider_count(header_before),
+        "concise header keeps every count but the split provider total: {block_after:?}"
+    );
     assert!(
+        header_provider_count(header_after) > header_provider_count(header_before),
+        "the fold splits one provider group into two: {block_after:?}"
+    );
+    assert_eq!(
         block_after
             .iter()
-            .any(|line| line.contains("1 completed") && line.contains("0 active operations")),
-        "concise text keeps the completed tally: {block_after:?}"
+            .find(|line| line.contains("per-key tracking lost")),
+        block_before
+            .iter()
+            .find(|line| line.contains("per-key tracking lost")),
+        "concise still names the loss beside exact rows: {block_after:?}"
     );
     assert!(
         block_after
             .iter()
-            .any(|line| line.contains("per-key tracking lost some calls")),
-        "concise text still names the loss beside exact rows: {block_after:?}"
+            .any(|line| line.contains("unidentified provider")),
+        "the folded feed reads as an unidentified provider: {block_after:?}"
+    );
+    assert!(
+        block_after.iter().any(|line| {
+            line.starts_with("  ")
+                && line.contains(": ")
+                && line.contains("sign")
+                && !line.contains("unidentified provider")
+        }),
+        "the healthy sibling keeps its provider name: {block_after:?}"
     );
     assert!(
         !block_after
@@ -16618,6 +16721,28 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
             .any(|line| line.contains("not available")),
         "concise text never hides proved rows: {block_after:?}"
     );
+}
+
+/// The concise header's provider-group total:
+/// `key operations: ... on {n} provider(s); ...`.
+fn header_provider_count(header: &str) -> u64 {
+    header
+        .split_once(" on ")
+        .expect("header provider segment")
+        .1
+        .split_whitespace()
+        .next()
+        .expect("header provider count")
+        .parse()
+        .expect("header provider count")
+}
+
+/// The concise header minus its provider-group total, for exact
+/// comparison across a grouping split.
+fn header_without_provider_count(header: &str) -> String {
+    let (head, tail) = header.split_once(" on ").expect("header provider segment");
+    let (_, rest) = tail.split_once("; ").expect("header revision segment");
+    format!("{head}; {rest}")
 }
 
 #[test]

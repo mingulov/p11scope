@@ -2398,10 +2398,15 @@ established facts. KEM T0 stays except the length lift above;
 terminal states, `CKA_ID`/payload/PIN prohibitions and every
 other exclusion stay in force. Allowlist-v1 bytes are unchanged.
 
-What is captured: one output-length WORD per completed call at
-the §8.1 evidence endpoints (signature, ciphertext and wrap
-lengths), plus the already-captured mechanism id the family
-inference reuses (no new read). BPF cannot see the mechanism
+What is captured: up to one approved length value per completed
+call at the §8.1 evidence endpoints (signature, ciphertext and
+wrap lengths) — an S-cell output-length WORD retained at entry
+and read at return, or a V-snapshot input-length scalar
+snapshotted at entry with no dereference — admitted only on
+`CKR_OK` (`CKR_BUFFER_TOO_SMALL` corroborates S-cells; a refused
+or unreadable shape emits unavailable with zero), plus the
+already-captured mechanism id the family inference reuses (no new
+read). BPF cannot see the mechanism
 family at `C_Encrypt`/`C_Decrypt`, so those words are read for
 every mechanism — for AES-GCM/CBC the word IS the message length
 plus tag or padding. This lane therefore partially supersedes

@@ -1957,14 +1957,14 @@ main() {
             echo "$PROG: cannot stage the btrfs pair: no ELF seed among /bin/true /usr/bin/true /bin/sh" >&2
             return 1
         fi
-        if ! btrfs subvolume create "$btrfs_mnt/subvol-a" >/dev/null 2>&1 \
-            || ! btrfs subvolume create "$btrfs_mnt/subvol-b" >/dev/null 2>&1; then
-            echo "$PROG: cannot create btrfs subvolumes under $btrfs_mnt" >&2
+        if ! btrfs subvolume create "$btrfs_mnt/subvol-a" >/dev/null 2>"$tmpdir/btrfs-pair.err" \
+            || ! btrfs subvolume create "$btrfs_mnt/subvol-b" >/dev/null 2>>"$tmpdir/btrfs-pair.err"; then
+            echo "$PROG: cannot create btrfs subvolumes under $btrfs_mnt: $(cat "$tmpdir/btrfs-pair.err")" >&2
             return 1
         fi
-        if ! cp "$btrfs_pair_source" "$btrfs_mnt/subvol-a/probe-a" 2>/dev/null \
-            || ! cp "$btrfs_pair_source" "$btrfs_mnt/subvol-b/probe-b" 2>/dev/null; then
-            echo "$PROG: cannot stage the btrfs pair ELFs under $btrfs_mnt" >&2
+        if ! cp "$btrfs_pair_source" "$btrfs_mnt/subvol-a/probe-a" >/dev/null 2>"$tmpdir/btrfs-pair.err" \
+            || ! cp "$btrfs_pair_source" "$btrfs_mnt/subvol-b/probe-b" >/dev/null 2>>"$tmpdir/btrfs-pair.err"; then
+            echo "$PROG: cannot stage the btrfs pair ELFs under $btrfs_mnt: $(cat "$tmpdir/btrfs-pair.err")" >&2
             return 1
         fi
         btrfs_pair_files=$btrfs_mnt/subvol-a/probe-a:$btrfs_mnt/subvol-b/probe-b

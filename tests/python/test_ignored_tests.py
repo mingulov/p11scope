@@ -142,6 +142,7 @@ BTRFS_EXPECTED = [
     "discovery::sweep_attribution::tests::privileged_btrfs_equal_pin_twins_use_their_own_inspections",
     "discovery::sweep_attribution::tests::privileged_btrfs_snapshot_twins_do_not_merge",
     "discovery::unbound_exe::tests::privileged_btrfs_subvolume_collision_resolves_ambiguous",
+    "discovery::identity::tests::btrfs_live_two_subvolumes_merge_per_file",
 ]
 
 # The two D3d forced-kernel cells fail their positive gate (observed on
@@ -1609,6 +1610,34 @@ class IgnoredTestsTests(unittest.TestCase):
             text,
         )
 
+    def test_btrfs_pair_staging_surfaces_tool_stderr(self):
+        # A hosted pair-staging failure must print the tool's
+        # reason, not just the generic "cannot ..." line: stderr
+        # is captured to a file and inlined, the way the mount
+        # step captures btrfs.err.
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertNotIn(
+            'btrfs subvolume create "$btrfs_mnt/subvol-a"'
+            " >/dev/null 2>&1",
+            text,
+        )
+        self.assertNotIn(
+            'cp "$btrfs_pair_source"'
+            ' "$btrfs_mnt/subvol-a/probe-a" 2>/dev/null',
+            text,
+        )
+        self.assertIn('2>"$tmpdir/btrfs-pair.err"', text)
+        self.assertIn(
+            "cannot create btrfs subvolumes under $btrfs_mnt: "
+            '$(cat "$tmpdir/btrfs-pair.err")',
+            text,
+        )
+        self.assertIn(
+            "cannot stage the btrfs pair ELFs under $btrfs_mnt: "
+            '$(cat "$tmpdir/btrfs-pair.err")',
+            text,
+        )
+
     def test_revived_group_membership_is_exact(self):
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         self.assertEqual(set(lists["BTRFS_TESTS"]), set(BTRFS_EXPECTED))
@@ -1698,14 +1727,14 @@ class IgnoredTestsTests(unittest.TestCase):
         # The fake lists both load-gate alternatives (a real binary has
         # exactly one), so the default section shows 271 + 2.
         self.assertIn("default (273)", result.stdout)
-        self.assertIn("btrfs (17, --include-btrfs only)", result.stdout)
+        self.assertIn("btrfs (18, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (14, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (3, --include-expected-failures "
                       "only)", result.stdout)
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (347 tests)",
+        self.assertIn("verify: curation matches the binary (348 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):
@@ -1905,7 +1934,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "DEFAULT_TESTS=271",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=17",
-            "BTRFS_TESTS=17",
+            "BTRFS_TESTS=18",
             "OVERLAY_TESTS=14",
             "EXPECTED_FAILURE_TESTS=3",
             "SKIP_TESTS=37",

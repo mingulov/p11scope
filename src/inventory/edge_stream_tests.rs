@@ -1991,6 +1991,87 @@ fn fold_waits_for_deferred_instance_rows_before_folding_caller() {
     assert_eq!(state.instances.tracked_len(), 0, "no digest retained");
 }
 
+/// F4 wrapper twin: a stop delivered before terminal certification
+/// aborts the streaming wrapper — nothing folds, and the partial
+/// pass notes nothing into the carry — and clearing it resumes
+/// normally.
+#[test]
+fn fold_streaming_wrapper_checks_stop_before_certifying_terminal_rows() {
+    use crate::inventory_present::Presence;
+    let mut harness = harness(2, 1);
+    let exiting_pid = FIRST_PID + 1;
+    let exiting = caller(&harness, 1);
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
+    let mut state = StreamState::new();
+    // Carry the initial rows, then the terminal exit revision.
+    let mut pass1 = presentation(&harness);
+    for edge in &mut pass1.edges {
+        if edge.caller == exiting {
+            edge.entry_count = 2;
+        }
+    }
+    emit_pass_events(&mut writer, &mut state, &report(1), &pass1, 1).unwrap();
+    emit_pass_events(&mut writer, &mut state, &report(2), &pass1, 2).unwrap();
+    assert_eq!(state.last_deferred.edge_events, 0, "the initial rows drain");
+    kill_pid(&mut harness, exiting_pid, &[FIRST_PID]);
+    let mut pass2 = presentation(&harness);
+    for edge in &mut pass2.edges {
+        if edge.caller == exiting {
+            assert_eq!(
+                edge.presence,
+                Presence::ProcessExited,
+                "the exit flips presence"
+            );
+            edge.entry_count = 3;
+        } else {
+            edge.entry_count = 1;
+        }
+    }
+    emit_pass_events(&mut writer, &mut state, &report(3), &pass2, 3).unwrap();
+    emit_pass_events(&mut writer, &mut state, &report(4), &pass2, 4).unwrap();
+    assert_eq!(
+        state.last_deferred.edge_events, 0,
+        "the terminal revision drains"
+    );
+    state.last_stream_view = Some(std::sync::Arc::new(pass2));
+    let dummy = dir.path().join("dummy.jsonl");
+    let stream = EventLogState::new(Some(EventWriter::create(&dummy, 1 << 20, 2).unwrap()));
+    assert!(stream.emits(), "the gate runs on the streaming path");
+    // The stop lands before certification: nothing folds.
+    let signals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    harness
+        .coordinator_mut()
+        .set_stop_source(std::sync::Arc::clone(&signals));
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(exiting).is_some(),
+        "a stop before certification folds nothing"
+    );
+    // The aborted pass noted nothing: with the stop cleared, a bare
+    // coordinator retirement (no wrapper re-note) finds no carry.
+    signals.store(0, std::sync::atomic::Ordering::SeqCst);
+    let now = harness.now_ns();
+    assert_eq!(
+        harness
+            .coordinator_mut()
+            .retire_rendered_callers(now, None)
+            .retired,
+        0,
+        "the aborted pass notes nothing into the carry"
+    );
+    // Clearing the stop resumes normally through the wrapper.
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(exiting).is_none(),
+        "clearing the stop folds the terminal row"
+    );
+    drop(writer);
+}
+
 /// F1 credit-boundary twin (fix2): 1,025 exited callers share one
 /// publication while the fold carries 1,024 credits, so the last
 /// caller (the largest id) waits at the credit boundary. A retained

@@ -25664,6 +25664,166 @@ exit 0
         );
     }
 
+    /// F4 handoff twin: a stop delivered after the lazy index build
+    /// but before the first binder mutation aborts the fold —
+    /// nothing folds, the row keeps its evidence and waits in the
+    /// carry — and the next pass folds it exactly once.
+    #[test]
+    fn fold_plan_checks_stop_between_index_build_and_first_mutation() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let id = stage_exited_caller(&mut native, 5020, 100);
+        native
+            .scene
+            .coordinator
+            .binder
+            .stage_cookie_for_test(domain, 100, 0, Some(id));
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        // Quiet at the entry gate and the per-row gate, tripped at
+        // the plan-to-mutation handoff: the scene stays far below one
+        // stride, so no stride check fires first.
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 2
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retired,
+            0,
+            "a stop at the mutation handoff folds nothing"
+        );
+        assert_eq!(
+            checks.get(),
+            3,
+            "the entry gate, the row gate, then the handoff check ran"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(id).is_some(),
+            "no row folds on the aborted pass"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_callers.len(),
+            1,
+            "the row waits out the stop in the carry"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test(),
+            vec![id],
+            "the waiting row keeps its cookie binding"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the next pass folds the waiting row"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "the resumed fold clears the cookie exactly once"
+        );
+    }
+
+    /// F4 forwarding twin: the declared-layer match counts its stats
+    /// and comparisons through the shared stride cursor and aborts on
+    /// stop — nothing folds, the row waits in the carry — and the
+    /// next pass folds it exactly once.
+    #[test]
+    fn fold_forwarding_match_aborts_on_stop_and_resumes_exact() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let id = stage_exited_caller(&mut native, 5020, 100);
+        native
+            .scene
+            .coordinator
+            .binder
+            .stage_cookie_for_test(domain, 100, 0, Some(id));
+        for module in 0..10u64 {
+            native
+                .scene
+                .coordinator
+                .registry_mut()
+                .scripted_module_edge(
+                    ModuleKey::physical(8, 1, 7000 + module, None, "/fold/forward.so"),
+                    id,
+                );
+        }
+        native
+            .scene
+            .coordinator
+            .set_forwarding(vec![std::path::PathBuf::from("no-such-layer.so"); 100]);
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        // Quiet at the entry gate and the first stride lap, tripped
+        // at the second: both laps land inside the declared-layer
+        // match (100 declarations over 10 modules), which runs
+        // without a stop check pre-fix.
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 2
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retired,
+            0,
+            "a stop inside the forwarding match folds nothing"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(id).is_some(),
+            "no row folds on the aborted pass"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_callers.len(),
+            1,
+            "the row waits out the stop in the carry"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test(),
+            vec![id],
+            "the waiting row keeps its cookie binding"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the next pass folds the waiting row"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "the resumed fold clears the cookie exactly once"
+        );
+    }
+
     /// Twin: an exec newcomer the next pass enumerates and admits is
     /// covered, never counted as short-lived.
     #[test]

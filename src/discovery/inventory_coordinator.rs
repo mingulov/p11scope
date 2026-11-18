@@ -25851,6 +25851,220 @@ exit 0
         );
     }
 
+    /// F4 charge twin: one caller with 200 cookie sequences plus a
+    /// bound pair and a stalled recovery costs 4 credits, and it sorts
+    /// last behind 1,023 single-credit siblings. A single remaining
+    /// credit must not admit its 4 credits of work: it waits with its
+    /// evidence intact and folds next pass, with every count exact.
+    #[test]
+    fn fold_costly_last_caller_waits_for_a_fresh_credit_window() {
+        const SEQUENCES: u64 = 200;
+        const SIBLINGS: u32 = 1023;
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let mut ids = Vec::new();
+        for caller in 0..SIBLINGS {
+            let id = stage_exited_caller(&mut native, 5030 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                10_000 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
+        }
+        // The high-fanout caller stages last, so it sorts last: 200
+        // sequences + 1 target + 1 recovery = 202 units = 4 credits
+        // against the single credit the siblings leave.
+        let heavy = stage_exited_caller(&mut native, 5030 + SIBLINGS, 100);
+        for sequence in 0..SEQUENCES {
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + sequence,
+                sequence,
+                Some(heavy),
+            );
+        }
+        let target = PairKey::scripted(domain, 500, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            target,
+            PairTarget::scripted_bound(
+                heavy,
+                ModuleKey::physical(8, 1, 7000, None, "/fold/pair.so"),
+                0,
+                10,
+                10,
+            ),
+        );
+        let stalled = PairKey::scripted(domain, 1500, 0, 0);
+        native
+            .scene
+            .coordinator
+            .recoveries
+            .insert(stalled, PairRecovery::scripted(heavy, 0, ModuleId(3)));
+        native.scene.coordinator.recovery_order.push(target);
+        native.scene.coordinator.recovery_order.push(stalled);
+        ids.push(heavy);
+        assert_eq!(
+            ids.iter().max(),
+            Some(&heavy),
+            "the costly caller sorts last, past its affordable window"
+        );
+        native.scene.coordinator.note_rendered_callers(&ids);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            u64::from(SIBLINGS),
+            "one remaining credit does not admit 4 credits of work"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the costly caller waits past the credit boundary"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test(),
+            vec![heavy],
+            "the waiting row keeps its cookie bindings"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_callers.len(),
+            1,
+            "exactly one row waits past the cap"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the remainder resumes without a re-note"
+        );
+        for id in &ids {
+            assert!(
+                native.scene.coordinator.adapter.record(*id).is_none(),
+                "every row eventually folds"
+            );
+        }
+        // Publication safety: the heavy pair's staged base lands in
+        // the dropped-pair machinery exactly once, and no late row
+        // names a folded caller.
+        let dropped_base: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .map(|target| match target {
+                PairTarget::Dropped { base, .. } => *base,
+                PairTarget::Bound { .. }
+                | PairTarget::Pending { .. }
+                | PairTarget::Suspended { .. } => 0,
+            })
+            .sum();
+        assert_eq!(dropped_base, 10, "the staged base lands exactly once");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "no cookie names a folded caller"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stalled recovery survives its caller"
+        );
+    }
+
+    /// F4 close twin: four folded callers each release one last-owner
+    /// pidfd pin. A stop during the close drain closes only what ran
+    /// before it — the rest stays queued under coordinator custody —
+    /// while the fold receipt still publishes exactly once; the
+    /// resume closes the remainder, never twice.
+    #[test]
+    fn fold_close_drain_defers_queued_pins_on_stop_and_resumes_exact() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let mut ids = Vec::new();
+        let mut pins = Vec::new();
+        for caller in 0..4u32 {
+            let id = stage_exited_caller(&mut native, 5020 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            let pin = std::sync::Arc::new(crate::process::PidPin::test_proc_only(1234 + caller));
+            pins.push(std::sync::Arc::downgrade(&pin));
+            native
+                .scene
+                .coordinator
+                .semantic_bindings
+                .insert_for_test(semantics::SemanticCallerBinding::scripted(
+                    id,
+                    ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                    domain,
+                    ImageIdentity {
+                        task_cookie: 500 + u64::from(caller),
+                        exec_id: 1,
+                    },
+                    pin,
+                ))
+                .expect("the binding fits");
+            ids.push(id);
+        }
+        for (at, pin) in pins.iter().enumerate() {
+            assert_eq!(
+                pin.strong_count(),
+                1,
+                "pin {at} is last-owned before the fold"
+            );
+        }
+        native.scene.coordinator.note_rendered_callers(&ids);
+        // Quiet through the entry gate, the four row gates and the
+        // four handoff checks, tripped inside the close drain: the
+        // scene stays far below one stride, so no stride check fires
+        // first.
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 10
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retired,
+            4,
+            "the folds publish before the close drain trips"
+        );
+        let closed = pins.iter().filter(|pin| pin.upgrade().is_none()).count();
+        assert_eq!(closed, 1, "the drain closes one pin, then defers on stop");
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "the resume publishes no row twice"
+        );
+        assert!(
+            pins.iter().all(|pin| pin.upgrade().is_none()),
+            "the resume closes the remainder exactly once"
+        );
+    }
+
     /// Twin: an exec newcomer the next pass enumerates and admits is
     /// covered, never counted as short-lived.
     #[test]

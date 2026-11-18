@@ -1814,7 +1814,10 @@ fn cbom_folded_key_instance_stays_named_but_unjoinable() {
         "the folded instance cannot rejoin its key"
     );
     assert!(
-        !folded.dependencies.iter().any(|(from, _)| from == "p11scope:key:0"),
+        !folded
+            .dependencies
+            .iter()
+            .any(|(from, _)| from == "p11scope:key:0"),
         "the named key carries no join edges: {:?}",
         folded.dependencies
     );

@@ -3882,7 +3882,10 @@ fn concise_snapshot_names_folded_callers_with_calls() {
 fn concise_snapshot_names_folded_modules_and_gates_the_absence_line() {
     let harness = varied_harness();
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
-    assert!(!presentation.modules.is_empty(), "fixture must map a module");
+    assert!(
+        !presentation.modules.is_empty(),
+        "fixture must map a module"
+    );
     let module = presentation.modules[0].id;
     let name = module_display_name(&presentation, module);
     let mut departed = DepartedUse::default();
@@ -3908,9 +3911,7 @@ fn concise_snapshot_names_folded_modules_and_gates_the_absence_line() {
                 }),
                 authority: ImageAuthority::ScanPinned,
                 lifecycle: CallerLifecycle::Exited,
-                lifecycle_reason: Some(
-                    "process exited (pid names no live process)".to_string(),
-                ),
+                lifecycle_reason: Some("process exited (pid names no live process)".to_string()),
                 first_seen_ns: 110,
                 last_seen_ns: 190,
                 exec_observed: true,

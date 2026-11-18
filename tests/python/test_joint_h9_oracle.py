@@ -1071,7 +1071,10 @@ class StreamTwins(unittest.TestCase):
             # A true promotion pass: one object genuinely updated (its
             # v7 body differs) at the publication revision the marker
             # carries; every other object retains its single v6
-            # record (the emitter skips unchanged rows).
+            # record (the emitter skips unchanged rows). Every
+            # changed known key row likewise re-sends at v7 on that
+            # same pass (the inferred blocks are the change), while
+            # unknown rows stay at their carried v6 revisions.
             objects = [line for line in stream
                        if line["kind"] == "object_observed"]
             marker = next(line for line in stream
@@ -1098,6 +1101,37 @@ class StreamTwins(unittest.TestCase):
                 if oid != updated[0]:
                     self.assertEqual(len(lines), 1)
                     self.assertEqual(lines[0]["event"]["version"], 6)
+            known = [line for line in stream
+                     if line["kind"] == "key_operations_observed"
+                     and line["event"]["bucket"] == "known"]
+            by_key = {}
+            for line in known:
+                row = line["event"]["row"]
+                by_key.setdefault((row["instance"], row["object"],
+                                   row["category"], row["role"],
+                                   row["metadata_at_use"]),
+                                  []).append(line)
+            self.assertTrue(by_key, "the stream carries known key rows")
+            for key, lines in by_key.items():
+                lines = sorted(lines,
+                               key=lambda item: item["event"]["revision"])
+                versions = [item["event"]["version"] for item in lines]
+                self.assertTrue(all(version == 6
+                                    for version in versions[:-1])
+                                and versions[-1] == 7,
+                                f"key {key} promotes once, on the pass")
+                self.assertEqual(lines[-1]["event"]["revision"],
+                                 marker["event"]["object_revision"],
+                                 "the v7 key update shares the marker")
+                self.assertNotEqual(lines[-2]["event"]["row"],
+                                    lines[-1]["event"]["row"],
+                                    "the v7 key body genuinely updates it")
+            unknowns = [line for line in stream
+                        if line["kind"] == "key_operations_observed"
+                        and line["event"]["bucket"] == "unknown"]
+            self.assertTrue(all(line["event"]["version"] == 6
+                                for line in unknowns),
+                            "unknown rows stay at their v6 revisions")
             check_v6_objects(snapshot["objects"], "snapshot")
             check_v6_objects([line["event"]["row"] for line in objects],
                              "stream")
@@ -1134,6 +1168,48 @@ class StreamTwins(unittest.TestCase):
             for row in snapshot["objects"]:
                 if row["object"] == updated["object"]:
                     row.update(copy.deepcopy(updated))
+            return stream
+
+        def promote_keys(stream, snapshot):
+            # The promotion pass re-sends every changed known key row
+            # at v7 (the inferred blocks are the change; counters
+            # carry no new completions) at the same publication
+            # revision the marker carries, in producer order after the
+            # object replacement. Unknown rows are unchanged and stay.
+            marker = next(line for line in stream
+                          if line["kind"] == "pass_committed")
+            new_revision = marker["event"]["object_revision"]
+            at_ns = max(line["at_ns"] for line in stream
+                        if line["kind"] == "key_operations_observed") + 60
+            last_by_key = {}
+            for line in stream:
+                if line["kind"] == "key_operations_observed" \
+                        and line["event"]["bucket"] == "known":
+                    row = line["event"]["row"]
+                    key = (row["instance"], row["object"], row["category"],
+                           row["role"], row["metadata_at_use"])
+                    last_by_key[key] = line
+            promotions = []
+            for key in sorted(last_by_key):
+                carried = copy.deepcopy(last_by_key[key]["event"]["row"])
+                family, size = inferred_pair()
+                carried["inferred_family"] = family
+                carried["inferred_size"] = size
+                carried["inferred_family"]["completions"] = \
+                    carried["completed"]
+                carried["inferred_size"]["completions"] = carried["completed"]
+                promotions.append({"schema": "p11scope/inventory-events/v1",
+                                   "seq": 0, "at_ns": at_ns,
+                                   "kind": "key_operations_observed",
+                                   "event": {"revision": new_revision,
+                                             "version": 7, "bucket": "known",
+                                             "row": carried}})
+                at_ns += 1
+            marker_index = next(index for index, line in enumerate(stream)
+                                if line["kind"] == "pass_committed")
+            stream[marker_index:marker_index] = promotions
+            for seq, line in enumerate(stream):
+                line["seq"] = seq
             return stream
 
         def v7_stream(snapshot, key_version):
@@ -1180,45 +1256,27 @@ class StreamTwins(unittest.TestCase):
         with self.subTest("mixed v6-to-v7 stream reconciles"):
             snapshot = v7_snapshot()
             stream = healthy_stream([first, second], snapshot)
-            # Early key revisions ride v6 without inferred keys; the
-            # last revision per row rides v7 with them, matching the
-            # snapshot. Objects carry an early v6 revision plus a v7
-            # replacement tied to the promotion pass.
-            last_by_key = {}
-            for line in stream:
-                if line["kind"] == "key_operations_observed":
-                    row = line["event"]["row"]
-                    if line["event"]["bucket"] == "known":
-                        key = (row["instance"], row["object"], row["category"],
-                               row["role"], row["metadata_at_use"])
-                        last_by_key[key] = line
+            # Every carried revision rides v6 without inferred keys;
+            # the promotion pass re-sends each changed known row at
+            # v7 with them, matching the snapshot. Objects carry an
+            # early v6 revision plus a v7 replacement tied to the
+            # promotion pass.
             for line in stream:
                 if line["kind"] == "object_observed":
                     line["event"]["version"] = 6
                 elif line["kind"] == "key_operations_observed":
-                    row = line["event"]["row"]
+                    line["event"]["version"] = 6
                     if line["event"]["bucket"] == "known":
-                        key = (row["instance"], row["object"], row["category"],
-                               row["role"], row["metadata_at_use"])
-                        if line is last_by_key[key]:
-                            line["event"]["version"] = 7
-                            family, size = inferred_pair()
-                            row["inferred_family"] = family
-                            row["inferred_size"] = size
-                            row["inferred_family"]["completions"] = row["completed"]
-                            row["inferred_size"]["completions"] = row["completed"]
-                        else:
-                            line["event"]["version"] = 6
-                            row.pop("inferred_family", None)
-                            row.pop("inferred_size", None)
-                    else:
-                        line["event"]["version"] = 6
+                        row = line["event"]["row"]
+                        row.pop("inferred_family", None)
+                        row.pop("inferred_size", None)
                 elif line["kind"] == "pass_committed":
                     line["event"]["object_version"] = 7
             for row in snapshot["key_operations"]:
                 row["inferred_family"]["completions"] = row["completed"]
                 row["inferred_size"]["completions"] = row["completed"]
             stream = promote_objects(stream, snapshot)
+            stream = promote_keys(stream, snapshot)
             check_promotion(stream, snapshot)
             oracle.validate_snapshot(snapshot)
             oracle.compare_stream(stream, [first, second], snapshot)

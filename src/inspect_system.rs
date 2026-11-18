@@ -8513,6 +8513,45 @@ int main(int argc, char **argv) {
             )
         }
 
+        /// Genuine function-start proofs for c1b tables: the large owned
+        /// ELF's actual proof list (every `STT_FUNC`/FDE start in a `PF_X`
+        /// segment), cached per process. Table offsets derived from this
+        /// list are real proofs, never fabricated `0x1000 + i * 8`.
+        fn real_proof_starts() -> &'static [u64] {
+            static STARTS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+            STARTS.get_or_init(|| {
+                use crate::discovery::identity::test_fixture::large_owned_object;
+                let path = large_owned_object();
+                let file = p11scope_manifest::identity::open_object(path)
+                    .expect("the large owned fixture opens");
+                let inspected = p11scope_manifest::identity::inspect_file(&file)
+                    .expect("the large owned fixture inspects");
+                assert!(
+                    inspected.function_starts.len() >= 2500,
+                    "the large owned fixture must cover wide builds: {}",
+                    inspected.function_starts.len()
+                );
+                for offset in &inspected.function_starts {
+                    assert!(
+                        inspected
+                            .executable_ranges
+                            .iter()
+                            .any(|(start, end)| *start <= *offset && *offset < *end),
+                        "proof {offset:#x} outside every executable segment"
+                    );
+                }
+                let mut sorted = inspected.function_starts.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(
+                    sorted.len(),
+                    inspected.function_starts.len(),
+                    "proof starts must be distinct for endpoint counts"
+                );
+                sorted
+            })
+        }
+
         /// A provider with `tables` bare heuristic tables of
         /// `entries_per_table` endpoints each, for admission-wiring twins.
         fn heuristic_provider(tables: usize, entries_per_table: usize) -> ScannedModule {
@@ -8593,6 +8632,47 @@ int main(int argc, char **argv) {
                 .find(|object| object.path == PATH)
                 .expect("the provider object")
                 .admission
+        }
+
+        #[test]
+        fn c1b_fixture_offsets_are_genuine_executable_function_starts() {
+            // Admitted fixtures need real proofs: every offset must be an
+            // STT_FUNC/FDE start in a PF_X segment, from the large owned
+            // ELF's actual proof list — never fabricated 0x1000 + i * 8.
+            // Distinctness is load-bearing: aliased offsets share attach
+            // slots and collapse endpoint counts.
+            let genuine: BTreeSet<u64> = real_proof_starts().iter().copied().collect();
+            let collection = over_cap(&[]);
+            let provider = &collection.members[0].modules[0];
+            for table in &provider.tables {
+                for entry in &table.entries {
+                    assert!(
+                        genuine.contains(&entry.file_offset),
+                        "over_cap offset {:#x} is not a genuine proof",
+                        entry.file_offset
+                    );
+                }
+            }
+            for (tables, per) in [
+                (1, 32),
+                (4, p11scope_ebpf_common::MAX_SLOTS as usize / 4 + 10),
+            ] {
+                let provider = heuristic_provider(tables, per);
+                let mut seen = BTreeSet::new();
+                for table in &provider.tables {
+                    for entry in &table.entries {
+                        assert!(
+                            genuine.contains(&entry.file_offset),
+                            "heuristic offset {:#x} is not a genuine proof",
+                            entry.file_offset
+                        );
+                        assert!(
+                            seen.insert(entry.file_offset),
+                            "heuristic offsets must be distinct"
+                        );
+                    }
+                }
+            }
         }
 
         #[test]

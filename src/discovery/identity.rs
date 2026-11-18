@@ -2202,6 +2202,30 @@ impl PinnedObjects {
         }
     }
 
+    /// Test-only real-proof backfill: inspect `elf_path` through
+    /// production ELF parsing and merge its proven function starts
+    /// (`STT_FUNC`/FDE in `PF_X`) into every pin here. For synthetic
+    /// pins that preserve maps/attribution scaffolding while carrying
+    /// genuine proofs — unlike [`prove_scanned_entries_for_test`], which
+    /// copies test-input offsets without inspecting any ELF bytes.
+    #[cfg(test)]
+    pub(crate) fn prove_elf_function_starts_for_test(&mut self, elf_path: &Path) {
+        let file = p11scope_manifest::identity::open_object(elf_path).expect("the proof ELF opens");
+        let inspected =
+            p11scope_manifest::identity::inspect_file(&file).expect("the proof ELF inspects");
+        assert!(
+            !inspected.function_starts.is_empty(),
+            "the proof ELF must carry function-start proofs or the check is vacuous"
+        );
+        for pinned in self.by_id.values_mut() {
+            let mut starts = inspected.function_starts.clone();
+            starts.extend(pinned.function_starts.iter().copied());
+            starts.sort_unstable();
+            starts.dedup();
+            pinned.function_starts = starts.into();
+        }
+    }
+
     /// The witness-completeness bits for the pinned object's exports:
     /// `(getter_present, witness_fault)`. False when the object is not
     /// pinned here (whose empty exports can never prove anyway).
@@ -11057,6 +11081,47 @@ pub(crate) mod test_fixture {
                     "the small owned fixture must stay small: {len} bytes"
                 );
                 dir.keep().join("small-owned-object.so")
+            })
+            .as_path()
+    }
+
+    /// A large owned ELF for tests needing many distinct executable
+    /// function starts (c1b admission twins with hundreds of endpoints).
+    /// Like [`small_owned_object`] but with 3,000 tiny `STT_FUNC` bodies
+    /// in one executable LOAD: gcc-built, never instrumented, cached per
+    /// process. Offsets derived from its proof list are genuine
+    /// `STT_FUNC`/FDE starts in a `PF_X` segment, never fabricated
+    /// `0x1000 + i * 8`.
+    pub(crate) fn large_owned_object() -> &'static Path {
+        static OBJECT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        OBJECT
+            .get_or_init(|| {
+                const COUNT: usize = 3000;
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("large-owned-object.c");
+                let path = dir.path().join("large-owned-object.so");
+                let mut text = String::with_capacity(COUNT * 64);
+                for i in 0..COUNT {
+                    use std::fmt::Write as _;
+                    writeln!(text, "int p11scope_many_{i:04}(void) {{ return {i}; }}").unwrap();
+                }
+                std::fs::write(&source, text).unwrap();
+                assert!(
+                    std::process::Command::new("gcc")
+                        .args(["-shared", "-fPIC", "-o"])
+                        .arg(&path)
+                        .arg(&source)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "the large owned fixture must compile"
+                );
+                let len = std::fs::metadata(&path).unwrap().len();
+                assert!(
+                    len < 64 * 1024 * 1024,
+                    "the large owned fixture must stay small: {len} bytes"
+                );
+                dir.keep().join("large-owned-object.so")
             })
             .as_path()
     }

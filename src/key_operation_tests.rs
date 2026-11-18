@@ -28884,6 +28884,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 conflict_completions: 1,
                 further: 2,
                 reason: None,
+                further_seen: 0,
             },
             size: SizeState {
                 status: InferredStatus::Conflicting,
@@ -28904,6 +28905,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 )),
                 further: 1,
                 reason: None,
+                further_seen: Vec::new(),
             },
         }),
     };
@@ -28957,6 +28959,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 conflict_completions: 0,
                 further: 0,
                 reason: Some(crate::keymeta::REASON_UNLISTED_MECHANISM),
+                further_seen: 0,
             },
             size: SizeState {
                 status: InferredStatus::Inferred,
@@ -28971,6 +28974,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 conflict_detail: None,
                 further: 0,
                 reason: None,
+                further_seen: Vec::new(),
             },
         }),
         ..row
@@ -29026,6 +29030,7 @@ fn key_row_json_revision_changes_bytes() {
                 conflict_completions: 0,
                 further: 0,
                 reason: None,
+                further_seen: 0,
             },
             size: SizeState {
                 status: InferredStatus::Inferred,
@@ -29040,6 +29045,7 @@ fn key_row_json_revision_changes_bytes() {
                 conflict_detail: None,
                 further: 0,
                 reason: None,
+                further_seen: Vec::new(),
             },
         }),
     };
@@ -29092,6 +29098,7 @@ fn observations_version_v7_triggers_on_inferred_content() {
                 conflict_completions: 0,
                 further: 0,
                 reason: None,
+                further_seen: 0,
             },
             size: SizeState::default(),
         }))]),
@@ -29109,8 +29116,53 @@ fn observations_version_v7_triggers_on_inferred_content() {
                 conflict_detail: None,
                 further: 0,
                 reason: Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF),
+                further_seen: Vec::new(),
             },
         }))]),
         1
     );
+}
+
+// ---------------------------------------------------------------------------
+// Keymeta Task 3 (R4 RED): conflict-dedup twins (further counts
+// distinct values once each, repeats never double-count).
+// ---------------------------------------------------------------------------
+
+/// Family further-values count distinct values, never completions:
+/// repeats of the third value leave `further` at 1 while the block
+/// total keeps counting.
+#[test]
+fn keymeta_family_further_counts_distinct_once() {
+    use crate::semantics_key_use::FamilyState;
+    let mut state = FamilyState::default();
+    for mechanism in [0x0001u64, 0x1044, 0x1087, 0x1087, 0x1087] {
+        state.accumulate_family(None, mechanism);
+    }
+    assert_eq!(state.status, InferredStatus::Conflicting);
+    assert_eq!(state.value, Some(KeyFamily::Rsa));
+    assert_eq!(state.value_completions, 1);
+    assert_eq!(state.conflict_value, Some(KeyFamily::Ec));
+    assert_eq!(state.conflict_completions, 1);
+    assert_eq!(state.further, 1);
+    assert_eq!(state.completions, 5);
+}
+
+/// Size further-details count distinct sizes, never completions:
+/// repeats of the third size leave `further` at 1 while the block
+/// total keeps counting.
+#[test]
+fn keymeta_size_further_counts_distinct_once() {
+    use crate::semantics_key_use::{SizeInput, SizeState};
+    let mut state = SizeState::default();
+    for length in [256u64, 384, 128, 128, 128] {
+        state.accumulate_size(
+            None,
+            Some(0x0001),
+            Some(EvidenceTag::SignOutput),
+            SizeInput::Value(length),
+        );
+    }
+    assert_eq!(state.status, InferredStatus::Conflicting);
+    assert_eq!(state.further, 1);
+    assert_eq!(state.completions, 5);
 }

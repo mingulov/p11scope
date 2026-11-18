@@ -14,43 +14,227 @@ use p11scope_ebpf_common::object_policy::SafeCurve;
 use crate::semantics_objects::KeyLabel;
 
 /// Inferred key family: the §4.2 finite vocabulary (schema order).
+/// Explicit discriminants back the further-value bitmask (21
+/// families fit a u32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
 pub(crate) enum KeyFamily {
-    Rsa,
-    Ec,
-    Eddsa,
-    Xeddsa,
-    Secret,
-    Dsa,
-    Dh,
-    Aes,
-    GenericSecret,
-    Hkdf,
-    MlKem,
-    MlDsa,
-    SlhDsa,
-    Chacha20,
-    Poly1305,
-    Des,
-    Des3,
-    Camellia,
-    Aria,
-    Seed,
-    Gost,
+    Rsa = 0,
+    Ec = 1,
+    Eddsa = 2,
+    Xeddsa = 3,
+    Secret = 4,
+    Dsa = 5,
+    Dh = 6,
+    Aes = 7,
+    GenericSecret = 8,
+    Hkdf = 9,
+    MlKem = 10,
+    MlDsa = 11,
+    SlhDsa = 12,
+    Chacha20 = 13,
+    Poly1305 = 14,
+    Des = 15,
+    Des3 = 16,
+    Camellia = 17,
+    Aria = 18,
+    Seed = 19,
+    Gost = 20,
 }
+
+/// Per-family §4.2 id tables (sorted, for binary search). Generated
+/// from the reviewed name assignment; the catalog coverage test pins
+/// every id against `mechanism_names` plus the full universe.
+const RSA_IDS: &[u64] = &[
+    0x00000001, 0x00000002, 0x00000003, 0x00000004, 0x00000005, 0x00000006, 0x00000007, 0x00000008,
+    0x00000009, 0x0000000b, 0x0000000c, 0x0000000d, 0x0000000e, 0x00000040, 0x00000041, 0x00000042,
+    0x00000043, 0x00000044, 0x00000045, 0x00000046, 0x00000047, 0x00000060, 0x00000061, 0x00000062,
+    0x00000063, 0x00000064, 0x00000065, 0x00000066, 0x00000067, 0x00001054, 0x00004001, 0x00004002,
+];
+const EC_IDS: &[u64] = &[
+    0x00001041, 0x00001042, 0x00001043, 0x00001044, 0x00001045, 0x00001046, 0x00001047, 0x00001048,
+    0x00001049, 0x0000104a, 0x00001050, 0x00001051, 0x00001052, 0x00001053, 0x00004038, 0x00004039,
+];
+const EDDSA_IDS: &[u64] = &[0x00001057];
+const XEDDSA_IDS: &[u64] = &[0x00004029];
+const SECRET_IDS: &[u64] = &[
+    0x0000004b, 0x0000004f, 0x00000053, 0x00000056, 0x00000057, 0x00000360, 0x00000362, 0x00000363,
+    0x00000364, 0x00000365, 0x00000371, 0x00000372, 0x00000373, 0x00000375, 0x00000376, 0x00000377,
+    0x00000378, 0x00000390, 0x00000391, 0x00000392, 0x00000393, 0x00000394, 0x00000395, 0x00000396,
+    0x00000397, 0x00000398, 0x00000399, 0x0000039a, 0x0000039b, 0x0000039c, 0x000003ac, 0x000003ad,
+    0x000003ae, 0x000003d1, 0x000003d2, 0x000003d3, 0x000003d4, 0x000003d5, 0x000003d9, 0x000003e0,
+    0x000003e1, 0x000003e2, 0x000003e3, 0x000003e5, 0x00000510, 0x00000511, 0x00000512, 0x0000402e,
+    0x0000402f, 0x00004030, 0x00004031,
+];
+const DSA_IDS: &[u64] = &[
+    0x00000011, 0x00000012, 0x00000013, 0x00000014, 0x00000015, 0x00000016, 0x00000018, 0x00000019,
+    0x0000001a, 0x0000001b,
+];
+const DH_IDS: &[u64] = &[
+    0x00000021, 0x00000031, 0x00000032, 0x00000033, 0x00001011, 0x00001012,
+];
+const AES_IDS: &[u64] = &[
+    0x00001071, 0x00001081, 0x00001082, 0x00001083, 0x00001084, 0x00001085, 0x00001086, 0x00001087,
+    0x00001088, 0x00001089, 0x0000108a, 0x0000108b, 0x0000108c, 0x0000108d, 0x0000108e, 0x00001104,
+    0x00001105, 0x00002104, 0x00002105, 0x00002106, 0x00002107, 0x00002108, 0x00002109, 0x0000210a,
+    0x0000210b, 0x0000210c,
+];
+const GENERIC_SECRET_IDS: &[u64] = &[
+    0x00000049, 0x0000004a, 0x0000004d, 0x0000004e, 0x00000051, 0x00000052, 0x00000201, 0x00000202,
+    0x00000211, 0x00000212, 0x00000221, 0x00000222, 0x00000231, 0x00000232, 0x00000241, 0x00000242,
+    0x00000251, 0x00000252, 0x00000256, 0x00000257, 0x00000261, 0x00000262, 0x00000271, 0x00000272,
+    0x00000291, 0x000002b1, 0x000002b2, 0x000002b6, 0x000002b7, 0x000002c1, 0x000002c2, 0x000002d1,
+    0x000002d2, 0x00001211, 0x0000400d, 0x0000400e, 0x00004012, 0x00004013, 0x00004017, 0x00004018,
+    0x0000401c, 0x0000401d,
+];
+const HKDF_IDS: &[u64] = &[0x0000402a, 0x0000402b];
+const ML_KEM_IDS: &[u64] = &[0x00000017];
+const ML_DSA_IDS: &[u64] = &[
+    0x0000001d, 0x0000001f, 0x00000023, 0x00000024, 0x00000025, 0x00000026, 0x00000027, 0x00000028,
+    0x00000029, 0x0000002a, 0x0000002b, 0x0000002c,
+];
+const SLH_DSA_IDS: &[u64] = &[
+    0x0000002e, 0x00000034, 0x00000036, 0x00000037, 0x00000038, 0x00000039, 0x0000003a, 0x0000003b,
+    0x0000003c, 0x0000003d, 0x0000003e, 0x0000003f,
+];
+const CHACHA20_IDS: &[u64] = &[0x00001226, 0x00004021];
+const POLY1305_IDS: &[u64] = &[0x00001228];
+const DES_IDS: &[u64] = &[
+    0x00000121, 0x00000122, 0x00000123, 0x00000124, 0x00000125, 0x00000150, 0x00000151, 0x00000152,
+    0x00000153, 0x00001100, 0x00001101,
+];
+const DES3_IDS: &[u64] = &[
+    0x00000132, 0x00000133, 0x00000134, 0x00000135, 0x00000136, 0x00000137, 0x00000138, 0x00001102,
+    0x00001103,
+];
+const CAMELLIA_IDS: &[u64] = &[
+    0x00000551, 0x00000552, 0x00000553, 0x00000554, 0x00000555, 0x00000556, 0x00000557, 0x00000558,
+];
+const ARIA_IDS: &[u64] = &[
+    0x00000561, 0x00000562, 0x00000563, 0x00000564, 0x00000565, 0x00000566, 0x00000567,
+];
+const SEED_IDS: &[u64] = &[
+    0x00000651, 0x00000652, 0x00000653, 0x00000654, 0x00000655, 0x00000656, 0x00000657,
+];
+const GOST_IDS: &[u64] = &[0x00001221, 0x00001222, 0x00001223, 0x00001224];
+
+/// §5.2 mechanism subsets: the ECDSA sign/verify ids (ECDSA plus the
+/// nine hash variants).
+const ECDSA_IDS: &[u64] = &[
+    0x00001041, 0x00001042, 0x00001043, 0x00001044, 0x00001045, 0x00001046, 0x00001047, 0x00001048,
+    0x00001049, 0x0000104a,
+];
+/// §5.2 ECDH1-family subset (family-only): derive plus wrap ids,
+/// ECMQV included.
+const ECDH1_FAMILY_IDS: &[u64] = &[
+    0x00001050, 0x00001051, 0x00001052, 0x00001053, 0x00004038, 0x00004039,
+];
+/// §4.5 ECDH1 qualifier (Montgomery compatibility): ECMQV excluded.
+const ECDH1_QUALIFIED_IDS: &[u64] = &[0x00001050, 0x00001051, 0x00001053, 0x00004038, 0x00004039];
+const RSA_AES_KEY_WRAP_ID: u64 = 0x00001054;
+const AES_XTS_ID: u64 = 0x00001071;
+const AES_KW_ID: u64 = 0x00002109;
+const AES_KW_PAD_ID: u64 = 0x0000210a;
+const AES_KW_KWP_ID: u64 = 0x0000210b;
+const AES_KW_PKCS7_ID: u64 = 0x0000210c;
 
 /// Infer the §4.2 family for one mechanism id, or `None` when the id
 /// infers nothing (unlisted, vendor, keygen/parameter-gen, CMS_SIG,
-/// PBKD2, PBA, or an unobserved legacy id).
-pub(crate) fn infer_family(_mechanism: u64) -> Option<KeyFamily> {
-    // RED STUB: replaced by the §4.2 tables in the GREEN commit.
+/// PBKD2, PBA, or an unobserved legacy id). Full-width equality:
+/// hostile-width aliases never match.
+pub(crate) fn infer_family(mechanism: u64) -> Option<KeyFamily> {
+    // Spec order; each table is sorted for binary search.
+    if RSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Rsa);
+    }
+    if EC_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Ec);
+    }
+    if EDDSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Eddsa);
+    }
+    if XEDDSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Xeddsa);
+    }
+    if SECRET_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Secret);
+    }
+    if DSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Dsa);
+    }
+    if DH_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Dh);
+    }
+    if AES_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Aes);
+    }
+    if GENERIC_SECRET_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::GenericSecret);
+    }
+    if HKDF_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Hkdf);
+    }
+    if ML_KEM_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::MlKem);
+    }
+    if ML_DSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::MlDsa);
+    }
+    if SLH_DSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::SlhDsa);
+    }
+    if CHACHA20_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Chacha20);
+    }
+    if POLY1305_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Poly1305);
+    }
+    if DES_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Des);
+    }
+    if DES3_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Des3);
+    }
+    if CAMELLIA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Camellia);
+    }
+    if ARIA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Aria);
+    }
+    if SEED_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Seed);
+    }
+    if GOST_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Gost);
+    }
     None
 }
 
 /// The §10.2 schema spelling of one family.
-pub(crate) fn family_value(_family: KeyFamily) -> &'static str {
-    // RED STUB.
-    "?"
+pub(crate) fn family_value(family: KeyFamily) -> &'static str {
+    match family {
+        KeyFamily::Rsa => "rsa",
+        KeyFamily::Ec => "ec",
+        KeyFamily::Eddsa => "eddsa",
+        KeyFamily::Xeddsa => "xeddsa",
+        KeyFamily::Secret => "secret",
+        KeyFamily::Dsa => "dsa",
+        KeyFamily::Dh => "dh",
+        KeyFamily::Aes => "aes",
+        KeyFamily::GenericSecret => "generic_secret",
+        KeyFamily::Hkdf => "hkdf",
+        KeyFamily::MlKem => "ml_kem",
+        KeyFamily::MlDsa => "ml_dsa",
+        KeyFamily::SlhDsa => "slh_dsa",
+        KeyFamily::Chacha20 => "chacha20",
+        KeyFamily::Poly1305 => "poly1305",
+        KeyFamily::Des => "des",
+        KeyFamily::Des3 => "des3",
+        KeyFamily::Camellia => "camellia",
+        KeyFamily::Aria => "aria",
+        KeyFamily::Seed => "seed",
+        KeyFamily::Gost => "gost",
+    }
 }
 
 /// The `-v`/concise display spelling of one family.
@@ -115,22 +299,98 @@ pub(crate) enum EstablishedKind {
     Poly1305,
 }
 
-/// Map one established [`KeyLabel`] to its §4.5 kind.
-pub(crate) fn established_kind(_label: KeyLabel) -> EstablishedKind {
-    // RED STUB.
-    EstablishedKind::Rsa { bits: 0 }
+/// Map one established [`KeyLabel`] to its §4.5 kind. PQC codes map
+/// to their parameter-set spellings (the §10.2 `parameter_set`
+/// vocabulary); Montgomery/Edwards curves split by name.
+pub(crate) fn established_kind(label: KeyLabel) -> EstablishedKind {
+    use crate::semantics_objects::PqcCode;
+    match label {
+        KeyLabel::Rsa { modulus_bits } => EstablishedKind::Rsa { bits: modulus_bits },
+        KeyLabel::Aes { value_len } => EstablishedKind::Aes { bytes: value_len },
+        KeyLabel::Ec { curve } => match curve {
+            SafeCurve::X25519 | SafeCurve::X448 => EstablishedKind::Montgomery,
+            SafeCurve::Ed25519 | SafeCurve::Ed448 => EstablishedKind::Edwards { curve },
+            curve => EstablishedKind::Ec { curve },
+        },
+        KeyLabel::Hkdf { value_len } => EstablishedKind::Hkdf { bytes: value_len },
+        KeyLabel::GenericSecret { value_len } => {
+            EstablishedKind::GenericSecret { bytes: value_len }
+        }
+        KeyLabel::Pqc(code) => match code {
+            PqcCode::MlKem512 => EstablishedKind::MlKem { set: "ml_kem_512" },
+            PqcCode::MlKem768 => EstablishedKind::MlKem { set: "ml_kem_768" },
+            PqcCode::MlKem1024 => EstablishedKind::MlKem { set: "ml_kem_1024" },
+            PqcCode::MlDsa44 => EstablishedKind::MlDsa { set: "ml_dsa_44" },
+            PqcCode::MlDsa65 => EstablishedKind::MlDsa { set: "ml_dsa_65" },
+            PqcCode::MlDsa87 => EstablishedKind::MlDsa { set: "ml_dsa_87" },
+            PqcCode::SlhDsaSha2128s | PqcCode::SlhDsaShake128s => EstablishedKind::SlhDsa {
+                set: "slh_dsa_128s",
+            },
+            PqcCode::SlhDsaSha2128f | PqcCode::SlhDsaShake128f => EstablishedKind::SlhDsa {
+                set: "slh_dsa_128f",
+            },
+            PqcCode::SlhDsaSha2192s | PqcCode::SlhDsaShake192s => EstablishedKind::SlhDsa {
+                set: "slh_dsa_192s",
+            },
+            PqcCode::SlhDsaSha2192f | PqcCode::SlhDsaShake192f => EstablishedKind::SlhDsa {
+                set: "slh_dsa_192f",
+            },
+            PqcCode::SlhDsaSha2256s | PqcCode::SlhDsaShake256s => EstablishedKind::SlhDsa {
+                set: "slh_dsa_256s",
+            },
+            PqcCode::SlhDsaSha2256f | PqcCode::SlhDsaShake256f => EstablishedKind::SlhDsa {
+                set: "slh_dsa_256f",
+            },
+        },
+    }
 }
 
 /// Whether one inferred family is compatible with one established
 /// kind under the §4.5 table (`mechanism` carries the ECDH1/XTS
 /// qualifiers). Everything cross-name outside the table conflicts.
 pub(crate) fn families_compatible(
-    _inferred: KeyFamily,
-    _mechanism: u64,
-    _established: EstablishedKind,
+    inferred: KeyFamily,
+    mechanism: u64,
+    established: EstablishedKind,
 ) -> bool {
-    // RED STUB.
-    false
+    use EstablishedKind as E;
+    use KeyFamily as F;
+    // The secret superclass never flips, either direction, against
+    // any inferred family or established kind.
+    if inferred == F::Secret {
+        return true;
+    }
+    match (inferred, established) {
+        (F::Rsa, E::Rsa { .. }) => true,
+        (F::Ec, E::Ec { .. }) => true,
+        // The Firefox X25519/X448 derive case: ECDH1-qualified only
+        // (ECMQV and ECDSA uses stay conflicting).
+        (F::Ec, E::Montgomery) => ECDH1_QUALIFIED_IDS.binary_search(&mechanism).is_ok(),
+        (F::Eddsa, E::Edwards { .. }) => true,
+        (F::Xeddsa, E::Montgomery) => true,
+        (F::Dsa, E::Dsa) => true,
+        (F::Dh, E::Dh | E::X9_42Dh) => true,
+        (F::Aes, E::Aes { .. }) => true,
+        (F::Aes, E::AesXts) => mechanism == AES_XTS_ID,
+        (F::GenericSecret, E::GenericSecret { .. } | E::Hkdf { .. }) => true,
+        // The Firefox TLS 1.3 case: ECDH results established as
+        // generic secret, then HKDF.
+        (F::Hkdf, E::Hkdf { .. } | E::GenericSecret { .. }) => true,
+        // Inert while both stay unlisted in the KeyType set.
+        (F::Des3, E::Des3 | E::Des2) => true,
+        (F::MlKem, E::MlKem { .. }) => true,
+        (F::MlDsa, E::MlDsa { .. }) => true,
+        (F::SlhDsa, E::SlhDsa { .. }) => true,
+        (F::Chacha20, E::Chacha20) => true,
+        (F::Poly1305, E::Poly1305) => true,
+        (F::Des, E::Des) => true,
+        (F::Camellia, E::Camellia) => true,
+        (F::Aria, E::Aria) => true,
+        (F::Seed, E::Seed) => true,
+        (F::Gost, E::Gost) => true,
+        // Everything else cross-name conflicts.
+        _ => false,
+    }
 }
 
 /// Whether one inferred size is compatible with one established kind
@@ -141,12 +401,69 @@ pub(crate) fn families_compatible(
 /// secret lengths for wrapped material). Demonstrable contradiction
 /// only — anything unmeasurable stays compatible.
 pub(crate) fn size_compatible(
-    _detail: &SizeDetail,
-    _mechanism: u64,
-    _established: EstablishedKind,
+    detail: &SizeDetail,
+    mechanism: u64,
+    established: EstablishedKind,
 ) -> bool {
-    // RED STUB.
-    false
+    use EstablishedKind as E;
+    // Wrapped material sizes without typing: only an exact secret
+    // length can contradict it; every other kind is unmeasurable.
+    if let SizeDetail::WrappedMaterial {
+        material_octets, ..
+    } = detail
+    {
+        return match established {
+            E::Aes { bytes } | E::GenericSecret { bytes } | E::Hkdf { bytes } => {
+                u64::from(bytes) == *material_octets
+            }
+            _ => true,
+        };
+    }
+    // Family gate first (same table, mechanism qualified).
+    let Some(family) = size_family(detail) else {
+        return true;
+    };
+    if !families_compatible(family, mechanism, established) {
+        return false;
+    }
+    // Same-family exact params.
+    match (detail, established) {
+        (SizeDetail::Rsa { modulus_bytes, .. }, E::Rsa { bits }) => {
+            *modulus_bytes == u64::from(bits).div_ceil(8)
+        }
+        (SizeDetail::Ec { octets, .. }, E::Ec { curve }) => {
+            let field = match curve {
+                SafeCurve::Secp256r1 => 32,
+                SafeCurve::Secp384r1 => 48,
+                SafeCurve::Secp521r1 => 66,
+                // Montgomery/Edwards curves never reach here: the
+                // family gate above already refused them for ECDSA
+                // mechanisms (only ECDH1 qualifies, and derive calls
+                // carry no lengths).
+                _ => return true,
+            };
+            *octets == 2 * field
+        }
+        (SizeDetail::Eddsa { curve, .. }, E::Edwards { curve: established }) => {
+            *curve == edwards_curve_name(established)
+        }
+        (
+            SizeDetail::PqcSet { parameter_set, .. },
+            E::MlKem { set } | E::MlDsa { set } | E::SlhDsa { set },
+        ) => *parameter_set == set,
+        // DSA classes, unit kinds and cross-kind survivors of the
+        // family gate carry no further params to contradict.
+        _ => true,
+    }
+}
+
+/// The §10.2 curve spelling for one Edwards curve.
+fn edwards_curve_name(curve: SafeCurve) -> &'static str {
+    match curve {
+        SafeCurve::Ed25519 => "ed25519",
+        SafeCurve::Ed448 => "ed448",
+        _ => "?",
+    }
 }
 
 /// Length evidence kind: the §10.2 `detail.evidence` vocabulary, one
@@ -167,15 +484,32 @@ pub(crate) enum EvidenceTag {
 /// category carries no §5.1 position (derive, message, generate,
 /// verify_recover, ...). `sign_recover` reads `SignOutput`: the RSA
 /// single-block output is signature evidence.
-pub(crate) fn evidence_tag_for_category(_category: &str) -> Option<EvidenceTag> {
-    // RED STUB.
-    None
+pub(crate) fn evidence_tag_for_category(category: &str) -> Option<EvidenceTag> {
+    match category {
+        "sign" | "sign_recover" => Some(EvidenceTag::SignOutput),
+        "verify" => Some(EvidenceTag::VerifyInput),
+        "encrypt" => Some(EvidenceTag::EncryptOutput),
+        "decrypt" => Some(EvidenceTag::DecryptInput),
+        "wrap" => Some(EvidenceTag::WrapOutput),
+        "unwrap" => Some(EvidenceTag::UnwrapInput),
+        "encapsulate" => Some(EvidenceTag::EncapsulateOutput),
+        "decapsulate" => Some(EvidenceTag::DecapsulateInput),
+        _ => None,
+    }
 }
 
 /// The §10.2 schema spelling of one evidence kind.
-pub(crate) fn evidence_value(_tag: EvidenceTag) -> &'static str {
-    // RED STUB.
-    "?"
+pub(crate) fn evidence_value(tag: EvidenceTag) -> &'static str {
+    match tag {
+        EvidenceTag::SignOutput => "sign_output",
+        EvidenceTag::VerifyInput => "verify_input",
+        EvidenceTag::EncryptOutput => "encrypt_output",
+        EvidenceTag::DecryptInput => "decrypt_input",
+        EvidenceTag::WrapOutput => "wrap_output",
+        EvidenceTag::UnwrapInput => "unwrap_input",
+        EvidenceTag::EncapsulateOutput => "encapsulate_output",
+        EvidenceTag::DecapsulateInput => "decapsulate_input",
+    }
 }
 
 /// The `-v` noun for one evidence kind (§10.3).
@@ -252,22 +586,325 @@ pub(crate) enum SizeOutcome {
 /// Classify one (mechanism, evidence kind, length) triple per §5.2.
 /// `None` mechanism (no usable id) classifies unknown with the
 /// unlisted-mechanism reason: a length alone never maps.
-pub(crate) fn classify_size(
-    _mechanism: Option<u64>,
-    _tag: EvidenceTag,
-    _length: u64,
-) -> SizeOutcome {
-    // RED STUB.
-    SizeOutcome::Unknown {
-        reason: REASON_NO_LENGTH_EVIDENCE,
+pub(crate) fn classify_size(mechanism: Option<u64>, tag: EvidenceTag, length: u64) -> SizeOutcome {
+    let Some(mechanism) = mechanism else {
+        // A length alone never maps.
+        return SizeOutcome::Unknown {
+            reason: REASON_UNLISTED_MECHANISM,
+        };
+    };
+    // The hybrid wrap sizes neither key (family-only §5.2 row).
+    if mechanism == RSA_AES_KEY_WRAP_ID {
+        return SizeOutcome::Unknown {
+            reason: REASON_HYBRID_WRAP_FORMAT,
+        };
     }
+    if RSA_IDS.binary_search(&mechanism).is_ok() {
+        return classify_rsa(tag, length);
+    }
+    if ECDSA_IDS.binary_search(&mechanism).is_ok() {
+        return classify_ecdsa(tag, length);
+    }
+    if ECDH1_FAMILY_IDS.binary_search(&mechanism).is_ok() {
+        return SizeOutcome::Unsupported {
+            reason: REASON_FAMILY_ONLY_SUBSET,
+        };
+    }
+    if EDDSA_IDS.binary_search(&mechanism).is_ok() {
+        return classify_eddsa(tag, length);
+    }
+    if XEDDSA_IDS.binary_search(&mechanism).is_ok() {
+        // A 64-octet XEdDSA signature would alias Ed25519: family
+        // only, and the §12.1 twin pins unknown (not unsupported).
+        return SizeOutcome::Unknown {
+            reason: REASON_FAMILY_ONLY_SUBSET,
+        };
+    }
+    if ML_KEM_IDS.binary_search(&mechanism).is_ok() {
+        return classify_ml_kem(tag, length);
+    }
+    if ML_DSA_IDS.binary_search(&mechanism).is_ok() {
+        return classify_ml_dsa(tag, length);
+    }
+    if SLH_DSA_IDS.binary_search(&mechanism).is_ok() {
+        return classify_slh_dsa(tag, length);
+    }
+    if DSA_IDS.binary_search(&mechanism).is_ok() {
+        return classify_dsa(tag, length);
+    }
+    if mechanism == AES_KW_ID {
+        return classify_aes_kw(tag, length);
+    }
+    if mechanism == AES_KW_PAD_ID || mechanism == AES_KW_KWP_ID || mechanism == AES_KW_PKCS7_ID {
+        return match tag {
+            EvidenceTag::WrapOutput | EvidenceTag::UnwrapInput => SizeOutcome::Unknown {
+                reason: REASON_PADDING_AMBIGUITY,
+            },
+            _ => SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            },
+        };
+    }
+    // Legacy ciphers sign/encrypt use into a display family with no
+    // size class.
+    if DES_IDS.binary_search(&mechanism).is_ok()
+        || DES3_IDS.binary_search(&mechanism).is_ok()
+        || CAMELLIA_IDS.binary_search(&mechanism).is_ok()
+        || ARIA_IDS.binary_search(&mechanism).is_ok()
+        || SEED_IDS.binary_search(&mechanism).is_ok()
+        || GOST_IDS.binary_search(&mechanism).is_ok()
+    {
+        return SizeOutcome::Unsupported {
+            reason: REASON_NO_LENGTH_MAP,
+        };
+    }
+    // Every other triple: unlisted mechanisms name the mechanism gap,
+    // listed ones without a map name the subset gap — never a
+    // neighboring class.
+    SizeOutcome::Unknown {
+        reason: if infer_family(mechanism).is_none() {
+            REASON_UNLISTED_MECHANISM
+        } else {
+            REASON_NO_LENGTH_MAP
+        },
+    }
+}
+
+/// RSA-subset lengths (§5.2): standard octets name the standard size
+/// with the byte count beside them; other admitted octets mask the
+/// class; anything outside the anti-alias bound is unsupported.
+fn classify_rsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
+    match tag {
+        EvidenceTag::SignOutput
+        | EvidenceTag::VerifyInput
+        | EvidenceTag::EncryptOutput
+        | EvidenceTag::DecryptInput
+        | EvidenceTag::WrapOutput
+        | EvidenceTag::UnwrapInput => {}
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            };
+        }
+    }
+    let size_class = match length {
+        128 => Some(1024),
+        256 => Some(2048),
+        384 => Some(3072),
+        512 => Some(4096),
+        64..=2048 => None,
+        _ => {
+            return SizeOutcome::Unsupported {
+                reason: REASON_OUTSIDE_ADMISSION_BOUND,
+            };
+        }
+    };
+    SizeOutcome::Inferred(SizeDetail::Rsa {
+        size_class,
+        modulus_bytes: length,
+    })
+}
+
+/// ECDSA raw r||s lengths name curves; anything else is DER or another
+/// curve (N6: the PKCS#11 result representation is what was measured).
+fn classify_ecdsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
+    match tag {
+        EvidenceTag::SignOutput | EvidenceTag::VerifyInput => {}
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            };
+        }
+    }
+    let curve = match length {
+        64 => "p256",
+        96 => "p384",
+        132 => "p521",
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_VARIABLE_LENGTH_ENCODING,
+            };
+        }
+    };
+    SizeOutcome::Inferred(SizeDetail::Ec {
+        curve,
+        octets: length,
+    })
+}
+
+/// EdDSA fixed lengths determine the curve (RFC 8032: the mechanism
+/// carries no curve parameter).
+fn classify_eddsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
+    match tag {
+        EvidenceTag::SignOutput | EvidenceTag::VerifyInput => {}
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            };
+        }
+    }
+    let curve = match length {
+        64 => "ed25519",
+        114 => "ed448",
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_UNMAPPED_LENGTH,
+            };
+        }
+    };
+    SizeOutcome::Inferred(SizeDetail::Eddsa {
+        curve,
+        octets: length,
+    })
+}
+
+/// ML-KEM ciphertext lengths (FIPS 203 Table 2).
+fn classify_ml_kem(tag: EvidenceTag, length: u64) -> SizeOutcome {
+    match tag {
+        EvidenceTag::EncapsulateOutput | EvidenceTag::DecapsulateInput => {}
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            };
+        }
+    }
+    let parameter_set = match length {
+        768 => "ml_kem_512",
+        1088 => "ml_kem_768",
+        1568 => "ml_kem_1024",
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_UNMAPPED_LENGTH,
+            };
+        }
+    };
+    SizeOutcome::Inferred(SizeDetail::PqcSet {
+        parameter_set,
+        octets: length,
+    })
+}
+
+/// ML-DSA signature lengths (FIPS 204 Table 2).
+fn classify_ml_dsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
+    match tag {
+        EvidenceTag::SignOutput | EvidenceTag::VerifyInput => {}
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            };
+        }
+    }
+    let parameter_set = match length {
+        2420 => "ml_dsa_44",
+        3309 => "ml_dsa_65",
+        4627 => "ml_dsa_87",
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_UNMAPPED_LENGTH,
+            };
+        }
+    };
+    SizeOutcome::Inferred(SizeDetail::PqcSet {
+        parameter_set,
+        octets: length,
+    })
+}
+
+/// SLH-DSA signature lengths (FIPS 205 Table 2); SHA2-vs-SHAKE stays
+/// ambiguous on shared sizes and is said so in text.
+fn classify_slh_dsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
+    match tag {
+        EvidenceTag::SignOutput | EvidenceTag::VerifyInput => {}
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            };
+        }
+    }
+    let parameter_set = match length {
+        7856 => "slh_dsa_128s",
+        17088 => "slh_dsa_128f",
+        16224 => "slh_dsa_192s",
+        35664 => "slh_dsa_192f",
+        29792 => "slh_dsa_256s",
+        49856 => "slh_dsa_256f",
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_UNMAPPED_LENGTH,
+            };
+        }
+    };
+    SizeOutcome::Inferred(SizeDetail::PqcSet {
+        parameter_set,
+        octets: length,
+    })
+}
+
+/// DSA legacy classes (ambiguous classes said so).
+fn classify_dsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
+    match tag {
+        EvidenceTag::SignOutput | EvidenceTag::VerifyInput => {}
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            };
+        }
+    }
+    let label = match length {
+        40 => "dsa_1024",
+        56 => "dsa_2048_224",
+        64 => "dsa_2048_256_or_3072",
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_UNMAPPED_LENGTH,
+            };
+        }
+    };
+    SizeOutcome::Inferred(SizeDetail::DsaClass {
+        label,
+        octets: length,
+    })
+}
+
+/// AES-KW output/input lengths size the wrapped key's material
+/// (L-8); outputs under 8 octets cannot map.
+fn classify_aes_kw(tag: EvidenceTag, length: u64) -> SizeOutcome {
+    match tag {
+        EvidenceTag::WrapOutput | EvidenceTag::UnwrapInput => {}
+        _ => {
+            return SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP,
+            };
+        }
+    }
+    let Some(material_octets) = length.checked_sub(8) else {
+        return SizeOutcome::Unknown {
+            reason: REASON_UNMAPPED_LENGTH,
+        };
+    };
+    SizeOutcome::Inferred(SizeDetail::WrappedMaterial {
+        material_octets,
+        octets: length,
+    })
 }
 
 /// The implied family of one size detail, or `None` for wrapped
 /// material (which sizes the wrapped key without typing it).
-pub(crate) fn size_family(_detail: &SizeDetail) -> Option<KeyFamily> {
-    // RED STUB.
-    None
+pub(crate) fn size_family(detail: &SizeDetail) -> Option<KeyFamily> {
+    match detail {
+        SizeDetail::Rsa { .. } => Some(KeyFamily::Rsa),
+        SizeDetail::Ec { .. } => Some(KeyFamily::Ec),
+        SizeDetail::Eddsa { .. } => Some(KeyFamily::Eddsa),
+        SizeDetail::DsaClass { .. } => Some(KeyFamily::Dsa),
+        SizeDetail::PqcSet { parameter_set, .. } => Some(if parameter_set.starts_with("ml_kem") {
+            KeyFamily::MlKem
+        } else if parameter_set.starts_with("ml_dsa") {
+            KeyFamily::MlDsa
+        } else {
+            KeyFamily::SlhDsa
+        }),
+        SizeDetail::WrappedMaterial { .. } => None,
+    }
 }
 
 /// The concise parenthetical label for one size detail
@@ -286,18 +923,34 @@ pub(crate) fn size_verbose(_detail: &SizeDetail, _tag: EvidenceTag) -> String {
 
 /// The masked non-standard RSA class for `octets` (8·octets with the
 /// last two digits masked: 256 → "2,0xx"). Never a range.
-pub(crate) fn masked_rsa_class(_octets: u64) -> String {
-    // RED STUB.
-    "?".to_string()
+pub(crate) fn masked_rsa_class(octets: u64) -> String {
+    let bits = octets.saturating_mul(8);
+    let grouped = grouped_thousands(bits);
+    let masked_len = grouped.len().saturating_sub(2);
+    format!("{}xx", &grouped[..masked_len])
+}
+
+/// Thousands-grouped decimal rendering (no locale, no allocation
+/// beyond the string).
+fn grouped_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// Whether two size details are the same size (§10.2): same detail
 /// kind plus size params. The evidence tag never enters (it is not a
 /// parameter), so same-size evidence keeps the first tag by
 /// construction.
-pub(crate) fn same_size(_a: &SizeDetail, _b: &SizeDetail) -> bool {
-    // RED STUB.
-    false
+pub(crate) fn same_size(a: &SizeDetail, b: &SizeDetail) -> bool {
+    // Tags never enter: same kind plus same size params only.
+    a == b
 }
 
 /// The concise combined label for one valued family plus one valued

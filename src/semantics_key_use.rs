@@ -2355,6 +2355,9 @@ pub(crate) struct FamilyState {
     pub conflict_completions: u64,
     pub further: u64,
     pub reason: Option<&'static str>,
+    /// Seen further-value bitmask (discriminant bits): repeats never
+    /// double-count `further`.
+    pub further_seen: u32,
 }
 
 /// One row's inferred size accumulation (keymeta §5.4): same
@@ -2362,6 +2365,11 @@ pub(crate) struct FamilyState {
 /// same detail kind plus size params — the evidence tag does not
 /// count, and the detail keeps the first tag. `unsupported` never
 /// overwrites `inferred` and never flips to `conflicting`.
+/// At most 64 remembered further size details per row: distinct
+/// sizes are unbounded (hostile callers vary lengths), so the
+/// dedup set caps while `further` keeps counting past it.
+pub(crate) const FURTHER_SEEN_CAP: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SizeState {
     pub status: InferredStatus,
@@ -2370,6 +2378,20 @@ pub(crate) struct SizeState {
     pub conflict_detail: Option<(crate::keymeta::SizeDetail, crate::keymeta::EvidenceTag)>,
     pub further: u64,
     pub reason: Option<&'static str>,
+    /// Remembered further size details for repeat suppression
+    /// (capped at [`FURTHER_SEEN_CAP`]; tags never compared).
+    pub further_seen: Vec<crate::keymeta::SizeDetail>,
+}
+
+/// One completion's size input after flag/trailer resolution: the
+/// flag is off, the completion carried no trailer, the trailer was
+/// BPF-unavailable, or a length value arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SizeInput {
+    Off,
+    NoEvidence,
+    Unavailable,
+    Value(u64),
 }
 
 /// One proved row's inferred keys (keymeta §10.2): family (both
@@ -2400,6 +2422,37 @@ impl RowInference {
 pub(crate) struct ParkedSize {
     pub detail: crate::keymeta::SizeDetail,
     pub tag: crate::keymeta::EvidenceTag,
+}
+
+impl FamilyState {
+    /// Accumulate one mechanism-present completion (§4.4): first
+    /// value pins with support, a second distinct specific family
+    /// rides the conflict pair, further distinct values count once
+    /// each, and the `secret` superclass accumulates beside any
+    /// family without ever flipping.
+    pub(crate) fn accumulate_family(
+        &mut self,
+        _established: Option<crate::keymeta::EstablishedKind>,
+        _mechanism: u64,
+    ) {
+        // RED STUB.
+    }
+}
+
+impl SizeState {
+    /// Accumulate one completion's size input (§5.4): valued evidence
+    /// upgrades unknowns, same sizes keep the first tag, distinct
+    /// sizes conflict with extras counted once each, and
+    /// `unsupported` never overwrites `inferred` nor flips.
+    pub(crate) fn accumulate_size(
+        &mut self,
+        _established: Option<crate::keymeta::EstablishedKind>,
+        _mechanism: Option<u64>,
+        _tag: Option<crate::keymeta::EvidenceTag>,
+        _input: SizeInput,
+    ) {
+        // RED STUB.
+    }
 }
 
 /// One open association's bucket: a reserved proved aggregate key

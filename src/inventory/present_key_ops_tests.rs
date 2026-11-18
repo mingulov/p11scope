@@ -3155,6 +3155,7 @@ fn inferred_rsa_2048(completions: u64) -> RowInference {
             conflict_completions: 0,
             further: 0,
             reason: None,
+            further_seen: 0,
         },
         size: SizeState {
             status: InferredStatus::Inferred,
@@ -3169,6 +3170,7 @@ fn inferred_rsa_2048(completions: u64) -> RowInference {
             conflict_detail: None,
             further: 0,
             reason: None,
+            further_seen: Vec::new(),
         },
     }
 }
@@ -3184,6 +3186,7 @@ fn inferred_family_only(family: KeyFamily, completions: u64) -> RowInference {
             conflict_completions: 0,
             further: 0,
             reason: None,
+            further_seen: 0,
         },
         size: SizeState::default(),
     }
@@ -3330,6 +3333,7 @@ fn key_ops_verbose_conflict_and_reasons() {
                 conflict_completions: 1,
                 further: 2,
                 reason: None,
+                further_seen: 0,
             },
             size: SizeState {
                 status: InferredStatus::Conflicting,
@@ -3350,6 +3354,7 @@ fn key_ops_verbose_conflict_and_reasons() {
                 )),
                 further: 1,
                 reason: None,
+                further_seen: Vec::new(),
             },
         },
     ));
@@ -3369,6 +3374,7 @@ fn key_ops_verbose_conflict_and_reasons() {
                 conflict_completions: 0,
                 further: 0,
                 reason: None,
+                further_seen: 0,
             },
             size: SizeState {
                 status: InferredStatus::Unknown,
@@ -3377,6 +3383,7 @@ fn key_ops_verbose_conflict_and_reasons() {
                 conflict_detail: None,
                 further: 0,
                 reason: Some(crate::keymeta::REASON_VARIABLE_LENGTH_ENCODING),
+                further_seen: Vec::new(),
             },
         },
     ));
@@ -3465,6 +3472,7 @@ fn key_ops_concise_wrapped_material() {
                 conflict_completions: 0,
                 further: 0,
                 reason: None,
+                further_seen: 0,
             },
             size: SizeState {
                 status: InferredStatus::Inferred,
@@ -3479,6 +3487,7 @@ fn key_ops_concise_wrapped_material() {
                 conflict_detail: None,
                 further: 0,
                 reason: None,
+                further_seen: Vec::new(),
             },
         },
     ));

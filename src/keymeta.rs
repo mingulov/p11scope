@@ -94,12 +94,12 @@ pub(crate) enum EstablishedKind {
     Aes { bytes: u16 },
     Ec { curve: SafeCurve },
     Montgomery,
-    Edwards,
+    Edwards { curve: SafeCurve },
     GenericSecret { bytes: u16 },
     Hkdf { bytes: u16 },
-    MlKem,
-    MlDsa,
-    SlhDsa,
+    MlKem { set: &'static str },
+    MlDsa { set: &'static str },
+    SlhDsa { set: &'static str },
     Dsa,
     Dh,
     X9_42Dh,
@@ -126,6 +126,22 @@ pub(crate) fn established_kind(_label: KeyLabel) -> EstablishedKind {
 /// qualifiers). Everything cross-name outside the table conflicts.
 pub(crate) fn families_compatible(
     _inferred: KeyFamily,
+    _mechanism: u64,
+    _established: EstablishedKind,
+) -> bool {
+    // RED STUB.
+    false
+}
+
+/// Whether one inferred size is compatible with one established kind
+/// (§3: a contradicting size conflicts beside the standing label).
+/// Family compatibility comes first (same §4.5 table, mechanism
+/// qualified); same-family pairs then compare exact size params
+/// (RSA bytes, EC field octets, Edwards curves, PQC sets, exact
+/// secret lengths for wrapped material). Demonstrable contradiction
+/// only — anything unmeasurable stays compatible.
+pub(crate) fn size_compatible(
+    _detail: &SizeDetail,
     _mechanism: u64,
     _established: EstablishedKind,
 ) -> bool {
@@ -1372,7 +1388,9 @@ mod tests {
             established_kind(KeyLabel::Ec {
                 curve: SafeCurve::Ed25519
             }),
-            EstablishedKind::Edwards
+            EstablishedKind::Edwards {
+                curve: SafeCurve::Ed25519
+            }
         );
         assert_eq!(
             established_kind(KeyLabel::Hkdf { value_len: 32 }),
@@ -1384,15 +1402,17 @@ mod tests {
         );
         assert_eq!(
             established_kind(KeyLabel::Pqc(PqcCode::MlKem768)),
-            EstablishedKind::MlKem
+            EstablishedKind::MlKem { set: "ml_kem_768" }
         );
         assert_eq!(
             established_kind(KeyLabel::Pqc(PqcCode::MlDsa65)),
-            EstablishedKind::MlDsa
+            EstablishedKind::MlDsa { set: "ml_dsa_65" }
         );
         assert_eq!(
             established_kind(KeyLabel::Pqc(PqcCode::SlhDsaShake128s)),
-            EstablishedKind::SlhDsa
+            EstablishedKind::SlhDsa {
+                set: "slh_dsa_128s"
+            }
         );
     }
 
@@ -1414,7 +1434,9 @@ mod tests {
         const XEDDSA: u64 = 0x4029;
         let rsa = EstablishedKind::Rsa { bits: 2048 };
         let mont = EstablishedKind::Montgomery;
-        let edw = EstablishedKind::Edwards;
+        let edw = EstablishedKind::Edwards {
+            curve: SafeCurve::Ed25519,
+        };
         let generic = EstablishedKind::GenericSecret { bytes: 32 };
         let hkdf = EstablishedKind::Hkdf { bytes: 32 };
         let aes = EstablishedKind::Aes { bytes: 16 };
@@ -1475,6 +1497,148 @@ mod tests {
             KeyFamily::Chacha20,
             0x1226,
             EstablishedKind::Poly1305
+        ));
+    }
+
+    /// The remaining §4.5 same-name rows (R3 top-up): every
+    /// same-name-only pair holds, and cross pairs conflict.
+    #[test]
+    fn compat_same_name_matrix() {
+        use EstablishedKind as E;
+        use KeyFamily as F;
+        for (family, mechanism, established) in [
+            (F::Dsa, 0x0011u64, E::Dsa),
+            (F::Dh, 0x0021u64, E::Dh),
+            (F::Dh, 0x0031u64, E::X9_42Dh),
+            (F::MlKem, 0x0017u64, E::MlKem { set: "ml_kem_768" }),
+            (F::MlDsa, 0x001Du64, E::MlDsa { set: "ml_dsa_65" }),
+            (
+                F::SlhDsa,
+                0x002Eu64,
+                E::SlhDsa {
+                    set: "slh_dsa_128s",
+                },
+            ),
+            (F::Chacha20, 0x1226u64, E::Chacha20),
+            (F::Poly1305, 0x1228u64, E::Poly1305),
+            (F::Des, 0x0121u64, E::Des),
+            (F::Des3, 0x0132u64, E::Des3),
+            (F::Camellia, 0x0551u64, E::Camellia),
+            (F::Aria, 0x0561u64, E::Aria),
+            (F::Seed, 0x0651u64, E::Seed),
+            (F::Gost, 0x1221u64, E::Gost),
+            (
+                F::Eddsa,
+                0x1057u64,
+                E::Edwards {
+                    curve: SafeCurve::Ed25519,
+                },
+            ),
+        ] {
+            assert!(
+                families_compatible(family, mechanism, established),
+                "{family:?} holds its name"
+            );
+        }
+        // Cross pairs conflict (same-name-only rows).
+        assert!(!families_compatible(
+            F::MlKem,
+            0x0017,
+            E::MlDsa { set: "ml_dsa_65" }
+        ));
+        assert!(!families_compatible(F::Des, 0x0121, E::Des3));
+        assert!(!families_compatible(F::Eddsa, 0x1057, E::Montgomery));
+        assert!(!families_compatible(F::Dh, 0x0021, E::Rsa { bits: 2048 }));
+    }
+
+    /// §3 size compatibility: family gate first, then exact size
+    /// params; demonstrable contradiction only.
+    #[test]
+    fn size_compatible_matrix() {
+        use EstablishedKind as E;
+        let rsa_2048 = SizeDetail::Rsa {
+            size_class: Some(2048),
+            modulus_bytes: 256,
+        };
+        // RSA bytes against established bits.
+        assert!(size_compatible(&rsa_2048, 0x0001, E::Rsa { bits: 2048 }));
+        assert!(!size_compatible(&rsa_2048, 0x0001, E::Rsa { bits: 1024 }));
+        assert!(size_compatible(&rsa_2048, 0x0001, E::Rsa { bits: 2041 }));
+        assert!(!size_compatible(&rsa_2048, 0x0001, E::Aes { bytes: 16 }));
+        // EC field octets against established curves.
+        let p256 = SizeDetail::Ec {
+            curve: "p256",
+            octets: 64,
+        };
+        assert!(size_compatible(
+            &p256,
+            0x1044,
+            E::Ec {
+                curve: SafeCurve::Secp256r1
+            }
+        ));
+        assert!(!size_compatible(
+            &p256,
+            0x1044,
+            E::Ec {
+                curve: SafeCurve::Secp384r1
+            }
+        ));
+        assert!(!size_compatible(&p256, 0x1044, E::Montgomery));
+        // Edwards curves.
+        let ed25519 = SizeDetail::Eddsa {
+            curve: "ed25519",
+            octets: 64,
+        };
+        assert!(size_compatible(
+            &ed25519,
+            0x1057,
+            E::Edwards {
+                curve: SafeCurve::Ed25519
+            }
+        ));
+        assert!(!size_compatible(
+            &ed25519,
+            0x1057,
+            E::Edwards {
+                curve: SafeCurve::Ed448
+            }
+        ));
+        // PQC sets.
+        let kem_768 = SizeDetail::PqcSet {
+            parameter_set: "ml_kem_768",
+            octets: 1088,
+        };
+        assert!(size_compatible(
+            &kem_768,
+            0x0017,
+            E::MlKem { set: "ml_kem_768" }
+        ));
+        assert!(!size_compatible(
+            &kem_768,
+            0x0017,
+            E::MlKem { set: "ml_kem_512" }
+        ));
+        assert!(!size_compatible(
+            &kem_768,
+            0x0017,
+            E::MlDsa { set: "ml_dsa_65" }
+        ));
+        // Wrapped material against exact secret lengths; unmeasurable
+        // pairs stay compatible.
+        let wrapped_16 = SizeDetail::WrappedMaterial {
+            material_octets: 16,
+            octets: 24,
+        };
+        assert!(size_compatible(&wrapped_16, 0x2109, E::Aes { bytes: 16 }));
+        assert!(!size_compatible(&wrapped_16, 0x2109, E::Aes { bytes: 32 }));
+        assert!(size_compatible(&wrapped_16, 0x2109, E::Rsa { bits: 2048 }));
+        assert!(size_compatible(
+            &wrapped_16,
+            0x2109,
+            E::Ec {
+                curve: SafeCurve::Secp256r1
+            }
         ));
     }
 

@@ -428,6 +428,9 @@ pub(super) mod program {
             }
             gap();
             bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            if Record::LENGTH {
+                length_return_abandon(&key);
+            }
             return 0;
         }
         let facts =

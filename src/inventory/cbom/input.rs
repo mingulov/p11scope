@@ -257,6 +257,19 @@ fn count_rows(value: &Value, limits: InputLimits) -> Result<()> {
             .map(Vec::len)
             .unwrap_or(0))?;
     }
+    // Folded rows convert like live rows, so they count the same way.
+    for module in arr_of(value, "modules") {
+        let Some(departed) = module.get("departed_use") else {
+            continue;
+        };
+        for key in ["identities", "mechanisms"] {
+            add(departed
+                .get(key)
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0))?;
+        }
+    }
     if let Some(section) = value.get("object_observations") {
         for key in [
             "sessions",
@@ -376,11 +389,64 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
                 .insert(lifecycle.to_string());
         }
     }
+    // Folded callers rejoin the same grouping: one component per
+    // distinct executable path, incarnations counted, lifecycles
+    // unioned. A present-but-unreadable aggregate stays unread, like
+    // any unknown additive subtree.
+    let mut app_departed: BTreeMap<String, u64> = BTreeMap::new();
+    for module in arr_of(value, "modules") {
+        let Some(departed) = module.get("departed_use").and_then(Value::as_object) else {
+            continue;
+        };
+        out.unknowns.departed_identities_dropped =
+            out.unknowns.departed_identities_dropped.saturating_add(
+                departed
+                    .get("identities_dropped")
+                    .and_then(u64_of)
+                    .unwrap_or(0),
+            );
+        if departed
+            .get("identities_saturated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            out.unknowns.departed_identities_saturated += 1;
+        }
+        let Some(identities) = departed.get("identities").and_then(Value::as_array) else {
+            continue;
+        };
+        for identity in identities {
+            if identity.get("caller").and_then(str_of).is_none() {
+                out.unknowns.callers_skipped += 1;
+                continue;
+            }
+            let path = identity
+                .get("exe")
+                .and_then(|exe| exe.get("path"))
+                .and_then(str_of)
+                .filter(|path| !path.is_empty());
+            let Some(path) = path else {
+                out.unknowns.callers_unknown_exe += 1;
+                continue;
+            };
+            if !app_incarnations.contains_key(path) {
+                app_order.push(path.to_string());
+            }
+            *app_incarnations.entry(path.to_string()).or_insert(0) += 1;
+            *app_departed.entry(path.to_string()).or_insert(0) += 1;
+            if let Some(lifecycle) = identity.get("lifecycle").and_then(str_of) {
+                app_lifecycles
+                    .entry(path.to_string())
+                    .or_default()
+                    .insert(lifecycle.to_string());
+            }
+        }
+    }
     for (index, path) in app_order.iter().enumerate() {
         out.applications.push(Application {
             path: path.clone(),
             incarnations: app_incarnations.get(path).copied().unwrap_or(0),
-            departed_incarnations: 0,
+            departed_incarnations: app_departed.get(path).copied().unwrap_or(0),
             lifecycles: app_lifecycles
                 .get(path)
                 .map(|set| set.iter().cloned().collect())
@@ -491,6 +557,44 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
     let mut mechs: BTreeMap<u64, MechAccum> = BTreeMap::new();
     let mut edges_seen = 0u64;
     let mut edges_with_mechanisms = 0u64;
+    // One mechanism row in the edge-row shape, live or folded: counts
+    // sum, categories and provenance union. Attribution stays with the
+    // caller: live rows join their edge, folded rows their aggregate.
+    let fold_mech_row = |row: &Value, entry: &mut MechAccum| {
+        entry.rows += 1;
+        if entry.name.is_none() {
+            entry.name = row.get("name").and_then(str_of).map(str::to_string);
+        }
+        entry.calls = entry
+            .calls
+            .saturating_add(row.get("calls").and_then(u64_of).unwrap_or(0));
+        entry.errors = entry
+            .errors
+            .saturating_add(row.get("errors").and_then(u64_of).unwrap_or(0));
+        for op in arr_of(row, "operations") {
+            if let Some(op) = str_of(op) {
+                entry.operations.insert(op.to_string());
+            }
+        }
+        if let Some(evidence) = row.get("evidence") {
+            for function in arr_of(evidence, "functions") {
+                if let Some(function) = str_of(function) {
+                    entry.functions.insert(function.to_string());
+                }
+            }
+            for ret in arr_of(evidence, "returns") {
+                let label = ret
+                    .get("name")
+                    .and_then(str_of)
+                    .map(str::to_string)
+                    .or_else(|| ret.get("rv_hex").and_then(str_of).map(str::to_string))
+                    .or_else(|| ret.get("rv").and_then(u64_of).map(|rv| format!("rv {rv}")));
+                if let Some(label) = label {
+                    entry.returns.insert(label);
+                }
+            }
+        }
+    };
     let mut fold_edge = |edge: &Value, out: &mut Projection| {
         let caller = edge.get("caller").and_then(str_of);
         let module = edge.get("module").and_then(str_of);
@@ -526,39 +630,7 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
                 continue;
             };
             let entry = mechs.entry(id).or_default();
-            entry.rows += 1;
-            if entry.name.is_none() {
-                entry.name = row.get("name").and_then(str_of).map(str::to_string);
-            }
-            entry.calls = entry
-                .calls
-                .saturating_add(row.get("calls").and_then(u64_of).unwrap_or(0));
-            entry.errors = entry
-                .errors
-                .saturating_add(row.get("errors").and_then(u64_of).unwrap_or(0));
-            for op in arr_of(row, "operations") {
-                if let Some(op) = str_of(op) {
-                    entry.operations.insert(op.to_string());
-                }
-            }
-            if let Some(evidence) = row.get("evidence") {
-                for function in arr_of(evidence, "functions") {
-                    if let Some(function) = str_of(function) {
-                        entry.functions.insert(function.to_string());
-                    }
-                }
-                for ret in arr_of(evidence, "returns") {
-                    let label = ret
-                        .get("name")
-                        .and_then(str_of)
-                        .map(str::to_string)
-                        .or_else(|| ret.get("rv_hex").and_then(str_of).map(str::to_string))
-                        .or_else(|| ret.get("rv").and_then(u64_of).map(|rv| format!("rv {rv}")));
-                    if let Some(label) = label {
-                        entry.returns.insert(label);
-                    }
-                }
-            }
+            fold_mech_row(row, entry);
             if let Some(app) = &app {
                 entry.callers.insert(app.clone());
             }
@@ -572,6 +644,112 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
     }
     for edge in arr_of(value, "semantic_edges") {
         fold_edge(edge, &mut out);
+    }
+    // Folded mechanism rows merge into the same per-id totals: the
+    // fold preserves the edge-row shape. Overflow rows past the
+    // bounds have no id to merge under, so their sums stay named
+    // unknowns instead.
+    for module in arr_of(value, "modules") {
+        let Some(id) = module.get("id").and_then(str_of) else {
+            continue;
+        };
+        let Some(provider) = module_ref.get(id).cloned() else {
+            continue;
+        };
+        let Some(departed) = module.get("departed_use").and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(overflow) = departed
+            .get("mechanisms_overflow")
+            .and_then(Value::as_object)
+        {
+            out.unknowns.departed_mechs_overflow = out
+                .unknowns
+                .departed_mechs_overflow
+                .saturating_add(overflow.get("mechs").and_then(u64_of).unwrap_or(0));
+            out.unknowns.departed_mechs_overflow_calls = out
+                .unknowns
+                .departed_mechs_overflow_calls
+                .saturating_add(overflow.get("calls").and_then(u64_of).unwrap_or(0));
+            out.unknowns.departed_mechs_overflow_errors = out
+                .unknowns
+                .departed_mechs_overflow_errors
+                .saturating_add(overflow.get("errors").and_then(u64_of).unwrap_or(0));
+        }
+        let identities = departed
+            .get("identities")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut named = 0u64;
+        let mut paths = BTreeSet::new();
+        let mut all_named_have_paths = true;
+        for identity in &identities {
+            if identity.get("caller").and_then(str_of).is_none() {
+                continue;
+            }
+            named += 1;
+            match identity
+                .get("exe")
+                .and_then(|exe| exe.get("path"))
+                .and_then(str_of)
+                .filter(|path| !path.is_empty())
+            {
+                Some(path) => {
+                    paths.insert(path.to_string());
+                }
+                None => {
+                    all_named_have_paths = false;
+                }
+            }
+        }
+        // The folded mapping joins each departed application to this
+        // provider, exactly like a live edge with no mechanism claims.
+        for path in &paths {
+            if let Some(app) = app_ref_of(path) {
+                add_dependency(&mut out.dependencies, &app, &provider);
+            }
+        }
+        let rows = departed
+            .get("mechanisms")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if rows.is_empty() {
+            continue;
+        }
+        // Per-app mechanism pairs survive the fold only when every
+        // folded caller is named and all share one executable path;
+        // otherwise the pairs are withheld, never guessed.
+        let callers = departed.get("callers").and_then(u64_of).unwrap_or(0);
+        let dropped = departed
+            .get("identities_dropped")
+            .and_then(u64_of)
+            .unwrap_or(0);
+        let saturated = departed
+            .get("identities_saturated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let complete = !saturated && dropped == 0 && named > 0 && named == callers;
+        let single_app = if complete && all_named_have_paths && paths.len() == 1 {
+            paths.iter().next().cloned()
+        } else {
+            None
+        };
+        if paths.len() > 1 {
+            out.unknowns.departed_links_withheld += 1;
+        }
+        for row in rows {
+            let Some(id) = row.get("mechanism").and_then(u64_of) else {
+                continue;
+            };
+            let entry = mechs.entry(id).or_default();
+            fold_mech_row(row, entry);
+            if let Some(app) = &single_app {
+                entry.callers.insert(app.clone());
+            }
+            entry.modules.insert(provider.clone());
+        }
     }
     out.unknowns.edges_without_mechanisms = edges_seen.saturating_sub(edges_with_mechanisms);
     for (id, accum) in &mechs {

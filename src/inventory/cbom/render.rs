@@ -175,6 +175,38 @@ fn render_metadata(projection: &Projection) -> Value {
     ] {
         properties.push(prop(name, count.to_string()));
     }
+    // Departed-fold bounds ride only when nonzero, so inputs without
+    // a fold render byte-identically to before.
+    for (name, count) in [
+        (
+            "p11scope:departed_identities_dropped",
+            unknowns.departed_identities_dropped,
+        ),
+        (
+            "p11scope:departed_identities_saturated",
+            unknowns.departed_identities_saturated,
+        ),
+        (
+            "p11scope:departed_mech_overflow",
+            unknowns.departed_mechs_overflow,
+        ),
+        (
+            "p11scope:departed_mech_overflow_calls",
+            unknowns.departed_mechs_overflow_calls,
+        ),
+        (
+            "p11scope:departed_mech_overflow_errors",
+            unknowns.departed_mechs_overflow_errors,
+        ),
+        (
+            "p11scope:departed_links_withheld",
+            unknowns.departed_links_withheld,
+        ),
+    ] {
+        if count > 0 {
+            properties.push(prop(name, count.to_string()));
+        }
+    }
     Value::Object(Map::from_iter([
         (
             "tools".to_string(),
@@ -191,6 +223,12 @@ fn render_components(projection: &Projection) -> Vec<Value> {
     let mut components = Vec::new();
     for app in &projection.applications {
         let mut properties = vec![prop("p11scope:incarnations", app.incarnations.to_string())];
+        if app.departed_incarnations > 0 {
+            properties.push(prop(
+                "p11scope:departed_incarnations",
+                app.departed_incarnations.to_string(),
+            ));
+        }
         if !app.lifecycles.is_empty() {
             properties.push(prop("p11scope:lifecycle", app.lifecycles.join(",")));
         }
@@ -665,6 +703,42 @@ fn coverage_parts(projection: &Projection) -> Vec<String> {
             "malformed caller/module rows skipped",
         ));
     }
+    if unknowns.departed_identities_dropped > 0 {
+        parts.push(counted(
+            unknowns.departed_identities_dropped as usize,
+            "departed identity dropped",
+            "departed identities dropped",
+        ));
+    }
+    if unknowns.departed_identities_saturated > 0 {
+        parts.push(counted(
+            unknowns.departed_identities_saturated as usize,
+            "module with saturated departed identities",
+            "modules with saturated departed identities",
+        ));
+    }
+    if unknowns.departed_mechs_overflow > 0
+        || unknowns.departed_mechs_overflow_calls > 0
+        || unknowns.departed_mechs_overflow_errors > 0
+    {
+        parts.push(format!(
+            "{} past bounds ({} calls, {} errors)",
+            counted(
+                unknowns.departed_mechs_overflow as usize,
+                "departed mechanism",
+                "departed mechanisms",
+            ),
+            unknowns.departed_mechs_overflow_calls,
+            unknowns.departed_mechs_overflow_errors,
+        ));
+    }
+    if unknowns.departed_links_withheld > 0 {
+        parts.push(counted(
+            unknowns.departed_links_withheld as usize,
+            "module with withheld departed mechanism linkage",
+            "modules with withheld departed mechanism linkage",
+        ));
+    }
     if let Some(note) = &projection.profile_note {
         parts.push(escape_controls(note).into_owned());
     }
@@ -722,11 +796,20 @@ pub(super) fn render_verbose(projection: &Projection, out: &mut Vec<u8>) -> std:
         projection.applications.len()
     );
     for app in &projection.applications {
+        let incarnations = if app.departed_incarnations > 0 {
+            format!(
+                "{}, {} departed",
+                counted(app.incarnations as usize, "incarnation", "incarnations"),
+                app.departed_incarnations
+            )
+        } else {
+            counted(app.incarnations as usize, "incarnation", "incarnations")
+        };
         let _ = writeln!(
             text,
             "  {} ({}, {})",
             escape_controls(&app.path),
-            counted(app.incarnations as usize, "incarnation", "incarnations"),
+            incarnations,
             if app.lifecycles.is_empty() {
                 "lifecycle unknown".to_string()
             } else {

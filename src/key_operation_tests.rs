@@ -16795,9 +16795,16 @@ fn fold_capped_feed_keeps_row_budget_partial_across_last_fold() {
         "concise text names the partial section: {block_before:?}"
     );
     let totals_before = key_tally_totals(&block_before);
+    assert_eq!(
+        totals_before.get("sign"),
+        Some(&(1, 0, 1)),
+        "one completed use plus the refused start's open active: {block_before:?}"
+    );
     assert!(
-        !totals_before.is_empty(),
-        "the twin parses tallies before the fold: {block_before:?}"
+        block_before
+            .iter()
+            .any(|line| line.contains("hit their budget")),
+        "concise names the exhausted row budget: {block_before:?}"
     );
     let (_, jsonl_before) = jsonl_reconstruction(&before.object_observations);
     assert!(!jsonl_before.known.is_empty(), "JSONL carries proved rows");
@@ -16834,9 +16841,15 @@ fn fold_capped_feed_keeps_row_budget_partial_across_last_fold() {
         "concise text stays partial, never hidden: {block_after:?}"
     );
     assert_eq!(
-        key_tally_totals(&block_after),
-        totals_before,
-        "concise keeps exact tally totals: {block_after:?}"
+        key_tally_totals(&block_after).get("sign"),
+        Some(&(1, 0, 0)),
+        "completed stays while the fold settles the departed open active: {block_after:?}"
+    );
+    assert!(
+        block_after
+            .iter()
+            .any(|line| line.contains("hit their budget")),
+        "concise still names the exhausted row budget: {block_after:?}"
     );
     assert!(
         !block_after

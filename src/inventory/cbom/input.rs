@@ -309,6 +309,26 @@ fn arr_of<'a>(value: &'a Value, key: &str) -> Vec<&'a Value> {
         .unwrap_or_default()
 }
 
+fn accumulate_departed_overflow(
+    unknowns: &mut Unknowns,
+    departed: &serde_json::Map<String, Value>,
+) {
+    if let Some(overflow) = departed
+        .get("mechanisms_overflow")
+        .and_then(Value::as_object)
+    {
+        unknowns.departed_mechs_overflow = unknowns
+            .departed_mechs_overflow
+            .saturating_add(overflow.get("mechs").and_then(u64_of).unwrap_or(0));
+        unknowns.departed_mechs_overflow_calls = unknowns
+            .departed_mechs_overflow_calls
+            .saturating_add(overflow.get("calls").and_then(u64_of).unwrap_or(0));
+        unknowns.departed_mechs_overflow_errors = unknowns
+            .departed_mechs_overflow_errors
+            .saturating_add(overflow.get("errors").and_then(u64_of).unwrap_or(0));
+    }
+}
+
 pub(super) fn join_bounded(items: &BTreeSet<String>, limit: usize) -> String {
     let mut parts: Vec<String> = items.iter().take(limit).cloned().collect();
     if items.len() > limit {
@@ -394,6 +414,10 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
     // unioned. A present-but-unreadable aggregate stays unread, like
     // any unknown additive subtree.
     let mut app_departed: BTreeMap<String, u64> = BTreeMap::new();
+    // One caller folds into every module it touched, so the same
+    // caller label repeats across modules; caller labels are never
+    // reused, so first sight counts the incarnation once.
+    let mut seen_departed_callers: BTreeSet<String> = BTreeSet::new();
     for module in arr_of(value, "modules") {
         let Some(departed) = module.get("departed_use").and_then(Value::as_object) else {
             continue;
@@ -416,10 +440,10 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             continue;
         };
         for identity in identities {
-            if identity.get("caller").and_then(str_of).is_none() {
+            let Some(caller) = identity.get("caller").and_then(str_of) else {
                 out.unknowns.callers_skipped += 1;
                 continue;
-            }
+            };
             let path = identity
                 .get("exe")
                 .and_then(|exe| exe.get("path"))
@@ -432,8 +456,10 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             if !app_incarnations.contains_key(path) {
                 app_order.push(path.to_string());
             }
-            *app_incarnations.entry(path.to_string()).or_insert(0) += 1;
-            *app_departed.entry(path.to_string()).or_insert(0) += 1;
+            if seen_departed_callers.insert(caller.to_string()) {
+                *app_incarnations.entry(path.to_string()).or_insert(0) += 1;
+                *app_departed.entry(path.to_string()).or_insert(0) += 1;
+            }
             if let Some(lifecycle) = identity.get("lifecycle").and_then(str_of) {
                 app_lifecycles
                     .entry(path.to_string())
@@ -650,32 +676,29 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
     // bounds have no id to merge under, so their sums stay named
     // unknowns instead.
     for module in arr_of(value, "modules") {
-        let Some(id) = module.get("id").and_then(str_of) else {
-            continue;
-        };
-        let Some(provider) = module_ref.get(id).cloned() else {
-            continue;
-        };
         let Some(departed) = module.get("departed_use").and_then(Value::as_object) else {
             continue;
         };
-        if let Some(overflow) = departed
-            .get("mechanisms_overflow")
-            .and_then(Value::as_object)
-        {
-            out.unknowns.departed_mechs_overflow = out
-                .unknowns
-                .departed_mechs_overflow
-                .saturating_add(overflow.get("mechs").and_then(u64_of).unwrap_or(0));
-            out.unknowns.departed_mechs_overflow_calls = out
-                .unknowns
-                .departed_mechs_overflow_calls
-                .saturating_add(overflow.get("calls").and_then(u64_of).unwrap_or(0));
-            out.unknowns.departed_mechs_overflow_errors = out
-                .unknowns
-                .departed_mechs_overflow_errors
-                .saturating_add(overflow.get("errors").and_then(u64_of).unwrap_or(0));
-        }
+        let Some(provider) = module
+            .get("id")
+            .and_then(str_of)
+            .and_then(|id| module_ref.get(id))
+            .cloned()
+        else {
+            // No usable module id: the aggregate cannot join a
+            // provider, so its overflow sums still accumulate and
+            // its mechanism rows count as dangling instead of
+            // vanishing.
+            accumulate_departed_overflow(&mut out.unknowns, departed);
+            let rows = departed
+                .get("mechanisms")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0) as u64;
+            out.unknowns.dangling_edge_refs = out.unknowns.dangling_edge_refs.saturating_add(rows);
+            continue;
+        };
+        accumulate_departed_overflow(&mut out.unknowns, departed);
         let identities = departed
             .get("identities")
             .and_then(Value::as_array)
@@ -736,7 +759,9 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
         } else {
             None
         };
-        if paths.len() > 1 {
+        // Rows are non-empty past the early continue above, so every
+        // module without a single proven application withholds pairs.
+        if single_app.is_none() {
             out.unknowns.departed_links_withheld += 1;
         }
         for row in rows {

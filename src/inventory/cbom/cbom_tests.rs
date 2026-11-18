@@ -1556,12 +1556,7 @@ fn cbom_folded_caller_at_two_modules_counts_one_incarnation() {
                 departed_use(
                     1,
                     1,
-                    json!([mechanism_row(
-                        4231,
-                        Some("CKM_AES_GCM"),
-                        &["encrypt"],
-                        10,
-                    )]),
+                    json!([mechanism_row(4231, Some("CKM_AES_GCM"), &["encrypt"], 10,)]),
                     vec![departed_identity("c0", Some("/bin/driver"), "exited")],
                     false,
                     0,
@@ -1613,17 +1608,41 @@ fn cbom_departed_single_path_incomplete_withholds_and_counts_linkage() {
     let shapes: Vec<(&str, Value, bool)> = vec![
         (
             "dropped",
-            departed_use(2, 1, row(), vec![named()], false, 1, departed_overflow(0, 0, 0)),
+            departed_use(
+                2,
+                1,
+                row(),
+                vec![named()],
+                false,
+                1,
+                departed_overflow(0, 0, 0),
+            ),
             true,
         ),
         (
             "saturated",
-            departed_use(2, 1, row(), vec![named()], true, 1, departed_overflow(0, 0, 0)),
+            departed_use(
+                2,
+                1,
+                row(),
+                vec![named()],
+                true,
+                1,
+                departed_overflow(0, 0, 0),
+            ),
             true,
         ),
         (
             "mismatch",
-            departed_use(2, 1, row(), vec![named()], false, 0, departed_overflow(0, 0, 0)),
+            departed_use(
+                2,
+                1,
+                row(),
+                vec![named()],
+                false,
+                0,
+                departed_overflow(0, 0, 0),
+            ),
             true,
         ),
         (
@@ -1752,10 +1771,7 @@ fn cbom_departed_rows_without_a_module_id_stay_named_unknowns() {
             departed_overflow(5, 50, 6),
         ),
     );
-    orphan
-        .as_object_mut()
-        .expect("module object")
-        .remove("id");
+    orphan.as_object_mut().expect("module object").remove("id");
     let bytes = inventory_document(vec![], vec![orphan], vec![]);
     let projection = parse_input(&bytes).unwrap();
     // The malformed module counts, and so does its folded content.

@@ -72,6 +72,16 @@ def journal_rows():
     ]
 
 
+def key_sizes_rows():
+    """The journal group with the length pair loaded, as a --key-sizes
+    linked run's probe file holds it (same BTF group, small owned
+    counts)."""
+    return journal_rows() + [
+        load_row("p11_entry_journal_length", processed=150000, btf_id=61),
+        load_row("p11_return_journal_length", processed=100000, btf_id=61),
+    ]
+
+
 LINKED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
@@ -182,6 +192,7 @@ class JournalGateTests(unittest.TestCase):
         rows = journal_rows()
         (self.work / "rows.json").write_text(json.dumps({
             "linked": rows,
+            "linked-key-sizes": key_sizes_rows(),
             "linked-unlatched": rows,
             "linked-idle": rows,
             "linked-oldline": rows,
@@ -205,6 +216,7 @@ class JournalGateTests(unittest.TestCase):
         }))
         (self.work / "texts.json").write_text(json.dumps({
             "linked": {"rc": 0, "text": LINKED_TEXT},
+            "linked-key-sizes": {"rc": 0, "text": LINKED_TEXT},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             # The stop line before it carried a `lost` term: the gate
@@ -271,7 +283,7 @@ class JournalGateTests(unittest.TestCase):
         self.manifest.write_text('{"schema": "owned-test"}\n')
 
     def run_gate(self, *kernels, mode="linked", budgets=None, extra=None,
-                 object_name=None):
+                 object_name=None, key_sizes=None):
         out = self.work / "out"
         out.mkdir()
         env = {**os.environ,
@@ -287,6 +299,8 @@ class JournalGateTests(unittest.TestCase):
             command += ["--budgets", str(budgets)]
         if object_name is not None:
             command += ["--object", object_name]
+        if key_sizes is not None:
+            command += ["--key-sizes", key_sizes]
         command += [str(self.bin / "observer"), str(self.probe),
                     str(self.manifest), str(out), *kernels]
         result = subprocess.run(command, capture_output=True, text=True,
@@ -548,6 +562,59 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         (row,) = self.read_rows(out)
         self.assertIn("unbudgeted", row["detail"])
+
+    def owned_key_sizes_budgets(self):
+        programs = {
+            name.replace("journal/", "journal-gate1/", 1): cells
+            for name, cells in json.loads(
+                self.owned_budgets().read_text())["programs"].items()
+        }
+        programs["journal-gate1/p11_entry_journal_length"] = {
+            KERNEL: 200000}
+        programs["journal-gate1/p11_return_journal_length"] = {
+            KERNEL: 150000}
+        return self.write_budgets(programs)
+
+    def test_key_sizes_run_scores_the_length_pair(self):
+        # The --key-sizes leg passes the flag to the linked command,
+        # requires all four roots, and scores the length pair against
+        # the gate-1 length cells.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("# OVERALL: PASS", result.stdout)
+        argv = self.observer_argv()
+        self.assertIn("--key-sizes", argv)
+        self.assertIn("--key-operations", argv)
+        for root in ("journal-gate1/p11_entry_journal_length",
+                     "journal-gate1/p11_return_journal_length"):
+            self.assertRegex(result.stdout,
+                             rf"{root} \d+ \d+ [\d.]+ \d+ PASS")
+        (row,) = self.read_rows(out)
+        self.assertTrue(row["pass"])
+        self.assertIn("budgeted", row["detail"])
+
+    def test_key_sizes_run_without_length_rows_fails(self):
+        # Non-vacuity: a --key-sizes leg whose probe file lacks the
+        # length pair fails naming both missing roots (the budgeted-
+        # but-missing shape), even though the flag was passed.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("--key-sizes", self.observer_argv())
+        for root in ("journal-gate1/p11_entry_journal_length",
+                     "journal-gate1/p11_return_journal_length"):
+            self.assertIn(f"{root} - - - ", result.stdout)
+        self.assertIn("missing from probe rows", result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
 
     def test_unknown_object_is_a_harness_error(self):
         result, out = self.run_gate(KERNEL, object_name="detailed")

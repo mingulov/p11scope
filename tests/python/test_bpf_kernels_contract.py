@@ -319,6 +319,31 @@ def check_no_tag_triggers(text):
     return problems
 
 
+def check_journal_key_sizes(bpf_text):
+    """Every gate-1 journal leg loads the length pair.
+
+    tests/bpf-verifier-budgets.json carries journal-gate1 length cells
+    for every matrix kernel, and the report fails budgeted-but-missing
+    roots, so each CI journal leg must pass --key-sizes to the driver:
+    without it the length programs never load and their cells fail as
+    missing from probe rows. Returns a problem list, like the other
+    check_* helpers.
+    """
+    joined = re.sub(r"\\\n\s*", " ", bpf_text)
+    calls = [match.group(0) for match in re.finditer(
+        r"scripts/check-bpf-load-journal\.sh\b[^\n]*", joined)]
+    if not calls:
+        return ["bpf-kernels.yml never invokes check-bpf-load-journal.sh"]
+    problems = []
+    for call in calls:
+        if "journal-gate1" not in call:
+            continue
+        if "--key-sizes 1" not in call and "--key-sizes=1" not in call:
+            problems.append("gate-1 journal leg never passes --key-sizes "
+                            "1, so the budgeted length pair never loads")
+    return problems
+
+
 class BpfKernelsContractTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(CI_YML.is_file(), "ci.yml is missing")
@@ -575,6 +600,16 @@ class BpfKernelsContractTests(unittest.TestCase):
                           "this build omits counter objects",
                           "missing counter-mode omission refusal",
                           "check-multi-host-refusal.py"))
+
+    def test_gate1_journal_leg_loads_the_length_pair(self):
+        self.assertEqual([], check_journal_key_sizes(self.bpf))
+
+    def test_journal_key_sizes_check_catches_a_dropped_flag(self):
+        dropped = self.bpf.replace("--key-sizes 1", "--key-sizes 0")
+        self.assertNotEqual(dropped, self.bpf)
+        self.assertIn("gate-1 journal leg never passes --key-sizes 1, "
+                      "so the budgeted length pair never loads",
+                      check_journal_key_sizes(dropped))
 
 
 if __name__ == "__main__":

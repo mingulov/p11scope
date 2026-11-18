@@ -40070,6 +40070,408 @@ fn incomplete_rescan_unions_the_extension_proof() {
 }
 
 #[test]
+fn remapped_legacy_prefix_carries_only_the_fresh_extension_proof() {
+    // A 3.x 68-slot legacy prefix re-decoded at a new address unions with
+    // the retained row (same file offset, version, walk and decoded
+    // content), but the union must never carry layout proof the fresh
+    // decode lacks: the retained mapping's tail evidence (a fully read
+    // tail refuting the wider layouts) says nothing about the fresh
+    // mapping's tail (executable anonymous memory leaves the wider
+    // layouts possible). The fresh decode's verdict wins on a remap; a
+    // same-address re-decode keeps the monotonic union (see
+    // `incomplete_rescan_unions_the_extension_proof`).
+    // Authority legs: a fresh `exact_standard` interface reindexed onto
+    // the union row must not pick up the older layout proof — the merged
+    // table stays count-only — while a fresh proof still grants through
+    // the linkage leg (no under-authority regression). The getter-present
+    // fixture blocks the sole leg, so linkage is the only leg that can
+    // grant here.
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let entries = || {
+        pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .enumerate()
+            .map(|(index, field)| ScannedEntry {
+                name: field.name,
+                object: key,
+                object_path: "/opt/p.so".into(),
+                file_offset: 0x1000 + (index as u64) * 8,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(entries().len(), 68);
+    let table = |address: u64, extension_impossible: bool| ScannedTable {
+        version: (3, 2),
+        walk: "known_prefix",
+        entries: entries(),
+        null_entries: vec![],
+        unpinned: vec![],
+        address,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible,
+    };
+    let interface = || ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table: Some(0),
+    };
+    let module = |tables: Vec<ScannedTable>, interfaces: Vec<ScannedInterface>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key,
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces,
+    };
+    let authority_of = |scanned: &ScannedModule| {
+        let object = PinnedObjectId(42);
+        let reconciled = ReconciledModule {
+            scanned: scanned.clone(),
+            object,
+            entry_objects: scanned
+                .tables
+                .iter()
+                .map(|table| vec![object; table.entries.len()])
+                .collect(),
+            forward_verified: scanned
+                .tables
+                .iter()
+                .map(|table| vec![false; table.entries.len()])
+                .collect(),
+            exports: std::sync::Arc::from(vec![("C_GetFunctionList".to_string(), 0x1000u64)]),
+            getter_present: true,
+            witness_fault: false,
+        };
+        plan::build_from_sources(
+            std::slice::from_ref(&reconciled),
+            &[],
+            &PinnedObjects::empty(),
+        )
+    };
+    // An older proof must not survive a remap onto a fresh unproven
+    // decode: the union row sits at the fresh address with the fresh
+    // verdict, and the fresh interface lands on it.
+    let mut unproven = vec![module(vec![table(0x1000, true)], vec![])];
+    merge_scanned_module(
+        &mut unproven,
+        module(vec![table(0x2000, false)], vec![interface()]),
+    );
+    assert_eq!(unproven.len(), 1, "same module unions, not twins");
+    assert_eq!(
+        unproven[0].tables.len(),
+        1,
+        "same table at a new address unions, not rivals"
+    );
+    assert_eq!(unproven[0].tables[0].address, 0x2000);
+    assert!(
+        !unproven[0].tables[0].extension_impossible,
+        "a remap union never carries proof the fresh decode lacks"
+    );
+    assert!(
+        unproven[0].tables_scan_finished,
+        "a same-table re-decode preserves the finished scan"
+    );
+    assert_eq!(unproven[0].interfaces.len(), 1);
+    assert_eq!(
+        unproven[0].interfaces[0].table,
+        Some(0),
+        "the fresh interface lands on the union row"
+    );
+    let refused = authority_of(&unproven[0]);
+    assert!(
+        refused.slots.iter().all(|slot| !slot.semantic_authorized),
+        "a fresh interface does not pick up the older layout proof"
+    );
+    assert!(
+        refused.standard_layout_evidence().is_empty(),
+        "no leg grants on an unproven remapped prefix"
+    );
+    assert!(
+        refused
+            .slots
+            .iter()
+            .all(|slot| slot.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY),
+        "the unproven remapped prefix stays count-only"
+    );
+    // The symmetric direction: a fresh proof is honored, not ANDed away.
+    let mut proven = vec![module(vec![table(0x1000, false)], vec![])];
+    merge_scanned_module(
+        &mut proven,
+        module(vec![table(0x2000, true)], vec![interface()]),
+    );
+    assert_eq!(
+        proven[0].tables.len(),
+        1,
+        "same table at a new address unions, not rivals"
+    );
+    assert!(
+        proven[0].tables[0].extension_impossible,
+        "a remap union honors the fresh decode's proof"
+    );
+    let granted = authority_of(&proven[0]);
+    assert_eq!(granted.slots.len(), 68);
+    assert!(
+        granted.slots.iter().all(|slot| slot.semantic_authorized),
+        "a freshly proven prefix grants through interface linkage"
+    );
+    assert_eq!(
+        granted.standard_layout_evidence(),
+        ["interface linkage"],
+        "the recorded basis is the linkage leg — the only leg that can grant here"
+    );
+}
+
+#[test]
+fn remap_match_yields_to_the_exact_live_match() {
+    // A retained static row must not be rewritten onto a fresh address
+    // when an exact live row already sits there: the fresh static
+    // re-decode merges into its exact (address-equal, content-equal)
+    // live sibling — live flags are observations, not identity — and the
+    // older static row stays where the scan found it. Without the
+    // exact-first order the merge rewrites the static row onto the live
+    // address, leaving two rows at one address and shadowing the live
+    // match (the address-based fallback binder refuses ambiguous
+    // addresses outright).
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let table = |address: u64, live_return: bool| ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_GetSlotList",
+            object: key,
+            object_path: "/opt/p.so".into(),
+            file_offset: 0x100,
+        }],
+        null_entries: vec![],
+        unpinned: vec![],
+        address,
+        file_offset: Some(0),
+        live_return,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |finished: bool,
+                  tables: Vec<ScannedTable>,
+                  interfaces: Vec<ScannedInterface>| {
+        ScannedModule {
+            key_is_identity: false,
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: None,
+            view: ProcessViewId(0),
+            mount_namespace: crate::process::MountNamespaceId {
+                device: 1,
+                inode: 2,
+            },
+            key,
+            path: "/opt/p.so".into(),
+            tables_scan_finished: finished,
+            decoder_abi: None,
+            exports: vec![],
+            tables,
+            interfaces,
+        }
+    };
+    // Retained static A, then a live observation B of the same content
+    // at another address: the live row twins, as observations always do.
+    let mut merged = vec![module(true, vec![table(0x1000, false)], vec![])];
+    merge_scanned_module(&mut merged, module(false, vec![table(0x2000, true)], vec![]));
+    assert_eq!(merged[0].tables.len(), 2, "the live row twins");
+    // A fresh static re-decode at the live address merges into its exact
+    // live sibling — it must not rewrite the older static row onto it.
+    merge_scanned_module(
+        &mut merged,
+        module(
+            true,
+            vec![table(0x2000, false)],
+            vec![ScannedInterface {
+                index: 0,
+                name_class: "exact_standard",
+                name_lossy: None,
+                name_private: None,
+                flags: 0,
+                table: Some(0),
+            }],
+        ),
+    );
+    assert_eq!(
+        merged[0]
+            .tables
+            .iter()
+            .map(|table| (table.address, table.live_return))
+            .collect::<Vec<_>>(),
+        [(0x1000, false), (0x2000, true)],
+        "the static row stays put while the fresh decode joins its exact live match"
+    );
+    assert_eq!(merged[0].interfaces.len(), 1);
+    assert_eq!(
+        merged[0].interfaces[0].table,
+        Some(1),
+        "the fresh interface follows the exact live match, not the static row"
+    );
+    assert!(
+        merged[0].tables_scan_finished,
+        "an exact-match union preserves the finished scan"
+    );
+}
+
+#[test]
+fn same_table_redecode_refuses_version_walk_and_hole_mismatches() {
+    // The remap union is keyed on the full normalized record: version,
+    // walk, decoded entries, NULL holes and moved-aside records must all
+    // agree — anything less is a rival (torn read, changed file, or a
+    // genuinely different table), never a silent union. Live rows never
+    // take the address-insensitive match in either direction: a live
+    // observation twins with a static row at another address.
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let entry = ScannedEntry {
+        name: "C_GetSlotList",
+        object: key,
+        object_path: "/opt/p.so".into(),
+        file_offset: 0x100,
+    };
+    let table = || ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![entry.clone()],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x1000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |table: ScannedTable| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key,
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![table],
+        interfaces: vec![],
+    };
+    let rival = |mutate: &dyn Fn(&mut ScannedTable)| {
+        let mut merged = vec![module(table())];
+        let mut incoming = table();
+        incoming.address = 0x2000;
+        mutate(&mut incoming);
+        merge_scanned_module(&mut merged, module(incoming));
+        merged
+    };
+    let version: &dyn Fn(&mut ScannedTable) = &|incoming| incoming.version = (3, 0);
+    let merged = rival(version);
+    assert_eq!(
+        merged[0].tables.len(),
+        2,
+        "a version mismatch stays rival twins"
+    );
+    assert!(
+        !merged[0].tables_scan_finished,
+        "a version rival still re-opens finished-ness"
+    );
+    let walk: &dyn Fn(&mut ScannedTable) = &|incoming| incoming.walk = "known_prefix";
+    let merged = rival(walk);
+    assert_eq!(merged[0].tables.len(), 2, "a walk mismatch stays rival twins");
+    assert!(
+        !merged[0].tables_scan_finished,
+        "a walk rival still re-opens finished-ness"
+    );
+    let holes: &dyn Fn(&mut ScannedTable) =
+        &|incoming| incoming.null_entries = vec!["C_GetTokenInfo"];
+    let merged = rival(holes);
+    assert_eq!(
+        merged[0].tables.len(),
+        2,
+        "a NULL-hole mismatch stays rival twins"
+    );
+    assert!(
+        !merged[0].tables_scan_finished,
+        "a hole rival still re-opens finished-ness"
+    );
+    let moved_aside: &dyn Fn(&mut ScannedTable) = &|incoming| {
+        incoming.unpinned = vec![Skipped {
+            subject: "C_GetSlotList".into(),
+            reason: "moved aside".into(),
+        }]
+    };
+    let merged = rival(moved_aside);
+    assert_eq!(
+        merged[0].tables.len(),
+        2,
+        "a moved-aside mismatch stays rival twins"
+    );
+    assert!(
+        !merged[0].tables_scan_finished,
+        "a moved-aside rival still re-opens finished-ness"
+    );
+    // Live rows never take the address-insensitive match, in either
+    // direction: both shapes twin.
+    let mut merged = vec![module({
+        let mut retained = table();
+        retained.live_return = true;
+        retained
+    })];
+    let mut incoming = table();
+    incoming.address = 0x2000;
+    merge_scanned_module(&mut merged, module(incoming));
+    assert_eq!(
+        merged[0].tables.len(),
+        2,
+        "a live retained row never takes a static re-decode"
+    );
+    let mut merged = vec![module(table())];
+    let mut incoming = table();
+    incoming.address = 0x2000;
+    incoming.live_return = true;
+    merge_scanned_module(&mut merged, module(incoming));
+    assert_eq!(
+        merged[0].tables.len(),
+        2,
+        "a live incoming row never merges into a static row elsewhere"
+    );
+}
+
+#[test]
 fn incomplete_rescan_preserves_highest_load_count() {
     // The count analog of the boolean union above: a retained 3
     // survives an incoming 1 (a partial pass is not fresh evidence

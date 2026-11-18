@@ -1233,6 +1233,11 @@ pub struct Engine {
     learned_unlink_before_pin_for_test: Option<std::path::PathBuf>,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
+    /// Test-only: teardown-deferral budget remaining observed by the last
+    /// loader-arm `after_scan` probe, so the batch-entry reset twin pins
+    /// what the loader phase saw without a real teardown wait.
+    #[cfg(test)]
+    loader_arm_scan_teardown_remaining_for_test: Option<std::time::Duration>,
     /// Test-only one-shot: force the next record-path loader scan to
     /// report incomplete, pinning the `found_complete` plumbing from
     /// the record-path scan to the loader-timing classifier.
@@ -14097,6 +14102,8 @@ impl Engine {
             learned_unlink_before_pin_for_test: None,
             #[cfg(test)]
             loader_arm_scan_after_scan: None,
+            #[cfg(test)]
+            loader_arm_scan_teardown_remaining_for_test: None,
             #[cfg(test)]
             loader_force_record_scan_incomplete: false,
             #[cfg(test)]

@@ -93591,3 +93591,37 @@ fn rebuild_discovered_refuses_uncorroborated_entries_in_every_scope() {
         );
     }
 }
+
+/// A loader scan in a new batch gets a fresh teardown-deferral budget
+/// even when the previous tick spent it: the batch entry resets before
+/// the loader phase, not only the inventory tick after it. The probe
+/// snapshots what the loader-arm catch-up scan saw; the fixture child
+/// stays alive, so no real teardown wait runs and the snapshot is exact.
+#[test]
+fn loader_scan_after_spent_tick_gets_fresh_teardown_budget() {
+    use std::time::Duration;
+    let (_fixture, mut engine, mut session, _key) = loader_arm_catchup_route();
+    // Simulate the previous tick's spent budget.
+    engine.teardown_deferral = TeardownDeferralBudget::with_remaining(Duration::ZERO);
+    let before = engine.loader_memory_scan_attempts;
+    engine.loader_arm_scan_after_scan = Some(|engine| {
+        engine.loader_arm_scan_teardown_remaining_for_test =
+            Some(engine.teardown_deferral.remaining());
+    });
+    engine
+        .with_live_frame(|engine| apply_ordinary_batch(engine, &mut session, Vec::new()))
+        .unwrap();
+    assert_eq!(
+        engine.loader_memory_scan_attempts,
+        before + 1,
+        "the batch ran the loader-arm catch-up scan"
+    );
+    let seen = engine
+        .loader_arm_scan_teardown_remaining_for_test
+        .expect("the probe ran at the loader scan");
+    assert_eq!(
+        seen,
+        TeardownDeferralBudget::new().remaining(),
+        "the loader scan sees a fresh budget, not the spent tick's"
+    );
+}

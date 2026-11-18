@@ -1198,6 +1198,41 @@ impl SemanticBindingSet {
         removed.into_iter().collect()
     }
 
+    /// Whether a proven-ended caller may release its semantic state at
+    /// the fold: no sealed gap still awaits the normal finalizer. A
+    /// pending gap pins the row (the fold defers one pass); anything
+    /// else about a folded caller is dead state whose removal strands
+    /// nothing: handoffs already moved (a held handoff pins the row
+    /// through `pending_successors`), successor reservations for a
+    /// dead destination refuse late receipts either way, and the gone
+    /// adapter record refuses late re-proof on its own.
+    pub(crate) fn foldable(&self, caller: CallerId) -> bool {
+        self.admission_images
+            .get(&caller)
+            .is_none_or(|history| history.pending_gap.is_none())
+    }
+
+    /// Release one folded caller's semantic binding, accepted-scan
+    /// history and successor reservations, dropping their pidfd
+    /// custody so the semantic budget recycles with the caller slots.
+    /// Call only after [`Self::foldable`] (a retained sealed gap must
+    /// drain first) and after the adapter row is forgotten (late rows
+    /// then fail closed on the gone record).
+    pub(crate) fn release_folded_caller(&mut self, caller: CallerId) {
+        if let Some(at) = self.index.remove(&caller) {
+            self.bindings.swap_remove(at);
+            if let Some(moved) = self.bindings.get(at) {
+                self.index.insert(moved.caller(), at);
+            }
+            self.cursor = self.cursor.min(self.bindings.len());
+            if self.refresh_cursor.is_some_and(|(held, _)| held == caller) {
+                self.refresh_cursor = None;
+            }
+        }
+        self.admission_images.remove(&caller);
+        self.release_successor(caller);
+    }
+
     /// Accepted semantic bindings. The disclosure gap reports how many
     /// bindings existed when calls shed without a route.
     pub(crate) fn len(&self) -> usize {
@@ -8017,10 +8052,7 @@ mod promotion_lifecycle_tests {
             "only the healthy join holds a binding"
         );
         assert!(
-            coordinator
-                .semantic_bindings
-                .admission_images
-                .is_empty(),
+            coordinator.semantic_bindings.admission_images.is_empty(),
             "folded histories leave the table: {} retained",
             coordinator.semantic_bindings.admission_images.len()
         );

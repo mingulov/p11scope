@@ -12379,3 +12379,257 @@ mod census_tests {
         );
     }
 }
+
+/// `bind_collection` (the `inventory --system`/`--pid`/`--cgroup` bind)
+/// must refuse uncorroborated non-function-entry offsets exactly like the
+/// engine candidate bind: a table-shaped decode with no live return and no
+/// manifest agreement proves every entry or the entry is refused with a
+/// named gap, never attached at a mid-instruction offset.
+#[cfg(test)]
+mod bind_collection_strict_tests {
+    use super::*;
+    use crate::discovery::identity::{pin_scanned_view_objects, test_fixture};
+    use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+    /// A real pinned object (the small owned fixture), its pin set, its id
+    /// in that set, and its executable file ranges.
+    fn pinned_fixture() -> (
+        ScannedModule,
+        PinnedObjects,
+        PinnedObjectId,
+        Vec<(u64, u64)>,
+    ) {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let module = test_fixture::small_owned_module(&view);
+        let mut budget = CaptureWorkBudget::default();
+        let (pins, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let object = pins
+            .id_for_scanned(&module, module.key, &module.path)
+            .expect("the fixture pin resolves");
+        let file = p11scope_manifest::identity::open_object(std::path::Path::new(&module.path))
+            .expect("the fixture opens");
+        let inspected =
+            p11scope_manifest::identity::inspect_file(&file).expect("the fixture inspects");
+        (module, pins, object, inspected.executable_ranges)
+    }
+
+    fn decoded_table(entries: Vec<ScannedEntry>) -> ScannedTable {
+        ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries,
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000,
+            file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        }
+    }
+
+    fn collection_with(
+        pid: u32,
+        view: ProcessViewId,
+        module: ScannedModule,
+        pins: PinnedObjects,
+    ) -> Collection {
+        let member = MemberResult {
+            pid,
+            view,
+            status: MemberStatus::Scanned,
+            generation: None,
+            complete_scan: Some(CompleteMemberScan::scripted(
+                MemberGeneration {
+                    start_time: None,
+                    exe: None,
+                },
+                0,
+                1,
+            )),
+            application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+            mapping_scan_completed: true,
+            hints_examined: true,
+            modules: vec![module],
+            examined: vec![],
+            pins,
+            gaps: vec![],
+            scan_ms: 0,
+        };
+        Collection {
+            enumerated: vec![pid],
+            selected: vec![pid],
+            cap: 1,
+            cap_hit: false,
+            members: vec![member],
+            scope_gaps: vec![],
+            proc_list_failed: false,
+            sweep: vec![],
+            sweep_unavailable: BTreeSet::new(),
+            budget: CaptureWorkBudget::default(),
+            digests: BTreeMap::new(),
+            generations: BTreeMap::new(),
+        }
+    }
+
+    /// An executable offset the pin proves nothing about: inside a `PF_X`
+    /// range (the crash shape — a uprobe planted here runs mid-instruction)
+    /// but in neither proof list.
+    fn unproven_executable_offset(
+        pins: &PinnedObjects,
+        object: PinnedObjectId,
+        executable: &[(u64, u64)],
+    ) -> u64 {
+        let exports = pins.exports_for(object);
+        let starts = pins.function_starts_for(object);
+        let (start, end) = executable
+            .iter()
+            .max_by_key(|(start, end)| end - start)
+            .copied()
+            .expect("the fixture has an executable range");
+        ((start + 1)..end)
+            .find(|offset| {
+                !exports.iter().any(|(_, proven)| proven == offset)
+                    && starts.binary_search(offset).is_err()
+            })
+            .expect("an unproven executable offset exists")
+    }
+
+    #[test]
+    fn bind_collection_refuses_uncorroborated_non_entry_offsets() {
+        let (mut module, pins, object, executable) = pinned_fixture();
+        let dangling = unproven_executable_offset(&pins, object, &executable);
+        module.tables = vec![decoded_table(vec![ScannedEntry {
+            name: "C_Initialize",
+            object: module.key,
+            object_path: module.path.clone(),
+            file_offset: dangling,
+        }])];
+        let pid = std::process::id();
+        let mut collection = collection_with(pid, module.view, module, pins);
+
+        let bound = bind_collection(&mut collection);
+
+        // The module reconciles (its identity held) but the unproven
+        // entry is gone from the bound tables.
+        assert_eq!(bound.reconciled.len(), 1, "the module identity held");
+        let tables = &bound.reconciled[0].2.scanned.tables;
+        assert_eq!(tables.len(), 1);
+        assert!(
+            tables[0].entries.is_empty(),
+            "the uncorroborated non-entry offset must not bind: {:?}",
+            tables[0].entries
+        );
+        // The refusal is a named gap, never silence: the bind gap, the
+        // table-level record, and the lost complete scan (partial catalog).
+        assert_eq!(
+            bound.bind_gaps.len(),
+            1,
+            "one named gap: {:?}",
+            bound.bind_gaps
+        );
+        let gap = &bound.bind_gaps[0];
+        assert_eq!(gap.pid, Some(pid));
+        assert_eq!(gap.subject, "C_Initialize");
+        assert!(
+            gap.reason.contains("not a proven function entry")
+                && gap.reason.contains("not attached"),
+            "the gap names the check and the outcome: {}",
+            gap.reason
+        );
+        assert_eq!(tables[0].unpinned.len(), 1);
+        assert!(
+            collection.members[0].complete_scan.is_none(),
+            "the refused member loses its complete scan"
+        );
+    }
+
+    #[test]
+    fn bind_collection_binds_corroborated_tables_without_entry_proof() {
+        let (mut module, pins, object, executable) = pinned_fixture();
+        let offset = unproven_executable_offset(&pins, object, &executable);
+        let mut table = decoded_table(vec![ScannedEntry {
+            name: "C_Initialize",
+            object: module.key,
+            object_path: module.path.clone(),
+            file_offset: offset,
+        }]);
+        // A live provider return vouches for these slots, so no
+        // function-entry proof is required.
+        table.live_return = true;
+        module.tables = vec![table];
+        let pid = std::process::id();
+        let mut collection = collection_with(pid, module.view, module, pins);
+
+        let bound = bind_collection(&mut collection);
+
+        assert_eq!(bound.reconciled.len(), 1);
+        let entries = &bound.reconciled[0].2.scanned.tables[0].entries;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the corroborated entry binds: {entries:?}"
+        );
+        assert!(bound.bind_gaps.is_empty(), "{:?}", bound.bind_gaps);
+        assert!(collection.members[0].complete_scan.is_some());
+    }
+
+    #[test]
+    fn bind_collection_binds_proven_function_entries_on_uncorroborated_tables() {
+        let (mut module, pins, object, _) = pinned_fixture();
+        let starts = pins.function_starts_for(object);
+        assert!(
+            !starts.is_empty(),
+            "the fixture must carry function-start proofs or the check is vacuous"
+        );
+        module.tables = vec![decoded_table(vec![ScannedEntry {
+            name: "C_Initialize",
+            object: module.key,
+            object_path: module.path.clone(),
+            file_offset: starts[0],
+        }])];
+        let pid = std::process::id();
+        let mut collection = collection_with(pid, module.view, module, pins);
+
+        let bound = bind_collection(&mut collection);
+
+        assert_eq!(bound.reconciled.len(), 1);
+        let entries = &bound.reconciled[0].2.scanned.tables[0].entries;
+        assert_eq!(entries.len(), 1, "the proven entry binds: {entries:?}");
+        assert!(bound.bind_gaps.is_empty(), "{:?}", bound.bind_gaps);
+        assert!(collection.members[0].complete_scan.is_some());
+    }
+
+    #[test]
+    fn bind_collection_entry_proofs_come_from_executable_segments() {
+        let (_module, pins, object, executable) = pinned_fixture();
+        assert!(
+            !executable.is_empty(),
+            "the fixture must have executable ranges or the check is vacuous"
+        );
+        let inside = |offset: u64| {
+            executable
+                .iter()
+                .any(|(start, end)| *start <= offset && offset < *end)
+        };
+        for (name, offset) in pins.exports_for(object).iter() {
+            assert!(
+                inside(*offset),
+                "export proof {name} outside every executable segment: {offset:#x}"
+            );
+        }
+        let starts = pins.function_starts_for(object);
+        assert!(
+            !starts.is_empty(),
+            "the fixture must carry function-start proofs or the check is vacuous"
+        );
+        for offset in starts.iter() {
+            assert!(
+                inside(*offset),
+                "function-start proof outside every executable segment: {offset:#x}"
+            );
+        }
+    }
+}

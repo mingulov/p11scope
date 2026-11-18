@@ -95,6 +95,20 @@ pub(super) struct Provider {
     pub bom_ref: String,
 }
 
+/// Dedup key for Task 7 token devices: one device per (module,
+/// slot, token identity).
+type TokenIdentityKey = (
+    String,
+    u64,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+);
+
 /// One Task 7 per-(module, caller, slot) token row: manufacturer,
 /// model, versions, flags and PIN lengths. Serials, labels, session
 /// counts, memory sizes and clock readings never reach this struct
@@ -589,17 +603,7 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
         // reporting the same token share it, while a conflicting
         // identity on the same slot keeps its own device (slot ids
         // are per-process).
-        let mut seen_tokens: BTreeSet<(
-            String,
-            u64,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            u64,
-            u64,
-            u64,
-        )> = BTreeSet::new();
+        let mut seen_tokens: BTreeSet<TokenIdentityKey> = BTreeSet::new();
         for row in arr_of(section, "tokens") {
             let (Some(module), Some(caller)) = (
                 row.get("module").and_then(str_of),

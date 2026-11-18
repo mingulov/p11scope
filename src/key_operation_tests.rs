@@ -27180,6 +27180,21 @@ impl KeymetaCtx {
         }
     }
 
+    /// A context with an injected aggregate/park bound: parking and
+    /// proving share the production capacity shape at a tight size,
+    /// so a refused park that consumed a slot would surface as a
+    /// capacity refusal or a missing proved row.
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            edge: EdgeSemantics::default(),
+            sink: Vec::new(),
+            keyuse: KeyUseReducer::with_capacity(capacity),
+            ledger: StagingLedger::new(),
+            instance:
+                crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3),
+        }
+    }
+
     /// Harvest `count` REAL object ids by driving creates through a
     /// scene (H9 never mints ids from integers).
     fn object_ids(count: usize) -> Vec<ObjectId> {
@@ -28648,41 +28663,75 @@ fn keymeta_flag_off_drops_wrapped_parks() {
     assert_eq!(inferred.size.completions, 0);
 }
 
-/// An unusable-association AES-KW wrap parks only admitted material:
-/// a wrap output above the admission bound (8200) parks nothing, so
-/// the wrapped view's first proved row carries no parked size and no
-/// park slot is consumed; the admitted bound (8199) parks and
-/// forward-fills with its wrap tag. A refused park never blocks a
-/// later admitted park for the same view (first park wins applies to
-/// admitted parks only).
+/// An unusable-association AES-KW wrap parks only admitted material,
+/// end to end: under a tight three-slot budget (one wrapping row plus
+/// two first uses) an above-bound wrap output (8200) for view A parks
+/// nothing, admitted bound outputs (8199) for B, C and D fill the
+/// three park slots, and a fifth admitted output for E refuses with
+/// the named gap — proving A consumed no slot and B holds one. Each
+/// first proved row then publishes: A carries no size, B carries the
+/// exact wrapped-material scalars with its wrap tag. A refused park
+/// never blocks a later admitted park for the same view (first park
+/// wins applies to admitted parks only).
 #[test]
 fn keymeta_wrap_park_refuses_above_bound_material() {
+    use crate::key_operation_projection::key_row_json;
+    use crate::key_operation_projection::producer::commit;
     use crate::keymeta::WRAPPED_MATERIAL_MAX;
-    // Above the bound: 8200 refuses on the direct path, so the park
-    // route must refuse it too.
-    let ids = KeymetaCtx::object_ids(2);
-    let mut ctx = KeymetaCtx::new();
-    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
-    let mut wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
-    wrapped.attribution_valid = false;
-    ctx.direct(
-        "C_WrapKey",
-        7,
-        Some(0x2109),
-        &[wrapping, wrapped],
-        100,
-        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
-        None,
-    )
-    .expect("wrap completes");
+    let ids = KeymetaCtx::object_ids(6);
+    let mut ctx = KeymetaCtx::with_capacity(3);
+    let above = WRAPPED_MATERIAL_MAX + 9;
+    let bound = WRAPPED_MATERIAL_MAX + 8;
+    // A above the bound, then admitted B/C/D/E: only E refuses, the
+    // positive capacity control (a slot-eating refusal would refuse D
+    // too and count two).
+    for (view, length) in [
+        (ids[1], above),
+        (ids[2], bound),
+        (ids[3], bound),
+        (ids[4], bound),
+        (ids[5], bound),
+    ] {
+        let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+        let mut wrapped = KeymetaCtx::receipt(view, "C_WrapKey", 1, KeyRole::WrappedKey, None);
+        wrapped.attribution_valid = false;
+        ctx.direct(
+            "C_WrapKey",
+            7,
+            Some(0x2109),
+            &[wrapping, wrapped],
+            100,
+            Some(LengthOutcome::Value(length)),
+            None,
+        )
+        .expect("wrap completes");
+    }
     assert_eq!(
         ctx.keyuse.key_use_evidence().parked_refused,
-        0,
-        "an admission refusal is silent, never a capacity refusal"
+        1,
+        "only the fifth park refuses: A parked nothing, B holds a slot"
     );
-    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
-    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
-    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    // First proved uses: A carries no parked size, B carries the
+    // admitted park with its wrap tag.
+    for (n, view) in [ids[1], ids[2]].into_iter().enumerate() {
+        let receipt = KeymetaCtx::receipt(view, "C_EncryptInit", 0, KeyRole::OperationKey, None);
+        ctx.start(
+            "C_EncryptInit",
+            7,
+            Some(0x1082),
+            &[receipt],
+            200 + n as u64 * 200,
+        );
+        ctx.end(
+            "C_Encrypt",
+            7,
+            CkRv::OK.0,
+            op_capture(),
+            300 + n as u64 * 200,
+            None,
+            None,
+        );
+    }
     let inferred = ctx
         .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
         .expect("the first row exists");
@@ -28695,27 +28744,8 @@ fn keymeta_wrap_park_refuses_above_bound_material() {
         inferred.size.reason,
         Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
     );
-    // On the bound: 8199 parks and forward-fills with its wrap tag.
-    let ids = KeymetaCtx::object_ids(2);
-    let mut ctx = KeymetaCtx::new();
-    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
-    let mut wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
-    wrapped.attribution_valid = false;
-    ctx.direct(
-        "C_WrapKey",
-        7,
-        Some(0x2109),
-        &[wrapping, wrapped],
-        100,
-        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 8)),
-        None,
-    )
-    .expect("wrap completes");
-    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
-    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
-    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
     let inferred = ctx
-        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .inference(ids[2].as_u64(), "encrypt", "key", "unknown")
         .expect("the first row carries the park");
     assert_eq!(
         inferred.size.detail,
@@ -28728,8 +28758,50 @@ fn keymeta_wrap_park_refuses_above_bound_material() {
         ))
     );
     assert_eq!(inferred.size.completions, 1);
-    // A refused park occupies no slot: an admitted wrap for the same
-    // view parks after the refusal and forward-fills.
+    // The published section carries both first rows at version 7: A
+    // with no size, B with the exact wrapped-material scalars and its
+    // wrap tag, and the capacity refusal beside them as a named gap.
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(section["version"], 7);
+    let rendered = |object: u64| {
+        let row = committed
+            .key_operations
+            .iter()
+            .find(|row| row.object == object && row.category == "encrypt")
+            .unwrap_or_else(|| panic!("view {object} publishes its first row"));
+        key_row_json(row)
+    };
+    assert_eq!(
+        rendered(ids[1].as_u64())["inferred_size"]["status"],
+        "unknown"
+    );
+    assert!(
+        rendered(ids[1].as_u64())["inferred_size"]["detail"].is_null(),
+        "A publishes no parked size"
+    );
+    assert_eq!(
+        rendered(ids[2].as_u64())["inferred_size"],
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "wrapped_material",
+                       "material_octets": WRAPPED_MATERIAL_MAX,
+                       "octets": WRAPPED_MATERIAL_MAX + 8,
+                       "evidence": "wrap_output", "about": "wrapped"},
+            "completions": 1
+        })
+    );
+    let gap = committed
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "wrapped_park_refused")
+        .expect("the capacity refusal publishes as a named gap");
+    assert_eq!(gap.repeats, 1);
+    // A refused park occupies no slot for the same view either: an
+    // admitted wrap after the refusal parks and forward-fills.
     let ids = KeymetaCtx::object_ids(2);
     let mut ctx = KeymetaCtx::new();
     for length in [WRAPPED_MATERIAL_MAX + 9, WRAPPED_MATERIAL_MAX + 8] {
@@ -28766,37 +28838,78 @@ fn keymeta_wrap_park_refuses_above_bound_material() {
     );
 }
 
-/// A fresh-view AES-KW unwrap parks only admitted material: an
-/// unwrap input above the admission bound (8200) parks nothing, so
-/// the fresh view's first proved row carries no parked size and no
-/// park slot is consumed; the admitted bound (8199) parks and
-/// forward-fills with its unwrap tag.
+/// A fresh-view AES-KW unwrap parks only admitted material, end to
+/// end: under a tight three-slot budget (one unwrapping row plus two
+/// first uses) an above-bound unwrap input (8200) for fresh view A
+/// parks nothing, admitted bound inputs (8199) for fresh views B, C
+/// and D fill the three park slots, and a fifth admitted input for E
+/// refuses with the named gap — proving A consumed no slot and B
+/// holds one. Every unwrap allocates its own fresh-view id, as the
+/// production seam does. Each first proved row then publishes: A
+/// carries no size, B carries the exact wrapped-material scalars with
+/// its unwrap tag.
 #[test]
 fn keymeta_unwrap_park_refuses_above_bound_material() {
+    use crate::key_operation_projection::key_row_json;
+    use crate::key_operation_projection::producer::commit;
     use crate::keymeta::WRAPPED_MATERIAL_MAX;
-    // Above the bound: 8200 refuses on the direct path, so U1 must
-    // refuse it too.
-    let ids = KeymetaCtx::object_ids(2);
-    let mut ctx = KeymetaCtx::new();
-    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
-    ctx.direct(
-        "C_UnwrapKey",
-        7,
-        Some(0x2109),
-        &[unwrapping],
-        100,
-        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
-        Some(ids[1].as_u64()),
-    )
-    .expect("unwrap completes");
+    let ids = KeymetaCtx::object_ids(6);
+    let mut ctx = KeymetaCtx::with_capacity(3);
+    let above = WRAPPED_MATERIAL_MAX + 9;
+    let bound = WRAPPED_MATERIAL_MAX + 8;
+    // A above the bound, then admitted B/C/D/E, each unwrap minting
+    // its own fresh view: only E refuses, the positive capacity
+    // control (a slot-eating refusal would refuse D too and count
+    // two).
+    for (n, (view, length)) in [
+        (ids[1], above),
+        (ids[2], bound),
+        (ids[3], bound),
+        (ids[4], bound),
+        (ids[5], bound),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let unwrapping =
+            KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+        ctx.direct(
+            "C_UnwrapKey",
+            7,
+            Some(0x2109),
+            &[unwrapping],
+            100 + n as u64 * 100,
+            Some(LengthOutcome::Value(length)),
+            Some(view.as_u64()),
+        )
+        .expect("unwrap completes");
+    }
     assert_eq!(
         ctx.keyuse.key_use_evidence().parked_refused,
-        0,
-        "an admission refusal is silent, never a capacity refusal"
+        1,
+        "only the fifth park refuses: A parked nothing, B holds a slot"
     );
-    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
-    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
-    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    // First proved uses: A carries no parked size, B carries the
+    // admitted park with its unwrap tag.
+    for (n, view) in [ids[1], ids[2]].into_iter().enumerate() {
+        let receipt = KeymetaCtx::receipt(view, "C_EncryptInit", 0, KeyRole::OperationKey, None);
+        ctx.start(
+            "C_EncryptInit",
+            7,
+            Some(0x1082),
+            &[receipt],
+            700 + n as u64 * 200,
+        );
+        ctx.end(
+            "C_Encrypt",
+            7,
+            CkRv::OK.0,
+            op_capture(),
+            800 + n as u64 * 200,
+            None,
+            None,
+        );
+    }
     let inferred = ctx
         .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
         .expect("the first row exists");
@@ -28809,25 +28922,8 @@ fn keymeta_unwrap_park_refuses_above_bound_material() {
         inferred.size.reason,
         Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
     );
-    // On the bound: 8199 parks and forward-fills with its unwrap tag.
-    let ids = KeymetaCtx::object_ids(2);
-    let mut ctx = KeymetaCtx::new();
-    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
-    ctx.direct(
-        "C_UnwrapKey",
-        7,
-        Some(0x2109),
-        &[unwrapping],
-        100,
-        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 8)),
-        Some(ids[1].as_u64()),
-    )
-    .expect("unwrap completes");
-    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
-    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
-    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
     let inferred = ctx
-        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .inference(ids[2].as_u64(), "encrypt", "key", "unknown")
         .expect("the first row carries the park");
     assert_eq!(
         inferred.size.detail,
@@ -28840,54 +28936,106 @@ fn keymeta_unwrap_park_refuses_above_bound_material() {
         ))
     );
     assert_eq!(inferred.size.completions, 1);
-    // A refused park occupies no slot: an admitted unwrap for the
-    // same view parks after the refusal and forward-fills.
-    let ids = KeymetaCtx::object_ids(2);
-    let mut ctx = KeymetaCtx::new();
-    for (n, length) in [WRAPPED_MATERIAL_MAX + 9, WRAPPED_MATERIAL_MAX + 8]
-        .into_iter()
-        .enumerate()
-    {
-        let unwrapping =
-            KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
-        ctx.direct(
-            "C_UnwrapKey",
-            7,
-            Some(0x2109),
-            &[unwrapping],
-            100 + n as u64 * 100,
-            Some(LengthOutcome::Value(length)),
-            Some(ids[1].as_u64()),
-        )
-        .expect("unwrap completes");
-    }
-    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
-    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
-    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
-    let inferred = ctx
-        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
-        .expect("the first row carries the admitted park");
+    // The published section carries both first rows at version 7: A
+    // with no size, B with the exact wrapped-material scalars and its
+    // unwrap tag, and the capacity refusal beside them as a named gap.
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(section["version"], 7);
+    let rendered = |object: u64| {
+        let row = committed
+            .key_operations
+            .iter()
+            .find(|row| row.object == object && row.category == "encrypt")
+            .unwrap_or_else(|| panic!("view {object} publishes its first row"));
+        key_row_json(row)
+    };
     assert_eq!(
-        inferred.size.detail,
-        Some((
-            SizeDetail::WrappedMaterial {
-                material_octets: WRAPPED_MATERIAL_MAX,
-                octets: WRAPPED_MATERIAL_MAX + 8,
-            },
-            EvidenceTag::UnwrapInput,
-        )),
-        "the refused park blocked nothing"
+        rendered(ids[1].as_u64())["inferred_size"]["status"],
+        "unknown"
     );
+    assert!(
+        rendered(ids[1].as_u64())["inferred_size"]["detail"].is_null(),
+        "A publishes no parked size"
+    );
+    assert_eq!(
+        rendered(ids[2].as_u64())["inferred_size"],
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "wrapped_material",
+                       "material_octets": WRAPPED_MATERIAL_MAX,
+                       "octets": WRAPPED_MATERIAL_MAX + 8,
+                       "evidence": "unwrap_input", "about": "wrapped"},
+            "completions": 1
+        })
+    );
+    let gap = committed
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "wrapped_park_refused")
+        .expect("the capacity refusal publishes as a named gap");
+    assert_eq!(gap.repeats, 1);
 }
 
-/// Above-bound wrapped evidence never publishes: a refused park
-/// forward-fills nothing onto a two-valued row (no capped-fallback
-/// inflation), and a direct above-bound completion after two admitted
-/// values counts its completion while the pinned pair and the further
-/// count stand.
+/// Above-bound wrapped evidence never publishes: a direct
+/// above-bound completion as first evidence reads unsupported with no
+/// detail and publishes exactly that; a refused park forward-fills
+/// nothing onto a two-valued row (no capped-fallback inflation); and
+/// a direct above-bound completion after two admitted values counts
+/// its completion while the pinned pair and the further count stand.
 #[test]
 fn keymeta_above_bound_wrapped_evidence_never_publishes() {
+    use crate::key_operation_projection::key_row_json;
+    use crate::key_operation_projection::producer::commit;
     use crate::keymeta::WRAPPED_MATERIAL_MAX;
+    // First evidence above the bound: the row reads unsupported with
+    // no detail, and publishes exactly that (the refusal counts its
+    // completion but forwards no size).
+    let initial = KeymetaCtx::object_ids(2);
+    let mut first = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(initial[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(initial[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    first
+        .direct(
+            "C_WrapKey",
+            7,
+            Some(0x2109),
+            &[wrapping, wrapped],
+            100,
+            Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
+            None,
+        )
+        .expect("wrap completes");
+    let inferred = first
+        .inference(initial[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the above-bound row exists");
+    assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+    assert_eq!(inferred.size.detail, None);
+    assert_eq!(inferred.size.completions, 1);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_OUTSIDE_ADMISSION_BOUND)
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &first.keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.object == initial[1].as_u64() && row.category == "wrap")
+        .expect("the above-bound row publishes");
+    assert_eq!(
+        key_row_json(row)["inferred_size"],
+        serde_json::json!({
+            "status": "unsupported",
+            "detail": null,
+            "completions": 1
+        })
+    );
     let ids = KeymetaCtx::object_ids(2);
     let mut ctx = KeymetaCtx::new();
     // Two admitted wraps pin the pair on the wrapped row.

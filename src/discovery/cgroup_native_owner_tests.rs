@@ -692,6 +692,34 @@ fn cgroup_native_owner_stable_retained_member_activates_after_final_permit() {
     );
 }
 
+/// An owner scan in a physical-publication commit gets a fresh
+/// teardown-deferral budget even when the coordinator engine's budget is
+/// spent: the publication entry owns its window exactly like the
+/// discovery passes. The fixture child stays alive, so no real teardown
+/// wait runs and the snapshot is exact.
+#[test]
+fn commit_physical_publication_owner_scan_gets_fresh_teardown_budget_after_spent() {
+    use std::time::Duration;
+    let mut scene = ScopedNativeScene::new();
+    let _acquired = scene.set_scripted_acquisition(&[
+        (1, 41, 1),
+        (2, 41, 1),
+        (3, 41, 1),
+        (4, 41, 1),
+        (5, 41, 1),
+    ]);
+    scene.coordinator.engine.teardown_deferral =
+        super::super::TeardownDeferralBudget::with_remaining(Duration::ZERO);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(completion.scan_callers, 1, "the commit ran the owner scan");
+    assert_eq!(
+        scene.coordinator.engine.teardown_deferral.remaining(),
+        super::super::TeardownDeferralBudget::new().remaining(),
+        "the owner scan sees a fresh budget, not the spent one"
+    );
+}
+
 #[test]
 fn cgroup_native_owner_migration_during_provider_retention_refuses_activation() {
     // If owner activation moves before the final sample, this twin must fail

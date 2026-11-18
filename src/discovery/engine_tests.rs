@@ -93592,6 +93592,87 @@ fn rebuild_discovered_refuses_uncorroborated_entries_in_every_scope() {
     }
 }
 
+/// Needle: the teardown-deferral budget has one owner. Every write of the
+/// `teardown_deferral` field stays exactly the pass-entry owner
+/// (`begin_teardown_pass`), the needle-pinned `discover_plan` inline reset
+/// above, and the constructor init — and no coordinator or inventory file
+/// writes the field directly. A future entry that assigns the field
+/// instead of calling the owner fails here and gets routed through it.
+#[test]
+fn teardown_budget_writes_stay_with_the_single_owner() {
+    let source = include_str!("engine.rs");
+    let resets: Vec<&str> = source
+        .lines()
+        .filter(|line| line.contains("teardown_deferral =") && !line.contains("=="))
+        .collect();
+    assert_eq!(
+        resets.len(),
+        2,
+        "exactly two field resets: the owner and the discover inline one, got: {resets:?}"
+    );
+    assert!(
+        resets
+            .iter()
+            .any(|line| line.trim() == "self.teardown_deferral = TeardownDeferralBudget::new();"),
+        "the pass-entry owner keeps its reset: {resets:?}"
+    );
+    assert!(
+        resets
+            .iter()
+            .any(|line| line.trim()
+                == "discovered.teardown_deferral = TeardownDeferralBudget::new();"),
+        "the discover inline reset stays needle-pinned: {resets:?}"
+    );
+    let inits: Vec<&str> = source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("teardown_deferral:"))
+        .collect();
+    assert_eq!(
+        inits.len(),
+        2,
+        "the field declaration plus the constructor init only, got: {inits:?}"
+    );
+    assert!(
+        inits
+            .iter()
+            .any(|line| line.trim() == "teardown_deferral: TeardownDeferralBudget::new(),"),
+        "the constructor init stays: {inits:?}"
+    );
+    for (name, source) in [
+        ("inventory.rs", include_str!("inventory.rs")),
+        (
+            "inventory_coordinator.rs",
+            include_str!("inventory_coordinator.rs"),
+        ),
+        (
+            "cgroup_native_owner_tests.rs",
+            include_str!("cgroup_native_owner_tests.rs"),
+        ),
+    ] {
+        // Test twins spend the budget through the `#[cfg(test)]` helper,
+        // on the same line or the next; production has no such shape (it
+        // cannot call it), so anything else assigning the field here
+        // bypasses the owner.
+        let lines: Vec<&str> = source.lines().collect();
+        let mut writes = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("teardown_deferral =") || line.contains("==") {
+                continue;
+            }
+            let continued = lines
+                .get(index + 1)
+                .is_some_and(|next| next.contains("with_remaining"));
+            if !line.contains("with_remaining") && !continued {
+                writes.push(*line);
+            }
+        }
+        assert!(
+            writes.is_empty(),
+            "{name} never writes the budget field directly; entries call the owner: {writes:?}"
+        );
+    }
+}
+
 /// A loader scan in a new batch gets a fresh teardown-deferral budget
 /// even when the previous tick spent it: the batch entry resets before
 /// the loader phase, not only the inventory tick after it. The probe

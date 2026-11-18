@@ -15746,6 +15746,92 @@ pub(crate) mod tests {
         assert_eq!(coordinator.lifecycle_high_water_bytes(), Some(300));
     }
 
+    /// A staged Lifecycle batch opens a fresh teardown-deferral window
+    /// even when the coordinator engine's budget is spent: the staging
+    /// entry owns its window exactly like the discovery passes. Staging
+    /// performs no scans itself, so the twin pins the refresh plus the
+    /// staging effect, not a scan.
+    #[test]
+    fn staged_lifecycle_batch_gets_fresh_teardown_budget_after_spent() {
+        use std::time::Duration;
+        let mut coordinator = coordinator();
+        coordinator.engine.teardown_deferral =
+            super::super::TeardownDeferralBudget::with_remaining(Duration::ZERO);
+        let domain = NativeDomainId::mint();
+        let now = crate::discovery::caller_registry::now_ns();
+        let mut batch = DiscoveryBatch::scripted(domain, Vec::new(), now);
+        batch.drain_high_water_bytes = Some(300);
+        coordinator.stage_native(NativeBatch::Lifecycle(batch), &mut ScanOnlyIdentity, now);
+        assert_eq!(
+            coordinator.lifecycle_high_water_bytes(),
+            Some(300),
+            "the Lifecycle batch staged"
+        );
+        assert_eq!(
+            coordinator.engine.teardown_deferral.remaining(),
+            super::super::TeardownDeferralBudget::new().remaining(),
+            "staging opens a fresh window, not the spent one"
+        );
+    }
+
+    /// An owner scan in a catalog pass gets a fresh teardown-deferral
+    /// budget even when the coordinator engine's budget is spent: the
+    /// catalog entry owns its window exactly like the discovery passes.
+    /// The fixture process stays alive, so no real teardown wait runs
+    /// and the snapshot is exact.
+    #[test]
+    fn catalog_pass_owner_scan_gets_fresh_teardown_budget_after_spent() {
+        use std::time::Duration;
+        let mut coordinator = coordinator();
+        coordinator.engine.teardown_deferral =
+            super::super::TeardownDeferralBudget::with_remaining(Duration::ZERO);
+        let pid = std::process::id();
+        let report = coordinator
+            .scan_pass(
+                &InventoryScope::Pid(pid),
+                None,
+                &mut UnavailableImageGuard,
+                &mut ScanOnlyIdentity,
+                u64::MAX,
+                crate::discovery::caller_registry::now_ns(),
+            )
+            .unwrap();
+        assert_eq!(report.scan_callers, 1, "the pass ran the owner scan");
+        assert_eq!(
+            coordinator.engine.teardown_deferral.remaining(),
+            super::super::TeardownDeferralBudget::new().remaining(),
+            "the owner scan sees a fresh budget, not the spent one"
+        );
+    }
+
+    /// A catalog applied directly (the production inventory route, beside
+    /// the `scan_pass` twin above) opens a fresh teardown-deferral window
+    /// even when the coordinator engine's budget is spent: same catalog
+    /// entry, through the direct caller. The fixture process stays alive,
+    /// so no real teardown wait runs and the snapshot is exact.
+    #[test]
+    fn direct_catalog_owner_scan_gets_fresh_teardown_budget_after_spent() {
+        use std::time::Duration;
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let catalog = coordinator.collector(InventoryScope::Pid(pid), None)().unwrap();
+        coordinator.engine.teardown_deferral =
+            super::super::TeardownDeferralBudget::with_remaining(Duration::ZERO);
+        let report = coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut ScanOnlyIdentity,
+            u64::MAX,
+            crate::discovery::caller_registry::now_ns(),
+        );
+        assert_eq!(report.scan_callers, 1, "the pass ran the owner scan");
+        assert_eq!(
+            coordinator.engine.teardown_deferral.remaining(),
+            super::super::TeardownDeferralBudget::new().remaining(),
+            "the owner scan sees a fresh budget, not the spent one"
+        );
+    }
+
     #[test]
     fn unavailable_guard_falls_back_to_scan_lane_with_an_authority_gap() {
         let mut coordinator = coordinator();

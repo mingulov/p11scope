@@ -306,7 +306,7 @@ impl AtomicFile {
     /// with another delivery (the profile/metrics stdout rescue) can
     /// tell a recovery-dir save — which must not be rescued again —
     /// from a loss.
-    pub fn commit(mut self) -> Result<(), String> {
+    pub fn commit(self) -> Result<(), String> {
         self.commit_with_outcome()
             .map_err(|failure| failure.into_message())
     }
@@ -3502,7 +3502,7 @@ mod tests {
             "no handover failure falls back to publishing the unhanded report"
         );
         let commit = production
-            .split_once("pub fn commit(mut self)")
+            .split_once("pub fn commit(self)")
             .unwrap()
             .1
             .split_once("fn publish(")
@@ -3610,7 +3610,7 @@ mod tests {
         let source = include_str!("output.rs");
         let production = source.split_once("mod tests").unwrap().0;
         let commit = production
-            .split_once("pub fn commit(mut self)")
+            .split_once("pub fn commit(self)")
             .unwrap()
             .1
             .split_once("fn publish(")
@@ -3752,7 +3752,7 @@ mod tests {
             "AtomicFile::create must not hand the live temp over: it stays creator-owned until commit"
         );
         let commit = production
-            .split_once("pub fn commit(mut self)")
+            .split_once("pub fn commit(self)")
             .unwrap()
             .1
             .split_once("fn publish(")
@@ -4201,7 +4201,7 @@ mod tests {
             "a double failure must say the capture is lost"
         );
         let commit = production
-            .split_once("pub fn commit(mut self)")
+            .split_once("pub fn commit(self)")
             .unwrap()
             .1
             .split_once("fn publish(")

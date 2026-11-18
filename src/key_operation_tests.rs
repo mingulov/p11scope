@@ -16091,6 +16091,415 @@ fn key_operation_loss_after_delivery_keeps_rows_partial() {
     );
 }
 
+// ==================== v0.7.2 F1: fold keeps proved key rows ====================
+
+use crate::cli::TextVerbosity;
+use crate::discovery::caller_registry::ImageAuthority;
+use crate::inventory_present::render_snapshot_with_verbosity;
+
+/// One fold twin scene: a real Harness coordinator (production
+/// admission and retirement) with Joint delivery on its own
+/// registry, so `retire_rendered_callers` runs the true fold.
+struct FoldScene {
+    harness: Harness,
+    scene: JointScene,
+    domain: NativeDomainId,
+    module: ModuleKey,
+    pids: Vec<u32>,
+    next_id: u32,
+}
+
+impl FoldScene {
+    fn new() -> Self {
+        let harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+        let scene = JointScene::new();
+        let domain = NativeDomainId::try_mint().expect("fresh domain");
+        let module = ModuleKey::Physical {
+            dev_major: 1,
+            dev_minor: 2,
+            ino: 3,
+            sha256: None,
+        };
+        Self {
+            harness,
+            scene,
+            domain,
+            module,
+            pids: Vec::new(),
+            next_id: 0,
+        }
+    }
+
+    fn admit(&mut self, pid: u32) -> CallerId {
+        self.harness.source().spawn(pid, 1000 + u64::from(pid));
+        self.pids.push(pid);
+        let observed: std::collections::BTreeSet<u32> =
+            self.pids.iter().copied().collect();
+        let now = self.harness.now_ns();
+        let events = self.harness.coordinator_mut().adapter_mut().reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            now,
+        );
+        self.harness
+            .coordinator_mut()
+            .apply_reconcile_events(&events, now);
+        self.harness.advance(10);
+        self.harness
+            .coordinator()
+            .adapter()
+            .live_id(pid)
+            .expect("production admission retains the caller")
+    }
+
+    fn key(&self, router: u64) -> InstanceKey {
+        InstanceKey::scripted(
+            self.domain,
+            ImageIdentity {
+                task_cookie: 100 + router,
+                exec_id: 1,
+            },
+            InstanceId::from_raw(router),
+            self.module.clone(),
+        )
+    }
+
+    fn admit_shape(&mut self, call: &ShapedS1) -> (SemanticCall, u64) {
+        let admitted = admit_call_input(&mut self.scene, call);
+        self.scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("call attests");
+        (admitted.s1_facts().clone(), admitted.h0_ordinal())
+    }
+
+    /// One sealed key use on `caller`'s Joint feed: install, register,
+    /// observe an init, seal and deliver it.
+    fn deliver_proved_use(&mut self, caller: CallerId, router: u64) -> RegistryInstanceId {
+        self.harness
+            .coordinator_mut()
+            .registry_mut()
+            .note_journal_linked(true);
+        let bootstrap = self.scene.bootstrap();
+        let key = self.key(router);
+        assert!(
+            self.harness
+                .coordinator_mut()
+                .registry_mut()
+                .install_joint_receipt(key.clone(), bootstrap),
+            "the grant installs"
+        );
+        let id = RegistryInstanceId::from_raw(self.next_id);
+        self.next_id += 1;
+        self.harness
+            .coordinator_mut()
+            .registry_mut()
+            .scripted_module_edge(self.module.clone(), caller);
+        self.harness
+            .coordinator_mut()
+            .registry_mut()
+            .note_instance(AdmittedInstance::scripted(key.clone(), caller));
+        self.harness.coordinator_mut().registry_mut().publish();
+        assert!(
+            self.harness
+                .coordinator()
+                .registry()
+                .feed_mode_for_test(id)
+                .is_some(),
+            "registration retains the instance"
+        );
+        let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+        let (facts, pos) = self.admit_shape(&init);
+        self.harness
+            .coordinator_mut()
+            .registry_mut()
+            .observe_instance_semantic(AdmittedInstanceCall::scripted(
+                key.clone(),
+                caller,
+                pos,
+                facts,
+            ));
+        self.harness
+            .coordinator_mut()
+            .registry_mut()
+            .publish_with_ledger(self.scene.adapter.ledger_mut());
+        ingest_call(&mut self.scene, &init, pos);
+        let seal = self.scene.seal().expect("healthy call seals");
+        assert_eq!(
+            self.harness.coordinator_mut().registry_mut()
+                .deliver_joint_algorithm_seal_for_test(
+                    id,
+                    &seal,
+                    &self.scene.model,
+                    self.scene.adapter.ledger_mut()
+                ),
+            SealApplyOutcome::ReplayedOne,
+            "the sealed use delivers"
+        );
+        id
+    }
+
+    fn retire_pid(&mut self, pid: u32) {
+        self.harness.source().kill(pid);
+        self.pids.retain(|live| *live != pid);
+        let observed: std::collections::BTreeSet<u32> =
+            self.pids.iter().copied().collect();
+        let now = self.harness.now_ns();
+        let events = self.harness.coordinator_mut().adapter_mut().reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            now,
+        );
+        self.harness
+            .coordinator_mut()
+            .apply_reconcile_events(&events, now);
+        self.harness.advance(10);
+    }
+
+    fn fold(&mut self, caller: CallerId) -> u64 {
+        self.harness
+            .coordinator_mut()
+            .note_rendered_callers(&[caller]);
+        let now = self.harness.now_ns();
+        self.harness
+            .coordinator_mut()
+            .retire_rendered_callers(now, None)
+            .retired
+    }
+
+    fn presentation(&self) -> Presentation {
+        Presentation::capture(self.harness.coordinator(), "fold-twin", 1, 2, 7)
+    }
+}
+
+/// The concise `key operations:` block: the header plus its indented
+/// tallies, the exact lines a folded row must not hide.
+fn key_ops_text_block(text: &str) -> Vec<String> {
+    let mut block = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line.starts_with("key operations:") {
+            inside = true;
+            block.push(line.to_string());
+            continue;
+        }
+        if inside && line.starts_with("  ") {
+            block.push(line.to_string());
+            continue;
+        }
+        if inside {
+            break;
+        }
+    }
+    block
+}
+
+/// One JSONL reconstruction of a committed section: emit every row,
+/// read the stream back, replay it like the consumer.
+fn jsonl_reconstruction(observations: &ObjectObservations) -> (usize, Reconstructed) {
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    let emission = emitter.emit(&mut writer, observations, 1_000).unwrap();
+    assert_eq!(emission.deferred, 0, "one section drains in one emission");
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    (emission.emitted, reconstruct(&lines))
+}
+
+/// Sole clean feed: retiring the last Joint feed must not hide its
+/// proved rows. JSON, JSONL and concise text agree before and after
+/// the real coordinator fold.
+#[test]
+fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
+    let mut scene = FoldScene::new();
+    let pid = 5001;
+    let caller = scene.admit(pid);
+    scene.deliver_proved_use(caller, 1);
+    assert_eq!(scene.harness.coordinator().registry().joint_feeds(), 1);
+
+    let before = scene.presentation();
+    assert_eq!(
+        (before.object_observations.status, before.object_observations.reason),
+        (ObsStatus::Populated, "none")
+    );
+    assert!(
+        !before.object_observations.key_operations.is_empty(),
+        "the sealed use proves rows"
+    );
+    let json_before = render_json_from_presentation(&before);
+    let section_before = json_before["object_observations"].clone();
+    let (emitted_before, jsonl_before) = jsonl_reconstruction(&before.object_observations);
+    assert!(!jsonl_before.known.is_empty(), "JSONL carries proved rows");
+    let text_before = render_snapshot_with_verbosity(&before, TextVerbosity::Concise);
+    let block_before = key_ops_text_block(&text_before);
+    assert!(
+        block_before.first().is_some_and(|line| line.contains("populated")),
+        "concise text names the populated section: {block_before:?}"
+    );
+
+    scene.retire_pid(pid);
+    let record = scene
+        .harness
+        .coordinator()
+        .adapter()
+        .record(caller)
+        .expect("retired record retained");
+    assert!(record.retired, "production reconcile retires the dead pid");
+    assert_eq!(scene.fold(caller), 1, "the rendered exited row folds");
+    assert_eq!(
+        scene.harness.coordinator().registry().joint_feeds(),
+        0,
+        "the fold decrements the live-feed census"
+    );
+
+    let after = scene.presentation();
+    assert_eq!(
+        (after.object_observations.status, after.object_observations.reason),
+        (ObsStatus::Populated, "none"),
+        "proved rows survive the fold with their status"
+    );
+    assert_eq!(
+        after.object_observations.key_operations, before.object_observations.key_operations,
+        "the exact proved rows survive"
+    );
+    let json_after = render_json_from_presentation(&after);
+    assert_eq!(
+        json_after["object_observations"], section_before,
+        "the JSON section is stable across the fold"
+    );
+    let (emitted_after, jsonl_after) = jsonl_reconstruction(&after.object_observations);
+    assert_eq!(emitted_after, emitted_before, "JSONL emits the same rows");
+    assert_eq!(jsonl_after.known, jsonl_before.known, "JSONL keeps proved rows");
+    let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
+    assert_eq!(
+        key_ops_text_block(&text_after),
+        block_before,
+        "concise text keeps the proved rows"
+    );
+}
+
+/// Loss plus a healthy sibling: folding the departed feed must keep
+/// its named loss count beside the sibling's rows, on all three
+/// surfaces.
+#[test]
+fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+    let mut scene = FoldScene::new();
+    let pid_a = 5011;
+    let pid_b = 5012;
+    let caller_a = scene.admit(pid_a);
+    let caller_b = scene.admit(pid_b);
+    let key_a = scene.key(1);
+    scene.deliver_proved_use(caller_a, 1);
+    scene.deliver_proved_use(caller_b, 2);
+    assert_eq!(scene.harness.coordinator().registry().joint_feeds(), 2);
+
+    // A counted loss on the departing feed: one more call stages,
+    // then its history disposes.
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, pos) = scene.admit_shape(&sign);
+    scene
+        .harness
+        .coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            key_a.clone(),
+            caller_a,
+            pos,
+            facts,
+        ));
+    scene
+        .harness
+        .coordinator_mut()
+        .registry_mut()
+        .publish_with_ledger(scene.scene.adapter.ledger_mut());
+    let barrier = scene.scene.fixture.admit_function("C_Sign").h0_ordinal();
+    scene
+        .harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(loss(
+            Scope::Exact(key_a.clone()),
+            position(scene.domain, barrier),
+            InstanceReason::SemanticLoss,
+        ));
+    scene
+        .harness
+        .coordinator_mut()
+        .registry_mut()
+        .publish_with_ledger(scene.scene.adapter.ledger_mut());
+
+    let before = scene.presentation();
+    assert_eq!(
+        (before.object_observations.status, before.object_observations.reason),
+        (ObsStatus::Partial, "authority_lost")
+    );
+    let lost_before: Vec<(&str, u64)> = before
+        .object_observations
+        .unattributed
+        .iter()
+        .map(|row| (row.reason, row.count))
+        .collect();
+    assert_eq!(lost_before, vec![("record_lost", 1)]);
+    let json_before = render_json_from_presentation(&before);
+    let section_before = json_before["object_observations"].clone();
+    let (_, jsonl_before) = jsonl_reconstruction(&before.object_observations);
+    let text_before = render_snapshot_with_verbosity(&before, TextVerbosity::Concise);
+    let block_before = key_ops_text_block(&text_before);
+
+    scene.retire_pid(pid_a);
+    assert_eq!(scene.fold(caller_a), 1, "the lossy row folds");
+    assert_eq!(
+        scene.harness.coordinator().registry().joint_feeds(),
+        1,
+        "the fold decrements the live-feed census past the sibling"
+    );
+    assert!(
+        scene
+            .harness
+            .coordinator()
+            .adapter()
+            .record(caller_b)
+            .is_some(),
+        "the healthy sibling stays"
+    );
+
+    let after = scene.presentation();
+    assert_eq!(
+        (after.object_observations.status, after.object_observations.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "the folded loss still names itself beside the healthy sibling"
+    );
+    let lost_after: Vec<(&str, u64)> = after
+        .object_observations
+        .unattributed
+        .iter()
+        .map(|row| (row.reason, row.count))
+        .collect();
+    assert_eq!(lost_after, vec![("record_lost", 1)], "the named loss survives");
+    assert_eq!(
+        after.object_observations.key_operations, before.object_observations.key_operations,
+        "proved rows from both feeds survive"
+    );
+    let json_after = render_json_from_presentation(&after);
+    assert_eq!(
+        json_after["object_observations"], section_before,
+        "the JSON section is stable across the lossy fold"
+    );
+    let (_, jsonl_after) = jsonl_reconstruction(&after.object_observations);
+    assert_eq!(jsonl_after.known, jsonl_before.known, "JSONL keeps proved rows");
+    let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
+    assert_eq!(
+        key_ops_text_block(&text_after),
+        block_before,
+        "concise text keeps rows and the named loss"
+    );
+}
+
 #[test]
 fn key_operation_joint_failure_delivery_retains_projection() {
     let mut guarded = GuardedScene::new();

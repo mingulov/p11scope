@@ -383,36 +383,37 @@ fn global_purge_spares_resolvable_but_claimless_ids() {
     );
 }
 
-/// `replace_view_pins_with_claims_for` splits the sets: every preserved
-/// id stays resolvable, but only `claims_for` restore ownership claims.
+/// A refused pin observation is skipped, never a group rejection: the
+/// failed raw is scrubbed, committed entries stand, and the failure is
+/// recorded as a skip.
 #[test]
-fn replace_view_pins_with_claims_for_splits_resolve_and_claims() {
-    let entries = distinct_keys(3);
+fn pin_failure_scrubs_without_group_rejection() {
+    let entries = distinct_keys(2);
     let mut pins = pin_set(&entries, true);
-    let loader = PinnedObjectId(0);
-    let carried = PinnedObjectId(1);
-    let dropped = PinnedObjectId(2);
-    for (key, _, _) in &entries {
-        record_scan_ownership(&mut pins, ProcessViewId(1), *key, PATH);
-    }
-    pins.replace_view_pins_with_claims_for(
-        ProcessViewId(1),
-        PinnedObjects::empty(),
-        &[loader, carried],
-        &[loader],
+    record_scan_ownership(&mut pins, ProcessViewId(1), entries[0].0, PATH);
+    record_scan_ownership(&mut pins, ProcessViewId(2), entries[1].0, PATH);
+    let filed = pins.raw_to_id.keys().next().unwrap().clone();
+    let raw = RawObjectInstance {
+        path: "/unfiled.so".to_string(),
+        ..filed
+    };
+    let mut skipped = Vec::new();
+    record_scanned_candidate(
+        &mut pins,
+        ProcessViewId(3),
+        raw.clone(),
+        Err(PinFailure::Refused("TEST refused".to_string())),
+        &mut skipped,
+        false,
     );
-    assert!(pins.summary(loader).is_some(), "loader stays resolvable");
-    assert!(pins.summary(carried).is_some(), "carried stays resolvable");
-    assert!(pins.summary(dropped).is_none(), "other still drops");
-    let claims = pins
-        .view_claims(ProcessViewId(1))
-        .expect("the view keeps claims");
+    assert!(!pins.rejects(raw.key), "pin failure never group-rejects");
     assert!(
-        claims.pins.contains(&loader),
-        "the loader id restores its claim"
+        pins.summary(PinnedObjectId(0)).is_some(),
+        "committed entries stand"
     );
     assert!(
-        !claims.pins.contains(&carried),
-        "the carried id stays merely resolvable"
+        pins.summary(PinnedObjectId(1)).is_some(),
+        "committed entries stand"
     );
+    assert!(!skipped.is_empty(), "the failure is still recorded");
 }

@@ -25027,6 +25027,225 @@ exit 0
         );
     }
 
+    /// F4 entry twin: a stop requested before retirement skips every
+    /// planning scan — references, candidates, the binder plan and
+    /// the pair and fold indexes — and folds nothing; clearing the
+    /// stop resumes without a re-note.
+    #[test]
+    fn stopped_retirement_skips_all_planning_before_folding_nothing() {
+        let (mut native, live) = NativeScene::new();
+        let domain = native.domain;
+        for row in 0..8u64 {
+            native
+                .scene
+                .coordinator
+                .binder
+                .stage_pending_sighting_for_test(domain, live, 9000 + row);
+        }
+        let mut ids = Vec::new();
+        for caller in 0..8u32 {
+            let id = stage_exited_caller(&mut native, 5020 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
+        }
+        native.scene.coordinator.note_rendered_callers(&ids);
+        native.scene.coordinator.stopped = true;
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a stopped retirement folds nothing"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .release_pending_visits_for_test(),
+            0,
+            "no pending row is scanned while stopped"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .release_cookie_visits_for_test(),
+            0,
+            "no cookie sequence is scanned while stopped"
+        );
+        assert_eq!(
+            native.scene.coordinator.fold_pair_target_visits_for_test(),
+            0,
+            "no pair target is indexed while stopped"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_pair_recovery_visits_for_test(),
+            0,
+            "no pair recovery is indexed while stopped"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .recovery_order_search_visits_for_test(),
+            0,
+            "no order position is indexed while stopped"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_callers.len(),
+            8,
+            "every row waits out the stop in the carry"
+        );
+        native.scene.coordinator.stopped = false;
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            8,
+            "clearing the stop resumes without a re-note"
+        );
+    }
+
+    /// F4 fanout twin: one caller with 200 cookie sequences plus a
+    /// bound pair and a stalled recovery spans multiple credits (one
+    /// per 64 member units past the base), so 1,021 of 1,022 rows
+    /// fold in the first publication and the remainder resumes next
+    /// pass with every count exact and no late row attributable to a
+    /// folded caller.
+    #[test]
+    fn fold_high_fanout_caller_consumes_extra_credits_and_resumes() {
+        const SEQUENCES: u64 = 200;
+        const SIBLINGS: u32 = 1021;
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        // The high-fanout caller sorts first, so its cost lands on
+        // the first publication: 200 sequences + 1 target + 1
+        // recovery = 202 units = 3 extra credits past the base.
+        let heavy = stage_exited_caller(&mut native, 5029, 100);
+        for sequence in 0..SEQUENCES {
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + sequence,
+                sequence,
+                Some(heavy),
+            );
+        }
+        let target = PairKey::scripted(domain, 500, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            target,
+            PairTarget::scripted_bound(
+                heavy,
+                ModuleKey::physical(8, 1, 7000, None, "/fold/pair.so"),
+                0,
+                10,
+                10,
+            ),
+        );
+        let stalled = PairKey::scripted(domain, 1500, 0, 0);
+        native.scene.coordinator.recoveries.insert(
+            stalled,
+            PairRecovery::scripted(heavy, 0, ModuleId(3)),
+        );
+        native.scene.coordinator.recovery_order.push(target);
+        native.scene.coordinator.recovery_order.push(stalled);
+        let mut ids = vec![heavy];
+        for caller in 0..SIBLINGS {
+            let id = stage_exited_caller(&mut native, 5030 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                10_000 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
+        }
+        native.scene.coordinator.note_rendered_callers(&ids);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            1021,
+            "the fanout caller's 4 credits leave one sibling waiting"
+        );
+        let remainder: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| native.scene.coordinator.adapter.record(*id).is_some())
+            .collect();
+        assert_eq!(remainder.len(), 1, "exactly one row waits past the cap");
+        assert_ne!(remainder[0], heavy, "the fanout caller folds first");
+        let mut owners = native
+            .scene
+            .coordinator
+            .binder
+            .cookie_bound_owners_for_test();
+        owners.sort();
+        assert_eq!(
+            owners, remainder,
+            "the waiting row keeps its cookie binding"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the remainder resumes without a re-note"
+        );
+        for id in &ids {
+            assert!(
+                native.scene.coordinator.adapter.record(*id).is_none(),
+                "every row eventually folds"
+            );
+        }
+        // Publication safety: the heavy pair's staged base lands in
+        // the dropped-pair machinery exactly once, and no late row
+        // names a folded caller.
+        let dropped_base: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .map(|target| match target {
+                PairTarget::Dropped { base, .. } => *base,
+                PairTarget::Bound { .. }
+                | PairTarget::Pending { .. }
+                | PairTarget::Suspended { .. } => 0,
+            })
+            .sum();
+        assert_eq!(dropped_base, 10, "the staged base lands exactly once");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "no cookie names a folded caller"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stalled recovery survives its caller"
+        );
+    }
+
     /// Twin: an exec newcomer the next pass enumerates and admits is
     /// covered, never counted as short-lived.
     #[test]

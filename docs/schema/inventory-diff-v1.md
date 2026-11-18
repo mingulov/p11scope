@@ -166,7 +166,8 @@ are never matched across captures.
 `physical_continuity`, all `unknown`; `counter_relation` is
 `independent_windows`; `scope_relation` is `same_recorded_label` or
 `different_recorded_labels`; and `application_paths` is a sorted, unique
-array of exact nonempty executable paths on edges with known module digest.
+array of exact nonempty executable paths on edges or folded departed
+identities with known module digest.
 Same scope labels do not prove equal actual scope.
 
 All projection rows have `key`, `presence`, sorted `changes`, `before`, and
@@ -194,11 +195,16 @@ removal, or physical replacement.
 
 Change codes are `content_presence`, `paths`, `caller_population`,
 `physical_records`, `admission`, `mapping`, `lifecycle`, `coverage`,
-`entries`, and `semantics`. They describe variation in the supported
+`entries`, `semantics`, and `departed_use`. They describe variation in the supported
 observation facts and their associations, never a paired entity's transition.
 Comparison uses multisets of associated facts without guessing pairings or
 summing counts across callers or physical modules. `caller_population`
 includes recorded PID/start and executable metadata; it does not prove churn.
+`departed_use` names folded-use differences on the application group:
+its departed identities (capture-local caller labels excluded) or its
+per-module folded aggregate counts. A group held only as folded rows on
+one side keeps presence `both` with `departed_use` beside the presence
+and population codes, never a false single-side presence.
 
 Absolute observation timestamps and capture-local IDs alone do not mark an
 application changed. Coverage ending becoming known versus null remains a

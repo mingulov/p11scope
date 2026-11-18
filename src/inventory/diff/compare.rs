@@ -57,6 +57,59 @@ struct Group {
     edges: Vec<usize>,
     callers: BTreeSet<usize>,
     modules: BTreeSet<usize>,
+    departed_identities: Vec<Vec<u8>>,
+    departed_modules: Vec<Vec<u8>>,
+}
+
+/// True when a group holds neither live rows nor folded rows on its
+/// side: only then is the group absent there.
+fn group_empty(group: &Group) -> bool {
+    group.edges.is_empty()
+        && group.departed_identities.is_empty()
+        && group.departed_modules.is_empty()
+}
+
+/// Normalized folded-identity facts: the caller-visible fields
+/// minus the capture-local caller label (never matched across
+/// captures). Departed records carry no instants.
+fn departed_identity_fact(identity: &input::DepartedIdentity) -> Vec<u8> {
+    encoded(&(
+        identity.pid,
+        identity.start_time,
+        identity.incarnation,
+        identity.exe_dev,
+        identity.exe_ino,
+        identity.exe_path.as_deref(),
+        identity.authority.as_str(),
+        identity.lifecycle.as_str(),
+        identity.lifecycle_reason.as_deref(),
+        identity.exec_observed,
+        identity.metadata_status.as_deref(),
+    ))
+}
+
+/// Normalized per-module folded summary: every aggregate count,
+/// distribution and breakdown row, plus the identity bounds — but
+/// not the identities themselves (they compare per path above).
+/// Aggregate counts are module-level facts, so a count change flags
+/// every group holding the module, like the module-level facet.
+fn departed_module_fact(departed: &input::DepartedUse) -> Vec<u8> {
+    encoded(&(
+        departed.callers,
+        departed.edges,
+        &departed.entries,
+        &departed.mapping,
+        &departed.semantic_labels,
+        &departed.mechanisms,
+        departed.mechs_overflow,
+        departed.mechs_overflow_calls,
+        departed.mechs_overflow_errors,
+        &departed.operations,
+        &departed.instances,
+        departed.identities.len(),
+        departed.identities_saturated,
+        departed.identities_dropped,
+    ))
 }
 struct Projection<'a> {
     contents: BTreeMap<&'a str, Vec<usize>>,
@@ -65,7 +118,7 @@ struct Projection<'a> {
 }
 
 pub(super) fn compare(before: &Snapshot, after: &Snapshot) -> DiffReport {
-    let paths: Vec<String> = [before, after]
+    let mut paths: Vec<String> = [before, after]
         .into_iter()
         .flat_map(|s| {
             s.edges.iter().filter_map(|e| {
@@ -77,6 +130,37 @@ pub(super) fn compare(before: &Snapshot, after: &Snapshot) -> DiffReport {
         .into_iter()
         .map(str::to_owned)
         .collect();
+    // Folded callers rejoin the compared paths: a departed identity
+    // with a recorded exe path on a digested module defines the same
+    // group its live edge did, so folded callers neither vanish from
+    // the compared groups nor read as removed against a live
+    // snapshot. Pathless identities stay module-level only (like
+    // pathless live callers).
+    {
+        let mut folded: BTreeSet<&str> = BTreeSet::new();
+        for s in [before, after] {
+            for module in &s.modules {
+                if module.sha256.is_none() {
+                    continue;
+                }
+                let Some(departed) = module.departed_use.as_ref() else {
+                    continue;
+                };
+                for identity in &departed.identities {
+                    if let Some(path) = identity
+                        .exe_path
+                        .as_deref()
+                        .filter(|path| !path.is_empty())
+                    {
+                        folded.insert(path);
+                    }
+                }
+            }
+        }
+        paths.extend(folded.into_iter().map(str::to_owned));
+        paths.sort();
+        paths.dedup();
+    }
     let path_indexes: BTreeMap<&str, usize> = paths
         .iter()
         .enumerate()
@@ -158,7 +242,7 @@ pub(super) fn compare(before: &Snapshot, after: &Snapshot) -> DiffReport {
                 exe_path_ref: ApplicationPathRef(key.0),
                 sha256: key.1.to_owned(),
             },
-            presence: presence(bg.edges.is_empty(), ag.edges.is_empty()),
+            presence: presence(group_empty(bg), group_empty(ag)),
             changes,
             before: mapped(&bg.edges, &b.edges),
             after: mapped(&ag.edges, &a.edges),
@@ -635,6 +719,41 @@ fn project<'a>(s: &'a Snapshot, paths: &BTreeMap<&str, usize>) -> Projection<'a>
         g.callers.insert(e.caller);
         g.modules.insert(e.module);
     }
+    for (mi, module) in s.modules.iter().enumerate() {
+        let (Some(digest), Some(departed)) = (
+            module.sha256.as_deref(),
+            module.departed_use.as_ref(),
+        ) else {
+            continue;
+        };
+        let mut matched: BTreeSet<usize> = BTreeSet::new();
+        for identity in &departed.identities {
+            let Some(path) = identity
+                .exe_path
+                .as_deref()
+                .filter(|path| !path.is_empty())
+            else {
+                continue;
+            };
+            let Some(index) = paths.get(path) else {
+                continue;
+            };
+            let g = p.applications.entry((*index, digest)).or_default();
+            g.modules.insert(mi);
+            g.departed_identities
+                .push(departed_identity_fact(identity));
+            matched.insert(*index);
+        }
+        for index in matched {
+            let g = p.applications.entry((index, digest)).or_default();
+            g.modules.insert(mi);
+            g.departed_modules.push(departed_module_fact(departed));
+        }
+    }
+    for group in p.applications.values_mut() {
+        group.departed_identities.sort();
+        group.departed_modules.sort();
+    }
     p
 }
 fn population(g: &Group, p: &Prepared) -> PopulationEvidence {
@@ -833,10 +952,45 @@ fn application_changes_for(
     br: &Ranks,
     ar: &Ranks,
 ) -> Vec<&'static str> {
-    if bg.edges.is_empty() || ag.edges.is_empty() {
+    if group_empty(bg) || group_empty(ag) {
         return vec!["content_presence"];
     }
     let mut changes = BTreeSet::new();
+    if bg.departed_identities != ag.departed_identities
+        || bg.departed_modules != ag.departed_modules
+    {
+        changes.insert("departed_use");
+    }
+    if bg.edges.is_empty() || ag.edges.is_empty() {
+        // Fold-transition shape: at least one side holds the group
+        // only as folded rows, so live-edge facets have no rows on
+        // one side. Name the presence transition plus population
+        // differences instead of spraying per-facet codes.
+        if bg.edges.is_empty() != ag.edges.is_empty() {
+            changes.insert("content_presence");
+        }
+        let caller_equal = caller_population(bg, br) == caller_population(ag, ar);
+        let physical_equal = physical_population(bg, br) == physical_population(ag, ar);
+        let caller_facts_equal =
+            full_caller_population(bg, br) == full_caller_population(ag, ar);
+        let module_facts_equal =
+            full_module_population(bg, br) == full_module_population(ag, ar);
+        if !caller_equal {
+            changes.insert("caller_population");
+        }
+        if !physical_equal {
+            changes.insert("physical_records");
+        }
+        if !caller_facts_equal && caller_equal {
+            changes.insert("lifecycle");
+        }
+        if !module_facts_equal && physical_equal {
+            let bi: Vec<_> = bg.modules.iter().copied().collect();
+            let ai: Vec<_> = ag.modules.iter().copied().collect();
+            changes.extend(content_changes_for(&bi, &ai, br, ar));
+        }
+        return changes.into_iter().collect();
+    }
     let caller_equal = caller_population(bg, br) == caller_population(ag, ar);
     let physical_equal = physical_population(bg, br) == physical_population(ag, ar);
     let caller_facts_equal = full_caller_population(bg, br) == full_caller_population(ag, ar);

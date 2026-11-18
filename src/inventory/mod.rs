@@ -8854,6 +8854,15 @@ fn stream_view_guarded(
     Some(presentation)
 }
 
+/// Count one terminal-certification unit; true when the stride
+/// lapped and the stop source asks to abandon the pass. Certification
+/// paces against the same INV-2 stride as fold planning.
+fn cert_unit(units: &mut u64, stop: &dyn Fn() -> bool) -> bool {
+    *units = units.saturating_add(1);
+    units.is_multiple_of(crate::discovery::engine::inventory_coordinator::FOLD_PLAN_STRIDE)
+        && stop()
+}
+
 /// Retire caller rows the last published pass presentation rendered and
 /// whose process is proven ended. The presentation already owns the row's
 /// facts; the coordinator only drops state that no later render can need.
@@ -8866,6 +8875,13 @@ fn retire_rendered_callers<Source: ProcessSource>(
     state: &mut StreamState,
     now_ns: u64,
 ) {
+    // The certification below scans and hashes before the fold's own
+    // entry gate runs, so it paces against the same live stop query:
+    // a stopped pass certifies nothing and notes nothing.
+    let stop = coordinator.stop_query();
+    if stop() {
+        return;
+    }
     let Some(view) = state.last_stream_view.as_ref() else {
         return;
     };
@@ -8879,8 +8895,12 @@ fn retire_rendered_callers<Source: ProcessSource>(
     // exact terminal payload, never on a once-carried digest alone:
     // a stale carried record with a queued exit revision must keep
     // its row until the queued revision lands (the post-fold forget
-    // drops the digest and any queued update together).
+    // drops the digest and any queued update together). A stop
+    // mid-certification abandons the pass: the carry keeps only
+    // fully certified rows, and still-eligible rows re-note next
+    // pass.
     let foldable: Vec<crate::discovery::caller_registry::CallerId> = if stream.emits() {
+        let mut units = 0u64;
         // One per-caller instance index per call, not one scan per
         // candidate: the registry holds instances in one map.
         let mut instances_by_caller: BTreeMap<
@@ -8892,71 +8912,102 @@ fn retire_rendered_callers<Source: ProcessSource>(
                 .entry(record.caller)
                 .or_default()
                 .push(record.id);
+            if cert_unit(&mut units, stop.as_ref()) {
+                return;
+            }
         }
         // The emitted view's identity index, built once and only when
         // an exit candidate exists: only proven-ended callers pay for
         // exact payload comparisons.
         let mut identities: Option<IdentityIndex<'_>> = None;
-        ids.into_iter()
-            .filter(|id| {
-                let candidate = coordinator.adapter().record(*id).is_some_and(|record| {
-                    record.retired
-                        && matches!(
-                            record.lifecycle,
-                            crate::discovery::caller_registry::CallerLifecycle::Exited
-                                | crate::discovery::caller_registry::CallerLifecycle::ExecRetired
-                        )
-                });
-                if !candidate {
-                    // Live rows cannot fold this pass; keep the
-                    // current once-streamed noting so the set still
-                    // reflects the view.
-                    return coordinator
-                        .registry()
-                        .edges_of(*id)
-                        .all(|edge| state.edges.has_record(*id, edge.module))
-                        && instances_by_caller.get(id).is_none_or(|members| {
-                            members
-                                .iter()
-                                .all(|instance| state.instances.has_record(*instance))
-                        });
+        let mut foldable = Vec::new();
+        for id in ids {
+            if cert_unit(&mut units, stop.as_ref()) {
+                return;
+            }
+            let candidate = coordinator.adapter().record(id).is_some_and(|record| {
+                record.retired
+                    && matches!(
+                        record.lifecycle,
+                        crate::discovery::caller_registry::CallerLifecycle::Exited
+                            | crate::discovery::caller_registry::CallerLifecycle::ExecRetired
+                    )
+            });
+            if !candidate {
+                // Live rows cannot fold this pass; keep the
+                // current once-streamed noting so the set still
+                // reflects the view.
+                let streamed = coordinator
+                    .registry()
+                    .edges_of(id)
+                    .all(|edge| state.edges.has_record(id, edge.module))
+                    && instances_by_caller.get(&id).is_none_or(|members| {
+                        members
+                            .iter()
+                            .all(|instance| state.instances.has_record(*instance))
+                    });
+                if streamed {
+                    foldable.push(id);
                 }
-                let index = identities.get_or_insert_with(|| IdentityIndex::new(view));
-                coordinator.registry().edges_of(*id).all(|edge| {
-                    view.edges
-                        .binary_search_by_key(&(edge.caller, edge.module), |row| {
-                            (row.caller, row.module)
-                        })
-                        .ok()
-                        .is_some_and(|at| {
-                            state.edges.terminal_published(
-                                edge.caller,
-                                edge.module,
-                                &view.edges[at],
-                                index,
-                            )
-                        })
-                }) && instances_by_caller.get(id).is_none_or(|members| {
-                    members.iter().all(|instance| {
-                        let (Some(in_at), Some(edge_at)) = (
-                            view.instances
-                                .binary_search_by_key(instance, |row| row.id)
-                                .ok(),
-                            view.semantic_edges
-                                .binary_search_by_key(instance, |row| row.instance)
-                                .ok(),
-                        ) else {
-                            return false;
-                        };
-                        state.instances.terminal_published(
-                            *instance,
-                            &view.instances[in_at],
-                            &view.semantic_edges[edge_at],
-                        )
+                continue;
+            }
+            let index = identities.get_or_insert_with(|| IdentityIndex::new(view));
+            let mut edges_terminal = true;
+            for edge in coordinator.registry().edges_of(id) {
+                if cert_unit(&mut units, stop.as_ref()) {
+                    return;
+                }
+                let terminal = view
+                    .edges
+                    .binary_search_by_key(&(edge.caller, edge.module), |row| {
+                        (row.caller, row.module)
                     })
-                })
-            })
-            .collect()
+                    .ok()
+                    .is_some_and(|at| {
+                        state.edges.terminal_published(
+                            edge.caller,
+                            edge.module,
+                            &view.edges[at],
+                            index,
+                        )
+                    });
+                if !terminal {
+                    edges_terminal = false;
+                    break;
+                }
+            }
+            let mut instances_terminal = true;
+            if let Some(members) = instances_by_caller.get(&id) {
+                for instance in members {
+                    if cert_unit(&mut units, stop.as_ref()) {
+                        return;
+                    }
+                    let (Some(in_at), Some(edge_at)) = (
+                        view.instances
+                            .binary_search_by_key(instance, |row| row.id)
+                            .ok(),
+                        view.semantic_edges
+                            .binary_search_by_key(instance, |row| row.instance)
+                            .ok(),
+                    ) else {
+                        instances_terminal = false;
+                        break;
+                    };
+                    if !state.instances.terminal_published(
+                        *instance,
+                        &view.instances[in_at],
+                        &view.semantic_edges[edge_at],
+                    ) {
+                        instances_terminal = false;
+                        break;
+                    }
+                }
+            }
+            if edges_terminal && instances_terminal {
+                foldable.push(id);
+            }
+        }
+        foldable
     } else {
         ids
     };

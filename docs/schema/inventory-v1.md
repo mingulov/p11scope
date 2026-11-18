@@ -1406,9 +1406,11 @@ never imply S1 loss.
   `ec`, `eddsa`, `xeddsa`, `dh`, `secret` and the rest of the finite
   family vocabulary) and `inferred_size` (the size class derived from
   operation lengths, e.g. `RSA 2048 (from signature length)` with
-  `size_class` 2048 and `modulus_bytes` 256), each `{status, detail,
-  reason, completions}` with `status` one of `inferred`, `unknown`,
-  `conflicting` or `unsupported`. Families infer in both capture
+  `size_class` 2048 and `modulus_bytes` 256), each `{status, value
+  or detail, completions}` (plus conflict carriers when present)
+  with `status` one of `inferred`, `unknown`, `conflicting` or
+  `unsupported`. The named unknown/conflict reasons ride `-v` and
+  JSONL detail, never this closed shape. Families infer in both capture
   modes; sizes infer only with `--key-sizes` (without the flag every
   `inferred_size` reads `unknown` with reason `size_inference_off`
   and no length word is acquired on any path). `metadata_at_use` is

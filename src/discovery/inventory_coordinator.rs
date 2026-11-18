@@ -1462,10 +1462,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Record the run's `--key-sizes` request for the userspace
-    /// inference lane (Task 3 without Task 2 BPF: the reducer and
-    /// text gates; length programs arrive with Task 2).
+    /// inference lane, and pose it on the Joint key-use reducer
+    /// (off-mode lengths drop with `size_inference_off`, never as
+    /// absent evidence). Length programs arrive with BPF length
+    /// capture; until then flag-on runs observe no lengths.
     pub(crate) fn set_key_sizes_requested(&mut self, requested: bool) {
         self.key_sizes_requested = requested;
+        self.registry.set_joint_key_sizes(requested);
     }
 
     /// Whether `--key-sizes` was requested for this run.

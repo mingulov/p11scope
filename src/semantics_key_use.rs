@@ -2786,12 +2786,18 @@ impl KeyUseReducer {
     }
 
     /// Admit (`true`) or drop (`false`, `size_inference_off`)
-    /// `--key-sizes` length evidence. Seams and harnesses pose the
-    /// off mode through this; production on-mode is the default
-    /// (off-mode carries no trailers, so no production wiring).
-    #[cfg(test)]
+    /// `--key-sizes` length evidence. The run setup poses the flag
+    /// through this; on-mode is the default. Even without trailers
+    /// off-mode must read `size_inference_off`, never absent
+    /// evidence, so the default never substitutes for the wiring.
     pub(crate) fn set_key_sizes(&mut self, key_sizes: bool) {
         self.key_sizes = key_sizes;
+    }
+
+    /// Whether this reducer admits length evidence (wiring pin only).
+    #[cfg(test)]
+    pub(crate) fn key_sizes_enabled(&self) -> bool {
+        self.key_sizes
     }
 
     /// Retained per-bucket inferred keys, for the projection.

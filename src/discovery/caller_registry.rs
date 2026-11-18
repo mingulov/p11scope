@@ -4509,6 +4509,12 @@ impl CallerRegistry {
         self.uncovered_reason = reason;
     }
 
+    /// Pose the run's `--key-sizes` request on the Joint key-use
+    /// reducer, so off-mode lengths drop with `size_inference_off`.
+    pub(crate) fn set_joint_key_sizes(&mut self, requested: bool) {
+        self.joint_keyuse.set_key_sizes(requested);
+    }
+
     /// Tests-only reference wiring (N1): bind one module key to one
     /// caller edge, retained exactly as a mapped admission would
     /// leave it. Skips admission verdicts: the guarded-path tests

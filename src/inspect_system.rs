@@ -12843,52 +12843,61 @@ mod bind_collection_strict_tests {
         );
     }
 
-    /// Binder refusal reasons embed the target pathname first. A directory
-    /// component containing the verified-absence marker must not turn the
-    /// loss into a note (and the catalog complete).
+    /// Bind gaps file by source, not by reason text: every binder
+    /// refusal shape whose pathname contains the verified-absence marker
+    /// still lands in `skipped`, while genuine verified absence in
+    /// ordinary gaps still lands in `notes`.
     #[test]
-    fn marker_pathname_binder_refusal_still_truncates() {
-        use crate::discovery::scan::{
-            NO_TABLE_FOUND_MARKER, no_table_found_reason, scan_skip_truncates,
-        };
-        let plain = no_table_found_reason("/opt/p11.so", false);
-        let hinted = no_table_found_reason("/opt/p11.so", true);
-        assert!(
-            !scan_skip_truncates(&plain),
-            "genuine absence stays benign: {plain:?}"
-        );
-        assert!(
-            !scan_skip_truncates(&hinted),
-            "hinted absence stays benign: {hinted:?}"
-        );
-        assert!(
-            !scan_skip_truncates(NO_TABLE_FOUND_MARKER),
-            "bare marker stays benign"
-        );
+    fn bind_gaps_with_marker_pathnames_stay_losses_by_source() {
+        use crate::discovery::scan::{NO_TABLE_FOUND_MARKER, no_table_found_reason};
         let marker_path = format!("/tmp/{NO_TABLE_FOUND_MARKER}/libprobe.so");
-        for reason in [
-            format!(
-                "{marker_path} does not define C_Initialize at the uncorroborated offset \
-                 and the offset is not a proven function entry; entry was not attached"
+        let refusal = |subject: &str, suffix: &str| {
+            PidGap::member(
+                7,
+                Skipped {
+                    subject: subject.into(),
+                    reason: format!("{marker_path}{suffix}"),
+                },
+            )
+        };
+        let bind_gaps = vec![
+            refusal(
+                "C_Initialize",
+                " does not define C_Initialize at the uncorroborated offset and the \
+                 offset is not a proven function entry; entry was not attached",
             ),
-            format!(
-                "{marker_path} has a different target ABI from its provider; \
-                 entry was not attached"
+            refusal(
+                "C_Initialize",
+                " has a different target ABI from its provider; entry was not attached",
             ),
-            format!(
-                "{marker_path} could not be reconciled to a comparable pinned object; \
-                 entry was not attached"
+            refusal(
+                "C_Initialize",
+                " could not be reconciled to a comparable pinned object; entry was not \
+                 attached",
             ),
-        ] {
-            assert!(
-                scan_skip_truncates(&reason),
-                "a marker pathname must not hide a refusal: {reason:?}"
-            );
-        }
-        assert!(scan_skip_truncates(
-            "/opt/p11.so does not define C_Initialize at the uncorroborated offset \
-             and the offset is not a proven function entry; entry was not attached"
-        ));
+            refusal(
+                "C_GetFunctionList",
+                " does not define C_GetFunctionList at the forwarded offset; entry was not \
+                 attached",
+            ),
+        ];
+        let gaps = vec![PidGap::member(
+            9,
+            Skipped {
+                subject: "/opt/b.so".into(),
+                reason: no_table_found_reason("/opt/b.so", false),
+            },
+        )];
+        let (skipped, notes) = split_gaps(gaps, bind_gaps);
+        assert_eq!(
+            skipped.len(),
+            4,
+            "marker pathnames must not hide refusals: {skipped:?}"
+        );
+        assert!(skipped.iter().all(|gap| gap.pid == Some(7)), "{skipped:?}");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].pid, Some(9));
+        assert_eq!(notes[0].subject, "/opt/b.so");
     }
 
     /// End-to-end pathname case: a real provider file copied under a

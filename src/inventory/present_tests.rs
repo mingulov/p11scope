@@ -3888,11 +3888,13 @@ fn concise_snapshot_names_folded_modules_and_gates_the_absence_line() {
     );
     let module = presentation.modules[0].id;
     let name = module_display_name(&presentation, module);
-    let mut departed = DepartedUse::default();
-    departed.callers = 2;
-    departed.edges = 3;
-    departed.entries = 9;
-    departed.identities_dropped = 3;
+    let mut departed = DepartedUse {
+        callers: 2,
+        edges: 3,
+        entries: 9,
+        identities_dropped: 3,
+        ..Default::default()
+    };
     for (slot, caller) in [4242u32, 4243].into_iter().enumerate() {
         let id = CallerId(caller);
         departed.identities.insert(

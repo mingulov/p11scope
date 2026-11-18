@@ -7905,6 +7905,247 @@ mod promotion_lifecycle_tests {
             .expect("the live test process admits")
     }
 
+    /// Install one admitted caller's semantic state the way a healthy
+    /// H0 admission leaves it: a binding through the production
+    /// insert (real budget enforcement) plus its accepted-scan
+    /// history, each holding the given pidfd custody.
+    fn install_admitted(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        caller: CallerId,
+        domain: NativeDomainId,
+        cookie: u64,
+        module_ino: u64,
+        binding_pin: Arc<PidPin>,
+        history_pin: Arc<PidPin>,
+    ) {
+        let image = ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 1,
+        };
+        coordinator
+            .semantic_bindings
+            .insert(SemanticCallerBinding::scripted(
+                caller,
+                module_key(module_ino),
+                domain,
+                image,
+                binding_pin,
+            ))
+            .expect("each cycle's binding fits the recycled budget");
+        coordinator.semantic_bindings.admission_images.insert(
+            caller,
+            SemanticAdmissionHistory {
+                domain,
+                image,
+                incarnation: 1,
+                generation: crate::inspect_system::MemberGeneration {
+                    start_time: None,
+                    exe: None,
+                },
+                pin: history_pin,
+                initial_scope_cut: false,
+                pending_gap: None,
+            },
+        );
+    }
+
+    /// Retire one caller through exec transition and fold it through
+    /// the real publication fold. Returns the fold receipt's retired
+    /// count.
+    fn retire_and_fold(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        caller: CallerId,
+        now_ns: u64,
+    ) -> u64 {
+        coordinator
+            .adapter_mut()
+            .exec_transition_scoped(caller, now_ns);
+        coordinator.note_rendered_callers(&[caller]);
+        coordinator.retire_rendered_callers(now_ns, None).retired
+    }
+
+    /// F2 capacity twin: 4,096 sequential admit/bind/fold cycles in one
+    /// domain at low live occupancy, then one more healthy join. The
+    /// fold must recycle the semantic budget: the 4,097th distinct
+    /// admission must not refuse `Capacity`, and late receipts for a
+    /// folded caller fail closed.
+    #[test]
+    fn folded_callers_release_semantic_capacity_for_readmission() {
+        use crate::discovery::instances::MAX_INSTANCES;
+        let mut coordinator = coordinator();
+        let domain = domain();
+        let mut last_folded = None;
+        for cycle in 0..MAX_INSTANCES {
+            let caller = admit_self(&mut coordinator);
+            install_admitted(
+                &mut coordinator,
+                caller,
+                domain,
+                1000 + cycle as u64,
+                5000 + cycle as u64,
+                pin(),
+                pin(),
+            );
+            assert_eq!(
+                retire_and_fold(&mut coordinator, caller, 200 + cycle as u64),
+                1,
+                "cycle {cycle}: the rendered exited row folds"
+            );
+            last_folded = Some(caller);
+        }
+        assert!(
+            coordinator.adapter().len() <= 1,
+            "low live occupancy throughout: {} retained",
+            coordinator.adapter().len()
+        );
+        // One more healthy join past the old budget: the 4,097th
+        // distinct admission in the same domain.
+        let joiner = admit_self(&mut coordinator);
+        coordinator
+            .semantic_bindings
+            .insert(SemanticCallerBinding::scripted(
+                joiner,
+                module_key(9999),
+                domain,
+                image(),
+                pin(),
+            ))
+            .expect("the recycled budget admits one more healthy join");
+        assert_eq!(
+            coordinator.semantic_bindings.len(),
+            1,
+            "only the healthy join holds a binding"
+        );
+        assert!(
+            coordinator
+                .semantic_bindings
+                .admission_images
+                .is_empty(),
+            "folded histories leave the table: {} retained",
+            coordinator.semantic_bindings.admission_images.len()
+        );
+        // Late old-image receipts fail closed: the folded callers are
+        // gone, so a re-bind of one refuses without custody.
+        let folded = last_folded.expect("cycles folded");
+        assert!(coordinator.adapter().record(folded).is_none());
+        let mut identity = crate::discovery::native_binding::ScanOnlyIdentity;
+        assert_eq!(
+            coordinator.bind_semantic_caller(folded, module_key(1), domain, image(), &mut identity),
+            Err(SemanticBindingRefusal::NoLiveCaller),
+            "a late receipt for a folded caller refuses"
+        );
+    }
+
+    /// F2 custody twin: folded callers release their pidfd custody.
+    /// Sixty-four admitted callers share one real pidfd (one binding
+    /// clone plus one history clone each); after the folds only the
+    /// test's own clone remains, so the descriptor closes with it
+    /// instead of staying pinned 128 times.
+    #[test]
+    fn folded_callers_release_pidfd_custody() {
+        let mut coordinator = coordinator();
+        let domain = domain();
+        let shared = pin();
+        for cycle in 0..64u64 {
+            let caller = admit_self(&mut coordinator);
+            install_admitted(
+                &mut coordinator,
+                caller,
+                domain,
+                2000 + cycle,
+                6000 + cycle,
+                shared.clone(),
+                shared.clone(),
+            );
+            assert_eq!(
+                retire_and_fold(&mut coordinator, caller, 200 + cycle),
+                1,
+                "cycle {cycle}: the rendered exited row folds"
+            );
+        }
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "64 folded callers hold no pidfd clones"
+        );
+        assert_eq!(coordinator.semantic_bindings.len(), 0);
+        assert!(coordinator.semantic_bindings.admission_images.is_empty());
+    }
+
+    /// F2 quiescence twin: a retained sealed gap pins its caller until
+    /// the normal finalizer drains it, then the next pass folds and
+    /// releases. The gap is never dropped silently.
+    #[test]
+    fn fold_defers_while_semantic_gap_pends_then_releases() {
+        let mut coordinator = coordinator();
+        let domain = domain();
+        let caller = admit_self(&mut coordinator);
+        let image = image();
+        coordinator
+            .semantic_bindings
+            .insert(SemanticCallerBinding::scripted(
+                caller,
+                module_key(7777),
+                domain,
+                image,
+                pin(),
+            ))
+            .expect("the binding fits");
+        coordinator.semantic_bindings.admission_images.insert(
+            caller,
+            SemanticAdmissionHistory {
+                domain,
+                image,
+                incarnation: 1,
+                generation: crate::inspect_system::MemberGeneration {
+                    start_time: None,
+                    exe: None,
+                },
+                pin: pin(),
+                initial_scope_cut: true,
+                pending_gap: Some(crate::semantic_capture::PhysicalSemanticGap::adjudicated(
+                    domain,
+                    image,
+                    pin(),
+                )),
+            },
+        );
+        coordinator
+            .adapter_mut()
+            .exec_transition_scoped(caller, 200);
+        coordinator.note_rendered_callers(&[caller]);
+        assert_eq!(
+            coordinator.retire_rendered_callers(300, None).retired,
+            0,
+            "a pending semantic gap pins the row"
+        );
+        assert!(coordinator.adapter().record(caller).is_some());
+        assert!(
+            coordinator
+                .semantic_bindings
+                .admission_images
+                .contains_key(&caller)
+        );
+        // The normal finalizer drains the sealed gap; the next pass
+        // folds and releases.
+        let (gaps, _) = coordinator.assemble_tail_gaps();
+        assert_eq!(gaps.len(), 1, "the sealed gap drains exactly once");
+        coordinator.note_rendered_callers(&[caller]);
+        assert_eq!(
+            coordinator.retire_rendered_callers(400, None).retired,
+            1,
+            "the drained row folds next pass"
+        );
+        assert!(coordinator.adapter().record(caller).is_none());
+        assert!(coordinator.semantic_bindings.get(caller).is_none());
+        assert!(
+            !coordinator
+                .semantic_bindings
+                .admission_images
+                .contains_key(&caller)
+        );
+    }
+
     fn liveness_pair(caller: CallerId, module: ModuleId) -> PromotionPair {
         PromotionPair::new(caller.0, module.0)
     }

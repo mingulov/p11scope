@@ -1409,8 +1409,8 @@ never imply S1 loss.
   `size_class` 2048 and `modulus_bytes` 256), each `{status, value
   or detail, completions}` (plus conflict carriers when present)
   with `status` one of `inferred`, `unknown`, `conflicting` or
-  `unsupported`. The named unknown/conflict reasons ride `-v` and
-  JSONL detail, never this closed shape. Families infer in both capture
+  `unsupported`. The named unknown/conflict reasons ride `-v` text,
+  never this closed shape. Families infer in both capture
   modes; sizes infer only with `--key-sizes` (without the flag every
   `inferred_size` reads `unknown` with reason `size_inference_off`
   and no length word is acquired on any path). `metadata_at_use` is
@@ -1423,7 +1423,10 @@ never imply S1 loss.
   two disagreeing sides and count the rest. Version 7 adds the
   `corroboration_mismatch` gap reason: the corroborating length
   disagreed with the terminal length, which still classifies
-  (versions 1–6 never carry it).
+  (versions 1–6 never carry it). Version 7 also adds the
+  `wrapped_park_refused` gap reason: a wrapped-material park was
+  refused past the park budget (inference-side; rows intact,
+  coverage populated; versions 1–6 never carry it).
 - `unknown_key_operations[]` (sorted by category and reason) holds
   capture-wide unknown-key summaries without `started` (starts are
   never fabricated into the unknown bucket).

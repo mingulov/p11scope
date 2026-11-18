@@ -1769,7 +1769,7 @@ Limits that matter in pods:
   operation lengths: families infer in both modes, sizes only with
   the flag (without it no length word is acquired on any path).
   The summary line then carries a parenthetical tally (for example
-  `(probably RSA: 2; RSA 2048: 1)`); with `-v`, one row line per
+  `(probably RSA: 2; probably RSA 2048: 1)`); with `-v`, one row line per
   key names the inference (`  key row test-instance object 11 sign
   key (unknown): probably RSA (from mechanism); RSA 2048 (from
   signature length)`), conflicting sides pin the first two and count

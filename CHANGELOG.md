@@ -36,6 +36,14 @@ versioned separately and are opaque, exact dispatch keys.
   HKDF (`CKK_HKDF`, value lengths 12/48) and Edwards/Montgomery
   (`ec_edwards`/`ec_montgomery` with ed25519/ed448/x25519/x448) keys
   label without a query; versions 1–5 stay frozen and byte-stable.
+- Inferred key families and sizes on `--key-operations` rows
+  (section version 7): families infer from operation mechanisms in
+  both modes, sizes infer from operation lengths with the new
+  `--key-sizes` opt-in (needs `--key-operations`, off by default;
+  without it every size reads unknown and no length word is
+  acquired). Text gains parenthetical tallies plus `-v` per-row
+  lines, CBOM qualification counts inferred use without reading
+  inferred facts, and versions 1–6 stay frozen and byte-stable.
 
 ### Changed
 

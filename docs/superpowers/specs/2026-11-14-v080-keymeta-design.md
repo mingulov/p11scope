@@ -1308,9 +1308,9 @@ On every `key_operations[]` row (absent below v7):
 ```
 
 `unknown`: no evidence or evidence outside every map (§5.3, with the
-named reason in `-v`/JSONL detail, not in this closed shape).
+named reason in `-v` text, not in this closed shape).
 With `--key-sizes` off, `inferred_size` is always `unknown` with
-the `-v`/JSONL reason `size_inference_off` ("needs --key-sizes");
+the `-v` text reason `size_inference_off` ("needs --key-sizes");
 `inferred_family` is unaffected and infers in both modes.
 `conflicting`: two distinct values observed — `detail` holds the
 first, the second rides `conflict_detail` (same shape; omitted when

@@ -591,4 +591,110 @@ mod tests {
             }
         }
     }
+
+    /// Entry-fetch mask (§5.1, §8.2): the exact argument words the
+    /// length entry may acquire for one canonical descriptor, as a
+    /// bit per index. S rows mask their cell plus their disjointness
+    /// base (the only two argument words the S guards consult);
+    /// V rows mask their scalar alone (snapshotted, never
+    /// dereferenced). Zero refuses before any fetch: count-only,
+    /// narrowed, out-of-range, unlisted, corrupt and info
+    /// descriptors acquire nothing — acquisition itself is bounded
+    /// by the approved named positions, including on count-only
+    /// calls. Index 0 is never masked; only the two KEM length rows
+    /// mask index 6.
+    #[test]
+    fn length_entry_fetch_mask_pins_approved_positions() {
+        let expected: [(&str, u8); 11] = [
+            ("C_Sign", 0x18),
+            ("C_SignRecover", 0x18),
+            ("C_SignFinal", 0x06),
+            ("C_Verify", 0x10),
+            ("C_VerifyFinal", 0x04),
+            ("C_Encrypt", 0x18),
+            ("C_Decrypt", 0x04),
+            ("C_WrapKey", 0x30),
+            ("C_UnwrapKey", 0x10),
+            ("C_EncapsulateKey", 0x60),
+            ("C_DecapsulateKey", 0x40),
+        ];
+        for (name, mask) in expected {
+            let descriptor = function_ordinal(name) + 1;
+            assert_eq!(
+                length_entry_fetch_mask(descriptor),
+                mask,
+                "{name}: entry-fetch mask"
+            );
+            // The mask is exactly the row's named positions: the S
+            // cell plus its §5.1 base, or the V scalar alone.
+            let row = evidence_position(descriptor - 1).expect("a length row");
+            assert!(!row.info, "{name}: not an info row");
+            let mut positions = 0u8;
+            for arg in [row.length_cell_arg, row.length_scalar_arg] {
+                if arg != ARG_NONE {
+                    assert!(arg <= 6, "{name}: position {arg} within args");
+                    positions |= 1 << arg;
+                }
+            }
+            if row.length_cell_arg != ARG_NONE {
+                let base = length_buffer_base(descriptor - 1);
+                assert_ne!(base, ARG_NONE, "{name}: an S-row has its base");
+                assert!(base <= 6, "{name}: base {base} within args");
+                positions |= 1 << base;
+            }
+            assert_eq!(positions, mask, "{name}: mask covers the named words");
+        }
+        // Every refusal shape masks zero: narrowed/count-only zero,
+        // unlisted endpoints, the three info markers, out-of-range.
+        assert_eq!(length_entry_fetch_mask(0), 0, "narrowed/count-only: no fetch");
+        for name in [
+            "C_Initialize",
+            "C_GetSlotInfo",
+            "C_SignInit",
+            "C_Digest",
+            "C_GenerateKey",
+        ] {
+            assert_eq!(
+                length_entry_fetch_mask(function_ordinal(name) + 1),
+                0,
+                "{name}: unlisted, no fetch"
+            );
+        }
+        for name in ["C_GetInfo", "C_GetTokenInfo", "C_GetMechanismInfo"] {
+            assert_eq!(
+                length_entry_fetch_mask(function_ordinal(name) + 1),
+                0,
+                "{name}: info, no fetch"
+            );
+        }
+        for descriptor in [MAX_DESCRIPTORS, MAX_DESCRIPTORS + 1, u32::MAX] {
+            assert_eq!(
+                length_entry_fetch_mask(descriptor),
+                0,
+                "descriptor {descriptor}: out of range, no fetch"
+            );
+        }
+        // Whole-descriptor sweep: the mask refuses exactly the
+        // endpoints the return dispatch sends to the base pair, never
+        // masks index 0, and masks index 6 only for the two KEM rows.
+        let kem = [
+            function_ordinal("C_EncapsulateKey") + 1,
+            function_ordinal("C_DecapsulateKey") + 1,
+        ];
+        for descriptor in 0..MAX_DESCRIPTORS {
+            let mask = length_entry_fetch_mask(descriptor);
+            assert_eq!(
+                mask != 0,
+                length_kind_for_descriptor(descriptor).is_some(),
+                "descriptor {descriptor}: mask and return dispatch agree"
+            );
+            assert_eq!(mask & 0x01, 0, "descriptor {descriptor}: index 0 never fetched");
+            if mask & 0x40 != 0 {
+                assert!(
+                    kem.contains(&descriptor),
+                    "descriptor {descriptor}: only KEM rows fetch index 6"
+                );
+            }
+        }
+    }
 }

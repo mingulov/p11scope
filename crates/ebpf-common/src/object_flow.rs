@@ -4313,6 +4313,123 @@ mod tests {
         }
     }
 
+    /// Fetch-seam twin (§5.1, §8.2): on the positive path the entry
+    /// adapter fetches exactly the masked positions for all eleven
+    /// rows on both ABIs — the S cell then its §5.1 base, or the V
+    /// scalar alone — and on every refusal shape (count-only zero
+    /// including the narrowed path, unlisted, info, out-of-range)
+    /// it fetches nothing. The BPF stash prefetches through the
+    /// same mask, so the spy sees the production fetch set: any
+    /// extra acquisition fails here.
+    #[test]
+    fn length_entry_adapter_fetches_only_masked_positions() {
+        use crate::MAX_DESCRIPTORS;
+        use crate::evidence_table::length_entry_fetch_mask;
+        let s_rows = [
+            ("C_Sign", 4u8, 3u8),
+            ("C_SignRecover", 4, 3),
+            ("C_SignFinal", 2, 1),
+            ("C_Encrypt", 4, 3),
+            ("C_WrapKey", 5, 4),
+            ("C_EncapsulateKey", 6, 5),
+        ];
+        let v_rows = [
+            ("C_Verify", 4u8),
+            ("C_VerifyFinal", 2),
+            ("C_Decrypt", 2),
+            ("C_UnwrapKey", 4),
+            ("C_DecapsulateKey", 6),
+        ];
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for (name, cell_arg, base_arg) in s_rows {
+                let cell = 0x20_0000u64;
+                let base = 0x10_0000u64;
+                let mut spy = LengthSpy::new(
+                    length_args(&[(cell_arg, Some(cell)), (base_arg, Some(base))]),
+                    Ok(256),
+                );
+                let mut out = EvidenceStart::default();
+                let descriptor = length_descriptor(name);
+                assert!(
+                    spy.run_entry(&mut out, descriptor, layout, 0x3030),
+                    "{name} {layout:?}: positive path retains"
+                );
+                assert_eq!(
+                    spy.fetches.as_slice(),
+                    &[cell_arg, base_arg],
+                    "{name} {layout:?}: cell then base, nothing else"
+                );
+                let mask = length_entry_fetch_mask(descriptor);
+                assert_eq!(
+                    mask,
+                    (1 << cell_arg) | (1 << base_arg),
+                    "{name}: mask covers exactly the fetched words"
+                );
+            }
+            for (name, scalar_arg) in v_rows {
+                let mut spy = LengthSpy::new(
+                    length_args(&[(scalar_arg, Some(128))]),
+                    Ok(256),
+                );
+                let mut out = EvidenceStart::default();
+                let descriptor = length_descriptor(name);
+                assert!(
+                    spy.run_entry(&mut out, descriptor, layout, 0x3030),
+                    "{name} {layout:?}: positive path retains"
+                );
+                assert_eq!(
+                    spy.fetches.as_slice(),
+                    &[scalar_arg],
+                    "{name} {layout:?}: scalar alone, nothing else"
+                );
+                assert_eq!(
+                    length_entry_fetch_mask(descriptor),
+                    1 << scalar_arg,
+                    "{name}: mask covers exactly the fetched word"
+                );
+            }
+            // Refusal shapes fetch nothing on either ABI: the
+            // narrowed path resolves descriptor 0, like count-only.
+            let mut refused = vec![0, MAX_DESCRIPTORS, MAX_DESCRIPTORS + 1, u32::MAX];
+            for name in [
+                "C_Initialize",
+                "C_SignInit",
+                "C_GetInfo",
+                "C_GetTokenInfo",
+                "C_GetMechanismInfo",
+            ] {
+                refused.push(length_descriptor(name));
+            }
+            for descriptor in refused {
+                let mut spy = LengthSpy::new(
+                    length_args(&[
+                        (1, Some(0x30_0000)),
+                        (2, Some(0x20_0000)),
+                        (3, Some(0x10_0000)),
+                        (4, Some(0x20_0000)),
+                        (5, Some(0x10_0000)),
+                        (6, Some(0x20_0000)),
+                    ]),
+                    Ok(256),
+                );
+                let mut out = EvidenceStart::default();
+                assert!(
+                    !spy.run_entry(&mut out, descriptor, layout, 1),
+                    "descriptor {descriptor} {layout:?}: no retention"
+                );
+                assert!(
+                    spy.fetches.is_empty(),
+                    "descriptor {descriptor} {layout:?}: zero fetches"
+                );
+                assert_eq!(
+                    length_entry_fetch_mask(descriptor),
+                    0,
+                    "descriptor {descriptor}: mask refuses before any fetch"
+                );
+            }
+        }
+    }
+
     /// Terminal CKR_OK reads: S-cells read the word once at the
     /// retained cell (query shapes included — BPF cannot tell, so it
     /// reads and userspace drops the value); V-scalars resolve to the

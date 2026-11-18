@@ -338,16 +338,18 @@ fn end_length_header_trailer_and_absent_tail_initialize_in_poisoned_storage() {
     assert!(bytes.iter().all(|byte| *byte == 0xa5));
 }
 
-/// Length stash (v0.8.0 keymeta Task 2): every register argument is
-/// read with a compile-time-constant index. A dynamic index into
-/// `arg_u64` becomes register-offset pt_regs arithmetic (`ctx +=
-/// reg`), which the kernel verifier rejects with "dereference of
-/// modified ctx ptr" on every kernel (observed on 6.6/6.12/7.0);
-/// the adapter selects positions at runtime, so the stash
-/// pre-fetches args 0..=6 (LP64 regs plus the SP+8 stack slot)
-/// with literals and the fetch closure only indexes that array.
+/// Length stash (v0.8.0 keymeta Task 2): only the approved named
+/// argument words are acquired, each with a compile-time-constant
+/// index. A dynamic index into `arg_u64` becomes register-offset
+/// pt_regs arithmetic (`ctx += reg`), which the kernel verifier
+/// rejects with "dereference of modified ctx ptr" on every kernel
+/// (observed on 6.6/6.12/7.0); the indices stay literal, but every
+/// fetch is guarded by the row's entry-fetch mask, and a zero mask
+/// (count-only, narrowed, unlisted, corrupt, info) deletes any
+/// stale row and returns before the first fetch. Index 0 is never
+/// an approved length position and is never fetched.
 #[test]
-fn length_stash_prefetches_register_args_with_literal_indices() {
+fn length_stash_fetches_only_masked_args_with_literal_indices() {
     const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
     fn stash_body(source: &str) -> Option<&str> {
         source
@@ -359,24 +361,56 @@ fn length_stash_prefetches_register_args_with_literal_indices() {
         let Some(text) = stash_body(source) else {
             return false;
         };
-        (0..=6).all(|index| text.contains(&format!("arg_u64(ctx, {index}, layout)")))
+        // The mask refusal precedes the first acquisition: the head
+        // before the first fetch resolves the mask, deletes any
+        // stale row and returns on zero.
+        let Some(first_fetch) = text.find("arg_u64(ctx,") else {
+            return false;
+        };
+        let head = &text[..first_fetch];
+        head.contains("length_entry_fetch_mask(descriptor)")
+            && head.contains("EVIDENCE_START.remove(key)")
+            && head.contains("return;")
+            // Every fetched index is a guarded literal; index 0 is
+            // never fetched and no dynamic index exists.
+            && (1..=6).all(|index| {
+                text.contains(&format!("arg_u64(ctx, {index}, layout)"))
+                    && text.contains(&format!("if mask & 0x{:02x} != 0", 1u8 << index))
+            })
+            && !text.contains("arg_u64(ctx, 0, layout)")
             && !text.contains("arg_u64(ctx, index")
     }
     assert!(
         contract(SOURCE),
-        "stash_length_entry must pre-fetch args 0..=6 with literal indices"
+        "stash_length_entry must refuse on a zero mask before fetching, then fetch only masked args 1..=6 with guarded literal indices"
     );
     let start = SOURCE.find("    fn stash_length_entry(").unwrap();
-    for index in 0..=6 {
+    for index in 1..=6 {
         let marker = format!("arg_u64(ctx, {index}, layout)");
         let tail = SOURCE[start..].replacen(&marker, "REMOVED", 1);
         assert!(
             !contract(&format!("{}{}", &SOURCE[..start], tail)),
             "removed {marker}"
         );
+        let guard = format!("if mask & 0x{:02x} != 0", 1u8 << index);
+        let tail = SOURCE[start..].replacen(&guard, "if true", 1);
+        assert!(
+            !contract(&format!("{}{}", &SOURCE[..start], tail)),
+            "unguarded {marker}"
+        );
     }
     let tail =
-        SOURCE[start..].replacen("arg_u64(ctx, 0, layout)", "arg_u64(ctx, index, layout)", 1);
+        SOURCE[start..].replacen("length_entry_fetch_mask(descriptor)", "REMOVED", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "an unmasked stash must fail the contract"
+    );
+    let tail = SOURCE[start..].replacen("arg_u64(ctx, 1, layout)", "arg_u64(ctx, 0, layout)", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "an index-0 fetch must fail the contract"
+    );
+    let tail = SOURCE[start..].replacen("arg_u64(ctx, 1, layout)", "arg_u64(ctx, index, layout)", 1);
     assert!(
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
         "a dynamic fetch index must fail the contract"

@@ -717,6 +717,12 @@ pub(crate) struct NativeBinder {
     metadata_clock_qualified: bool,
     #[cfg(test)]
     current_binding_clock: Option<fn() -> Option<u64>>,
+    /// Pending rows examined by retired-caller releases (test count).
+    #[cfg(test)]
+    release_pending_visits: u64,
+    /// Cookie sequences examined by retired-caller releases (test count).
+    #[cfg(test)]
+    release_cookie_visits: u64,
 }
 
 impl NativeBinder {
@@ -734,6 +740,10 @@ impl NativeBinder {
             metadata_clock_qualified: false,
             #[cfg(test)]
             current_binding_clock: None,
+            #[cfg(test)]
+            release_pending_visits: 0,
+            #[cfg(test)]
+            release_cookie_visits: 0,
         }
     }
 
@@ -1018,19 +1028,28 @@ impl NativeBinder {
     /// cached binding makes any later row for that image read unknown,
     /// never attribute to a caller record that no longer exists.
     pub(crate) fn release_retired_caller(&mut self, id: CallerId) -> bool {
-        if self.domains.iter().any(|domain| {
-            domain.pending.iter().any(|pending| {
-                pending.sighting.as_ref().is_some_and(|s| s.caller == id)
+        for domain in &self.domains {
+            for pending in &domain.pending {
+                #[cfg(test)]
+                {
+                    self.release_pending_visits = self.release_pending_visits.saturating_add(1);
+                }
+                if pending.sighting.as_ref().is_some_and(|s| s.caller == id)
                     || pending.retained.is_some_and(|retained| retained.id == id)
-            })
-        }) {
-            return false;
+                {
+                    return false;
+                }
+            }
         }
         for domain in &mut self.domains {
             domain.callers.remove(&id);
             domain.ended.remove(&id);
             for execs in domain.cookies.values_mut() {
                 for seen in execs.values_mut() {
+                    #[cfg(test)]
+                    {
+                        self.release_cookie_visits = self.release_cookie_visits.saturating_add(1);
+                    }
                     if seen.bound == Some(id) {
                         seen.bound = None;
                     }
@@ -1038,6 +1057,141 @@ impl NativeBinder {
             }
         }
         true
+    }
+
+    /// Test-only: pending rows examined by retired-caller releases.
+    #[cfg(test)]
+    pub(crate) fn release_pending_visits_for_test(&self) -> u64 {
+        self.release_pending_visits
+    }
+
+    /// Test-only: cookie sequences examined by retired-caller releases.
+    #[cfg(test)]
+    pub(crate) fn release_cookie_visits_for_test(&self) -> u64 {
+        self.release_cookie_visits
+    }
+
+    /// Test-only: stage one cookie sequence bound to `bound` (or
+    /// unbound), like a decided row left it.
+    #[cfg(test)]
+    pub(crate) fn stage_cookie_for_test(
+        &mut self,
+        domain: NativeDomainId,
+        ticket: u64,
+        exec: u64,
+        bound: Option<CallerId>,
+    ) {
+        let index = self.domain_index(domain);
+        self.domains[index]
+            .cookies
+            .entry(DomainCookie::new(domain, ticket))
+            .or_default()
+            .insert(
+                exec,
+                ExecSeen {
+                    bound,
+                    last_t0_ns: 0,
+                    last_tgid: 0,
+                },
+            );
+    }
+
+    /// Test-only: stage one pending row sighting `caller` (its horizons
+    /// uncovered, so it stays pending until drained).
+    #[cfg(test)]
+    pub(crate) fn stage_pending_sighting_for_test(
+        &mut self,
+        domain: NativeDomainId,
+        caller: CallerId,
+        ticket: u64,
+    ) {
+        let index = self.domain_index(domain);
+        self.domains[index].pending.push_back(Pending {
+            row: WitnessRow::scripted(
+                domain,
+                ticket,
+                1,
+                crate::discovery::inventory_attach_set::AttachObjectId::scripted(0),
+                crate::discovery::inventory_attach_set::EndpointId(0),
+                0,
+                0,
+            ),
+            read_ns: None,
+            sighting: Some(Sighting {
+                caller,
+                first_seen_ns: 0,
+                query: CookieQuery::NoCookie,
+            }),
+            retained: None,
+        });
+        self.census.pending = self.census.pending.saturating_add(1);
+    }
+
+    /// Test-only: stage one pending row with a retained fallback for
+    /// `caller` (its horizons uncovered, so it stays pending).
+    #[cfg(test)]
+    pub(crate) fn stage_pending_retained_for_test(
+        &mut self,
+        domain: NativeDomainId,
+        caller: CallerId,
+        ticket: u64,
+    ) {
+        let index = self.domain_index(domain);
+        self.domains[index].pending.push_back(Pending {
+            row: WitnessRow::scripted(
+                domain,
+                ticket,
+                1,
+                crate::discovery::inventory_attach_set::AttachObjectId::scripted(0),
+                crate::discovery::inventory_attach_set::EndpointId(0),
+                0,
+                0,
+            ),
+            read_ns: None,
+            sighting: None,
+            retained: Some(RetainedCaller {
+                id: caller,
+                first_seen_ns: 0,
+                last_seen_ns: 0,
+                retired: true,
+                start_time: Some(1),
+                exe_present: true,
+                exec_observed: true,
+                lifecycle: CallerLifecycle::Exited,
+            }),
+        });
+        self.census.pending = self.census.pending.saturating_add(1);
+    }
+
+    /// Test-only: drain pending rows through the production decide
+    /// path after covering their horizons (the trigger is test
+    /// scaffolding; every decision is production).
+    #[cfg(test)]
+    pub(crate) fn drain_pending_for_test(&mut self, domain: NativeDomainId) {
+        let index = self.domain_index(domain);
+        for pending in &mut self.domains[index].pending {
+            pending.read_ns = Some(1);
+        }
+        self.domains[index].lifecycle_ns = Some(2);
+        self.domains[index].health_ns = Some(2);
+        self.decide_ready(index);
+    }
+
+    /// Test-only: every caller still bound to a cookie sequence.
+    #[cfg(test)]
+    pub(crate) fn cookie_bound_owners_for_test(&self) -> Vec<CallerId> {
+        let mut owners = Vec::new();
+        for domain in &self.domains {
+            for execs in domain.cookies.values() {
+                for seen in execs.values() {
+                    if let Some(bound) = seen.bound {
+                        owners.push(bound);
+                    }
+                }
+            }
+        }
+        owners.sort();
+        owners
     }
 
     /// Test-only: remembered exec instants across all open domains.

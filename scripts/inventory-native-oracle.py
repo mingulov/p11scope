@@ -1314,22 +1314,27 @@ def check_streams(view, res):
     # departed fold removed it after it was shown: the missing stream
     # keys must then count exactly into budgets.edges.folded (each
     # folded edge streamed at least its birth record). Anything else
-    # missing is a silent loss.
+    # missing is a silent loss — including a positive budget with no
+    # matching stream record at all.
     folded_budget = ((doc.get("budgets") or {}).get("edges") or {}).get("folded", 0)
     streamed_missing = sorted(set(last) - set(view.edges))
     bad = []
-    if streamed_missing and not (
-            type(folded_budget) is int and len(streamed_missing) == folded_budget):
+    if not (type(folded_budget) is int and len(streamed_missing) == folded_budget):
         bad.append(("*", f"{len(streamed_missing)} streamed edges are absent from the snapshot "
                          f"but budgets.edges.folded is {folded_budget!r}"))
     # A folded edge's last record must match its module's departed
     # aggregate exactly (unrotated): the fold carries the terminal
-    # row, so a stale last record is a silent terminal loss. Modules
-    # without a departed summary keep the count-only excuse above;
-    # saturated aggregates cannot prove exactness and skip the sum.
+    # row, so a stale last record is a silent terminal loss. Every
+    # module with a departed summary is compared, including one with
+    # zero matching stream records; modules without a departed
+    # summary keep the count-only excuse above. Saturated aggregates
+    # cannot prove exactness and skip the sum.
     by_module = {}
     for key in streamed_missing:
         by_module.setdefault(key[1], []).append(key)
+    for mid, module in (view.modules or {}).items():
+        if isinstance((module or {}).get("departed_use"), dict):
+            by_module.setdefault(mid, [])
     for mid, keys in sorted(by_module.items()):
         summary = (view.modules.get(mid) or {}).get("departed_use")
         if not isinstance(summary, dict):
@@ -1348,7 +1353,10 @@ def check_streams(view, res):
             if type(count) is not int:
                 got = None
                 break
-            got += count
+            # The producer adds saturating at u64::MAX while its
+            # saturated flag counts only saturated inputs, so two
+            # unsaturated inputs can legitimately sum past the max.
+            got = min(got + count, (1 << 64) - 1)
         if type(want) is not int or got != want:
             bad.append((mid, f"folded last entries sum {got!r} != departed aggregate {want!r} "
                              f"for module {mid}"))

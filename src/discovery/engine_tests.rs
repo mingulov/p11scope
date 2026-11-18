@@ -1331,17 +1331,17 @@ fn generational_stale_retirement_drops_claimed_sources() {
 }
 
 #[test]
-fn generational_rescan_drops_without_successor_evidence() {
-    // No unadmitted newcomer waits: the rescanned-empty view's drop is
-    // authoritative (unload), not a scan gap — modules and slots retire.
-    // In cgroup scope the pin stays resolvable (inert without modules);
-    // system scope drops it too.
+fn generational_rescan_drops_without_owned_run() {
+    // No owned run: the rescanned-empty view's drop is authoritative
+    // (unload), not a scan gap — modules and slots retire even while
+    // newcomers wait. The pin stays resolvable (inert without modules).
     let dir = tempfile::tempdir().expect("scope dir");
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
     let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
     for scope in [crate::attach::Scope::System, cgroup] {
         let (mut engine, _, object, _) = engine_with_overlay(78);
         engine.scope = scope.clone();
+        assert!(engine.owned_run_pid.is_none(), "no owned run ({scope:?})");
         engine
             .capture_facts
             .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
@@ -1350,10 +1350,7 @@ fn generational_rescan_drops_without_successor_evidence() {
             engine.plan.is_active(0),
             "the fixture starts attached for {scope:?}"
         );
-        assert!(
-            engine.newcomer_first_seen.is_empty(),
-            "the fixture stages no successor ({scope:?})"
-        );
+        engine.mark_newcomer_arrival(424242, Some(1));
         let view = engine.modules[0].scanned.view;
         let refreshed = vec![(view, Vec::new(), PinnedObjects::empty())];
         let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
@@ -1362,69 +1359,54 @@ fn generational_rescan_drops_without_successor_evidence() {
             .unwrap();
         assert!(
             !dropped.plan.is_active(0),
-            "no successor evidence retires the rescanned-empty slots ({scope:?})"
+            "no owned run retires the rescanned-empty slots ({scope:?})"
         );
         assert!(
             dropped.plan.modules.is_empty(),
             "the dropped module leaves the plan ({scope:?})"
         );
-        if matches!(scope, crate::attach::Scope::Cgroup { .. }) {
-            assert!(
-                dropped.pinned.summary(object).is_some(),
-                "cgroup scope keeps the pin resolvable (inert without modules)"
-            );
-        } else {
-            assert!(
-                dropped.pinned.summary(object).is_none(),
-                "system scope drops the pin with the slots"
-            );
-        }
+        assert!(
+            dropped.pinned.summary(object).is_some(),
+            "the pin stays resolvable (inert without modules) ({scope:?})"
+        );
     }
 }
 
 #[test]
 fn generational_candidate_carries_active_provider_across_empty_rescan() {
+    // A rescan that yields no tables (scan gap): the refreshed view's old
+    // modules must not take the attached slots down with them in an owned
+    // run, where member turnover is expected by design.
     let dir = tempfile::tempdir().expect("scope dir");
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
     let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
-    for scope in [crate::attach::Scope::System, cgroup] {
-        let (mut engine, _, object, _) = engine_with_overlay(74);
-        engine.scope = scope.clone();
-        engine
-            .capture_facts
-            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
-            .unwrap();
-        assert!(
-            engine.plan.is_active(0),
-            "the fixture starts attached for {scope:?}"
-        );
-        // A rescan that yields no tables (scan gap): the refreshed view's old
-        // modules must not take the attached slots down with them.
-        // Successor evidence: an unadmitted newcomer waits.
-        engine.mark_newcomer_arrival(424242, Some(1));
-        let view = engine.modules[0].scanned.view;
-        let refreshed = vec![(view, Vec::new(), PinnedObjects::empty())];
-        let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
-        let carried = engine
-            .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
-            .unwrap();
-        assert!(
-            carried.plan.is_active(0),
-            "generational scope keeps attached slots across an empty rescan ({scope:?})"
-        );
-        assert!(
-            !carried.plan.modules.is_empty(),
-            "the provider module survives the rescan ({scope:?})"
-        );
-        assert!(
-            carried.pinned.summary(object).is_some(),
-            "the pin survives with the slots ({scope:?})"
-        );
-        assert!(
-            carried.delta.retire.is_empty(),
-            "no retire on a scan gap ({scope:?})"
-        );
-    }
+    let (mut engine, _, object, _) = engine_with_overlay(74);
+    engine.scope = cgroup;
+    engine.owned_run_pid = Some(424242);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+    let view = engine.modules[0].scanned.view;
+    let refreshed = vec![(view, Vec::new(), PinnedObjects::empty())];
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let carried = engine
+        .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        carried.plan.is_active(0),
+        "an owned run keeps attached slots across an empty rescan"
+    );
+    assert!(
+        !carried.plan.modules.is_empty(),
+        "the provider module survives the rescan"
+    );
+    assert!(
+        carried.pinned.summary(object).is_some(),
+        "the pin survives with the slots"
+    );
+    assert!(carried.delta.retire.is_empty(), "no retire on a scan gap");
 }
 
 #[test]

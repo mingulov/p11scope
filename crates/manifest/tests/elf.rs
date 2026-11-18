@@ -2268,3 +2268,127 @@ fn function_starts_prove_exported_and_internal_functions() {
         "stripped objects keep unwind function starts"
     );
 }
+
+/// Target safety: a function-entry proof must resolve through an
+/// EXECUTABLE (`PF_X`) load segment. An `STT_FUNC` symbol (and its
+/// `.eh_frame_hdr` FDE) whose address maps through a data segment
+/// contributes no function start — a uprobe must never be proven at
+/// a data offset. The fixture links a function into the data
+/// segment, then clears `PF_X` on that segment (the linker marks it
+/// `RWE` for the `AX` section it carries): the symbol stays
+/// `STT_FUNC`, only the segment stops being executable.
+#[test]
+fn function_starts_exclude_data_segment_function_symbols() {
+    use object::{Object as _, ObjectSymbol as _, SymbolKind};
+    use p11scope_manifest::identity::inspect_file;
+    let dir = tmp("function-starts-data-segment");
+    let c_path = dir.join("datastart.c");
+    let so = dir.join("datastart.so");
+    let ld = dir.join("place.ld");
+    std::fs::write(
+        &c_path,
+        "int exported_fn(void) { return 1; }\n\
+         __attribute__((section(\".mydata\"))) int data_fn(void) { return 3; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &ld,
+        "SECTIONS {\n  .mydata : { *(.mydata) }\n}\nINSERT AFTER .data;\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c_path)
+            .arg(format!("-Wl,-T,{}", ld.display()))
+            .status()
+            .unwrap()
+            .success(),
+        "gcc failed for datastart"
+    );
+    let bytes = std::fs::read(&so).unwrap();
+    let object = object::File::parse(&*bytes).unwrap();
+    let data_symbol = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("data_fn"))
+        .expect("data_fn is in symtab");
+    assert_eq!(
+        data_symbol.kind(),
+        SymbolKind::Text,
+        "the fixture symbol really is STT_FUNC"
+    );
+    let file = std::fs::File::open(&so).unwrap();
+    let snapshot = ElfSnapshot::read(&file).unwrap();
+    let data_off = snapshot
+        .defined_symbol("data_fn")
+        .unwrap()
+        .expect("data_fn is defined")
+        .file_offset;
+    let exported_off = snapshot
+        .defined_symbol("exported_fn")
+        .unwrap()
+        .expect("exported_fn is defined")
+        .file_offset;
+    // Clear PF_X on the data_fn LOAD only: parse the 64-bit LE
+    // program headers, find the PT_LOAD whose file range holds the
+    // symbol, and drop bit 0 (PF_X). The .text LOAD is untouched.
+    assert_eq!(&bytes[..6], b"\x7fELF\x02\x01", "64-bit LE fixture");
+    let e_phoff = le_u64(&bytes, 0x20) as usize;
+    let e_phentsize = le_u16(&bytes, 0x36) as usize;
+    let e_phnum = le_u16(&bytes, 0x38) as usize;
+    let mut patched = bytes.clone();
+    let mut cleared = false;
+    for index in 0..e_phnum {
+        let base = e_phoff + index * e_phentsize;
+        let p_type = u32::from_le_bytes(patched[base..base + 4].try_into().unwrap());
+        if p_type != elf::PT_LOAD {
+            continue;
+        }
+        let p_offset = le_u64(&patched, base + 8);
+        let p_filesz = le_u64(&patched, base + 32);
+        if !(p_offset..p_offset + p_filesz).contains(&data_off) {
+            continue;
+        }
+        assert!(
+            !cleared,
+            "data_fn sits in exactly one LOAD (file ranges are disjoint here)"
+        );
+        let flags = u32::from_le_bytes(patched[base + 4..base + 8].try_into().unwrap());
+        assert_ne!(
+            flags & 0x1,
+            0,
+            "the data LOAD starts executable (linker RWE for the AX section)"
+        );
+        assert!(
+            !(p_offset..p_offset + p_filesz).contains(&exported_off),
+            "the patch is surgical: .text lives in another LOAD"
+        );
+        patched[base + 4..base + 8].copy_from_slice(&(flags & !0x1).to_le_bytes());
+        cleared = true;
+    }
+    assert!(cleared, "a LOAD holds data_fn");
+    let patched_path = dir.join("datastart-noexec.so");
+    std::fs::write(&patched_path, &patched).unwrap();
+    let patched_file = std::fs::File::open(&patched_path).unwrap();
+    let patched_snapshot = ElfSnapshot::read(&patched_file).unwrap();
+    assert!(
+        !patched_snapshot.is_executable_offset(data_off),
+        "the patch took: data_fn is no longer in an executable segment"
+    );
+    assert!(
+        patched_snapshot.is_executable_offset(exported_off),
+        ".text stays executable after the patch"
+    );
+    let inspected = inspect_file(&patched_file).unwrap();
+    assert!(
+        inspected.function_starts.contains(&exported_off),
+        "the .text control still proves: {exported_off:#x} in {:?}",
+        inspected.function_starts
+    );
+    assert!(
+        !inspected.function_starts.contains(&data_off),
+        "a data-segment STT_FUNC (and its FDE) proves no function start: {data_off:#x} in {:?}",
+        inspected.function_starts
+    );
+}

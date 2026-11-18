@@ -22506,6 +22506,254 @@ fn run_learned_table_harvest_cap_refusal_is_counted_and_named() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// Outside `--pid` a learned-entry misfire is host-wide: only
+/// `--pid` links name the target pid (`select_session_backend`;
+/// cgroup and system links name pid 0). This pins the last gate
+/// before those links: an unproven learned entry is refused at the
+/// live bind — under the owned-run cgroup flow that harvests it
+/// and under a system-scope bind of the same store — while its
+/// proven sibling binds into a slot in the same candidate.
+#[test]
+fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_scopes() {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    let dir = tempfile::tempdir().expect("learned backing dir");
+    let backing = dir.path().join("libgetteronly.so");
+    std::fs::write(&backing, "p11scope-fixture:getter-only-provider-bytes").expect("write backing");
+    let mut pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
+    let pin = pins.pinned().next().expect("one pin");
+    let key = pin.key;
+    let object = pin.id;
+    let me = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: "/".into(),
+        dir: Arc::new(File::open("/").expect("open root dir")),
+    };
+    engine.owned_run_pid = Some(me);
+    engine.next_view_id = 8;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
+    let path = backing.to_string_lossy().into_owned();
+    let mut module = fixture_module(key);
+    module.path = path.clone();
+    module.tables = vec![ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: ["C_Initialize", "C_GetSlotList", "C_OpenSession"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ScannedEntry {
+                name,
+                object: key,
+                object_path: path.clone(),
+                file_offset: 0x1000 + index as u64 * 0x10,
+            })
+            .collect(),
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    // Only the first offset proves: the control that must bind.
+    let mut proven_only = module.clone();
+    proven_only.tables[0].entries.truncate(1);
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&proven_only));
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(9),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "the learned tables really flow into the store"
+    );
+    for (label, scope) in [("cgroup", None), ("system", Some(Scope::System))] {
+        // A production --system engine never harvests
+        // (`learn_owned_proofs` no-ops outside owned runs); the
+        // flip simulates learned tables reaching a system-scope
+        // bind and pins that the bind refuses identically there.
+        if let Some(scope) = scope {
+            engine.scope = scope;
+        }
+        let candidate = engine
+            .live_candidate_with_pending(
+                engine.pinned.clone(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                &BTreeSet::new(),
+            )
+            .expect("a live candidate builds over the learned tables");
+        assert_eq!(
+            candidate.modules.len(),
+            1,
+            "the {label} candidate keeps the learned module shell"
+        );
+        let entries = &candidate.modules[0].scanned.tables[0].entries;
+        assert_eq!(
+            entries.iter().map(|entry| entry.name).collect::<Vec<_>>(),
+            vec!["C_Initialize"],
+            "only the proven learned entry binds in {label} scope: {entries:?}"
+        );
+        let skips = &engine.counters.object_skips;
+        for name in ["C_GetSlotList", "C_OpenSession"] {
+            assert!(
+                skips
+                    .iter()
+                    .any(|skip| skip.subject == name && skip.reason.contains("not attached")),
+                "the unproven learned {name} refuses in {label} scope: {skips:?}"
+            );
+        }
+        assert!(
+            candidate
+                .plan
+                .slots
+                .iter()
+                .any(|slot| slot.file_offset == 0x1000),
+            "the proven entry keeps its {label} attach slot: {:?}",
+            candidate.plan.slots
+        );
+        assert!(
+            !candidate
+                .plan
+                .slots
+                .iter()
+                .any(|slot| slot.file_offset == 0x1010 || slot.file_offset == 0x1020),
+            "no {label} attach slot for refused learned entries: {:?}",
+            candidate.plan.slots
+        );
+    }
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// A learned table is evidence about one generation of its file:
+/// the harvest union key carries no digest, so a proof from a NEW
+/// generation (same key after an in-place rewrite or inode reuse)
+/// must not union into the older generation's stored module. It
+/// refuses loudly with the finite replaced-file reason (no schema
+/// change), the stored module stays intact, and the old
+/// generation keeps binding against its own pins.
+#[test]
+fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    let (dir, mut sleeper, mut engine, key, path) =
+        learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "baseline: the old generation binds"
+    );
+    // The new generation: the same key (the same file), a new
+    // digest, and new tables that must never join the old module.
+    let backing = dir.path().join("libgetteronly.so");
+    let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    let pin = pins.pinned().next().expect("one pin");
+    assert_eq!(pin.key, key, "the generations share the union key");
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(11);
+    module.path = path.clone();
+    module.decoder_abi = Some(p11scope_manifest::elf::ElfAbi::Lp64);
+    module.tables = vec![ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_NewGeneration",
+            object: key,
+            object_path: path.clone(),
+            file_offset: 0x2000,
+        }],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x7000,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }];
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(11),
+        path: path.clone(),
+        object: pin.id,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    }];
+    engine.learn_owned_proofs(&pins, &proofs);
+    assert_eq!(
+        engine.run_learned_modules.len(),
+        1,
+        "the new generation files no module beside the old one"
+    );
+    let stored = &engine.run_learned_modules[0];
+    assert!(
+        !stored
+            .tables
+            .iter()
+            .flat_map(|table| &table.entries)
+            .any(|entry| entry.name == "C_NewGeneration"),
+        "the new generation's tables never union into the old module: {:?}",
+        stored.tables
+    );
+    assert_eq!(
+        stored
+            .tables
+            .iter()
+            .flat_map(|table| &table.entries)
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["C_Initialize", "C_GetSlotList", "C_OpenSession"],
+        "the old generation's tables stay intact"
+    );
+    let row = crate::discovery::scan::Skipped {
+        subject: "learned provider file".into(),
+        reason: "a provider file was replaced or deleted before staging; it was not learned".into(),
+    };
+    assert!(
+        engine.counters.object_skips.contains(&row),
+        "the generation refusal is loud and counted: {:?}",
+        engine.counters.object_skips,
+    );
+    let projected = crate::render::capture_skipped_out(&row);
+    assert_eq!(projected.name, "learned provider file");
+    assert_eq!(
+        projected.reason,
+        "a provider file was replaced or deleted before staging; it was not learned",
+        "the refusal keeps the closed learned vocabulary (no schema change)"
+    );
+    assert_eq!(
+        engine.learned_cap_skipped_for_test(),
+        0,
+        "a generation refusal is not a cap refusal"
+    );
+    assert_eq!(
+        engine.pending_learned.len(),
+        1,
+        "the refused tables do not duplicate the staged file"
+    );
+    assert_eq!(
+        learned_candidate_module_count(&mut engine),
+        1,
+        "the old generation still binds against its own pins"
+    );
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// A harvest that changes only union flags (here: the decoder ABI
 /// filling in) still owes the expedited frame and the learned
 /// apply: counts alone cannot decide "nothing changed".

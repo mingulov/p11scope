@@ -12274,6 +12274,114 @@ mod tests {
     }
 
     #[test]
+    fn bind_refuses_learned_entries_outside_executable_segments() {
+        // Attach authority requires PF_X: proving a pin keeps only
+        // executable offsets in its proof lists (exports and function
+        // starts), so a learned entry at a data-segment offset can
+        // never prove — not even when its name matches a data-segment
+        // export — and the strict bind refuses it with the named gap.
+        // Without this, a decode resolving into non-executable bytes
+        // plants a uprobe there. The .text sibling binds in the same
+        // candidate, proving the harness (not a broken pin) refuses.
+        const TEXT_OFFSET: u64 = 0x1000;
+        const DATA_OFFSET: u64 = 0x20;
+        let provider = overlay(220);
+        let scanned = module(provider);
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("libdataentry.so");
+        std::fs::write(&backing, "p11scope-fixture:data-entry-bytes").unwrap();
+        let file = std::fs::File::open(&backing).unwrap();
+        let metadata = file.metadata().unwrap();
+        let inspected = InspectedObject {
+            identity: ObjectIdentity {
+                kind: IdentityKind::Sha256,
+                value: Some("ab".repeat(32)),
+                sha256: Some("ab".repeat(32)),
+                reusable: true,
+                note: None,
+            },
+            executable_ranges: vec![(0x1000, 0x2000)],
+            abi: ElfAbi::Lp64,
+            exports: vec![
+                ("C_Initialize".to_string(), TEXT_OFFSET),
+                ("C_Login".to_string(), DATA_OFFSET),
+            ],
+            getter_present: false,
+            witness_fault: false,
+            function_starts: vec![DATA_OFFSET, TEXT_OFFSET],
+        };
+        let raw = RawObjectInstance::scanned(&scanned, provider, &scanned.path).unwrap();
+        let mapping = MappingFileKey {
+            mount_id: 1,
+            device_major: u64::from(libc::major(metadata.dev())),
+            device_minor: u64::from(libc::minor(metadata.dev())),
+            inode: metadata.ino(),
+        };
+        let pin = pin_of(&file).unwrap();
+        let proved = ProvedEntry::prove(
+            file,
+            pin,
+            scanned.path.clone(),
+            &inspected,
+            raw,
+            mapping,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            proved.meta.exports.as_ref(),
+            &[("C_Initialize".to_string(), TEXT_OFFSET)],
+            "the pin keeps only executable exports: {:?}",
+            proved.meta.exports
+        );
+        assert_eq!(
+            proved.meta.function_starts.as_ref(),
+            &[TEXT_OFFSET],
+            "the pin keeps only executable function starts: {:?}",
+            proved.meta.function_starts
+        );
+        let entry = file_proved_pin(proved, &mut Filing::Untracked).unwrap();
+        let mut pins = PinnedObjects::empty();
+        let mut filing_skipped = Vec::new();
+        let id = pins
+            .insert_entry(entry, &mut filing_skipped)
+            .expect("the proved entry files");
+        assert!(filing_skipped.is_empty(), "{filing_skipped:?}");
+        assert_eq!(
+            pins.id_for_scanned(&scanned, provider, &scanned.path),
+            Some(id),
+            "the filed pin routes the module"
+        );
+        let mut strict_scanned = scanned.clone();
+        strict_scanned.tables[0].entries.push(ScannedEntry {
+            name: "C_Login",
+            object: provider,
+            object_path: PATH.into(),
+            file_offset: DATA_OFFSET,
+        });
+        let (bound, skipped) = bind_scanned_modules_strict(&[strict_scanned], &mut pins);
+        assert_eq!(bound.len(), 1);
+        let entries = &bound[0].scanned.tables[0].entries;
+        assert!(
+            entries.iter().any(|entry| entry.name == "C_Initialize"),
+            "the proven .text entry binds: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.name == "C_Login"),
+            "the data-offset entry never binds despite its name match: {entries:?}"
+        );
+        assert_eq!(skipped.len(), 1, "exactly the data-offset entry refuses");
+        assert_eq!(skipped[0].subject, "C_Login");
+        assert!(
+            skipped[0].reason.contains("not a proven function entry")
+                && skipped[0].reason.contains("not attached"),
+            "the refusal is the named counted gap: {}",
+            skipped[0].reason
+        );
+    }
+
+    #[test]
     fn carried_proofs_follow_replace_absorb_remove() {
         // Carried proofs are keyed by capture-local ID lineage (the
         // strict bind above is their only producer): replacing a view's

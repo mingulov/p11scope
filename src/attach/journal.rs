@@ -74,18 +74,6 @@ pub(crate) fn is_length_endpoint(descriptor: u32) -> bool {
     p11scope_ebpf_common::evidence_table::length_kind_for_descriptor(descriptor).is_some()
 }
 
-/// The journal entry program for one canonical descriptor: the length
-/// entry at length endpoints with the flag on, else the base entry.
-/// Info endpoints, count-only zero and out-of-range descriptors always
-/// take the base entry (the info pair lives in the inventory object).
-pub(crate) fn journal_entry_program(descriptor: u32, key_sizes: bool) -> &'static str {
-    if key_sizes && is_length_endpoint(descriptor) {
-        LENGTH_PROGRAMS[0]
-    } else {
-        PROGRAMS[0]
-    }
-}
-
 /// Whether one slot links the length pair: its canonical descriptor
 /// names a length endpoint AND every name at the slot agrees on the
 /// canonical row's length shape. A conflicting or indeterminate
@@ -103,7 +91,10 @@ pub(crate) fn slot_takes_length_pair(descriptor: u32, names: &[String]) -> bool 
 
 /// The journal entry program for one slot: the length entry only
 /// when the slot takes the length pair (canonical descriptor plus
-/// name agreement) with the flag on, else the base entry.
+/// name agreement) with the flag on, else the base entry. Info
+/// endpoints, count-only zero and out-of-range descriptors always
+/// take the base entry (the info pair lives in the inventory
+/// object).
 pub(crate) fn journal_entry_program_for_names(
     descriptor: u32,
     names: &[String],
@@ -845,10 +836,13 @@ mod tests {
     /// Length entry selection: with the flag on, the 11 length
     /// endpoints link the length entry; every other endpoint (base
     /// functions, info endpoints, count-only zero, out-of-range) links
-    /// the base entry in both modes.
+    /// the base entry in both modes. Each single-name slot carries
+    /// its own descriptor beside its name.
     #[test]
     fn journal_length_entry_program_selects_pair_per_endpoint() {
-        use super::{LENGTH_PROGRAMS, PROGRAMS, is_length_endpoint, journal_entry_program};
+        use super::{
+            LENGTH_PROGRAMS, PROGRAMS, is_length_endpoint, journal_entry_program_for_names,
+        };
         assert_eq!(
             LENGTH_PROGRAMS,
             ["p11_entry_journal_length", "p11_return_journal_length"]
@@ -868,22 +862,28 @@ mod tests {
         ];
         for name in length {
             let descriptor = crate::kinds::function_id(name).unwrap() + 1;
+            let names = vec![name.to_string()];
             assert!(
                 is_length_endpoint(descriptor),
                 "{name} is a length endpoint"
             );
             assert_eq!(
-                journal_entry_program(descriptor, true),
+                journal_entry_program_for_names(descriptor, &names, true),
                 LENGTH_PROGRAMS[0],
                 "{name}: flag on links the length entry"
             );
             assert_eq!(
-                journal_entry_program(descriptor, false),
+                journal_entry_program_for_names(descriptor, &names, false),
                 PROGRAMS[0],
                 "{name}: flag off links the base entry"
             );
         }
-        let mut base = vec![0, MAX_DESCRIPTORS, MAX_DESCRIPTORS + 1, u32::MAX];
+        let mut base: Vec<(u32, Vec<String>)> = vec![
+            (0, Vec::new()),
+            (MAX_DESCRIPTORS, Vec::new()),
+            (MAX_DESCRIPTORS + 1, Vec::new()),
+            (u32::MAX, Vec::new()),
+        ];
         for name in [
             "C_Initialize",
             "C_SignInit",
@@ -893,16 +893,19 @@ mod tests {
             "C_GetTokenInfo",
             "C_GetMechanismInfo",
         ] {
-            base.push(crate::kinds::function_id(name).unwrap() + 1);
+            base.push((
+                crate::kinds::function_id(name).unwrap() + 1,
+                vec![name.to_string()],
+            ));
         }
-        for descriptor in base {
+        for (descriptor, names) in &base {
             assert!(
-                !is_length_endpoint(descriptor),
+                !is_length_endpoint(*descriptor),
                 "descriptor {descriptor} is not length"
             );
             for key_sizes in [false, true] {
                 assert_eq!(
-                    journal_entry_program(descriptor, key_sizes),
+                    journal_entry_program_for_names(*descriptor, names, key_sizes),
                     PROGRAMS[0],
                     "descriptor {descriptor}: base entry in both modes"
                 );

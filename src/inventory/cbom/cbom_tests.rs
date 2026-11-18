@@ -1516,3 +1516,276 @@ fn cbom_departed_rows_count_toward_the_row_bound() {
     assert!(error.contains("inventory row limit exceeded"), "{error}");
     assert!(parse_input(&bytes).is_ok());
 }
+
+#[test]
+fn cbom_folded_caller_at_two_modules_counts_one_incarnation() {
+    // Alive control: one caller with edges at two providers.
+    let control = inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![
+            module("m0", "/lib/a.so", Some(&"a".repeat(64))),
+            module("m1", "/lib/b.so", Some(&"b".repeat(64))),
+        ],
+        vec![
+            edge(
+                "c0",
+                "m0",
+                Some(vec![mechanism_row(
+                    4231,
+                    Some("CKM_AES_GCM"),
+                    &["encrypt"],
+                    10,
+                )]),
+            ),
+            edge(
+                "c0",
+                "m1",
+                Some(vec![mechanism_row(592, Some("CKM_SHA256"), &["digest"], 4)]),
+            ),
+        ],
+    );
+    // The fold writes the same caller identity into every module
+    // the caller touched; the projection still counts one incarnation.
+    let folded = inventory_document(
+        vec![],
+        vec![
+            module_with_departed(
+                "m0",
+                "/lib/a.so",
+                &"a".repeat(64),
+                departed_use(
+                    1,
+                    1,
+                    json!([mechanism_row(
+                        4231,
+                        Some("CKM_AES_GCM"),
+                        &["encrypt"],
+                        10,
+                    )]),
+                    vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+                    false,
+                    0,
+                    departed_overflow(0, 0, 0),
+                ),
+            ),
+            module_with_departed(
+                "m1",
+                "/lib/b.so",
+                &"b".repeat(64),
+                departed_use(
+                    1,
+                    1,
+                    json!([mechanism_row(592, Some("CKM_SHA256"), &["digest"], 4,)]),
+                    vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+                    false,
+                    0,
+                    departed_overflow(0, 0, 0),
+                ),
+            ),
+        ],
+        vec![],
+    );
+    let control = parse_input(&control).unwrap();
+    let folded = parse_input(&folded).unwrap();
+    assert_eq!(control.applications.len(), 1);
+    assert_eq!(folded.applications.len(), 1);
+    assert_eq!(folded.applications[0].incarnations, 1);
+    assert_eq!(
+        folded.applications[0].incarnations,
+        control.applications[0].incarnations
+    );
+    assert_eq!(folded.applications[0].departed_incarnations, 1);
+    // Both providers joined, both mechanisms merged, same pairs.
+    assert_eq!(folded.mechanisms.len(), 2);
+    assert_eq!(folded.dependencies, control.dependencies);
+    assert_eq!(folded.dependencies.len(), 6);
+    assert_eq!(folded.unknowns.departed_links_withheld, 0);
+}
+
+#[test]
+fn cbom_departed_single_path_incomplete_withholds_and_counts_linkage() {
+    // Every incomplete aggregate with rows withholds its
+    // app->mechanism pairs and counts the module once, even with a
+    // single path (or none): drops, saturation, a named/callers
+    // mismatch, a pathless named sibling, or no paths at all.
+    let row = || json!([mechanism_row(4231, Some("CKM_AES_GCM"), &["encrypt"], 10,)]);
+    let named = || departed_identity("c0", Some("/bin/driver"), "exited");
+    let shapes: Vec<(&str, Value, bool)> = vec![
+        (
+            "dropped",
+            departed_use(2, 1, row(), vec![named()], false, 1, departed_overflow(0, 0, 0)),
+            true,
+        ),
+        (
+            "saturated",
+            departed_use(2, 1, row(), vec![named()], true, 1, departed_overflow(0, 0, 0)),
+            true,
+        ),
+        (
+            "mismatch",
+            departed_use(2, 1, row(), vec![named()], false, 0, departed_overflow(0, 0, 0)),
+            true,
+        ),
+        (
+            "pathless_sibling",
+            departed_use(
+                2,
+                1,
+                row(),
+                vec![named(), departed_identity("c1", None, "exited")],
+                false,
+                0,
+                departed_overflow(0, 0, 0),
+            ),
+            true,
+        ),
+        (
+            "zero_paths",
+            departed_use(
+                1,
+                1,
+                row(),
+                vec![departed_identity("c0", None, "exited")],
+                false,
+                0,
+                departed_overflow(0, 0, 0),
+            ),
+            false,
+        ),
+    ];
+    for (name, departed, expect_app_join) in &shapes {
+        let bytes = inventory_document(
+            vec![],
+            vec![module_with_departed(
+                "m0",
+                "/lib/p.so",
+                &"d".repeat(64),
+                departed.clone(),
+            )],
+            vec![],
+        );
+        let projection = parse_input(&bytes).unwrap();
+        assert!(
+            !projection.dependencies.iter().any(|(from, to)| {
+                from.starts_with("p11scope:caller:") && to.starts_with("p11scope:mechanism:")
+            }),
+            "{name}: no guessed app->mechanism pairs, got: {:?}",
+            projection.dependencies
+        );
+        if *expect_app_join {
+            assert!(
+                projection.dependencies.contains(&(
+                    "p11scope:caller:0".to_string(),
+                    "p11scope:module:0".to_string()
+                )),
+                "{name}: the named path still joins its provider, got: {:?}",
+                projection.dependencies
+            );
+        }
+        assert!(
+            projection.dependencies.contains(&(
+                "p11scope:module:0".to_string(),
+                "p11scope:mechanism:0x1087".to_string()
+            )),
+            "{name}: the provider still joins its mechanism, got: {:?}",
+            projection.dependencies
+        );
+        assert_eq!(
+            projection.unknowns.departed_links_withheld, 1,
+            "{name}: the withheld module counts"
+        );
+        let document = super::render::render_json(&projection);
+        assert_eq!(
+            metadata_value(&document, "p11scope:departed_links_withheld"),
+            "1",
+            "{name}: JSON names the withholding"
+        );
+        let mut concise = Vec::new();
+        super::render::render_concise(&projection, &mut concise).unwrap();
+        let concise = String::from_utf8(concise).unwrap();
+        assert!(
+            concise.contains("1 module with withheld departed mechanism linkage"),
+            "{name}: coverage names the withholding, got:\n{concise}"
+        );
+    }
+    // No mechanism rows means no pairs to withhold: the module stays
+    // uncounted even for a multi-path aggregate.
+    let quiet = departed_use(
+        2,
+        0,
+        Value::Null,
+        vec![
+            departed_identity("c0", Some("/bin/first"), "exited"),
+            departed_identity("c1", Some("/bin/second"), "exited"),
+        ],
+        false,
+        0,
+        departed_overflow(0, 0, 0),
+    );
+    let bytes = inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"d".repeat(64),
+            quiet,
+        )],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.unknowns.departed_links_withheld, 0);
+}
+
+#[test]
+fn cbom_departed_rows_without_a_module_id_stay_named_unknowns() {
+    let mut orphan = module_with_departed(
+        "m0",
+        "/lib/p.so",
+        &"e".repeat(64),
+        departed_use(
+            1,
+            1,
+            json!([mechanism_row(4231, Some("CKM_AES_GCM"), &["encrypt"], 10,)]),
+            vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+            false,
+            0,
+            departed_overflow(5, 50, 6),
+        ),
+    );
+    orphan
+        .as_object_mut()
+        .expect("module object")
+        .remove("id");
+    let bytes = inventory_document(vec![], vec![orphan], vec![]);
+    let projection = parse_input(&bytes).unwrap();
+    // The malformed module counts, and so does its folded content.
+    assert_eq!(projection.unknowns.modules_skipped, 1);
+    assert_eq!(projection.unknowns.departed_mechs_overflow, 5);
+    assert_eq!(projection.unknowns.departed_mechs_overflow_calls, 50);
+    assert_eq!(projection.unknowns.departed_mechs_overflow_errors, 6);
+    assert_eq!(projection.unknowns.dangling_edge_refs, 1);
+    // Nothing joins a provider that was never minted.
+    assert!(projection.providers.is_empty());
+    assert!(projection.mechanisms.is_empty());
+    assert!(projection.dependencies.is_empty());
+    // The folded identity still rejoins its application.
+    assert_eq!(projection.applications.len(), 1);
+    assert_eq!(projection.applications[0].incarnations, 1);
+    // JSON names the overflow; concise text names the rows too.
+    let document = super::render::render_json(&projection);
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_mech_overflow"),
+        "5"
+    );
+    let mut concise = Vec::new();
+    super::render::render_concise(&projection, &mut concise).unwrap();
+    let concise = String::from_utf8(concise).unwrap();
+    assert!(
+        concise.contains("5 departed mechanisms past bounds (50 calls, 6 errors)"),
+        "coverage names the overflow, got:\n{concise}"
+    );
+    assert!(
+        concise.contains("1 dangling edge reference"),
+        "coverage names the unjoinable row, got:\n{concise}"
+    );
+}

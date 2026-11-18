@@ -5240,6 +5240,20 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
             }
             let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
         }
+        if Record::LENGTH {
+            // Sync START rows leave target_function FUNCTION_NONE, but
+            // the trailer validator matches the kind against the
+            // function-addressed evidence row: stamp the
+            // cookie-derived ordinal so the 648 decodes. The root's
+            // length dispatch guarantees a valid length descriptor
+            // (misrouted and narrowed endpoints degrade to the base
+            // flow before this runs), so descriptor - 1 is in range.
+            // `descriptor` is the validated cookie descriptor from the
+            // side-row agreement above.
+            unsafe {
+                core::ptr::addr_of_mut!((*raw).base.event.target_function).write(descriptor - 1);
+            }
+        }
         (entry, accounting.rv, facts.mechanism, facts.capture_flags)
     };
     let reservation = entry.as_mut_ptr();
@@ -5323,6 +5337,12 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
             rv,
             encode_return_gate(layout, joined),
         );
+    // Length hygiene (spec §8.2): an unemitted return never resolves
+    // its trailer (which deletes), so abandon the stash row here;
+    // the next same-key entry overwrites or deletes.
+    if Record::LENGTH && !emitted {
+        length_return_abandon(&key);
+    }
     // Submit the completed ring record only after successful
     // removal; otherwise discard it and fault. H7-E2: the shared
     // cleanup decision evaluates the retirement independently of

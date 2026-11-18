@@ -1036,7 +1036,7 @@
             ".debug_line": 106,
             ".debug_loclists": 391,
             ".debug_rnglists": 51,
-            ".debug_str": 109,
+            ".debug_str": 110,
             ".debug_str_offsets": 24,
             ".rel.BTF": 16,
             ".rel.BTF.ext": 144,
@@ -1056,7 +1056,7 @@
       },
       "identical": [],
       "lane": "keymeta length evidence with opt-in routing (v0.8.0 Task 2)",
-      "rationale": "Cumulative v0.6.0-anchored shape at the Task 2 tip (fix round 1 included: the modeled stamp and unemitted abandon sit inside `if Record::LENGTH`, const-eliminated with LENGTH=false). Task 2's own delta over the v0.8.0 integration batch 1 transition matches by per-section SIZE on all three default objects (debug-sections-only size drift from new source lines and symbols); .text/uprobe/relocs, .BTF/.BTF.ext and .symtab/.strtab match batch 1 by size, and the length programs, EVIDENCE_START stash and LENGTH dispatch arms are journal-gated (absent from inventory builds) and const-eliminated with LENGTH=false in Detailed builds by review. Same-size content change disclosed: EVIDENCE max_entries 9->11 (two reserved length cells, spec section 8.2; never bumped without the flag) changes the `maps` section bytes at unchanged size in all three default objects; the size gate cannot see same-size byte changes, so no byte-identity is claimed for `maps`. Re-measured at the fix tip: inventory-callers .debug_str 110->109 (debug-only drift from the fix lines); all code-section sizes unchanged. The journal object carrying the length code is outside this check's three default objects; its verifier budgets are pinned separately in tests/bpf-verifier-budgets.json."
+      "rationale": "Cumulative v0.6.0-anchored shape at the Task 2 tip (fix round 1 included: the modeled stamp and unemitted abandon sit inside `if Record::LENGTH`, const-eliminated with LENGTH=false). Task 2's own delta over the v0.8.0 integration batch 1 transition matches by per-section SIZE on all three default objects (debug-sections-only size drift from new source lines and symbols); .text/uprobe/relocs, .BTF/.BTF.ext and .symtab/.strtab match batch 1 by size, and the length programs, EVIDENCE_START stash and LENGTH dispatch arms are journal-gated (absent from inventory builds) and const-eliminated with LENGTH=false in Detailed builds by review. Same-size content change disclosed: EVIDENCE max_entries 9->11 (two reserved length cells, spec section 8.2; never bumped without the flag) changes the `maps` section bytes at unchanged size in all three default objects; the size gate cannot see same-size byte changes, so no byte-identity is claimed for `maps`. Re-measured at the fix tip: all code-section sizes unchanged from the lane record. The journal object carrying the length code is outside this check's three default objects; its verifier budgets are pinned separately in tests/bpf-verifier-budgets.json."
     }
   ],
   "version": 1

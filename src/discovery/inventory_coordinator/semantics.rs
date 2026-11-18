@@ -7097,6 +7097,319 @@ mod finalizer_history_tests {
         assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
         assert_eq!(lane.shed_calls_disclosed(), 1);
     }
+
+    /// Admit the test process itself through the real adapter path
+    /// (mirrors the F2 custody twin helper: reconcile, apply, then
+    /// resolve).
+    fn admit_self(coordinator: &mut InventoryCoordinator<OsProcessSource>) -> CallerId {
+        use std::collections::BTreeSet;
+        let pid = std::process::id();
+        let observed = BTreeSet::from([pid]);
+        let events = coordinator
+            .adapter_mut()
+            .reconcile(&observed, &mut |_| ImageAuthority::ScanPinned, 100);
+        coordinator.apply_reconcile_events(&events, 100);
+        coordinator
+            .adapter()
+            .live_id(pid)
+            .expect("the live test process admits")
+    }
+
+    /// Retire one caller through exec transition and fold it through
+    /// the real publication fold (mirrors the F2 twin helper).
+    /// Returns the fold receipt's retired count.
+    fn retire_and_fold(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        caller: CallerId,
+        now_ns: u64,
+    ) -> u64 {
+        coordinator
+            .adapter_mut()
+            .exec_transition_scoped(caller, now_ns);
+        coordinator.note_rendered_callers(&[caller]);
+        coordinator.retire_rendered_callers(now_ns, None).retired
+    }
+
+    /// F2 negative-carry twin: caller A is admitted and bound beside
+    /// sibling B, then folds through the real publication fold. A
+    /// late unrouted row for A's cookie must still barrier B's
+    /// history — the fold must not promote it to the other-caller
+    /// disposal — and the same holds for a same-cookie exec. A
+    /// healthy unrelated cookie still disposes: the negative carry
+    /// vetoes only the forgotten ticket. No positive attribution to
+    /// A survives.
+    #[test]
+    fn folded_cookie_late_unrouted_call_barriers_beside_bound_sibling() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        const FOLDED: u64 = 77;
+        const BOUND: u64 = 41;
+        const HEALTHY: u64 = 99;
+        // Fresh lanes per case, so staged positions never leak across.
+        for (cookie, exec, barrier) in
+            [(FOLDED, 3u64, true), (FOLDED, 9, true), (HEALTHY, 1, false)]
+        {
+            let (mut coordinator, mut lane, domain) = drop_test_lanes();
+            let CallerId(folded) = admit_self(&mut coordinator);
+            assert_ne!(folded, 9000, "the sibling id stays clear of the adapter row");
+            let image = ImageIdentity {
+                task_cookie: FOLDED,
+                exec_id: 1,
+            };
+            bind_image(&mut coordinator, domain, folded, image);
+            admit_history(&mut coordinator, domain, folded, image);
+            let sibling = ImageIdentity {
+                task_cookie: BOUND,
+                exec_id: 1,
+            };
+            bind_image(&mut coordinator, domain, 9000, sibling);
+            admit_history(&mut coordinator, domain, 9000, sibling);
+            assert_eq!(
+                retire_and_fold(&mut coordinator, CallerId(folded), 200),
+                1,
+                "the rendered exited row folds"
+            );
+            assert!(
+                coordinator
+                    .adapter()
+                    .record(CallerId(folded))
+                    .is_none(),
+                "the folded row leaves the adapter"
+            );
+            assert!(
+                coordinator
+                    .semantic_bindings
+                    .get(CallerId(folded))
+                    .is_none(),
+                "no binding survives for the folded caller"
+            );
+            assert!(
+                coordinator
+                    .semantic_bindings
+                    .get(CallerId(9000))
+                    .is_some(),
+                "the sibling stays bound"
+            );
+            let evidence = commit_outcomes(
+                &mut coordinator,
+                &mut lane,
+                domain,
+                vec![
+                    invalidation_at(
+                        domain,
+                        crate::semantic_capture::InvalidationScope::CoverageFailed,
+                        1,
+                    ),
+                    unrouted_call_exec(domain, cookie, exec, 2),
+                ],
+            );
+            if barrier {
+                assert!(
+                    matches!(evidence, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+                    "cookie {cookie} exec {exec} still barriers after the fold: {evidence:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        evidence,
+                        H3DispositionEvidence::Clean {
+                            staged_max: 2,
+                            pending_floor: None
+                        }
+                    ),
+                    "a healthy unrelated cookie still disposes: {evidence:?}"
+                );
+            }
+            assert_eq!(lane.shed_calls_disclosed(), 1, "cookie {cookie}");
+        }
+    }
+
+    /// F2 refused-proof twin: the foreign image sheds, taints and
+    /// stays refused in the journal, then binds S1 and folds through
+    /// the real publication fold. Its later shed must barrier the
+    /// bound Joint history: the forgotten same-cookie image might be
+    /// an unrefused exec, so the fold must not keep the other-caller
+    /// disposal.
+    #[test]
+    fn folded_refused_cookie_late_shed_barriers_beside_bound_sibling() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        let CallerId(folded) = admit_self(&mut coordinator);
+        assert_ne!(folded, 9000, "the sibling id stays clear of the adapter row");
+        let foreign = ImageIdentity {
+            task_cookie: 77,
+            exec_id: 3,
+        };
+        let sibling = ImageIdentity {
+            task_cookie: 41,
+            exec_id: 1,
+        };
+        bind_image(&mut coordinator, domain, 9000, sibling);
+        admit_history(&mut coordinator, domain, 9000, sibling);
+        let first = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+                unrouted_call(domain, 77, 3),
+            ],
+        );
+        assert!(
+            matches!(
+                first,
+                H3DispositionEvidence::Clean {
+                    staged_max: 3,
+                    pending_floor: None
+                }
+            ),
+            "the unbound foreign sheds dispose as before: {first:?}"
+        );
+        // The foreign sheds dispose AND taint at once; quiet batches
+        // past the bounded grace expire the lift window, and only
+        // then is the never-bound image permanently refused.
+        for position in 10u64..30u64 {
+            commit_outcomes(
+                &mut coordinator,
+                &mut lane,
+                domain,
+                vec![invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    position,
+                )],
+            );
+        }
+        assert!(
+            coordinator
+                .joint_capture
+                .adapter()
+                .image_refused((foreign.task_cookie, foreign.exec_id)),
+            "the foreign image is refused in the journal once its grace expires unbound"
+        );
+        // The refused caller binds S1, then folds.
+        bind_image(&mut coordinator, domain, folded, foreign);
+        admit_history(&mut coordinator, domain, folded, foreign);
+        assert_eq!(
+            retire_and_fold(&mut coordinator, CallerId(folded), 200),
+            1,
+            "the rendered exited row folds"
+        );
+        assert!(
+            coordinator
+                .adapter()
+                .record(CallerId(folded))
+                .is_none(),
+            "the folded row leaves the adapter"
+        );
+        let second = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    4,
+                ),
+                unrouted_call(domain, 77, 5),
+            ],
+        );
+        assert!(
+            matches!(second, H3DispositionEvidence::StagedLoss { barrier: 5 }),
+            "the forgotten refused image could be an unrefused exec: {second:?}"
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 3);
+        assert_eq!(unrouted_subject_calls(&coordinator, OTHER), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 1);
+    }
+
+    /// F2 saturation twin: the folded-image negative index is
+    /// bounded. Ten folds keep the other-caller shortcut alive for a
+    /// healthy cookie, while 4,097 distinct folds saturate it and
+    /// fail closed: both other-caller proofs refuse.
+    #[test]
+    fn folded_image_negatives_saturate_bounded_and_refuse_the_shortcut() {
+        const SIBLING: u64 = 41;
+        const HEALTHY: u64 = 99;
+        // Below the cap: the shortcut stays alive for healthy cookies.
+        let (mut coordinator, _lane, domain) = drop_test_lanes();
+        let sibling = ImageIdentity {
+            task_cookie: SIBLING,
+            exec_id: 1,
+        };
+        bind_image(&mut coordinator, domain, 9000, sibling);
+        admit_history(&mut coordinator, domain, 9000, sibling);
+        for cycle in 0..10u64 {
+            let CallerId(id) = admit_self(&mut coordinator);
+            assert!(id < 9000, "the sibling id stays clear of adapter rows");
+            let image = ImageIdentity {
+                task_cookie: 30_000 + cycle,
+                exec_id: 1,
+            };
+            bind_image(&mut coordinator, domain, id, image);
+            admit_history(&mut coordinator, domain, id, image);
+            assert_eq!(
+                retire_and_fold(&mut coordinator, CallerId(id), 200 + cycle),
+                1,
+                "cycle {cycle}: the rendered exited row folds"
+            );
+        }
+        assert!(
+            coordinator.semantic_bindings.proves_unbound_caller(
+                domain,
+                ImageIdentity {
+                    task_cookie: HEALTHY,
+                    exec_id: 1,
+                }
+            ),
+            "below the cap the unbound shortcut stays alive"
+        );
+        // Past the cap: both proofs fail closed.
+        let (mut coordinator, _lane, domain) = drop_test_lanes();
+        bind_image(&mut coordinator, domain, 9000, sibling);
+        admit_history(&mut coordinator, domain, 9000, sibling);
+        for cycle in 0..4097u64 {
+            let CallerId(id) = admit_self(&mut coordinator);
+            assert!(id < 9000, "the sibling id stays clear of adapter rows");
+            let image = ImageIdentity {
+                task_cookie: 40_000 + cycle,
+                exec_id: 1,
+            };
+            bind_image(&mut coordinator, domain, id, image);
+            admit_history(&mut coordinator, domain, id, image);
+            assert_eq!(
+                retire_and_fold(&mut coordinator, CallerId(id), 200 + cycle),
+                1,
+                "cycle {cycle}: the rendered exited row folds"
+            );
+        }
+        assert!(
+            !coordinator.semantic_bindings.proves_unbound_caller(
+                domain,
+                ImageIdentity {
+                    task_cookie: HEALTHY,
+                    exec_id: 1,
+                }
+            ),
+            "a saturated negative index refuses the unbound shortcut"
+        );
+        assert!(
+            !coordinator.semantic_bindings.proves_refused_other_caller(
+                domain,
+                ImageIdentity {
+                    task_cookie: HEALTHY,
+                    exec_id: 1,
+                },
+                |_| true
+            ),
+            "a saturated negative index refuses the refused shortcut"
+        );
+    }
 }
 
 #[cfg(test)]

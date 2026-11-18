@@ -16727,6 +16727,130 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
     );
 }
 
+/// Capped sole feed: a Joint feed that exhausted the key-row budget
+/// reports `partial/row_budget_exhausted`, and folding the last feed
+/// must not clear that status while the capture-wide refusal stands.
+/// The refusal count, the retained proved row and the partial marker
+/// stay pinned across the real coordinator fold.
+#[test]
+fn fold_capped_feed_keeps_row_budget_partial_across_last_fold() {
+    let mut scene = FoldScene::new();
+    scene
+        .harness
+        .coordinator_mut()
+        .registry_mut()
+        .set_joint_keyuse_capacity_for_test(1);
+    let pid = 5021;
+    let caller = scene.admit(pid);
+    let (key, id) = scene.deliver_proved_use(caller, 1);
+    scene.seal_sign_use(&key, caller, id);
+    // A second use on its own instance: the reducer is full, so its
+    // start refuses and latches the capture-wide budget evidence.
+    let (_key2, _id2) = scene.deliver_proved_use(caller, 2);
+    assert_eq!(
+        scene.harness.coordinator().registry().joint_feeds(),
+        2,
+        "both instances feed Joint"
+    );
+    let keyuse = scene.harness.coordinator().registry().keyuse_for_test();
+    assert!(
+        keyuse.evidence().partial,
+        "the full reducer latches the budget evidence"
+    );
+    assert_eq!(
+        keyuse.evidence().rows_refused,
+        1,
+        "exactly the second start refuses"
+    );
+
+    let before = scene.presentation();
+    assert_eq!(
+        (
+            before.object_observations.status,
+            before.object_observations.reason
+        ),
+        (ObsStatus::Partial, "row_budget_exhausted")
+    );
+    assert_eq!(before.object_observations.budgets.key_occupied, 1);
+    assert_eq!(before.object_observations.budgets.key_refused, 1);
+    assert_eq!(
+        before.object_observations.key_operations.len(),
+        1,
+        "the sealed use proves one row"
+    );
+    assert!(
+        before
+            .object_observations
+            .key_operations
+            .iter()
+            .all(|row| row.active == 0),
+        "the completed use leaves no open active"
+    );
+    let text_before = render_snapshot_with_verbosity(&before, TextVerbosity::Concise);
+    let block_before = key_ops_text_block(&text_before);
+    assert!(
+        block_before
+            .first()
+            .is_some_and(|line| line.contains("partial")),
+        "concise text names the partial section: {block_before:?}"
+    );
+    let totals_before = key_tally_totals(&block_before);
+    assert!(
+        !totals_before.is_empty(),
+        "the twin parses tallies before the fold: {block_before:?}"
+    );
+    let (_, jsonl_before) = jsonl_reconstruction(&before.object_observations);
+    assert!(!jsonl_before.known.is_empty(), "JSONL carries proved rows");
+
+    scene.retire_pid(pid);
+    assert_eq!(scene.fold(caller), 1, "the rendered exited row folds");
+    assert_eq!(
+        scene.harness.coordinator().registry().joint_feeds(),
+        0,
+        "the fold leaves no live Joint feed"
+    );
+
+    let after = scene.presentation();
+    assert_eq!(
+        (
+            after.object_observations.status,
+            after.object_observations.reason
+        ),
+        (ObsStatus::Partial, "row_budget_exhausted"),
+        "the folded budget refusal still names itself with no live feed"
+    );
+    assert_eq!(after.object_observations.budgets.key_occupied, 1);
+    assert_eq!(after.object_observations.budgets.key_refused, 1);
+    assert_eq!(
+        after.object_observations.key_operations, before.object_observations.key_operations,
+        "the exact proved row survives"
+    );
+    let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
+    let block_after = key_ops_text_block(&text_after);
+    assert!(
+        block_after
+            .first()
+            .is_some_and(|line| line.contains("partial")),
+        "concise text stays partial, never hidden: {block_after:?}"
+    );
+    assert_eq!(
+        key_tally_totals(&block_after),
+        totals_before,
+        "concise keeps exact tally totals: {block_after:?}"
+    );
+    assert!(
+        !block_after
+            .iter()
+            .any(|line| line.contains("not available")),
+        "concise text never hides proved rows: {block_after:?}"
+    );
+    let (_, jsonl_after) = jsonl_reconstruction(&after.object_observations);
+    assert_eq!(
+        jsonl_after.known, jsonl_before.known,
+        "JSONL keeps proved rows exactly"
+    );
+}
+
 /// The concise header's provider-group total:
 /// `key operations: ... on {n} provider(s); ...`.
 fn header_provider_count(header: &str) -> u64 {

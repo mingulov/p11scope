@@ -1990,3 +1990,295 @@ fn fold_waits_for_deferred_instance_rows_before_folding_caller() {
     assert_eq!(pass_lines(&all, 3).1["edge_events_deferred"], 0);
     assert_eq!(state.instances.tracked_len(), 0, "no digest retained");
 }
+
+/// F1 credit-boundary twin (fix2): 1,025 exited callers share one
+/// publication while the fold carries 1,024 credits, so the last
+/// caller (the largest id) waits at the credit boundary. A retained
+/// terminal revision then lands for the waiting caller — a count
+/// bucket jump on its edge plus both instance-slot revisions — while
+/// the FIFO holds a live row ahead of each update. The fold must
+/// wait for the queued terminal revisions: the carried credit
+/// membership alone must not authorize the fold, since the post-fold
+/// forget would erase the digest and the queued update together and
+/// leave the stream with a stale terminal record. Counts ride on the
+/// captured views (the emitter and the gate both read views; the
+/// registry carries row existence and freezes counts at retirement),
+/// so the revision is exact without BPF realism. In production the
+/// retained-row revision arrives as a native-side coverage downgrade
+/// (the frozen-watch overflow twin pins that path); the count
+/// revision exercises the identical exact-payload gate.
+#[test]
+fn fold_credit_deferred_caller_revised_behind_fifo_waits_for_terminal() {
+    use crate::attach::capture::NativeDomainId;
+    use crate::discovery::caller_registry::instance_input::{AdmittedInstance, InstanceKey};
+    use crate::discovery::instances::InstanceId;
+    use crate::inventory_present::Presence;
+    use p11scope_ebpf_common::ImageIdentity;
+    const EXITED: u32 = 1025;
+    let mut harness = harness((EXITED + 1) as usize, 1);
+    let live = caller(&harness, 0);
+    let target = caller(&harness, EXITED);
+    assert!(
+        live < target,
+        "the live edge queues ahead of the deferred exit"
+    );
+    let mut exited = Vec::new();
+    for index in 1..=EXITED {
+        exited.push(caller(&harness, index));
+    }
+    assert_eq!(
+        exited.iter().max(),
+        Some(&target),
+        "the deferred caller sorts last, past the credit boundary"
+    );
+    // The deferred caller owns an instance, so both instance slots
+    // gate with its edge.
+    let domain = NativeDomainId::try_mint().expect("fresh domain");
+    let extra = key(99);
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .scripted_module_edge(extra.clone(), target);
+    let instance_key = InstanceKey::scripted(
+        domain,
+        ImageIdentity {
+            task_cookie: 300,
+            exec_id: 1,
+        },
+        InstanceId::from_raw(7),
+        extra,
+    );
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_instance(AdmittedInstance::scripted(instance_key, target));
+    harness.coordinator_mut().registry_mut().publish();
+
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 24, 4).unwrap();
+    let mut state = StreamState::new();
+    state.edges = EdgeEmitter::with_cap(1);
+    state.instances = InstanceEmitter::with_cap(1);
+    let mut pass = 0u64;
+    let emit_until_carried = |writer: &mut EventWriter,
+                                  state: &mut StreamState,
+                                  view: &Presentation,
+                                  pass: &mut u64| {
+        for _ in 0..100_000 {
+            *pass += 1;
+            let at = *pass;
+            emit_pass_events(writer, state, &report(*pass), view, at).unwrap();
+            if state.last_deferred.edge_events == 0
+                && state.last_deferred.instance_events == 0
+                && state.last_deferred.semantic_edge_events == 0
+            {
+                return;
+            }
+        }
+        panic!("the capped FIFO never drained");
+    };
+    // Carry every initial row: the exiting edges at 2 entries.
+    let mut pass1 = presentation(&harness);
+    assert_eq!(pass1.edges.len(), (EXITED + 2) as usize, "one edge per caller plus the deferred second");
+    assert_eq!(pass1.instances.len(), 1, "the instance row renders");
+    assert_eq!(pass1.semantic_edges.len(), 1, "the semantic row renders");
+    for edge in &mut pass1.edges {
+        if edge.caller != live {
+            edge.entry_count = 2;
+        }
+    }
+    emit_until_carried(&mut writer, &mut state, &pass1, &mut pass);
+
+    // The exits: every caller but the live one dies through the
+    // production reconcile path, and each edge reaches its terminal
+    // revision (exit presence, 3 entries) with the live edge bumped
+    // across a count bucket.
+    for pid in FIRST_PID + 1..=FIRST_PID + EXITED {
+        harness.source().kill(pid);
+    }
+    let observed: BTreeSet<u32> = [FIRST_PID].into_iter().collect();
+    let now = harness.now_ns();
+    let events = harness.coordinator_mut().adapter_mut().reconcile(
+        &observed,
+        &mut |_| ImageAuthority::ScanPinned,
+        now,
+    );
+    harness
+        .coordinator_mut()
+        .apply_reconcile_events(&events, now);
+    harness.advance(10);
+    for id in &exited {
+        assert!(
+            harness
+                .coordinator()
+                .adapter()
+                .record(*id)
+                .is_some_and(|record| record.retired),
+            "production reconcile retires every dead pid"
+        );
+    }
+    let mut pass_terminal = presentation(&harness);
+    for edge in &mut pass_terminal.edges {
+        if edge.caller == live {
+            edge.entry_count = 1;
+        } else {
+            assert_eq!(
+                edge.presence,
+                Presence::ProcessExited,
+                "the exit flips presence"
+            );
+            edge.entry_count = 3;
+        }
+    }
+    let terminal_seen = pass_terminal.instances[0].last_seen_ns;
+    let terminal_returns = pass_terminal.semantic_edges[0].api_returns;
+    emit_until_carried(&mut writer, &mut state, &pass_terminal, &mut pass);
+
+    // Pass A: the fold carries 1,024 credits and defers the largest
+    // id. Every other exited row folds.
+    state.last_stream_view = Some(std::sync::Arc::new(pass_terminal.clone()));
+    let dummy = dir.path().join("dummy.jsonl");
+    let stream = EventLogState::new(Some(EventWriter::create(&dummy, 1 << 20, 2).unwrap()));
+    assert!(stream.emits(), "the gate runs on the streaming path");
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(target).is_some(),
+        "the credit boundary defers the largest id"
+    );
+    for id in exited.iter().filter(|id| **id != target) {
+        assert!(
+            harness.coordinator().adapter().record(*id).is_none(),
+            "every credited row folds"
+        );
+    }
+    assert_eq!(state.edges.tracked_len(), 3, "live plus the deferred pair");
+    let totals = harness.coordinator().registry().departed_totals();
+    assert_eq!(totals.edges, u64::from(EXITED - 1), "1,024 edges folded");
+
+    // The retained revision: the deferred edge jumps a count bucket
+    // (3 to 4) and both instance slots move, while the live edge's
+    // own bump (1 to 2) queues ahead behind the unit cap.
+    let mut pass_revised = presentation(&harness);
+    assert_eq!(
+        pass_revised.edges.len(),
+        3,
+        "only the live edge and the deferred pair survive the fold"
+    );
+    // The live edge owns only the scale module, so it names the
+    // revised edge: the deferred caller's scale-module edge jumps 3
+    // to 4 while its second edge stays at its carried 3.
+    let m0 = pass_revised
+        .edges
+        .iter()
+        .find(|edge| edge.caller == live)
+        .expect("live edge retained")
+        .module;
+    for edge in &mut pass_revised.edges {
+        if edge.caller == live {
+            edge.entry_count = 2;
+        } else if edge.caller == target {
+            edge.entry_count = if edge.module == m0 { 4 } else { 3 };
+        }
+    }
+    for row in &mut pass_revised.instances {
+        row.last_seen_ns = terminal_seen + 1;
+    }
+    for row in &mut pass_revised.semantic_edges {
+        row.api_returns = Some(terminal_returns.unwrap_or(0) + 5);
+    }
+    pass += 1;
+    emit_pass_events(&mut writer, &mut state, &report(pass), &pass_revised, pass).unwrap();
+    assert_eq!(
+        state.last_deferred.edge_events, 1,
+        "the edge revision waits behind the live row"
+    );
+    assert_eq!(
+        state.last_deferred.instance_events, 0,
+        "the instance row drains"
+    );
+    assert_eq!(
+        state.last_deferred.semantic_edge_events, 1,
+        "the semantic revision waits behind the cap"
+    );
+
+    // Pass B: the carried credit membership alone must not fold the
+    // caller whose terminal revisions are still queued.
+    state.last_stream_view = Some(std::sync::Arc::new(pass_revised.clone()));
+    let carried_before = state.edges.carried_bytes();
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(target).is_some(),
+        "the fold waits for the queued terminal revisions past the credit boundary"
+    );
+    assert_eq!(
+        state.edges.tracked_len(),
+        3,
+        "the waiting caller's digests survive the pass"
+    );
+    assert_eq!(
+        state.edges.carried_bytes(),
+        carried_before,
+        "no digest leaves the retention bound before its revision lands"
+    );
+
+    // The next passes drain both terminal revisions with the same
+    // terminal rows; then the fold runs.
+    emit_until_carried(&mut writer, &mut state, &pass_revised, &mut pass);
+    state.last_stream_view = Some(std::sync::Arc::new(pass_revised));
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(target).is_none(),
+        "the published terminal revisions fold"
+    );
+    drop(writer);
+
+    // The stream alone proves the terminal payloads: the last record
+    // of each row kind carries the terminal revision, the folded
+    // digests leave the retention bound, and the departed aggregate
+    // counts the folded pair.
+    let all = lines(&path);
+    let last_edge = all
+        .iter()
+        .rev()
+        .find(|line| line["kind"] == "edge_observed")
+        .expect("edge records streamed");
+    assert_eq!(
+        last_edge["event"]["entries"]["count"].as_u64().unwrap(),
+        4,
+        "the terminal edge revision streams last"
+    );
+    let last_instance = all
+        .iter()
+        .rev()
+        .find(|line| line["kind"] == "instance_observed")
+        .expect("instance records streamed");
+    assert_eq!(
+        last_instance["event"]["last_seen_ns"].as_u64().unwrap(),
+        terminal_seen + 1,
+        "the terminal instance revision streams last"
+    );
+    let last_semantic = all
+        .iter()
+        .rev()
+        .find(|line| line["kind"] == "semantic_edge_observed")
+        .expect("semantic records streamed");
+    assert_eq!(
+        last_semantic["event"]["api_returns"]["count"]
+            .as_u64()
+            .unwrap(),
+        terminal_returns.unwrap_or(0) + 5,
+        "the terminal semantic revision streams last"
+    );
+    assert_eq!(state.edges.tracked_len(), 1, "one live digest retained");
+    assert!(
+        state.edges.carried_bytes() < carried_before,
+        "the folded digests leave the retention bound"
+    );
+    assert_eq!(state.instances.tracked_len(), 0, "no digest retained");
+    let totals = harness.coordinator().registry().departed_totals();
+    assert_eq!(totals.edges, u64::from(EXITED + 1), "the deferred pair folds");
+}

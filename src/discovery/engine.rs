@@ -18149,6 +18149,11 @@ impl Engine {
         }
     }
 
+    /// Test-only shorthand: every production rebuild names its carried
+    /// views explicitly (`live_candidate_with_claimless`,
+    /// `live_candidate_with_declined`), so the bare form survives only
+    /// for unit-test callers.
+    #[cfg(test)]
     fn live_candidate(
         &mut self,
         pinned: PinnedObjects,

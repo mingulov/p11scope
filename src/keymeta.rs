@@ -135,6 +135,15 @@ const RSA_AES_KEY_WRAP_ID: u64 = 0x00001054;
 const AES_XTS_ID: u64 = 0x00001071;
 pub(crate) const AES_KW_ID: u64 = 0x00002109;
 
+/// Admitted wrapped-material octets (§5.2 AES-KW row): material
+/// 0..=8191 (wrap outputs 8..=8199), covering every standard
+/// asymmetric private-key blob with headroom. Above the bound the
+/// length is unsupported with the admission-bound reason — the RSA
+/// 64..=2048 anti-alias precedent, never a range render — so the
+/// reducer tracks the admitted domain exactly; widening the bound
+/// later is an amendment row.
+pub(crate) const WRAPPED_MATERIAL_MAX: u64 = 8191;
+
 /// Whether one mechanism id is in the AES-KW family (plain wrap plus
 /// the padded variants): their wrap/unwrap lengths concern the
 /// wrapped key or fresh view, never the operation key.
@@ -946,7 +955,9 @@ fn classify_dsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
 }
 
 /// AES-KW output/input lengths size the wrapped key's material
-/// (L-8); outputs under 8 octets cannot map.
+/// (L-8); outputs under 8 octets cannot map, and material above
+/// [`WRAPPED_MATERIAL_MAX`] is unsupported (anti-alias admission
+/// bound, the RSA precedent).
 fn classify_aes_kw(tag: EvidenceTag, length: u64) -> SizeOutcome {
     match tag {
         EvidenceTag::WrapOutput | EvidenceTag::UnwrapInput => {}
@@ -961,6 +972,11 @@ fn classify_aes_kw(tag: EvidenceTag, length: u64) -> SizeOutcome {
             reason: REASON_UNMAPPED_LENGTH,
         };
     };
+    if material_octets > WRAPPED_MATERIAL_MAX {
+        return SizeOutcome::Unsupported {
+            reason: REASON_OUTSIDE_ADMISSION_BOUND,
+        };
+    }
     SizeOutcome::Inferred(SizeDetail::WrappedMaterial {
         material_octets,
         octets: length,

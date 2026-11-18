@@ -2368,15 +2368,20 @@ pub(crate) struct FamilyState {
 /// count, and the detail keeps the first tag. `unsupported` never
 /// overwrites `inferred` and never flips to `conflicting`.
 /// RSA further values track exactly in a 1985-bit bitmap (64..=2048
-/// modulus octets); non-RSA further values deduplicate in a capped
-/// set (the finite non-RSA total is 20, so the cap never binds them;
-/// wrapped-material per-row distinct stays small in practice).
+/// modulus octets); wrapped-material further values track exactly in
+/// an 8192-bit bitmap (0..=8191 material octets, the
+/// [`crate::keymeta::WRAPPED_MATERIAL_MAX`] admission bound); the
+/// remaining non-RSA kinds deduplicate in a capped set (their finite
+/// total is 20 — 3 EC, 2 EdDSA, 3 DSA, 12 PQC — so the cap never
+/// binds them).
 pub(crate) const FURTHER_SEEN_CAP: usize = 64;
 /// RSA admitted octet bounds (§5.2): 64..=2048 inclusive.
 pub(crate) const RSA_FURTHER_MIN: u64 = 64;
 pub(crate) const RSA_FURTHER_MAX: u64 = 2048;
 /// Bitmap words covering the 1985 RSA octets (32×64).
 pub(crate) const RSA_FURTHER_WORDS: usize = 32;
+/// Bitmap words covering the 8192 wrapped-material octets (128×64).
+pub(crate) const WRAPPED_FURTHER_WORDS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SizeState {
@@ -2386,11 +2391,16 @@ pub(crate) struct SizeState {
     pub conflict_detail: Option<(crate::keymeta::SizeDetail, crate::keymeta::EvidenceTag)>,
     pub further: u64,
     pub reason: Option<&'static str>,
-    /// Remembered non-RSA further size details for repeat suppression
-    /// (capped at [`FURTHER_SEEN_CAP`]; tags never compared).
+    /// Remembered non-RSA, non-wrapped further size details for
+    /// repeat suppression (capped at [`FURTHER_SEEN_CAP`]; tags never
+    /// compared; the finite kinds total 20, so the cap never binds).
     pub further_seen: Vec<crate::keymeta::SizeDetail>,
     /// Exact RSA further-octet bitmap, bit `octets - 64`.
     pub rsa_further_seen: [u64; RSA_FURTHER_WORDS],
+    /// Exact wrapped-material further-octet bitmap, bit
+    /// `material_octets`, allocated on the first wrapped further
+    /// value: rows without wrapped conflicts carry no bitmap.
+    pub wrapped_further_seen: Option<Box<[u64; WRAPPED_FURTHER_WORDS]>>,
 }
 
 /// One completion's size input after flag/trailer resolution: the
@@ -2616,7 +2626,8 @@ impl SizeState {
     /// Accumulate one classified size detail: first value pins (with
     /// the established-size check), same sizes keep the first tag, a
     /// second distinct size rides the conflict pair, and further
-    /// distinct sizes count once each (dedup capped).
+    /// distinct sizes count once each (exact: RSA and wrapped
+    /// bitmaps, finite kinds in the capped set).
     fn accumulate_detail(
         &mut self,
         established: Option<crate::keymeta::EstablishedKind>,
@@ -2656,8 +2667,9 @@ impl SizeState {
                 Some((second, _)) if same_size(second, &detail) => {}
                 Some(_) => {
                     // RSA further octets track exactly in the bitmap;
-                    // non-RSA further values deduplicate in the capped
-                    // set (finite total 20, so exact for them).
+                    // wrapped-material further octets track exactly in
+                    // their bitmap; the remaining non-RSA kinds are
+                    // finite (20), so the capped set is exact for them.
                     if let crate::keymeta::SizeDetail::Rsa { modulus_bytes, .. } = &detail
                         && (RSA_FURTHER_MIN..=RSA_FURTHER_MAX).contains(modulus_bytes)
                     {
@@ -2665,6 +2677,21 @@ impl SizeState {
                         let (word, offset) = (bit / 64, bit % 64);
                         if self.rsa_further_seen[word] & (1u64 << offset) == 0 {
                             self.rsa_further_seen[word] |= 1u64 << offset;
+                            self.further = self.further.saturating_add(1);
+                        }
+                    } else if let crate::keymeta::SizeDetail::WrappedMaterial {
+                        material_octets,
+                        ..
+                    } = &detail
+                        && *material_octets <= crate::keymeta::WRAPPED_MATERIAL_MAX
+                    {
+                        let bit = *material_octets as usize;
+                        let (word, offset) = (bit / 64, bit % 64);
+                        let seen = self
+                            .wrapped_further_seen
+                            .get_or_insert_with(|| Box::new([0; WRAPPED_FURTHER_WORDS]));
+                        if seen[word] & (1u64 << offset) == 0 {
+                            seen[word] |= 1u64 << offset;
                             self.further = self.further.saturating_add(1);
                         }
                     } else if !self
@@ -2705,9 +2732,10 @@ struct OpenAssoc {
     /// snapshotted at admission: a later query never re-opens the
     /// compatibility comparison.
     established: Option<crate::keymeta::EstablishedKind>,
-    /// The receipt's frozen established key type (§4.5 left side),
-    /// even without a combined label: a later query never re-opens
-    /// the comparison.
+    /// The §4.5 left side: the combined label when one exists,
+    /// else the receipt's frozen established key type (type-only
+    /// receipts). Snapshotted at admission: a later query never
+    /// re-opens the comparison.
     established_type: Option<crate::keymeta::EstablishedKind>,
 }
 
@@ -3057,16 +3085,25 @@ impl KeyUseReducer {
                 let associations: Vec<OpenAssoc> = resolved
                     .iter()
                     .zip(receipts.iter())
-                    .map(|(slot, receipt)| OpenAssoc {
-                        bucket: slot.bucket,
-                        key: receipt.key,
-                        lost: false,
-                        primary: slot.primary,
-                        established: receipt.label.map(crate::keymeta::established_kind),
-                        established_type: receipt
-                            .key_type
-                            .and_then(crate::keymeta::established_type_kind)
-                            .or_else(|| receipt.label.map(crate::keymeta::established_kind)),
+                    .map(|(slot, receipt)| {
+                        let established = receipt.label.map(crate::keymeta::established_kind);
+                        // The combined label governs when present (the
+                        // base behavior, including legacy CKK_EC plus
+                        // curve shapes); the raw type only fills in
+                        // when no label exists.
+                        let established_type = established.or_else(|| {
+                            receipt
+                                .key_type
+                                .and_then(crate::keymeta::established_type_kind)
+                        });
+                        OpenAssoc {
+                            bucket: slot.bucket,
+                            key: receipt.key,
+                            lost: false,
+                            primary: slot.primary,
+                            established,
+                            established_type,
+                        }
                     })
                     .collect();
                 if receipts.is_empty() {
@@ -3327,10 +3364,14 @@ impl KeyUseReducer {
             );
         for (slot, receipt) in resolved.iter().zip(receipts.iter()) {
             let established = receipt.label.map(crate::keymeta::established_kind);
-            let established_type = receipt
-                .key_type
-                .and_then(crate::keymeta::established_type_kind)
-                .or(established);
+            // The combined label governs when present (the base
+            // behavior, including legacy CKK_EC plus curve shapes);
+            // the raw type only fills in when no label exists.
+            let established_type = established.or_else(|| {
+                receipt
+                    .key_type
+                    .and_then(crate::keymeta::established_type_kind)
+            });
             match slot.bucket {
                 AssocBucket::Proved(bucket) => {
                     self.forward_fill(bucket, established);

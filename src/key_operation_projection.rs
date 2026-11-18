@@ -56,8 +56,8 @@ pub(crate) const OBSERVATIONS_VERSION_V5: u8 = 5;
 pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
 /// Section version 7 (keymeta inferred keys): v6 vocabulary plus the
 /// `inferred_family`/`inferred_size` row keys. The renderer emits v7
-/// exactly when a row carries non-blank inferred content; v1–v6
-/// output stays byte-stable.
+/// exactly when a row carries non-blank inferred content or a
+/// v7-only gap does; v1–v6 output stays byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V7: u8 = 7;
 /// The named reason an unseen metadata field carries at v6 when its
 /// creation template carried more than the eight observed cells
@@ -1854,18 +1854,6 @@ pub(crate) mod producer {
             });
         }
         unknown_rows.sort_by(|a, b| (a.category, a.reason).cmp(&(b.category, b.reason)));
-        // v7 emits exactly when a row carries non-blank inferred
-        // content; below v7 every row drops its keys (uniform fill
-        // above, frozen 13 below).
-        if !key_rows.iter().any(|row| {
-            row.inferred
-                .as_ref()
-                .is_some_and(|keys| keys.is_v7_content())
-        }) {
-            for row in &mut key_rows {
-                row.inferred = None;
-            }
-        }
         observations.key_operations = key_rows;
         observations.unknown_key_operations = unknown_rows;
         observations.budgets.unknown_occupied = observations.unknown_key_operations.len();
@@ -1895,6 +1883,26 @@ pub(crate) mod producer {
                 reason: "wrapped_park_refused",
                 repeats: parks_refused,
             });
+        }
+        // The row shape follows the same version decision as the
+        // snapshot, marker and stream ([`observations_version`]):
+        // v7 keeps the inferred keys on every proved row, whether a
+        // row carries non-blank content or a v7-only gap does, so a
+        // gap-driven v7 section still renders all 15 keys per row.
+        // Below v7 every row drops its keys (uniform fill above,
+        // frozen 13 below). Model gaps (collected after this) never
+        // trigger v7, and the at-most-three key-side gaps sort
+        // before them under the 256-cap, so this decision equals the
+        // final one.
+        let v7 = observations.key_operations.iter().any(|row| {
+            row.inferred
+                .as_ref()
+                .is_some_and(|keys| keys.is_v7_content())
+        }) || has_v7_gap_content(observations);
+        if !v7 {
+            for row in &mut observations.key_operations {
+                row.inferred = None;
+            }
         }
     }
 

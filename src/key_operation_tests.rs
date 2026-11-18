@@ -29342,6 +29342,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 reason: None,
                 further_seen: Vec::new(),
                 rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
             },
         }),
     };
@@ -29412,6 +29413,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 reason: None,
                 further_seen: Vec::new(),
                 rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
             },
         }),
         ..row
@@ -29484,6 +29486,7 @@ fn key_row_json_revision_changes_bytes() {
                 reason: None,
                 further_seen: Vec::new(),
                 rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
             },
         }),
     };
@@ -29557,6 +29560,7 @@ fn observations_version_v7_triggers_on_inferred_content() {
                 reason: Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF),
                 further_seen: Vec::new(),
                 rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
             },
         }))]),
         4
@@ -29769,6 +29773,7 @@ fn observations_version_no_evidence_stays_below_v7() {
                 reason: Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE),
                 further_seen: Vec::new(),
                 rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
             },
         }),
     }];

@@ -3016,6 +3016,50 @@ fn provider_text_disambiguates_shared_slots_per_caller() {
 }
 
 #[test]
+fn provider_text_disambiguates_many_shared_slots() {
+    // Output-preservation pin for the linear row renderer: every
+    // shared slot names its caller, one line per row.
+    let mut presentation = provider_presentation();
+    let observations = presentation
+        .provider_observations
+        .as_mut()
+        .expect("observations");
+    observations.tokens.clear();
+    observations.mechanisms.clear();
+    for caller in 0..60u32 {
+        observations
+            .tokens
+            .push(info_token_row(caller, u64::from(caller % 3)));
+    }
+    for caller in 0..60u32 {
+        observations
+            .mechanisms
+            .push(info_mechanism_row(caller, 0, 1082));
+    }
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let token_lines: Vec<&str> = verbose
+        .lines()
+        .filter(|line| line.starts_with("  token slot"))
+        .collect();
+    assert_eq!(token_lines.len(), 60);
+    assert!(
+        token_lines.iter().all(|line| line.contains("(caller c")),
+        "every shared slot names its caller, got:\n{verbose}"
+    );
+    let mechanism_lines: Vec<&str> = verbose
+        .lines()
+        .filter(|line| line.starts_with("  mechanism 0x"))
+        .collect();
+    assert_eq!(mechanism_lines.len(), 60);
+    assert!(
+        mechanism_lines
+            .iter()
+            .all(|line| line.contains("(caller c")),
+        "every shared limit names its caller, got:\n{verbose}"
+    );
+}
+
+#[test]
 fn provider_refused_strings_render_unknown_marker() {
     let mut presentation = provider_presentation();
     let info = presentation.modules[0]

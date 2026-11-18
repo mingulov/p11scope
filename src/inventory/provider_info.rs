@@ -1837,4 +1837,158 @@ mod tests {
             vec!["info_aliased_endpoint", "info_return_deferred"]
         );
     }
+
+    #[test]
+    fn info_join_refuses_token_rows_past_the_run_wide_cap() {
+        // Spec §17.5: tokens are bounded run-wide; overflow refuses
+        // new rows with a named counted gap while re-polls of kept
+        // rows still complete.
+        assert_eq!(INFO_MAX_TOKEN_ROWS, 4096);
+        let mut join = InfoJoin::new();
+        for slot in 0..INFO_MAX_TOKEN_ROWS as u64 {
+            ingest_token(&mut join, slot, 0);
+        }
+        ingest_token(&mut join, INFO_MAX_TOKEN_ROWS as u64, 0);
+        ingest_token(&mut join, 0, 0);
+        let (_, observations) = join.finish();
+        assert_eq!(observations.tokens.len(), INFO_MAX_TOKEN_ROWS);
+        assert_eq!(observations.gaps.tokens_refused, 1);
+        let row = observations
+            .tokens
+            .iter()
+            .find(|row| row.slot == 0)
+            .expect("slot 0 stands");
+        assert_eq!(row.completions, 2);
+    }
+
+    #[test]
+    fn info_join_refuses_mechanism_rows_past_the_run_wide_cap() {
+        // Spec §17.5: mechanisms are bounded run-wide beside the
+        // 128-per-slot cap; overflow refuses new rows with a named
+        // counted gap while re-polls of kept rows still complete.
+        assert_eq!(INFO_MAX_MECHANISM_ROWS, 32768);
+        let mut join = InfoJoin::new();
+        let full = full_mech_lp64();
+        let mut rows = 0u64;
+        for slot in 0..256u64 {
+            for mechanism in 0..128u64 {
+                let record = decode_info_record(&record_bytes(
+                    INFO_KIND_MECHANISM,
+                    INFO_LAYOUT_LP64,
+                    &full,
+                    slot,
+                    mechanism,
+                    100,
+                ))
+                .expect("mechanism record decodes");
+                join.ingest(&record, ModuleId(0), CallerId(0), None);
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, INFO_MAX_MECHANISM_ROWS as u64);
+        let record = decode_info_record(&record_bytes(
+            INFO_KIND_MECHANISM,
+            INFO_LAYOUT_LP64,
+            &full,
+            256,
+            0,
+            100,
+        ))
+        .expect("mechanism record decodes");
+        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        let record = decode_info_record(&record_bytes(
+            INFO_KIND_MECHANISM,
+            INFO_LAYOUT_LP64,
+            &full,
+            0,
+            7,
+            100,
+        ))
+        .expect("mechanism record decodes");
+        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        let (_, observations) = join.finish();
+        assert_eq!(observations.mechanisms.len(), INFO_MAX_MECHANISM_ROWS);
+        assert_eq!(observations.gaps.mechanisms_refused, 1);
+        assert_eq!(observations.gaps.mechanism_refused, 0);
+        let row = observations
+            .mechanisms
+            .iter()
+            .find(|row| row.slot == 0 && row.mechanism == 7)
+            .expect("reporter 7 stands");
+        assert_eq!(row.completions, 2);
+    }
+
+    #[test]
+    fn info_join_folds_departed_caller_rows_with_counts() {
+        // Spec §17.5: folding a departed caller retires its rows and
+        // counts them; live callers stand untouched.
+        let mut join = InfoJoin::new();
+        ingest_token(&mut join, 0, 0);
+        ingest_token(&mut join, 0, 1);
+        ingest_token(&mut join, 1, 1);
+        let full = full_mech_lp64();
+        for (caller, slot) in [(0u32, 0u64), (1, 0), (1, 1)] {
+            let record = decode_info_record(&record_bytes(
+                INFO_KIND_MECHANISM,
+                INFO_LAYOUT_LP64,
+                &full,
+                slot,
+                1082,
+                100 + u64::from(caller),
+            ))
+            .expect("mechanism record decodes");
+            join.ingest(&record, ModuleId(0), CallerId(caller), None);
+        }
+        join.fold_departed_caller(CallerId(9));
+        join.fold_departed_caller(CallerId(1));
+        let (_, observations) = join.finish();
+        assert_eq!(observations.tokens.len(), 1);
+        assert_eq!(observations.tokens[0].caller, CallerId(0));
+        assert_eq!(observations.mechanisms.len(), 1);
+        assert_eq!(observations.mechanisms[0].caller, CallerId(0));
+        assert_eq!(observations.gaps.tokens_departed, 2);
+        assert_eq!(observations.gaps.mechanisms_departed, 2);
+    }
+
+    #[test]
+    fn info_gaps_render_new_reasons_in_fixed_order() {
+        let observations = ProviderObservations {
+            tokens: Vec::new(),
+            mechanisms: Vec::new(),
+            gaps: ProviderGaps {
+                aliased: 1,
+                return_deferred: 2,
+                caller_unavailable: 3,
+                mechanism_refused: 4,
+                tokens_refused: 5,
+                mechanisms_refused: 6,
+                tokens_departed: 7,
+                mechanisms_departed: 8,
+            },
+        };
+        let section = provider_observations_json(&observations);
+        let gaps = section["gaps"].as_array().expect("gaps array");
+        let reasons: Vec<&str> = gaps
+            .iter()
+            .map(|gap| gap["reason"].as_str().expect("gap reason"))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                "info_aliased_endpoint",
+                "info_return_deferred",
+                "info_caller_unavailable",
+                "mechanism_info_refused",
+                "info_token_rows_refused",
+                "info_mechanism_rows_refused",
+                "info_token_departed_folded",
+                "info_mechanism_departed_folded",
+            ]
+        );
+        let counts: Vec<u64> = gaps
+            .iter()
+            .map(|gap| gap["count"].as_u64().expect("gap count"))
+            .collect();
+        assert_eq!(counts, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
 }

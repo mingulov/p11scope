@@ -788,6 +788,59 @@ fn cbom_token_projects_device_component() {
 }
 
 #[test]
+fn cbom_token_devices_dedup_per_module_slot_identity() {
+    // Same (module, slot, token identity) from two callers projects
+    // one device; a conflicting identity on the same slot keeps its
+    // own device (slot ids are per-process).
+    let mut conflict = token_row("c2", 0);
+    conflict["model"] = json!("Model-Y");
+    let bytes = inventory_document_with_info(
+        vec![
+            caller("c0", Some("/bin/driver")),
+            caller("c1", Some("/bin/other")),
+            caller("c2", Some("/bin/third")),
+        ],
+        vec![module_with_info("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![
+            edge("c0", "m0", None),
+            edge("c1", "m0", None),
+            edge("c2", "m0", None),
+        ],
+        vec![
+            token_row("c0", 0),
+            token_row("c1", 0),
+            conflict,
+            token_row("c0", 1),
+        ],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.tokens.len(), 3);
+    let mut names: Vec<(&str, u64)> = projection
+        .tokens
+        .iter()
+        .map(|token| (token.name.as_str(), token.slot))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            ("TokenMfr Model-X", 0),
+            ("TokenMfr Model-X", 1),
+            ("TokenMfr Model-Y", 0),
+        ]
+    );
+    let mut refs: Vec<&str> = projection
+        .tokens
+        .iter()
+        .map(|token| token.bom_ref.as_str())
+        .collect();
+    refs.sort_unstable();
+    refs.dedup();
+    assert_eq!(refs.len(), 3, "one bom-ref per device");
+}
+
+#[test]
 fn cbom_never_emits_serial_keys() {
     let bytes = inventory_document_with_info(
         vec![caller("c0", Some("/bin/driver"))],

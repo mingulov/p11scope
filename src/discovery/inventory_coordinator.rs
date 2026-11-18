@@ -738,6 +738,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Caller rows a published presentation has rendered; retirement of
     /// a proven-exited row waits until it has appeared at least once.
     rendered_callers: BTreeSet<CallerId>,
+    /// Released pidfd custody awaiting its close: folds hand their
+    /// pins here instead of dropping them, and the paced drain
+    /// closes them one per stop check. A stop defers the remainder
+    /// under coordinator custody; a quiet pass drains the queue
+    /// whole, so steady state piles nothing up. Bounded by one
+    /// pass's folds times the per-caller pins.
+    pending_close_queue: Vec<Arc<PidPin>>,
     /// Proven-exited caller rows retired into the counted aggregate
     /// (monotonic, saturating).
     retired_caller_rows: u64,
@@ -1441,6 +1448,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
             rendered_callers: BTreeSet::new(),
+            pending_close_queue: Vec::new(),
             retired_caller_rows: 0,
             retired_with_calls: 0,
             folded_terminal_missed: 0,
@@ -5913,12 +5921,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// again where the pure plan meets the first mutation. Rows
     /// leave the carry as decided — folded, vetoed, deferred or
     /// simply not a candidate — so an abort keeps the unprocessed
-    /// suffix carried without rebuilding it. Each fold spends one
-    /// credit plus one per further member stride, and released pidfd
-    /// custody drains through one explicit handoff outside the
-    /// per-caller loop. Each single-caller fold stays atomic: an
-    /// abort only defers whole rows. The stop query covers the local
-    /// flag and the wired operator counter alike.
+    /// suffix carried without rebuilding it. Each fold is charged
+    /// before it runs — one credit plus one per further member
+    /// stride — and a caller that does not fit the remaining credits
+    /// waits for a fresh window. Released pidfd custody joins a
+    /// bounded close queue serviced one pin per stop check; a stop
+    /// defers the remainder under coordinator custody. Each
+    /// single-caller fold stays atomic: an abort only defers whole
+    /// rows. The stop query covers the local flag and the wired
+    /// operator counter alike.
     pub(crate) fn retire_rendered_callers(
         &mut self,
         now_ns: u64,
@@ -5937,23 +5948,42 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         subset: Option<&AttestedSubset>,
         stop: &dyn Fn() -> bool,
     ) -> FoldReceipt {
-        if self.rendered_callers.is_empty() {
-            return FoldReceipt::default();
-        }
-        // The entry gate runs before any planning: a stopped
-        // retirement plans nothing, folds nothing, and leaves the
-        // carry intact for the resume.
+        // The entry gate runs before any planning — and before the
+        // close drain: a stopped retirement plans nothing, folds
+        // nothing, closes nothing, and leaves the carry intact for
+        // the resume.
         if stop() {
             return FoldReceipt::default();
         }
-        // Released pidfd custody drains here, in one explicit place
-        // outside the per-caller fold loop: every return path below
-        // converges on this drop, so no last-owner close runs inside
-        // a fold credit and no release strands on an abort.
+        if self.rendered_callers.is_empty() {
+            // No rows wait, but a stopped drain may have left closes
+            // queued: service them while quiet.
+            self.drain_close_queue(stop);
+            return FoldReceipt::default();
+        }
+        // Released pidfd custody joins the bounded close queue: every
+        // return path below converges on the paced drain, so no
+        // last-owner close runs inside a fold credit and no release
+        // strands on an abort.
         let mut handoff: Vec<Arc<PidPin>> = Vec::new();
         let receipt = self.retire_inner(now_ns, subset, stop, &mut handoff);
-        drop(handoff);
+        self.pending_close_queue.append(&mut handoff);
+        self.drain_close_queue(stop);
         receipt
+    }
+
+    /// Service the deferred close queue one pin per stop check: each
+    /// drop may close a last-owner pidfd, so the drain paces like
+    /// any I/O work. A stop defers the remainder under coordinator
+    /// custody (the fold receipt already published); a quiet pass
+    /// drains the queue whole, so steady state piles nothing up.
+    fn drain_close_queue(&mut self, stop: &dyn Fn() -> bool) {
+        while !self.pending_close_queue.is_empty() {
+            if stop() {
+                break;
+            }
+            drop(self.pending_close_queue.pop());
+        }
     }
 
     /// One retirement pass under an explicit stop query, with
@@ -6081,15 +6111,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if stop() {
                 break;
             }
-            // The member pacing counts this caller's units before
-            // folding: cookies, pair targets and recoveries, edges,
-            // instances and pidfd custody. Clearing runs now (the
-            // veto was checked above), so a folded row's evidence
-            // clears exactly once, in its own fold.
-            if !self.binder.apply_retired_release(plan, id) {
-                self.rendered_callers.remove(&id);
-                continue;
-            }
+            // Charge the member work before running it: cookies,
+            // pair targets and recoveries, edges, instances and pidfd
+            // custody. A caller that does not fit the remaining
+            // credits waits for a fresh window instead of spending
+            // work it was never granted; a caller costlier than a
+            // whole window still folds alone on a fresh pass, so no
+            // row starves. Clearing runs below (the veto and the
+            // handoff stop were checked above), so a folded row's
+            // evidence clears exactly once, in its own fold.
             let pairs_ref = pairs.as_ref().expect("indexes build before the first fold");
             let ctx_ref = folded
                 .as_ref()
@@ -6102,6 +6132,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .saturating_add(ctx_ref.instances_by_caller.get(&id).map_or(0, Vec::len))
                 .saturating_add(self.semantic_bindings.fold_pin_count(id));
             let cost = 1usize.saturating_add(units / FOLD_PLAN_STRIDE as usize);
+            if cost > credits && credits != FOLD_CALLERS_PER_PUBLICATION {
+                break;
+            }
+            if !self.binder.apply_retired_release(plan, id) {
+                self.rendered_callers.remove(&id);
+                continue;
+            }
             let folded_caller = self.fold_caller_rendered_state(
                 id,
                 &record,
@@ -25924,13 +25961,16 @@ exit 0
             native.scene.coordinator.adapter.record(heavy).is_some(),
             "the costly caller waits past the credit boundary"
         );
+        // The accessor reports one owner per bound sequence: all 200
+        // of the waiter's sequences stay bound, and every sibling's
+        // cleared (no other id appears).
         assert_eq!(
             native
                 .scene
                 .coordinator
                 .binder
                 .cookie_bound_owners_for_test(),
-            vec![heavy],
+            vec![heavy; SEQUENCES as usize],
             "the waiting row keeps its cookie bindings"
         );
         assert_eq!(

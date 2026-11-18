@@ -12080,7 +12080,11 @@ pub(crate) mod tests {
             .expect("kept getter slot");
         assert!(plan.is_active(kept.index));
         assert_eq!(kept.descriptor_index, getter.descriptor_index);
-        assert!(!kept.semantic_authorized, "authority follows the manifest");
+        assert!(
+            kept.semantic_authorized,
+            "the kept descriptor keeps its authorization"
+        );
+        plan.validate_slot_index().unwrap();
     }
 
     #[test]
@@ -18776,6 +18780,60 @@ pub(crate) mod tests {
         assert!(
             plan.slots[0].semantic_authorized,
             "the kept descriptor keeps its authorization: {:?}",
+            plan.slots[0]
+        );
+        plan.validate_slot_index().unwrap();
+    }
+
+    #[test]
+    fn extend_exact_replaces_a_getter_claimed_by_a_rival_manifest_owner() {
+        // Failure twin for the manifest-only getter carry above: the
+        // rebuilt manifest getter names a rival owner (a different module
+        // id for the same exact target), so the merge must take the
+        // replace branch — the rival must not inherit the old
+        // authorization. Same names, both count-only, scan retired: only
+        // the owner gate refuses the carry. Driven through the production
+        // stable-id entry so the rival id survives (plain `extend_exact`
+        // would remap a same-object id onto the old owner).
+        let object = PinnedObjectId(1);
+        let descriptor = crate::kinds::function_id("C_GetFunctionList").unwrap() + 1;
+        let getter_slot = |descriptor_index: u32, authorized: bool, owner: u32| Slot {
+            index: 0,
+            descriptor_index,
+            object,
+            object_path: "/proc/self/fd/1".into(),
+            file_offset: 0x10,
+            names: vec!["C_GetFunctionList".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: authorized,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(owner)],
+        };
+        let mut scan_module = exact_module(0, object);
+        scan_module.source = "scan";
+        let mut plan = exact_plan(vec![getter_slot(descriptor, true, 0)], vec![scan_module]);
+        plan.validate_slot_index().unwrap();
+        let rival_module = exact_module(1, object);
+        assert_eq!(rival_module.source, "manifest");
+        let rebuilt = exact_plan(vec![getter_slot(0, false, 1)], vec![rival_module]);
+        rebuilt.validate_slot_index().unwrap();
+
+        let delta = plan.extend_exact_with_stable_module_ids(rebuilt).unwrap();
+
+        assert!(
+            !delta.replace.is_empty(),
+            "a rival owner must replace, never carry: {delta:?}"
+        );
+        assert!(
+            delta.new.is_empty() && delta.retire.is_empty(),
+            "pure replace, no churn elsewhere: {delta:?}"
+        );
+        assert_eq!(plan.slots[0].descriptor_index, 0);
+        assert!(
+            !plan.slots[0].semantic_authorized,
+            "the rival must not inherit the old authorization: {:?}",
             plan.slots[0]
         );
         plan.validate_slot_index().unwrap();

@@ -21,9 +21,6 @@ versioned separately and are opaque, exact dispatch keys.
   HKDF (`CKK_HKDF`, value lengths 12/48) and Edwards/Montgomery
   (`ec_edwards`/`ec_montgomery` with ed25519/ed448/x25519/x448) keys
   label without a query; versions 1–5 stay frozen and byte-stable.
-- Inventory text names folded departed callers per module: a
-  `departed use:` summary row counts the folded callers, entries and
-  edges (plus any identities or mechanisms past the row bound).
 
 ### Changed
 
@@ -48,7 +45,9 @@ versioned separately and are opaque, exact dispatch keys.
   and `inventory cbom` (application components, app-to-provider
   joins and mechanism totals rejoin from `departed_use`, with drops,
   saturation and overflow as named unknowns) already consume the
-  aggregate.
+  aggregate. Inventory text names folded departed callers per module:
+  a `departed use:` summary row counts the folded callers, entries
+  and edges (plus any identities or mechanisms past the row bound).
 
 ### Fixed
 

@@ -1134,7 +1134,7 @@
       "properties": {
         "status": {
           "enum": ["inferred", "unknown", "conflicting", "unsupported"],
-          "description": "inferred: one size. unknown: no evidence or evidence outside every map (named reason in -v text only). conflicting: two distinct sizes, or a contradicting established size. unsupported: evidence exists but the subset has no map (never overwrites inferred, never flips)."
+          "description": "inferred: one size. unknown: no evidence or evidence outside every map (named reason in -v text only). conflicting: two distinct sizes, or a contradicting established size. unsupported: evidence exists but the subset has no map, or the length is outside the subset admission bound (RSA outside 64..=2048, AES-KW material above 8191; -v reason outside_admission_bound, publishes no size, parks nothing; never overwrites inferred, never flips)."
         },
         "detail": {
           "anyOf": [{"type": "null"}, {"$ref": "#/$defs/size_detail"}],
@@ -1208,7 +1208,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 18446744073709551615,
-          "description": "Wrapped-key material octets (L-8 for AES-KW)."
+          "description": "Wrapped-key material octets (L-8 for plain AES-KW wrap output and fresh-view unwrap input, admitted 0..=8191 with L 8..=8199; larger observed values refuse as unsupported with -v reason outside_admission_bound, park nothing and publish no size)."
         },
         "about": {
           "const": "wrapped",

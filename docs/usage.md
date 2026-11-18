@@ -1776,7 +1776,11 @@ Limits that matter in pods:
   the rest, and every unknown names its reason. Without the flag,
   `-v` prints one hint line instead of size rows: `  sizes from
   operation lengths need --key-sizes (families, creation and
-  token-reported sizes still shown)`.
+  token-reported sizes still shown)`. Wrapped-key sizes from plain
+  AES-KW wrap outputs and fresh-view unwrap inputs infer through
+  8191 material octets (8199 observed); a larger observed value
+  publishes no size (`-v` names `outside_admission_bound`) and parks
+  nothing.
   In v0.6.0 key-operation rows name only registered mechanisms: the
   journal lane keeps withholding unregistered ids, which appear with
   counts in the profile and trace mechanism tables instead.

@@ -1426,7 +1426,13 @@ never imply S1 loss.
   (versions 1–6 never carry it). Version 7 also adds the
   `wrapped_park_refused` gap reason: a wrapped-material park was
   refused past the park budget (inference-side; rows intact,
-  coverage populated; versions 1–6 never carry it).
+  coverage populated; versions 1–6 never carry it). Plain AES-KW
+  (`CKM_AES_KEY_WRAP`) wrap outputs and fresh-view unwrap inputs
+  infer wrapped-key material L−8 through 8191 material octets
+  (L 8..=8199), about the wrapped key; a larger observed value is
+  refused directly (`unsupported` with `-v` reason
+  `outside_admission_bound`): it counts its completion, publishes no
+  size, parks nothing and forward-fills nothing.
 - `unknown_key_operations[]` (sorted by category and reason) holds
   capture-wide unknown-key summaries without `started` (starts are
   never fabricated into the unknown bucket).

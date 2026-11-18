@@ -1336,8 +1336,11 @@ first tag). "First" is first-seen in ingestion order (deterministic
 per capture replay; multi-CPU interleaves order by ring timestamp).
 `unsupported`: evidence exists but the (mechanism subset, evidence
 kind) has no map (legacy ciphers, padded wraps, family-only
-subsets); it never overwrites `inferred` and never flips to
-`conflicting` (§5.4). Every transition of either inferred key bumps
+subsets), or the length is outside the subset's admission bound
+(RSA outside 64..=2048, AES-KW material above 8191 — §5.2, `-v`
+reason `outside_admission_bound`); it never overwrites `inferred`
+and never flips to `conflicting` (§5.4). Every transition of either
+inferred key bumps
 the JSONL row revision. `metadata_at_use` semantics are unchanged;
 `unknown` there beside valued inferred keys is the normal browser
 shape, not a contradiction.

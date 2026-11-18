@@ -720,6 +720,16 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     recoveries: HashMap<PairKey, PairRecovery>,
     recovery_order: Vec<PairKey>,
     recovery_cursor: usize,
+    /// Pair targets examined by departed-caller folds (test count).
+    #[cfg(test)]
+    fold_pair_target_visits: u64,
+    /// Pair recoveries examined by departed-caller folds (test count).
+    #[cfg(test)]
+    fold_pair_recovery_visits: u64,
+    /// Recovery-order entries examined by order removals (test count;
+    /// fold and servicing removals share it).
+    #[cfg(test)]
+    recovery_order_search_visits: u64,
     /// The next pending-count handle (P3): minted in staging order.
     next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
@@ -1363,6 +1373,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             recoveries: HashMap::new(),
             recovery_order: Vec::new(),
             recovery_cursor: 0,
+            #[cfg(test)]
+            fold_pair_target_visits: 0,
+            #[cfg(test)]
+            fold_pair_recovery_visits: 0,
+            #[cfg(test)]
+            recovery_order_search_visits: 0,
             next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
@@ -5606,11 +5622,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.placement_generations.remove(&key);
         }
         if let Some(pos) = self.recovery_order.iter().position(|keyed| *keyed == key) {
+            #[cfg(test)]
+            {
+                self.recovery_order_search_visits = self
+                    .recovery_order_search_visits
+                    .saturating_add(pos as u64 + 1);
+            }
             self.recovery_order.swap_remove(pos);
             if self.recovery_cursor > pos {
                 self.recovery_cursor -= 1;
             }
             self.recovery_cursor %= self.recovery_order.len().max(1);
+        } else {
+            #[cfg(test)]
+            {
+                self.recovery_order_search_visits = self
+                    .recovery_order_search_visits
+                    .saturating_add(self.recovery_order.len() as u64);
+            }
         }
     }
 
@@ -5624,6 +5653,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// else resolves a dead caller's placement. Routine churn work,
     /// not a count decision, so no diagnostic record.
     fn drop_caller_pairs_for_fold(&mut self, id: CallerId) {
+        #[cfg(test)]
+        {
+            self.fold_pair_target_visits = self
+                .fold_pair_target_visits
+                .saturating_add(self.pair_targets.len() as u64);
+        }
         let keys: Vec<PairKey> = self
             .pair_targets
             .iter()
@@ -5644,11 +5679,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.recoveries.remove(&key);
             self.placement_generations.remove(&key);
             if let Some(pos) = self.recovery_order.iter().position(|keyed| *keyed == key) {
+                #[cfg(test)]
+                {
+                    self.recovery_order_search_visits = self
+                        .recovery_order_search_visits
+                        .saturating_add(pos as u64 + 1);
+                }
                 self.recovery_order.swap_remove(pos);
                 if self.recovery_cursor > pos {
                     self.recovery_cursor -= 1;
                 }
                 self.recovery_cursor %= self.recovery_order.len().max(1);
+            } else {
+                #[cfg(test)]
+                {
+                    self.recovery_order_search_visits = self
+                        .recovery_order_search_visits
+                        .saturating_add(self.recovery_order.len() as u64);
+                }
             }
         }
         // Dropped or pruned pairs keep their exact base for the grace
@@ -5658,6 +5706,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // rewriting the staged base to a watermark and clobbering any
         // revived pair. The settle discloses any withheld range and
         // removes the recovery without touching the base.
+        #[cfg(test)]
+        {
+            self.fold_pair_recovery_visits = self
+                .fold_pair_recovery_visits
+                .saturating_add(self.recoveries.len() as u64);
+        }
         let stranded: Vec<PairKey> = self
             .recoveries
             .iter()
@@ -5752,6 +5806,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn set_exec_pruned_cap_for_test(&mut self, cap: usize) {
         self.exec_pruned_cap = cap;
+    }
+
+    /// Test-only: pair targets examined by departed-caller folds.
+    #[cfg(test)]
+    pub(crate) fn fold_pair_target_visits_for_test(&self) -> u64 {
+        self.fold_pair_target_visits
+    }
+
+    /// Test-only: pair recoveries examined by departed-caller folds.
+    #[cfg(test)]
+    pub(crate) fn fold_pair_recovery_visits_for_test(&self) -> u64 {
+        self.fold_pair_recovery_visits
+    }
+
+    /// Test-only: recovery-order entries examined by order removals.
+    #[cfg(test)]
+    pub(crate) fn recovery_order_search_visits_for_test(&self) -> u64 {
+        self.recovery_order_search_visits
     }
 
     /// Test-only: summed bases in the departed dropped-pair aggregate.
@@ -12567,6 +12639,16 @@ impl PairKey {
             object: update.object.index(),
         }
     }
+
+    /// Test-only: one scripted pair identity.
+    #[cfg(test)]
+    fn scripted(domain: NativeDomainId, ticket: u64, exec: u64, object: u32) -> Self {
+        Self {
+            image: DomainCookie::new(domain, ticket),
+            exec,
+            object,
+        }
+    }
 }
 
 /// The exact class of a pruned dropped pair: its native identity domain
@@ -12746,6 +12828,28 @@ enum PairTarget {
     },
 }
 
+impl PairTarget {
+    /// Test-only: one bound pair with an exact base.
+    #[cfg(test)]
+    fn scripted_bound(
+        caller: CallerId,
+        module: ModuleKey,
+        endpoint: u32,
+        base: u64,
+        staged: u64,
+    ) -> Self {
+        Self::Bound {
+            caller,
+            module,
+            endpoint: EndpointId(endpoint),
+            base,
+            staged,
+            staged_ns: 0,
+            base_since: 0,
+        }
+    }
+}
+
 /// One immutable publication request. A decision cannot borrow a newer held maximum.
 struct PendingCountObservation {
     key: PairKey,
@@ -12798,6 +12902,33 @@ struct PairRecovery {
     /// Its placement generation and target are untouched until those finish.
     epoch_pending: bool,
     diagnostic: RecoveryDiagnostics,
+}
+
+impl PairRecovery {
+    /// Test-only: one stalled recovery with no reads in flight.
+    #[cfg(test)]
+    fn scripted(caller: CallerId, endpoint: u32, carrier: ModuleId) -> Self {
+        Self {
+            caller,
+            endpoint: EndpointId(endpoint),
+            carrier,
+            ordinary_checkpoint: 0,
+            epoch: None,
+            scan: None,
+            sighting: None,
+            fence: None,
+            pending_reads: [None, None, None],
+            withheld_through: 0,
+            discarded_through: 0,
+            watermark: 0,
+            blocked: false,
+            recovered: false,
+            deferred_count: false,
+            receipt_refused: false,
+            epoch_pending: false,
+            diagnostic: RecoveryDiagnostics::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -24420,6 +24551,307 @@ exit 0
             2,
             "both retirements are counted, never silent"
         );
+    }
+
+    // ==================== v0.7.2 F5: bounded fold scans ====================
+
+    /// Admit one scripted caller and retire it through exec transition.
+    fn stage_exited_caller(native: &mut NativeScene, pid: u32, now_ns: u64) -> CallerId {
+        native.scene.source.spawn(pid, 1000 + u64::from(pid));
+        let id = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(
+                pid,
+                crate::discovery::caller_registry::ImageAuthority::ScanPinned,
+                now_ns,
+            )
+            .unwrap();
+        native
+            .scene
+            .coordinator
+            .adapter
+            .exec_transition_scoped(id, now_ns + 10);
+        id
+    }
+
+    /// F5 churn twin: 64 exited callers sharing one publication, each
+    /// with 16 retained cookie sequences, one bound pair and one
+    /// stalled recovery, plus 64 pending rows naming nobody folding.
+    /// The fold must scan each table once per publication — never once
+    /// per caller — keep every count exact, and leave no late row
+    /// attributable to a folded caller.
+    #[test]
+    fn fold_churn_scans_tables_once_per_publication() {
+        const CALLERS: u64 = 64;
+        const SEQUENCES_PER_CALLER: u64 = 16;
+        const PENDING_ROWS: u64 = 64;
+        let (mut native, live) = NativeScene::new();
+        let domain = native.domain;
+        for row in 0..PENDING_ROWS {
+            native
+                .scene
+                .coordinator
+                .binder
+                .stage_pending_sighting_for_test(domain, live, 9000 + row);
+        }
+        let mut ids = Vec::new();
+        for caller in 0..CALLERS {
+            let pid = 5000 + caller as u32;
+            let id = stage_exited_caller(&mut native, pid, 100);
+            for sequence in 0..SEQUENCES_PER_CALLER {
+                native.scene.coordinator.binder.stage_cookie_for_test(
+                    domain,
+                    100 + caller * 100 + sequence,
+                    sequence,
+                    Some(id),
+                );
+            }
+            let target = PairKey::scripted(domain, 500 + caller, caller, caller as u32);
+            native.scene.coordinator.pair_targets.insert(
+                target,
+                PairTarget::scripted_bound(
+                    id,
+                    ModuleKey::physical(8, 1, 7000 + caller, None, "/fold/pair.so"),
+                    caller as u32,
+                    10 + caller,
+                    10 + caller,
+                ),
+            );
+            let stalled = PairKey::scripted(domain, 1500 + caller, caller, caller as u32);
+            native.scene.coordinator.recoveries.insert(
+                stalled,
+                PairRecovery::scripted(id, caller as u32, ModuleId(3)),
+            );
+            native.scene.coordinator.recovery_order.push(target);
+            native.scene.coordinator.recovery_order.push(stalled);
+            ids.push(id);
+        }
+        native.scene.coordinator.note_rendered_callers(&ids);
+        let receipt = native.scene.coordinator.retire_rendered_callers(300, None);
+        assert_eq!(receipt.retired, CALLERS, "every exited row folds");
+        // Exact counts preserved: every staged base lands in the
+        // dropped-pair machinery exactly once (the live Dropped rows
+        // hold them; the grace prune aggregates later).
+        let expected_base: u64 = (0..CALLERS).map(|caller| 10 + caller).sum();
+        let dropped_base: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .map(|target| match target {
+                PairTarget::Dropped { base, .. } => *base,
+                PairTarget::Bound { .. }
+                | PairTarget::Pending { .. }
+                | PairTarget::Suspended { .. } => 0,
+            })
+            .sum();
+        assert_eq!(
+            dropped_base, expected_base,
+            "every staged base lands exactly once"
+        );
+        // No late reattribution: no cookie sequence names a folded
+        // caller, no live target names one either, and no recovery
+        // survives to suspend one back to life.
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "no cookie names a folded caller"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .pair_targets
+                .values()
+                .all(|target| {
+                    !matches!(
+                        target,
+                        PairTarget::Bound { caller, .. }
+                            | PairTarget::Pending { caller, .. }
+                            | PairTarget::Suspended { caller, .. }
+                            if ids.contains(caller)
+                    )
+                }),
+            "no live target names a folded caller"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stalled recovery survives its caller"
+        );
+        // Bounded visits: one batch scan per table per publication
+        // plus O(1) per caller — never one full scan per caller
+        // (64 x 1024 cookie visits pre-fix, 64 x 64 everywhere else).
+        let pending = native
+            .scene
+            .coordinator
+            .binder
+            .release_pending_visits_for_test();
+        let cookies = native
+            .scene
+            .coordinator
+            .binder
+            .release_cookie_visits_for_test();
+        let targets = native.scene.coordinator.fold_pair_target_visits_for_test();
+        let recoveries = native
+            .scene
+            .coordinator
+            .fold_pair_recovery_visits_for_test();
+        let order = native
+            .scene
+            .coordinator
+            .recovery_order_search_visits_for_test();
+        assert!(
+            pending <= PENDING_ROWS + CALLERS,
+            "pending scanned once per publication: {pending}"
+        );
+        assert!(
+            cookies <= CALLERS * SEQUENCES_PER_CALLER + CALLERS,
+            "cookies scanned once per publication: {cookies}"
+        );
+        assert!(
+            targets <= CALLERS + CALLERS,
+            "pair targets scanned once per publication: {targets}"
+        );
+        assert!(
+            recoveries <= CALLERS + CALLERS,
+            "pair recoveries scanned once per publication: {recoveries}"
+        );
+        assert_eq!(order, 0, "order removals never scan: {order}");
+    }
+
+    /// F5 pending twin: a pending binder row — by sighting or by
+    /// retained fallback — pins its caller through the fold; draining
+    /// it through the production decide path lets the next pass fold.
+    #[test]
+    fn fold_defers_while_binder_row_pends_then_folds_after_drain() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let id = stage_exited_caller(&mut native, 5010, 100);
+        native
+            .scene
+            .coordinator
+            .binder
+            .stage_pending_sighting_for_test(domain, id, 9100);
+        native
+            .scene
+            .coordinator
+            .binder
+            .stage_pending_retained_for_test(domain, id, 9101);
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "pending rows pin their caller"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(id).is_some(),
+            "the pinned row keeps its facts"
+        );
+        native
+            .scene
+            .coordinator
+            .binder
+            .drain_pending_for_test(domain);
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the drained row folds next pass"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(id).is_none(),
+            "the folded row leaves the adapter"
+        );
+    }
+
+    /// F5 stop twin: a stop requested mid-retirement folds nothing
+    /// more and keeps every row; clearing it resumes without a
+    /// re-note.
+    #[test]
+    fn stopped_retirement_folds_nothing_and_resumes() {
+        let (mut native, _live) = NativeScene::new();
+        let mut ids = Vec::new();
+        for caller in 0..8u32 {
+            ids.push(stage_exited_caller(&mut native, 5020 + caller, 100));
+        }
+        native.scene.coordinator.note_rendered_callers(&ids);
+        native.scene.coordinator.stopped = true;
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a stopped retirement folds nothing"
+        );
+        for id in &ids {
+            assert!(
+                native.scene.coordinator.adapter.record(*id).is_some(),
+                "every row waits out the stop"
+            );
+        }
+        native.scene.coordinator.stopped = false;
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            8,
+            "clearing the stop resumes without a re-note"
+        );
+    }
+
+    /// F5 credit twin: the fold carries bounded credits per
+    /// publication (past the real cap) and resumes the remainder
+    /// next pass without a re-note.
+    #[test]
+    fn fold_credit_cap_resumes_across_publications() {
+        let (mut native, _live) = NativeScene::new();
+        let mut ids = Vec::new();
+        for caller in 0..1100u32 {
+            ids.push(stage_exited_caller(&mut native, 5030 + caller, 100));
+        }
+        native.scene.coordinator.note_rendered_callers(&ids);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            1024,
+            "the first publication folds its credits"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            76,
+            "the remainder resumes without a re-note"
+        );
+        for id in &ids {
+            assert!(
+                native.scene.coordinator.adapter.record(*id).is_none(),
+                "every row eventually folds"
+            );
+        }
     }
 
     /// Twin: an exec newcomer the next pass enumerates and admits is

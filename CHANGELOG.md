@@ -106,6 +106,11 @@ versioned separately and are opaque, exact dispatch keys.
   fires only as the last resort, after the recovery save failed. The
   saved-fallback line names the actual owner (`mode 0600, readable
   only by <user>`; `root-only` only for root-owned files).
+- Retiring the last Joint feed no longer hides proved key-operation
+  rows or erases named loss counts: the fold carries the departing
+  feed's finite counters and final authority into bounded
+  capture-owned evidence, proved rows keep their status on JSON,
+  JSONL and text, and the live-feed census decrements.
 
 ## [0.7.1] - 2026-11-17
 

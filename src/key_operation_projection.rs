@@ -1617,6 +1617,28 @@ pub(crate) mod producer {
     };
     use p11scope_ebpf_common::object_policy::{SafeAttributeKind, SafeCurve};
 
+    /// The linked entry for suites that stage feeds without a
+    /// registry (no folded evidence exists there): the 0.6.0 world
+    /// the committed suites model. Production lanes commit through
+    /// `commit_with_journal_linked` with the lane's folded evidence
+    /// and latched linkage.
+    #[cfg(test)]
+    pub(crate) fn commit(
+        revision: u64,
+        stagings: &[&JointStaging],
+        model: &ObjectProjection,
+        keyuse: &KeyUseReducer,
+    ) -> ObjectObservations {
+        commit_with_journal_linked(
+            revision,
+            stagings,
+            model,
+            keyuse,
+            &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
+            true,
+        )
+    }
+
     /// Commit one immutable revision from the live reducers: the one
     /// typed producer-to-projection mapping. Status derives from the
     /// capture-wide feed census plus refusal evidence: any Joint
@@ -1624,26 +1646,17 @@ pub(crate) mod producer {
     /// unknown-key S1 facts, never a refusal); with no Joint feed
     /// the reason names the loss. Rows aggregate per-operation
     /// reducer state into frozen aggregate rows; budgets measure.
-    /// The linked entry (the 0.6.0 world the committed suites model);
-    /// lanes commit here when linked, else through
-    /// `commit_with_journal_linked`.
-    pub(crate) fn commit(
-        revision: u64,
-        stagings: &[&JointStaging],
-        model: &ObjectProjection,
-        keyuse: &KeyUseReducer,
-    ) -> ObjectObservations {
-        commit_with_journal_linked(revision, stagings, model, keyuse, true)
-    }
-
-    /// Commit with the lane's latched journal linkage: with no Joint
-    /// feed and no linked producer the reason is `journal_unavailable`
-    /// (OD33/R-50); every other census maps exactly as before.
+    /// With no Joint feed and no linked producer the reason is
+    /// `journal_unavailable` (OD33/R-50). Folded departed feeds lend
+    /// their final authority and counters beside the live census, so
+    /// a retirement never hides proved rows or erases named loss;
+    /// only the live `joint` census drops the folded feed.
     pub(crate) fn commit_with_journal_linked(
         revision: u64,
         stagings: &[&JointStaging],
         model: &ObjectProjection,
         keyuse: &KeyUseReducer,
+        folded: &crate::discovery::caller_registry::instance_input::FoldedJointEvidence,
         journal_linked: bool,
     ) -> ObjectObservations {
         let evidence = keyuse.evidence();
@@ -1658,13 +1671,32 @@ pub(crate) mod producer {
         // `record_lost` never sits under `populated`. A clean resume
         // clears the latches and baselines disposed history: the
         // closed segment stays counted beside a populated section.
+        // A folded feed's ended segment lends the same authority.
         let lost = stagings.iter().any(|staging| {
             staging.degraded_loss()
                 || staging.watchdog_tripped()
                 || staging.history_disposed_since_resume() > 0
+        }) || folded.lost();
+        let fallback = stagings.iter().any(|staging| staging.fell_back()) || folded.fell_back();
+        let mut unattributed = collect_unattributed(stagings);
+        for (reason, count) in folded.rows() {
+            if count == 0 {
+                continue;
+            }
+            if let Some(row) = unattributed.iter_mut().find(|row| row.reason == reason) {
+                row.count = row.count.saturating_add(count);
+            } else {
+                unattributed.push(UnattributedRow { reason, count });
+            }
+        }
+        // Folded-only reasons join at the tail above; restore the
+        // frozen publication order (same sort as `add_unattributed`).
+        unattributed.sort_by_key(|row| {
+            UNATTRIBUTED_REASONS
+                .iter()
+                .position(|known| *known == row.reason)
+                .unwrap_or(usize::MAX)
         });
-        let fallback = stagings.iter().any(|staging| staging.fell_back());
-        let unattributed = collect_unattributed(stagings);
         // Joint never stops as a whole: a feed that fell back or lost
         // authority keeps every already-attributed and S1-preserved
         // row under `partial`, with its unattributed calls counted
@@ -1694,6 +1726,12 @@ pub(crate) mod producer {
             (ObsStatus::Unavailable, "authority_lost")
         } else if fallback {
             (ObsStatus::Unavailable, "proof_refused_fallback")
+        } else if has_evidence && folded.joint_history() {
+            // The last Joint feed folded cleanly: no live feed, no
+            // loss, but proved rows survive. They stand as history
+            // under `populated`, never as a bootstrap that never
+            // started.
+            (ObsStatus::Populated, "none")
         } else if journal_linked {
             (ObsStatus::Unavailable, "bootstrap_unavailable")
         } else {

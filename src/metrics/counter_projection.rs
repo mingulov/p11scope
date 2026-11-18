@@ -1253,6 +1253,7 @@ pub(super) mod tests {
         KernelLoss,
         BankGaps,
         BankQuarantined,
+        RvLowerBound,
     }
 
     /// The run-loop tests replace I/O only: every successful acquisition still
@@ -1364,6 +1365,19 @@ pub(super) mod tests {
                             health_failed: false,
                             kernel_failed: false,
                         });
+                        Ok(read)
+                    }
+                    Some(ConsumerFault::RvLowerBound) => {
+                        let mut read = read_with_health(
+                            plan,
+                            mode,
+                            generation,
+                            returned,
+                            CounterHealth::default(),
+                            KernelEvidence::default(),
+                            reserve,
+                        );
+                        read.set_rv_lower_bound(true);
                         Ok(read)
                     }
                     Some(ConsumerFault::BankQuarantined) => CounterRead::new(
@@ -1731,6 +1745,47 @@ pub(super) mod tests {
         let mut evidence = crate::render::tests::evidence();
         evidence.verdict();
         crate::render::apply_counter_snapshot(&mut evidence, &stale);
+        assert_eq!(evidence.completeness, "PARTIAL");
+    }
+
+    #[test]
+    fn counter_rv_lower_bound_renders_in_text_and_json_evidence() {
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        let fresh = fixture
+            .fresh(CounterMode::Counts, 1, 5, None)
+            .expect("exact reads stay exact");
+        assert!(
+            fresh
+                .counter_collection()
+                .unwrap()
+                .get("rv_lower_bound")
+                .is_none()
+        );
+        assert!(
+            !fresh
+                .counter_summary()
+                .expect("an exact read has a summary")
+                .contains("lower bound")
+        );
+        assert!(!fresh.has_counter_gap());
+        let exhausted = fixture
+            .fresh(CounterMode::Counts, 1, 9, Some(ConsumerFault::RvLowerBound))
+            .expect("an rv-exhausted read still publishes its rows");
+        let collection = exhausted.counter_collection().unwrap();
+        assert_eq!(collection["status"], "fresh");
+        assert_eq!(collection["rv_lower_bound"], true);
+        assert!(
+            exhausted
+                .counter_summary()
+                .expect("an exhausted read has a summary")
+                .contains("lower bound"),
+            "the text summary must name the lower bound in plain words"
+        );
+        assert!(exhausted.has_counter_gap());
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &exhausted);
         assert_eq!(evidence.completeness, "PARTIAL");
     }
 

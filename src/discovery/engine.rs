@@ -4696,6 +4696,11 @@ impl EngineSession for Session {
         objects: &PinnedObjects,
         ended: &BTreeSet<plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
+        eprintln!(
+            "p11scope: DIAG v072 attach targets={} mono_ns={:?}",
+            targets.len(),
+            crate::attach::monotonic_ns(),
+        );
         Session::attach_targets(self, targets, objects, ended)
     }
 
@@ -4726,12 +4731,22 @@ impl EngineSession for Session {
     }
 
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
+        eprintln!(
+            "p11scope: DIAG v072 detach_slots n={} mono_ns={:?}",
+            slots.len(),
+            crate::attach::monotonic_ns(),
+        );
         Session::detach_slots(self, slots)
     }
     fn begin_global_static_retirement(
         &mut self,
         slots: &[plan::Slot],
     ) -> Result<Option<RetirementTicket>> {
+        eprintln!(
+            "p11scope: DIAG v072 begin_global_retirement n={} mono_ns={:?}",
+            slots.len(),
+            crate::attach::monotonic_ns(),
+        );
         Session::begin_global_static_retirement(self, slots)
     }
     fn global_retirement_blocking(&self) -> bool {
@@ -4749,6 +4764,12 @@ impl EngineSession for Session {
         owner: &ProcessView,
         ended: &crate::attach::EndedPidRetirement,
     ) -> Result<DetachOutcome> {
+        eprintln!(
+            "p11scope: DIAG v072 detach_ended_pid n={} owner_pid={} mono_ns={:?}",
+            slots.len(),
+            owner.pid(),
+            crate::attach::monotonic_ns(),
+        );
         Session::detach_ended_pid_slots(self, slots, owner, ended)
     }
 
@@ -21349,6 +21370,16 @@ impl Engine {
         let retired = candidate
             .plan
             .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
+        if !retired.is_empty() {
+            eprintln!(
+                "p11scope: DIAG v072 retire_unpinned n={} stale_views={} owned_run={:?} scope_cgroup={} mono_ns={:?}",
+                retired.len(),
+                stale_views.len(),
+                self.owned_run_pid,
+                matches!(self.scope, Scope::Cgroup { .. }),
+                crate::attach::monotonic_ns(),
+            );
+        }
         let detach_retired_start = crate::attach::monotonic_ns();
         let detach_retired_outcome = session.detach_slots(&retired);
         self.sync_physical_gap(session);

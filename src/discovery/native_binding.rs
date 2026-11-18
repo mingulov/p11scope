@@ -690,6 +690,14 @@ impl DomainState {
     }
 }
 
+/// One publication's retired-caller release plan: callers vetoed
+/// by a pending row plus cookie ownership by caller, scanned once
+/// per publication by [`NativeBinder::plan_retired_release`].
+pub(crate) struct BinderReleasePlan {
+    vetoed: HashSet<CallerId>,
+    owned: HashMap<CallerId, Vec<(usize, DomainCookie, u64)>>,
+}
+
 /// The binder: per-domain state, decisions and transitions for the
 /// coordinator to stage, and the census.
 pub(crate) struct NativeBinder {
@@ -1021,39 +1029,77 @@ impl NativeBinder {
         }
     }
 
-    /// Release one retired caller's binder evidence after its row was
-    /// rendered: cached bindings, ended marks and pending-row references.
-    /// A row still pending keeps the caller (it still decides through
-    /// the incarnation snapshot) and this returns false. A cleared
-    /// cached binding makes any later row for that image read unknown,
-    /// never attribute to a caller record that no longer exists.
-    pub(crate) fn release_retired_caller(&mut self, id: CallerId) -> bool {
-        for domain in &self.domains {
+    /// Scan one publication's retired-caller release plan: pending
+    /// references veto their callers, cookie ownership indexes by
+    /// caller for direct clearing. One scan of every pending row and
+    /// every cookie sequence per publication, never one full scan per
+    /// caller. Clearing stays per fold ([`Self::apply_retired_release`]),
+    /// so a credit-deferred caller keeps its evidence until its own
+    /// fold runs.
+    pub(crate) fn plan_retired_release(&mut self) -> BinderReleasePlan {
+        let mut vetoed: HashSet<CallerId> = HashSet::new();
+        let mut owned: HashMap<CallerId, Vec<(usize, DomainCookie, u64)>> = HashMap::new();
+        for (index, domain) in self.domains.iter().enumerate() {
             for pending in &domain.pending {
                 #[cfg(test)]
                 {
                     self.release_pending_visits = self.release_pending_visits.saturating_add(1);
                 }
-                if pending.sighting.as_ref().is_some_and(|s| s.caller == id)
-                    || pending.retained.is_some_and(|retained| retained.id == id)
-                {
-                    return false;
+                if let Some(sighting) = pending.sighting.as_ref() {
+                    vetoed.insert(sighting.caller);
+                }
+                if let Some(retained) = pending.retained {
+                    vetoed.insert(retained.id);
                 }
             }
-        }
-        for domain in &mut self.domains {
-            domain.callers.remove(&id);
-            domain.ended.remove(&id);
-            for execs in domain.cookies.values_mut() {
-                for seen in execs.values_mut() {
+            for (cookie, execs) in &domain.cookies {
+                for (exec, seen) in execs {
                     #[cfg(test)]
                     {
                         self.release_cookie_visits = self.release_cookie_visits.saturating_add(1);
                     }
-                    if seen.bound == Some(id) {
-                        seen.bound = None;
+                    if let Some(bound) = seen.bound {
+                        owned
+                            .entry(bound)
+                            .or_default()
+                            .push((index, *cookie, *exec));
                     }
                 }
+            }
+        }
+        BinderReleasePlan { vetoed, owned }
+    }
+
+    /// Release one retired caller's binder evidence under a release
+    /// plan after its row was rendered: cached bindings, ended marks
+    /// and cookie ownership. A row still pending keeps the caller (it
+    /// still decides through the incarnation snapshot) and this
+    /// returns false. A cleared cached binding makes any later row
+    /// for that image read unknown, never attribute to a caller
+    /// record that no longer exists.
+    pub(crate) fn apply_retired_release(&mut self, plan: &BinderReleasePlan, id: CallerId) -> bool {
+        if plan.vetoed.contains(&id) {
+            return false;
+        }
+        for domain in &mut self.domains {
+            domain.callers.remove(&id);
+            domain.ended.remove(&id);
+        }
+        if let Some(keys) = plan.owned.get(&id) {
+            for (index, cookie, exec) in keys {
+                let cleared = self.domains[*index]
+                    .cookies
+                    .get_mut(cookie)
+                    .and_then(|execs| execs.get_mut(exec))
+                    .is_some_and(|seen| {
+                        if seen.bound == Some(id) {
+                            seen.bound = None;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                debug_assert!(cleared, "the plan indexed this caller's sequence");
             }
         }
         true

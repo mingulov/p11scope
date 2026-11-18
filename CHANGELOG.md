@@ -121,6 +121,10 @@ versioned separately and are opaque, exact dispatch keys.
   digest: a queued exit revision keeps its row until the FIFO
   carries it, so the event stream never ends with a stale count and
   no loss marker.
+- The fold callback scans binder and pair tables once per
+  publication instead of once per exited caller, folds at most
+  1,024 callers per call with the remainder resuming next pass,
+  and stops promptly on stop, keeping every count exact.
 
 ## [0.7.1] - 2026-11-17
 

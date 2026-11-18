@@ -1322,6 +1322,36 @@ def check_streams(view, res):
             type(folded_budget) is int and len(streamed_missing) == folded_budget):
         bad.append(("*", f"{len(streamed_missing)} streamed edges are absent from the snapshot "
                          f"but budgets.edges.folded is {folded_budget!r}"))
+    # A folded edge's last record must match its module's departed
+    # aggregate exactly (unrotated): the fold carries the terminal
+    # row, so a stale last record is a silent terminal loss. Modules
+    # without a departed summary keep the count-only excuse above;
+    # saturated aggregates cannot prove exactness and skip the sum.
+    by_module = {}
+    for key in streamed_missing:
+        by_module.setdefault(key[1], []).append(key)
+    for mid, keys in sorted(by_module.items()):
+        summary = (view.modules.get(mid) or {}).get("departed_use")
+        if not isinstance(summary, dict):
+            continue
+        if summary.get("edges") != len(keys):
+            bad.append((mid, f"{len(keys)} streamed folded edges for module {mid} "
+                             f"but its departed summary counts {summary.get('edges')!r}"))
+            continue
+        entries = summary.get("entries") or {}
+        if entries.get("saturated"):
+            continue
+        want = entries.get("count")
+        got = 0
+        for key in keys:
+            count = ((last.get(key) or {}).get("entries") or {}).get("count")
+            if type(count) is not int:
+                got = None
+                break
+            got += count
+        if type(want) is not int or got != want:
+            bad.append((mid, f"folded last entries sum {got!r} != departed aggregate {want!r} "
+                             f"for module {mid}"))
     for key, ev in last.items():
         if key in view.edges:
             bad.extend(edge_payload_problems(view, key, ev))

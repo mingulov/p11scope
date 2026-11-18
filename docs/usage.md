@@ -1683,7 +1683,11 @@ Limits that matter in pods:
   physical counting; this
   preparation gate alone does not activate positive Inventory instance delivery.
   `--key-operations` (default off) opts in to per-key tracking through a linked
-  journal session; it requires `--capture auto` or `native`. Without a manifest,
+  journal session; it requires `--capture auto` or `native`. `--key-sizes`
+  (default off) additionally infers key sizes from operation lengths; it needs
+  `--key-operations` and a FULL build (P0 omits length capture). Without it,
+  token-reported and creation-template sizes and inferred families are still
+  shown. Without a manifest,
   the semantic lane seals only from scan-discovered tables whose publication is
   proved by standard interface linkage or by an observed live function-list
   return; tables with export-name agreement alone never qualify (for example

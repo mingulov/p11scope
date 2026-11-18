@@ -12617,6 +12617,17 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 // needs a writable table and lasts until that rescan.
                 if remapped {
                     existing.tables[index].extension_impossible = table.extension_impossible;
+                    // Address-bound associations drop on remap: the scan
+                    // linked interfaces by absolute function-list pointer,
+                    // so a retained linkage proves nothing about the fresh
+                    // mapping's table. The records stay as unlinked
+                    // history; fresh associations arrive through the
+                    // incoming index map below.
+                    for interface in &mut existing.interfaces {
+                        if interface.table == Some(index) {
+                            interface.table = None;
+                        }
+                    }
                 } else {
                     existing.tables[index].extension_impossible |= table.extension_impossible;
                 }

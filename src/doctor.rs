@@ -4021,6 +4021,7 @@ mod tests {
     #[test]
     fn parse_major_minor_reads_a_real_uname_style_release() {
         assert_eq!(parse_major_minor("7.0.0-28-generic"), Some((7, 0)));
+        assert_eq!(parse_major_minor("6.6.157-1-generic"), Some((6, 6)));
         assert_eq!(parse_major_minor("5.15.0"), Some((5, 15)));
         assert_eq!(parse_major_minor("not-a-version"), None);
     }

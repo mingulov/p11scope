@@ -37,6 +37,12 @@
  *   --delay-ms N     sleep N ms after the gate (after a --late dlopen) before calling;
  *                    exec-chain also sleeps N ms before every exec
  *   --sleep-us N     sleep N us after every iteration (stretches a short CLI)
+ *   --hot-loop       (mech) hoist the AES + HMAC keygens out of the timed
+ *                    loop: each iteration runs only EncryptInit/Encrypt/
+ *                    SignInit/Sign, so paced cells can offer 5k/10k
+ *                    calls/s per endpoint (ring-rate cells)
+ *   --pace-us N      (mech) pace iterations onto an absolute N-us
+ *                    deadline grid; overruns re-anchor, never catch up
  *   --chain SPEC     (exec-chain) comma list of HOW:EXE steps, HOW = leader|thread
  *   --gen K          (internal) exec generation, set by the chain itself
  *   --ledger-singletons opt-in: flush each returned call as a singleton entry
@@ -461,10 +467,61 @@ static void iteration(int m, CK_SESSION_HANDLE s, int phase) {
     CALL(m, phase, I_DestroyObject, NO_MECH, CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s, mac);
 }
 
+/* Hot iteration: the two ring-rate endpoints with hoisted keys — 4 table calls
+ * (EncryptInit/Encrypt/SignInit/Sign). Setup hoists the AES + HMAC keygens out
+ * of the timed loop so paced cells can offer 5k/10k calls/s per endpoint; the
+ * destroys land in teardown. The GCM IV advances per call. */
+static void hot_iteration(int m, CK_SESSION_HANDLE s, CK_OBJECT_HANDLE aes, CK_OBJECT_HANDLE mac,
+                          int phase) {
+    static unsigned long hot_iv_ctr;
+    unsigned char in[64] = {1}, out[128];
+    CK_ULONG ol;
+    unsigned char iv[12] = {0};
+    unsigned long ctr = hot_iv_ctr++;
+    for (int i = 0; i < 8; i++) iv[11 - i] = (unsigned char)(ctr >> (8 * i));
+    CK_GCM_PARAMS gcm = {iv, sizeof iv, 96, NULL, 0, 128};
+    CK_MECHANISM enc = {CKM_AES_GCM, &gcm, sizeof gcm};
+    CALL(m, phase, I_EncryptInit, CKM_AES_GCM, CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE),
+         s, &enc, aes);
+    ol = sizeof out;
+    CALL(m, phase, I_Encrypt, CKM_AES_GCM,
+         CK_RV (*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG *), s, in, 32, out,
+         &ol);
+
+    CK_MECHANISM hmac = {CKM_SHA256_HMAC, 0, 0};
+    CALL(m, phase, I_SignInit, CKM_SHA256_HMAC,
+         CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE), s, &hmac, mac);
+    ol = sizeof out;
+    CALL(m, phase, I_Sign, CKM_SHA256_HMAC,
+         CK_RV (*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG *), s, in, sizeof in,
+         out, &ol);
+}
+
+/* Absolute-deadline pacing for offered-rate cells: each iteration lands on the
+ * next deadline grid point (CLOCK_MONOTONIC). On overrun the grid re-anchors to
+ * now instead of sleeping catch-up, so the ledger's t0/t1 always reports the
+ * achieved rate honestly. No pacing when pace_us <= 0. */
+static void pace_next(struct timespec *deadline, long pace_us) {
+    if (pace_us <= 0) return;
+    deadline->tv_nsec += pace_us * 1000L;
+    while (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_nsec -= 1000000000L;
+        deadline->tv_sec++;
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (deadline->tv_sec > now.tv_sec ||
+        (deadline->tv_sec == now.tv_sec && deadline->tv_nsec > now.tv_nsec)) {
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL) && errno == EINTR) {}
+    } else {
+        *deadline = now;
+    }
+}
+
 struct options {
     const char *mode, *gate, *gate2, *pre_init_gate, *chain;
-    long iters, delay_ms, sleep_us;
-    int hold, gate_before_setup, late_from, single_call, h6_control, c8_warm_initial;
+    long iters, delay_ms, sleep_us, pace_us;
+    int hold, gate_before_setup, late_from, single_call, h6_control, c8_warm_initial, hot_loop;
     unsigned long h6_deadline, h6_leg_deadline;
 };
 static struct options opt = {.gate = "-", .pre_init_gate = "-", .iters = 4, .late_from = -1,
@@ -582,11 +639,32 @@ static void mech_generation(long iters, int gated) {
                 s[m] = (m == opt.single_call) ? setup_after_init(m, PH_SETUP) : setup(m, PH_SETUP);
         }
     }
-    for (int m = 0; m < module_count; m++)
-        for (long i = 0; i < iters * (m + 1); i++) {
-            iteration(m, s[m], PH_MAIN);
-            if (opt.sleep_us > 0) usleep((useconds_t)opt.sleep_us);
+    struct timespec pace_deadline = {0, 0};
+    if (opt.pace_us > 0) clock_gettime(CLOCK_MONOTONIC, &pace_deadline);
+    for (int m = 0; m < module_count; m++) {
+        CK_OBJECT_HANDLE hot_aes = 0, hot_mac = 0;
+        if (opt.hot_loop) {
+            hot_aes = keygen(m, s[m], CKM_AES_KEY_GEN, 0x1f /* CKK_AES */, 0x104 /* CKA_ENCRYPT */,
+                             PH_SETUP, 0);
+            hot_mac = keygen(m, s[m], CKM_GENERIC_SECRET_KEY_GEN, 0x10 /* CKK_GENERIC_SECRET */,
+                             0x108 /* CKA_SIGN */, PH_SETUP, 0);
+            if (!hot_aes || !hot_mac) die("hot-loop key setup failed");
         }
+        for (long i = 0; i < iters * (m + 1); i++) {
+            if (opt.hot_loop)
+                hot_iteration(m, s[m], hot_aes, hot_mac, PH_MAIN);
+            else
+                iteration(m, s[m], PH_MAIN);
+            if (opt.sleep_us > 0) usleep((useconds_t)opt.sleep_us);
+            pace_next(&pace_deadline, opt.pace_us);
+        }
+        if (opt.hot_loop) {
+            CALL(m, PH_TEARDOWN, I_DestroyObject, NO_MECH,
+                 CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s[m], hot_aes);
+            CALL(m, PH_TEARDOWN, I_DestroyObject, NO_MECH,
+                 CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s[m], hot_mac);
+        }
+    }
     flush_ledger();
     for (int m = 0; m < module_count; m++) teardown(m, s[m], PH_TEARDOWN);
     flush_ledger();
@@ -803,7 +881,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: inventory-ledger mech|map|exec-chain|held|leader-exit --cell LABEL "
                         "[--module P]... [--iters N] [--gate F|-] [--gate-before-setup] [--hold] [--late] [--delay-ms N] "
-                        "[--sleep-us N] [--chain HOW:EXE,...] [--late-from N] [--gate2 F] "
+                        "[--sleep-us N] [--hot-loop] [--pace-us N] [--chain HOW:EXE,...] [--late-from N] [--gate2 F] "
                         "[--single-call M] [--pre-init-gate F]\n");
         return 2;
     }
@@ -815,6 +893,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--ledger-singletons")) { ledger_singletons = 1; continue; }
         if (!strcmp(a, "--c8-warm-initial")) { opt.c8_warm_initial = 1; continue; }
         if (!strcmp(a, "--hold")) { opt.hold = 1; continue; }
+        if (!strcmp(a, "--hot-loop")) { opt.hot_loop = 1; continue; }
         if (!strcmp(a, "--gate-before-setup")) { opt.gate_before_setup = 1; continue; }
         if (!strcmp(a, "--late")) { opt.late_from = 0; continue; }
         if (!v) { fprintf(stderr, "missing value for %s\n", a); return 2; }
@@ -835,6 +914,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--pre-init-gate")) opt.pre_init_gate = v;
         else if (!strcmp(a, "--delay-ms")) opt.delay_ms = atol(v);
         else if (!strcmp(a, "--sleep-us")) opt.sleep_us = atol(v);
+        else if (!strcmp(a, "--pace-us")) opt.pace_us = atol(v);
         else if (!strcmp(a, "--chain")) opt.chain = v;
         else if (!strcmp(a, "--gen")) gen = atoi(v);
         else if (!strcmp(a, "--h6-deadline")) opt.h6_deadline = absolute_bound(v);

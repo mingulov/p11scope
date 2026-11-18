@@ -86,6 +86,36 @@ pub(crate) fn journal_entry_program(descriptor: u32, key_sizes: bool) -> &'stati
     }
 }
 
+/// Whether one slot links the length pair: its canonical descriptor
+/// names a length endpoint AND every name at the slot agrees on the
+/// canonical row's length shape. A conflicting or indeterminate
+/// shape keeps the base pair with length unavailable; a
+/// descriptor/names skew keeps the base pair fail-closed.
+pub(crate) fn slot_takes_length_pair(descriptor: u32, names: &[String]) -> bool {
+    if !is_length_endpoint(descriptor) {
+        return false;
+    }
+    let Some(agreed) = crate::kinds::length_agreement(names) else {
+        return false;
+    };
+    crate::kinds::length_shape_for_ordinal(descriptor - 1) == Some(agreed)
+}
+
+/// The journal entry program for one slot: the length entry only
+/// when the slot takes the length pair (canonical descriptor plus
+/// name agreement) with the flag on, else the base entry.
+pub(crate) fn journal_entry_program_for_names(
+    descriptor: u32,
+    names: &[String],
+    key_sizes: bool,
+) -> &'static str {
+    if key_sizes && slot_takes_length_pair(descriptor, names) {
+        LENGTH_PROGRAMS[0]
+    } else {
+        PROGRAMS[0]
+    }
+}
+
 /// The journal return program for one entry program: length returns
 /// serve length entries, base returns serve base entries. Entry and
 /// return always pair; anything else is refused by

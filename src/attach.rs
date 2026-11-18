@@ -3062,6 +3062,7 @@ fn downgrade_entry_program(
     object_has_unsafe: bool,
     target_abi: ElfAbi,
     descriptor: u32,
+    names: &[String],
     key_sizes: bool,
 ) -> &'static str {
     if journal {
@@ -3069,7 +3070,8 @@ fn downgrade_entry_program(
         // under `--key-sizes` keeps its length entry (whose adapter
         // refuses the narrowed descriptor, so the call still counts
         // without length evidence), like the base pair elsewhere.
-        journal::journal_entry_program(descriptor, key_sizes)
+        // The length pair needs name agreement, like attach time.
+        journal::journal_entry_program_for_names(descriptor, names, key_sizes)
     } else {
         entry_program(semantics, policy, object_has_unsafe, target_abi)
     }
@@ -4550,7 +4552,7 @@ fn group_static_slots_with_roots(
             unreachable!("static attach points are absolute with cookies");
         };
         let program = if journal {
-            journal::journal_entry_program(slot.descriptor_index, key_sizes)
+            journal::journal_entry_program_for_names(slot.descriptor_index, &slot.names, key_sizes)
         } else if roots == StaticRoots::CounterBanks {
             "p11_counter_bank_entry"
         } else {
@@ -5465,7 +5467,11 @@ pub(crate) fn singles_journal_link_plan(
     slots
         .iter()
         .map(|slot| {
-            let entry = journal::journal_entry_program(slot.descriptor_index, key_sizes);
+            let entry = journal::journal_entry_program_for_names(
+                slot.descriptor_index,
+                &slot.names,
+                key_sizes,
+            );
             (slot.index, entry, journal::journal_return_program(entry))
         })
         .collect()
@@ -10156,7 +10162,11 @@ impl Session {
                 continue;
             }
             let expected_entry = if self.journal {
-                journal::journal_entry_program(slot.descriptor_index, self.key_sizes)
+                journal::journal_entry_program_for_names(
+                    slot.descriptor_index,
+                    &slot.names,
+                    self.key_sizes,
+                )
             } else {
                 "p11_entry"
             };
@@ -10193,6 +10203,7 @@ impl Session {
                 self.embedded_flavor.unsafe_present,
                 retained.abi,
                 slot.descriptor_index,
+                &slot.names,
                 self.key_sizes,
             );
             if resolved != expected_entry {
@@ -13026,7 +13037,9 @@ mod tests {
                 return false;
             };
             downgrade.contains("downgrade_entry_program(")
-                && helper.contains("journal::journal_entry_program(descriptor, key_sizes)")
+                && helper.contains(
+                    "journal::journal_entry_program_for_names(descriptor, names, key_sizes)",
+                )
                 && helper
                     .contains("entry_program(semantics, policy, object_has_unsafe, target_abi)")
         }
@@ -13039,7 +13052,7 @@ mod tests {
             ("    pub fn downgrade_in_place(", "downgrade_entry_program("),
             (
                 "fn downgrade_entry_program(",
-                "journal::journal_entry_program(descriptor, key_sizes)",
+                "journal::journal_entry_program_for_names(descriptor, names, key_sizes)",
             ),
             (
                 "fn downgrade_entry_program(",
@@ -13080,7 +13093,23 @@ mod tests {
         let unsafe_policy = super::CapturePolicy::UnsafeUnvalidatedMetadata;
         let sign = crate::kinds::function_id("C_Sign").unwrap() + 1;
         let init = crate::kinds::function_id("C_SignInit").unwrap() + 1;
-        for (journal, semantics, policy, object_has_unsafe, abi, descriptor, key_sizes, expected) in [
+        let verify = crate::kinds::function_id("C_Verify").unwrap() + 1;
+        let empty: Vec<String> = Vec::new();
+        let sign_names = vec!["C_Sign".to_string()];
+        let init_names = vec!["C_SignInit".to_string()];
+        let verify_pair = vec!["C_Verify".to_string(), "C_VerifyFinal".to_string()];
+        let verify_names = vec!["C_Verify".to_string()];
+        for (
+            journal,
+            semantics,
+            policy,
+            object_has_unsafe,
+            abi,
+            descriptor,
+            names,
+            key_sizes,
+            expected,
+        ) in [
             (
                 false,
                 &count_only,
@@ -13088,6 +13117,7 @@ mod tests {
                 false,
                 ElfAbi::Lp64,
                 0,
+                &empty,
                 false,
                 "p11_entry",
             ),
@@ -13098,6 +13128,7 @@ mod tests {
                 true,
                 ElfAbi::Lp64,
                 0,
+                &empty,
                 false,
                 "p11_entry_template_pair",
             ),
@@ -13108,6 +13139,7 @@ mod tests {
                 true,
                 ElfAbi::Lp64,
                 0,
+                &empty,
                 false,
                 "p11_entry_template_types",
             ),
@@ -13118,6 +13150,7 @@ mod tests {
                 true,
                 ElfAbi::Lp64,
                 0,
+                &empty,
                 false,
                 "p11_entry_template",
             ),
@@ -13128,6 +13161,7 @@ mod tests {
                 true,
                 ElfAbi::Ilp32,
                 0,
+                &empty,
                 false,
                 "p11_entry_ia32",
             ),
@@ -13138,6 +13172,7 @@ mod tests {
                 false,
                 ElfAbi::Lp64,
                 init,
+                &init_names,
                 false,
                 "p11_entry_journal",
             ),
@@ -13148,6 +13183,7 @@ mod tests {
                 true,
                 ElfAbi::Ilp32,
                 init,
+                &init_names,
                 false,
                 "p11_entry_journal",
             ),
@@ -13160,6 +13196,7 @@ mod tests {
                 false,
                 ElfAbi::Lp64,
                 sign,
+                &sign_names,
                 true,
                 "p11_entry_journal_length",
             ),
@@ -13170,6 +13207,7 @@ mod tests {
                 false,
                 ElfAbi::Lp64,
                 sign,
+                &sign_names,
                 false,
                 "p11_entry_journal",
             ),
@@ -13180,6 +13218,32 @@ mod tests {
                 false,
                 ElfAbi::Lp64,
                 init,
+                &init_names,
+                true,
+                "p11_entry_journal",
+            ),
+            // A conflicting alias keeps the base entry with the flag,
+            // like a descriptor/names skew: the length pair needs
+            // agreement, like attach time.
+            (
+                true,
+                &count_only,
+                safe,
+                false,
+                ElfAbi::Lp64,
+                verify,
+                &verify_pair,
+                true,
+                "p11_entry_journal",
+            ),
+            (
+                true,
+                &count_only,
+                safe,
+                false,
+                ElfAbi::Lp64,
+                sign,
+                &verify_names,
                 true,
                 "p11_entry_journal",
             ),
@@ -13192,6 +13256,7 @@ mod tests {
                     object_has_unsafe,
                     abi,
                     descriptor,
+                    names,
                     key_sizes
                 ),
                 expected,
@@ -27013,6 +27078,9 @@ mod tests {
     fn length_group_slot(index: u32, function: &str) -> crate::plan::Slot {
         let mut slot = group_slot(index, 0, SlotSemantics::COUNT_ONLY);
         slot.descriptor_index = crate::kinds::function_id(function).unwrap() + 1;
+        // Production slots always carry their names beside the
+        // descriptor; the length pair needs both to agree.
+        slot.names = vec![function.to_string()];
         slot
     }
 
@@ -27226,7 +27294,10 @@ mod tests {
                 assert_eq!(group.return_program, PROGRAMS[1]);
             } else {
                 assert_eq!(members, vec![1]);
-                assert_eq!(group.entry_program, LENGTH_PROGRAMS[0], "single takes length");
+                assert_eq!(
+                    group.entry_program, LENGTH_PROGRAMS[0],
+                    "single takes length"
+                );
                 assert_eq!(group.return_program, LENGTH_PROGRAMS[1]);
             }
         }

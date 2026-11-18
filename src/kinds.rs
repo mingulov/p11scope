@@ -122,6 +122,69 @@ pub fn descriptor_index_with_object_agreement(names: &[String]) -> (u32, AliasAg
     (index.unwrap_or(0), AliasAgreement::Agree)
 }
 
+/// One slot's agreed length shape (v0.8.0 keymeta Task 2): the S
+/// cell plus its disjointness base, or the V scalar alone.
+/// Positions only, like the evidence table; agrees on no read by
+/// itself — attach routing decides the pair from this agreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LengthShape {
+    pub cell: u8,
+    pub base: u8,
+    pub scalar: u8,
+}
+
+/// Length shape of one function ordinal: the evidence row's
+/// positions plus the S-row's disjointness base. Unlisted, info and
+/// skewed rows (an S-row without a base) carry none.
+pub fn length_shape_for_ordinal(ordinal: u32) -> Option<LengthShape> {
+    let row = p11scope_ebpf_common::evidence_table::evidence_position(ordinal)?;
+    if row.info {
+        return None;
+    }
+    let none = p11scope_ebpf_common::ARG_NONE;
+    if row.length_cell_arg != none && row.length_scalar_arg == none {
+        let base = p11scope_ebpf_common::evidence_table::length_buffer_base(ordinal);
+        if base == none {
+            return None;
+        }
+        Some(LengthShape {
+            cell: row.length_cell_arg,
+            base,
+            scalar: none,
+        })
+    } else if row.length_scalar_arg != none && row.length_cell_arg == none {
+        Some(LengthShape {
+            cell: none,
+            base: none,
+            scalar: row.length_scalar_arg,
+        })
+    } else {
+        None
+    }
+}
+
+/// Length-position agreement across every name at one slot: all
+/// names must resolve to the same length shape before the slot
+/// links the length pair. Unknown names, names without a shape,
+/// conflicting shapes and an empty set agree with nothing. The
+/// existing S1/object alias verdict is unchanged and decided
+/// separately; this gates the length pair only.
+pub fn length_agreement(names: &[String]) -> Option<LengthShape> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut agreed: Option<LengthShape> = None;
+    for name in names {
+        let shape = length_shape_for_ordinal(function_id(name)?)?;
+        match agreed {
+            Some(previous) if previous != shape => return None,
+            Some(_) => {}
+            None => agreed = Some(shape),
+        }
+    }
+    agreed
+}
+
 fn session(operations: u16, transition: u8) -> SlotSemantics {
     SlotSemantics {
         operations,
@@ -645,7 +708,11 @@ mod tests {
             vec!["C_NotAStandardFunction".to_string()],
             vec![],
         ] {
-            assert_eq!(length_agreement(&names), None, "{names:?} agrees with nothing");
+            assert_eq!(
+                length_agreement(&names),
+                None,
+                "{names:?} agrees with nothing"
+            );
         }
         // Every length endpoint agrees with itself alone.
         for name in [

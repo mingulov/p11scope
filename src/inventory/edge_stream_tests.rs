@@ -1967,8 +1967,8 @@ fn fold_waits_for_deferred_instance_rows_before_folding_caller() {
     let all = lines(&path);
     let last_instance = all
         .iter()
-        .filter(|line| line["kind"] == "instance_observed")
-        .last()
+        .rev()
+        .find(|line| line["kind"] == "instance_observed")
         .expect("instance records streamed");
     assert_eq!(
         last_instance["event"]["last_seen_ns"].as_u64().unwrap(),
@@ -1977,8 +1977,8 @@ fn fold_waits_for_deferred_instance_rows_before_folding_caller() {
     );
     let last_semantic = all
         .iter()
-        .filter(|line| line["kind"] == "semantic_edge_observed")
-        .last()
+        .rev()
+        .find(|line| line["kind"] == "semantic_edge_observed")
         .expect("semantic records streamed");
     assert_eq!(
         last_semantic["event"]["api_returns"]["count"]

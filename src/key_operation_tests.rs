@@ -4519,7 +4519,8 @@ fn key_operation_unknown_key_and_requested_only() {
 /// joint-throughput workload) keeps its per-key row with exact
 /// counts under its established label — R2 new-site: the complete
 /// creation template establishes on success, so the row carries
-/// `generic_256` and the section versions v6. No type or size is
+/// `generic_256` and the section versions v7 (inference trips on the
+/// mechanism-bearing signs). No type or size is
 /// guessed: incomplete triples still row `unknown`. The conflicted
 /// twin keeps the strict guard: a key whose metadata conflicts
 /// never rows and counts `metadata_conflicting` instead.
@@ -12447,10 +12448,11 @@ fn key_operation_kem_abandoned_call_clears_without_proof() {
 }
 
 /// Item 20 (H9 dispatch): the section version follows its content.
-/// KEM creation or role labels publish version 2; KEM-free content
-/// keeps byte-stable version 1. The JSONL stream reconstructs the
-/// versioned section exactly, and dashboard tallies carry the KEM
-/// categories.
+/// KEM creation/role labels still select the KEM vocabulary, but the
+/// mechanism-bearing scenes trip inference and publish version 7
+/// (the mechanism-free frozen twins pin v2 and v1 below). The JSONL
+/// stream reconstructs the versioned section exactly, and dashboard
+/// tallies carry the KEM categories.
 #[test]
 fn key_operation_h9_v2_dispatches_on_kem_content() {
     use crate::key_operation_projection::{
@@ -12458,7 +12460,8 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
     };
     assert_eq!(OBSERVATIONS_VERSION, 1);
     assert_eq!(OBSERVATIONS_VERSION_V2, 2);
-    // KEM-bearing commit renders version 2 with the new labels.
+    // KEM-bearing commit renders version 7 (inference trips on the
+    // mechanism-bearing decapsulation) with the new labels.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -12521,7 +12524,8 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
         .find(|tally| tally.category == "decapsulate")
         .expect("decapsulate tally");
     assert_eq!((decap.completed, decap.failed, decap.active), (1, 0, 0));
-    // KEM-free content keeps version 1: proved rows and all.
+    // KEM-free content renders version 7 too (the sign infers):
+    // proved rows and all, with no KEM vocabulary.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -12577,8 +12581,8 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
 /// Row events and the pass marker carry the section version;
 /// reconstruction dispatches role/creation vocabularies per event
 /// and refuses unknown versions. Creation-only and role-only KEM
-/// states, incremental v1→v2 transitions and rotation all ride
-/// real rendering and reconstruction.
+/// states and rotation all ride real rendering and reconstruction
+/// (v7: every scene trips inference).
 #[test]
 fn key_operation_kem_jsonl_version_dispatch() {
     use crate::discovery::engine::inventory_coordinator::PassReport;
@@ -24952,10 +24956,10 @@ fn key_operation_schema_v5_pins_pqc_metadata_contract() {
 }
 
 /// F16: the section version follows the content. A scene whose
-/// object carries an established parameter set renders v5 with the
-/// `parameter_set` key in every metadata block and the PQC label on
-/// its key row; the same scene with RSA metadata renders v1 with
-/// six-key blocks (negative control: no PQC content, no v5).
+/// object carries an established parameter set renders v7 (PQC
+/// content plus inference) with the `parameter_set` key in every
+/// metadata block and the PQC label on its key row; the
+/// mechanism-free frozen twins pin v5 and v1 below.
 #[test]
 fn key_operation_pqc_version_follows_content() {
     use crate::key_operation_projection::producer::commit;
@@ -25029,7 +25033,8 @@ fn key_operation_pqc_version_follows_content() {
         "established"
     );
     assert_eq!(section["objects"][0]["label"], "ml_dsa_65");
-    // Negative control: RSA metadata renders v1 with six-key blocks.
+    // Control: RSA metadata renders v7 (the sign infers) with
+    // seven-key blocks; the mechanism-free frozen twin pins v1.
     let rsa = commit_scene(vec![
         (1u8, 1u8, 3u16),
         (2u8, 1u8, 0u16),
@@ -25039,15 +25044,15 @@ fn key_operation_pqc_version_follows_content() {
         observations_version(&rsa),
         crate::key_operation_projection::OBSERVATIONS_VERSION_V7
     );
-    let legacy = object_observations_json(&rsa);
-    assert_eq!(legacy["version"], 7);
+    let control = object_observations_json(&rsa);
+    assert_eq!(control["version"], 7);
     assert_eq!(
-        legacy["key_operations"][0]["metadata_at_use"], "rsa_2048",
+        control["key_operations"][0]["metadata_at_use"], "rsa_2048",
         "the control row proves the scene is live"
     );
     for block in ["requested", "established"] {
         // JSON maps iterate sorted; the contract pins the set.
-        let mut keys: Vec<&str> = legacy["objects"][0][block]
+        let mut keys: Vec<&str> = control["objects"][0][block]
             .as_object()
             .unwrap()
             .keys()
@@ -25067,8 +25072,8 @@ fn key_operation_pqc_version_follows_content() {
         assert_eq!(keys, expected, "{block} keeps seven keys");
     }
     assert_eq!(
-        legacy["objects"][0]["queries"]["parameter_set"], "not_queried",
-        "no parameter_set query outcome on the legacy row"
+        control["objects"][0]["queries"]["parameter_set"], "not_queried",
+        "no parameter_set query outcome on the control row"
     );
     fn assert_seven_key_blocks(section: &serde_json::Value) {
         for block in ["requested", "established"] {
@@ -25103,7 +25108,8 @@ fn key_operation_pqc_version_follows_content() {
     assert_seven_key_blocks(&section);
     // F16 residual (review item 3): every v5 trigger, not only a
     // present label. A PQC key-type scalar alone (73/74/75, no set)
-    // versions v5 without labelling.
+    // renders v7 here (the sign infers); the frozen twin pins the
+    // bare v5 trigger.
     for key_type in [0x49u16, 0x4a, 0x4b] {
         let bare = commit_scene(vec![(1u8, 1u8, 2u16), (2u8, 1u8, key_type)]);
         assert_eq!(
@@ -25129,9 +25135,9 @@ fn key_operation_pqc_version_follows_content() {
         assert_eq!(rows[0]["metadata_at_use"], "unknown", "no guessed label");
         assert_eq!(rows[0]["completed"], 1);
     }
-    // A parameter-set query outcome alone versions v5: the RSA row
-    // stays proved (the scene is live) while the refused set query
-    // carries no scalar.
+    // A parameter-set query outcome alone renders v7 (the sign
+    // infers): the RSA row stays proved (the scene is live) while
+    // the refused set query carries no scalar.
     let queried = commit_scene(vec![
         (1u8, 1u8, 3u16),
         (2u8, 1u8, 0u16),
@@ -25158,10 +25164,10 @@ fn key_operation_pqc_version_follows_content() {
         section["objects"][0]["established"]["parameter_set"]["status"],
         "unknown"
     );
-    // A PQC keygen template versions v6: R2 new-site success
-    // promotes the requested scalars to established (with
-    // `creation_success` sources), but the mismatched secret class
-    // still withholds the label, so the row stays unknown.
+    // A PQC keygen template renders v7 (the sign infers): R2
+    // new-site success promotes the requested scalars to established
+    // (with `creation_success` sources), but the mismatched secret
+    // class still withholds the label, so the row stays unknown.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -25818,11 +25824,11 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
 
 /// R2 new-site: the section version follows the content. A scene
 /// whose HKDF key is created in-window (complete finite template, no
-/// query) renders v6 with the HKDF label on its key row — the
-/// promotion path end to end. Keymeta §6/K5: an old-vocabulary
-/// creation (AES-256) also renders v6, through the non-`query`
-/// source; only a query-established scene renders v1 (negative
-/// control: no new-site content, byte-stable two-key fields).
+/// query) renders v7 (promotion plus inference) with the HKDF label
+/// on its key row — the promotion path end to end. Keymeta §6/K5:
+/// an old-vocabulary creation (AES-256) renders v7 through the
+/// non-`query` source plus inference; the mechanism-free frozen
+/// twins pin v6 and v1 below.
 #[test]
 fn key_operation_newsite_version_follows_content() {
     use crate::key_operation_projection::producer::commit;
@@ -25888,8 +25894,8 @@ fn key_operation_newsite_version_follows_content() {
         established["key_type"]["source"], "creation_success",
         "the promoted HKDF type carries its source"
     );
-    // Old-vocabulary creation still renders v6: the established
-    // block carries non-`query` sources.
+    // Old-vocabulary creation renders v7 (non-`query` sources plus
+    // inference): the established block carries non-`query` sources.
     let aes = commit_scene(vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1f), (4u8, 1u8, 32u16)]);
     assert_eq!(observations_version(&aes), OBSERVATIONS_VERSION_V7);
     let promoted = object_observations_json(&aes);
@@ -25902,8 +25908,9 @@ fn key_operation_newsite_version_follows_content() {
         promoted["objects"][0]["established"]["value_len"]["source"],
         "creation_success"
     );
-    // Negative control: a query-established AES scene renders v1
-    // with byte-stable two-key metadata fields.
+    // Control: a query-established AES scene renders v7 (the sign
+    // infers) with four-key metadata fields; the mechanism-free
+    // frozen twin pins v1 with two-key fields.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -25945,9 +25952,9 @@ fn key_operation_newsite_version_follows_content() {
         &mut sink,
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
-    let legacy = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(observations_version(&legacy), OBSERVATIONS_VERSION_V7);
-    let section = object_observations_json(&legacy);
+    let control = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(observations_version(&control), OBSERVATIONS_VERSION_V7);
+    let section = object_observations_json(&control);
     assert_eq!(section["version"], 7);
     assert_eq!(
         section["key_operations"][0]["metadata_at_use"], "aes_256",
@@ -25985,7 +25992,8 @@ fn key_operation_newsite_version_follows_content() {
 /// Keymeta §6 Edwards/Montgomery join (controller KEYMETA-T1 rulings
 /// 2026-11-16, ruling 1), end to end: a private Montgomery key
 /// created with the X25519 curve label in-window renders `x25519`
-/// on its object view and key row at section v6.
+/// on its object view and key row — v7 with a sign, v6 for the
+/// creation/query-only twin.
 #[test]
 fn key_operation_newsite_montgomery_labels_end_to_end() {
     use crate::key_operation_projection::producer::commit;
@@ -28280,10 +28288,7 @@ fn keymeta_ended_view_park_expires() {
             "{name}: no forward fill"
         );
         assert_eq!(inferred.size.detail, None, "{name}: no parked detail");
-        assert_eq!(
-            inferred.size.completions, 0,
-            "{name}: no parked completion"
-        );
+        assert_eq!(inferred.size.completions, 0, "{name}: no parked completion");
     }
 }
 

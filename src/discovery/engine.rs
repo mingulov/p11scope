@@ -15342,7 +15342,9 @@ impl Engine {
         self.learned_cap_skipped
     }
 
-    /// Fresh tables the per-module merge cap dropped.
+    /// Fresh tables the per-module merge cap dropped. Test-only: the
+    /// harvest path names drops on the diagnostics channel in product.
+    #[cfg(test)]
     pub(crate) fn merge_tables_dropped(&self) -> u64 {
         self.merge_tables_dropped
     }
@@ -23273,6 +23275,7 @@ impl Engine {
             pins.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
         }
         let before = self.run_learned_modules.clone();
+        let drops_before = self.merge_tables_dropped;
         merge_scanned_module_counted(
             &mut self.run_learned_modules,
             module,
@@ -23286,6 +23289,16 @@ impl Engine {
                 proof.module.interfaces.len(),
                 self.run_learned_modules.len(),
             );
+            let fresh_drops = self.merge_tables_dropped.saturating_sub(drops_before);
+            if fresh_drops > 0 {
+                eprintln!(
+                    "p11scope: run-learned tables for {}: {} table{} past the per-module cap dropped ({} total)",
+                    proof.path,
+                    fresh_drops,
+                    if fresh_drops == 1 { "" } else { "s" },
+                    self.merge_tables_dropped,
+                );
+            }
         }
         if self.run_learned_modules == before {
             return;

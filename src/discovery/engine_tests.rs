@@ -22754,6 +22754,58 @@ fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
     sleeper.wait().expect("reap sleeper");
 }
 
+/// A harvested proof past the per-module table cap truncates on entry
+/// and counts the dropped tables on the engine: the store keeps 64
+/// tables and the overflow counts, never silent.
+#[test]
+fn run_learned_table_merge_cap_overflow_is_counted() {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    let (dir, mut sleeper, mut engine, _key, _path) = learned_tables_engine_with(None);
+    assert_eq!(engine.merge_tables_dropped(), 0);
+    let backing = dir.path().join("libtableover.so");
+    std::fs::write(&backing, "p11scope-fixture:table-over").expect("write over-cap backing");
+    let mut pins = real_scan_pin(&backing, None, 400, &"34".repeat(32));
+    let pin = pins.pinned().next().expect("one pin");
+    let key = pin.key;
+    let object = pin.id;
+    let path = backing.to_string_lossy().into_owned();
+    let mut module = fixture_module(key);
+    module.view = ProcessViewId(99);
+    module.path = path.clone();
+    module.tables = (0..MAX_MERGED_TABLES_PER_MODULE as u64 + 6)
+        .map(|slot| ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: vec![],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000 + slot,
+            file_offset: Some(slot),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        })
+        .collect();
+    let proofs = vec![OwnedLearnProof {
+        view: ProcessViewId(99),
+        path: path.clone(),
+        object,
+        loader_exe: None,
+        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+        module,
+    }];
+    engine.learn_owned_proofs(&mut pins, &proofs);
+    let stored = engine
+        .run_learned_modules
+        .iter()
+        .find(|module| module.path == path)
+        .expect("the over-cap proof still files its module");
+    assert_eq!(stored.tables.len(), MAX_MERGED_TABLES_PER_MODULE);
+    assert_eq!(engine.merge_tables_dropped(), 6);
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
 /// A harvest that changes only union flags (here: the decoder ABI
 /// filling in) still owes the expedited frame and the learned
 /// apply: counts alone cannot decide "nothing changed".

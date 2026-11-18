@@ -1368,7 +1368,10 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
         "stale retirement keeps pins carried across refreshes"
     );
     assert!(
-        staled.modules.iter().any(|module| module.object == object_a),
+        staled
+            .modules
+            .iter()
+            .any(|module| module.object == object_a),
         "stale retirement keeps modules carried across refreshes"
     );
 }
@@ -40788,9 +40791,10 @@ fn remapped_legacy_prefix_carries_only_the_fresh_extension_proof() {
         "the retained association unlinks on remap but stays reportable"
     );
     assert!(
-        !reversed[0].interfaces.iter().any(|i| {
-            i.table == Some(0) && i.name_class == "exact_standard"
-        }),
+        !reversed[0]
+            .interfaces
+            .iter()
+            .any(|i| { i.table == Some(0) && i.name_class == "exact_standard" }),
         "no exact-standard linkage survives the remap without fresh proof"
     );
     let merged_authority = authority_of(&reversed[0]);

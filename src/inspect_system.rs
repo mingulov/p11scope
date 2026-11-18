@@ -36,7 +36,7 @@ use crate::discovery::engine::{
 use crate::discovery::handle_table::{DeferredReason, HandleTable};
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
-    ExaminedObject, PinnedObjectId, PinnedObjects, ReconciledModule, bind_scanned_modules,
+    ExaminedObject, PinnedObjectId, PinnedObjects, ReconciledModule, bind_scanned_modules_strict,
     canonicalize_scanned_overlays, pin_count_manifest_objects_in_views_with_prior_and_table,
     pin_scanned_view_objects_with_table,
 };
@@ -2030,13 +2030,16 @@ fn bind_collection(collection: &mut Collection) -> Bound {
     // Bind each module on its own so every loss attributes to the pid
     // whose scan produced it. Binding is per-module independent (the
     // overlay collapse above is the only global step), so this equals one
-    // batch bind with exact attribution.
+    // batch bind with exact attribution. The bind is strict: an
+    // uncorroborated table proves every entry is a function entry or the
+    // entry is refused with a named gap, so inventory never attaches a
+    // uprobe at a decoded-but-unproven offset.
     let mut reconciled: Vec<(u32, ProcessViewId, ReconciledModule)> = Vec::new();
     let mut unresolved: Vec<(u32, ProcessViewId, ScannedModule, Vec<String>)> = Vec::new();
     for member in &collection.members {
         for module in &member.modules {
             let (mut bound, lost) =
-                bind_scanned_modules(std::slice::from_ref(module), &mut aggregate);
+                bind_scanned_modules_strict(std::slice::from_ref(module), &mut aggregate);
             for skip in &lost {
                 bind_gaps.push(PidGap::member(member.pid, skip.clone()));
             }

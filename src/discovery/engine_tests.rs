@@ -93625,3 +93625,126 @@ fn loader_scan_after_spent_tick_gets_fresh_teardown_budget() {
         "the loader scan sees a fresh budget, not the spent tick's"
     );
 }
+
+/// A loader scan in a backlog quantum gets a fresh teardown-deferral
+/// budget even when the previous tick spent it: the backlog entry owns
+/// its pass budget exactly like the batch entry. The record-path probe
+/// snapshots what the dispatched loader scan saw; the fixture child
+/// stays alive, so no real teardown wait runs and the snapshot is exact.
+#[test]
+fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_backlog() {
+    use std::time::Duration;
+    let (_fixture, mut engine, _context, record, mut session) = armed_seed_route(1);
+    // Simulate the previous tick's spent budget.
+    engine.teardown_deferral = TeardownDeferralBudget::with_remaining(Duration::ZERO);
+    let scans_before = engine.deep_scans;
+    let attempts_before = engine.loader_memory_scan_attempts;
+    engine.loader_record_scan_after_scan = Some(|engine| {
+        engine.loader_record_scan_teardown_remaining_for_test =
+            Some(engine.teardown_deferral.remaining());
+    });
+    engine
+        .pending_discovery_records
+        .push(QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        });
+    engine
+        .service_backlog_quantum(&mut session)
+        .expect("the backlog quantum dispatches the loader record");
+    assert_eq!(
+        engine.loader_memory_scan_attempts,
+        attempts_before + 1,
+        "the quantum ran the record-path loader scan"
+    );
+    assert_eq!(engine.deep_scans, scans_before + 1, "exactly that scan ran");
+    let seen = engine
+        .loader_record_scan_teardown_remaining_for_test
+        .expect("the probe ran at the loader scan");
+    assert_eq!(
+        seen,
+        TeardownDeferralBudget::new().remaining(),
+        "the loader scan sees a fresh budget, not the spent tick's"
+    );
+}
+
+/// A loader scan in a collected-finish pass gets a fresh teardown-deferral
+/// budget even when the previous tick spent it: the finish entry owns its
+/// pass budget exactly like the batch entry. The record-path probe
+/// snapshots what the dispatched loader scan saw; the fixture child
+/// stays alive, so no real teardown wait runs and the snapshot is exact.
+#[test]
+fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_collected_finish() {
+    use std::time::Duration;
+    let (_fixture, mut engine, _context, record, mut session) = armed_seed_route(1);
+    // Simulate the previous tick's spent budget.
+    engine.teardown_deferral = TeardownDeferralBudget::with_remaining(Duration::ZERO);
+    let scans_before = engine.deep_scans;
+    let attempts_before = engine.loader_memory_scan_attempts;
+    engine.loader_record_scan_after_scan = Some(|engine| {
+        engine.loader_record_scan_teardown_remaining_for_test =
+            Some(engine.teardown_deferral.remaining());
+    });
+    engine
+        .service_collected_finish_records(&mut session, vec![record], 0, 1)
+        .expect("finish dispatches the loader record");
+    assert_eq!(
+        engine.loader_memory_scan_attempts,
+        attempts_before + 1,
+        "finish ran the record-path loader scan"
+    );
+    assert_eq!(engine.deep_scans, scans_before + 1, "exactly that scan ran");
+    let seen = engine
+        .loader_record_scan_teardown_remaining_for_test
+        .expect("the probe ran at the loader scan");
+    assert_eq!(
+        seen,
+        TeardownDeferralBudget::new().remaining(),
+        "the loader scan sees a fresh budget, not the spent tick's"
+    );
+}
+
+/// A loader scan in a finish terminal-batch drain gets a fresh
+/// teardown-deferral budget even when the previous tick spent it: the
+/// finish entry owns its pass budget on the terminal-drain branch too.
+/// The record-path probe snapshots what the drained loader scan saw; the
+/// fixture child stays alive, so no real teardown wait runs and the
+/// snapshot is exact.
+#[test]
+fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_finish_drain() {
+    use std::time::Duration;
+    let (_fixture, mut engine, context, record, mut session) = armed_seed_route(1);
+    engine
+        .begin_terminal_drain(context, Vec::new(), || Ok::<(), anyhow::Error>(()))
+        .expect("the terminal drain opens")
+        .expect("the drain body runs");
+    engine
+        .retain_terminal_batch([record], true, 0)
+        .expect("the loader record joins the complete batch");
+    // Simulate the previous tick's spent budget.
+    engine.teardown_deferral = TeardownDeferralBudget::with_remaining(Duration::ZERO);
+    let scans_before = engine.deep_scans;
+    let attempts_before = engine.loader_memory_scan_attempts;
+    engine.loader_record_scan_after_scan = Some(|engine| {
+        engine.loader_record_scan_teardown_remaining_for_test =
+            Some(engine.teardown_deferral.remaining());
+    });
+    engine
+        .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+        .expect("finish drains the terminal batch");
+    assert_eq!(
+        engine.loader_memory_scan_attempts,
+        attempts_before + 1,
+        "finish drained the terminal loader scan"
+    );
+    assert_eq!(engine.deep_scans, scans_before + 1, "exactly that scan ran");
+    let seen = engine
+        .loader_record_scan_teardown_remaining_for_test
+        .expect("the probe ran at the loader scan");
+    assert_eq!(
+        seen,
+        TeardownDeferralBudget::new().remaining(),
+        "the loader scan sees a fresh budget, not the spent tick's"
+    );
+}

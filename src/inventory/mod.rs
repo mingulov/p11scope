@@ -13884,14 +13884,37 @@ mod tests {
                                     assert_eq!(committed, bytes);
                                 }
                             }
-                            assert!(
-                                !std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
-                                    .unwrap()
-                                    .file_name()
-                                    .to_string_lossy()
-                                    .starts_with(".p11scope.")),
-                                "stdout started before the report attempt disposed its temp file"
-                            );
+                            let kept: Vec<String> = std::fs::read_dir(dir.path())
+                                .unwrap()
+                                .map(|entry| {
+                                    entry.unwrap().file_name().to_string_lossy().into_owned()
+                                })
+                                .filter(|name| name.starts_with(".p11scope."))
+                                .collect();
+                            if report_failed {
+                                // New handover contract (approved assertion
+                                // change): a refused commit keeps the finished
+                                // capture in its temp beside the destination,
+                                // never deleted — so stdout must see the kept
+                                // capture, not a disposed temp.
+                                assert_eq!(
+                                    kept.len(),
+                                    1,
+                                    "stdout started without the refused capture kept"
+                                );
+                                let kept_bytes = std::fs::read(dir.path().join(&kept[0])).unwrap();
+                                let kept_document: serde_json::Value =
+                                    serde_json::from_slice(&kept_bytes).unwrap();
+                                assert_eq!(kept_document["schema"], DOC_ID);
+                                if json {
+                                    assert_eq!(kept_bytes, bytes);
+                                }
+                            } else {
+                                assert!(
+                                    kept.is_empty(),
+                                    "stdout started before the report attempt disposed its temp file"
+                                );
+                            }
                         };
                         let mut stdout = Check {
                             cancelled,
@@ -13925,6 +13948,37 @@ mod tests {
                             notices.iter().any(|line| line.contains("report saved")),
                             !report_failed && result.exit_code() != 0
                         );
+                        // New handover contract (approved assertion change):
+                        // a refused commit keeps the finished capture in its
+                        // temp beside the destination and names it in the -o
+                        // failure line; no other failure path uses that wording.
+                        if report_failed {
+                            let kept: Vec<String> = std::fs::read_dir(dir.path())
+                                .unwrap()
+                                .map(|entry| {
+                                    entry.unwrap().file_name().to_string_lossy().into_owned()
+                                })
+                                .filter(|name| name.starts_with(".p11scope."))
+                                .collect();
+                            assert_eq!(kept.len(), 1, "the refused capture is kept, not deleted");
+                            assert!(
+                                result.failures.iter().any(|failure| {
+                                    failure.contains(&kept[0])
+                                        && failure.contains("report not deleted")
+                                }),
+                                "the -o failure names the kept temp: {:?}",
+                                result.failures
+                            );
+                        } else {
+                            assert!(
+                                !result
+                                    .failures
+                                    .iter()
+                                    .any(|failure| failure.contains("report not deleted")),
+                                "no kept temp without a refused commit: {:?}",
+                                result.failures
+                            );
+                        }
                     }
                 }
             }
@@ -14405,13 +14459,27 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(event_records(&events).last().unwrap()["kind"], "ended");
-        assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".p11scope.")
-        }));
+        // New handover contract (approved assertion change): a final-name
+        // security refusal keeps the finished capture in its temp beside
+        // the destination — never deleted, without a recovery-dir
+        // fallback — and names it in the -o failure line.
+        let kept: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".p11scope."))
+            .collect();
+        assert_eq!(kept.len(), 1, "the refused capture is kept, not deleted");
+        assert_eq!(
+            std::fs::read(dir.path().join(&kept[0])).unwrap(),
+            stdout,
+            "the kept temp holds the finished capture"
+        );
+        assert!(
+            result.failures.iter().any(|failure| failure.contains(&kept[0])
+                && failure.contains("report not deleted")),
+            "the -o failure names the kept temp: {:?}",
+            result.failures
+        );
     }
 
     #[test]

@@ -84,7 +84,10 @@ APPROVED and IMPLEMENTED (owner/Opus privacy reviews
 controller KEYMETA-T1 rulings 2026-11-16; Opus tier 3 is the final
 privacy review and no separate re-review is outstanding). The
 [Key metadata: inferred family and size class (v0.8.0 keymeta)](#key-metadata-inferred-family-and-size-class-v080-keymeta)
-section stays PROPOSED and carries no capture authority until reviewed. The
+section is APPROVED and its length capture is IMPLEMENTED behind
+`--key-sizes` (controller ruling 2026-11-18: privacy wording is
+ours, owner sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2`
++ `rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with fix round 1). The
 [Provider, token and mechanism info (v0.8.0 keymeta Task 7)](#provider-token-and-mechanism-info-v080-keymeta-task-7)
 section stays PROPOSED and carries no capture authority until reviewed.
 The R2 section also amends in place, APPROVED under the same reviews
@@ -95,11 +98,17 @@ type 0x42, value sizes 12/48, the Montgomery/Edwards encodings, and
 removal of the rule that Edwards/Montgomery key types do not authorize
 curve decoding), the requested-values promotion rule and the
 establishment rule. The keymeta section adds the three
-operation-length rows. Until the length review passes, no
-operation-length word is captured; the implemented R2 boundary is EC
-parameter lengths 5/7/10/11, value lengths 12/16/24/32/48, key types
-including 0x42, the seven-member derive set and promotion with
-per-field source and reason.
+operation-length rows: one output-length WORD per completed call at
+the eleven §8.1 endpoints (`C_Sign`, `C_SignRecover`, `C_SignFinal`,
+`C_Verify`, `C_VerifyFinal`, `C_Encrypt`, `C_Decrypt`, `C_WrapKey`,
+`C_UnwrapKey`, `C_EncapsulateKey`, `C_DecapsulateKey`), acquired only
+under `--key-sizes` (with `--key-operations`, off by default) in the
+extra journal length programs; never buffer, key-material, PIN or
+environment bytes. The implemented boundary is EC parameter lengths
+5/7/10/11, value lengths 12/16/24/32/48, key types including 0x42,
+the seven-member derive set and promotion with per-field source and
+reason, plus the classified length shapes (§5.2) with the `length`
+source.
 Apart from the sections the status line lists, this document does not
 enable capture, describe implemented fields, or qualify a release. The
 implemented contracts remain
@@ -2369,8 +2378,11 @@ versions 1–5 stay frozen and byte-stable.
 
 § references are to `docs/superpowers/specs/2026-11-14-v080-keymeta-design.md`.
 
-**Status: PROPOSED (v0.8.0 keymeta design 2026-11-14); owner/Opus
-privacy review and Codex re-review required before activation.**
+**Status: APPROVED and length-capture IMPLEMENTED behind `--key-sizes`
+(controller ruling 2026-11-18: privacy wording is ours, owner
+sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2` +
+`rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with fix round 1).
+Join/publication (Task 3) and the Task 5 live matrix remain.**
 This section scopes section version 7 of
 `inventory-v1-object-observations-v7.schema.json`: the
 `inferred_family`/`inferred_size` row keys and the finite
@@ -2426,11 +2438,12 @@ in the base journal pair. Without the flag no length word is
 acquired on any path, and family, creation-template and
 token-reported facts are still published as above.
 
-Required evidence before activation: the §12 twin tables (host
-RED/GREEN at the journal seam, hostile-width, overlap/alias,
-2041-bit and DER/padding negative controls), the §12.1 off-mode
-identity contract (byte-identical records, same linked set,
-base-program linked-instruction identity), canary lanes with length-cell sentinel
+Required evidence for the lane series (Task 2 records its portion;
+later tasks record theirs): the §12 twin tables (host RED/GREEN at
+the journal seam, hostile-width, overlap/alias, 2041-bit and
+DER/padding negative controls), the §12.1 off-mode identity contract
+(byte-identical records, same linked set, base-program
+linked-instruction identity), canary lanes with length-cell sentinel
 positions on every §5.1 shape (LP64+ia32) proving no payload byte
 reaches output/maps/logs and that unclassified lengths (the
 AES-GCM canary) publish nowhere, verifier headroom + `bpf loads`

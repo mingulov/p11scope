@@ -12647,4 +12647,226 @@ mod bind_collection_strict_tests {
             );
         }
     }
+
+    /// A refused entry plus a proved sibling through catalog assembly:
+    /// the refusal surfaces as a named `skipped` row with its table
+    /// `unpinned` record and a partial catalog, while the sibling still
+    /// binds. Fails when `bind_gaps` propagation is removed.
+    #[test]
+    fn bind_collection_refusal_surfaces_as_skipped_and_partial_catalog() {
+        let (mut module, pins, object, executable) = pinned_fixture();
+        let dangling = unproven_executable_offset(&pins, object, &executable);
+        let starts = pins.function_starts_for(object);
+        assert!(
+            !starts.is_empty(),
+            "the fixture must carry function-start proofs or the check is vacuous"
+        );
+        let proved = starts[0];
+        assert_ne!(
+            dangling, proved,
+            "the refused and proved offsets must differ"
+        );
+        module.tables = vec![decoded_table(vec![
+            ScannedEntry {
+                name: "C_Initialize",
+                object: module.key,
+                object_path: module.path.clone(),
+                file_offset: dangling,
+            },
+            ScannedEntry {
+                name: "C_GetFunctionList",
+                object: module.key,
+                object_path: module.path.clone(),
+                file_offset: proved,
+            },
+        ])];
+        let pid = std::process::id();
+        let mut collection = collection_with(pid, module.view, module, pins);
+        let bound = bind_collection(&mut collection);
+        assert_eq!(bound.bind_gaps.len(), 1, "{:?}", bound.bind_gaps);
+        assert_eq!(bound.bind_gaps[0].subject, "C_Initialize");
+        let tables = &bound.reconciled[0].2.scanned.tables;
+        assert_eq!(
+            tables[0].entries.len(),
+            1,
+            "the proved sibling still binds: {:?}",
+            tables[0].entries
+        );
+        assert_eq!(tables[0].entries[0].file_offset, proved);
+        assert_eq!(tables[0].unpinned.len(), 1);
+        assert_eq!(tables[0].unpinned[0].subject, "C_Initialize");
+        let catalog = assemble(
+            collection,
+            bound,
+            None,
+            AdmissionPolicy::detailed(),
+            crate::plan::AdmissionScope::Shared,
+        );
+        assert_eq!(
+            catalog.scan_status, "partial",
+            "skipped: {:?}, notes: {:?}",
+            catalog.skipped, catalog.notes
+        );
+        assert_eq!(catalog.skipped.len(), 1, "{:?}", catalog.skipped);
+        assert_eq!(catalog.skipped[0].subject, "C_Initialize");
+        assert!(
+            catalog.skipped[0]
+                .reason
+                .contains("not a proven function entry"),
+            "{}",
+            catalog.skipped[0].reason
+        );
+        assert!(
+            catalog
+                .notes
+                .iter()
+                .all(|note| note.subject != "C_Initialize"),
+            "a refusal is a loss, never a note: {:?}",
+            catalog.notes
+        );
+        assert_eq!(
+            catalog.objects.len(),
+            1,
+            "the proved sibling keeps its provider object"
+        );
+    }
+
+    /// Binder refusal reasons embed the target pathname first. A directory
+    /// component containing the verified-absence marker must not turn the
+    /// loss into a note (and the catalog complete).
+    #[test]
+    fn marker_pathname_binder_refusal_still_truncates() {
+        use crate::discovery::scan::{
+            NO_TABLE_FOUND_MARKER, no_table_found_reason, scan_skip_truncates,
+        };
+        let plain = no_table_found_reason("/opt/p11.so", false);
+        let hinted = no_table_found_reason("/opt/p11.so", true);
+        assert!(
+            !scan_skip_truncates(&plain),
+            "genuine absence stays benign: {plain:?}"
+        );
+        assert!(
+            !scan_skip_truncates(&hinted),
+            "hinted absence stays benign: {hinted:?}"
+        );
+        assert!(
+            !scan_skip_truncates(NO_TABLE_FOUND_MARKER),
+            "bare marker stays benign"
+        );
+        let marker_path = format!("/tmp/{NO_TABLE_FOUND_MARKER}/libprobe.so");
+        for reason in [
+            format!(
+                "{marker_path} does not define C_Initialize at the uncorroborated offset \
+                 and the offset is not a proven function entry; entry was not attached"
+            ),
+            format!(
+                "{marker_path} has a different target ABI from its provider; \
+                 entry was not attached"
+            ),
+            format!(
+                "{marker_path} could not be reconciled to a comparable pinned object; \
+                 entry was not attached"
+            ),
+        ] {
+            assert!(
+                scan_skip_truncates(&reason),
+                "a marker pathname must not hide a refusal: {reason:?}"
+            );
+        }
+        assert!(scan_skip_truncates(
+            "/opt/p11.so does not define C_Initialize at the uncorroborated offset \
+             and the offset is not a proven function entry; entry was not attached"
+        ));
+    }
+
+    /// End-to-end pathname case: a real provider file copied under a
+    /// directory whose name contains the verified-absence marker. Its
+    /// strict refusal embeds that pathname and must still surface as
+    /// `skipped` with a partial catalog.
+    #[test]
+    fn bind_gap_with_marker_pathname_surfaces_as_skipped_and_partial() {
+        use crate::discovery::scan::NO_TABLE_FOUND_MARKER;
+        use p11scope_manifest::maps::Device;
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let source = test_fixture::small_owned_object();
+        let dir = tempfile::tempdir().unwrap();
+        let marker_dir = dir.path().join(NO_TABLE_FOUND_MARKER);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let dest = marker_dir.join("libmarker-probe.so");
+        std::fs::copy(source, &dest).unwrap();
+        let file = p11scope_manifest::identity::open_object(&dest).expect("marker copy opens");
+        let mapping =
+            p11scope_manifest::identity::mapping_file_key(&file).expect("marker copy keys");
+        let key = ObjectKey {
+            device: Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        let mut module = ScannedModule {
+            key_is_identity: false,
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: None,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            path: dest.display().to_string(),
+            tables_scan_finished: false,
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        };
+        let mut budget = CaptureWorkBudget::default();
+        let (pins, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let object = pins
+            .id_for_scanned(&module, module.key, &module.path)
+            .expect("the marker pin resolves");
+        let inspected =
+            p11scope_manifest::identity::inspect_file(&file).expect("marker copy inspects");
+        let dangling = unproven_executable_offset(&pins, object, &inspected.executable_ranges);
+        module.tables = vec![decoded_table(vec![ScannedEntry {
+            name: "C_Initialize",
+            object: module.key,
+            object_path: module.path.clone(),
+            file_offset: dangling,
+        }])];
+        let pid = std::process::id();
+        let mut collection = collection_with(pid, module.view, module, pins);
+        let bound = bind_collection(&mut collection);
+        assert_eq!(bound.bind_gaps.len(), 1, "{:?}", bound.bind_gaps);
+        assert!(
+            bound.bind_gaps[0].reason.contains(NO_TABLE_FOUND_MARKER),
+            "the refusal must embed the marker pathname to test the shape: {}",
+            bound.bind_gaps[0].reason
+        );
+        let catalog = assemble(
+            collection,
+            bound,
+            None,
+            AdmissionPolicy::detailed(),
+            crate::plan::AdmissionScope::Shared,
+        );
+        assert_eq!(
+            catalog.scan_status, "partial",
+            "skipped: {:?}, notes: {:?}",
+            catalog.skipped, catalog.notes
+        );
+        assert_eq!(catalog.skipped.len(), 1, "{:?}", catalog.skipped);
+        assert!(
+            catalog
+                .notes
+                .iter()
+                .all(|note| note.subject != "C_Initialize"),
+            "a marker-pathname refusal is a loss, never a note: {:?}",
+            catalog.notes
+        );
+        drop(dir);
+    }
 }

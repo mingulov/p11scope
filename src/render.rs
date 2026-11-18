@@ -847,8 +847,25 @@ pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
     declared: &[std::path::PathBuf],
     modules: &[(Id, String, (u64, u64), u64)],
 ) -> (Vec<Id>, Vec<String>) {
+    match_forwarding_inputs_counted(declared, modules, || false)
+        .expect("a never-abort scan always completes")
+}
+
+/// [`match_forwarding_inputs`] with pacing for fold planning: every
+/// filesystem stat counts one I/O unit and every module comparison
+/// one scan unit through `unit`, and a true return aborts with
+/// `None` (the caller retries next pass). With no declarations the
+/// match is empty without scanning.
+pub(crate) fn match_forwarding_inputs_counted<Id: Copy + Ord>(
+    declared: &[std::path::PathBuf],
+    modules: &[(Id, String, (u64, u64), u64)],
+    mut unit: impl FnMut() -> bool,
+) -> Option<(Vec<Id>, Vec<String>)> {
     use std::collections::BTreeSet;
     use std::os::unix::ffi::OsStrExt as _;
+    if declared.is_empty() {
+        return Some((Vec::new(), Vec::new()));
+    }
     let mut matched: BTreeSet<Id> = BTreeSet::new();
     let mut unmatched: Vec<String> = Vec::new();
     for input in declared {
@@ -866,10 +883,14 @@ pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
         // fstat, and the two disagree for the same file (btrfs host:
         // st_dev 37 vs mount 0:35).
         let inode = if is_path {
-            std::fs::metadata(input).ok().map(|meta| {
+            let stat = std::fs::metadata(input).ok().map(|meta| {
                 use std::os::unix::fs::MetadataExt as _;
                 meta.ino()
-            })
+            });
+            if unit() {
+                return None;
+            }
+            stat
         } else {
             None
         };
@@ -887,18 +908,25 @@ pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
                 matched.insert(*id);
                 hit = true;
             }
+            if unit() {
+                return None;
+            }
         }
         if !hit {
             unmatched.push(input_string);
         }
     }
-    let mut ordered: Vec<Id> = modules
-        .iter()
-        .map(|(id, _, _, _)| *id)
-        .filter(|id| matched.contains(id))
-        .collect();
+    let mut ordered: Vec<Id> = Vec::new();
+    for (id, _, _, _) in modules {
+        if matched.contains(id) {
+            ordered.push(*id);
+        }
+        if unit() {
+            return None;
+        }
+    }
     ordered.dedup();
-    (ordered, unmatched)
+    Some((ordered, unmatched))
 }
 
 /// Match `--module` inputs against discovered modules at evidence

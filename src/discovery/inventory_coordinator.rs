@@ -1262,7 +1262,9 @@ const FOLD_CALLERS_PER_PUBLICATION: usize = 1024;
 /// so a stop lands within one stride instead of past whole-table
 /// scans. Planning is pure (indexes rebuild next pass) and each
 /// single-caller fold stays atomic, so an abort only defers work.
-const FOLD_PLAN_STRIDE: u64 = 64;
+/// The streaming wrapper paces its terminal certification against
+/// the same stride.
+pub(crate) const FOLD_PLAN_STRIDE: u64 = 64;
 
 /// One retire call's planning stride cursor: counts examined units
 /// across every planning scan and asks the stop source every
@@ -5900,14 +5902,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// changes afterwards). Binder and pair tables scan once per call,
     /// never once per caller; the call folds at most
     /// [`FOLD_CALLERS_PER_PUBLICATION`] rows, stops promptly on stop,
-    /// and re-queues whatever it did not reach, so the remainder
+    /// and leaves whatever it did not reach carried, so the remainder
     /// resumes next pass without a re-note. Returns how many rows
     /// retired and what folded.
     ///
     /// Bounded work: the entry gate runs before any planning, every
     /// planning scan counts its units through one shared
     /// [`FOLD_PLAN_STRIDE`] cursor and aborts on stop (planning is
-    /// pure, so the next pass rebuilds it), each fold spends one
+    /// pure, so the next pass rebuilds it), and a stop is checked
+    /// again where the pure plan meets the first mutation. Rows
+    /// leave the carry as decided — folded, vetoed, deferred or
+    /// simply not a candidate — so an abort keeps the unprocessed
+    /// suffix carried without rebuilding it. Each fold spends one
     /// credit plus one per further member stride, and released pidfd
     /// custody drains through one explicit handoff outside the
     /// per-caller loop. Each single-caller fold stays atomic: an
@@ -5962,27 +5968,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut stride = FoldStride::new();
         // One referenced-caller set per call, not one scan per candidate:
         // steady state can render the whole caller budget every pass.
-        // The scan is pure: an abort leaves the carry untaken.
+        // The scan is pure: an abort leaves the carry untouched.
         let Some(referenced) = self.referenced_callers(|| stride.unit(stop)) else {
             return FoldReceipt::default();
         };
         // Phase 1: fold candidates through the cheap per-row checks.
-        // Missing, live and referenced rows drop here and re-note from
-        // the view next pass, as before. An abort requeues everything
-        // taken: the filtered candidates beside the unreached rest.
-        let rendered: Vec<CallerId> = std::mem::take(&mut self.rendered_callers)
-            .into_iter()
-            .collect();
-        let mut candidates = Vec::new();
-        for (index, id) in rendered.iter().copied().enumerate() {
+        // The carry stays in place while the snapshot scans: an abort
+        // returns with every row still carried, and rows the pass
+        // decides leave the set as decided — the unprocessed suffix
+        // is never rebuilt, it is simply never taken.
+        let mut rendered = Vec::new();
+        for id in self.rendered_callers.iter().copied() {
             if stride.unit(stop) {
-                self.rendered_callers
-                    .extend(candidates.iter().map(|(id, _)| *id));
-                self.rendered_callers
-                    .extend(rendered[index..].iter().copied());
+                return FoldReceipt::default();
+            }
+            rendered.push(id);
+        }
+        let mut candidates = Vec::new();
+        let mut drops = Vec::new();
+        for id in rendered {
+            if stride.unit(stop) {
                 return FoldReceipt::default();
             }
             let Some(record) = self.adapter.record(id) else {
+                drops.push(id);
                 continue;
             };
             if !record.retired
@@ -5991,29 +6000,35 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     CallerLifecycle::Exited | CallerLifecycle::ExecRetired
                 )
             {
+                drops.push(id);
                 continue;
             }
             if referenced.contains(&id) {
+                drops.push(id);
                 continue;
             }
             candidates.push((id, record.clone()));
         }
+        // Missing, live and referenced rows drop here and re-note from
+        // the view next pass, as before.
+        for id in drops {
+            self.rendered_callers.remove(&id);
+        }
         // Phase 2: one binder release plan for every candidate
         // (skipped when no candidate exists: most passes retire
         // nothing and must not scan). The plan is pure: an abort
-        // discards it and every candidate waits for the rebuild.
+        // discards it and every candidate stays carried for the
+        // rebuild.
         let mut release = None;
         if !candidates.is_empty() {
             let Some(plan) = self.binder.plan_retired_release(|| stride.unit(stop)) else {
-                self.rendered_callers
-                    .extend(candidates.iter().map(|(id, _)| *id));
                 return FoldReceipt::default();
             };
             release = Some(plan);
         }
         // Phase 3: folds with bounded credits and stop checks. Vetoed
         // rows drop (the view re-notes them); stop and credit breaks
-        // re-queue the unreached remainder for the next pass.
+        // leave the unreached remainder carried for the next pass.
         // The fold indexes build lazily on the first folding caller:
         // most passes retire nothing.
         let mut folded: Option<FoldContext> = None;
@@ -6027,14 +6042,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // pure check runs before any clearing, so a deferred row
             // keeps all of its evidence.
             if !self.semantic_bindings.foldable(id) {
+                self.rendered_callers.remove(&id);
                 continue;
             }
-            // The stop and credit gate stays pure: a re-queued row
+            // The stop and credit gate stays pure: a waiting row
             // keeps its binder evidence until its own fold runs, so
             // this check precedes the clearing below.
             if stop() || credits == 0 {
-                self.rendered_callers.insert(id);
-                self.rendered_callers.extend(rest.map(|(id, _)| id));
                 break;
             }
             // A pending binder row still needs its incarnation snapshot;
@@ -6043,26 +6057,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // never pays for indexes it will not use.
             let plan = release.as_ref().expect("a candidate implies a plan");
             if plan.vetoes(id) {
+                self.rendered_callers.remove(&id);
                 continue;
             }
             if folded.is_none() {
                 let Some(ctx) = self.fold_context(subset, || stride.unit(stop)) else {
                     // The pure index build aborted: the current row
-                    // and the unreached remainder wait (no clearing
-                    // ran yet for this row, so its evidence is
-                    // intact). Folds already completed keep their
+                    // and the unreached remainder stay carried (no
+                    // clearing ran yet for this row, so its evidence
+                    // is intact). Folds already completed keep their
                     // receipt.
-                    self.rendered_callers.insert(id);
-                    self.rendered_callers.extend(rest.map(|(id, _)| id));
                     break;
                 };
                 let Some(work) = self.pair_fold_work(|| stride.unit(stop)) else {
-                    self.rendered_callers.insert(id);
-                    self.rendered_callers.extend(rest.map(|(id, _)| id));
                     break;
                 };
                 folded = Some(ctx);
                 pairs = Some(work);
+            }
+            // The pure plan meets the mutating fold here: a stop that
+            // landed during the index build aborts before the first
+            // clearing, so the row keeps its evidence for the resume.
+            if stop() {
+                break;
             }
             // The member pacing counts this caller's units before
             // folding: cookies, pair targets and recoveries, edges,
@@ -6070,6 +6087,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // veto was checked above), so a folded row's evidence
             // clears exactly once, in its own fold.
             if !self.binder.apply_retired_release(plan, id) {
+                self.rendered_callers.remove(&id);
                 continue;
             }
             let pairs_ref = pairs.as_ref().expect("indexes build before the first fold");
@@ -6091,6 +6109,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 pairs.as_mut(),
                 now_ns,
             );
+            // The row is decided: it leaves the carry whether the
+            // adapter still held it or not, as before.
+            self.rendered_callers.remove(&id);
             if self.adapter.forget_caller(id) {
                 self.semantic_bindings.release_folded_caller(id, handoff);
                 self.count_ownership.forget_caller(id);
@@ -6248,9 +6269,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// modules (for carried Joint-terminal contributions, when a lane
     /// is seated). Counts every examined row through `unit` and
     /// aborts (`None`) when it asks; the index is pure, so the caller
-    /// requeues and rebuilds. The forwarding match itself stays
-    /// unstrided: it stats each declared input once (never per
-    /// module), bounded by the run's declared inputs.
+    /// requeues and rebuilds. The forwarding match counts its stats
+    /// as I/O units and its comparisons as scan units through the
+    /// same cursor, and stays empty without scanning when nothing is
+    /// declared.
     fn fold_context(
         &self,
         subset: Option<&AttestedSubset>,
@@ -6300,8 +6322,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 return None;
             }
         }
-        let (forwarding_declared, _) =
-            crate::render::match_forwarding_inputs(self.forwarding_inputs(), &module_keys);
+        let (forwarding_declared, _) = crate::render::match_forwarding_inputs_counted(
+            self.forwarding_inputs(),
+            &module_keys,
+            &mut unit,
+        )?;
         let mut forwarding: BTreeSet<ModuleId> = forwarding_declared.into_iter().collect();
         for module in self.registry.modules() {
             if matches!(
@@ -11390,8 +11415,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// An owned stop query over the current sources: the local
-    /// flag's current value plus the live counter, if wired.
-    fn stop_query(&self) -> Arc<dyn Fn() -> bool> {
+    /// flag's current value plus the live counter, if wired. The
+    /// streaming wrapper paces its terminal certification against
+    /// the same query before the fold runs.
+    pub(crate) fn stop_query(&self) -> Arc<dyn Fn() -> bool> {
         let stopped = self.stopped;
         let source = self.stop_source.clone();
         Arc::new(move || {

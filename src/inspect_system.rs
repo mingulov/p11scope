@@ -8269,7 +8269,9 @@ int main(int argc, char **argv) {
 
     mod c1b {
         use super::super::*;
-        use crate::discovery::identity::test_fixture::{PATH, SHA, module, view_pin};
+        use crate::discovery::identity::test_fixture::{
+            PATH, SHA, large_owned_object, module, view_pin,
+        };
         use crate::discovery::identity::{FileIdentity, MappedFile};
         use crate::discovery::sweep_attribution::{
             Confirmation, ConfirmedRead, MappedIdentities, RangeProof,
@@ -8451,13 +8453,14 @@ int main(int argc, char **argv) {
             }
             let mut provider = module(PROVIDER);
             provider.view = ProcessViewId(0);
-            let mut pins = view_pin(&provider, 21, SHA, 1, false);
             // These twins exercise admission/attribution over a bound
-            // provider, not bind refusal: backfill the synthetic entry
-            // offsets as proven function starts (the same test-only
-            // proof the engine twins use), so the strict inventory
-            // bind admits them.
-            pins.prove_scanned_entries_for_test(std::slice::from_ref(&provider));
+            // provider, not bind refusal: the entry offset is a genuine
+            // STT_FUNC/FDE start from the large owned ELF (in a PF_X
+            // segment), and the pin carries that ELF's full proof list,
+            // so the strict inventory bind admits it.
+            provider.tables[0].entries[0].file_offset = real_proof_starts()[0];
+            let mut pins = view_pin(&provider, 21, SHA, 1, false);
+            pins.prove_elf_function_starts_for_test(large_owned_object());
             Collection {
                 enumerated: sweep.iter().map(|(pid, _)| *pid).collect(),
                 selected: vec![10_000, 20_000],
@@ -8554,8 +8557,19 @@ int main(int argc, char **argv) {
 
         /// A provider with `tables` bare heuristic tables of
         /// `entries_per_table` endpoints each, for admission-wiring twins.
+        /// Entry offsets are genuine `STT_FUNC`/FDE starts from the large
+        /// owned ELF's proof list (distinct, in a `PF_X` segment), so the
+        /// strict bind admits them without weakening the heuristic class
+        /// or endpoint counts.
         fn heuristic_provider(tables: usize, entries_per_table: usize) -> ScannedModule {
             use crate::discovery::scan::{ScannedEntry, ScannedTable};
+            let starts = real_proof_starts();
+            let total = tables * entries_per_table;
+            assert!(
+                starts.len() >= total,
+                "the large owned fixture must cover {total} endpoints, has {}",
+                starts.len()
+            );
             let mut provider = module(PROVIDER);
             provider.view = ProcessViewId(0);
             provider.tables = (0..tables)
@@ -8563,11 +8577,14 @@ int main(int argc, char **argv) {
                     version: (2, 40),
                     walk: "full",
                     entries: (0..entries_per_table)
-                        .map(|entry| ScannedEntry {
-                            name: "C_Initialize",
-                            object: PROVIDER,
-                            object_path: PATH.into(),
-                            file_offset: 0x1000 + (table * entries_per_table + entry) as u64 * 8,
+                        .map(|entry| {
+                            let index = table * entries_per_table + entry;
+                            ScannedEntry {
+                                name: "C_Initialize",
+                                object: PROVIDER,
+                                object_path: PATH.into(),
+                                file_offset: starts[index],
+                            }
                         })
                         .collect(),
                     null_entries: vec![],
@@ -8593,12 +8610,10 @@ int main(int argc, char **argv) {
             hints: &[PathBuf],
         ) -> Catalog {
             let mut collection = over_cap(&[]);
-            // The lowered provider replaces the over-cap module, so its
-            // own synthetic offsets need the same test-only
-            // function-start proof (see `over_cap`).
-            collection.members[0]
-                .pins
-                .prove_scanned_entries_for_test(std::slice::from_ref(&provider));
+            // The over-cap pins already carry the large owned ELF's full
+            // genuine proof list, which covers the lowered provider's own
+            // real offsets (a subset of the same list) — no per-table
+            // backfill.
             collection.members[0].modules = vec![provider];
             let snapshots: HashMap<u32, Vec<MapEntry>> = collection.sweep.iter().cloned().collect();
             let bound = bind_collection(&mut collection);

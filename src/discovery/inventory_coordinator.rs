@@ -6065,8 +6065,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut pairs: Option<PairFoldWork> = None;
         let mut receipt = FoldReceipt::default();
         let mut credits = FOLD_CALLERS_PER_PUBLICATION;
-        let mut rest = candidates.into_iter();
-        while let Some((id, record)) = rest.next() {
+        let rest = candidates.into_iter();
+        for (id, record) in rest {
             // A sealed semantic gap still awaiting its finalizer pins
             // the row; the fold defers and the next pass retries. This
             // pure check runs before any clearing, so a deferred row

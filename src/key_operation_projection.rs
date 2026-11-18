@@ -1710,7 +1710,14 @@ pub(crate) mod producer {
                 .any(|counters| counters.is_live())
             || !model.sessions.is_empty()
             || !model.objects.is_empty();
-        let (status, reason) = if joint && evidence.partial {
+        // A proved folded Joint history carries the same row-budget
+        // authority as a live Joint feed: the capture-wide reducer
+        // still records refused rows after the last feed folds, so
+        // the status must not clear to populated while refusals
+        // stand. The live census stays separate, and a never-Joint
+        // capture still bootstraps below.
+        let joint_or_history = joint || folded.joint_history();
+        let (status, reason) = if joint_or_history && evidence.partial {
             (ObsStatus::Partial, "row_budget_exhausted")
         } else if joint && lost {
             (ObsStatus::Partial, "authority_lost")

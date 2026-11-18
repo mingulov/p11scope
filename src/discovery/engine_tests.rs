@@ -22575,7 +22575,7 @@ fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_sc
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module,
     }];
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.run_learned_modules.len(),
         1,
@@ -22661,7 +22661,7 @@ fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
     // The new generation: the same key (the same file), a new
     // digest, and new tables that must never join the old module.
     let backing = dir.path().join("libgetteronly.so");
-    let pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    let mut pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
     let pin = pins.pinned().next().expect("one pin");
     assert_eq!(pin.key, key, "the generations share the union key");
     let mut module = fixture_module(key);
@@ -22693,7 +22693,7 @@ fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
         loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         module,
     }];
-    engine.learn_owned_proofs(&pins, &proofs);
+    engine.learn_owned_proofs(&mut pins, &proofs);
     assert_eq!(
         engine.run_learned_modules.len(),
         1,

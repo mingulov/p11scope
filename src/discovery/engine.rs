@@ -12557,10 +12557,24 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         let typed_live = table.live_return
             && !table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
         let incoming_is_static = !table.live_return;
+        // Exact matches win over remaps: a fresh re-decode at an address
+        // where an exact (address- and content-equal) row already sits
+        // merges into that row — even when an older static row with the
+        // same normalized content sits elsewhere. Rewriting the older row
+        // onto the occupied address would shadow the exact match and leave
+        // two rows at one address; the address-based fallback binder
+        // refuses ambiguous addresses outright. The remap arm below runs
+        // only when no exact row exists anywhere in the module.
         let index = existing
             .tables
             .iter()
-            .position(|known| *known == table || same_table_redecode(known, &table));
+            .position(|known| *known == table)
+            .or_else(|| {
+                existing
+                    .tables
+                    .iter()
+                    .position(|known| same_table_redecode(known, &table))
+            });
         table_indices.push(match index {
             Some(index) => {
                 if typed_live

@@ -3055,6 +3055,7 @@ fn entry_program(
 /// never the plain program the non-journal resolver returns; every
 /// other session resolves through the attach-time [`entry_program`].
 /// Mirrors the attach-time grouping resolver.
+#[allow(clippy::too_many_arguments)] // Same explicit grouping seam; the slot names join the descriptor for the length agreement.
 fn downgrade_entry_program(
     journal: bool,
     semantics: &SlotSemantics,

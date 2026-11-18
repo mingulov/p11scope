@@ -461,8 +461,11 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
     let mut app_departed: BTreeMap<String, u64> = BTreeMap::new();
     // One caller folds into every module it touched, so the same
     // caller label repeats across modules; caller labels are never
-    // reused, so first sight counts the incarnation once.
+    // reused, so first sight counts the incarnation once. Pathless
+    // sightings keep their own set: the unknown-exe count dedups
+    // across modules without consuming the caller's incarnation.
     let mut seen_departed_callers: BTreeSet<String> = BTreeSet::new();
+    let mut seen_pathless_departed_callers: BTreeSet<String> = BTreeSet::new();
     for module in arr_of(value, "modules") {
         let Some(departed) = module.get("departed_use").and_then(Value::as_object) else {
             continue;
@@ -495,7 +498,9 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
                 .and_then(str_of)
                 .filter(|path| !path.is_empty());
             let Some(path) = path else {
-                out.unknowns.callers_unknown_exe += 1;
+                if seen_pathless_departed_callers.insert(caller.to_string()) {
+                    out.unknowns.callers_unknown_exe += 1;
+                }
                 continue;
             };
             if !app_incarnations.contains_key(path) {

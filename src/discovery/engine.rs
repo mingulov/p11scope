@@ -28751,9 +28751,12 @@ impl Engine {
     /// Marks listing pids no view admits yet, so the conservative
     /// carry gate sees successors spawned since the last admission
     /// window (getter-debt passes replay before the window marks).
-    /// Cgroup scope only (matching the gate); admitted pids are never
-    /// re-marked. One listing read per replay; listing failures simply
-    /// mark nothing (the gate then reads last tick's marks).
+    /// Cgroup scope only (matching the gate), with the admission
+    /// window's own newcomer filter: admitted pids, held-back pids, and
+    /// pids with no possible arrival (zombies of tracked generations,
+    /// unreadable tracked pids) are never re-marked. One listing read per
+    /// replay; listing failures simply mark nothing (the gate then reads
+    /// last tick's marks).
     fn freshen_newcomer_marks(&mut self) {
         if !matches!(self.scope, Scope::Cgroup { .. }) {
             return;
@@ -28762,9 +28765,16 @@ impl Engine {
         let (pids, _) = scope_pids(&self.scope);
         let now = crate::attach::monotonic_ns();
         for pid in pids {
-            if !admitted.contains(&pid) {
-                self.mark_newcomer_arrival(pid, now);
+            if admitted.contains(&pid) {
+                continue;
             }
+            if self.held_back_waiting(pid) {
+                continue;
+            }
+            if !newcomer_arrival_possible(&self.proc_root, pid, &self.admitted_cgroup_pid_counts) {
+                continue;
+            }
+            self.mark_newcomer_arrival(pid, now);
         }
     }
 

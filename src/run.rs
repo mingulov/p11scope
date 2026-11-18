@@ -33145,6 +33145,140 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// A commit the output layer already saved to the recovery dir
+    /// suppresses the stdout rescue: the `-o` error still surfaces
+    /// (nonzero exit), but stdout stays empty — the bytes are safe in
+    /// the fallback, so a rescue would deliver twice. Arranged with a
+    /// read-only destination (EACCES at rename) and a writable
+    /// recovery override, through the production helper and publisher.
+    #[test]
+    fn terminal_publish_suppresses_the_rescue_when_the_recovery_dir_already_saved() {
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3", "n": 1});
+        let dir = tempfile::tempdir().unwrap();
+        let permissions = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
+        let out_path = dir.path().join("observed.json");
+        let recovered_parent = tempfile::tempdir().unwrap();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut out_file = AtomicFile::create(&out_path).unwrap();
+        write_json_report(out_file.file(), &json).expect("the report renders into the temp");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let mut sink = Vec::new();
+        let mut sink_open = true;
+        let error = publish_streamed_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            Some(&out_path),
+            || commit_streamed_report(out_file),
+            |bytes, failed_path, out_error| {
+                serde_json::to_writer(
+                    bytes,
+                    &with_rescue_delivery_mark(&json, failed_path, out_error),
+                )
+            },
+            None,
+        )
+        .expect_err("the -o failure still exits nonzero");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let text = format!("{error:#}");
+        assert!(text.contains("capture saved to"), "{text}");
+        assert!(
+            error
+                .downcast_ref::<crate::output::CommitFailure>()
+                .is_some_and(|failure| failure.saved_to_recovery().is_some()),
+            "the surfaced error stays typed as a recovery-dir save: {text}"
+        );
+        assert!(
+            sink.is_empty(),
+            "no stdout rescue when the recovery dir already saved"
+        );
+        assert!(!out_path.exists(), "the requested -o does not exist");
+        let saved = std::fs::read_dir(&recovered_base).unwrap().count();
+        assert_eq!(saved, 1, "one fallback file holds the capture");
+    }
+
+    /// A double failure (`capture lost`: a read-only destination plus
+    /// a refused recovery dir) still rescues to stdout as the last
+    /// resort: the surfaced error stays plain and names both
+    /// failures, and stdout carries the marked document.
+    #[test]
+    fn terminal_publish_still_rescues_when_the_recovery_dir_also_failed() {
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3", "n": 1});
+        let dir = tempfile::tempdir().unwrap();
+        let permissions = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
+        let out_path = dir.path().join("observed.json");
+        let plant = tempfile::tempdir().unwrap();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut out_file = AtomicFile::create(&out_path).unwrap();
+        write_json_report(out_file.file(), &json).expect("the report renders into the temp");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _override = crate::output::hold_recovered_override(&link);
+        let mut sink = Vec::new();
+        let mut sink_open = true;
+        let error = publish_streamed_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            Some(&out_path),
+            || commit_streamed_report(out_file),
+            |bytes, failed_path, out_error| {
+                serde_json::to_writer(
+                    bytes,
+                    &with_rescue_delivery_mark(&json, failed_path, out_error),
+                )
+            },
+            None,
+        )
+        .expect_err("the -o failure still exits nonzero");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let text = format!("{error:#}");
+        assert!(text.contains("capture lost"), "{text}");
+        assert!(
+            error.downcast_ref::<crate::output::CommitFailure>().is_none(),
+            "a lost capture stays a plain error so the rescue fires: {text}"
+        );
+        assert!(
+            !sink.is_empty(),
+            "the last-resort rescue still delivers to stdout"
+        );
+        assert!(!out_path.exists(), "the requested -o does not exist");
+        // Machine-separable on stdout alone: exactly one marked JSON line.
+        assert_eq!(sink.first(), Some(&b'\n'));
+        assert_eq!(sink.last(), Some(&b'\n'));
+        let inner = &sink[1..sink.len() - 1];
+        assert!(!inner.contains(&b'\n'), "the rescued document is one line");
+        let parsed: serde_json::Value = serde_json::from_slice(inner).unwrap();
+        assert_eq!(parsed["n"], 1, "the rendered payload survives the rescue");
+        assert!(
+            parsed["delivery"]["output_error"]
+                .as_str()
+                .unwrap()
+                .contains("capture lost"),
+            "the rescue names its -o cause inside the document: {parsed}"
+        );
+    }
+
+    /// Healthy twin for the recovery-aware commit: a writable
+    /// destination publishes through the helper with no error.
+    #[test]
+    fn commit_streamed_report_publishes_a_healthy_report() {
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3"});
+        let dir = tempfile::tempdir().unwrap();
+        let permissions = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
+        let out_path = dir.path().join("observed.json");
+        let mut out_file = AtomicFile::create(&out_path).unwrap();
+        write_json_report(out_file.file(), &json).expect("the report renders into the temp");
+        commit_streamed_report(out_file).expect("a healthy report publishes");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        assert_eq!(parsed["schema"], "p11scope/observed-profile/v3");
+    }
+
     /// A rescue shed by backpressure is drained and named: the terminal
     /// tick budget is spent (the frame already used it), the socket buffer
     /// is full, so the rescue flush drops with counters. The drop

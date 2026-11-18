@@ -1801,6 +1801,46 @@ fn save_recovered_capture(
     ))
 }
 
+/// Serializes tests that override the recovery directory: the override
+/// is a process-global env var, so concurrent tests would race on it.
+/// Shared by the output twins and the streamed-publish twins in `run`,
+/// so no test writes the production `/var/tmp` path.
+#[cfg(test)]
+static RECOVERED_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds the override lock and the env var for one fallback test.
+/// Unsets the var on drop.
+#[cfg(test)]
+pub(crate) struct RecoveredOverrideGuard<'a> {
+    _lock: std::sync::MutexGuard<'a, ()>,
+}
+
+#[cfg(test)]
+pub(crate) fn hold_recovered_override(dir: &Path) -> RecoveredOverrideGuard<'_> {
+    // A sibling twin that panicked while holding the lock must not
+    // cascade into this test: recover the guard and fail (or pass)
+    // on this test's own assertions.
+    let lock = RECOVERED_OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: under the process-wide override lock, no other test
+    // thread touches this variable.
+    unsafe {
+        std::env::set_var("P11SCOPE_TEST_RECOVERED_DIR", dir);
+    }
+    RecoveredOverrideGuard { _lock: lock }
+}
+
+#[cfg(test)]
+impl Drop for RecoveredOverrideGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: still under the override lock; ours is the only writer.
+        unsafe {
+            std::env::remove_var("P11SCOPE_TEST_RECOVERED_DIR");
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) use tests::{atomic_file_test_fixture, atomic_file_test_fixture_read_only};
 
@@ -3592,41 +3632,6 @@ mod tests {
         );
     }
 
-    /// Serializes tests that override the recovery directory: the
-    /// override is a process-global env var, so concurrent tests would
-    /// race on it.
-    static RECOVERED_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Holds the override lock and the env var for one fallback test.
-    /// Unsets the var on drop.
-    struct RecoveredOverrideGuard<'a> {
-        _lock: std::sync::MutexGuard<'a, ()>,
-    }
-
-    fn hold_recovered_override(dir: &Path) -> RecoveredOverrideGuard<'_> {
-        // A sibling twin that panicked while holding the lock must not
-        // cascade into this test: recover the guard and fail (or pass)
-        // on this test's own assertions.
-        let lock = RECOVERED_OVERRIDE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: under the process-wide override lock, no other test
-        // thread touches this variable.
-        unsafe {
-            std::env::set_var("P11SCOPE_TEST_RECOVERED_DIR", dir);
-        }
-        RecoveredOverrideGuard { _lock: lock }
-    }
-
-    impl Drop for RecoveredOverrideGuard<'_> {
-        fn drop(&mut self) {
-            // SAFETY: still under the override lock; ours is the only writer.
-            unsafe {
-                std::env::remove_var("P11SCOPE_TEST_RECOVERED_DIR");
-            }
-        }
-    }
-
     /// Lists entries in the recovery dir (names only); empty when the
     /// dir does not exist yet.
     fn recovered_files(dir: &Path) -> Vec<String> {
@@ -3742,6 +3747,99 @@ mod tests {
         assert!(!path.exists(), "the requested -o does not exist");
         let files = recovered_files(&recovered_base);
         assert_eq!(files.len(), 1, "one fallback file: {files:?}");
+    }
+
+    /// `commit_with_outcome` reports a recovery-dir save as a typed
+    /// `SavedToRecovery` failure: the message names the fallback, the
+    /// saved path holds the finished bytes, and the requested `-o`
+    /// does not exist (exit 1).
+    #[test]
+    fn commit_with_outcome_reports_a_saved_fallback() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&recovered_base);
+        let failure = a.commit_with_outcome().unwrap_err();
+        assert_eq!(failure.kind(), CommitFailureKind::SavedToRecovery);
+        let saved = failure
+            .saved_to_recovery()
+            .expect("a saved fallback names its path")
+            .to_path_buf();
+        assert!(
+            failure.message().contains("capture saved to"),
+            "the message names the fallback, got: {}",
+            failure.message()
+        );
+        assert!(
+            failure.message().contains(&saved.display().to_string()),
+            "the message names the fallback path, got: {}",
+            failure.message()
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"{\"ok\":true}");
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A refused recovery dir (a planted symlink here) reports a typed
+    /// `RecoveryFailed` failure: no saved path, the message carries
+    /// both errors with `capture lost`, and nothing is created through
+    /// the refused base.
+    #[test]
+    fn commit_with_outcome_reports_a_double_failure_as_lost() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let plant = private_tempdir();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&link);
+        let failure = a.commit_with_outcome().unwrap_err();
+        assert_eq!(failure.kind(), CommitFailureKind::RecoveryFailed);
+        assert!(
+            failure.saved_to_recovery().is_none(),
+            "a double failure saves nothing"
+        );
+        let message = failure.into_message();
+        assert!(message.contains("capture lost"), "got: {message}");
+        assert!(
+            message.contains("also failed"),
+            "the message names the fallback failure, got: {message}"
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused symlink"
+        );
+    }
+
+    /// The saved-line ownership note is true for its owner in every
+    /// direction: root keeps `root-only`; a named user is named; an
+    /// unknown uid prints numerically. A pure-function pin, so the
+    /// root branch holds without privilege.
+    #[test]
+    fn recovery_saved_note_is_true_for_its_owner() {
+        assert_eq!(
+            recovery_saved_note(0, Some("root")),
+            "(root-only, mode 0600)"
+        );
+        assert_eq!(recovery_saved_note(0, None), "(root-only, mode 0600)");
+        assert_eq!(
+            recovery_saved_note(1000, Some("alice")),
+            "(mode 0600, readable only by alice)"
+        );
+        assert_eq!(
+            recovery_saved_note(1000, None),
+            "(mode 0600, readable only by uid 1000)"
+        );
     }
 
     /// ENOSPC surfacing at the pre-handover sync saves the capture to

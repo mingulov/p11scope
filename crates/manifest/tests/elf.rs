@@ -1798,6 +1798,80 @@ fn elf32_program_table_is_gated() {
     );
 }
 
+/// Synthetic ELF64 with `e_phnum == PN_XNUM` (the real count rides
+/// section 0's `sh_info`) but a zero `e_phentsize`: the byte cap
+/// computes 0 while the count stays billion-scale. The parser
+/// refuses the entry size, so the gate must admit with zero program
+/// entries instead of charging a walk that never happens.
+fn write_zero_phentsize_xnum_elf(path: &Path, real_phnum: u32) {
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[32..40].copy_from_slice(&128u64.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&0u16.to_le_bytes());
+    header[56..58].copy_from_slice(&0xffffu16.to_le_bytes());
+    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    let mut section0 = [0u8; 64];
+    section0[44..48].copy_from_slice(&real_phnum.to_le_bytes());
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&section0);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn zero_phentsize_with_pn_xnum_charges_no_program_entries() {
+    use p11scope_manifest::elf::{read_raw_scan_facts_bounded, read_table_bounds};
+    let d = tmp("elf-table-cap-zero-phentsize");
+    let path = d.join("zero-phentsize.so");
+    write_zero_phentsize_xnum_elf(&path, u32::MAX);
+    let file = std::fs::File::open(&path).unwrap();
+    let bounds = read_table_bounds(&file).0.unwrap();
+    assert_eq!(bounds.program_entries, 0);
+    assert_eq!(bounds.program_table_bytes, 0);
+    assert_eq!(bounds.table_entries(), bounds.section_entries);
+    // The file itself is still refused (the legacy parser fails
+    // fast on the entry size) — as its own file, never as an
+    // over-cap table and never with a pass-stopping charge.
+    let refused = read_raw_scan_facts_bounded(&file, &[], u64::MAX).unwrap_err();
+    assert!(
+        !p11scope_manifest::elf::is_table_cap_reason(&refused),
+        "zero-size tables are a corrupt file, not an over-cap table: {refused}"
+    );
+}
+
+#[test]
+fn zero_shentsize_charges_no_section_entries() {
+    use p11scope_manifest::elf::read_table_bounds;
+    let d = tmp("elf-table-cap-zero-shentsize");
+    let path = d.join("zero-shentsize.so");
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header[16..18].copy_from_slice(&2u16.to_le_bytes());
+    header[18..20].copy_from_slice(&62u16.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    header[52..54].copy_from_slice(&64u16.to_le_bytes());
+    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    header[58..60].copy_from_slice(&0u16.to_le_bytes());
+    header[60..62].copy_from_slice(&1000u16.to_le_bytes());
+    std::fs::write(&path, header).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let bounds = read_table_bounds(&file).0.unwrap();
+    assert_eq!(bounds.section_entries, 0);
+    assert_eq!(bounds.section_table_bytes, 0);
+    assert_eq!(bounds.table_entries(), bounds.program_entries);
+}
+
 /// The header probe moves at most 128 bytes however large the file:
 /// the 64-byte header, plus section 0 only when the extended counts
 /// are used. Both the actual reads and the reported charge basis.

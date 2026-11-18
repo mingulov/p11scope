@@ -22342,6 +22342,134 @@ mod tests {
         assert_eq!(pool.snapshot().charged_bytes, baseline);
     }
 
+    /// Drive the conservative copy plus the terminal scanned rebind
+    /// over `modules` and return both the direct bind and the rebind
+    /// outcomes, so pre-copy-up twins assert equivalence without
+    /// repeating the cursor dance.
+    fn rebind_equivalence(
+        source: &PinnedObjects,
+        modules: &[ScannedModule],
+    ) -> (
+        Vec<ReconciledModule>,
+        Vec<Skipped>,
+        Vec<ReconciledModule>,
+        Vec<Skipped>,
+    ) {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(source, &mut pins, &selection, &reserve);
+        let mut expected = pins.pinned().unwrap().clone();
+        expected.reset_derived_claims();
+        let (expected_modules, expected_skips) = bind_scanned_modules(modules, &mut expected);
+        let (mut input, _) = retained_rebind_inputs(&pool, modules, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        let actual_modules = rebind.modules().unwrap().to_vec();
+        let actual_skips = rebind.skipped().unwrap().to_vec();
+        (
+            expected_modules,
+            expected_skips,
+            actual_modules,
+            actual_skips,
+        )
+    }
+
+    /// Re-file provider-0's pin in `source` as the witness-proven
+    /// pre-copy-up side: the absorb-time shape `mark_pre_copy_up`
+    /// stages for one-object sets, located by its filed plain raw.
+    fn refile_provider_pin_as_pre_copy_up(source: &mut PinnedObjects, module: &ScannedModule) {
+        let mut filed =
+            RawObjectInstance::scanned(module, module.key, &module.path).expect("absolute path");
+        filed.pre_copy_up = false;
+        let id = source
+            .raw_to_id
+            .remove(&filed)
+            .expect("provider-0 pin filed plain");
+        let entry = source.by_id.get_mut(&id).expect("entry for the raw");
+        entry.raw.pre_copy_up = true;
+        entry.pre_copy_up = true;
+        filed.pre_copy_up = true;
+        source.raw_to_id.insert(filed, id);
+    }
+
+    #[test]
+    fn scanned_rebind_resolves_pre_copy_up_provider_like_direct_bind() {
+        // Only the pre-copy-up pin exists for provider-0 (its lower
+        // row): direct bind resolves both pre modules, and the
+        // terminal rebind must resolve them too instead of filing
+        // the named MODULE_MISSING skip the install would swap in.
+        let (_dir, mut source, mut raw) = conservative_cursor_fixture();
+        raw[0].pre_copy_up = Some(0);
+        raw[3].pre_copy_up = Some(0);
+        refile_provider_pin_as_pre_copy_up(&mut source, &raw[0]);
+        let subset = vec![raw[0].clone(), raw[3].clone()];
+        let (expected_modules, expected_skips, actual_modules, actual_skips) =
+            rebind_equivalence(&source, &subset);
+        assert!(expected_skips.is_empty(), "{expected_skips:?}");
+        assert_eq!(expected_modules.len(), 2);
+        assert!(
+            actual_skips
+                .iter()
+                .all(|skip| !skip.subject.contains("provider-0")),
+            "pre-copy-up providers must rebind, got: {actual_skips:?}"
+        );
+        assert_eq!(actual_modules, expected_modules);
+        assert_eq!(actual_skips, expected_skips);
+    }
+
+    #[test]
+    fn scanned_rebind_routes_copy_up_pair_by_proof_like_direct_bind() {
+        // The ruled plain+pre pair: the plain module resolves the
+        // upper pin and the pre module the lower pin. The terminal
+        // rebind must route by proof too instead of binding the
+        // lower facts to the upper object.
+        let (dir, mut source, mut raw) = conservative_cursor_fixture();
+        let mut lower = image_pins(&[(raw[0].key, "bbbbbbbb", 2)]);
+        reback(&mut lower, &backing_file(&dir, "lower-0.so"));
+        // Same observation locus as provider-0's filed pin: the same
+        // mount namespace, key and merge path, differing only by proof.
+        let (mut locus, lower_old) = lower.raw_to_id.pop_first().expect("one forged raw");
+        locus.mount_namespace = Some(raw[0].mount_namespace);
+        locus.path = normalize_target_path(&raw[0].path).expect("absolute path");
+        let entry = lower.by_id.get_mut(&lower_old).expect("entry for the raw");
+        entry.raw.mount_namespace = locus.mount_namespace;
+        entry.raw.path = locus.path.clone();
+        entry.path = locus.path.clone();
+        lower.raw_to_id.insert(locus, lower_old);
+        mark_pre_copy_up(&mut lower);
+        let absorbed = source.absorb(lower);
+        assert!(absorbed.is_empty(), "{absorbed:?}");
+        raw[0].pre_copy_up = Some(0);
+        let lower_id = source
+            .id_for_scanned(&raw[0], raw[0].key, &raw[0].path)
+            .expect("the pre module resolves");
+        let upper_id = source
+            .id_for_scanned(&raw[3], raw[3].key, &raw[3].path)
+            .expect("the plain module resolves");
+        assert_ne!(lower_id, upper_id);
+        assert!(
+            source.summary(lower_id).unwrap().pre_copy_up,
+            "direct bind routes the pre module to the lower pin"
+        );
+        assert!(
+            !source.summary(upper_id).unwrap().pre_copy_up,
+            "direct bind routes the plain module to the upper pin"
+        );
+        let subset = vec![raw[0].clone(), raw[3].clone()];
+        let (expected_modules, expected_skips, actual_modules, actual_skips) =
+            rebind_equivalence(&source, &subset);
+        assert!(expected_skips.is_empty(), "{expected_skips:?}");
+        assert_eq!(
+            [expected_modules[0].object, expected_modules[1].object],
+            [lower_id, upper_id]
+        );
+        assert_eq!(actual_modules, expected_modules);
+        assert_eq!(actual_skips, expected_skips);
+    }
+
     #[test]
     fn scanned_rebind_cursor_denies_carried_views_but_reconciles_their_rows() {
         use crate::semantics_edge::resources::SemanticResourcePool;

@@ -500,4 +500,51 @@ mod tests {
                 .any(|gap| gap.subject == "leader task link loss")
         );
     }
+
+    #[test]
+    fn production_stop_gate_adjudicates_pending_leader_exits() {
+        use crate::inventory_capture::LaneHost;
+        // The classic loop stops its host exactly once per run
+        // through `LaneHost::stop_coordinator` (in-loop latches plus
+        // the post-loop gate); that gate must adjudicate pending
+        // leader exits and disclose them before the final commit.
+        let (mut native, caller) = NativeScene::boxed();
+        native
+            .scene
+            .source
+            .set_leader_exit_observation(7, LeaderExitObservation::Unresolved);
+        native
+            .scene
+            .coordinator
+            .defer_leader_exit(caller, 7, 1_500, native.domain);
+        assert!(!native.scene.coordinator.pending_leader_exits.is_empty());
+        LaneHost::stop_coordinator(&mut native.scene.coordinator);
+        assert!(native.scene.coordinator.pending_leader_exits.is_empty());
+        // The fence stays: unproved inputs remain refused, disclosed.
+        assert!(native.scene.coordinator.adapter.leader_exit_pending(caller));
+        // The final commit publishes the staged stop disclosure.
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert_eq!(
+            gaps.iter()
+                .filter(|gap| gap.caller == Some(caller)
+                    && gap.subject == "leader exit status unresolved at stop")
+                .count(),
+            1
+        );
+        // Idempotent: a second gate records nothing further.
+        LaneHost::stop_coordinator(&mut native.scene.coordinator);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == "leader exit status unresolved at stop")
+                .count(),
+            1
+        );
+    }
 }

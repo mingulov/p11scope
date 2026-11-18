@@ -20184,6 +20184,55 @@ int main(int argc, char **argv) {
         assert_eq!(budget.take_scan_stop_reason(), None);
     }
 
+    /// Synthetic ELF64 with `e_phnum == PN_XNUM` (the real count
+    /// rides section 0's `sh_info`) but a zero `e_phentsize`: the
+    /// byte cap computes 0 while the count stays billion-scale.
+    fn write_zero_phentsize_xnum_elf(path: &std::path::Path) {
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[6] = 1;
+        header[16..18].copy_from_slice(&2u16.to_le_bytes());
+        header[18..20].copy_from_slice(&62u16.to_le_bytes());
+        header[20..24].copy_from_slice(&1u32.to_le_bytes());
+        header[32..40].copy_from_slice(&128u64.to_le_bytes());
+        header[40..48].copy_from_slice(&64u64.to_le_bytes());
+        header[52..54].copy_from_slice(&64u16.to_le_bytes());
+        header[54..56].copy_from_slice(&0u16.to_le_bytes());
+        header[56..58].copy_from_slice(&0xffffu16.to_le_bytes());
+        header[58..60].copy_from_slice(&64u16.to_le_bytes());
+        let mut section0 = [0u8; 64];
+        section0[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(&section0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn zero_phentsize_xnum_does_not_stop_scan_pass_for_later_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let crafted_path = dir.path().join("zero-phentsize.so");
+        write_zero_phentsize_xnum_elf(&crafted_path);
+        let crafted = File::open(&crafted_path).unwrap();
+        let sound_path = dir.path().join("sound.so");
+        std::fs::copy("/bin/sh", &sound_path).unwrap();
+        let sound = File::open(&sound_path).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let first = read_raw_scan_facts_budgeted(&crafted, &[], &mut budget);
+        assert!(
+            first.is_err(),
+            "the crafted file is refused as its own file"
+        );
+        assert_eq!(
+            budget.stopped_reason(),
+            None,
+            "a corrupt file must not stop the pass"
+        );
+        let second = read_raw_scan_facts_budgeted(&sound, &[], &mut budget);
+        assert!(second.is_ok(), "later providers still scan: {second:?}");
+    }
+
     #[test]
     fn deadline_polling_uses_the_local_window_boundary_after_variable_work() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();

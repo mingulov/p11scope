@@ -12733,23 +12733,20 @@ mod bind_collection_strict_tests {
     }
 
     #[test]
-    fn bind_collection_entry_proofs_come_from_executable_segments() {
+    fn bind_collection_function_starts_come_from_executable_segments() {
         let (_module, pins, object, executable) = pinned_fixture();
         assert!(
             !executable.is_empty(),
             "the fixture must have executable ranges or the check is vacuous"
         );
+        // This fixture carries no wanted `C_*` dynamic symbols, so its
+        // export list is empty and export PF_X stays pinned at the pin
+        // layer instead. This test covers function starts alone.
         let inside = |offset: u64| {
             executable
                 .iter()
                 .any(|(start, end)| *start <= offset && offset < *end)
         };
-        for (name, offset) in pins.exports_for(object).iter() {
-            assert!(
-                inside(*offset),
-                "export proof {name} outside every executable segment: {offset:#x}"
-            );
-        }
         let starts = pins.function_starts_for(object);
         assert!(
             !starts.is_empty(),

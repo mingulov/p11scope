@@ -147,10 +147,7 @@ pub(super) fn compare(before: &Snapshot, after: &Snapshot) -> DiffReport {
                     continue;
                 };
                 for identity in &departed.identities {
-                    if let Some(path) = identity
-                        .exe_path
-                        .as_deref()
-                        .filter(|path| !path.is_empty())
+                    if let Some(path) = identity.exe_path.as_deref().filter(|path| !path.is_empty())
                     {
                         folded.insert(path);
                     }
@@ -720,19 +717,14 @@ fn project<'a>(s: &'a Snapshot, paths: &BTreeMap<&str, usize>) -> Projection<'a>
         g.modules.insert(e.module);
     }
     for (mi, module) in s.modules.iter().enumerate() {
-        let (Some(digest), Some(departed)) = (
-            module.sha256.as_deref(),
-            module.departed_use.as_ref(),
-        ) else {
+        let (Some(digest), Some(departed)) =
+            (module.sha256.as_deref(), module.departed_use.as_ref())
+        else {
             continue;
         };
         let mut matched: BTreeSet<usize> = BTreeSet::new();
         for identity in &departed.identities {
-            let Some(path) = identity
-                .exe_path
-                .as_deref()
-                .filter(|path| !path.is_empty())
-            else {
+            let Some(path) = identity.exe_path.as_deref().filter(|path| !path.is_empty()) else {
                 continue;
             };
             let Some(index) = paths.get(path) else {
@@ -740,8 +732,7 @@ fn project<'a>(s: &'a Snapshot, paths: &BTreeMap<&str, usize>) -> Projection<'a>
             };
             let g = p.applications.entry((*index, digest)).or_default();
             g.modules.insert(mi);
-            g.departed_identities
-                .push(departed_identity_fact(identity));
+            g.departed_identities.push(departed_identity_fact(identity));
             matched.insert(*index);
         }
         for index in matched {
@@ -971,10 +962,8 @@ fn application_changes_for(
         }
         let caller_equal = caller_population(bg, br) == caller_population(ag, ar);
         let physical_equal = physical_population(bg, br) == physical_population(ag, ar);
-        let caller_facts_equal =
-            full_caller_population(bg, br) == full_caller_population(ag, ar);
-        let module_facts_equal =
-            full_module_population(bg, br) == full_module_population(ag, ar);
+        let caller_facts_equal = full_caller_population(bg, br) == full_caller_population(ag, ar);
+        let module_facts_equal = full_module_population(bg, br) == full_module_population(ag, ar);
         if !caller_equal {
             changes.insert("caller_population");
         }

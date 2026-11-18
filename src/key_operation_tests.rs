@@ -16492,10 +16492,14 @@ fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
         block_after, block_before,
         "the fold degrades the provider display name: {block_after:?}"
     );
-    let normalized_before: Vec<String> =
-        block_before.iter().map(|line| normalize_key_provider(line)).collect();
-    let normalized_after: Vec<String> =
-        block_after.iter().map(|line| normalize_key_provider(line)).collect();
+    let normalized_before: Vec<String> = block_before
+        .iter()
+        .map(|line| normalize_key_provider(line))
+        .collect();
+    let normalized_after: Vec<String> = block_after
+        .iter()
+        .map(|line| normalize_key_provider(line))
+        .collect();
     assert_eq!(
         normalized_after, normalized_before,
         "concise text keeps the proved rows exactly: {block_after:?} vs {block_before:?}"

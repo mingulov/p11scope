@@ -4142,6 +4142,65 @@ fn render_concise_edges(out: &mut String, presentation: &Presentation) {
     }
 }
 
+/// One concise line per module with folded departed callers: the
+/// module name, the exact folded counts, up to three folded caller
+/// paths, and any past-the-bound tails. Concise and quiet only;
+/// verbose names the same aggregate on its module detail lines.
+fn render_concise_departed(out: &mut String, presentation: &Presentation) {
+    use std::collections::BTreeSet;
+    use std::fmt::Write as _;
+    let mut modules: Vec<&ModuleView> = presentation
+        .modules
+        .iter()
+        .filter(|module| module.departed_use.is_some())
+        .collect();
+    modules.sort_by_key(|module| module_display_name(presentation, module.id));
+    for module in modules {
+        let departed = module.departed_use.as_ref().expect("filtered above");
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for identity in departed.identities.values() {
+            names.insert(retained_path_label(
+                identity.exe.as_ref().and_then(|exe| exe.path.as_deref()),
+                "Unknown executable",
+            ));
+        }
+        let all_names: Vec<String> = names.into_iter().collect();
+        let mut shown: Vec<String> = all_names.iter().take(3).cloned().collect();
+        if all_names.len() > 3 {
+            shown.push("...".to_string());
+        }
+        let paths = if shown.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", shown.join(", "))
+        };
+        let mut tail = String::new();
+        if departed.identities_dropped > 0 {
+            tail.push_str(&format!(
+                " (+{} identities past the bound)",
+                departed.identities_dropped
+            ));
+        }
+        if departed.mechs_overflow > 0 {
+            tail.push_str(&format!(
+                " (+{} mechanisms past the row bound)",
+                departed.mechs_overflow
+            ));
+        }
+        let _ = writeln!(
+            out,
+            "{}: {} departed caller{} folded with {} entr{} in {} edge{}{paths}{tail}",
+            module_display_name(presentation, module.id),
+            departed.callers,
+            if departed.callers == 1 { "" } else { "s" },
+            departed.entries,
+            if departed.entries == 1 { "y" } else { "ies" },
+            departed.edges,
+            if departed.edges == 1 { "" } else { "s" },
+        );
+    }
+}
+
 /// One concise per-caller scope line (F10): the per-caller entry total
 /// plus the container/pod label. Only callers with a label get a line —
 /// host callers stay covered by the provider lines above, and missing or
@@ -4932,7 +4991,8 @@ fn render_snapshot_inner(
         let _ = writeln!(out, "{hint}");
     }
     // Verbose keeps one line per edge with internal ids; concise and
-    // quiet group per provider (see `render_concise_edges`). Concise
+    // quiet group per provider (see `render_concise_edges`) with one
+    // folded line per departed module beside the live groups. Concise
     // adds one scope line per labeled caller when the cgroup metadata
     // opt-in is on; quiet stays a bare summary.
     if verbose {
@@ -4941,11 +5001,20 @@ fn render_snapshot_inner(
         }
     } else {
         render_concise_edges(&mut out, presentation);
+        render_concise_departed(&mut out, presentation);
         if verbosity == crate::cli::TextVerbosity::Concise {
             render_concise_caller_scope_lines(&mut out, presentation);
         }
     }
-    if presentation.edges.is_empty() {
+    // The absence block speaks only for a truly empty view: folded
+    // modules above already name their associations, and replaced
+    // files keep their named gaps in the gaps block below (the same
+    // split the live-edges view uses).
+    let any_departed = presentation
+        .modules
+        .iter()
+        .any(|module| module.departed_use.is_some());
+    if presentation.edges.is_empty() && !any_departed {
         // An empty view with replaced files names the loss instead of
         // the bare absence line: one not-counted notice per distinct
         // (program, file) pair with restart advice. Text only; JSON

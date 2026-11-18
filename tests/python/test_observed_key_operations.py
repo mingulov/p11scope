@@ -576,7 +576,13 @@ class ObservedRsaTests(unittest.TestCase):
              defs["unknown_reason"]["enum"]),
             ("GAP_SUBJECTS", ORACLE.GAP_SUBJECTS,
              defs["gap_row"]["properties"]["subject"]["enum"]),
-            ("GAP_REASONS", ORACLE.GAP_REASONS, defs["gap_reason"]["enum"]),
+            # The script carries the new v7 mismatch reason ahead of the
+            # frozen base schema (v1-v6 never emit it: mismatches imply
+            # admitted lengths, hence non-blank rows, hence v7). The v7
+            # schema file pins the reason; the union keeps this v1 pin
+            # correct.
+            ("GAP_REASONS", ORACLE.GAP_REASONS,
+             set(defs["gap_reason"]["enum"]) | {"corroboration_mismatch"}),
             ("CURVE_LABELS", ORACLE.CURVE_LABELS,
              [name for name in
               defs["metadata_field_curve"]["properties"]["value"]["enum"]

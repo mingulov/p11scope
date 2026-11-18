@@ -26846,8 +26846,8 @@ fn key_operation_newsite_unwrap_carries_no_unestablished_curve_reason() {
     );
     let section = object_observations_json(&committed);
     assert_eq!(
-        section["version"], 7,
-        "the promoted creation_success source trips v7"
+        section["version"], 6,
+        "the promoted creation_success source trips v6"
     );
 }
 
@@ -27251,15 +27251,16 @@ impl KeymetaCtx {
         self.edge
             .observe_joint(&c, &origin, receipts, &mut self.sink);
         assert_eq!(self.sink.len(), before + 1, "{init_name} starts");
-        for effect in self.sink[before..].to_vec() {
+        for effect in &self.sink[before..] {
             self.keyuse
-                .observe_effect(self.instance, &effect, Some(&mut self.ledger), None);
+                .observe_effect(self.instance, effect, Some(&mut self.ledger), None);
         }
         started(self.sink.last().expect("start emits")).0
     }
 
     /// End one machine with rebuilt evidence, feeding the rebuilt
     /// terminal to the reducer; returns the rebuilt effect.
+    #[allow(clippy::too_many_arguments)] // One explicit slot per evidence axis: op, return, length, corroboration.
     fn end(
         &mut self,
         op_name: &str,
@@ -27301,6 +27302,7 @@ impl KeymetaCtx {
 
     /// Complete one direct call with rebuilt evidence; returns the
     /// rebuilt effect (`None` when the direct emits nothing).
+    #[allow(clippy::too_many_arguments)] // One explicit slot per evidence axis: call, receipts, length, fresh view.
     fn direct(
         &mut self,
         call_name: &str,
@@ -27867,6 +27869,25 @@ fn keymeta_corroboration_mismatch_counts() {
     assert_eq!(ctx.keyuse.key_use_evidence().corroboration_mismatches, 0);
 }
 
+/// A receipt-less completion partitions unknown; its length
+/// disagreement feeds no mismatch counter (residuals attach to
+/// rows, and the gap must never escape a v7 section).
+#[test]
+fn keymeta_receiptless_mismatched_completion_counts_no_mismatch() {
+    let mut ctx = KeymetaCtx::new();
+    ctx.start("C_SignInit", 7, Some(0x0001), &[], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(257)),
+        Some(256),
+    );
+    assert_eq!(ctx.keyuse.key_use_evidence().corroboration_mismatches, 0);
+}
+
 /// Over-estimate query triple: the dropped query plus the
 /// corroborating too-small plus the terminal yield exactly one
 /// completion, no conflict.
@@ -27947,43 +27968,42 @@ fn keymeta_rsa_wrap_sizes_wrapping_key() {
 /// Padded variants are ambiguous; the hybrid wrap sizes neither key.
 #[test]
 fn keymeta_aes_kw_wrap_sizes_wrapped_material() {
-    for (mechanism, material) in [(0x2109u64, Some(24u64))] {
-        let ids = KeymetaCtx::object_ids(2);
-        let mut ctx = KeymetaCtx::new();
-        let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
-        let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
-        ctx.direct(
-            "C_WrapKey",
-            7,
-            Some(mechanism),
-            &[wrapping, wrapped],
-            100,
-            Some(LengthOutcome::Value(32)),
-            None,
-        )
-        .expect("wrap completes");
-        let inferred = ctx
-            .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
-            .expect("the wrapped row infers");
-        assert_eq!(
-            inferred.size.detail,
-            Some((
-                SizeDetail::WrappedMaterial {
-                    material_octets: material.expect("material"),
-                    octets: 32,
-                },
-                EvidenceTag::WrapOutput,
-            ))
-        );
-        let inferred = ctx
-            .inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
-            .expect("the wrapping row infers");
-        assert_eq!(inferred.family.value, Some(KeyFamily::Aes));
-        assert_eq!(
-            inferred.size.reason,
-            Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
-        );
-    }
+    let mechanism = 0x2109u64;
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(mechanism),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(32)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row infers");
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: 24,
+                octets: 32,
+            },
+            EvidenceTag::WrapOutput,
+        ))
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
+        .expect("the wrapping row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Aes));
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
     // Padded wrap: the wrapped row names the ambiguity.
     let ids = KeymetaCtx::object_ids(2);
     let mut ctx = KeymetaCtx::new();
@@ -28357,9 +28377,9 @@ fn keymeta_failed_and_cancelled_prove_nothing() {
     ctx.edge
         .observe_joint(&c, &origin, &[receipt2], &mut ctx.sink);
     assert_eq!(ctx.sink.len(), before + 2, "replacement emits end+start");
-    for effect in ctx.sink[before..].to_vec() {
+    for effect in &ctx.sink[before..] {
         ctx.keyuse
-            .observe_effect(ctx.instance, &effect, Some(&mut ctx.ledger), None);
+            .observe_effect(ctx.instance, effect, Some(&mut ctx.ledger), None);
     }
     let cancelled = ctx
         .sink
@@ -29257,6 +29277,77 @@ fn keymeta_valued_upgrades_unsupported_and_unknown() {
     assert_eq!(family.conflict_value, Some(KeyFamily::Ec));
     assert_eq!(family.further, 0);
     assert_eq!(family.completions, 3);
+}
+
+/// Wrapped rows count their wrap mechanisms (family evidence of
+/// the operation-key limit), so the named reason shows with support.
+#[test]
+fn keymeta_wrapped_row_counts_wrap_mechanisms() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(32)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.family.reason,
+        Some(crate::keymeta::REASON_OPERATION_KEY_ONLY)
+    );
+    assert_eq!(inferred.family.completions, 1);
+}
+
+/// Zero-completion reasons never trigger v7 on their own: a row with
+/// only absent-evidence reasons stays below v7 (JSON-identical to
+/// blank), while `-v` still names the reasons.
+#[test]
+fn observations_version_no_evidence_stays_below_v7() {
+    use crate::key_operation_projection::{
+        KeyAggRow, ObjectObservations, ObsStatus, observations_version,
+    };
+    use crate::semantics_key_use::{FamilyState, SizeState};
+    let mut observations = ObjectObservations::unavailable(1, "none");
+    observations.status = ObsStatus::Populated;
+    observations.reason = "none";
+    observations.key_operations = vec![KeyAggRow {
+        instance: "i3".to_string(),
+        object: 7,
+        category: "sign",
+        role: "key",
+        metadata_at_use: "rsa_2048",
+        unit: "operations",
+        started: 1,
+        completed: 1,
+        failed: 0,
+        cancelled: 0,
+        unknown: 0,
+        active: 0,
+        key_join_lost: 0,
+        inferred: Some(RowInference {
+            family: FamilyState::default(),
+            size: SizeState {
+                status: InferredStatus::Unknown,
+                detail: None,
+                completions: 0,
+                conflict_detail: None,
+                further: 0,
+                reason: Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE),
+                further_seen: Vec::new(),
+            },
+        }),
+    }];
+    assert_eq!(observations_version(&observations), 1);
 }
 
 /// Size further-details count distinct sizes, never completions:

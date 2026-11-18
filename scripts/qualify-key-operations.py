@@ -70,6 +70,7 @@ OBSERVATIONS_VERSION_V3 = 3
 OBSERVATIONS_VERSION_V4 = 4
 OBSERVATIONS_VERSION_V5 = 5
 OBSERVATIONS_VERSION_V6 = 6
+OBSERVATIONS_VERSION_V7 = 7
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -182,7 +183,8 @@ GAP_REASONS = ("bootstrap_unproven", "bootstrap_refused", "prefix_contradiction"
                "handle_reuse", "finalize", "token_reset", "exec", "fork", "unload", "loss",
                "pending_capacity", "session_capacity", "object_capacity", "instance_capacity",
                "id_exhausted", "device_loss", "unseen_finalize", "inconsistent_mechanism",
-               "outcome_lost", "unknown_domain", "domain_pruned", "pruned_object_referenced")
+               "outcome_lost", "unknown_domain", "domain_pruned", "pruned_object_referenced",
+               "corroboration_mismatch")
 
 SECTION_KEYS = {"version", "revision", "status", "reason", "sessions", "objects",
                 "key_operations", "unknown_key_operations", "gaps", "budgets"}
@@ -200,6 +202,15 @@ OBJECT_ROW_KEYS = {"object", "session", "origin", "creation", "birth", "lifetime
 KEY_ROW_KEYS = {"instance", "object", "category", "role", "metadata_at_use", "unit",
                 "started", "completed", "failed", "cancelled", "unknown", "active",
                 "key_join_lost"}
+KEY_ROW_KEYS_V7 = KEY_ROW_KEYS | {"inferred_family", "inferred_size"}
+INFERRED_STATUSES = ("inferred", "unknown", "conflicting", "unsupported")
+INFERRED_FAMILIES = ("rsa", "ec", "eddsa", "xeddsa", "secret", "dsa", "dh", "aes",
+                     "generic_secret", "hkdf", "ml_kem", "ml_dsa", "slh_dsa", "chacha20",
+                     "poly1305", "des", "des3", "camellia", "aria", "seed", "gost")
+INFERRED_EVIDENCE = ("sign_output", "verify_input", "encrypt_output", "decrypt_input",
+                     "wrap_output", "unwrap_input", "encapsulate_output", "decapsulate_input")
+SIZE_DETAIL_KINDS = ("rsa", "rsa_nonstandard", "ec", "eddsa", "dsa_class", "pqc_set",
+                     "wrapped_material")
 UNKNOWN_ROW_KEYS = {"category", "reason", "unit", "completed", "failed", "cancelled",
                     "unknown", "active"}
 GAP_ROW_KEYS = {"subject", "reason", "repeats"}
@@ -584,8 +595,86 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
     return ids
 
 
-def _check_key_row(row, objects, roles, labels=METADATA_LABELS):
-    _keys(row, KEY_ROW_KEYS)
+def _check_size_detail(detail):
+    _require(type(detail) is dict, "invalid size detail")
+    _require("kind" in detail and "evidence" in detail,
+             "size detail needs kind and evidence")
+    kind = _label(detail["kind"], SIZE_DETAIL_KINDS, "size detail kind")
+    _label(detail["evidence"], INFERRED_EVIDENCE, "size detail evidence")
+    if kind == "rsa":
+        _keys(detail, {"kind", "size_class", "modulus_bytes", "evidence"})
+        _require(_u64(detail["size_class"]) and _u64(detail["modulus_bytes"]),
+                 "invalid rsa detail")
+    elif kind == "rsa_nonstandard":
+        _keys(detail, {"kind", "modulus_bytes", "evidence"})
+        _require(_u64(detail["modulus_bytes"]), "invalid rsa detail")
+    elif kind in ("ec", "eddsa"):
+        _keys(detail, {"kind", "curve", "octets", "evidence"})
+        _require(type(detail["curve"]) is str and _u64(detail["octets"]),
+                 "invalid curve detail")
+    elif kind == "dsa_class":
+        _keys(detail, {"kind", "label", "octets", "evidence"})
+        _require(type(detail["label"]) is str and _u64(detail["octets"]),
+                 "invalid dsa detail")
+    elif kind == "pqc_set":
+        _keys(detail, {"kind", "parameter_set", "octets", "evidence"})
+        _require(type(detail["parameter_set"]) is str and _u64(detail["octets"]),
+                 "invalid pqc detail")
+    elif kind == "wrapped_material":
+        _keys(detail, {"kind", "material_octets", "octets", "evidence", "about"})
+        _require(_u64(detail["material_octets"]) and _u64(detail["octets"])
+                 and detail["about"] == "wrapped", "invalid wrapped detail")
+
+
+def _check_inferred_family(block):
+    _require(type(block) is dict, "invalid inferred family")
+    allowed = {"status", "value", "completions", "conflict_value",
+               "conflict_completions", "further_conflicts"}
+    _require(set(block) <= allowed
+             and {"status", "value", "completions"} <= set(block),
+             "unexpected inferred family keys")
+    status = _label(block["status"], INFERRED_STATUSES, "inferred status")
+    value = block["value"]
+    _require(value is None or value in INFERRED_FAMILIES, "unexpected inferred family")
+    _require(_u64(block["completions"]), "invalid inferred completions")
+    if status in ("unknown", "unsupported"):
+        _require(value is None, "unknown family carries no value")
+    else:
+        _require(value is not None, "valued family needs a value")
+    conflict = block.get("conflict_value")
+    conflict_completions = block.get("conflict_completions")
+    _require((conflict is None) == (conflict_completions is None),
+             "conflict pair is atomic")
+    if conflict is not None:
+        _require(conflict in INFERRED_FAMILIES, "unexpected conflict family")
+        _require(_u64(conflict_completions), "invalid conflict completions")
+    if "further_conflicts" in block:
+        _require(_u64(block["further_conflicts"]) and block["further_conflicts"] >= 1,
+                 "invalid further conflicts")
+
+
+def _check_inferred_size(block):
+    _require(type(block) is dict, "invalid inferred size")
+    allowed = {"status", "detail", "completions", "conflict_detail", "further_conflicts"}
+    _require(set(block) <= allowed and {"status", "detail", "completions"} <= set(block),
+             "unexpected inferred size keys")
+    status = _label(block["status"], INFERRED_STATUSES, "inferred status")
+    detail = block["detail"]
+    _require(_u64(block["completions"]), "invalid inferred completions")
+    if status in ("unknown", "unsupported"):
+        _require(detail is None, "unknown size carries no detail")
+    else:
+        _require(detail is not None, "valued size needs a detail")
+        _check_size_detail(detail)
+    if "conflict_detail" in block:
+        _check_size_detail(block["conflict_detail"])
+    if "further_conflicts" in block:
+        _require(_u64(block["further_conflicts"]) and block["further_conflicts"] >= 1,
+                 "invalid further conflicts")
+
+
+def _check_key_row(row, objects, roles, labels=METADATA_LABELS, version=1):
+    _keys(row, KEY_ROW_KEYS_V7 if version >= OBSERVATIONS_VERSION_V7 else KEY_ROW_KEYS)
     _require(type(row["instance"]) is str and INSTANCE_RE.fullmatch(row["instance"]) is not None,
              "unexpected instance label")
     _require(_u64(row["object"]), "invalid key row")
@@ -689,12 +778,14 @@ def check_section(section):
     version = section.get("version") if type(section) is dict else None
     _keys(section, SECTION_KEYS_V3
           if version in (OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
-                         OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6)
+                         OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6,
+                         OBSERVATIONS_VERSION_V7)
           else SECTION_KEYS)
     _require(type(version) is int
              and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
                              OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
-                             OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6),
+                             OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6,
+                             OBSERVATIONS_VERSION_V7),
              "unsupported observations version")
     roles = ROLES_V2 if version >= OBSERVATIONS_VERSION_V2 else ROLES
     creations = CREATIONS_V2 if version >= OBSERVATIONS_VERSION_V2 else CREATIONS
@@ -741,7 +832,10 @@ def check_section(section):
     order = []
     _require(type(section["key_operations"]) is list, "unexpected fields")
     for row in section["key_operations"]:
-        category, counters = _check_key_row(row, objects, roles, labels)
+        category, counters = _check_key_row(row, objects, roles, labels, version)
+        if version >= OBSERVATIONS_VERSION_V7:
+            _check_inferred_family(row["inferred_family"])
+            _check_inferred_size(row["inferred_size"])
         key = (row["instance"], row["object"], category, row["role"], row["metadata_at_use"])
         _require(key not in tallies, "duplicate key row")
         tallies[key] = (category, counters)
@@ -758,8 +852,22 @@ def check_section(section):
     _check_budgets(section["budgets"], len(order), len(objects), len(unknown))
     if version == OBSERVATIONS_VERSION_V6:
         _require_v6_content(section, keys)
+    if version >= OBSERVATIONS_VERSION_V7:
+        _require_v7_content(section)
     return {"status": status, "reason": reason, "rows": list(tallies.values()),
             "unknown": unknown, "gaps": gaps, "unattributed": unattributed}
+
+
+def _require_v7_content(section):
+    """A v7 section carries a non-blank inferred key on some row: a
+    valued, conflicting or unsupported state, or an unknown carrying
+    completions."""
+    for row in section["key_operations"]:
+        for name in ("inferred_family", "inferred_size"):
+            block = row[name]
+            if block["status"] != "unknown" or block["completions"] > 0:
+                return
+    _require(False, "v7 section without inferred content")
 
 
 def _require_v6_content(section, keys):

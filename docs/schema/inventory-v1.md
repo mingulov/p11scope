@@ -1249,14 +1249,19 @@ contracts are
 [inventory-v1-object-observations-v5.schema.json](inventory-v1-object-observations-v5.schema.json)
 (section version 5) and
 [inventory-v1-object-observations-v6.schema.json](inventory-v1-object-observations-v6.schema.json)
-(section version 6); consumers must reject unknown section versions,
+(section version 6) and
+[inventory-v1-object-observations-v7.schema.json](inventory-v1-object-observations-v7.schema.json)
+(section version 7); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` follows the content: 6 iff new-site content is present —
+- `version` follows the content: 7 iff inferred key content is
+  present — any key row whose `inferred_family` or `inferred_size`
+  status is not `unknown`, or with any inference completions — else
+  6 iff new-site content is present —
   a new-site `metadata_at_use` or object label (`x25519`, `x448`,
   `ed25519`, `ed448`, `hkdf_*`, `generic_*`), the HKDF key-type
   scalar (66, requested or established), a 12/48 value length, a
@@ -1278,11 +1283,11 @@ never imply S1 loss.
   else 3 iff an `unattributed` counter is present, else 2 iff a KEM
   creation (`encapsulate`, `decapsulate`) or role
   (`encapsulation_key`, `decapsulation_key`) label is present,
-  otherwise byte-stable 1. Versions 1, 2, 3, 4 and 5 are frozen;
-  version 1 never carries KEM labels and neither 1 nor 2 carries
-  `unattributed`; versions 4, 5 and 6 always carry `unattributed`
-  (possibly empty), and versions 5 and 6 always carry the seven-key
-  metadata blocks. A feed that fell back or lost
+  otherwise byte-stable 1. Versions 1, 2, 3, 4, 5 and 6 are
+  frozen; version 1 never carries KEM labels and neither 1 nor 2
+  carries `unattributed`; versions 4, 5, 6 and 7 always carry
+  `unattributed` (possibly empty), and versions 5, 6 and 7 always
+  carry the seven-key metadata blocks. A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
   (`{reason, count}`, finite reasons, frozen order); the section is
@@ -1396,7 +1401,27 @@ never imply S1 loss.
   Row equation: `started = completed + failed + cancelled + unknown
   + active + key_join_lost` (before counter saturation). Role rows
   count associations and cannot be summed across roles into a global
-  operation denominator.
+  operation denominator. At version 7 each row also carries
+  `inferred_family` (the mechanism family observed at use: `rsa`,
+  `ec`, `eddsa`, `xeddsa`, `dh`, `secret` and the rest of the finite
+  family vocabulary) and `inferred_size` (the size class derived from
+  operation lengths, e.g. `RSA 2048 (from signature length)` with
+  `size_class` 2048 and `modulus_bytes` 256), each `{status, detail,
+  reason, completions}` with `status` one of `inferred`, `unknown`,
+  `conflicting` or `unsupported`. Families infer in both capture
+  modes; sizes infer only with `--key-sizes` (without the flag every
+  `inferred_size` reads `unknown` with reason `size_inference_off`
+  and no length word is acquired on any path). `metadata_at_use` is
+  untouched: inference never rewrites it (a 2041-bit RSA key whose
+  256-byte signature classifies never reads `rsa_2048` there while
+  `inferred_size` carries `size_class` 2048 plus the byte count;
+  byte counts outside the tables mask the class and keep the bytes).
+  Every `unknown` or
+  `conflicting` side names its finite reason; conflicts pin the first
+  two disagreeing sides and count the rest. Version 7 adds the
+  `corroboration_mismatch` gap reason: the corroborating length
+  disagreed with the terminal length, which still classifies
+  (versions 1–6 never carry it).
 - `unknown_key_operations[]` (sorted by category and reason) holds
   capture-wide unknown-key summaries without `started` (starts are
   never fabricated into the unknown bucket).

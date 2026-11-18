@@ -119,7 +119,17 @@ are not in the input (see the object-observations privacy rule) and
 this projection invents no identifier for them. The capture-local
 object id rides a `p11scope:object` property for traceability, with
 the label, key-type code, creation family and reference counts beside
-it.
+it. The key-type code 66 renders `key_type_name: hkdf`; other
+codes keep their established names. K4 qualification: a slot whose
+`status` is `value` qualifies however it was established — a query
+answer and a creation-success promotion read identically; the
+recorded `source` only feeds the
+`p11scope:established_source_{query,creation_success,unrecorded}`
+provenance tallies in `metadata.properties` (unrecorded covers
+pre-v6 inputs, which carry no source). Inferred facts never reach
+these established fields: a v7
+`inferred_family`/`inferred_size` is not `type`, `size` or `curve`
+here, and no property echoes it.
 
 ## Provenance and unknowns
 

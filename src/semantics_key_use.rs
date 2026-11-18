@@ -2404,20 +2404,13 @@ pub(crate) struct RowInference {
 
 impl RowInference {
     /// Whether either key is non-blank (§10.1 v7 trigger): a valued,
-    /// conflicting or unsupported state, or an unknown with a named
-    /// reason other than the off-mode hint (the hint explains the
-    /// mode, never triggers a version on its own).
+    /// conflicting or unsupported state, or an unknown carrying
+    /// completions. Zero-completion reasons (the off-mode hint,
+    /// absent evidence) render JSON-identical to blank and never
+    /// trigger on their own; `-v` still shows every named reason.
     pub(crate) fn is_v7_content(&self) -> bool {
-        let family = self.family.status != InferredStatus::Unknown
-            || self
-                .family
-                .reason
-                .is_some_and(|reason| reason != crate::keymeta::REASON_SIZE_INFERENCE_OFF);
-        let size = self.size.status != InferredStatus::Unknown
-            || self
-                .size
-                .reason
-                .is_some_and(|reason| reason != crate::keymeta::REASON_SIZE_INFERENCE_OFF);
+        let family = self.family.status != InferredStatus::Unknown || self.family.completions > 0;
+        let size = self.size.status != InferredStatus::Unknown || self.size.completions > 0;
         family || size
     }
 }
@@ -3183,7 +3176,16 @@ impl KeyUseReducer {
         corroboration: Option<u64>,
     ) {
         use crate::keymeta::{LengthOutcome, evidence_tag_for_category};
-        if let (Some(LengthOutcome::Value(terminal)), Some(expected)) = (length, corroboration)
+        // Residuals attach to rows: unattributed completions partition
+        // unknown (existing) and feed no mismatch counter, so the gap
+        // never escapes a v7 section (mismatches imply admitted
+        // lengths, which always leave non-blank rows behind).
+        let attributed = open
+            .associations
+            .iter()
+            .any(|assoc| matches!(assoc.bucket, AssocBucket::Proved(_)));
+        if attributed
+            && let (Some(LengthOutcome::Value(terminal)), Some(expected)) = (length, corroboration)
             && terminal != expected
         {
             self.evidence.corroboration_mismatches =
@@ -3256,6 +3258,10 @@ impl KeyUseReducer {
                         KeyRole::WrappedKey => {
                             if mechanism.is_some() {
                                 let state = &mut self.inferred.entry(bucket).or_default().family;
+                                // The wrap mechanism is family
+                                // evidence (of its operation-key
+                                // limit), so it counts.
+                                state.completions = state.completions.saturating_add(1);
                                 if state.status == InferredStatus::Unknown && state.reason.is_none()
                                 {
                                     state.reason = Some(REASON_OPERATION_KEY_ONLY);

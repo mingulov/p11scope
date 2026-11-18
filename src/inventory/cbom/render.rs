@@ -135,6 +135,18 @@ fn render_metadata(projection: &Projection) -> Value {
         "p11scope:source_gaps",
         projection.gap_count.to_string(),
     ));
+    properties.push(prop(
+        "p11scope:established_source_query",
+        projection.provenance.query.to_string(),
+    ));
+    properties.push(prop(
+        "p11scope:established_source_creation_success",
+        projection.provenance.creation_success.to_string(),
+    ));
+    properties.push(prop(
+        "p11scope:established_source_unrecorded",
+        projection.provenance.unrecorded.to_string(),
+    ));
     if projection.gaps_suppressed > 0 {
         properties.push(prop(
             "p11scope:gaps_suppressed",
@@ -517,6 +529,7 @@ fn key_type_name(code: u64) -> &'static str {
         31 => "aes",
         64 => "ec_edwards",
         65 => "ec_montgomery",
+        66 => "hkdf",
         _ => "unknown",
     }
 }

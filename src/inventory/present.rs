@@ -1945,6 +1945,19 @@ struct KeyProviderGroup {
     unidentified: bool,
     instances: Vec<String>,
     tallies: Vec<KeyOpTally>,
+    /// Per-category inferred-key parentheticals (§10.3): present only
+    /// where inference adds information (unknown-metadata rows with
+    /// valued or conflicting inference).
+    notes: std::collections::BTreeMap<&'static str, String>,
+}
+
+/// One (group, category) inference partition: valued completions by
+/// combined label, conflicting completions, and the unknown residual.
+#[derive(Default)]
+struct InferredPartition {
+    valued: std::collections::BTreeMap<String, u64>,
+    conflicting: u64,
+    unknown: u64,
 }
 
 /// Proved rows grouped by resolved provider module: instances on one
@@ -1964,26 +1977,35 @@ fn key_provider_groups(
             .entry(instance.id.label())
             .or_insert(instance.module);
     }
-    // (tallies by category, instance labels) per resolved module, plus
-    // the unidentified residual under `None`.
+    // (tallies by category, instance labels, inference partitions)
+    // per resolved module, plus the unidentified residual under `None`.
     type TalliesByCategory<'a> = BTreeMap<&'a str, (u64, u64, u64, &'a str)>;
-    let mut groups: BTreeMap<Option<ModuleId>, (TalliesByCategory<'_>, BTreeSet<String>)> =
-        BTreeMap::new();
+    type NotesByCategory<'a> = BTreeMap<&'a str, InferredPartition>;
+    let mut groups: BTreeMap<
+        Option<ModuleId>,
+        (TalliesByCategory<'_>, BTreeSet<String>, NotesByCategory<'_>),
+    > = BTreeMap::new();
     for row in &observations.key_operations {
         if row.role == secondary {
             continue;
         }
         let module = modules.get(&row.instance).copied();
-        let (tallies, instances) = groups.entry(module).or_default();
+        let (tallies, instances, notes) = groups.entry(module).or_default();
         instances.insert(row.instance.clone());
         let slot = tallies.entry(row.category).or_insert((0, 0, 0, row.unit));
         slot.0 = slot.0.saturating_add(row.completed);
         slot.1 = slot.1.saturating_add(row.failed);
         slot.2 = slot.2.saturating_add(row.active);
+        // Inferred facts surface only where they add information:
+        // unknown-metadata rows (established rows already name
+        // their key).
+        if row.metadata_at_use == "unknown" {
+            partition_inferred(notes.entry(row.category).or_default(), row);
+        }
     }
     let mut out: Vec<KeyProviderGroup> = groups
         .into_iter()
-        .map(|(module, (tallies, instances))| {
+        .map(|(module, (tallies, instances, notes))| {
             let (name, unidentified) = match module {
                 Some(module) => (module_display_name(presentation, module), false),
                 None => ("unidentified provider".to_string(), true),
@@ -1998,11 +2020,18 @@ fn key_provider_groups(
                     unit,
                 })
                 .collect();
+            let notes = notes
+                .into_iter()
+                .filter_map(|(category, partition)| {
+                    render_parenthetical(&partition).map(|note| (category, note))
+                })
+                .collect();
             KeyProviderGroup {
                 name,
                 unidentified,
                 instances: instances.into_iter().collect(),
                 tallies,
+                notes,
             }
         })
         .collect();
@@ -2050,6 +2079,168 @@ fn unknown_keys_tallies(
 
 /// One per-category tally segment: what happened to the call, not an
 /// observer failure (JSON keeps `failed`).
+/// Partition one unknown-metadata row's completions by combined
+/// inference state: valued rows by their combined label, conflicting
+/// rows together, everything else into the unknown residual.
+fn partition_inferred(
+    partition: &mut InferredPartition,
+    row: &crate::key_operation_projection::KeyAggRow,
+) {
+    use crate::keymeta::{concise_label, family_display, size_concise};
+    use crate::semantics_key_use::InferredStatus;
+    let Some(inferred) = row.inferred.as_ref() else {
+        partition.unknown = partition.unknown.saturating_add(row.completed);
+        return;
+    };
+    if inferred.family.status == InferredStatus::Conflicting
+        || inferred.size.status == InferredStatus::Conflicting
+    {
+        partition.conflicting = partition.conflicting.saturating_add(row.completed);
+        return;
+    }
+    let family = (inferred.family.status == InferredStatus::Inferred)
+        .then_some(inferred.family.value)
+        .flatten();
+    let size = (inferred.size.status == InferredStatus::Inferred)
+        .then_some(inferred.size.detail.as_ref().map(|(detail, _)| detail))
+        .flatten();
+    match (family, size) {
+        (Some(family), Some(detail)) => {
+            *partition
+                .valued
+                .entry(concise_label(family, detail))
+                .or_default() += row.completed;
+        }
+        (Some(family), None) => {
+            *partition
+                .valued
+                .entry(family_display(family).to_string())
+                .or_default() += row.completed;
+        }
+        (None, Some(detail)) => {
+            *partition.valued.entry(size_concise(detail)).or_default() += row.completed;
+        }
+        (None, None) => {
+            partition.unknown = partition.unknown.saturating_add(row.completed);
+        }
+    }
+}
+
+/// Render one partition as a tally parenthetical, or nothing when no
+/// valued or conflicting segment exists (all-unknown adds no
+/// information). Valued segments sort by count then label, with the
+/// conflicting segment next and the unknown residual last.
+fn render_parenthetical(partition: &InferredPartition) -> Option<String> {
+    if partition.valued.is_empty() && partition.conflicting == 0 {
+        return None;
+    }
+    let mut valued: Vec<(&str, u64)> = partition
+        .valued
+        .iter()
+        .map(|(label, count)| (label.as_str(), *count))
+        .collect();
+    valued.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    let mut segments: Vec<String> = valued
+        .into_iter()
+        .map(|(label, count)| format!("probably {label}: {count}"))
+        .collect();
+    if partition.conflicting > 0 {
+        segments.push(format!("conflicting: {}", partition.conflicting));
+    }
+    if partition.unknown > 0 {
+        segments.push(format!("unknown: {}", partition.unknown));
+    }
+    Some(format!(" ({})", segments.join("; ")))
+}
+
+/// One `-v` per-row inference line, or nothing for fully blank rows.
+/// Fragments follow §10.3 exactly; a blank half omits its fragment.
+fn inferred_row_detail(row: &crate::key_operation_projection::KeyAggRow) -> Option<String> {
+    use crate::keymeta::{family_display, reason_display, size_verbose};
+    use crate::semantics_key_use::InferredStatus;
+    let inferred = row.inferred.as_ref()?;
+    let mut fragments = Vec::new();
+    match inferred.family.status {
+        InferredStatus::Inferred => {
+            if let Some(family) = inferred.family.value {
+                fragments.push(format!(
+                    "probably {} (from mechanism)",
+                    family_display(family)
+                ));
+            }
+        }
+        InferredStatus::Conflicting => {
+            fragments.push(family_conflict_fragment(&inferred.family));
+        }
+        InferredStatus::Unknown => {
+            if let Some(reason) = inferred.family.reason {
+                fragments.push(format!("family unknown ({})", reason_display(reason)));
+            }
+        }
+        InferredStatus::Unsupported => {}
+    }
+    match inferred.size.status {
+        InferredStatus::Inferred => {
+            if let Some((detail, tag)) = inferred.size.detail.as_ref() {
+                fragments.push(size_verbose(detail, *tag));
+            }
+        }
+        InferredStatus::Conflicting => {
+            if let Some((detail, tag)) = inferred.size.detail.as_ref() {
+                let rest = 1 + inferred.size.further;
+                fragments.push(format!(
+                    "{}, +{rest} more conflicting size",
+                    size_verbose(detail, *tag)
+                ));
+            }
+        }
+        InferredStatus::Unknown => {
+            if let Some(reason) = inferred.size.reason {
+                fragments.push(format!("size unknown ({})", reason_display(reason)));
+            }
+        }
+        InferredStatus::Unsupported => {
+            if let Some(reason) = inferred.size.reason {
+                fragments.push(format!("size unsupported ({})", reason_display(reason)));
+            }
+        }
+    }
+    if fragments.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "  key row {} object {} {} {} ({}): {}",
+        row.instance,
+        row.object,
+        row.category,
+        row.role,
+        row.metadata_at_use,
+        fragments.join("; ")
+    ))
+}
+
+/// The `-v` family-conflict fragment: both pinned values with counts
+/// plus further values, or the single inferred value for an
+/// established mismatch (the established label stands on the row).
+fn family_conflict_fragment(family: &crate::semantics_key_use::FamilyState) -> String {
+    use crate::keymeta::family_display;
+    let Some(value) = family.value else {
+        return "family conflicting".to_string();
+    };
+    let mut inner = format!("{}: {}", family_display(value), family.value_completions);
+    if let Some(conflict) = family.conflict_value {
+        inner.push_str(&format!(
+            ", {}: {}",
+            family_display(conflict),
+            family.conflict_completions
+        ));
+    }
+    if family.further > 0 {
+        inner.push_str(&format!(", +{} more", family.further));
+    }
+    format!("family conflicting ({inner})")
+}
+
 fn key_tally_segment(tally: &KeyOpTally) -> String {
     let failed_noun = if tally.failed == 1 {
         "returned an error"
@@ -4490,6 +4681,19 @@ fn render_snapshot_inner(
                     let _ = writeln!(out, "  {plain}");
                 }
             }
+            // Without --key-sizes, -v names the missing sizes once
+            // per run (families, creation and token-reported sizes
+            // still show).
+            if verbose
+                && !presentation.key_sizes_requested
+                && (!observations.key_operations.is_empty()
+                    || !observations.unknown_key_operations.is_empty())
+            {
+                let _ = writeln!(
+                    out,
+                    "  sizes from operation lengths need --key-sizes (families, creation and token-reported sizes still shown)"
+                );
+            }
             let any_tallies =
                 groups.iter().any(|group| !group.tallies.is_empty()) || !unknown.is_empty();
             if !any_tallies {
@@ -4511,15 +4715,14 @@ fn render_snapshot_inner(
                     String::new()
                 };
                 for tally in &group.tallies {
+                    let segment = match group.notes.get(tally.category) {
+                        Some(note) => format!("{}{}", key_tally_segment(tally), note),
+                        None => key_tally_segment(tally),
+                    };
                     let _ = writeln!(
                         out,
                         "{}",
-                        key_detail_line(
-                            &group.name,
-                            &key_tally_segment(tally),
-                            &suffix,
-                            !group.unidentified
-                        )
+                        key_detail_line(&group.name, &segment, &suffix, !group.unidentified)
                     );
                 }
             }
@@ -4534,6 +4737,15 @@ fn render_snapshot_inner(
                     "{}",
                     key_detail_line("unknown keys", &key_tally_segment(tally), &suffix, false)
                 );
+            }
+            // Verbose per-row inference detail (all non-blank rows,
+            // primary and secondary alike).
+            if verbose {
+                for row in &observations.key_operations {
+                    if let Some(line) = inferred_row_detail(row) {
+                        let _ = writeln!(out, "{line}");
+                    }
+                }
             }
             // F16 (7.05 PQC): the PQC spotlight names proved uses per
             // parameter set on its own line; concise shows completions,

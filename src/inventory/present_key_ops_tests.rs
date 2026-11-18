@@ -201,6 +201,8 @@ fn two_provider_presentation() -> Presentation {
         .key_operations
         .push(key_row_on("i1", 14, "decrypt", 1, 2, 0));
     let mut presentation = key_ops_presentation(observations);
+    // Non-hint tests run flag-on (the hint is pinned separately).
+    presentation.key_sizes_requested = true;
     presentation.modules[0].paths = vec!["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so".into()];
     let first_module = presentation.modules[0].id;
     let next_module = presentation
@@ -1884,7 +1886,8 @@ fn key_ops_unresolved_instance_reads_unidentified_provider() {
     observations
         .key_operations
         .push(key_row("sign", "key", 2, 1, 0, "operations"));
-    let presentation = key_ops_presentation(observations);
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let block = key_ops_block(&concise);
     assert_eq!(
@@ -1918,7 +1921,8 @@ fn key_ops_verbose_instance_labels_escape_controls() {
     observations
         .key_operations
         .push(key_row_on("i0\nX", 11, "sign", 2, 0, 0));
-    let presentation = key_ops_presentation(observations);
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let block = key_ops_block(&verbose);
     assert_eq!(block.len(), 2, "header plus one provider line:\n{verbose}");
@@ -1955,6 +1959,7 @@ fn key_ops_verbose_many_instances_stay_within_100_chars() {
     // the one fixed-label group and all labels land on one line.
     let labels: Vec<String> = (0..300).map(|i| format!("instance-{i:03}")).collect();
     let mut presentation = key_ops_presentation(observations_with_instances(&labels));
+    presentation.key_sizes_requested = true;
     presentation.instances.clear();
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let block = key_ops_block(&verbose);
@@ -1986,6 +1991,7 @@ fn key_ops_verbose_many_instances_stay_within_100_chars() {
     // the provider-named group carries all 300 labels.
     let labels: Vec<String> = (0..300).map(|i| format!("i{i}")).collect();
     let mut presentation = key_ops_presentation(observations_with_instances(&labels));
+    presentation.key_sizes_requested = true;
     let module = presentation.modules[0].id;
     let caller = presentation.callers[0].id;
     presentation.instances.clear();
@@ -2040,6 +2046,7 @@ fn key_ops_verbose_long_name_many_instances_stay_within_100_chars() {
             .push(key_row_on(instance, 11, "sign", 1, 0, 0));
     }
     let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
     let basename = format!("lib{}.so", "p".repeat(194));
     assert_eq!(basename.chars().count(), 200);
     presentation.modules[0].paths = vec![format!("/opt/vendor/{basename}")];
@@ -2108,7 +2115,8 @@ fn key_ops_unknown_bucket_reads_unknown_keys_lines() {
     observations
         .unknown_key_operations
         .push(unknown_row("sign", 3, 0, 1, "operations"));
-    let presentation = key_ops_presentation(observations);
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let block = key_ops_block(&concise);
     assert_eq!(

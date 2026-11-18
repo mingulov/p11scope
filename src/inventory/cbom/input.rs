@@ -182,6 +182,50 @@ pub(super) struct KeyObject {
     pub bom_ref: String,
 }
 
+/// Per-slot sources of qualified established facts (K4
+/// provenance): query answers, creation-success promotions, and
+/// unrecorded (null/absent — pre-v6 inputs by construction).
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ProvenanceTallies {
+    pub(super) query: u64,
+    pub(super) creation_success: u64,
+    pub(super) unrecorded: u64,
+}
+
+impl ProvenanceTallies {
+    fn tally(&mut self, source: EstablishedSource) {
+        match source {
+            EstablishedSource::Query => self.query += 1,
+            EstablishedSource::CreationSuccess => self.creation_success += 1,
+            EstablishedSource::Unrecorded => self.unrecorded += 1,
+        }
+    }
+}
+
+/// One qualified slot's recorded source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EstablishedSource {
+    Query,
+    CreationSuccess,
+    Unrecorded,
+}
+
+/// The recorded source of one qualified (`status == "value"`)
+/// established slot, or `None` when the slot does not qualify.
+/// Qualification ignores the source (K4: creation-success facts
+/// qualify exactly like queries); the source only feeds tallies.
+fn qualified_source(block: Option<&Value>, slot: &str) -> Option<EstablishedSource> {
+    let field = block?.get(slot)?;
+    if field.get("status").and_then(str_of) != Some("value") {
+        return None;
+    }
+    Some(match field.get("source").and_then(str_of) {
+        Some("query") => EstablishedSource::Query,
+        Some("creation_success") => EstablishedSource::CreationSuccess,
+        _ => EstablishedSource::Unrecorded,
+    })
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Projection {
     pub source_schema: String,
@@ -203,6 +247,7 @@ pub(super) struct Projection {
     /// Proven joins only: (from `bom_ref`, to `bom_ref`).
     pub dependencies: Vec<(String, String)>,
     pub unknowns: Unknowns,
+    pub provenance: ProvenanceTallies,
 }
 
 fn str_of(value: &Value) -> Option<&str> {
@@ -1032,6 +1077,20 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
                     }
                 });
             let token = established_value(established, "token");
+            // K4 provenance: tally every qualified slot's source.
+            // Qualification itself stays source-agnostic above.
+            for slot in [
+                "class",
+                "key_type",
+                "modulus_bits",
+                "value_len",
+                "ec_params",
+                "token",
+            ] {
+                if let Some(source) = qualified_source(established, slot) {
+                    out.provenance.tally(source);
+                }
+            }
             let creation = object.get("creation").and_then(str_of).map(str::to_string);
             let references = object
                 .get("successful_key_references")

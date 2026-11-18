@@ -1764,6 +1764,19 @@ Limits that matter in pods:
   `  pqc keys: ML-DSA-65 sign: 12`), with failed/active terminals
   under `-v`; `--json` carries the matching `metadata_at_use` label
   (`ml_dsa_65`) on every key row.
+  `--key-sizes` (needs `--key-operations`; off by default) also
+  infers key families from operation mechanisms and key sizes from
+  operation lengths: families infer in both modes, sizes only with
+  the flag (without it no length word is acquired on any path).
+  The summary line then carries a parenthetical tally (for example
+  `(probably RSA: 2; RSA 2048: 1)`); with `-v`, one row line per
+  key names the inference (`  key row test-instance object 11 sign
+  key (unknown): probably RSA (from mechanism); RSA 2048 (from
+  signature length)`), conflicting sides pin the first two and count
+  the rest, and every unknown names its reason. Without the flag,
+  `-v` prints one hint line instead of size rows: `  sizes from
+  operation lengths need --key-sizes (families, creation and
+  token-reported sizes still shown)`.
   In v0.6.0 key-operation rows name only registered mechanisms: the
   journal lane keeps withholding unregistered ids, which appear with
   counts in the profile and trace mechanism tables instead.

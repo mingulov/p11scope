@@ -248,9 +248,30 @@ pub(crate) fn family_value(family: KeyFamily) -> &'static str {
 }
 
 /// The `-v`/concise display spelling of one family.
-pub(crate) fn family_display(_family: KeyFamily) -> &'static str {
-    // RED STUB.
-    "?"
+pub(crate) fn family_display(family: KeyFamily) -> &'static str {
+    match family {
+        KeyFamily::Rsa => "RSA",
+        KeyFamily::Ec => "EC",
+        KeyFamily::Eddsa => "EdDSA",
+        KeyFamily::Xeddsa => "XEdDSA",
+        KeyFamily::Secret => "secret-key",
+        KeyFamily::Dsa => "DSA",
+        KeyFamily::Dh => "DH",
+        KeyFamily::Aes => "AES",
+        KeyFamily::GenericSecret => "generic-secret",
+        KeyFamily::Hkdf => "HKDF",
+        KeyFamily::MlKem => "ML-KEM",
+        KeyFamily::MlDsa => "ML-DSA",
+        KeyFamily::SlhDsa => "SLH-DSA",
+        KeyFamily::Chacha20 => "ChaCha20",
+        KeyFamily::Poly1305 => "Poly1305",
+        KeyFamily::Des => "DES",
+        KeyFamily::Des3 => "DES3",
+        KeyFamily::Camellia => "Camellia",
+        KeyFamily::Aria => "Aria",
+        KeyFamily::Seed => "SEED",
+        KeyFamily::Gost => "GOST",
+    }
 }
 
 /// Named size/family unknown reasons (owner rule: every unknown is a
@@ -272,9 +293,22 @@ pub(crate) const REASON_OUTSIDE_ADMISSION_BOUND: &str = "outside_admission_bound
 /// The `-v` display phrase for one unknown reason (explicit phrases,
 /// never mechanical joins: `variable_length_encoding` reads
 /// "variable-length encoding").
-pub(crate) fn reason_display(_reason: &str) -> &'static str {
-    // RED STUB.
-    "?"
+pub(crate) fn reason_display(reason: &str) -> &'static str {
+    match reason {
+        REASON_UNLISTED_MECHANISM => "unlisted mechanism",
+        REASON_OPERATION_KEY_ONLY => "mechanism types the operation key",
+        REASON_SIZE_INFERENCE_OFF => "needs --key-sizes",
+        REASON_NO_LENGTH_EVIDENCE => "no length evidence",
+        REASON_LENGTH_UNAVAILABLE => "length unavailable",
+        REASON_HYBRID_WRAP_FORMAT => "hybrid wrap format",
+        REASON_VARIABLE_LENGTH_ENCODING => "variable-length encoding",
+        REASON_PADDING_AMBIGUITY => "padding ambiguity",
+        REASON_UNMAPPED_LENGTH => "unmapped length",
+        REASON_NO_LENGTH_MAP => "no length map for this mechanism",
+        REASON_FAMILY_ONLY_SUBSET => "family-only mechanism",
+        REASON_OUTSIDE_ADMISSION_BOUND => "outside admission bound",
+        _ => "unknown reason",
+    }
 }
 
 /// The receipt's frozen established key type (§4.5 left side), from
@@ -283,6 +317,7 @@ pub(crate) fn reason_display(_reason: &str) -> &'static str {
 /// complete the §4.5 table; a receipt without one skips the
 /// comparison and the inference stands alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Tail variants: reserved vocabulary for labels not yet mapped.
 pub(crate) enum EstablishedKind {
     Rsa { bits: u16 },
     Aes { bytes: u16 },
@@ -523,9 +558,16 @@ pub(crate) fn evidence_value(tag: EvidenceTag) -> &'static str {
 }
 
 /// The `-v` noun for one evidence kind (§10.3).
-pub(crate) fn evidence_noun(_tag: EvidenceTag) -> &'static str {
-    // RED STUB.
-    "?"
+pub(crate) fn evidence_noun(tag: EvidenceTag) -> &'static str {
+    match tag {
+        EvidenceTag::SignOutput | EvidenceTag::VerifyInput => "signature",
+        EvidenceTag::EncryptOutput
+        | EvidenceTag::DecryptInput
+        | EvidenceTag::EncapsulateOutput
+        | EvidenceTag::DecapsulateInput => "ciphertext",
+        EvidenceTag::WrapOutput => "wrap output",
+        EvidenceTag::UnwrapInput => "unwrap input",
+    }
 }
 
 /// One call's admitted length outcome: a classified-candidate value
@@ -918,17 +960,124 @@ pub(crate) fn size_family(detail: &SizeDetail) -> Option<KeyFamily> {
 }
 
 /// The concise parenthetical label for one size detail
-/// ("RSA 2048", "EC P-256", "RSA (non-standard length)", ...).
-pub(crate) fn size_concise(_detail: &SizeDetail) -> String {
-    // RED STUB.
-    "?".to_string()
+/// ("RSA 2048", "EC P-256", "RSA (non-standard length)", ...):
+/// family-implied standalone form.
+pub(crate) fn size_concise(detail: &SizeDetail) -> String {
+    match detail {
+        SizeDetail::Rsa {
+            size_class: Some(class),
+            ..
+        } => format!("RSA {class}"),
+        SizeDetail::Rsa { .. } => "RSA (non-standard length)".to_string(),
+        SizeDetail::Ec { curve, .. } => format!("EC {}", ec_curve_display(curve)),
+        SizeDetail::Eddsa { curve, .. } => eddsa_curve_display(curve).to_string(),
+        SizeDetail::DsaClass { label, .. } => {
+            format!("DSA {}", dsa_class_display(label))
+        }
+        SizeDetail::PqcSet { parameter_set, .. } => pqc_set_display(parameter_set).to_string(),
+        SizeDetail::WrappedMaterial {
+            material_octets, ..
+        } => {
+            format!("wrapped material {material_octets} bytes")
+        }
+    }
 }
 
 /// The `-v` fragment for one size detail with its evidence tag
 /// ("RSA 2048 (from signature length)", ...).
-pub(crate) fn size_verbose(_detail: &SizeDetail, _tag: EvidenceTag) -> String {
-    // RED STUB.
-    "?".to_string()
+pub(crate) fn size_verbose(detail: &SizeDetail, tag: EvidenceTag) -> String {
+    let noun = evidence_noun(tag);
+    match detail {
+        SizeDetail::Rsa {
+            size_class: Some(class),
+            ..
+        } => format!("RSA {class} (from {noun} length)"),
+        SizeDetail::Rsa { modulus_bytes, .. } => format!(
+            "RSA, {}-bit class (from {noun} length)",
+            masked_rsa_class(*modulus_bytes)
+        ),
+        SizeDetail::Ec { curve, .. } => {
+            format!("EC {} (from {noun} length)", ec_curve_display(curve))
+        }
+        SizeDetail::Eddsa { curve, .. } => {
+            format!("{} (from {noun} length)", eddsa_curve_display(curve))
+        }
+        SizeDetail::DsaClass { label, .. } => {
+            format!("DSA {} (from {noun} length)", dsa_class_display(label))
+        }
+        SizeDetail::PqcSet { parameter_set, .. } => {
+            let ambiguous = parameter_set.starts_with("slh_dsa");
+            if ambiguous {
+                format!(
+                    "{} (from {noun} length; SHA-2/SHAKE ambiguous)",
+                    pqc_set_display(parameter_set)
+                )
+            } else {
+                format!("{} (from {noun} length)", pqc_set_display(parameter_set))
+            }
+        }
+        SizeDetail::WrappedMaterial {
+            material_octets,
+            octets,
+        } => match tag {
+            EvidenceTag::WrapOutput => format!(
+                "wrapped material {material_octets} bytes (from {octets}-byte wrap output, about wrapped key)"
+            ),
+            EvidenceTag::UnwrapInput => {
+                format!("wrapped material {material_octets} bytes (from {octets}-byte wrapped key)")
+            }
+            _ => format!("wrapped material {material_octets} bytes (from {octets}-byte {noun})"),
+        },
+    }
+}
+
+/// EC curve display ("p256" to "P-256"); unknown spellings pass
+/// through, never hidden.
+fn ec_curve_display(curve: &str) -> &str {
+    match curve {
+        "p256" => "P-256",
+        "p384" => "P-384",
+        "p521" => "P-521",
+        curve => curve,
+    }
+}
+
+/// EdDSA curve display ("ed25519" to "Ed25519").
+fn eddsa_curve_display(curve: &str) -> &str {
+    match curve {
+        "ed25519" => "Ed25519",
+        "ed448" => "Ed448",
+        curve => curve,
+    }
+}
+
+/// DSA class display ("dsa_1024" to "1024-bit class").
+fn dsa_class_display(label: &str) -> &str {
+    match label {
+        "dsa_1024" => "1024-bit class",
+        "dsa_2048_224" => "2048/224 class",
+        "dsa_2048_256_or_3072" => "2048/256-or-3072 class",
+        label => label,
+    }
+}
+
+/// PQC parameter-set display ("ml_kem_768" to "ML-KEM-768").
+fn pqc_set_display(set: &str) -> &str {
+    match set {
+        "ml_kem_512" => "ML-KEM-512",
+        "ml_kem_768" => "ML-KEM-768",
+        "ml_kem_1024" => "ML-KEM-1024",
+        "ml_dsa_44" => "ML-DSA-44",
+        "ml_dsa_65" => "ML-DSA-65",
+        "ml_dsa_87" => "ML-DSA-87",
+        "slh_dsa_128s" => "SLH-DSA-128s",
+        "slh_dsa_128f" => "SLH-DSA-128f",
+        "slh_dsa_192s" => "SLH-DSA-192s",
+        "slh_dsa_192f" => "SLH-DSA-192f",
+        "slh_dsa_256s" => "SLH-DSA-256s",
+        "slh_dsa_256f" => "SLH-DSA-256f",
+        set => set,
+    }
 }
 
 /// The masked non-standard RSA class for `octets` (8·octets with the
@@ -968,9 +1117,26 @@ pub(crate) fn same_size(a: &SizeDetail, b: &SizeDetail) -> bool {
 /// "ML-KEM-768", "AES wrapped material 24 bytes"). Self-sufficient
 /// size displays (EdDSA curves, PQC sets) stand alone; every other
 /// kind names the family.
-pub(crate) fn concise_label(_family: KeyFamily, _detail: &SizeDetail) -> String {
-    // RED STUB.
-    "?".to_string()
+pub(crate) fn concise_label(family: KeyFamily, detail: &SizeDetail) -> String {
+    let fam = family_display(family);
+    match detail {
+        SizeDetail::Rsa {
+            size_class: Some(class),
+            ..
+        } => format!("{fam} {class}"),
+        SizeDetail::Rsa { .. } => format!("{fam} (non-standard length)"),
+        SizeDetail::Ec { curve, .. } => format!("{fam} {}", ec_curve_display(curve)),
+        SizeDetail::Eddsa { curve, .. } => eddsa_curve_display(curve).to_string(),
+        SizeDetail::DsaClass { label, .. } => {
+            format!("{fam} {}", dsa_class_display(label))
+        }
+        SizeDetail::PqcSet { parameter_set, .. } => pqc_set_display(parameter_set).to_string(),
+        SizeDetail::WrappedMaterial {
+            material_octets, ..
+        } => {
+            format!("{fam} wrapped material {material_octets} bytes")
+        }
+    }
 }
 
 #[cfg(test)]

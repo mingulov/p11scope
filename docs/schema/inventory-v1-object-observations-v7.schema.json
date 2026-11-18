@@ -758,9 +758,10 @@
         "outcome_lost",
         "unknown_domain",
         "domain_pruned",
-        "pruned_object_referenced"
+        "pruned_object_referenced",
+        "corroboration_mismatch"
       ],
-      "description": "Model gap vocabulary (snake_case of the finite model enum) plus pruned_object_referenced: a retained key row references an object the model pruned (history stays; the dangle is explicit, never silent)."
+      "description": "Model gap vocabulary (snake_case of the finite model enum) plus pruned_object_referenced: a retained key row references an object the model pruned (history stays; the dangle is explicit, never silent). v7 adds corroboration_mismatch: the corroborating length disagreed with the terminal length (the terminal still classifies; v1-v6 never carry it)."
     },
     "object_row": {
       "type": "object",

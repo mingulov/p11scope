@@ -2061,26 +2061,28 @@ fn fold_credit_deferred_caller_revised_behind_fifo_waits_for_terminal() {
     state.edges = EdgeEmitter::with_cap(1);
     state.instances = InstanceEmitter::with_cap(1);
     let mut pass = 0u64;
-    let emit_until_carried = |writer: &mut EventWriter,
-                                  state: &mut StreamState,
-                                  view: &Presentation,
-                                  pass: &mut u64| {
-        for _ in 0..100_000 {
-            *pass += 1;
-            let at = *pass;
-            emit_pass_events(writer, state, &report(*pass), view, at).unwrap();
-            if state.last_deferred.edge_events == 0
-                && state.last_deferred.instance_events == 0
-                && state.last_deferred.semantic_edge_events == 0
-            {
-                return;
+    let emit_until_carried =
+        |writer: &mut EventWriter, state: &mut StreamState, view: &Presentation, pass: &mut u64| {
+            for _ in 0..100_000 {
+                *pass += 1;
+                let at = *pass;
+                emit_pass_events(writer, state, &report(*pass), view, at).unwrap();
+                if state.last_deferred.edge_events == 0
+                    && state.last_deferred.instance_events == 0
+                    && state.last_deferred.semantic_edge_events == 0
+                {
+                    return;
+                }
             }
-        }
-        panic!("the capped FIFO never drained");
-    };
+            panic!("the capped FIFO never drained");
+        };
     // Carry every initial row: the exiting edges at 2 entries.
     let mut pass1 = presentation(&harness);
-    assert_eq!(pass1.edges.len(), (EXITED + 2) as usize, "one edge per caller plus the deferred second");
+    assert_eq!(
+        pass1.edges.len(),
+        (EXITED + 2) as usize,
+        "one edge per caller plus the deferred second"
+    );
     assert_eq!(pass1.instances.len(), 1, "the instance row renders");
     assert_eq!(pass1.semantic_edges.len(), 1, "the semantic row renders");
     for edge in &mut pass1.edges {
@@ -2280,5 +2282,9 @@ fn fold_credit_deferred_caller_revised_behind_fifo_waits_for_terminal() {
     );
     assert_eq!(state.instances.tracked_len(), 0, "no digest retained");
     let totals = harness.coordinator().registry().departed_totals();
-    assert_eq!(totals.edges, u64::from(EXITED + 1), "the deferred pair folds");
+    assert_eq!(
+        totals.edges,
+        u64::from(EXITED + 1),
+        "the deferred pair folds"
+    );
 }

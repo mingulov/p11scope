@@ -13508,6 +13508,22 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// The run's `--key-sizes` request reaches the Joint key-use
+    /// reducer: off-mode lengths drop with `size_inference_off`,
+    /// never silently and never as absent evidence.
+    #[test]
+    fn key_sizes_request_reaches_joint_keyuse_reducer() {
+        let mut coordinator = coordinator();
+        assert!(coordinator.registry().keyuse_for_test().key_sizes_enabled());
+        coordinator.set_key_sizes_requested(false);
+        assert!(
+            !coordinator.registry().keyuse_for_test().key_sizes_enabled(),
+            "off-mode reaches the reducer"
+        );
+        coordinator.set_key_sizes_requested(true);
+        assert!(coordinator.registry().keyuse_for_test().key_sizes_enabled());
+    }
+
     #[test]
     fn coordinator_memory_snapshot_carries_owned_rows() {
         let mut coordinator = coordinator();

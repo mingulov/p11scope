@@ -648,6 +648,72 @@ fn length_object_return_abandons_the_stash_when_unemitted() {
     );
 }
 
+/// Length stash on identity-refused returns (v0.8.0 keymeta Task 2):
+/// a length call that passes entry identity and meets a remap before
+/// return retires START with the identity reason; the stash row must
+/// go with it (abandoned under `Record::LENGTH`), or the stranded
+/// row lingers until key reuse or stop scrub and the terminal-clear
+/// contract fails. Both return halves — the ordinary journal half
+/// and the modeled object half — abandon in that arm.
+#[test]
+fn length_identity_refusal_abandons_the_stash_on_both_halves() {
+    const ROOTS: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
+    const MAIN: &str = include_str!("../crates/ebpf/src/main.rs");
+    fn body<'a>(source: &'a str, marker: &str, end: &str) -> Option<&'a str> {
+        source
+            .split_once(marker)
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once(end).map(|(text, _)| text))
+    }
+    fn arm_abandons(text: &str) -> bool {
+        let Some(identity) = text.find("!image_pair_matches") else {
+            return false;
+        };
+        let Some(facts) = text[identity..].find("capture_return_facts") else {
+            return false;
+        };
+        let arm = &text[identity..identity + facts];
+        arm.contains("if Record::LENGTH") && arm.contains("length_return_abandon(&key)")
+    }
+    fn ordinary_contract(source: &str) -> bool {
+        let Some(text) = body(
+            source,
+            "    pub(crate) fn ordinary_return<Record: ReturnPayload>(",
+            "\n    }\n",
+        ) else {
+            return false;
+        };
+        arm_abandons(text)
+    }
+    fn modeled_contract(source: &str) -> bool {
+        let Some(text) = body(
+            source,
+            "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+            "\n}\n",
+        ) else {
+            return false;
+        };
+        arm_abandons(text)
+    }
+    assert!(
+        ordinary_contract(ROOTS),
+        "ordinary_return must abandon the stash in its identity-refusal arm"
+    );
+    assert!(
+        modeled_contract(MAIN),
+        "object_return must abandon the stash in its identity-refusal arm"
+    );
+    let start = ROOTS
+        .find("    pub(crate) fn ordinary_return<Record: ReturnPayload>(")
+        .unwrap();
+    let marker = "length_return_abandon(&key)";
+    let tail = ROOTS[start..].replacen(marker, "REMOVED", 1);
+    assert!(
+        !ordinary_contract(&format!("{}{}", &ROOTS[..start], tail)),
+        "removed ordinary identity abandon"
+    );
+}
+
 #[test]
 fn routing_words_are_sampled_once_and_stored_before_the_next_sampler() {
     use p11scope_ebpf_common::Event;

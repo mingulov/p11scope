@@ -423,8 +423,12 @@ without the flag (stronger than the `KEM_CAPTURE_WIRED`
 FULL/P0 split — the P0 journal flavor omits the length programs
 and P0 refuses the flag, §10.5). No length-cell
 pointer is retained beyond its matching call; every
-terminal/loss/cancellation/exec/teardown path clears it, exactly
-like the result-handle pointer row.
+entry/return terminal/loss/cancellation path clears it (entry
+overwrite/delete, return abandon on every bail including unemitted,
+trailer unconditional delete), exactly like the result-handle
+pointer row, plus stop scrub. Thread-exit/exec relies on the same
+overwrite + timestamp-bind + scrub discipline (no exit-time
+iteration): an abandoned row is never trusted.
 
 Two protocols (F2: never one shared read):
 

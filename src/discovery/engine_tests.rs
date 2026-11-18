@@ -1208,9 +1208,22 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
     // refresh then drops the provider with a missing-pin bind skip.
     let raw_a = overlay_module(overlay_key(86));
     let raw_b = overlay_module(overlay_key(87));
-    let mut pins = overlay_pins(&[(raw_a.key, OVERLAY_SHA, 1), (raw_b.key, OVERLAY_SHA, 1)]);
+    // Distinct kernel files and pin ctimes: fixtures sharing /dev/null
+    // with one ctime are one (pin, sha) overlay observation, and the
+    // canonicalizer would fold the two providers into one object before
+    // the rebind under test.
+    let dir = tempfile::tempdir().expect("backing dir");
+    let mut pins = overlay_pins(&[(raw_a.key, OVERLAY_SHA, 1)]);
+    overlay_reback(&mut pins, &overlay_backing_file(&dir, "a.so"));
+    let mut pins_b = overlay_pins(&[(raw_b.key, OVERLAY_SHA, 2)]);
+    overlay_reback(&mut pins_b, &overlay_backing_file(&dir, "b.so"));
+    assert!(pins.absorb(pins_b).is_empty());
     let (modules, skipped) = bind_scanned_modules(&[raw_a, raw_b], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
+    assert_ne!(
+        modules[0].object, modules[1].object,
+        "the two providers stay distinct objects"
+    );
     let mut engine = Engine::empty();
     engine.scope = crate::attach::Scope::System;
     engine.plan = plan::build_from_reconciled_modules(&modules);
@@ -1248,7 +1261,10 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
         "generational scope keeps the attached slot when only its scan view exits"
     );
     assert!(
-        carried.modules.iter().any(|module| module.object == object_a),
+        carried
+            .modules
+            .iter()
+            .any(|module| module.object == object_a),
         "the provider module survives the exit"
     );
     assert!(
@@ -1397,9 +1413,11 @@ fn loader_rebind_keeps_carried_provider_claimless() {
         .inventory_candidate(&removed, &[], &[], Vec::new(), &empty)
         .unwrap();
     assert!(
-        carried.plan.slots.iter().any(|slot| {
-            carried.plan.is_active(slot.index) && slot.object == object
-        }),
+        carried
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { carried.plan.is_active(slot.index) && slot.object == object }),
         "the carry keeps the victim's slots attached"
     );
     engine.plan = carried.plan;
@@ -1424,8 +1442,132 @@ fn loader_rebind_keeps_carried_provider_claimless() {
         "the carried pin stays resolvable across the loader scan"
     );
     assert!(
-        candidate.modules.iter().any(|module| module.object == object),
+        candidate
+            .modules
+            .iter()
+            .any(|module| module.object == object),
         "the carried module stays bound across the loader scan"
+    );
+}
+
+#[test]
+fn dead_module_views_lists_only_unlisted_owners() {
+    // The rebind claimless-set derivation: module owners that are no
+    // longer live views, minus the kept (fresh-evidence) view. Live
+    // owners are never listed, and the kept view is excluded even when
+    // it is unlisted.
+    let mut engine = Engine::empty();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), std::process::id()).unwrap());
+    let modules = [
+        overlay_module(overlay_key(0)),
+        overlay_module(overlay_key(1)),
+        overlay_module(overlay_key(2)),
+    ];
+    assert_eq!(
+        modules[0].view,
+        ProcessViewId(0),
+        "the fixture views are the minors"
+    );
+    assert_eq!(
+        engine.dead_module_views(&modules, None),
+        BTreeSet::from([ProcessViewId(1), ProcessViewId(2)]),
+        "unlisted owners are dead, the live owner is not"
+    );
+    assert_eq!(
+        engine.dead_module_views(&modules, Some(ProcessViewId(1))),
+        BTreeSet::from([ProcessViewId(2)]),
+        "the kept view is excluded"
+    );
+    assert_eq!(
+        engine.dead_module_views(&modules, Some(ProcessViewId(0))),
+        BTreeSet::from([ProcessViewId(1), ProcessViewId(2)]),
+        "keeping a live view changes nothing"
+    );
+    assert!(
+        engine.dead_module_views(&[], None).is_empty(),
+        "no modules, no dead views"
+    );
+}
+
+#[test]
+fn claimless_rebuild_binds_carried_modules_without_claiming_them() {
+    // The choke-point mechanism every rebind-carry site shares: modules
+    // bound under a claimless view resolve their exact attached targets
+    // (both modules bind, both slots stay attached) but file no
+    // ownership claims, so the carried pins read as carried coverage.
+    // Live views in the same rebuild keep their claims.
+    let raw_a = overlay_module(overlay_key(92));
+    let raw_b = overlay_module(overlay_key(93));
+    // Distinct kernel files and pin ctimes: fixtures sharing /dev/null
+    // with one ctime are one (pin, sha) overlay observation, and the
+    // canonicalizer would fold the two providers into one object before
+    // the rebind under test.
+    let dir = tempfile::tempdir().expect("backing dir");
+    let mut pins = overlay_pins(&[(raw_a.key, OVERLAY_SHA, 1)]);
+    overlay_reback(&mut pins, &overlay_backing_file(&dir, "a.so"));
+    let mut pins_b = overlay_pins(&[(raw_b.key, OVERLAY_SHA, 2)]);
+    overlay_reback(&mut pins_b, &overlay_backing_file(&dir, "b.so"));
+    assert!(pins.absorb(pins_b).is_empty());
+    let (modules, skipped) = bind_scanned_modules(&[raw_a, raw_b], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_ne!(
+        modules[0].object, modules[1].object,
+        "the two providers stay distinct objects"
+    );
+    let mut engine = Engine::empty();
+    engine.scope = crate::attach::Scope::System;
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    let view_a = engine.modules[0].scanned.view;
+    let view_b = engine.modules[1].scanned.view;
+    let object_a = engine.modules[0].object;
+    let object_b = engine.modules[1].object;
+    let raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let claimless = BTreeSet::from([view_a]);
+    let candidate = engine
+        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .unwrap();
+    assert_eq!(candidate.modules.len(), 2, "both modules bind");
+    for object in [object_a, object_b] {
+        assert!(
+            candidate
+                .plan
+                .slots
+                .iter()
+                .any(|slot| candidate.plan.is_active(slot.index) && slot.object == object),
+            "the rebuild keeps every bound module attached"
+        );
+        assert!(
+            candidate.pinned.summary(object).is_some(),
+            "every bound pin stays resolvable"
+        );
+    }
+    assert!(
+        candidate.pinned.view_claims(view_a).is_none(),
+        "the claimless view owns no claims"
+    );
+    assert!(
+        candidate.pinned.carried_ids().contains(&object_a),
+        "the claimless view's pins read as carried coverage"
+    );
+    assert!(
+        candidate.pinned.view_claims(view_b).is_some(),
+        "the live view keeps its claims"
+    );
+    assert!(
+        !candidate.pinned.carried_ids().contains(&object_b),
+        "the live view's claimed pins are not carried"
     );
 }
 
@@ -25725,6 +25867,7 @@ fn two_view_selection_claims_retire_independently() {
             claims,
             tables,
             pending,
+            &BTreeSet::new(),
         )
         .unwrap();
     engine
@@ -25823,7 +25966,14 @@ fn two_view_selection_claims_retire_independently() {
         .map(|module| module.scanned.clone())
         .collect();
     let candidate = engine
-        .live_candidate_with_selection(engine.pinned.clone(), raw_modules, claims, tables, pending)
+        .live_candidate_with_selection(
+            engine.pinned.clone(),
+            raw_modules,
+            claims,
+            tables,
+            pending,
+            &BTreeSet::new(),
+        )
         .unwrap();
     assert!(
         engine
@@ -26556,6 +26706,7 @@ fn selection_bindings_isolate_provider_attribution_and_refusal() {
             claims,
             [(table_key, table)].into_iter().collect(),
             pending,
+            &BTreeSet::new(),
         )
         .unwrap();
     assert!(candidate.plan.slots.len() >= engine.plan.slots.len());
@@ -28245,7 +28396,14 @@ fn selection_table_partial_attach_rolls_back_the_successful_prefix() {
         .map(|module| module.scanned.clone())
         .collect();
     let candidate = engine
-        .live_candidate_with_selection(engine.pinned.clone(), raw_modules, claims, tables, pending)
+        .live_candidate_with_selection(
+            engine.pinned.clone(),
+            raw_modules,
+            claims,
+            tables,
+            pending,
+            &BTreeSet::new(),
+        )
         .unwrap();
     assert_eq!(candidate.delta.new.len(), 2);
     let successful_prefix = candidate.delta.new[0].index;
@@ -28314,6 +28472,7 @@ fn selection_candidate_preflight_refusal_keeps_claims_and_latch_unchanged() {
             claims,
             tables,
             pending,
+            &BTreeSet::new(),
         )
         .unwrap();
     let before_plan = engine.plan.clone();
@@ -28364,6 +28523,7 @@ fn selection_rollback_does_not_restore_a_latch_after_generation_loss() {
             claims,
             tables,
             pending,
+            &BTreeSet::new(),
         )
         .unwrap();
     let mut session = ScriptedSession::losing_generation_at_attach(engine.views[0].pid());
@@ -40509,9 +40669,7 @@ fn remap_match_yields_to_the_exact_live_match() {
         manifest_supported: false,
         extension_impossible: false,
     };
-    let module = |finished: bool,
-                  tables: Vec<ScannedTable>,
-                  interfaces: Vec<ScannedInterface>| {
+    let module = |finished: bool, tables: Vec<ScannedTable>, interfaces: Vec<ScannedInterface>| {
         ScannedModule {
             key_is_identity: false,
             module_hint: None,
@@ -40536,7 +40694,10 @@ fn remap_match_yields_to_the_exact_live_match() {
     // Retained static A, then a live observation B of the same content
     // at another address: the live row twins, as observations always do.
     let mut merged = vec![module(true, vec![table(0x1000, false)], vec![])];
-    merge_scanned_module(&mut merged, module(false, vec![table(0x2000, true)], vec![]));
+    merge_scanned_module(
+        &mut merged,
+        module(false, vec![table(0x2000, true)], vec![]),
+    );
     assert_eq!(merged[0].tables.len(), 2, "the live row twins");
     // A fresh static re-decode at the live address merges into its exact
     // live sibling — it must not rewrite the older static row onto it.
@@ -40647,7 +40808,11 @@ fn same_table_redecode_refuses_version_walk_and_hole_mismatches() {
     );
     let walk: &dyn Fn(&mut ScannedTable) = &|incoming| incoming.walk = "known_prefix";
     let merged = rival(walk);
-    assert_eq!(merged[0].tables.len(), 2, "a walk mismatch stays rival twins");
+    assert_eq!(
+        merged[0].tables.len(),
+        2,
+        "a walk mismatch stays rival twins"
+    );
     assert!(
         !merged[0].tables_scan_finished,
         "a walk rival still re-opens finished-ness"
@@ -70329,7 +70494,14 @@ fn midfinal_res2_declined_inventory_keeps_selection_derived_slots() {
         .map(|module| module.scanned.clone())
         .collect();
     let candidate = engine
-        .live_candidate_with_selection(engine.pinned.clone(), raw_modules, claims, tables, pending)
+        .live_candidate_with_selection(
+            engine.pinned.clone(),
+            raw_modules,
+            claims,
+            tables,
+            pending,
+            &BTreeSet::new(),
+        )
         .expect("the selection candidate builds");
     assert!(
         engine
@@ -70454,7 +70626,14 @@ fn midfinal_res2_accepted_removal_retires_selection_derived_slots() {
         .map(|module| module.scanned.clone())
         .collect();
     let candidate = engine
-        .live_candidate_with_selection(engine.pinned.clone(), raw_modules, claims, tables, pending)
+        .live_candidate_with_selection(
+            engine.pinned.clone(),
+            raw_modules,
+            claims,
+            tables,
+            pending,
+            &BTreeSet::new(),
+        )
         .expect("the selection candidate builds");
     assert!(
         engine

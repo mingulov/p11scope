@@ -3019,6 +3019,21 @@ impl PinnedObjects {
         }
     }
 
+    /// Drops one view's ownership claims while keeping every pin
+    /// resolvable: the except-carry shape (`remove_view_except` with a
+    /// keep set) without the purge. Rebinding files claims for every
+    /// bound module, so assembly sites that carry retired views' modules
+    /// call this for the carried views after the rebind — a retained
+    /// table supplies exact attached targets without filing claims under
+    /// a retired process. Carried ids (resolvable, claimless) stay spared
+    /// by every later purge; dropping an already claimless view is a
+    /// no-op. Never removes pins, raw mappings, or another view's claims.
+    pub(crate) fn drop_view_claims(&mut self, view: ProcessViewId) {
+        if self.ownership.remove(&view).is_some() {
+            self.bump_revision();
+        }
+    }
+
     /// The one pin opened for a manifest object before it is absorbed into the
     /// capture set. Used only to compare that opened object with scan-owned pins.
     /// Same-id duplicates (a manifest and a pre-arm alias merged onto one
@@ -11823,6 +11838,54 @@ mod tests {
         Version, WalkOutcome,
     };
     use std::cell::RefCell;
+
+    #[test]
+    fn drop_view_claims_keeps_pins_resolvable_without_claims() {
+        // Claims-only removal: the view's pins stay resolvable (the
+        // except-carry shape), the view owns nothing afterwards, and its
+        // ids read as carried coverage. Another view's claims are
+        // untouched, and dropping an already claimless view is a no-op.
+        let first = module(overlay(90));
+        let second = module(overlay(91));
+        let mut pinned = pins(&[(first.key, SHA, 1), (second.key, SHA, 1)]);
+        let (bound, skipped) = bind_scanned_modules(&[first, second], &mut pinned);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(bound.len(), 2);
+        let view = bound[0].scanned.view;
+        let other = bound[1].scanned.view;
+        let object = bound[0].object;
+        let peer = bound[1].object;
+        assert!(
+            pinned.view_claims(view).is_some(),
+            "the binder files claims before the drop"
+        );
+        pinned.drop_view_claims(view);
+        assert!(
+            pinned.view_claims(view).is_none(),
+            "the drop removes the view's claims"
+        );
+        assert!(
+            pinned.summary(object).is_some(),
+            "the dropped view's pins stay resolvable"
+        );
+        assert!(
+            pinned.carried_ids().contains(&object),
+            "the dropped ids read as carried coverage"
+        );
+        assert!(
+            pinned.view_claims(other).is_some(),
+            "another view's claims are untouched"
+        );
+        assert!(
+            !pinned.carried_ids().contains(&peer),
+            "the peer's claimed ids are not carried"
+        );
+        pinned.drop_view_claims(view);
+        assert!(
+            pinned.view_claims(view).is_none() && pinned.summary(object).is_some(),
+            "dropping an already claimless view is a no-op"
+        );
+    }
 
     #[test]
     fn small_owned_object_stays_pinnable() {

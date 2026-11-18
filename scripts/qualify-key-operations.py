@@ -185,6 +185,8 @@ GAP_REASONS = ("bootstrap_unproven", "bootstrap_refused", "prefix_contradiction"
                "id_exhausted", "device_loss", "unseen_finalize", "inconsistent_mechanism",
                "outcome_lost", "unknown_domain", "domain_pruned", "pruned_object_referenced",
                "corroboration_mismatch", "wrapped_park_refused")
+# v7-only gap reasons: refused below v7, never silently dropped.
+V7_ONLY_GAPS = ("corroboration_mismatch", "wrapped_park_refused")
 
 SECTION_KEYS = {"version", "revision", "status", "reason", "sessions", "objects",
                 "key_operations", "unknown_key_operations", "gaps", "budgets"}
@@ -211,6 +213,20 @@ INFERRED_EVIDENCE = ("sign_output", "verify_input", "encrypt_output", "decrypt_i
                      "wrap_output", "unwrap_input", "encapsulate_output", "decapsulate_input")
 SIZE_DETAIL_KINDS = ("rsa", "rsa_nonstandard", "ec", "eddsa", "dsa_class", "pqc_set",
                      "wrapped_material")
+# Closed per-kind vocabularies (§10.2): evidence, curves, labels and
+# parameter sets, each enforced in its own variant only.
+RSA_EVIDENCE = ("sign_output", "verify_input", "encrypt_output", "decrypt_input",
+                "wrap_output", "unwrap_input")
+SIGN_EVIDENCE = ("sign_output", "verify_input")
+PQC_EVIDENCE = ("encapsulate_output", "decapsulate_input", "sign_output",
+                "verify_input")
+WRAP_EVIDENCE = ("wrap_output", "unwrap_input")
+EC_CURVES = ("p256", "p384", "p521")
+EDDSA_CURVES = ("ed25519", "ed448")
+DSA_LABELS = ("dsa_1024", "dsa_2048_224", "dsa_2048_256_or_3072")
+PQC_SETS = ("ml_kem_512", "ml_kem_768", "ml_kem_1024", "ml_dsa_44", "ml_dsa_65",
+            "ml_dsa_87", "slh_dsa_128s", "slh_dsa_128f", "slh_dsa_192s",
+            "slh_dsa_192f", "slh_dsa_256s", "slh_dsa_256f")
 UNKNOWN_ROW_KEYS = {"category", "reason", "unit", "completed", "failed", "cancelled",
                     "unknown", "active"}
 GAP_ROW_KEYS = {"subject", "reason", "repeats"}
@@ -600,30 +616,46 @@ def _check_size_detail(detail):
     _require("kind" in detail and "evidence" in detail,
              "size detail needs kind and evidence")
     kind = _label(detail["kind"], SIZE_DETAIL_KINDS, "size detail kind")
-    _label(detail["evidence"], INFERRED_EVIDENCE, "size detail evidence")
     if kind == "rsa":
         _keys(detail, {"kind", "size_class", "modulus_bytes", "evidence"})
-        _require(_u64(detail["size_class"]) and _u64(detail["modulus_bytes"]),
+        _require(detail["size_class"] in (1024, 2048, 3072, 4096),
                  "invalid rsa detail")
+        _require(detail["modulus_bytes"] in (128, 256, 384, 512),
+                 "invalid rsa detail")
+        _label(detail["evidence"], RSA_EVIDENCE, "size detail evidence")
     elif kind == "rsa_nonstandard":
         _keys(detail, {"kind", "modulus_bytes", "evidence"})
-        _require(_u64(detail["modulus_bytes"]), "invalid rsa detail")
-    elif kind in ("ec", "eddsa"):
+        _require(type(detail["modulus_bytes"]) is int
+                 and 64 <= detail["modulus_bytes"] <= 2048,
+                 "invalid rsa detail")
+        _label(detail["evidence"], RSA_EVIDENCE, "size detail evidence")
+    elif kind == "ec":
         _keys(detail, {"kind", "curve", "octets", "evidence"})
-        _require(type(detail["curve"]) is str and _u64(detail["octets"]),
-                 "invalid curve detail")
+        _label(detail["curve"], EC_CURVES, "size detail curve")
+        _require(detail["octets"] in (64, 96, 132), "invalid curve detail")
+        _label(detail["evidence"], SIGN_EVIDENCE, "size detail evidence")
+    elif kind == "eddsa":
+        _keys(detail, {"kind", "curve", "octets", "evidence"})
+        _label(detail["curve"], EDDSA_CURVES, "size detail curve")
+        _require(detail["octets"] in (64, 114), "invalid curve detail")
+        _label(detail["evidence"], SIGN_EVIDENCE, "size detail evidence")
     elif kind == "dsa_class":
         _keys(detail, {"kind", "label", "octets", "evidence"})
-        _require(type(detail["label"]) is str and _u64(detail["octets"]),
-                 "invalid dsa detail")
+        _label(detail["label"], DSA_LABELS, "size detail label")
+        _require(detail["octets"] in (40, 56, 64), "invalid dsa detail")
+        _label(detail["evidence"], SIGN_EVIDENCE, "size detail evidence")
     elif kind == "pqc_set":
         _keys(detail, {"kind", "parameter_set", "octets", "evidence"})
-        _require(type(detail["parameter_set"]) is str and _u64(detail["octets"]),
+        _label(detail["parameter_set"], PQC_SETS, "size detail parameter set")
+        _require(detail["octets"] in (768, 1088, 1568, 2420, 3309, 4627,
+                                      7856, 17088, 16224, 35664, 29792, 49856),
                  "invalid pqc detail")
+        _label(detail["evidence"], PQC_EVIDENCE, "size detail evidence")
     elif kind == "wrapped_material":
         _keys(detail, {"kind", "material_octets", "octets", "evidence", "about"})
         _require(_u64(detail["material_octets"]) and _u64(detail["octets"])
                  and detail["about"] == "wrapped", "invalid wrapped detail")
+        _label(detail["evidence"], WRAP_EVIDENCE, "size detail evidence")
 
 
 def _check_inferred_family(block):
@@ -710,7 +742,7 @@ def _check_unknown_row(row):
     return category, reason, unit, counters
 
 
-def _check_gaps(gaps):
+def _check_gaps(gaps, version):
     _keys(gaps, {"rows", "suppressed"})
     _require(type(gaps["rows"]) is list and _u64(gaps["suppressed"]), "invalid gaps")
     _require(len(gaps["rows"]) <= GAPS_CAPACITY, "too many gap rows")
@@ -719,6 +751,8 @@ def _check_gaps(gaps):
         _keys(row, GAP_ROW_KEYS)
         subject = _label(row["subject"], GAP_SUBJECTS, "gap subject")
         reason = _label(row["reason"], GAP_REASONS, "gap reason")
+        if version < OBSERVATIONS_VERSION_V7 and reason in V7_ONLY_GAPS:
+            raise OracleRefusal(f"v7-only gap reason in v{version} section")
         _require(_u64(row["repeats"]), "invalid gap repeats")
         _require((subject, reason) not in seen, "duplicate gap row")
         seen.add((subject, reason))
@@ -848,7 +882,7 @@ def check_section(section):
     pairs = [(category, reason) for category, reason, _, _ in unknown]
     _require(len(set(pairs)) == len(pairs), "duplicate unknown row")
     _require(sorted(pairs) == pairs, "unknown rows out of order")
-    gaps = _check_gaps(section["gaps"])
+    gaps = _check_gaps(section["gaps"], version)
     _check_budgets(section["budgets"], len(order), len(objects), len(unknown))
     if version == OBSERVATIONS_VERSION_V6:
         _require_v6_content(section, keys)

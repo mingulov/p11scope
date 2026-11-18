@@ -2040,6 +2040,8 @@ class AsyncV6NewsiteTwins(unittest.TestCase):
                             row["inferred_size"]["completions"] = row["completed"]
                         else:
                             line["event"]["version"] = 6
+                            row.pop("inferred_family", None)
+                            row.pop("inferred_size", None)
                     else:
                         line["event"]["version"] = 6
                 elif line["kind"] == "pass_committed":

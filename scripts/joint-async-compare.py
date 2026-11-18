@@ -83,6 +83,26 @@ NEWSITE_LABELS = {"x25519", "x448", "ed25519", "ed448",
                   "generic_256", "generic_384", "generic_other"}
 LABELS_V6 = LABELS_V5 | NEWSITE_LABELS
 OBJECT_LABELS_V6 = OBJECT_LABELS_V5 | NEWSITE_LABELS
+# H9 section v7 (keymeta inferred family/size): every proved row
+# carries both inferred keys (blank states render unknown); v1–v6
+# rows keep the frozen keys. Per-kind closed vocabularies (§10.2).
+INFERRED_STATUSES = ("inferred", "unknown", "conflicting", "unsupported")
+INFERRED_FAMILIES = ("rsa", "ec", "eddsa", "xeddsa", "secret", "dsa", "dh",
+                     "aes", "generic_secret", "hkdf", "ml_kem", "ml_dsa",
+                     "slh_dsa", "chacha20", "poly1305", "des", "des3",
+                     "camellia", "aria", "seed", "gost")
+RSA_EVIDENCE = ("sign_output", "verify_input", "encrypt_output",
+                "decrypt_input", "wrap_output", "unwrap_input")
+SIGN_EVIDENCE = ("sign_output", "verify_input")
+PQC_EVIDENCE = ("encapsulate_output", "decapsulate_input", "sign_output",
+                "verify_input")
+WRAP_EVIDENCE = ("wrap_output", "unwrap_input")
+EC_CURVES = ("p256", "p384", "p521")
+EDDSA_CURVES = ("ed25519", "ed448")
+DSA_LABELS = ("dsa_1024", "dsa_2048_224", "dsa_2048_256_or_3072")
+PQC_SETS = ("ml_kem_512", "ml_kem_768", "ml_kem_1024", "ml_dsa_44",
+            "ml_dsa_65", "ml_dsa_87", "slh_dsa_128s", "slh_dsa_128f",
+            "slh_dsa_192s", "slh_dsa_192f", "slh_dsa_256s", "slh_dsa_256f")
 CATEGORIES = {"digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "verify_recover", "message_encrypt", "message_decrypt",
               "message_sign", "message_verify", "generate_key",
@@ -100,7 +120,7 @@ CREATIONS = {"create", "copy", "generate", "generate_pair", "derive",
              "unwrap"}
 # H9 section v2 additions (packet 6.07c): v1 tables stay frozen.
 CREATIONS_V2 = CREATIONS | {"encapsulate", "decapsulate"}
-SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5, 6)
+SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
 UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "metadata_conflicting", "role_unavailable", "not_applicable"}
@@ -523,10 +543,148 @@ def _check_counters(row, names, where):
         _require(_integer(row[name]), f"{where}: {name} out of range")
 
 
-def _check_key_row(row, where, roles=ROLES, labels=LABELS):
+def _check_size_detail(detail, where):
+    """Closed per-kind size detail (§10.2): required fields, per-kind
+    enums, no foreign fields."""
+    _require(type(detail) is dict, f"{where}: size detail must be an object")
+    _require("kind" in detail and "evidence" in detail,
+             f"{where}: size detail needs kind and evidence")
+    kind = detail["kind"]
+    _require(kind in ("rsa", "rsa_nonstandard", "ec", "eddsa", "dsa_class",
+                      "pqc_set", "wrapped_material"),
+             f"{where}: size detail kind invalid")
+    if kind == "rsa":
+        _require(set(detail) == {"kind", "size_class", "modulus_bytes",
+                                 "evidence"},
+                 f"{where}: unexpected fields")
+        _require(detail["size_class"] in (1024, 2048, 3072, 4096),
+                 f"{where}: rsa size class invalid")
+        _require(detail["modulus_bytes"] in (128, 256, 384, 512),
+                 f"{where}: rsa modulus bytes invalid")
+        _require(detail["evidence"] in RSA_EVIDENCE,
+                 f"{where}: size detail evidence invalid")
+    elif kind == "rsa_nonstandard":
+        _require(set(detail) == {"kind", "modulus_bytes", "evidence"},
+                 f"{where}: unexpected fields")
+        _require(type(detail["modulus_bytes"]) is int
+                 and 64 <= detail["modulus_bytes"] <= 2048,
+                 f"{where}: rsa modulus bytes invalid")
+        _require(detail["evidence"] in RSA_EVIDENCE,
+                 f"{where}: size detail evidence invalid")
+    elif kind == "ec":
+        _require(set(detail) == {"kind", "curve", "octets", "evidence"},
+                 f"{where}: unexpected fields")
+        _require(detail["curve"] in EC_CURVES,
+                 f"{where}: ec curve invalid")
+        _require(detail["octets"] in (64, 96, 132),
+                 f"{where}: ec octets invalid")
+        _require(detail["evidence"] in SIGN_EVIDENCE,
+                 f"{where}: size detail evidence invalid")
+    elif kind == "eddsa":
+        _require(set(detail) == {"kind", "curve", "octets", "evidence"},
+                 f"{where}: unexpected fields")
+        _require(detail["curve"] in EDDSA_CURVES,
+                 f"{where}: eddsa curve invalid")
+        _require(detail["octets"] in (64, 114),
+                 f"{where}: eddsa octets invalid")
+        _require(detail["evidence"] in SIGN_EVIDENCE,
+                 f"{where}: size detail evidence invalid")
+    elif kind == "dsa_class":
+        _require(set(detail) == {"kind", "label", "octets", "evidence"},
+                 f"{where}: unexpected fields")
+        _require(detail["label"] in DSA_LABELS,
+                 f"{where}: dsa label invalid")
+        _require(detail["octets"] in (40, 56, 64),
+                 f"{where}: dsa octets invalid")
+        _require(detail["evidence"] in SIGN_EVIDENCE,
+                 f"{where}: size detail evidence invalid")
+    elif kind == "pqc_set":
+        _require(set(detail) == {"kind", "parameter_set", "octets", "evidence"},
+                 f"{where}: unexpected fields")
+        _require(detail["parameter_set"] in PQC_SETS,
+                 f"{where}: pqc parameter set invalid")
+        _require(detail["octets"] in (768, 1088, 1568, 2420, 3309, 4627,
+                                      7856, 17088, 16224, 35664, 29792, 49856),
+                 f"{where}: pqc octets invalid")
+        _require(detail["evidence"] in PQC_EVIDENCE,
+                 f"{where}: size detail evidence invalid")
+    elif kind == "wrapped_material":
+        _require(set(detail) == {"kind", "material_octets", "octets",
+                                 "evidence", "about"},
+                 f"{where}: unexpected fields")
+        _require(_integer(detail["material_octets"])
+                 and _integer(detail["octets"])
+                 and detail["about"] == "wrapped",
+                 f"{where}: wrapped detail invalid")
+        _require(detail["evidence"] in WRAP_EVIDENCE,
+                 f"{where}: size detail evidence invalid")
+
+
+def _check_inferred_family(block, where):
+    _require(type(block) is dict, f"{where}: inferred family must be an object")
+    allowed = {"status", "value", "completions", "conflict_value",
+               "conflict_completions", "further_conflicts"}
+    _require(set(block) <= allowed
+             and {"status", "value", "completions"} <= set(block),
+             f"{where}: unexpected fields")
+    _require(block["status"] in INFERRED_STATUSES,
+             f"{where}: inferred status invalid")
+    value = block["value"]
+    _require(value is None or value in INFERRED_FAMILIES,
+             f"{where}: inferred family invalid")
+    _require(_integer(block["completions"]),
+             f"{where}: inferred completions out of range")
+    if block["status"] in ("unknown", "unsupported"):
+        _require(value is None, f"{where}: unknown family carries no value")
+    else:
+        _require(value is not None, f"{where}: valued family needs a value")
+    conflict = block.get("conflict_value")
+    conflict_completions = block.get("conflict_completions")
+    _require((conflict is None) == (conflict_completions is None),
+             f"{where}: conflict pair is atomic")
+    if conflict is not None:
+        _require(conflict in INFERRED_FAMILIES,
+                 f"{where}: conflict family invalid")
+        _require(_integer(conflict_completions),
+                 f"{where}: conflict completions out of range")
+    if "further_conflicts" in block:
+        _require(_integer(block["further_conflicts"])
+                 and block["further_conflicts"] >= 1,
+                 f"{where}: further conflicts out of range")
+
+
+def _check_inferred_size(block, where):
+    _require(type(block) is dict, f"{where}: inferred size must be an object")
+    allowed = {"status", "detail", "completions", "conflict_detail",
+               "further_conflicts"}
+    _require(set(block) <= allowed
+             and {"status", "detail", "completions"} <= set(block),
+             f"{where}: unexpected fields")
+    _require(block["status"] in INFERRED_STATUSES,
+             f"{where}: inferred status invalid")
+    detail = block["detail"]
+    _require(_integer(block["completions"]),
+             f"{where}: inferred completions out of range")
+    if block["status"] in ("unknown", "unsupported"):
+        _require(detail is None, f"{where}: unknown size carries no detail")
+    else:
+        _require(detail is not None, f"{where}: valued size needs a detail")
+        _check_size_detail(detail, where)
+    if "conflict_detail" in block:
+        _check_size_detail(block["conflict_detail"], where)
+    if "further_conflicts" in block:
+        _require(_integer(block["further_conflicts"])
+                 and block["further_conflicts"] >= 1,
+                 f"{where}: further conflicts out of range")
+
+
+def _check_key_row(row, where, roles=ROLES, labels=LABELS, version=1):
     _require(type(row) is dict, f"{where}: key row must be an object")
-    _keys(row, {"instance", "object", "category", "role", "metadata_at_use",
-                "unit"} | set(KEY_COUNTERS))
+    expected = ({"instance", "object", "category", "role", "metadata_at_use",
+                 "unit"} | set(KEY_COUNTERS))
+    if version >= 7:
+        expected |= {"inferred_family", "inferred_size"}
+    _keys(row, expected)
     _require(type(row["instance"]) is str
              and INSTANCE_PATTERN.match(row["instance"]),
              f"{where}: key row instance invalid")
@@ -546,6 +704,9 @@ def _check_key_row(row, where, roles=ROLES, labels=LABELS):
     _require(row["started"] == total,
              f"{where}: key row equation: started {row['started']}"
              f" disagrees with {total}")
+    if version >= 7:
+        _check_inferred_family(row["inferred_family"], where)
+        _check_inferred_size(row["inferred_size"], where)
     return (row["instance"], row["object"], row["category"], row["role"],
             row["metadata_at_use"])
 
@@ -650,11 +811,11 @@ def _check_unattributed(document, tag):
     """Validate not-attributed counters: present iff version >= 3.
 
     Version 3 requires a nonempty list (it is emitted iff a count
-    exists); versions 4, 5 and 6 always carry the key and it may be
+    exists); versions 4, 5, 6 and 7 always carry the key and it may be
     empty.
     """
     version = document["version"]
-    if version not in (3, 4, 5, 6):
+    if version not in (3, 4, 5, 6, 7):
         _require("unattributed" not in document,
                  f"{tag}: unattributed counters before section version 3")
         return
@@ -682,7 +843,7 @@ def validate_snapshot(document, tag):
     keys = {"version", "revision", "status", "reason", "sessions",
             "objects", "key_operations", "unknown_key_operations",
             "gaps", "budgets"}
-    if type(document) is dict and document.get("version") in (3, 4, 5, 6):
+    if type(document) is dict and document.get("version") in (3, 4, 5, 6, 7):
         keys |= {"unattributed"}
     _keys(document, keys)
     _check_unattributed(document, tag)
@@ -721,8 +882,9 @@ def validate_snapshot(document, tag):
     _check_sorted_unique(object_ids, f"{tag} snapshot objects")
     _require(type(document["key_operations"]) is list,
              f"{tag}: snapshot key_operations must be a list")
+    version = document["version"]
     known_keys = [_check_key_row(row, f"{tag} snapshot key row {position}",
-                                      roles, labels)
+                                      roles, labels, version)
                   for position, row in enumerate(document["key_operations"])]
     _check_sorted_unique(known_keys, f"{tag} snapshot key rows")
     _require(type(document["unknown_key_operations"]) is list,
@@ -913,6 +1075,7 @@ def compare_joint(collision, snapshot):
     owner, challenger = collision["owner"], collision["challenger"]
     roles = _snapshot_roles(snapshot, "joint")
     labels = _snapshot_labels(snapshot, "joint")
+    version = snapshot["version"]
     _require(snapshot["gaps"]["suppressed"] == 0,
              f"joint snapshot gaps suppressed"
              f" {_shown(snapshot['gaps']['suppressed'])} hides dispositions")
@@ -932,7 +1095,7 @@ def compare_joint(collision, snapshot):
     known = {}
     for row in snapshot["key_operations"]:
         known[_check_key_row(row, "joint snapshot key row", roles,
-                              labels)] = row
+                              labels, version)] = row
     unknown = {}
     for row in snapshot["unknown_key_operations"]:
         unknown[_check_unknown_row(row, "joint snapshot unknown row")] = row
@@ -1160,7 +1323,7 @@ def compare_stream(events, collision, snapshot, view):
                      f"{where}: bucket invalid")
             if event["bucket"] == "known":
                 key = ("known", _check_key_row(event["row"], where, roles,
-                                                labels))
+                                                labels, version))
             else:
                 key = ("unknown", _check_unknown_row(event["row"], where))
             series.setdefault(key, []).append(

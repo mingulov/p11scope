@@ -27475,6 +27475,24 @@ fn keymeta_secret_never_conflicts() {
     }
 }
 
+/// A secret-first value clears a prior unknown reason, like every
+/// other first-value arm (state hygiene: no stale reason behind an
+/// inferred value).
+#[test]
+fn keymeta_secret_first_clears_unknown_reason() {
+    use crate::semantics_key_use::FamilyState;
+    let mut family = FamilyState::default();
+    family.accumulate_family(None, 0x0500);
+    assert_eq!(
+        family.reason,
+        Some(crate::keymeta::REASON_UNLISTED_MECHANISM)
+    );
+    family.accumulate_family(None, 0x0360);
+    assert_eq!(family.status, InferredStatus::Inferred);
+    assert_eq!(family.value, Some(KeyFamily::Secret));
+    assert_eq!(family.reason, None, "secret-first clears the reason");
+}
+
 /// Established/inferred compatibility at the reducer seam: an
 /// incompatible pair flips the inferred side while the established
 /// label stands; compatible pairs show both sides quietly.
@@ -28150,6 +28168,125 @@ fn keymeta_unwrap_u1_forward_fills_first_row() {
     );
 }
 
+/// A refused wrapped-material park is inference-side, never row
+/// loss: the refusal counts into the named gap while coverage stays
+/// populated (no row was refused).
+#[test]
+fn keymeta_park_refused_counts_gap_without_partial() {
+    use crate::key_operation_projection::producer::commit;
+    let ids = KeymetaCtx::object_ids(3);
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    let mut sink = Vec::new();
+    let mut ledger = StagingLedger::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    for (n, view) in [ids[1], ids[2]].into_iter().enumerate() {
+        let receipts = [KeymetaCtx::receipt(
+            ids[0],
+            "C_UnwrapKey",
+            0,
+            KeyRole::UnwrappingKey,
+            None,
+        )];
+        let mut c = call("C_UnwrapKey", 7, CkRv::OK.0, 100 + n as u64 * 100);
+        c.mechanism = 0x2109;
+        c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NONE;
+        let origin = EffectOrigin::from(&c);
+        let before = sink.len();
+        edge.observe_joint_with_resources(
+            &c,
+            &origin,
+            &receipts,
+            &CompletionEvidence {
+                length: Some(LengthOutcome::Value(32)),
+                fresh_view: Some(view.as_u64()),
+            },
+            &mut sink,
+        )
+        .expect("replay");
+        assert_eq!(sink.len(), before + 1, "unwrap {n} emits");
+        let effect = sink.last().cloned().expect("effect");
+        keyuse.observe_effect(instance, &effect, Some(&mut ledger), None);
+    }
+    let evidence = keyuse.key_use_evidence();
+    assert_eq!(evidence.parked_refused, 1);
+    assert!(
+        !evidence.partial,
+        "a refused park is inference-side, never row loss"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    assert_eq!(committed.reason, "none");
+    let gap = committed
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "wrapped_park_refused")
+        .expect("the refusal publishes as a named gap");
+    assert_eq!(gap.subject, "key_operation");
+    assert_eq!(gap.repeats, 1);
+}
+
+/// Parked evidence expires with its view on every end path: a
+/// retired or access-ended view forward-fills nothing afterwards
+/// (destroyed shares the retire arm).
+#[test]
+fn keymeta_ended_view_park_expires() {
+    use crate::semantics_objects::{ObjectEffect, ObjectEffects, ObjectGap};
+    for name in ["retired", "access_ended"] {
+        let ids = KeymetaCtx::object_ids(2);
+        let mut ctx = KeymetaCtx::new();
+        let unwrapping =
+            KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+        ctx.direct(
+            "C_UnwrapKey",
+            7,
+            Some(0x2109),
+            &[unwrapping],
+            100,
+            Some(LengthOutcome::Value(32)),
+            Some(ids[1].as_u64()),
+        )
+        .expect("unwrap completes");
+        let scene = JointScene::new();
+        let effect = match name {
+            "retired" => ObjectEffect::Retired {
+                object: ids[1],
+                reason: ObjectGap::SessionClosed,
+            },
+            _ => ObjectEffect::AccessEnded {
+                object: ids[1],
+                reason: ObjectGap::SessionClosed,
+            },
+        };
+        ctx.keyuse.apply_invalidations(
+            &ObjectEffects {
+                effects: vec![effect],
+            },
+            &scene.model,
+        );
+        let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+        ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+        ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+        let inferred = ctx
+            .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+            .unwrap_or_else(|| panic!("{name}: the first row exists"));
+        assert_eq!(
+            inferred.size.status,
+            InferredStatus::Unknown,
+            "{name}: no forward fill"
+        );
+        assert_eq!(inferred.size.detail, None, "{name}: no parked detail");
+        assert_eq!(
+            inferred.size.completions, 0,
+            "{name}: no parked completion"
+        );
+    }
+}
+
 /// KEM lengths name parameter sets on the encapsulation rows.
 #[test]
 fn keymeta_kem_lengths_name_parameter_sets() {
@@ -28434,6 +28571,156 @@ fn keymeta_flag_off_drops_lengths() {
     assert_eq!(inferred.size.completions, 0);
 }
 
+/// Off-mode drops unwrap parks (§9 stale/replayed rule): a valued
+/// trailer with the flag off parks nothing, so the fresh view's
+/// first row carries no forward-filled size.
+#[test]
+fn keymeta_flag_off_drops_unwrap_parks() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    ctx.keyuse.set_key_sizes(false);
+    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x2109),
+        &[unwrapping],
+        100,
+        Some(LengthOutcome::Value(32)),
+        Some(ids[1].as_u64()),
+    )
+    .expect("unwrap completes");
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row exists");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Aes));
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF)
+    );
+    assert_eq!(inferred.size.completions, 0);
+}
+
+/// Off-mode drops unknown-bucket wrap parks too: the same stale
+/// trailer rule covers the wrapped-key park site.
+#[test]
+fn keymeta_flag_off_drops_wrapped_parks() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    ctx.keyuse.set_key_sizes(false);
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let mut wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    wrapped.attribution_valid = false;
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(32)),
+        None,
+    )
+    .expect("wrap completes");
+    // The wrapped view's first proved use carries no parked size.
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row exists");
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF)
+    );
+    assert_eq!(inferred.size.completions, 0);
+}
+
+/// Off-mode counts no corroboration mismatches: a stale terminal
+/// pair with the flag off is not evidence of anything.
+#[test]
+fn keymeta_flag_off_mismatch_uncounted() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    ctx.keyuse.set_key_sizes(false);
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(257)),
+        Some(256),
+    );
+    assert_eq!(
+        ctx.keyuse.key_use_evidence().corroboration_mismatches,
+        0,
+        "a stale pair counts nothing off-mode"
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF)
+    );
+}
+
+/// Off-mode drops lengths on the direct path too: wrap and unwrap
+/// directs infer families with the flag off while every size reads
+/// unknown with zero size completions.
+#[test]
+fn keymeta_flag_off_drops_direct_lengths() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    ctx.keyuse.set_key_sizes(false);
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x0001),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(256)),
+        None,
+    )
+    .expect("wrap completes");
+    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x0001),
+        &[unwrapping],
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    )
+    .expect("unwrap completes");
+    for (category, role, family) in [
+        ("wrap", "wrapping_key", KeyFamily::Rsa),
+        ("unwrap", "unwrapping_key", KeyFamily::Rsa),
+    ] {
+        let inferred = ctx
+            .inference(ids[0].as_u64(), category, role, "unknown")
+            .unwrap_or_else(|| panic!("the {category} row infers"));
+        assert_eq!(inferred.family.value, Some(family));
+        assert_eq!(inferred.size.status, InferredStatus::Unknown);
+        assert_eq!(
+            inferred.size.reason,
+            Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF)
+        );
+        assert_eq!(inferred.size.completions, 0);
+    }
+}
+
 /// A BPF-unavailable trailer names its reason and counts once.
 #[test]
 fn keymeta_unavailable_trailer_names_reason() {
@@ -28706,6 +28993,89 @@ fn keymeta_edge_direct_carries_completion() {
     assert_eq!(sink.len(), before, "a too-small direct emits nothing");
 }
 
+/// Direct length queries drop their value at the edge (§5.4): a
+/// NULL-output OK wrap/encapsulate still completes (the call ran),
+/// but the over-estimate query length never rides the effect — only
+/// a terminal non-NULL length classifies. The seal's fresh view
+/// rides through unchanged.
+#[test]
+fn keymeta_edge_direct_query_drops_length() {
+    for name in ["C_WrapKey", "C_EncapsulateKey", "C_WrapKeyAuthenticated"] {
+        let mut edge = EdgeSemantics::default();
+        let mut sink = Vec::new();
+        let mut c = call(name, 7, CkRv::OK.0, 100);
+        c.mechanism = 0x0001;
+        c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NULL;
+        let origin = EffectOrigin::from(&c);
+        edge.observe_joint_with_resources(
+            &c,
+            &origin,
+            &[],
+            &CompletionEvidence {
+                length: Some(LengthOutcome::Value(256)),
+                fresh_view: Some(999),
+            },
+            &mut sink,
+        )
+        .expect("replay");
+        match sink.last().unwrap_or_else(|| panic!("{name} query emits")) {
+            OperationEffect::DirectCompleted {
+                length, fresh_view, ..
+            } => {
+                assert_eq!(*length, None, "{name}: the query value drops");
+                assert_eq!(
+                    *fresh_view,
+                    Some(999),
+                    "{name}: the fresh view rides through"
+                );
+            }
+            other => panic!("expected DirectCompleted, got {other:?}"),
+        }
+    }
+}
+
+/// A direct wrap query never sizes at the reducer seam: through the
+/// real edge the query value drops, so the wrapping row infers its
+/// family (the mechanism is real) with no size completion behind it.
+#[test]
+fn keymeta_direct_query_never_sizes() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    let mut c = call("C_WrapKey", 7, CkRv::OK.0, 100);
+    c.mechanism = 0x0001;
+    c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NULL;
+    let origin = EffectOrigin::from(&c);
+    let before = ctx.sink.len();
+    ctx.edge
+        .observe_joint_with_resources(
+            &c,
+            &origin,
+            &[wrapping, wrapped],
+            &CompletionEvidence {
+                length: Some(LengthOutcome::Value(256)),
+                fresh_view: None,
+            },
+            &mut ctx.sink,
+        )
+        .expect("replay");
+    assert_eq!(ctx.sink.len(), before + 1, "the query completes");
+    let effect = ctx.sink.last().cloned().expect("effect");
+    ctx.keyuse
+        .observe_effect(ctx.instance, &effect, Some(&mut ctx.ledger), None);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
+        .expect("the wrapping row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+    assert_eq!(inferred.size.completions, 0);
+}
+
 /// Without length capture the seal carries no length into the settled
 /// call (never a guess): a base-form END settles with `length: None`.
 /// The 648-byte validated-trailer twin arrives with BPF length capture.
@@ -28873,6 +29243,41 @@ fn key_operation_schema_v7_pins_inferred_keys() {
         names("/$defs/size_detail/properties/parameter_set/enum").len(),
         12,
         "twelve PQC parameter sets"
+    );
+}
+
+/// The v7 size-detail linkage is closed: `detail`/`conflict_detail`
+/// reference the one closed `size_detail` shape, so a malformed
+/// detail cannot validate.
+#[test]
+fn key_operation_schema_v7_detail_references_closed_shape() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v7.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        schema.pointer("/$defs/inferred_size/properties/detail/anyOf"),
+        Some(&serde_json::json!([
+            {"type": "null"},
+            {"$ref": "#/$defs/size_detail"}
+        ])),
+        "detail is null or the closed shape"
+    );
+    assert_eq!(
+        schema
+            .pointer("/$defs/inferred_size/properties/conflict_detail/$ref")
+            .and_then(|value| value.as_str()),
+        Some("#/$defs/size_detail"),
+        "conflict_detail is the closed shape"
+    );
+    assert_eq!(
+        schema.pointer("/$defs/size_detail/additionalProperties"),
+        Some(&serde_json::Value::Bool(false)),
+        "the shared shape stays closed"
     );
 }
 
@@ -29348,6 +29753,499 @@ fn observations_version_no_evidence_stays_below_v7() {
         }),
     }];
     assert_eq!(observations_version(&observations), 1);
+}
+
+/// Frozen v1, live: a query-established scene with mechanism-free
+/// operations renders v1 (no inference trips without mechanism or
+/// length evidence) with frozen 13 key-row keys and two-key object
+/// fields — the restored mechanism-free negative control.
+#[test]
+fn key_operation_frozen_v1_renders_without_mechanisms() {
+    use crate::key_operation_projection::contract::{FIELD_KEYS, KEY_ROW_KEYS};
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let mechanism_free = capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0, mechanism_free),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION);
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 1);
+    assert_eq!(
+        section["key_operations"][0]["metadata_at_use"], "aes_256",
+        "the control row proves the scene is live"
+    );
+    let keys_of = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let table = |keys: &[&str]| -> Vec<String> {
+        let mut owned: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        owned.sort();
+        owned
+    };
+    assert_eq!(
+        keys_of(&section["key_operations"][0]),
+        table(&KEY_ROW_KEYS),
+        "frozen 13 row keys"
+    );
+    for block in ["requested", "established"] {
+        for field in [
+            "class",
+            "key_type",
+            "token",
+            "value_len",
+            "modulus_bits",
+            "ec_params",
+        ] {
+            assert_eq!(
+                keys_of(&section["objects"][0][block][field]),
+                table(&FIELD_KEYS),
+                "v1 {block}.{field} stays byte-stable"
+            );
+        }
+    }
+}
+
+/// Frozen v2, live: a mechanism-free KEM decapsulation renders v2
+/// (KEM creation/role labels, no inference) with frozen row keys.
+#[test]
+fn key_operation_frozen_v2_kem_without_mechanisms() {
+    use crate::key_operation_projection::contract::KEY_ROW_KEYS;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V2, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped(
+            "C_DecapsulateKey",
+            CkRv::OK.0,
+            0,
+            capture::MECHANISM_NONE | capture::OUTPUT_NONE,
+        ),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V2);
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 2);
+    let rendered = serde_json::to_string(&section).unwrap();
+    assert!(rendered.contains("\"decapsulation_key\""), "{rendered}");
+    assert!(rendered.contains("\"decapsulate\""), "{rendered}");
+    let keys_of = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let table = |keys: &[&str]| -> Vec<String> {
+        let mut owned: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        owned.sort();
+        owned
+    };
+    assert_eq!(
+        keys_of(&section["key_operations"][0]),
+        table(&KEY_ROW_KEYS),
+        "frozen 13 row keys"
+    );
+}
+
+/// Frozen v3, live: proved rows beside a not-attributed count render
+/// v3 with frozen row keys (a healthy feed joined with a
+/// proof-refused fallback census).
+#[test]
+fn key_operation_frozen_v3_unattributed_with_rows() {
+    use crate::key_operation_projection::contract::KEY_ROW_KEYS;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V3, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let instance = RegistryInstanceId::from_raw(3);
+    // Healthy feed: v1 rows (query-established AES, mechanism-free sign).
+    let mechanism_free = capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0, mechanism_free),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    // Fallback census: replayed S1 counts as not attributed.
+    let mut fall_scene = JointScene::new();
+    let fall_bootstrap = fall_scene.bootstrap();
+    let mut fall_staging = JointStaging::select_joint(Some(&fall_bootstrap));
+    let mut fall_edge = EdgeSemantics::default();
+    let mut fall_keyuse = KeyUseReducer::new();
+    let mut fall_sink = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        prepare_call(&mut fall_scene, &mut fall_staging, call);
+    }
+    let failure = fall_scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &fall_bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = fall_staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &fall_scene.model,
+        fall_scene.adapter.ledger_mut(),
+        &mut fall_edge,
+        &mut fall_keyuse,
+        instance,
+        &mut fall_sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 3 }
+    ));
+    let committed = commit(
+        1,
+        &[&staging, &fall_staging],
+        &scene.model.project(),
+        &keyuse,
+    );
+    assert_eq!(committed.status, ObsStatus::Partial);
+    assert_eq!(committed.reason, "proof_refused_fallback");
+    assert!(
+        !committed.unattributed.is_empty(),
+        "the fallback census counts"
+    );
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V3);
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 3);
+    let keys_of = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let table = |keys: &[&str]| -> Vec<String> {
+        let mut owned: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        owned.sort();
+        owned
+    };
+    assert_eq!(
+        keys_of(&section["key_operations"][0]),
+        table(&KEY_ROW_KEYS),
+        "frozen 13 row keys"
+    );
+}
+
+/// Frozen v4, live: label-less proved rows (no query, no template)
+/// with mechanism-free operations render v4 with frozen row keys.
+#[test]
+fn key_operation_frozen_v4_unknown_metadata_without_mechanisms() {
+    use crate::key_operation_projection::contract::KEY_ROW_KEYS;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V4, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let mechanism_free = capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut flow = sign_flow();
+    flow[1] = ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0, mechanism_free);
+    for call in flow[0..3].iter() {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            call,
+        );
+    }
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V4);
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 4);
+    assert!(
+        section["key_operations"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|row| row["metadata_at_use"] == "unknown"),
+        "a label-less row selects v4"
+    );
+    let keys_of = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let table = |keys: &[&str]| -> Vec<String> {
+        let mut owned: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        owned.sort();
+        owned
+    };
+    assert_eq!(
+        keys_of(&section["key_operations"][0]),
+        table(&KEY_ROW_KEYS),
+        "frozen 13 row keys"
+    );
+}
+
+/// Frozen v5, live: PQC-established rows with mechanism-free
+/// operations render v5 (PQC content, no inference) with frozen keys.
+#[test]
+fn key_operation_frozen_v5_pqc_without_mechanisms() {
+    use crate::key_operation_projection::contract::KEY_ROW_KEYS;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V5, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let mechanism_free = capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x4a), (7u8, 1u8, 2u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0, mechanism_free),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V5);
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 5);
+    assert_eq!(
+        section["key_operations"][0]["metadata_at_use"], "ml_dsa_65",
+        "the key row carries the PQC label"
+    );
+    let keys_of = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let table = |keys: &[&str]| -> Vec<String> {
+        let mut owned: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        owned.sort();
+        owned
+    };
+    assert_eq!(
+        keys_of(&section["key_operations"][0]),
+        table(&KEY_ROW_KEYS),
+        "frozen 13 row keys"
+    );
+}
+
+/// Frozen v6, live: an old-vocabulary creation (non-`query` sources)
+/// with mechanism-free operations renders v6 with frozen keys.
+#[test]
+fn key_operation_frozen_v6_newsite_without_mechanisms() {
+    use crate::key_operation_projection::contract::KEY_ROW_KEYS;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    let mechanism_free = capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1f), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0, mechanism_free),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 6);
+    assert_eq!(
+        section["key_operations"][0]["metadata_at_use"], "aes_256",
+        "the key row carries the promoted AES label"
+    );
+    assert_eq!(
+        section["objects"][0]["established"]["value_len"]["source"],
+        "creation_success"
+    );
+    let keys_of = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let table = |keys: &[&str]| -> Vec<String> {
+        let mut owned: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        owned.sort();
+        owned
+    };
+    assert_eq!(
+        keys_of(&section["key_operations"][0]),
+        table(&KEY_ROW_KEYS),
+        "frozen 13 row keys"
+    );
 }
 
 /// Size further-details count distinct sizes, never completions:

@@ -3510,3 +3510,88 @@ fn key_ops_concise_wrapped_material() {
         "wrapped tally:\n{snapshot}"
     );
 }
+
+/// An established-vs-inferred size mismatch names the single inferred
+/// value with no phantom second side: `conflict_detail` is absent
+/// and `further` is 0, so `-v` renders the bare value (the
+/// established label stands on the row).
+#[test]
+fn key_ops_verbose_size_conflict_established_mismatch() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        10,
+        "rsa_1024",
+        RowInference {
+            family: FamilyState {
+                status: InferredStatus::Inferred,
+                value: Some(KeyFamily::Rsa),
+                completions: 10,
+                value_completions: 10,
+                conflict_value: None,
+                conflict_completions: 0,
+                further: 0,
+                reason: None,
+                further_seen: 0,
+            },
+            size: SizeState {
+                status: InferredStatus::Conflicting,
+                detail: Some((
+                    SizeDetail::Rsa {
+                        size_class: Some(2048),
+                        modulus_bytes: 256,
+                    },
+                    EvidenceTag::SignOutput,
+                )),
+                completions: 10,
+                conflict_detail: None,
+                further: 0,
+                reason: None,
+                further_seen: Vec::new(),
+            },
+        },
+    ));
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&snapshot);
+    let line = block
+        .iter()
+        .find(|line| line.contains("key row"))
+        .expect("one row line");
+    assert!(
+        line.contains("RSA 2048 (from signature length)"),
+        "the inferred value renders:\n{snapshot}"
+    );
+    assert!(
+        !line.contains("more conflicting size"),
+        "no phantom second side:\n{snapshot}"
+    );
+}
+
+/// A forward-filled row with zero completions (operation in flight
+/// at capture end) contributes no valued tally segment: concise
+/// never renders a `probably X: 0` segment.
+#[test]
+fn key_ops_concise_skips_zero_completed_valued_rows() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        0,
+        "unknown",
+        inferred_rsa_2048(1),
+    ));
+    let presentation = key_ops_presentation(observations);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&snapshot);
+    assert!(
+        block.iter().all(|line| !line.contains("probably")),
+        "no zero-count segment:\n{snapshot}"
+    );
+}

@@ -912,6 +912,103 @@ class ObservedRsaTests(unittest.TestCase):
                 with self.assertRaises(ORACLE.OracleRefusal):
                     ORACLE.check_section(mutated)
 
+    def test_oracle_v7_gap_reasons_live_only_in_v7_schema(self):
+        # Both v7-only gap reasons are pinned in the v7 schema file
+        # and absent from the frozen base file (v1-v6 never carry
+        # them: each implies admitted lengths, hence v7 rows).
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v7.schema.json",
+                  encoding="utf-8") as stream:
+            v7 = json.load(stream)["$defs"]["gap_reason"]["enum"]
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations.schema.json",
+                  encoding="utf-8") as stream:
+            base = json.load(stream)["$defs"]["gap_reason"]["enum"]
+        for reason in ("corroboration_mismatch", "wrapped_park_refused"):
+            with self.subTest(reason=reason):
+                self.assertIn(reason, v7)
+                self.assertNotIn(reason, base)
+                self.assertIn(reason, ORACLE.GAP_REASONS)
+
+    def test_h9_v7_section_checks_structurally(self):
+        # v7 shape: the v6 object blocks plus inferred keys on every
+        # key row. The closed size detail refuses malformed shapes;
+        # the v7-only gap reasons qualify beside rows.
+        section = observed("clean.json")
+        section["version"] = 7
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for name, block in (("requested", row["requested"]),
+                                ("established", row["established"])):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None, "source": None,
+                                          "reason": None}
+                for cell_name, cell in block.items():
+                    if cell_name == "parameter_set":
+                        continue
+                    if name == "established" and cell["status"] == "value":
+                        cell["source"] = "query"
+                    else:
+                        cell["source"] = None
+                    cell["reason"] = None
+            row["queries"]["parameter_set"] = "not_queried"
+        for row in section["key_operations"]:
+            row["inferred_family"] = {"status": "inferred", "value": "rsa",
+                                      "completions": 1}
+            row["inferred_size"] = {
+                "status": "inferred",
+                "detail": {"kind": "rsa", "size_class": 2048,
+                           "modulus_bytes": 256,
+                           "evidence": "sign_output"},
+                "completions": 1}
+        with self.subTest("v7 shape checks"):
+            facts = ORACLE.check_section(copy.deepcopy(section))
+            self.assertEqual(len(facts["rows"]), 2)
+            self.assertEqual(len(facts["unknown"]), 0)
+        with self.subTest("malformed size detail refused"):
+            mutated = copy.deepcopy(section)
+            mutated["key_operations"][0]["inferred_size"]["detail"] = {
+                "arbitrary": 1}
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("open size detail refused"):
+            mutated = copy.deepcopy(section)
+            mutated["key_operations"][0]["inferred_size"]["detail"]["bogus"] = 1
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("malformed conflict detail refused"):
+            mutated = copy.deepcopy(section)
+            mutated["key_operations"][0]["inferred_size"]["conflict_detail"] = {
+                "kind": "rsa"}
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("missing inferred keys refused"):
+            mutated = copy.deepcopy(section)
+            del mutated["key_operations"][0]["inferred_size"]
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("v7 without inferred content refused"):
+            mutated = copy.deepcopy(section)
+            for row in mutated["key_operations"]:
+                row["inferred_family"] = {"status": "unknown",
+                                          "value": None, "completions": 0}
+                row["inferred_size"] = {"status": "unknown",
+                                        "detail": None, "completions": 0}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "v7 section without inferred content"):
+                ORACLE.check_section(mutated)
+        with self.subTest("v7 gap reasons qualify"):
+            mutated = copy.deepcopy(section)
+            mutated["gaps"] = {
+                "rows": [
+                    {"subject": "key_operation",
+                     "reason": "corroboration_mismatch", "repeats": 2},
+                    {"subject": "key_operation",
+                     "reason": "wrapped_park_refused", "repeats": 1}],
+                "suppressed": 0}
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(len(facts["gaps"]["rows"]), 2)
+
     def test_h9_v6_section_checks_structurally(self):
         # v6 shape with the cell's RSA key rows: the new-site content
         # rides the object views (key_type 66, value_len 48, hkdf_384

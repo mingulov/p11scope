@@ -2786,6 +2786,14 @@ impl CallerRegistry {
         &self.joint_keyuse
     }
 
+    /// Tests-only: replace the capture-wide key reducer with a
+    /// small-capacity one (N/N+1 twins): the production bound stays
+    /// `KEY_OP_ROW_CAPACITY`.
+    #[cfg(test)]
+    pub(crate) fn set_joint_keyuse_capacity_for_test(&mut self, capacity: usize) {
+        self.joint_keyuse = crate::semantics_key_use::KeyUseReducer::with_capacity(capacity);
+    }
+
     /// Joint calls reduced S1Only-direct for lack of H8 staging.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn joint_direct_fallback(&self) -> u64 {

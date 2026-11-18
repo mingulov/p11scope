@@ -2008,6 +2008,54 @@ class AsyncV6NewsiteTwins(unittest.TestCase):
                 line["seq"] = seq
             return stream
 
+        def check_v6_objects(rows, where):
+            # Producer-shaped v6+ object rows: seven metadata slots
+            # per block, source/reason on every field, seven query
+            # outcomes (the golden v6 contract).
+            fields = ("class", "key_type", "token", "value_len",
+                      "modulus_bits", "ec_params", "parameter_set")
+            self.assertTrue(rows, f"{where} carries object rows")
+            for row in rows:
+                for block_name in ("requested", "established"):
+                    block = row[block_name]
+                    self.assertEqual(set(block), set(fields),
+                                     f"{where}: {block_name} slots")
+                    for name in fields:
+                        self.assertEqual(set(block[name]),
+                                         {"status", "value", "source",
+                                          "reason"},
+                                         f"{where}: {block_name}.{name}")
+                self.assertEqual(set(row["queries"]), set(fields),
+                                 f"{where}: queries slots")
+
+        def check_promotion(stream, snapshot):
+            # A true promotion pass: the single object genuinely
+            # updated (its v7 body differs) at the publication
+            # revision the marker carries.
+            objects = [line for line in stream
+                       if line["kind"] == "object_observed"]
+            marker = next(line for line in stream
+                          if line["kind"] == "pass_committed")
+            by_object = {}
+            for line in objects:
+                by_object.setdefault(line["event"]["row"]["object"],
+                                     []).append(line)
+            self.assertEqual(len(by_object), 1,
+                             "the stream carries one object")
+            lines = sorted(next(iter(by_object.values())),
+                           key=lambda item: item["event"]["revision"])
+            self.assertEqual([item["event"]["version"] for item in lines],
+                             [6, 7])
+            self.assertNotEqual(lines[0]["event"]["row"],
+                                lines[1]["event"]["row"],
+                                "the v7 replacement genuinely updates it")
+            self.assertEqual(lines[1]["event"]["revision"],
+                             marker["event"]["object_revision"],
+                             "the v7 update and the marker share it")
+            check_v6_objects(snapshot["objects"], "snapshot")
+            check_v6_objects([line["event"]["row"] for line in objects],
+                             "stream")
+
         def v7_pair(key_version):
             collision, joint, _single = paired(oracle, "poll_msg")
             v6_objects(joint)
@@ -2046,6 +2094,9 @@ class AsyncV6NewsiteTwins(unittest.TestCase):
                                 for line in objects),
                             "the producer stamps every row, objects "
                             "included, with the publication version")
+            check_v6_objects(joint["objects"], "snapshot")
+            check_v6_objects([line["event"]["row"] for line in objects],
+                             "stream")
             oracle.validate_snapshot(joint, "joint")
             oracle.compare_stream(stream, collision, joint, "joint")
         with self.subTest("mixed v6-to-v7 stream reconciles"):
@@ -2092,16 +2143,7 @@ class AsyncV6NewsiteTwins(unittest.TestCase):
                 elif line["kind"] == "pass_committed":
                     line["event"]["object_version"] = 7
             stream = promote_objects(stream)
-            versions = {}
-            for line in stream:
-                if line["kind"] == "object_observed":
-                    versions.setdefault(line["event"]["row"]["object"],
-                                        []).append(line["event"]["version"])
-            self.assertTrue(versions, "the stream carries object rows")
-            self.assertTrue(all(sorted(seen) == [6, 7]
-                                for seen in versions.values()),
-                            "each object rides an early v6 revision "
-                            "plus a v7 replacement")
+            check_promotion(stream, joint)
             oracle.validate_snapshot(joint, "joint")
             oracle.compare_stream(stream, collision, joint, "joint")
         with self.subTest("future version still refused"):

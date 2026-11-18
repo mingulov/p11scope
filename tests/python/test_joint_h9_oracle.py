@@ -1037,6 +1037,61 @@ class StreamTwins(unittest.TestCase):
                 row["inferred_size"] = size
             return v6_objects(snapshot)
 
+        def check_v6_objects(rows, where):
+            # Producer-shaped v6+ object rows: seven metadata slots
+            # per block, source/reason on every field, seven query
+            # outcomes (the golden v6 contract).
+            fields = ("class", "key_type", "token", "value_len",
+                      "modulus_bits", "ec_params", "parameter_set")
+            self.assertTrue(rows, f"{where} carries object rows")
+            for row in rows:
+                for block_name in ("requested", "established"):
+                    block = row[block_name]
+                    self.assertEqual(set(block), set(fields),
+                                     f"{where}: {block_name} slots")
+                    for name in fields:
+                        self.assertEqual(set(block[name]),
+                                         {"status", "value", "source",
+                                          "reason"},
+                                         f"{where}: {block_name}.{name}")
+                self.assertEqual(set(row["queries"]), set(fields),
+                                 f"{where}: queries slots")
+
+        def check_promotion(stream, snapshot):
+            # A true promotion pass: one object genuinely updated (its
+            # v7 body differs) at the publication revision the marker
+            # carries; every other object retains its single v6
+            # record (the emitter skips unchanged rows).
+            objects = [line for line in stream
+                       if line["kind"] == "object_observed"]
+            marker = next(line for line in stream
+                          if line["kind"] == "pass_committed")
+            by_object = {}
+            for line in objects:
+                by_object.setdefault(line["event"]["row"]["object"],
+                                     []).append(line)
+            updated = [oid for oid, lines in by_object.items()
+                       if len(lines) > 1]
+            self.assertEqual(len(updated), 1,
+                             "one object updates in the promotion pass")
+            lines = sorted(by_object[updated[0]],
+                           key=lambda item: item["event"]["revision"])
+            self.assertEqual([item["event"]["version"] for item in lines],
+                             [6, 7])
+            self.assertNotEqual(lines[0]["event"]["row"],
+                                lines[1]["event"]["row"],
+                                "the v7 replacement genuinely updates it")
+            self.assertEqual(lines[1]["event"]["revision"],
+                             marker["event"]["object_revision"],
+                             "the v7 update and the marker share it")
+            for oid, lines in by_object.items():
+                if oid != updated[0]:
+                    self.assertEqual(len(lines), 1)
+                    self.assertEqual(lines[0]["event"]["version"], 6)
+            check_v6_objects(snapshot["objects"], "snapshot")
+            check_v6_objects([line["event"]["row"] for line in objects],
+                             "stream")
+
         def promote_objects(stream):
             # An early v6 object revision plus a v7 replacement tied
             # to the promotion pass the marker announces.
@@ -1099,6 +1154,9 @@ class StreamTwins(unittest.TestCase):
                                 for line in objects),
                             "the producer stamps every row, objects "
                             "included, with the publication version")
+            check_v6_objects(snapshot["objects"], "snapshot")
+            check_v6_objects([line["event"]["row"] for line in objects],
+                             "stream")
             oracle.validate_snapshot(snapshot)
             oracle.compare_stream(stream, [first, second], snapshot)
         with self.subTest("mixed v6-to-v7 stream reconciles"):
@@ -1143,16 +1201,7 @@ class StreamTwins(unittest.TestCase):
                 row["inferred_family"]["completions"] = row["completed"]
                 row["inferred_size"]["completions"] = row["completed"]
             stream = promote_objects(stream)
-            versions = {}
-            for line in stream:
-                if line["kind"] == "object_observed":
-                    versions.setdefault(line["event"]["row"]["object"],
-                                        []).append(line["event"]["version"])
-            self.assertTrue(versions, "the stream carries object rows")
-            self.assertTrue(all(sorted(seen) == [6, 7]
-                                for seen in versions.values()),
-                            "each object rides an early v6 revision "
-                            "plus a v7 replacement")
+            check_promotion(stream, snapshot)
             oracle.validate_snapshot(snapshot)
             oracle.compare_stream(stream, [first, second], snapshot)
         with self.subTest("future version still refused"):

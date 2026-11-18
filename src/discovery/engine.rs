@@ -810,8 +810,9 @@ pub struct Engine {
     /// The capture's operator-stop flag, checked between work items.
     cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Shared teardown-deferral budget for the current pass / tick: at most
-    /// 1 s of teardown waiting in total. Reset at each pass/tick entry;
-    /// scans charge it via `scan_and_pin_with_proof`.
+    /// 1 s of teardown waiting in total. Owned per pass through
+    /// `begin_teardown_pass` at each pass entry; scans charge it via
+    /// `scan_and_pin_with_proof`.
     teardown_deferral: TeardownDeferralBudget,
     scope: Scope,
     hooks: HookRegistry,
@@ -7709,6 +7710,27 @@ impl TeardownDeferralBudget {
 impl Default for TeardownDeferralBudget {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Engine {
+    /// Starts one discovery pass's shared teardown-deferral budget.
+    ///
+    /// The single owner of the per-pass budget: every dispatch pass that
+    /// can scan calls this exactly once at its entry, before any scan — a
+    /// discovery batch (`apply_discovery_batch_inner`, covering its record,
+    /// pending-loader, arm-catch-up and terminal phases), a backlog quantum
+    /// (`service_backlog_quantum_inner`), a collected-finish pass
+    /// (`service_collected_finish_records_inner`, covering its record and
+    /// terminal-batch drains), an inventory tick (`refresh_inventory`, which
+    /// reseeds its own window even nested in a batch), and an owned-tree
+    /// watch run (`owned_tree_watch`). The initial discover pass
+    /// (`discover_plan`) keeps its equivalent inline reset: source-needle
+    /// tests pin its exact text. Scans share the pass budget through the
+    /// field; the next pass's call discards the leftover, so no pass
+    /// inherits a spent budget and files false loud gaps.
+    fn begin_teardown_pass(&mut self) {
+        self.teardown_deferral = TeardownDeferralBudget::new();
     }
 }
 
@@ -22811,7 +22833,7 @@ impl Engine {
         let wall_start = crate::attach::monotonic_ns();
         let budget_ns = self.owned_watch_run_budget_ns;
         // One shared teardown-deferral budget for this watch run.
-        self.teardown_deferral = TeardownDeferralBudget::new();
+        self.begin_teardown_pass();
         for (index, pid) in picks.into_iter().enumerate() {
             let wall_now = wall_start.and_then(|_| crate::attach::monotonic_ns());
             if index > 0
@@ -32628,7 +32650,7 @@ impl Engine {
         self.inventory_passes = self.inventory_passes.saturating_add(1);
         // One shared teardown-deferral budget for this tick: at most 1 s of
         // teardown waiting in total across every scan the tick runs.
-        self.teardown_deferral = TeardownDeferralBudget::new();
+        self.begin_teardown_pass();
         // Fix7: the handle baseline for the end-of-tick
         // release observation — only while a handles-deferred retry
         // pends, so idle ticks pay one `is_empty` for the whole round.
@@ -38246,6 +38268,10 @@ impl Engine {
         transport_at_q: bool,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<BacklogOutcome> {
+        // The finish pass owns its budget on both drains below (record
+        // dispatch and terminal batch): their loader scans inherit the
+        // previous tick's spent budget without this reset.
+        self.begin_teardown_pass();
         let fresh = records.len().saturating_add(malformed as usize);
         self.charge_discovery_drain(records.len(), malformed);
         self.record_malformed_discovery(malformed);
@@ -38690,6 +38716,10 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<BacklogOutcome> {
+        // The backlog quantum owns its pass budget like a batch: its record
+        // dispatch scans loader views, so a quantum after a spent tick files
+        // false loud gaps without this reset.
+        self.begin_teardown_pass();
         if self.pending_global_retirement.is_some() || self.global_retirement_frame_owed {
             // Deferring mutation does not defer absolute producer-loss reads.
             self.update_counter_snapshot(session)?;
@@ -38972,10 +39002,10 @@ impl Engine {
     ) -> Result<DiscoveryBatchOutcome> {
         // One shared teardown-deferral budget for this batch: the record
         // and loader phases below scan before the inventory tick's own
-        // reset (which is also conditional on the tick running), so the
-        // budget resets here or loader scans inherit the previous tick's
-        // spent budget and file false loud gaps on busy hosts.
-        self.teardown_deferral = TeardownDeferralBudget::new();
+        // window (which is also conditional on the tick running), so the
+        // pass owns its budget here or loader scans inherit the previous
+        // tick's spent budget and file false loud gaps on busy hosts.
+        self.begin_teardown_pass();
         self.charge_discovery_drain(records.len(), malformed);
         self.held_records = if self.pause_owned_batch {
             records.iter().map(held_record_key).collect()

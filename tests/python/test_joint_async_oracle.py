@@ -1973,39 +1973,55 @@ class AsyncV6NewsiteTwins(unittest.TestCase):
             )
 
         def v6_objects(snapshot):
-            # Producer-shaped v7 object rows inherit the v6 metadata
-            # fields (parameter_set in both blocks and queries).
+            # Producer-shaped v6+ object rows: seven metadata slots
+            # per block, source/reason on every field (requested
+            # proofs are null; established values carry their query
+            # proof), seven query outcomes.
             for row in snapshot["objects"]:
                 for block in (row["requested"], row["established"]):
+                    for field in block.values():
+                        field["source"] = None
+                        field["reason"] = None
                     block["parameter_set"] = {"status": "unknown",
-                                              "value": None}
+                                              "value": None,
+                                              "source": None,
+                                              "reason": None}
+                for field in row["established"].values():
+                    if field["status"] == "value":
+                        field["source"] = "query"
                 row["queries"]["parameter_set"] = "not_queried"
             return snapshot
 
-        def promote_objects(stream):
-            # An early v6 object revision plus a v7 replacement tied
-            # to the promotion pass the marker announces.
+        def promote_objects(stream, snapshot):
+            # A true promotion pass: the object genuinely updates
+            # (another reference lands, so the body differs) at a new
+            # publication revision carried by the v7 event and the
+            # marker alike, and the snapshot reconciles to it.
             revisions = [line["event"]["revision"] for line in stream
                          if line["kind"] in ("object_observed",
                                              "key_operations_observed")]
+            new_revision = max(revisions) + 1
             at_ns = max(line["at_ns"] for line in stream
                         if line["kind"] == "key_operations_observed") + 50
-            replacements = []
-            for line in stream:
-                if line["kind"] == "object_observed":
-                    replacements.append(
-                        {"schema": "p11scope/inventory-events/v1",
-                         "seq": 0, "at_ns": at_ns,
-                         "kind": "object_observed",
-                         "event": {"revision": max(revisions) + 1,
-                                   "version": 7,
-                                   "row": copy.deepcopy(
-                                       line["event"]["row"])}})
+            first = next(line for line in stream
+                         if line["kind"] == "object_observed")
+            updated = copy.deepcopy(first["event"]["row"])
+            updated["successful_references"] += 1
+            updated["successful_key_references"] += 1
+            replacement = {"schema": "p11scope/inventory-events/v1",
+                           "seq": 0, "at_ns": at_ns,
+                           "kind": "object_observed",
+                           "event": {"revision": new_revision,
+                                     "version": 7, "row": updated}}
             marker = next(index for index, line in enumerate(stream)
                           if line["kind"] == "pass_committed")
-            stream[marker:marker] = replacements
+            stream.insert(marker, replacement)
+            stream[marker + 1]["event"]["object_revision"] = new_revision
             for seq, line in enumerate(stream):
                 line["seq"] = seq
+            for row in snapshot["objects"]:
+                if row["object"] == updated["object"]:
+                    row.update(copy.deepcopy(updated))
             return stream
 
         def check_v6_objects(rows, where):
@@ -2142,7 +2158,7 @@ class AsyncV6NewsiteTwins(unittest.TestCase):
                         line["event"]["version"] = 6
                 elif line["kind"] == "pass_committed":
                     line["event"]["object_version"] = 7
-            stream = promote_objects(stream)
+            stream = promote_objects(stream, joint)
             check_promotion(stream, joint)
             oracle.validate_snapshot(joint, "joint")
             oracle.compare_stream(stream, collision, joint, "joint")

@@ -1018,12 +1018,22 @@ class StreamTwins(unittest.TestCase):
             )
 
         def v6_objects(snapshot):
-            # Producer-shaped v7 object rows inherit the v6 metadata
-            # fields (parameter_set in both blocks and queries).
+            # Producer-shaped v6+ object rows: seven metadata slots
+            # per block, source/reason on every field (requested
+            # proofs are null; established values carry their query
+            # proof), seven query outcomes.
             for row in snapshot["objects"]:
                 for block in (row["requested"], row["established"]):
+                    for field in block.values():
+                        field["source"] = None
+                        field["reason"] = None
                     block["parameter_set"] = {"status": "unknown",
-                                              "value": None}
+                                              "value": None,
+                                              "source": None,
+                                              "reason": None}
+                for field in row["established"].values():
+                    if field["status"] == "value":
+                        field["source"] = "query"
                 row["queries"]["parameter_set"] = "not_queried"
             return snapshot
 
@@ -1092,30 +1102,38 @@ class StreamTwins(unittest.TestCase):
             check_v6_objects([line["event"]["row"] for line in objects],
                              "stream")
 
-        def promote_objects(stream):
-            # An early v6 object revision plus a v7 replacement tied
-            # to the promotion pass the marker announces.
+        def promote_objects(stream, snapshot):
+            # A true promotion pass: the first object genuinely
+            # updates (another reference lands, so the body differs)
+            # at a new publication revision carried by the v7 event
+            # and the marker alike; every other object retains its
+            # v6 record (the emitter skips unchanged rows), and the
+            # snapshot reconciles to the last carried row per object.
             revisions = [line["event"]["revision"] for line in stream
                          if line["kind"] in ("object_observed",
                                              "key_operations_observed")]
+            new_revision = max(revisions) + 1
             at_ns = max(line["at_ns"] for line in stream
                         if line["kind"] == "key_operations_observed") + 50
-            replacements = []
-            for line in stream:
-                if line["kind"] == "object_observed":
-                    replacements.append(
-                        {"schema": "p11scope/inventory-events/v1",
-                         "seq": 0, "at_ns": at_ns,
-                         "kind": "object_observed",
-                         "event": {"revision": max(revisions) + 1,
-                                   "version": 7,
-                                   "row": copy.deepcopy(
-                                       line["event"]["row"])}})
+            first = next(line for line in stream
+                         if line["kind"] == "object_observed")
+            updated = copy.deepcopy(first["event"]["row"])
+            updated["successful_references"] += 1
+            updated["successful_key_references"] += 1
+            replacement = {"schema": "p11scope/inventory-events/v1",
+                           "seq": 0, "at_ns": at_ns,
+                           "kind": "object_observed",
+                           "event": {"revision": new_revision,
+                                     "version": 7, "row": updated}}
             marker = next(index for index, line in enumerate(stream)
                           if line["kind"] == "pass_committed")
-            stream[marker:marker] = replacements
+            stream.insert(marker, replacement)
+            stream[marker + 1]["event"]["object_revision"] = new_revision
             for seq, line in enumerate(stream):
                 line["seq"] = seq
+            for row in snapshot["objects"]:
+                if row["object"] == updated["object"]:
+                    row.update(copy.deepcopy(updated))
             return stream
 
         def v7_stream(snapshot, key_version):
@@ -1200,7 +1218,7 @@ class StreamTwins(unittest.TestCase):
             for row in snapshot["key_operations"]:
                 row["inferred_family"]["completions"] = row["completed"]
                 row["inferred_size"]["completions"] = row["completed"]
-            stream = promote_objects(stream)
+            stream = promote_objects(stream, snapshot)
             check_promotion(stream, snapshot)
             oracle.validate_snapshot(snapshot)
             oracle.compare_stream(stream, [first, second], snapshot)

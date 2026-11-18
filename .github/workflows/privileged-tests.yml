@@ -686,10 +686,11 @@ jobs:
             ${{ runner.temp }}/privileged-out/run/logs/
           if-no-files-found: warn
           retention-days: 7
-  # The btrfs campaign: the 16 cells that need TMPDIR on btrfs. The
+  # The btrfs campaign: the 18 cells that need TMPDIR on btrfs. The
   # curated runner loop-mounts its own image for them (no ambient
-  # btrfs needed) and tears it down afterwards; the cleanup step
-  # re-runs the idempotent teardown so a mount never leaks past the job.
+  # btrfs needed), stages the two-subvolume pair on it, and tears it
+  # down afterwards; the cleanup step re-runs the idempotent teardown
+  # so a mount never leaks past the job.
   # The discover btrfs-subvolume cell rides the same job on a second
   # loop mount, as the runner user (the fence refuses root).
   privileged-btrfs:

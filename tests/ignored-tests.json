@@ -2375,6 +2375,12 @@
       "path": "attach::tests::refused_downgrade_commit_disputes_identical_slot_revalidation_lp64",
       "reason": "privileged: refused downgrade commit disputes identical-slot revalidation",
       "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/identity.rs",
+      "path": "discovery::identity::tests::btrfs_live_two_subvolumes_merge_per_file",
+      "reason": "privileged: btrfs two-subvolume merge lock, staged by the btrfs campaign (root, loop-mounted btrfs)",
+      "cell": "privileged"
     }
   ]
 }

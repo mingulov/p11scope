@@ -107,13 +107,15 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Btrfs group (--include-btrfs): the 16 cells that assert TMPDIR is on
+# Btrfs group (--include-btrfs): the 18 cells that run with TMPDIR on
 # btrfs. The runner loop-mounts one btrfs image for the group
 # (scripts/ci/prepare-btrfs-tmpdir.sh), runs those cells with TMPDIR
-# pointed at the mount, and unmounts it afterwards. Without mkfs.btrfs
-# (or loop/btrfs support) the cells SKIP with a reason. The same mount
-# is also provided to the two btrfs-needing expected-failure cells so
-# their XFAIL reflects the named gate failure.
+# pointed at the mount, and unmounts it afterwards. The two-subvolume
+# pair cell additionally reads its staged ELFs from the mount (the
+# runner creates the subvolumes). Without mkfs.btrfs (or loop/btrfs
+# support) the cells SKIP with a reason. The same mount is also
+# provided to the two btrfs-needing expected-failure cells so their
+# XFAIL reflects the named gate failure.
 #
 # Expected-failure group (--include-expected-failures): known-failing
 # reproducers. A failing cell records XFAIL (counts as passed); a passing
@@ -933,6 +935,16 @@ discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_p
 discovery::sweep_attribution::tests::privileged_btrfs_equal_pin_twins_use_their_own_inspections
 discovery::sweep_attribution::tests::privileged_btrfs_snapshot_twins_do_not_merge
 discovery::unbound_exe::tests::privileged_btrfs_subvolume_collision_resolves_ambiguous
+discovery::identity::tests::btrfs_live_two_subvolumes_merge_per_file
+)
+
+# Cells reading the staged two-subvolume pair: the runner creates two
+# subvolumes on the btrfs loop mount, copies one ELF seed into each,
+# and exports their paths as P11SCOPE_TEST_BTRFS_FILES for these cells
+# only. Every member must also be curated in BTRFS_TESTS above, so the
+# mount exists and a missing mount SKIPs the cell with a reason.
+BTRFS_PAIR_TESTS=(
+discovery::identity::tests::btrfs_live_two_subvolumes_merge_per_file
 )
 
 # Btrfs TMPDIR provisioning also covers these expected-failure cells,
@@ -1599,11 +1611,12 @@ main() {
     local need_counter=0 counter_skip=
     local need_wrap=0 wrap_skip=
     local need_btrfs_run=0 btrfs_mnt='' btrfs_skip=''
+    local need_btrfs_pair=0 btrfs_pair_files=''
     local need_target_tmp=0 target_tmpdir=
     local need_getter_static=0
     local cell_tmpdir
     local -A counter_fixture_set=() wrap_fixture_set=() btrfs_set=() xfail_reason=() xfail_sig=()
-    local -A owned_child_tmp_set=() getter_static_set=()
+    local -A owned_child_tmp_set=() getter_static_set=() btrfs_pair_set=()
     local -a cell_env=()
 
     if [ $# -eq 0 ]; then
@@ -1847,6 +1860,7 @@ main() {
     for name in "${COUNTER_FIXTURE_TESTS[@]}"; do counter_fixture_set[$name]=1; done
     for name in "${WRAP_FIXTURE_TESTS[@]}"; do wrap_fixture_set[$name]=1; done
     for name in "${BTRFS_TESTS[@]}" "${BTRFS_TMPDIR_XFAIL_TESTS[@]}"; do btrfs_set[$name]=1; done
+    for name in "${BTRFS_PAIR_TESTS[@]}"; do btrfs_pair_set[$name]=1; done
     for name in "${OWNED_CHILD_TMP_TESTS[@]}"; do owned_child_tmp_set[$name]=1; done
     for name in "${GETTER_STATIC_TESTS[@]}"; do getter_static_set[$name]=1; done
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
@@ -1857,6 +1871,7 @@ main() {
         if [ -n "${counter_fixture_set[$name]+present}" ]; then need_counter=1; fi
         if [ -n "${wrap_fixture_set[$name]+present}" ]; then need_wrap=1; fi
         if [ -n "${btrfs_set[$name]+present}" ]; then need_btrfs_run=1; fi
+        if [ -n "${btrfs_pair_set[$name]+present}" ]; then need_btrfs_pair=1; fi
         if [ -n "${owned_child_tmp_set[$name]+present}" ]; then need_target_tmp=1; fi
         if [ -n "${getter_static_set[$name]+present}" ]; then need_getter_static=1; fi
     done
@@ -1926,6 +1941,33 @@ main() {
             BTRFS_TEARDOWN_MNT=$outdir/btrfs-mnt
             trap cleanup_btrfs_mount EXIT
         fi
+    fi
+    if [ "$need_btrfs_pair" -eq 1 ] && [ -z "$btrfs_skip" ]; then
+        # One ELF seed on each of two subvolumes for the pair cells.
+        # The tools are present here (the mount succeeded), so a
+        # staging failure fails the run loudly instead of skipping:
+        # the pair cell fails closed on a missing variable, and a
+        # silent single-subvolume fallback would fail its
+        # distinct-subvolume assertion anyway.
+        btrfs_pair_source=
+        for candidate in /bin/true /usr/bin/true /bin/sh; do
+            if [ -f "$candidate" ]; then btrfs_pair_source=$candidate; break; fi
+        done
+        if [ -z "$btrfs_pair_source" ]; then
+            echo "$PROG: cannot stage the btrfs pair: no ELF seed among /bin/true /usr/bin/true /bin/sh" >&2
+            return 1
+        fi
+        if ! btrfs subvolume create "$btrfs_mnt/subvol-a" >/dev/null 2>&1 \
+            || ! btrfs subvolume create "$btrfs_mnt/subvol-b" >/dev/null 2>&1; then
+            echo "$PROG: cannot create btrfs subvolumes under $btrfs_mnt" >&2
+            return 1
+        fi
+        if ! cp "$btrfs_pair_source" "$btrfs_mnt/subvol-a/probe-a" 2>/dev/null \
+            || ! cp "$btrfs_pair_source" "$btrfs_mnt/subvol-b/probe-b" 2>/dev/null; then
+            echo "$PROG: cannot stage the btrfs pair ELFs under $btrfs_mnt" >&2
+            return 1
+        fi
+        btrfs_pair_files=$btrfs_mnt/subvol-a/probe-a:$btrfs_mnt/subvol-b/probe-b
     fi
 
     # Opt-in tolerances are declared in the results, never applied silently.
@@ -2026,6 +2068,13 @@ main() {
                 continue
             fi
             cell_tmpdir=$btrfs_mnt
+        fi
+        if [ -n "${btrfs_pair_set[$name]+present}" ]; then
+            if [ -z "$btrfs_pair_files" ]; then
+                echo "$PROG: btrfs pair staging is missing for $name" >&2
+                return 1
+            fi
+            cell_env+=(P11SCOPE_TEST_BTRFS_FILES="$btrfs_pair_files")
         fi
         if [ -n "${owned_child_tmp_set[$name]+present}" ]; then
             cell_env+=(CARGO_TARGET_TMPDIR="$target_tmpdir")

@@ -2755,6 +2755,34 @@ mod tests {
         );
     }
 
+    /// AES-KW admission bound: material through
+    /// [`WRAPPED_MATERIAL_MAX`] sizes the wrapped key; above it the
+    /// length is unsupported with the admission-bound reason (the
+    /// RSA 64..=2048 anti-alias precedent).
+    #[test]
+    fn wrapped_material_admission_bound() {
+        use EvidenceTag::{UnwrapInput, WrapOutput};
+        assert_eq!(
+            classify_size(Some(AES_KW_ID), WrapOutput, WRAPPED_MATERIAL_MAX + 8),
+            SizeOutcome::Inferred(SizeDetail::WrappedMaterial {
+                material_octets: WRAPPED_MATERIAL_MAX,
+                octets: WRAPPED_MATERIAL_MAX + 8,
+            })
+        );
+        assert_eq!(
+            classify_size(Some(AES_KW_ID), WrapOutput, WRAPPED_MATERIAL_MAX + 9),
+            SizeOutcome::Unsupported {
+                reason: REASON_OUTSIDE_ADMISSION_BOUND
+            }
+        );
+        assert_eq!(
+            classify_size(Some(AES_KW_ID), UnwrapInput, WRAPPED_MATERIAL_MAX + 9),
+            SizeOutcome::Unsupported {
+                reason: REASON_OUTSIDE_ADMISSION_BOUND
+            }
+        );
+    }
+
     /// Category to evidence-kind mapping (reducer seam vocabulary).
     #[test]
     fn evidence_tags() {

@@ -30752,3 +30752,236 @@ fn key_operation_schema_v7_detail_validates_closed_variants() {
         "an RSA detail with an arbitrary class is refused"
     );
 }
+
+/// A proved row with blank inference beside a v7-only gap: the
+/// section still promotes to v7, and every proved row keeps (and
+/// renders) its blank inferred blocks — the snapshot, the stream
+/// rows and the row envelope share one version decision.
+#[test]
+fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
+    use crate::key_operation_projection::contract::KEY_ROW_KEYS_V7;
+    use crate::key_operation_projection::producer::commit;
+    let ids = KeymetaCtx::object_ids(3);
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    let mut sink = Vec::new();
+    let mut ledger = StagingLedger::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    // The proved row: a sign still active, no completion, hence no
+    // inferred evidence either way.
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    let start = init("C_SignInit", 7, RSA_PKCS, 50);
+    let origin = EffectOrigin::from(&start);
+    let before = sink.len();
+    edge.observe_joint(&start, &origin, &[receipt], &mut sink);
+    assert_eq!(sink.len(), before + 1, "the sign starts");
+    for effect in &sink[before..] {
+        keyuse.observe_effect(instance, effect, Some(&mut ledger), None);
+    }
+    for (n, view) in [ids[1], ids[2]].into_iter().enumerate() {
+        let mut receipt =
+            KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+        receipt.attribution_valid = false;
+        let mut c = call("C_UnwrapKey", 7, CkRv::OK.0, 100 + n as u64 * 100);
+        c.mechanism = 0x2109;
+        c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NONE;
+        let origin = EffectOrigin::from(&c);
+        let before = sink.len();
+        edge.observe_joint_with_resources(
+            &c,
+            &origin,
+            &[receipt],
+            &CompletionEvidence {
+                length: Some(LengthOutcome::Value(32)),
+                fresh_view: Some(view.as_u64()),
+            },
+            &mut sink,
+        )
+        .expect("replay");
+        assert_eq!(sink.len(), before + 1, "unwrap {n} emits");
+        let effect = sink.last().cloned().expect("effect");
+        keyuse.observe_effect(instance, &effect, Some(&mut ledger), None);
+    }
+    let evidence = keyuse.key_use_evidence();
+    assert_eq!(evidence.parked_refused, 1);
+    assert!(
+        !evidence.partial,
+        "a refused park is inference-side, never row loss"
+    );
+    assert_eq!(
+        keyuse.aggregates().len(),
+        1,
+        "the active sign holds its proved row"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    assert_eq!(committed.reason, "none");
+    assert_eq!(committed.key_operations.len(), 1);
+    let row = &committed.key_operations[0];
+    assert_eq!((row.started, row.active), (1, 1));
+    let inferred = row
+        .inferred
+        .as_ref()
+        .expect("gap-driven v7 keeps blank inferred blocks");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(inferred.family.completions, 0);
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(inferred.size.completions, 0);
+    let gap = committed
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "wrapped_park_refused")
+        .expect("the refusal publishes as a named gap");
+    assert_eq!(gap.subject, "key_operation");
+    assert_eq!(gap.repeats, 1);
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        7,
+        "a v7-only gap promotes its section to v7"
+    );
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(section["version"], 7);
+    let rendered = &section["key_operations"][0];
+    let mut keys: Vec<String> = rendered
+        .as_object()
+        .expect("row object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    let mut want: Vec<String> = KEY_ROW_KEYS_V7.iter().map(|key| key.to_string()).collect();
+    want.sort();
+    assert_eq!(keys, want, "gap-driven v7 rows carry all 15 keys");
+    assert_eq!(rendered["inferred_family"]["status"], "unknown");
+    assert_eq!(rendered["inferred_size"]["status"], "unknown");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v7.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // The emitted row validates against the selected (v7) schema's
+    // key-row shape through its real references: full-section
+    // validation needs the policy budgets limit, which the
+    // capacity-1 refusal twin cannot carry, so the checker twins
+    // assert the whole section instead.
+    let mut row_schema = serde_json::json!({"$ref": "#/$defs/key_row"});
+    row_schema["$defs"] = schema_file["$defs"].clone();
+    let validator = jsonschema::options()
+        .build(&row_schema)
+        .expect("v7 key-row schema builds");
+    assert!(
+        validator.is_valid(rendered),
+        "the gap-driven v7 row validates against the v7 key-row schema"
+    );
+}
+
+/// Repeat AES-KW wraps of one proved view count distinct wrapped
+/// sizes exactly past the retention cap: the first two stay pinned
+/// with their evidence tags and repeats never recount.
+#[test]
+fn keymeta_wrapped_further_stays_distinct_past_cap() {
+    use crate::keymeta::AES_KW_ID;
+    use crate::semantics_key_use::{SizeInput, SizeState};
+    let mut state = SizeState::default();
+    let mut lengths: Vec<u64> = (24u64..=552u64).step_by(8).collect();
+    lengths.push(552);
+    lengths.push(552);
+    assert_eq!(lengths.len(), 69, "67 distinct plus two repeats");
+    for length in lengths {
+        state.accumulate_size(
+            None,
+            None,
+            Some(AES_KW_ID),
+            Some(EvidenceTag::WrapOutput),
+            SizeInput::Value(length),
+        );
+    }
+    assert_eq!(state.status, InferredStatus::Conflicting);
+    assert_eq!(state.completions, 69);
+    assert_eq!(
+        state.detail.as_ref(),
+        Some(&(
+            SizeDetail::WrappedMaterial {
+                material_octets: 16,
+                octets: 24,
+            },
+            EvidenceTag::WrapOutput,
+        )),
+        "the first wrap stays pinned with its tag"
+    );
+    assert_eq!(
+        state.conflict_detail.as_ref(),
+        Some(&(
+            SizeDetail::WrappedMaterial {
+                material_octets: 24,
+                octets: 32,
+            },
+            EvidenceTag::WrapOutput,
+        )),
+        "the second wrap stays pinned with its tag"
+    );
+    assert_eq!(
+        state.further, 65,
+        "65 additional distinct values, repeats never recount"
+    );
+}
+
+/// A legacy CKK_EC key with an established X25519 curve freezes both
+/// the raw type and the combined label (the production shape); the
+/// combined label keeps governing compatibility, so an ECDSA
+/// completion conflicts on family and size together.
+#[test]
+fn keymeta_legacy_combined_label_conflicts_family_and_size() {
+    const ECDSA: u64 = 0x1041;
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let mut receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_SignInit",
+        0,
+        KeyRole::OperationKey,
+        Some(KeyLabel::Ec {
+            curve: SafeCurve::X25519,
+        }),
+    );
+    receipt.key_type = Some(0x03);
+    let id = ctx.start("C_SignInit", 7, Some(ECDSA), &[receipt], 100);
+    let end = ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    assert_eq!(ended(&end).0, id);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "x25519")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    assert_eq!(
+        inferred.family.status,
+        InferredStatus::Conflicting,
+        "ECDSA on a Montgomery-labeled key conflicts"
+    );
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Ec {
+            curve: "p256",
+            octets: 64,
+        })
+    );
+    assert_eq!(
+        inferred.size.status,
+        InferredStatus::Conflicting,
+        "the size gate agrees with the family gate"
+    );
+}

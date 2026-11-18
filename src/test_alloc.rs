@@ -13,17 +13,21 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 
-// Const-initialized and without a destructor, so reading these inside the
-// allocator neither allocates nor fails during thread teardown.
+// Const-initialized small flags, so reading these inside the allocator
+// neither allocates nor fails during thread teardown. The tracker's
+// table is NEVER static TLS: at 16384 entries it is 384 KiB, and
+// static TLS is carved from every thread stack — the 256 KiB confirm
+// workers (and every other small-stack lane) would start below their
+// own stack base. Instead each arm heap-allocates one table while
+// unarmed (untracked, no recursion) and drops it at disarm; unarmed
+// threads hold None.
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static ALLOCS: Cell<usize> = const { Cell::new(0) };
     static ALLOC_BYTES: Cell<usize> = const { Cell::new(0) };
     static PEAK_ARMED: Cell<bool> = const { Cell::new(false) };
     static PEAK_INCOMPLETE: Cell<bool> = const { Cell::new(false) };
-    // TLS contains the array directly: arming does not allocate a table or
-    // construct a large array on the test's stack.
-    static PEAK: RefCell<RequestedTracker> = const { RefCell::new(RequestedTracker::new()) };
+    static PEAK: RefCell<Option<Box<RequestedTracker>>> = const { RefCell::new(None) };
 }
 
 /// Count one fresh heap block of `size` bytes when this thread is armed.
@@ -48,14 +52,6 @@ struct RequestedBlock {
     state: u8,
 }
 
-impl RequestedBlock {
-    const EMPTY: Self = Self {
-        pointer: 0,
-        bytes: 0,
-        state: 0,
-    };
-}
-
 /// Requested sizes of successful allocations made while armed, rather
 /// than allocator usable sizes or process RSS. Baseline blocks are excluded.
 /// `realloc_overlap_bytes` also allows the old and new tracked requests to
@@ -76,23 +72,15 @@ struct RequestedTracker {
 }
 
 impl RequestedTracker {
-    const fn new() -> Self {
-        Self {
-            blocks: [RequestedBlock::EMPTY; TRACKED_BLOCK_LIMIT],
-            result: RequestedAllocationPeak {
-                live_bytes: 0,
-                peak_bytes: 0,
-                realloc_overlap_bytes: 0,
-                live_blocks: 0,
-                failed_requests: 0,
-                incomplete: false,
-            },
-        }
-    }
-
-    fn reset(&mut self) {
-        self.blocks.fill(RequestedBlock::EMPTY);
-        self.result = RequestedAllocationPeak::default();
+    /// One fresh table on the heap. All-zero memory is a valid reset
+    /// state — every block reads empty (`state` 0) and every report
+    /// counter reads zero — so arming never constructs a 384 KiB
+    /// temporary on the arming stack either.
+    fn new_boxed() -> Box<Self> {
+        // SAFETY: a zeroed RequestedBlock is empty (pointer 0, bytes
+        // 0, state 0) and a zeroed RequestedAllocationPeak is its
+        // default, so a zeroed box is a fully initialized tracker.
+        unsafe { Box::<Self>::new_zeroed().assume_init() }
     }
 
     fn start(pointer: usize) -> usize {
@@ -190,16 +178,40 @@ impl RequestedTracker {
     }
 }
 
+/// Install one fresh table; call only while unarmed, so the
+/// allocation itself stays untracked and cannot recurse into the probe.
+fn install_peak_table() {
+    PEAK.with(|tracker| {
+        *tracker.borrow_mut() = Some(RequestedTracker::new_boxed());
+    });
+}
+
+/// Drop the armed table after disarm and return its report (a default
+/// incomplete report when no table is installed — defensive only).
+fn take_peak_table() -> RequestedAllocationPeak {
+    let table = PEAK.with(|tracker| tracker.borrow_mut().take());
+    match table {
+        Some(table) => table.result,
+        None => RequestedAllocationPeak {
+            incomplete: true,
+            ..RequestedAllocationPeak::default()
+        },
+    }
+}
+
 fn note_peak(run: impl FnOnce(&mut RequestedTracker)) {
     if !PEAK_ARMED.try_with(Cell::get).unwrap_or(false) {
         return;
     }
     let complete = PEAK
         .try_with(|tracker| match tracker.try_borrow_mut() {
-            Ok(mut tracker) => {
-                run(&mut tracker);
-                true
-            }
+            Ok(mut tracker) => match tracker.as_mut() {
+                Some(table) => {
+                    run(table);
+                    true
+                }
+                None => false,
+            },
             Err(_) => false,
         })
         .unwrap_or(false);
@@ -284,7 +296,7 @@ impl Drop for AllocationProbeGuard {
 /// the same allocator entry points, so one armed scope driving both is
 /// not nesting — it is one run, two readouts. Returns the value, the
 /// peak report, and the cumulative `(requests, requested_bytes)`. Small
-/// stages only: the peak report still goes incomplete past 8192 tracked
+/// stages only: the peak report still goes incomplete past 16384 tracked
 /// blocks, while the cumulative counts stay exact.
 pub(crate) fn counted_peak_during<T>(
     run: impl FnOnce() -> T,
@@ -295,7 +307,7 @@ pub(crate) fn counted_peak_during<T>(
     );
     ALLOCS.set(0);
     ALLOC_BYTES.set(0);
-    PEAK.with(|tracker| tracker.borrow_mut().reset());
+    install_peak_table();
     PEAK_INCOMPLETE.set(false);
     ARMED.set(true);
     PEAK_ARMED.set(true);
@@ -304,7 +316,7 @@ pub(crate) fn counted_peak_during<T>(
     let value = run();
     drop(peak);
     drop(count);
-    let mut result = PEAK.with(|tracker| tracker.borrow().result);
+    let mut result = take_peak_table();
     result.incomplete |= PEAK_INCOMPLETE.get();
     (value, result, ALLOCS.get(), ALLOC_BYTES.get())
 }
@@ -317,13 +329,13 @@ pub(crate) fn requested_peak_during<T>(run: impl FnOnce() -> T) -> (T, Requested
         !ARMED.get() && !PEAK_ARMED.get(),
         "allocation probes cannot nest"
     );
-    PEAK.with(|tracker| tracker.borrow_mut().reset());
+    install_peak_table();
     PEAK_INCOMPLETE.set(false);
     PEAK_ARMED.set(true);
     let armed = AllocationProbeGuard(true);
     let value = run();
     drop(armed);
-    let mut result = PEAK.with(|tracker| tracker.borrow().result);
+    let mut result = take_peak_table();
     result.incomplete |= PEAK_INCOMPLETE.get();
     (value, result)
 }
@@ -333,7 +345,16 @@ pub(crate) fn armed_requested_snapshot() -> RequestedAllocationPeak {
         PEAK_ARMED.get(),
         "snapshot is only meaningful inside an armed probe"
     );
-    let mut result = PEAK.with(|tracker| tracker.borrow().result);
+    let mut result = PEAK.with(|tracker| {
+        tracker
+            .borrow()
+            .as_ref()
+            .map(|table| table.result)
+            .unwrap_or(RequestedAllocationPeak {
+                incomplete: true,
+                ..RequestedAllocationPeak::default()
+            })
+    });
     result.incomplete |= PEAK_INCOMPLETE.get();
     result
 }
@@ -364,9 +385,10 @@ mod tests {
     fn requested_peak_handles_failed_in_place_and_moving_realloc() {
         // Exercise outcomes deterministically without requesting OOM or
         // depending on which result System's realloc chooses on this host.
+        install_peak_table();
         PEAK.with(|tracker| {
             let mut tracker = tracker.borrow_mut();
-            tracker.reset();
+            let tracker = tracker.as_mut().expect("installed table");
             tracker.allocated(0x100, 40);
             tracker.reallocated(0x100, 0, 80);
             assert_eq!(tracker.result.live_bytes, 40);
@@ -384,15 +406,16 @@ mod tests {
             assert_eq!(tracker.result.live_bytes, 20);
             assert_eq!(tracker.result.failed_requests, 1);
             assert!(!tracker.result.incomplete);
-            tracker.reset();
         });
+        let _ = take_peak_table();
     }
 
     #[test]
     fn requested_peak_reports_bounded_table_overflow() {
+        install_peak_table();
         PEAK.with(|tracker| {
             let mut tracker = tracker.borrow_mut();
-            tracker.reset();
+            let tracker = tracker.as_mut().expect("installed table");
             for pointer in 1..=TRACKED_BLOCK_LIMIT {
                 tracker.allocated(pointer, 1);
             }
@@ -401,8 +424,8 @@ mod tests {
             tracker.allocated(TRACKED_BLOCK_LIMIT + 1, 1);
             assert!(tracker.result.incomplete);
             assert_eq!(tracker.result.live_blocks, TRACKED_BLOCK_LIMIT);
-            tracker.reset();
         });
+        let _ = take_peak_table();
     }
 
     #[test]
@@ -412,9 +435,10 @@ mod tests {
         // it was handed) leaves a stale live entry. One pointer is never
         // live twice, so re-inserting the same pointer proves the old
         // entry dead: retire it instead of reporting incomplete.
+        install_peak_table();
         PEAK.with(|tracker| {
             let mut tracker = tracker.borrow_mut();
-            tracker.reset();
+            let tracker = tracker.as_mut().expect("installed table");
             tracker.allocated(0x100, 40);
             // No remove: the free happened off-thread.
             tracker.allocated(0x100, 64);
@@ -422,8 +446,8 @@ mod tests {
             assert_eq!(tracker.result.live_bytes, 64);
             assert_eq!(tracker.result.live_blocks, 1);
             assert_eq!(tracker.result.peak_bytes, 64);
-            tracker.reset();
         });
+        let _ = take_peak_table();
     }
 
     #[test]

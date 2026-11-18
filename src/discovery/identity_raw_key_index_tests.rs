@@ -383,6 +383,40 @@ fn global_purge_spares_resolvable_but_claimless_ids() {
     );
 }
 
+/// `replace_view_pins_with_claims_for` splits the sets: every preserved
+/// id stays resolvable, but only `claims_for` restore ownership claims.
+#[test]
+fn replace_view_pins_with_claims_for_splits_resolve_and_claims() {
+    let entries = distinct_keys(3);
+    let mut pins = pin_set(&entries, true);
+    let loader = PinnedObjectId(0);
+    let carried = PinnedObjectId(1);
+    let dropped = PinnedObjectId(2);
+    for (key, _, _) in &entries {
+        record_scan_ownership(&mut pins, ProcessViewId(1), *key, PATH);
+    }
+    pins.replace_view_pins_with_claims_for(
+        ProcessViewId(1),
+        PinnedObjects::empty(),
+        &[loader, carried],
+        &[loader],
+    );
+    assert!(pins.summary(loader).is_some(), "loader stays resolvable");
+    assert!(pins.summary(carried).is_some(), "carried stays resolvable");
+    assert!(pins.summary(dropped).is_none(), "other still drops");
+    let claims = pins
+        .view_claims(ProcessViewId(1))
+        .expect("the view keeps claims");
+    assert!(
+        claims.pins.contains(&loader),
+        "the loader id restores its claim"
+    );
+    assert!(
+        !claims.pins.contains(&carried),
+        "the carried id stays merely resolvable"
+    );
+}
+
 /// A refused pin observation is skipped, never a group rejection: the
 /// failed raw is scrubbed, committed entries stand, and the failure is
 /// recorded as a skip.
@@ -416,4 +450,125 @@ fn pin_failure_scrubs_without_group_rejection() {
         "committed entries stand"
     );
     assert!(!skipped.is_empty(), "the failure is still recorded");
+}
+
+/// Two views refusing one key in the same store pair into ambiguity —
+/// without group-rejecting it. A lone refusal marks only itself.
+#[test]
+fn same_store_refusal_pair_publishes_ambiguity_without_rejection() {
+    let source = pin_set(&distinct_keys(1), true);
+    let raw = source.by_id.values().next().unwrap().raw.clone();
+    let mut pins = PinnedObjects::empty();
+    let mut skipped = Vec::new();
+    record_scanned_candidate(
+        &mut pins,
+        ProcessViewId(1),
+        raw.clone(),
+        Err(PinFailure::Refused("TEST refused one".to_string())),
+        &mut skipped,
+        false,
+    );
+    assert!(
+        pins.ambiguous_keys.is_empty(),
+        "a lone refusal publishes no ambiguity"
+    );
+    record_scanned_candidate(
+        &mut pins,
+        ProcessViewId(2),
+        raw.clone(),
+        Err(PinFailure::Refused("TEST refused two".to_string())),
+        &mut skipped,
+        false,
+    );
+    assert!(
+        pins.ambiguous_keys.contains(&raw.key),
+        "the paired refusal publishes ambiguity"
+    );
+    assert!(
+        !pins.rejects(raw.key),
+        "paired refusals never group-reject the key"
+    );
+}
+
+/// Refusals pair across stores at absorb: two single-refusal scans of
+/// one key publish ambiguity when the second absorbs — the
+/// cross-store twin of the same-store pairing above.
+#[test]
+fn absorb_pairs_refusals_across_stores_into_ambiguity() {
+    let source = pin_set(&distinct_keys(1), true);
+    let raw = source.by_id.values().next().unwrap().raw.clone();
+    let mut first = PinnedObjects::empty();
+    let mut skipped = Vec::new();
+    record_scanned_candidate(
+        &mut first,
+        ProcessViewId(1),
+        raw.clone(),
+        Err(PinFailure::Refused("TEST refused one".to_string())),
+        &mut skipped,
+        false,
+    );
+    let mut second = PinnedObjects::empty();
+    record_scanned_candidate(
+        &mut second,
+        ProcessViewId(2),
+        raw.clone(),
+        Err(PinFailure::Refused("TEST refused two".to_string())),
+        &mut skipped,
+        false,
+    );
+    assert!(
+        first.ambiguous_keys.is_empty(),
+        "one refusal alone publishes no ambiguity"
+    );
+    skipped.extend(first.absorb(second));
+    assert!(
+        first.ambiguous_keys.contains(&raw.key),
+        "absorb pairs the cross-store refusals"
+    );
+    assert!(
+        !first.rejects(raw.key),
+        "paired refusals never group-reject the key"
+    );
+}
+
+/// A view that refused a key contradicts itself by filing it after:
+/// the filing group-rejects like the reverse order, so the pairing
+/// is order-free — with a named counted gap, never silence.
+#[test]
+fn file_after_refuse_group_rejects_with_a_contradiction_gap() {
+    let source = pin_set(&distinct_keys(1), true);
+    let entry = source.by_id.values().next().unwrap().clone();
+    let raw = entry.raw.clone();
+    let mut pins = PinnedObjects::empty();
+    let mut skipped = Vec::new();
+    record_scanned_candidate(
+        &mut pins,
+        ProcessViewId(1),
+        raw.clone(),
+        Err(PinFailure::Refused("TEST refused".to_string())),
+        &mut skipped,
+        false,
+    );
+    record_scanned_candidate(
+        &mut pins,
+        ProcessViewId(1),
+        raw.clone(),
+        Ok(entry),
+        &mut skipped,
+        false,
+    );
+    assert!(
+        pins.rejects(raw.key),
+        "filing after refusing group-rejects the key"
+    );
+    assert!(
+        pins.ambiguous_keys.contains(&raw.key),
+        "the contradiction publishes ambiguity"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|skip| skip.reason.contains("contradicts filed")),
+        "the contradiction leaves a named gap: {skipped:?}"
+    );
 }

@@ -1558,6 +1558,42 @@ fn replay_freshen_marks_unadmitted_listing_pids_only() {
 }
 
 #[test]
+fn replay_freshen_skips_held_back_and_dead_tracked_pids() {
+    // The replay freshen applies the admission window's own newcomer
+    // filter: held-back pids (still waiting for a retry pass) and pids
+    // with no possible arrival (a tracked generation with no live
+    // process here) are never re-marked — only true newcomers mark.
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "424241\n424242\n424243\n")
+        .expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let (mut engine, _, _, _) = engine_with_overlay(82);
+    engine.scope = cgroup;
+    engine.held_back.insert(
+        424242,
+        HeldBack {
+            strikes: 1,
+            retry_pass: u64::MAX,
+            start_time: None,
+        },
+    );
+    engine.admitted_cgroup_pid_counts.insert(424243, 1);
+    engine.freshen_newcomer_marks();
+    assert!(
+        engine.newcomer_first_seen.contains_key(&424241),
+        "a true newcomer still marks"
+    );
+    assert!(
+        !engine.newcomer_first_seen.contains_key(&424242),
+        "a held-back pid is never re-marked"
+    );
+    assert!(
+        !engine.newcomer_first_seen.contains_key(&424243),
+        "a tracked pid with no live process is never re-marked"
+    );
+}
+
+#[test]
 fn loader_resolve_set_adds_committed_objects_in_cgroup_scope() {
     // Loader assembly keeps the loader id plus committed provider objects
     // resolvable in cgroup scope (a validated scan assembles a global
@@ -39827,7 +39863,8 @@ fn rescan_same_table_new_address_unions_without_reopening_finished() {
     // and churn the capture through a replace + async-retire hole with
     // no recovery (dead-view currency livelock). A table with different
     // content at the same offset stays a rival (torn read or changed
-    // file), as does a table at a genuinely new offset.
+    // file), as does a table at a genuinely new offset — and tables
+    // with unprovable (`None`) offsets never union at all.
     let table = |address: u64, file_offset: Option<u64>, name: &'static str| ScannedTable {
         version: (2, 40),
         walk: "full",
@@ -39905,6 +39942,22 @@ fn rescan_same_table_new_address_unions_without_reopening_finished() {
     assert!(
         !rival[0].tables_scan_finished,
         "rival content still re-opens finished-ness"
+    );
+    // Unprovable offsets never union: two static tables with unknown
+    // file offsets stay rivals even with identical decoded content.
+    let mut unprovable = vec![module(true, vec![table(0x1000, None, "C_GetSlotList")])];
+    merge_scanned_module(
+        &mut unprovable,
+        module(true, vec![table(0x2000, None, "C_GetSlotList")]),
+    );
+    assert_eq!(
+        unprovable[0].tables.len(),
+        2,
+        "unknown-offset tables stay rival twins"
+    );
+    assert!(
+        !unprovable[0].tables_scan_finished,
+        "unprovable twins still re-open finished-ness"
     );
 }
 

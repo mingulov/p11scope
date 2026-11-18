@@ -8973,8 +8973,7 @@ fn retire_rendered_callers<Source: ProcessSource>(
     // The fold paces its planning strides against the live stop
     // query (the local flag plus the operator counter, when wired),
     // so a stop delivered mid-fold aborts within one stride.
-    let query = coordinator.stop_query();
-    let receipt = coordinator.retire_rendered_callers_with_stop(now_ns, subset, query.as_ref());
+    let receipt = coordinator.retire_rendered_callers(now_ns, subset);
     // Folded rows left the snapshot: drop their stream digests so the
     // emitters stay bounded by live rows.
     for (caller, module) in receipt.folded_edges {

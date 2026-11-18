@@ -22,6 +22,54 @@ versioned separately and are opaque, exact dispatch keys.
   (`ec_edwards`/`ec_montgomery` with ed25519/ed448/x25519/x448) keys
   label without a query; versions 1–5 stay frozen and byte-stable.
 
+### Changed
+
+- **Inventory JSON contract (JSON-consumer migration note):**
+  proven-exited callers now fold out of the snapshot. `callers[]`
+  carries only retained (live) incarnations: a caller whose process
+  provably exited or exec-retired keeps its row until a published
+  presentation has rendered it, then the row leaves `callers[]` and
+  its edges and instances leave `edges[]`, `instances[]` and
+  `semantic_edges[]`, folding into the new per-module `departed_use`
+  aggregate (exact counts, mechanism rows in the edge-row shape, and
+  named identities up to the documented bounds). Consumers that
+  enumerate callers, edges or instances must also read `departed_use`:
+  pre-fold snapshots keep exited rows in place, post-fold snapshots
+  do not. New `budgets` counters (`callers.retired` /
+  `retired_with_calls`, `edges.folded` / `folded_entries`,
+  `instances.folded`, `departed_use`) account the fold. The event
+  stream keeps its shape but its edge and instance keys are a
+  superset of the final snapshot (every folded row streamed at least
+  once); the missing keys count exactly into `budgets.edges.folded`
+  and `budgets.instances.folded`. `inventory diff`, the text views
+  and `inventory cbom` (application components, app-to-provider
+  joins and mechanism totals rejoin from `departed_use`, with drops,
+  saturation and overflow as named unknowns) already consume the
+  aggregate.
+
+### Fixed
+
+- Atomic report handover now happens at commit, not at creation.
+  The live report temp stays creator-owned `0600` for the whole
+  capture; the handover decided at creation (`fchown` plus an
+  explicit `0600` on the open descriptor) applies just before
+  publication, so the future owner gains the file only with the
+  finished report and can no longer append bytes the commit checks
+  would accept. Event streams keep their at-create handover; all
+  ownership and trust refusals are unchanged.
+- `p11scope-discover` temp files beside the published output now
+  carry fresh randomness per attempt, so a hostile provider sharing
+  the directory cannot squat the temp name and block publishing;
+  the temp entry is re-checked against the written file (device and
+  inode) immediately before the rename, so a swapped entry fails
+  closed with the final name untouched.
+- Counter-bank return evidence is now counted per item: RV insert
+  failures count `rv_update_failures` (a lost race counts into the
+  winner's row; only a re-lookup miss latches the RV fault), and
+  scope-only losses count `unmatched_returns` instead of latching a
+  scope fault; the metrics reader now tracks whether the RV table
+  is a lower bound.
+
 ## [0.7.1] - 2026-11-17
 
 ### Added

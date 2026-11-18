@@ -16,8 +16,9 @@ discovery-listed providers only). Anything else is refused with exit 1.
 | p11scope fact (already published) | CBOM component |
 | --- | --- |
 | Caller executable path (`callers[].image.exe.path`), one component per distinct path | `type: application`, `name` = verbatim path |
+| Folded departed caller (`modules[].departed_use.identities[].exe.path`), merged into the same per-path component | `type: application` (same component; `p11scope:departed_incarnations` counts the folded incarnations) |
 | Provider module (`modules[]`: paths, device/inode, SHA-256, admission, lifecycle) | `type: library`, `name` = first recorded path; SHA-256 becomes a `hashes[]` entry when it is 64 hex digits |
-| Mechanism id (`edges[].mechanisms[]`, profile `mechanisms[]`), unioned by id | `type: cryptographic-asset`, `cryptoProperties.assetType: algorithm` |
+| Mechanism id (`edges[].mechanisms[]`, `modules[].departed_use.mechanisms[]`, profile `mechanisms[]`), unioned by id | `type: cryptographic-asset`, `cryptoProperties.assetType: algorithm` |
 | Key object (`object_observations.objects[]` with established metadata or a label) | `type: cryptographic-asset`, `cryptoProperties.assetType: related-crypto-material` |
 | Provider facts (`modules[].provider_info`) | `supplier` object + `version` on the provider's `type: library` component |
 | Token row (`provider_observations.tokens[]`) | `type: device`, linked to its library via `dependencies[]` |
@@ -31,7 +32,12 @@ carries only joins the input proves: application → its modules,
 application/module → mechanisms observed on their edges, key object →
 its provider module and caller application via the key-operation →
 instance → module/caller join (when joinable, otherwise no edge and
-a named note).
+a named note). Folded joins follow the same rule: each departed
+application joins the provider it folded at, and folded mechanisms
+join that provider, but per-application mechanism pairs survive the
+fold only when every folded caller at the module is named and all
+share one executable path — otherwise the pairs are withheld and the
+module counts into `p11scope:departed_links_withheld`, never guessed.
 
 ## Provider, token and mechanism info (Task 7, v1 only)
 
@@ -121,9 +127,14 @@ quoted verbatim in `metadata.properties` beside the source schema,
 scope, passes, gap count and coverage notes). Every unknown the input
 states stays an explicit unknown: unregistered mechanism ids, unnamed
 primitives, keys without established size, callers without an
-executable path, unavailable object observations, and profile inputs'
-missing caller/key/provenance linkage are counted in properties and
-named in text. Text output follows the usual contract (concise
+executable path, unavailable object observations, profile inputs'
+missing caller/key/provenance linkage, and the departed-fold bounds
+(`departed_identities_dropped`, `departed_identities_saturated`,
+`departed_mech_overflow` with its calls/errors, and
+`departed_links_withheld`) are counted in properties and
+named in text. The departed properties ride only when nonzero, so
+inputs without a fold render exactly as before. Text output follows
+the usual contract (concise
 default, `-v` detail, `--quiet` head only, `--json`/`-o` complete);
 a malformed crypto detail degrades its component to unknown with a
 named note and never stops the view. Input, schema or output failures

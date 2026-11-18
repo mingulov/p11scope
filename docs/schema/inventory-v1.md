@@ -236,9 +236,13 @@ and never proves an app identity. See the app identity rows of
   coordinator then folds the row into the exact
   `budgets.callers.retired` aggregate (additive within v1) and removes
   it; rows that carried attributed calls fold their edges and instances
-  into the per-module `departed_use` aggregate first (additive within
-  v1, v0.8.0; counted in `budgets.callers.retired_with_calls`), so a
-  busy host never fills the caller budget with churn. The retired ID
+  into the per-module `departed_use` aggregate first (v0.8.0; counted
+  in `budgets.callers.retired_with_calls`), so a busy host never fills
+  the caller budget with churn. Contract change: exited callers no
+  longer appear in `callers[]`, and their rows no longer appear in
+  `edges[]`, `instances[]` or `semantic_edges[]` — consumers must read
+  `departed_use` for folded history (see the migration note in
+  CHANGELOG.md). The retired ID
   stays refused as a bounded ID range (`budgets.callers.late_refused`
   counts late evidence), so a late mapping never invents a caller with
   no row, and gaps keep naming the folded caller by label, while live
@@ -432,10 +436,13 @@ and never proves an app identity. See the app identity rows of
   Witness gaps never carry a `pid`; the sole published tgid of an
   unbound row is its image's historical `pid_host` in `pids` above —
   the incarnation behind it is still what could not be identified.
-  `departed_use` (additive within v1, v0.8.0) is `null`, or this
-  module's exact aggregate of folded departed callers: proven-exited
-  caller rows whose edges and instances left the snapshot after a
-  presentation rendered them. One caller's edges at several modules
+  `departed_use` (v0.8.0) is `null`, or this module's exact
+  aggregate of folded departed callers: proven-exited caller rows
+  whose edges and instances left the snapshot after a presentation
+  rendered them. The key is new but the fold moves rows out of
+  `callers[]`/`edges[]`/`instances[]`/`semantic_edges[]`, so this is a
+  contract change, not an additive one (see the `callers[]` row above).
+  One caller's edges at several modules
   fold into each, so per-module caller counts may name one caller
   twice; `budgets.callers` counts each caller once. `first_ns` is the
   earliest fold instant, `callers`/`edges` the folded rows,

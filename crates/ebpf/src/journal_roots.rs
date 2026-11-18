@@ -5,8 +5,9 @@
 //! The host proof includes its scalar policy and in-place wire writers only.
 
 use p11scope_ebpf_common::object_journal::{
-    JOURNAL_END_FULL_BYTES, JOURNAL_END_TAIL_ABSENT, JOURNAL_END_UNJOURNALED, JOURNAL_KIND_END,
-    JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, JOURNAL_VERSION, JournalEndFull,
+    JOURNAL_END_FULL_BYTES, JOURNAL_END_LENGTH_BYTES, JOURNAL_END_TAIL_ABSENT,
+    JOURNAL_END_UNJOURNALED, JOURNAL_KIND_END, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+    JOURNAL_VERSION, JournalEndFull, JournalEndLength, LengthTrailer,
 };
 use p11scope_ebpf_common::{Event, LinuxLayout, MAX_DESCRIPTORS};
 
@@ -223,16 +224,47 @@ pub(crate) unsafe fn initialize_end(
     true
 }
 
+/// Initialize the exact 648-byte header + trailer in reserved storage:
+/// the shared [`initialize_end`] writes the 632-byte prefix (the two
+/// forms share the header layout and the absent-tail rule), then the
+/// length field is corrected and the carried trailer stored. Returns
+/// false without writing any byte when the flag conversion refuses;
+/// the caller must treat the reservation as uninitialized and refuse
+/// the record.
+///
+/// # Safety
+/// `record` is an aligned, exclusively owned 648-byte reservation;
+/// `words` is the fully initialized output of the native returning
+/// function; `trailer` is the resolved length trailer.
+#[cfg_attr(feature = "stub-object-attributes", allow(dead_code))]
+#[inline(always)]
+pub(crate) unsafe fn initialize_end_length(
+    record: *mut JournalEndLength,
+    words: &ReturnWords,
+    absent_tail: bool,
+    trailer: &LengthTrailer,
+) -> bool {
+    if !unsafe { initialize_end(record.cast(), words, absent_tail) } {
+        return false;
+    }
+    unsafe {
+        core::ptr::addr_of_mut!((*record).header.length).write(JOURNAL_END_LENGTH_BYTES as u16);
+        core::ptr::addr_of_mut!((*record).trailer).write(*trailer);
+    }
+    true
+}
+
 #[cfg(target_arch = "bpf")]
 pub(super) mod program {
     use super::{
         BeginAction, EntryContext, ReturnWords, RoutingWord, begin_action, completion_reason,
-        initialize_end,
+        initialize_end, initialize_end_length,
     };
     use crate::*;
     use p11scope_ebpf_common::object_flow::join_refusal_bump;
     use p11scope_ebpf_common::object_journal::{
         JOURNAL_REASON_IDENTITY_REFUSED, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, JournalEndFull,
+        LengthTrailer,
     };
 
     #[map]
@@ -289,7 +321,7 @@ pub(super) mod program {
         if !stop_gate_enter() {
             return 0;
         }
-        let rc = p11_return_impl::<true>(ctx);
+        let rc = p11_return_impl::<true, false>(ctx);
         stop_gate_leave();
         rc
     }
@@ -347,6 +379,7 @@ pub(super) mod program {
     }
 
     impl ReturnPayload for JournalEndFull {
+        const LENGTH: bool = false;
         #[inline(always)]
         unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord {
             unsafe { core::ptr::addr_of_mut!((*record).payload) }
@@ -369,7 +402,7 @@ pub(super) mod program {
     }
 
     #[inline(never)]
-    pub(crate) fn ordinary_return(
+    pub(crate) fn ordinary_return<Record: ReturnPayload>(
         ctx: RetProbeContext,
         key: &StartKey,
         start: *const CallStart,
@@ -399,17 +432,20 @@ pub(super) mod program {
         }
         let facts =
             unsafe { capture_return_facts::<true>(&ctx, &*start, flags, layout, accounting) };
-        let Some(mut entry) = EVENTS.reserve::<JournalEndFull>(0) else {
+        let Some(mut entry) = EVENTS.reserve::<Record>(0) else {
             if remove(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST) != 0 {
                 unsafe { p11_object_fault() };
                 bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             }
             gap();
             bump_evidence(EVIDENCE_RING_LOSS);
+            if Record::LENGTH {
+                length_return_abandon(&key);
+            }
             return 0;
         };
         let record = entry.as_mut_ptr();
-        let raw = unsafe { core::ptr::addr_of_mut!((*record).payload.base) };
+        let raw = unsafe { core::ptr::addr_of_mut!((*Record::payload(record)).base) };
         unsafe {
             fill_call_event(
                 core::ptr::addr_of_mut!((*raw).event),
@@ -420,7 +456,21 @@ pub(super) mod program {
             route(core::ptr::addr_of_mut!((*raw).event));
             let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).continuity));
         }
-        if !unsafe { continuity_joins(&(*raw).continuity) } {
+        if Record::LENGTH {
+            // Sync START rows leave target_function FUNCTION_NONE, but
+            // the trailer validator matches the kind against the
+            // function-addressed evidence row: stamp the
+            // cookie-derived ordinal so the 648 decodes. The root's
+            // length dispatch guarantees a valid length descriptor
+            // (misrouted and narrowed endpoints degrade to the base
+            // flow before this runs), so descriptor - 1 is in range.
+            let descriptor = cookie_descriptor(cookie_of(&ctx));
+            unsafe {
+                core::ptr::addr_of_mut!((*raw).event.target_function).write(descriptor - 1);
+            }
+        }
+        let joined = unsafe { continuity_joins(&(*raw).continuity) };
+        if !joined {
             // Decide accounting before the discard below invalidates
             // `raw`: both reads are pure (reservation bytes, cell).
             let bump = join_refusal_bump(unsafe { &(*raw).continuity }, unsafe {
@@ -454,9 +504,32 @@ pub(super) mod program {
             if semantic {
                 bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
             }
+            if Record::LENGTH {
+                length_return_abandon(&key);
+            }
             return 0;
         }
-        let Some(reason) = (unsafe { complete(record, &key, true) }) else {
+        // Length trailer (spec §8.2/§8.3): resolve the retained
+        // evidence now that the join gate passed (no target read
+        // before the join), and complete the matching END form. Base
+        // records fold the dummy trailer away unused.
+        let trailer = if Record::LENGTH {
+            length_trailer_for_return(&key, &ctx, accounting.rv, layout, joined)
+        } else {
+            LengthTrailer {
+                version: 0,
+                kind: 0,
+                status: 0,
+                reserved: [0; 4],
+                value: 0,
+            }
+        };
+        let completed = if Record::LENGTH {
+            unsafe { complete_length(record.cast(), &key, true, &trailer) }
+        } else {
+            unsafe { complete(record.cast(), &key, true) }
+        };
+        let Some(reason) = completed else {
             // The flag conversion refused: the reservation holds no
             // header, so it can never submit. Retire the call like a
             // lost result, then gap, mirroring the reserve-failure arm.
@@ -478,5 +551,249 @@ pub(super) mod program {
         entry.submit(0);
         bump_produced(PRODUCED_EVENTS);
         0
+    }
+
+    // Length programs (v0.8.0 keymeta Task 2, spec §8.6): the same
+    // journal BEGIN/END protocol as the base pair, plus the §8.2 length
+    // adapters into EVIDENCE_START and the 648 END+length form. Loaded
+    // and linked only with --key-sizes (attach-time routing); the P0
+    // journal flavor omits them, so without the flag the length code is
+    // never even verified. Everything length-specific lives below this
+    // marker: the base region above references no adapter or stash
+    // (pinned by the Task 2 contracts case).
+    #[cfg(not(feature = "stub-object-attributes"))]
+    use core::ffi::c_void;
+    #[cfg(not(feature = "stub-object-attributes"))]
+    use p11scope_ebpf_common::evidence_table::length_entry_descriptor;
+    use p11scope_ebpf_common::evidence_table::{LENGTH_KIND_SCELL, length_kind_for_descriptor};
+    use p11scope_ebpf_common::object_flow::{
+        EvidenceStart, LengthReturnVerdict, adapter_length_entry, adapter_length_return,
+    };
+    use p11scope_ebpf_common::object_journal::{JournalEndLength, length_trailer_for_verdict};
+    use p11scope_ebpf_common::{EVIDENCE_LENGTH_INSERT_FAILURES, EVIDENCE_LENGTH_STASH_MISMATCHES};
+
+    #[cfg_attr(feature = "stub-object-attributes", allow(dead_code))]
+    impl ReturnPayload for JournalEndLength {
+        const LENGTH: bool = true;
+        #[inline(always)]
+        unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord {
+            unsafe { core::ptr::addr_of_mut!((*record).payload) }
+        }
+    }
+
+    #[cfg(not(feature = "stub-object-attributes"))]
+    #[uprobe]
+    pub fn p11_entry_journal_length(ctx: ProbeContext) -> u32 {
+        keep_endpoint_stack(&ctx);
+        if !stop_gate_enter() {
+            return 0;
+        }
+        // Rebuilt below for argument fetch after the shared entry
+        // consumes `ctx` (ProbeContext is move-only): the regs pointer
+        // stays valid for the whole probe invocation.
+        let regs = ctx.regs as *mut c_void;
+        let mut completed = CompletedEntry::default();
+        capture_entry(ctx, &mut completed);
+        if completed.completed == 1 && completed.reserved == 0 {
+            let layout = match completed.layout {
+                1 => LinuxLayout::Lp64,
+                2 => LinuxLayout::Ilp32,
+                _ => {
+                    gap();
+                    bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+                    stop_gate_leave();
+                    return 0;
+                }
+            };
+            begin(
+                &completed.key,
+                completed.descriptor,
+                layout,
+                completed.switched != 0,
+            );
+            let ctx = ProbeContext::new(regs);
+            // Narrowed slots keep the link but lose semantic capture:
+            // the stash resolves descriptor 0, so the adapter refuses
+            // and the call still counts without length evidence.
+            let descriptor = length_entry_descriptor(completed.descriptor, completed.switched != 0);
+            stash_length_entry(&ctx, &completed.key, descriptor, layout);
+        }
+        stop_gate_leave();
+        0
+    }
+
+    /// Run the length entry adapter and bind the stash row: insert on
+    /// retention (overwrite), delete on unavailable (a stale row is
+    /// never trusted), count full-map insert failures. The START
+    /// timestamp binds the return (fix9 R4); a missing row binds zero,
+    /// which the return mismatches (fail closed). Outlined (not
+    /// inlined): the 32-byte row, the pre-fetched argument array and
+    /// the adapter spills stay out of the root frame, keeping the
+    /// entry call chain inside the unmodified 512-byte bound.
+    #[cfg_attr(feature = "stub-object-attributes", allow(dead_code))]
+    #[inline(never)]
+    fn stash_length_entry(
+        ctx: &ProbeContext,
+        key: &StartKey,
+        descriptor: u32,
+        layout: LinuxLayout,
+    ) {
+        let start_ts_ns = unsafe { p11_owner_start_get(key, 0).as_ref() }.map(|start| start.ts_ns);
+        let mut row = EvidenceStart::default();
+        // Pre-fetch every argument slot with a compile-time-constant
+        // index. The adapter selects positions at runtime, but a
+        // dynamic index into `arg_u64` becomes register-offset
+        // pt_regs arithmetic (`ctx += reg`), which the verifier
+        // rejects ("dereference of modified ctx ptr" on 6.6/6.12/
+        // 7.0). Slots 0..=5 are the LP64 registers; 6 is the SP+8
+        // stack slot (spec §8.2). Words start zeroed beside a
+        // validity mask: a `None` payload is undef, and LLVM spills
+        // the stale R0 as that payload, which the verifier rejects
+        // (`R0 !read_ok`). The fetch closure only indexes these
+        // arrays, never `arg_u64`.
+        let mut words = [0u64; 7];
+        let mut present: u8 = 0;
+        if let Ok(word) = arg_u64(ctx, 0, layout) {
+            words[0] = word;
+            present |= 0x01;
+        }
+        if let Ok(word) = arg_u64(ctx, 1, layout) {
+            words[1] = word;
+            present |= 0x02;
+        }
+        if let Ok(word) = arg_u64(ctx, 2, layout) {
+            words[2] = word;
+            present |= 0x04;
+        }
+        if let Ok(word) = arg_u64(ctx, 3, layout) {
+            words[3] = word;
+            present |= 0x08;
+        }
+        if let Ok(word) = arg_u64(ctx, 4, layout) {
+            words[4] = word;
+            present |= 0x10;
+        }
+        if let Ok(word) = arg_u64(ctx, 5, layout) {
+            words[5] = word;
+            present |= 0x20;
+        }
+        if let Ok(word) = arg_u64(ctx, 6, layout) {
+            words[6] = word;
+            present |= 0x40;
+        }
+        let mut fetch = |index: u8| {
+            if index < 7 && present & (1 << index) != 0 {
+                Some(words[index as usize])
+            } else {
+                None
+            }
+        };
+        if !adapter_length_entry(
+            &mut row,
+            descriptor,
+            layout,
+            start_ts_ns.unwrap_or(0),
+            &mut fetch,
+            BpfReader,
+        ) {
+            let _ = EVIDENCE_START.remove(key);
+            return;
+        }
+        if EVIDENCE_START.insert(key, &row, 0).is_err() {
+            bump_evidence(EVIDENCE_LENGTH_INSERT_FAILURES);
+        }
+    }
+
+    #[cfg(not(feature = "stub-object-attributes"))]
+    #[uretprobe]
+    pub fn p11_return_journal_length(ctx: RetProbeContext) -> u32 {
+        keep_endpoint_stack(&ctx);
+        if !stop_gate_enter() {
+            return 0;
+        }
+        // Length dispatch: only length endpoints take the length path; a
+        // misrouted endpoint degrades to the base flow with a valid base
+        // END instead of losing the completion.
+        let descriptor = cookie_descriptor(cookie_of(&ctx));
+        if length_kind_for_descriptor(descriptor).is_none() {
+            let rc = p11_return_impl::<true, false>(ctx);
+            stop_gate_leave();
+            return rc;
+        }
+        let rc = p11_return_impl::<true, true>(ctx);
+        stop_gate_leave();
+        rc
+    }
+
+    /// Resolve the length trailer for one return: copy the stash row and
+    /// delete it unconditionally (every emission deletes), then resolve
+    /// the START stamp and feed the return adapter (RV + owned
+    /// lifetime). A missing row resolves unavailable with zero reads
+    /// and never consults the stamp; a refused join resolves
+    /// unavailable the same way the adapter would; a stamp/layout
+    /// mismatch bumps its own counter. The kind re-derives from the
+    /// same cookie the root dispatched on, so the fallback below is
+    /// dead (kept fail-closed: a wrong kind refuses at validation).
+    /// Called only after the join gate passed.
+    #[cfg_attr(feature = "stub-object-attributes", allow(dead_code))]
+    #[inline(always)]
+    pub(crate) fn length_trailer_for_return(
+        key: &StartKey,
+        ctx: &RetProbeContext,
+        rv: u64,
+        layout: LinuxLayout,
+        joined: bool,
+    ) -> LengthTrailer {
+        let stash = EVIDENCE_START.get_ptr(key).map(|row| unsafe { *row });
+        let _ = EVIDENCE_START.remove(key);
+        let descriptor = cookie_descriptor(cookie_of(ctx));
+        let kind = length_kind_for_descriptor(descriptor).unwrap_or(LENGTH_KIND_SCELL);
+        let Some(stash) = stash else {
+            return length_trailer_for_verdict(kind, LengthReturnVerdict::Unavailable);
+        };
+        if !joined {
+            return length_trailer_for_verdict(kind, LengthReturnVerdict::Unavailable);
+        }
+        // An explicit null branch, never an as_ref().map chain: LLVM
+        // merges the chained null check with the adapter's downstream
+        // flag arithmetic into a bitwise OR on the map pointer
+        // itself, which the verifier rejects. The bump (a map
+        // helper) keeps this a real branch. A missing START stamp
+        // mismatches (fail closed), exactly as the adapter's None
+        // arm would.
+        let start = unsafe { p11_owner_start_get(key, 0) };
+        if start.is_null() {
+            bump_evidence(EVIDENCE_LENGTH_STASH_MISMATCHES);
+            return length_trailer_for_verdict(kind, LengthReturnVerdict::StashMismatch);
+        }
+        let verdict = adapter_length_return(
+            &stash,
+            Some(unsafe { (*start).ts_ns }),
+            rv,
+            layout,
+            joined,
+            BpfReader,
+        );
+        if verdict == LengthReturnVerdict::StashMismatch {
+            bump_evidence(EVIDENCE_LENGTH_STASH_MISMATCHES);
+        }
+        length_trailer_for_verdict(kind, verdict)
+    }
+
+    #[cfg_attr(feature = "stub-object-attributes", allow(dead_code))]
+    #[inline(always)]
+    pub(crate) unsafe fn complete_length(
+        record: *mut JournalEndLength,
+        key: &StartKey,
+        absent: bool,
+        trailer: &LengthTrailer,
+    ) -> Option<u32> {
+        let mut words = ReturnWords::default();
+        unsafe { p11_journal_returning(key, &mut words) };
+        if unsafe { initialize_end_length(record, &words, absent, trailer) } {
+            Some(completion_reason(&words))
+        } else {
+            None
+        }
     }
 }

@@ -528,6 +528,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// only: the snapshot distinguishes "requested but unavailable"
     /// from "off"). Set once at run setup; harnesses leave it false.
     key_operations_requested: bool,
+    /// Whether `--key-sizes` was requested for this run (v0.8.0
+    /// keymeta Task 2): the journal length programs load and link,
+    /// and the stash reserves fully. Set once at run setup beside
+    /// `key_operations_requested`; harnesses leave it false.
+    key_sizes_requested: bool,
     /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
     /// validation, pin and held-FD custody for supported auto/native
     /// Inventory capture. Proved offsets lower into the run's attach set
@@ -1301,6 +1306,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scan_mint_sources: None,
             count_manifests: Vec::new(),
             key_operations_requested: false,
+            key_sizes_requested: false,
             prearm: None,
             prearm_prior: (0, 0),
             prearm_state: crate::prearm_module::PrearmState::empty(),
@@ -1451,6 +1457,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Whether `--key-operations` was requested for this run.
     pub(crate) fn key_operations_requested(&self) -> bool {
         self.key_operations_requested
+    }
+
+    /// Record the run's `--key-sizes` request for the journal lane.
+    pub(crate) fn set_key_sizes_requested(&mut self, requested: bool) {
+        self.key_sizes_requested = requested;
+    }
+
+    /// Whether `--key-sizes` was requested for this run.
+    pub(crate) fn key_sizes_requested(&self) -> bool {
+        self.key_sizes_requested
     }
 
     /// Retains an already-validated `--prearm-module` pinning for the run's

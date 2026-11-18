@@ -58,6 +58,13 @@
 # latch does not complete in production runs at this base, so the
 # display state is recorded in the row, never gated.
 #
+# --key-sizes 1 (v0.8.0 keymeta Task 2) additionally loads and scores
+# the length pair (p11_entry_journal_length/p11_return_journal_length):
+# the guest run passes --key-sizes and the pair check requires all four
+# roots. The budgets file must carry the journal-gate1 length cells
+# (recorded via scripts/record-verifier-budgets.py), or the report fails
+# on the observed-but-unbudgeted roots.
+#
 # Pre-Multi kernels (v5.15.*, v6.1.*) are a refusal control, not a
 # load: the finite live-capture refusal with no loaded
 # journal row is a pass for that cell; a load or a crash is FAIL.
@@ -78,6 +85,7 @@ set -eu
 BUDGETS=""
 OBJECT=journal
 EXPECT_JOURNAL=1
+KEY_SIZES=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --budgets)
@@ -107,6 +115,15 @@ while [ $# -gt 0 ]; do
             EXPECT_JOURNAL="${1#--expect-journal=}"
             shift
             ;;
+        --key-sizes)
+            [ $# -ge 2 ] || { echo "missing value for --key-sizes" >&2; exit 2; }
+            KEY_SIZES="$2"
+            shift 2
+            ;;
+        --key-sizes=*)
+            KEY_SIZES="${1#--key-sizes=}"
+            shift
+            ;;
         --)
             shift
             break
@@ -121,9 +138,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 if [ $# -lt 4 ]; then
-    echo "usage: check-bpf-load-journal.sh [--budgets FILE] [--object journal|journal-gate1] [--expect-journal 0|1] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]" >&2
+    echo "usage: check-bpf-load-journal.sh [--budgets FILE] [--object journal|journal-gate1] [--expect-journal 0|1] [--key-sizes 0|1] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]" >&2
     exit 2
 fi
+case "$KEY_SIZES" in
+    0|1) ;;
+    *) echo "check-bpf-load-journal.sh: --key-sizes needs 0 or 1" >&2; exit 2 ;;
+esac
 case "$OBJECT" in
     journal|journal-gate1) ;;
     *) echo "check-bpf-load-journal.sh: unknown object $OBJECT" >&2; exit 2 ;;
@@ -345,6 +366,7 @@ PROBE=$3
 MANIFEST=$4
 WORKLOAD=$5
 MODULE=$6
+KEY_SIZES=${7:-0}
 TOKENS=$TMPDIR/journal-tokens
 CONF=$TMPDIR/softhsm2.conf
 mkdir -p "$TOKENS"
@@ -395,7 +417,8 @@ else
 fi
 ulimit -n 65536
 RC=0
-timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory -v --system --capture native --key-operations --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
+if [ "$KEY_SIZES" = "1" ]; then set -- --key-sizes; else set --; fi
+timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory -v --system --capture native --key-operations "$@" --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
 echo "guest-stage=observer-rc=$RC"
 if [ -f "$LEDGER_LOG" ]; then
     cp "$LEDGER_LOG" "./workload-$KERNEL.log"
@@ -439,7 +462,7 @@ for KERNEL in "$@"; do
     J_REPORT="$OUTDIR/journal-report-$KERNEL.txt"
     VNG_LOG="$OUTDIR/vng-journal-$KERNEL.log"
     rm -f "$J_TXT" "$J_PROBE" "$J_WL" "$J_REPORT" "$VNG_LOG"
-    EXEC="cd $(q "$OUTDIR") && $STAGE; sh ./journal-guest.sh $(q "$KERNEL") $(q "$OBSERVER") $(q "$STAGED_PROBE") $(q "$STAGED_MANIFEST") $(q "$STAGED_WORKLOAD") $(q "$MODULE"); echo journal-rc=\$?; echo guest-release=\$(uname -r)"
+    EXEC="cd $(q "$OUTDIR") && $STAGE; sh ./journal-guest.sh $(q "$KERNEL") $(q "$OBSERVER") $(q "$STAGED_PROBE") $(q "$STAGED_MANIFEST") $(q "$STAGED_WORKLOAD") $(q "$MODULE") $(q "$KEY_SIZES"); echo journal-rc=\$?; echo guest-release=\$(uname -r)"
     # Fail fast past the kernel command line: 950 raw bytes encode to
     # ~1270 base64 bytes, which still fits the 2048 budget beside
     # virtme's own arguments; past it the guest silently never runs.
@@ -494,9 +517,11 @@ for KERNEL in "$@"; do
     # is checked explicitly for the unbudgeted kernels too).
     PAIR_OUT="0 0"
     if [ -f "$J_PROBE" ]; then
-        PAIR_OUT=$(python3 - "$J_PROBE" <<'PY'
+        PAIR_OUT=$(python3 - "$J_PROBE" "$KEY_SIZES" <<'PY'
 import json,sys
 pair = ("p11_entry_journal", "p11_return_journal")
+if len(sys.argv) > 2 and sys.argv[2] == "1":
+    pair = pair + ("p11_entry_journal_length", "p11_return_journal_length")
 loaded = set()
 try:
     with open(sys.argv[1], encoding="ascii") as stream:

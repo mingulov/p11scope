@@ -880,6 +880,10 @@ pub fn run(
     identity_backend_explicit: bool,
     caller_metadata: crate::cli::CallerMetadataMode,
     key_operations: bool,
+    // `--key-sizes`: opt-in length capture beside `--key-operations`
+    // (spec §10.5). Programmatic callers face the same refusals as
+    // the CLI (below); the run records it on the coordinator.
+    key_sizes: bool,
     quiet: bool,
 ) -> Result<i32> {
     if !manifests.is_empty() && capture == CaptureMode::Scan {
@@ -896,6 +900,14 @@ pub fn run(
     // inventory continues. Never silently ignored.
     if key_operations && capture == CaptureMode::Scan {
         anyhow::bail!("--key-operations requires --capture auto or native");
+    }
+    // The opt-in gates before any load, mirroring the parse refusals
+    // for programmatic callers (spec §10.5).
+    if key_sizes && cfg!(feature = "stub-object-attributes") {
+        anyhow::bail!("--key-sizes requires a FULL build (P0 omits length capture)");
+    }
+    if key_sizes && !key_operations {
+        anyhow::bail!("--key-sizes requires --key-operations");
     }
     let scope: crate::cli::ScopeArg = scope.into();
     if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
@@ -961,6 +973,7 @@ pub fn run(
         #[cfg(test)]
         None,
         key_operations,
+        key_sizes,
     )
 }
 
@@ -1176,6 +1189,7 @@ fn run_with_terminal_diagnostics(
         &|| Ok(crate::attach::MultiCapableHost::for_test()),
         event_fault,
         None,
+        false,
         false,
     )
 }
@@ -1492,6 +1506,10 @@ fn run_with_terminal_budget(
     // start when set (scan pairings and omitted builds already refused
     // at the run entry); the run stays ordinary otherwise.
     key_operations: bool,
+    // `--key-sizes`: length capture rides the linked journal start when
+    // set (spec §10.5; refused without `--key-operations` at the run
+    // entry). Recorded on the coordinator; the lane reads it there.
+    key_sizes: bool,
 ) -> Result<i32> {
     let (engine_scope, numbering) = scope.into().resolve()?;
     let scope = InventoryRunScope::from(&engine_scope);
@@ -1685,6 +1703,7 @@ fn run_with_terminal_budget(
     }
     coordinator.set_manifests(manifests.to_vec());
     coordinator.set_forwarding(forwarding_modules.to_vec());
+    coordinator.set_key_sizes_requested(key_sizes);
     coordinator.set_key_operations_requested(key_operations);
     // Packet 6.13 round-2 (F5): the startup pinning above is retained
     // for the run, its proved offsets lower into the run's attach set
@@ -6061,7 +6080,9 @@ fn start_semantic_lane(
         return fallback_shell(coordinator, scope, backend, scan_subset);
     }
     if key_operations {
-        let spec = crate::attach::journal::JournalSpec;
+        let spec = crate::attach::journal::JournalSpec {
+            key_sizes: coordinator.key_sizes_requested(),
+        };
         // Guard refusals at the mints disclose and end the startup
         // here, exactly as without the flag: only a refused journal
         // *start* retries ordinary, never a refused subset. The
@@ -6251,7 +6272,7 @@ fn note_key_operations_subset_refused(
 /// causes win over the coarse live refusal so a missing pair or a
 /// build without the object is never hidden behind it.
 fn key_operations_refusal_reason(refusal: &crate::inventory_semantics::SemanticRefusal) -> String {
-    if let Err(error) = crate::attach::journal::JournalSpec.prepare() {
+    if let Err(error) = (crate::attach::journal::JournalSpec { key_sizes: false }).prepare() {
         return format!("{error:#}");
     }
     key_operations_refusal_reason_from(crate::attach::journal_pair_preflight(), refusal)
@@ -10944,6 +10965,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                 )
                 .unwrap_err();
                 assert_eq!(
@@ -10989,6 +11011,7 @@ mod tests {
             crate::cli::IdentityBackendSelection::Auto,
             false,
             crate::cli::CallerMetadataMode::None,
+            false,
             false,
             false,
         )
@@ -11160,6 +11183,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                 )
             },
         )
@@ -11252,6 +11276,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                 )
             },
         )
@@ -11315,6 +11340,7 @@ mod tests {
                     &|| Ok(crate::attach::MultiCapableHost::for_test()),
                     None,
                     None,
+                    false,
                     false,
                 )
             },
@@ -11820,6 +11846,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(code, 0);
@@ -11869,6 +11896,7 @@ mod tests {
             &|| panic!("a genuine scan must not probe or load capture BPF"),
             None,
             None,
+            false,
             false,
         )
         .unwrap();
@@ -12208,6 +12236,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                 )
             },
         )
@@ -12319,6 +12348,7 @@ mod tests {
                     },
                     None,
                     None,
+                    false,
                     false,
                 )
             },
@@ -12651,6 +12681,7 @@ mod tests {
                     crate::cli::IdentityBackendSelection::Auto,
                     false,
                     crate::cli::CallerMetadataMode::None,
+                    false,
                     false,
                     false,
                 )
@@ -31710,6 +31741,7 @@ mod seal_readiness_tests {
             CallerMetadataMode::None,
             true,
             false,
+            false,
         )
         .expect_err("colliding destinations refuse");
         let text = format!("{error:#}");
@@ -31755,6 +31787,7 @@ mod seal_readiness_tests {
             false,
             CallerMetadataMode::None,
             true,
+            false,
             false,
         )
         .expect_err("a flag-on scan run refuses");

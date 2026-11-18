@@ -2251,7 +2251,7 @@ _DETAILED_BASE_MAPS = {
         # the default ring must absorb drain gaps at fast-runner burst
         # rates. Tracks ebpf-common RING_BYTES; change both together.
         "EVENTS": (27, 0, 0, 33_554_432),
-        "EVIDENCE": (6, 4, 8, 9),
+        "EVIDENCE": (6, 4, 8, 11),
         # Per-ring submitted records (ebpf-common PRODUCED_CELLS): the
         # kernel half of the ring cross-check, beside the failure
         # counters. Tracks the constant; change both together.
@@ -2586,7 +2586,7 @@ def self_test():
     assert SAFE_MAPS["COUNTERS"] == map_def(6, 4, 8, 5)
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
-    assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
+    assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 11)
     assert SAFE_MAPS["PRODUCED"] == map_def(6, 4, 8, 2)
     assert INVENTORY_MAPS["PRODUCED"] == SAFE_MAPS["PRODUCED"]
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)

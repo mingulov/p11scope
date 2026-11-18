@@ -4475,7 +4475,7 @@ fn guest_returns_journal_retirement_failure_is_still_unmatched() {
     let source =
         std::fs::read_to_string("crates/ebpf/src/journal_roots.rs").expect("read journal roots");
     let (_, journal) = source
-        .split_once("pub(crate) fn ordinary_return(")
+        .split_once("pub(crate) fn ordinary_return<Record: ReturnPayload>(")
         .expect("journal ordinary half");
     assert!(
         refused_unmatched_is_retirement_aware(journal, "let Some(reason)"),

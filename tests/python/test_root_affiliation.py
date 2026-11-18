@@ -103,8 +103,12 @@ def hook_contract(main, identity):
             raise AssertionError("return must retain affiliation")
     impl = function(main, "p11_return_impl")
     ordinary = "ordinary_return(ctx, &key, start, flags, layout)"
-    if impl.count(ordinary) != 2 or impl.count("journal_roots::program::" + ordinary) != 1:
-        raise AssertionError("return must dispatch once per arm to ordinary_return")
+    if impl.count(ordinary) != 1:
+        raise AssertionError("return must dispatch once to ordinary_return")
+    if impl.count("journal_roots::program::ordinary_return::<JournalEndLength>(") != 1:
+        raise AssertionError("return must dispatch once to the journal length ordinary_return")
+    if impl.count("journal_roots::program::ordinary_return::<JournalEndFull>(") != 1:
+        raise AssertionError("return must dispatch once to the journal base ordinary_return")
     if impl.count("object_return_ordinary(ctx, &key, start, flags, layout)") != 1:
         raise AssertionError("return must dispatch once to object_return_ordinary")
     if impl.count("object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(") != 1:

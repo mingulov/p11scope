@@ -258,6 +258,9 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
     assert!(expected_programs.remove("p11_entry"));
     assert!(expected_programs.remove("p11_return"));
     expected_programs.extend(["p11_entry_journal", "p11_return_journal"]);
+    // v0.8.0 keymeta Task 2: the proof object is never stubbed, so it
+    // always carries the length pair (spec section 8.5).
+    expected_programs.extend(["p11_entry_journal_length", "p11_return_journal_length"]);
     assert_eq!(
         object
             .programs
@@ -272,6 +275,8 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
         "JOURNAL_CTL",
         "JOURNAL_MARKER_CTL",
         "JOURNAL_CLASSES",
+        // v0.8.0 keymeta Task 2: the length stash (spec section 8.2).
+        "EVIDENCE_START",
     ]);
     assert_eq!(
         object
@@ -280,7 +285,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
         expected_maps,
-        "private map inventory must be ordinary Detailed plus the four journal maps"
+        "private map inventory must be ordinary Detailed plus the five journal maps"
     );
     for (name, baseline) in &ordinary.maps {
         let map = &object.maps[name];
@@ -346,7 +351,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
         ("INSTANCE_START", (9, 16, 24, 16_384, 0)),
         ("DESCRIPTORS", (2, 4, 18, 105, 128)),
         ("EVENTS", (27, 0, 0, 32 * 1024 * 1024, 0)),
-        ("EVIDENCE", (6, 4, 8, 9, 0)),
+        ("EVIDENCE", (6, 4, 8, 11, 0)),
     ] {
         let map = object
             .maps
@@ -843,6 +848,11 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
     assert!(expected_programs.remove("p11_entry"));
     assert!(expected_programs.remove("p11_return"));
     expected_programs.extend(["p11_entry_journal", "p11_return_journal"]);
+    // v0.8.0 keymeta Task 2: FULL carries the length pair (spec section
+    // 8.5); the P0 flavor omits it.
+    if !cfg!(feature = "stub-object-attributes") {
+        expected_programs.extend(["p11_entry_journal_length", "p11_return_journal_length"]);
+    }
     assert_eq!(
         object
             .programs
@@ -857,6 +867,10 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
         "JOURNAL_CTL",
         "JOURNAL_MARKER_CTL",
         "JOURNAL_CLASSES",
+        // v0.8.0 keymeta Task 2: the length stash rides every journal
+        // flavor (spec section 8.2); the P0 flavor omits only the
+        // length programs.
+        "EVIDENCE_START",
     ]);
     assert_eq!(
         object
@@ -865,7 +879,7 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
         expected_maps,
-        "production map inventory must be ordinary Detailed plus the four journal maps"
+        "production map inventory must be ordinary Detailed plus the five journal maps"
     );
     for (name, baseline) in &ordinary.maps {
         let map = &object.maps[name];
@@ -931,7 +945,7 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
         ("INSTANCE_START", (9, 16, 24, 16_384, 0)),
         ("DESCRIPTORS", (2, 4, 18, 105, 128)),
         ("EVENTS", (27, 0, 0, 32 * 1024 * 1024, 0)),
-        ("EVIDENCE", (6, 4, 8, 9, 0)),
+        ("EVIDENCE", (6, 4, 8, 11, 0)),
     ] {
         let map = object
             .maps

@@ -92,14 +92,23 @@ use p11scope_ebpf_common::object_flow::{
     KEM_CAPTURE_WIRED, RefusedBaseOutcome, ReturnEventFacts, adapter_attributes_entry,
     adapter_derive_entry, adapter_emit_find_control, adapter_emit_get_control,
     adapter_fill_return_control, adapter_kem_entry, adapter_tail_fill, continuity_joins,
-    decode_return_gate, emission_finalize, encode_return_gate, fill_call_event,
-    join_refusal_bump, preserve_refused_base, refused_join_accounting,
+    decode_return_gate, emission_finalize, encode_return_gate, fill_call_event, join_refusal_bump,
+    preserve_refused_base, refused_join_accounting,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_journal::{
     JOURNAL_REASON_ABI_REFUSED, JOURNAL_REASON_IDENTITY_REFUSED, JOURNAL_REASON_INSERT_FAILED,
     JOURNAL_REASON_SCOPE_LOST, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
 };
+// Length-evidence vocabulary (v0.8.0 keymeta Task 2): the stash row,
+// the 648 form and the trailer, used only by the journal-gated map
+// and LENGTH arms below.
+#[cfg(p11scope_journal_roots)]
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_flow::EvidenceStart;
+#[cfg(p11scope_journal_roots)]
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_journal::{JournalEndFull, JournalEndLength, LengthTrailer};
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
     OBJECT_ACTION_DECAPSULATE, OBJECT_ACTION_DERIVE, OBJECT_ACTION_ENCAPSULATE, OBJECT_ACTION_FIND,
@@ -231,6 +240,17 @@ static OBJECT_DESCRIPTORS: Array<ObjectDescriptorWire> =
 #[cfg(not(feature = "inventory-only"))]
 #[map]
 static OBJECT_ZERO: Array<ObjectStart> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
+
+// Length-evidence stash (v0.8.0 keymeta Task 2, spec §8.2): one 32-byte
+// row per in-flight call at a length endpoint, keyed by the START key.
+// Journal builds only; the length programs insert on retention and
+// delete on every return path, and the stop scrub empties it after
+// quiescence. No shared row grows.
+#[cfg(p11scope_journal_roots)]
+#[cfg(not(feature = "inventory-only"))]
+#[map]
+static EVIDENCE_START: HashMap<StartKey, EvidenceStart> =
+    HashMap::with_max_entries(START_ENTRIES, 0);
 
 #[cfg(not(any(
     feature = "inventory-only",
@@ -4447,16 +4467,34 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
     if !stop_gate_enter() {
         return 0;
     }
-    let rc = p11_return_impl::<false>(ctx);
+    let rc = p11_return_impl::<false, false>(ctx);
     stop_gate_leave();
     rc
 }
 
+// Length hygiene for bailed returns (v0.8.0 keymeta Task 2, spec
+// section 8.2): delete the stash row so an abandoned row is never
+// trusted (the next same-key entry overwrites or deletes). Builds
+// without the journal stash take the empty stub.
+#[cfg(p11scope_journal_roots)]
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
-fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {
+fn length_return_abandon(key: &StartKey) {
+    let _ = EVIDENCE_START.remove(key);
+}
+
+#[cfg(not(p11scope_journal_roots))]
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn length_return_abandon(_key: &StartKey) {}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {
     let slot = slot_of(&ctx);
     if slot >= MAX_SLOTS {
+        // No stash can exist: the entry validates the slot first, so an
+        // invalid slot never retained.
         return 0;
     }
     let Some(flags) = scope_flags() else {
@@ -4485,6 +4523,12 @@ fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {
                 bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             }
         }
+        // Length hygiene (spec section 8.2): a bailed return abandons
+        // its stash row; the next same-key entry overwrites or deletes,
+        // so an abandoned row is never trusted.
+        if LENGTH {
+            length_return_abandon(&key);
+        }
         return 0;
     };
     let key = StartKey {
@@ -4504,6 +4548,9 @@ fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {
         }
         start_discard_for::<JOURNAL>(&key, JOURNAL_REASON_ABI_REFUSED);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
+        if LENGTH {
+            length_return_abandon(&key);
+        }
         return 0;
     };
     // Dispatch under the same physical owner. No START reference crosses
@@ -4520,12 +4567,18 @@ fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {
                 p11_instance_scope_gap();
             }
         }
+        if LENGTH {
+            length_return_abandon(&key);
+        }
         return 0;
     }
     if cfg!(feature = "counter-broad") && unsafe { (*start).object_required } != 0 {
         start_discard_for::<JOURNAL>(&key, JOURNAL_REASON_ABI_REFUSED);
         unsafe { p11_object_fault() };
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        if LENGTH {
+            length_return_abandon(&key);
+        }
         return 0;
     }
     // H8-D birth marker: the outlined return halves gap the leader row
@@ -4535,7 +4588,17 @@ fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {
     #[cfg(p11scope_journal_roots)]
     if JOURNAL {
         return if unsafe { (*start).object_required } == 0 {
-            journal_roots::program::ordinary_return(ctx, &key, start, flags, layout)
+            if LENGTH {
+                journal_roots::program::ordinary_return::<JournalEndLength>(
+                    ctx, &key, start, flags, layout,
+                )
+            } else {
+                journal_roots::program::ordinary_return::<JournalEndFull>(
+                    ctx, &key, start, flags, layout,
+                )
+            }
+        } else if LENGTH {
+            object_return::<true, JournalEndLength>(ctx, &key, start, flags, layout)
         } else {
             object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(
                 ctx, &key, start, flags, layout,
@@ -4828,11 +4891,15 @@ fn ordinary_return(
 
 #[cfg(not(feature = "inventory-only"))]
 trait ReturnPayload: Sized + 'static {
+    /// Whether this record carries the 16-byte length trailer past
+    /// the 608-byte payload (the 648 END+length form, spec §8.3).
+    const LENGTH: bool;
     unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord;
 }
 
 #[cfg(not(feature = "inventory-only"))]
 impl ReturnPayload for ObjectEventRecord {
+    const LENGTH: bool = false;
     #[inline(always)]
     unsafe fn payload(record: *mut Self) -> *mut ObjectEventRecord {
         record
@@ -5069,6 +5136,9 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
         let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST);
         unsafe { p11_object_fault() };
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        if Record::LENGTH {
+            length_return_abandon(&key);
+        }
         return 0;
     }
     let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
@@ -5081,6 +5151,9 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
         let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_ABI_REFUSED);
         unsafe { p11_object_fault() };
         bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        if Record::LENGTH {
+            length_return_abandon(&key);
+        }
         return 0;
     }
     // Finish the accounting/facts storage lifetime before deep object
@@ -5095,6 +5168,9 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
                 unsafe { p11_object_fault() };
                 bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             }
+            if Record::LENGTH {
+                length_return_abandon(&key);
+            }
             return 0;
         }
         let mut image = ImageIdentity::default();
@@ -5104,6 +5180,9 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
             let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_IDENTITY_REFUSED);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            if Record::LENGTH {
+                length_return_abandon(&key);
+            }
             return 0;
         }
         // This short immutable borrow ends before reservation/native continuity
@@ -5133,6 +5212,9 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
                 unsafe {
                     p11_instance_scope_gap();
                 }
+            }
+            if Record::LENGTH {
+                length_return_abandon(&key);
             }
             return 0;
         };
@@ -5205,6 +5287,9 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
         if semantic {
             bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         }
+        if Record::LENGTH {
+            length_return_abandon(&key);
+        }
         return 0;
     }
     let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
@@ -5251,8 +5336,27 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
     let reason = JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
     #[cfg(p11scope_journal_roots)]
     let reason = if JOURNAL && emitted {
-        let Some(reason) =
-            (unsafe { journal_roots::program::complete(reservation.cast(), &key, false) })
+        // Length trailer (spec §8.2/§8.3): resolve the retained
+        // evidence now that the join gate passed (no target read
+        // before the join), and complete the matching END form. Base
+        // records fold the dummy trailer away unused.
+        let trailer = if Record::LENGTH {
+            journal_roots::program::length_trailer_for_return(&key, ctx, rv, layout, joined)
+        } else {
+            LengthTrailer {
+                version: 0,
+                kind: 0,
+                status: 0,
+                reserved: [0; 4],
+                value: 0,
+            }
+        };
+        let completed = if Record::LENGTH {
+            unsafe { journal_roots::program::complete_length(reservation.cast(), &key, false, &trailer) }
+        } else {
+            unsafe { journal_roots::program::complete(reservation.cast(), &key, false) }
+        };
+        let Some(reason) = completed
         else {
             // The flag conversion refused: the reservation holds no
             // header, so it can never submit. Retire the call like a

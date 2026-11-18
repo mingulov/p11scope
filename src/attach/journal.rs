@@ -35,6 +35,13 @@ use std::collections::BTreeSet;
 /// The journal entry/return pair replacing the ordinary roots.
 pub(crate) const PROGRAMS: [&str; 2] = ["p11_entry_journal", "p11_return_journal"];
 
+/// The journal length pair (v0.8.0 keymeta Task 2, spec §8.6): the same
+/// journal BEGIN/END protocol as [`PROGRAMS`], plus the length adapters
+/// and the 648 END+length form. Loaded and linked only with
+/// `--key-sizes`; the P0 journal flavor omits them.
+pub(crate) const LENGTH_PROGRAMS: [&str; 2] =
+    ["p11_entry_journal_length", "p11_return_journal_length"];
+
 /// The ordinary roots a journal object must not carry.
 const ORDINARY_PAIR: [&str; 2] = ["p11_entry", "p11_return"];
 
@@ -56,14 +63,90 @@ const JOURNAL_MAPS: [(&str, ExactMapMetadata); 4] = [
     ),
 ];
 
+/// Whether one canonical descriptor names a length endpoint: a nonzero
+/// in-range descriptor whose function carries an S-cell or V-scalar
+/// position in `EVIDENCE_POSITIONS`. Count-only zero, out-of-range,
+/// unlisted and info descriptors take the base pair.
+pub(crate) fn is_length_endpoint(descriptor: u32) -> bool {
+    if descriptor == 0 || descriptor >= MAX_DESCRIPTORS {
+        return false;
+    }
+    p11scope_ebpf_common::evidence_table::length_kind_for_descriptor(descriptor).is_some()
+}
+
+/// The journal entry program for one canonical descriptor: the length
+/// entry at length endpoints with the flag on, else the base entry.
+/// Info endpoints, count-only zero and out-of-range descriptors always
+/// take the base entry (the info pair lives in the inventory object).
+pub(crate) fn journal_entry_program(descriptor: u32, key_sizes: bool) -> &'static str {
+    if key_sizes && is_length_endpoint(descriptor) {
+        LENGTH_PROGRAMS[0]
+    } else {
+        PROGRAMS[0]
+    }
+}
+
+/// The journal return program for one entry program: length returns
+/// serve length entries, base returns serve base entries. Entry and
+/// return always pair; anything else is refused by
+/// [`validate_journal_group_pair`], never mixed.
+pub(crate) fn journal_return_program(entry_program: &str) -> &'static str {
+    if entry_program == LENGTH_PROGRAMS[0] {
+        LENGTH_PROGRAMS[1]
+    } else {
+        PROGRAMS[1]
+    }
+}
+
+/// Refuse a mixed journal group pair loudly: entry and return always
+/// pair, and a mixed plan would strand the stash (a planner bug).
+pub(crate) fn validate_journal_group_pair(entry_program: &str, return_program: &str) -> Result<()> {
+    let paired = (entry_program == PROGRAMS[0] && return_program == PROGRAMS[1])
+        || (entry_program == LENGTH_PROGRAMS[0] && return_program == LENGTH_PROGRAMS[1]);
+    if paired {
+        Ok(())
+    } else {
+        bail!(
+            "mixed journal group pair: entry {entry_program} with return {return_program} \
+             (entry and return always pair; a mixed plan would strand the length stash)"
+        )
+    }
+}
+
+/// The `EVIDENCE_START` reservation for the flag: the full 16384-row
+/// stash with the flag on, exactly one row with the flag off (the
+/// loader overrides `max_entries` to 1, so the off-state reservation
+/// is one row).
+pub(crate) fn evidence_start_entries(key_sizes: bool) -> u32 {
+    if key_sizes { 16_384 } else { 1 }
+}
+
+/// Exact metadata of the `EVIDENCE_START` stash map for the flag:
+/// Hash of 16-byte keys to 32-byte rows, with the flag-dependent
+/// reservation above. The ELF always carries 16384 (journal builds
+/// never take small-state-maps); the loader overrides to 1 with the
+/// flag off.
+fn evidence_start_map_metadata(key_sizes: bool) -> ExactMapMetadata {
+    map_metadata(MapType::Hash, 16, 32, evidence_start_entries(key_sizes), 0)
+}
+
 /// Production journal capture request. The Session start chain resolves one
 /// through [`JournalSpec::prepare`] before anything loads.
-#[derive(Debug)]
-pub(crate) struct JournalSpec;
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JournalSpec {
+    /// Whether `--key-sizes` length capture rides this session: the
+    /// length programs load and link at length endpoints, and the
+    /// stash reserves fully. Object selection is flag-independent
+    /// (one journal object); the flag selects programs, maps and
+    /// routing at load/attach time.
+    pub(crate) key_sizes: bool,
+}
 
 impl JournalSpec {
     /// Resolve the embedded production object. Builds that omit it refuse
     /// with the finite build reason before any load, parse or fill.
+    /// Object selection is flag-independent (one journal object); the
+    /// flag rides the preparation to load/attach time.
     pub(crate) fn prepare(&self) -> Result<JournalPreparation<'static>> {
         check_journal_build(
             env!("P11SCOPE_JOURNAL_ENABLED"),
@@ -72,6 +155,7 @@ impl JournalSpec {
         .map_err(anyhow::Error::msg)?;
         Ok(JournalPreparation {
             object: journal_object(),
+            key_sizes: self.key_sizes,
         })
     }
 }
@@ -80,6 +164,8 @@ impl JournalSpec {
 #[derive(Debug)]
 pub(crate) struct JournalPreparation<'a> {
     pub(crate) object: &'a [u8],
+    /// Whether `--key-sizes` length capture rides this preparation.
+    pub(crate) key_sizes: bool,
 }
 
 /// The embedded production journal object. Omitted builds carry an empty
@@ -119,8 +205,12 @@ pub(crate) fn checked_journal_flavor(object: &[u8]) -> Result<EmbeddedFlavor> {
 }
 
 /// The parsed-object mapping: the journal pair must be present and named
-/// when missing, the ordinary pair must be absent, and the four journal
-/// maps must carry their exact shapes.
+/// when missing, the ordinary pair must be absent, and the journal maps
+/// must carry their exact shapes (the four base maps plus the
+/// `EVIDENCE_START` stash at its ELF reservation). The length pair is
+/// flavor-dependent (FULL carries it, P0 omits it) and is checked at
+/// load, not here: the load plan requests it only with the flag, and
+/// the loaded inventory accepts exactly one frozen shape.
 pub(crate) fn journal_flavor_from_parsed(parsed: &aya_obj::Object) -> Result<EmbeddedFlavor> {
     let missing: Vec<&str> = PROGRAMS
         .iter()
@@ -145,29 +235,41 @@ pub(crate) fn journal_flavor_from_parsed(parsed: &aya_obj::Object) -> Result<Emb
         );
     }
     for (name, expected) in JOURNAL_MAPS {
-        let Some(map) = parsed.maps.get(name) else {
-            bail!(
-                "journal BPF object map mismatch: {name} missing from the production journal object"
-            );
-        };
-        let actual = (
-            map.map_type(),
-            map.key_size(),
-            map.value_size(),
-            map.max_entries(),
-            map.map_flags(),
-        );
-        let expected = metadata_tuple(&expected);
-        if actual != expected {
-            bail!(
-                "journal BPF object map mismatch: {name} metadata {actual:?} differs from exact expected {expected:?}"
-            );
-        }
+        check_journal_map_shape(parsed, name, &expected)?;
     }
+    // The ELF always carries the full stash reservation (journal builds
+    // never take small-state-maps); the loader overrides to one row
+    // with the flag off.
+    check_journal_map_shape(parsed, "EVIDENCE_START", &evidence_start_map_metadata(true))?;
     Ok(EmbeddedFlavor {
         stubbed: false,
         unsafe_present: false,
     })
+}
+
+/// One exact map-shape check behind [`journal_flavor_from_parsed`].
+fn check_journal_map_shape(
+    parsed: &aya_obj::Object,
+    name: &str,
+    expected: &ExactMapMetadata,
+) -> Result<()> {
+    let Some(map) = parsed.maps.get(name) else {
+        bail!("journal BPF object map mismatch: {name} missing from the production journal object");
+    };
+    let actual = (
+        map.map_type(),
+        map.key_size(),
+        map.value_size(),
+        map.max_entries(),
+        map.map_flags(),
+    );
+    let expected = metadata_tuple(expected);
+    if actual != expected {
+        bail!(
+            "journal BPF object map mismatch: {name} metadata {actual:?} differs from exact expected {expected:?}"
+        );
+    }
+    Ok(())
 }
 
 /// Raw shape tuple behind [`JOURNAL_MAPS`], so the parsed-bytes rule and the
@@ -198,27 +300,59 @@ pub(crate) fn journal_expected_programs() -> BTreeSet<&'static str> {
         .collect()
 }
 
+/// Programs a journal session verifies and loads (spec §8.6): the base
+/// set, plus the length pair only with `--key-sizes`. Aya verifies each
+/// program at its own load, so with the flag off the length code is
+/// never even verified. The P0 journal flavor omits the length
+/// programs; requesting them there fails loudly at load.
+pub(crate) fn journal_load_programs(key_sizes: bool) -> BTreeSet<&'static str> {
+    let mut programs = journal_expected_programs();
+    if key_sizes {
+        programs.extend(LENGTH_PROGRAMS);
+    }
+    programs
+}
+
+/// The two frozen journal inventory shapes: the base set (P0 object)
+/// and the base set plus the length pair (FULL object). A partial
+/// length pair (one root present) matches neither.
+pub(crate) fn journal_inventory_shapes() -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
+    let mut base = journal_expected_programs();
+    base.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
+    base.insert(COPY_VMA_RET_PROGRAM);
+    base.insert(EXEC_RELEASE_MMAP_PROGRAM);
+    base.insert("p11_image_query");
+    base.extend(SELECTED_DETAILED_PROGRAMS);
+    let mut full = base.clone();
+    full.extend(LENGTH_PROGRAMS);
+    (base, full)
+}
+
 /// Exact program inventory of a loaded journal object: the swapped pair plus
 /// every retained ordinary program. Mirrors the Detailed inventory contract.
+/// Accepts exactly one of the two frozen shapes from
+/// [`journal_inventory_shapes`].
 pub(crate) fn validate_journal_inventory(ebpf: &Ebpf) -> Result<()> {
-    let mut expected = journal_expected_programs();
-    expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
-    expected.insert(COPY_VMA_RET_PROGRAM);
-    expected.insert(EXEC_RELEASE_MMAP_PROGRAM);
-    expected.insert("p11_image_query");
-    expected.extend(SELECTED_DETAILED_PROGRAMS);
+    let (base, full) = journal_inventory_shapes();
     let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
-    if actual != expected {
-        bail!("eBPF program inventory {actual:?} differs from {expected:?}");
+    if actual != base && actual != full {
+        bail!("eBPF program inventory {actual:?} differs from {base:?} and {full:?}");
     }
     Ok(())
 }
 
-/// Exact metadata of the four journal maps in a loaded object.
-pub(crate) fn validate_journal_maps(ebpf: &Ebpf) -> Result<()> {
+/// Exact metadata of the journal maps in a loaded object: the four base
+/// maps plus the `EVIDENCE_START` stash with its flag-dependent
+/// reservation (full with the flag on, one row with it off).
+pub(crate) fn validate_journal_maps(ebpf: &Ebpf, key_sizes: bool) -> Result<()> {
     for (name, expected) in JOURNAL_MAPS {
         validate_policy_map(ebpf, name, expected)?;
     }
+    validate_policy_map(
+        ebpf,
+        "EVIDENCE_START",
+        evidence_start_map_metadata(key_sizes),
+    )?;
     Ok(())
 }
 
@@ -426,10 +560,10 @@ mod tests {
     #[test]
     fn journal_spec_prepare_reports_unbuilt_before_any_work() {
         if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
-            let prepared = JournalSpec.prepare().unwrap();
+            let prepared = JournalSpec { key_sizes: false }.prepare().unwrap();
             assert!(!prepared.object.is_empty());
         } else {
-            let error = JournalSpec.prepare().unwrap_err();
+            let error = JournalSpec { key_sizes: false }.prepare().unwrap_err();
             assert!(
                 format!("{error:#}").contains("journal-pair-unavailable-in-build"),
                 "{error:#}"
@@ -585,7 +719,7 @@ mod tests {
     #[test]
     fn journal_expected_programs_swap_the_pair() {
         let expected = super::super::expected_programs(false);
-        let journal = journal_expected_programs(false);
+        let journal = journal_expected_programs();
         assert_eq!(journal.len(), expected.len());
         for name in PROGRAMS {
             assert!(journal.contains(name), "{name}");
@@ -612,7 +746,9 @@ mod tests {
     /// census or descriptor drift fails here first.
     #[test]
     fn journal_length_classes_snapshot_keymeta_task2() {
-        use crate::semantics_objects::journal::{endpoint_class, is_neutral_function, EndpointClass};
+        use crate::semantics_objects::journal::{
+            EndpointClass, endpoint_class, is_neutral_function,
+        };
         let neutral_length = [
             "C_Sign",
             "C_SignRecover",
@@ -633,9 +769,18 @@ mod tests {
                 Some(EndpointClass::ModeledAffecting),
                 "{name} stays Neutral-modeled"
             );
-            assert_eq!(super::journal_class_for_descriptor(function + 1), 2, "{name}");
+            assert_eq!(
+                super::journal_class_for_descriptor(function + 1),
+                2,
+                "{name}"
+            );
         }
-        for name in ["C_WrapKey", "C_UnwrapKey", "C_EncapsulateKey", "C_DecapsulateKey"] {
+        for name in [
+            "C_WrapKey",
+            "C_UnwrapKey",
+            "C_EncapsulateKey",
+            "C_DecapsulateKey",
+        ] {
             let function = crate::kinds::function_id(name).expect("catalog holds the length call");
             assert!(
                 !is_neutral_function(function),
@@ -646,7 +791,11 @@ mod tests {
                 Some(EndpointClass::ModeledAffecting),
                 "{name} stays modeled"
             );
-            assert_eq!(super::journal_class_for_descriptor(function + 1), 2, "{name}");
+            assert_eq!(
+                super::journal_class_for_descriptor(function + 1),
+                2,
+                "{name}"
+            );
         }
         for name in ["C_GetInfo", "C_GetTokenInfo", "C_GetMechanismInfo"] {
             let function = crate::kinds::function_id(name).expect("catalog holds the info call");
@@ -655,7 +804,11 @@ mod tests {
                 Some(EndpointClass::ProvedIrrelevant),
                 "{name} stays proved-irrelevant"
             );
-            assert_eq!(super::journal_class_for_descriptor(function + 1), 1, "{name}");
+            assert_eq!(
+                super::journal_class_for_descriptor(function + 1),
+                1,
+                "{name}"
+            );
         }
     }
 
@@ -666,7 +819,10 @@ mod tests {
     #[test]
     fn journal_length_entry_program_selects_pair_per_endpoint() {
         use super::{LENGTH_PROGRAMS, PROGRAMS, is_length_endpoint, journal_entry_program};
-        assert_eq!(LENGTH_PROGRAMS, ["p11_entry_journal_length", "p11_return_journal_length"]);
+        assert_eq!(
+            LENGTH_PROGRAMS,
+            ["p11_entry_journal_length", "p11_return_journal_length"]
+        );
         let length = [
             "C_Sign",
             "C_SignRecover",
@@ -682,7 +838,10 @@ mod tests {
         ];
         for name in length {
             let descriptor = crate::kinds::function_id(name).unwrap() + 1;
-            assert!(is_length_endpoint(descriptor), "{name} is a length endpoint");
+            assert!(
+                is_length_endpoint(descriptor),
+                "{name} is a length endpoint"
+            );
             assert_eq!(
                 journal_entry_program(descriptor, true),
                 LENGTH_PROGRAMS[0],
@@ -707,7 +866,10 @@ mod tests {
             base.push(crate::kinds::function_id(name).unwrap() + 1);
         }
         for descriptor in base {
-            assert!(!is_length_endpoint(descriptor), "descriptor {descriptor} is not length");
+            assert!(
+                !is_length_endpoint(descriptor),
+                "descriptor {descriptor} is not length"
+            );
             for key_sizes in [false, true] {
                 assert_eq!(
                     journal_entry_program(descriptor, key_sizes),
@@ -727,7 +889,10 @@ mod tests {
             LENGTH_PROGRAMS, PROGRAMS, journal_return_program, validate_journal_group_pair,
         };
         assert_eq!(journal_return_program(PROGRAMS[0]), PROGRAMS[1]);
-        assert_eq!(journal_return_program(LENGTH_PROGRAMS[0]), LENGTH_PROGRAMS[1]);
+        assert_eq!(
+            journal_return_program(LENGTH_PROGRAMS[0]),
+            LENGTH_PROGRAMS[1]
+        );
         validate_journal_group_pair(PROGRAMS[0], PROGRAMS[1]).unwrap();
         validate_journal_group_pair(LENGTH_PROGRAMS[0], LENGTH_PROGRAMS[1]).unwrap();
         for (entry, ret) in [
@@ -742,13 +907,16 @@ mod tests {
         }
     }
 
-    /// Program-inventory growth (§8.5): flag off is exactly today's set
-    /// (length pair absent); flag on adds exactly the length pair.
+    /// Load-set growth (§8.5/§8.6): flag off loads exactly today's
+    /// set (length pair absent, never even verified); flag on adds
+    /// exactly the length pair. Aya verifies each program at its own
+    /// load, so the load plan is the verification gate.
     #[test]
-    fn journal_expected_programs_grows_with_flag() {
-        use super::{LENGTH_PROGRAMS, PROGRAMS, journal_expected_programs};
-        let off = journal_expected_programs(false);
-        let on = journal_expected_programs(true);
+    fn journal_load_programs_grows_with_flag() {
+        use super::{LENGTH_PROGRAMS, PROGRAMS, journal_expected_programs, journal_load_programs};
+        let off = journal_load_programs(false);
+        let on = journal_load_programs(true);
+        assert_eq!(off, journal_expected_programs());
         for name in PROGRAMS {
             assert!(off.contains(name) && on.contains(name), "{name}");
         }
@@ -760,6 +928,43 @@ mod tests {
         let mut grown = off.clone();
         grown.extend(LENGTH_PROGRAMS);
         assert_eq!(on, grown);
+    }
+
+    /// Object-inventory shapes (§8.5): the embedded journal object
+    /// carries exactly one frozen shape — base (P0) or base plus the
+    /// length pair (FULL) — and a partial pair matches neither. The
+    /// flag selects the load subset, never the object content.
+    #[test]
+    fn journal_inventory_accepts_exactly_one_frozen_shape() {
+        use super::{LENGTH_PROGRAMS, journal_inventory_shapes, journal_object};
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_JOURNAL_OUTPUTS"), "");
+            return;
+        }
+        let (base, full) = journal_inventory_shapes();
+        for name in LENGTH_PROGRAMS {
+            assert!(!base.contains(name), "{name} absent from the base shape");
+            assert!(full.contains(name), "{name} present in the FULL shape");
+        }
+        assert_eq!(full.len(), base.len() + LENGTH_PROGRAMS.len());
+        let parsed = aya_obj::Object::parse(journal_object()).expect("journal bytes parse");
+        let actual: std::collections::BTreeSet<&str> =
+            parsed.programs.keys().map(String::as_str).collect();
+        assert!(
+            actual == base || actual == full,
+            "the journal object matches one frozen shape"
+        );
+        if cfg!(feature = "stub-object-attributes") {
+            assert_eq!(actual, base, "the P0 flavor omits the length pair");
+        } else {
+            assert_eq!(actual, full, "the FULL flavor carries the length pair");
+        }
+        for missing in LENGTH_PROGRAMS {
+            let mut partial = full.clone();
+            assert!(partial.remove(missing));
+            assert_ne!(partial, base, "partial pair matches neither shape");
+            assert_ne!(partial, full, "partial pair matches neither shape");
+        }
     }
 
     /// The `EVIDENCE_START` reservation follows the flag: the full

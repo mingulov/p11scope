@@ -25626,9 +25626,11 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
         .ledger()
         .roles_for_test();
     assert_eq!(before_roles[..4], [0, 3, 0, 1]);
+    // v0.8.0 keymeta Task 2: the retained END grows 632 to 648 with
+    // the length trailer (spec section 8.3), so the open charge is 1224.
     assert_eq!(
         crate::semantics_objects::journal::JournalAdapter::open_entry_size_for_test(),
-        1208
+        1224
     );
     assert_eq!(
         fixture
@@ -25639,7 +25641,7 @@ fn joint_pending_h3_stash_disposes_frame_and_claims_original_in_next_quantum() {
             .joint_capture()
             .adapter()
             .retained_open_charges_for_test(),
-        [1208; 3]
+        [1224; 3]
     );
     let before_starts = fixture
         .scene

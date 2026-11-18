@@ -865,6 +865,7 @@ fn inventory_prearm_section_empty_without_flag() {
         CallerMetadataMode::default(),
         false,
         false,
+        false,
     )
     .expect("scan inventory over an owned child");
     assert_eq!(code, 0);

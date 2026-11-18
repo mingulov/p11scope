@@ -469,7 +469,7 @@ fn inventory_maps(
         (
             "EVIDENCE",
             K::PerCpuArray,
-            map_metadata(MapType::PerCpuArray, 4, 8, 9, 0),
+            map_metadata(MapType::PerCpuArray, 4, 8, 11, 0),
         ),
         (
             "COUNTERS",

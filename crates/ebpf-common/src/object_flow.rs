@@ -20,11 +20,15 @@
 //! access. `core`-only: this module compiles for BPF and host alike.
 
 use crate::event_type;
+use crate::evidence_table::{
+    evidence_position, length_buffer_base, LENGTH_CAPACITY_MAX, LENGTH_KIND_SCELL,
+    LENGTH_KIND_VSCALAR,
+};
 use crate::instance;
 use crate::object_capture::{
     attribute_table_span, authorize_derive_return, classify_derive_mechanism, find_flag,
     handle_status, object_flag, return_accepts_get_results, spans_overlap, validate_target_span,
-    DeriveEntry, GetEntryVerdict, ReturnAuthority,
+    DeriveEntry, GetEntryVerdict, ReturnAuthority, CKR_BUFFER_TOO_SMALL, CKR_OK,
 };
 use crate::object_policy::ScalarDeriveMechanism;
 use crate::object_wire::{
@@ -32,10 +36,11 @@ use crate::object_wire::{
     ObjectStart, OBJECT_ACTION_DECAPSULATE, OBJECT_ACTION_DERIVE, OBJECT_ACTION_ENCAPSULATE,
     OBJECT_ACTION_FIND, OBJECT_ACTION_GET, OBJECT_ACTION_MAX, OBJECT_ACTION_NONE,
     OBJECT_ATTR_LIST_UNINSPECTED, OBJECT_DERIVE_UNAVAILABLE, OBJECT_FLAGS_MASK, OBJECT_GUARD_NONE,
-    OBJECT_GUARD_SCALAR_DERIVE,
+    OBJECT_GUARD_SCALAR_DERIVE, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64,
 };
 use crate::{
     target_word_end, CallStart, Event, ImageIdentity, InstanceContinuity, LinuxLayout, ARG_NONE,
+    MAX_DESCRIPTORS,
 };
 
 /// Already captured scalar return facts for the in-place Event writer.
@@ -728,6 +733,215 @@ pub fn adapter_kem_entry(
     side.result_ptrs = [cell, 0];
     side.phase = 2;
     true
+}
+
+/// `CKR_SIGNATURE_INVALID` (192, PKCS#11 v2.40): a rejected verify
+/// input length is ambiguous evidence (the provider may fail fast on
+/// a length mismatch), so it is never admitted (K2).
+pub const CKR_SIGNATURE_INVALID: u64 = 192;
+
+/// The `EVIDENCE_START` stash row: one retained length cell or scalar
+/// snapshot per in-flight call at a length endpoint (spec §8.2).
+/// Exactly 32 bytes; the BPF map and the stop scrub share this shape.
+/// Holds raw target words: deliberately no `Debug` (like the other
+/// stash rows, it must never be logged verbatim).
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvidenceStart {
+    /// Retained S-cell pointer or V-scalar snapshot.
+    pub ev_cell: u64,
+    /// The START row's entry timestamp, snapshotted at entry: the
+    /// return binding (fix9 R4 — no native accessor added).
+    pub ev_ts_ns: u64,
+    /// `LENGTH_KIND_SCELL` or `LENGTH_KIND_VSCALAR`.
+    pub ev_kind: u8,
+    /// `OBJECT_LAYOUT_LP64` or `OBJECT_LAYOUT_ILP32`.
+    pub ev_layout: u8,
+    /// Reserved flags, always zero.
+    pub ev_flags: u16,
+    /// Reserved, always zero.
+    pub reserved: [u8; 12],
+}
+
+/// Length-evidence return verdicts: a captured length word, an
+/// unavailable shape (trailer status 0, zero value), or a stash
+/// mismatch (trailer status 0 plus the mismatch count — deleted,
+/// never a guessed length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthReturnVerdict {
+    Value(u64),
+    Unavailable,
+    StashMismatch,
+}
+
+/// Production length-evidence entry adapter body (spec §5.1, §8.2):
+/// retain the S-cell pointer with the entry guards, or snapshot the
+/// V-scalar with no dereference. Returns true with `out` filled on
+/// retention, false with `out` zeroed on every unavailable shape
+/// (fail closed, never a guessed bound). The BPF wrapper inserts on
+/// true (overwrite) and deletes on false (a stale row is never
+/// trusted); full-map insert failures land in their own evidence
+/// counter, never silent.
+///
+/// `descriptor` is the canonical descriptor (`function + 1`); 0,
+/// out-of-range, unlisted and info descriptors retain nothing with
+/// zero reads. `start_ts_ns` is the START row's entry timestamp to
+/// bind. `fetch_arg` supplies entry argument scalars (probe
+/// registers/stack on BPF, a spy on host); `reader` reads one target
+/// word: the entry capacity, S-cells only.
+#[inline(always)]
+pub fn adapter_length_entry(
+    out: &mut EvidenceStart,
+    descriptor: u32,
+    layout: LinuxLayout,
+    start_ts_ns: u64,
+    fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
+    mut reader: impl crate::WordReader,
+) -> bool {
+    *out = EvidenceStart::default();
+    if descriptor == 0 || descriptor >= MAX_DESCRIPTORS {
+        return false;
+    }
+    let function = descriptor - 1;
+    let Some(row) = evidence_position(function) else {
+        return false;
+    };
+    if row.info {
+        return false;
+    }
+    let word_len = layout.word_bytes() as u64;
+    let layout_code = match layout {
+        LinuxLayout::Lp64 => OBJECT_LAYOUT_LP64,
+        LinuxLayout::Ilp32 => OBJECT_LAYOUT_ILP32,
+    };
+    if row.length_cell_arg != ARG_NONE && row.length_scalar_arg == ARG_NONE {
+        // S-protocol: retain the cell with the entry guards (null →
+        // no retention; entry capacity with the 1 MiB cap; full-span;
+        // disjointness against the buffer base on either side, with
+        // the explicit null-base rule: a NULL base skips the check
+        // and the cell still reads — query shapes read).
+        let Some(cell) = fetch_arg(row.length_cell_arg) else {
+            return false;
+        };
+        if cell == 0 {
+            return false;
+        }
+        if target_word_end(cell, layout).is_none() {
+            return false;
+        }
+        let Ok(capacity) = reader.read_word(cell, layout) else {
+            return false;
+        };
+        if layout == LinuxLayout::Ilp32 && capacity > u64::from(u32::MAX) {
+            return false;
+        }
+        if capacity > LENGTH_CAPACITY_MAX {
+            return false;
+        }
+        let base_arg = length_buffer_base(function);
+        if base_arg == ARG_NONE {
+            // An S-row without a base is table skew: fail closed,
+            // never an unguarded retention.
+            return false;
+        }
+        let Some(base) = fetch_arg(base_arg) else {
+            return false;
+        };
+        if base != 0 {
+            if base.checked_add(capacity).is_none() {
+                return false;
+            }
+            if spans_overlap(cell, word_len, base, capacity) {
+                return false;
+            }
+        }
+        *out = EvidenceStart {
+            ev_cell: cell,
+            ev_ts_ns: start_ts_ns,
+            ev_kind: LENGTH_KIND_SCELL,
+            ev_layout: layout_code,
+            ev_flags: 0,
+            reserved: [0; 12],
+        };
+        true
+    } else if row.length_scalar_arg != ARG_NONE && row.length_cell_arg == ARG_NONE {
+        // V-protocol: snapshot the register/stack word; no
+        // dereference, no pointer retention, no read.
+        let Some(scalar) = fetch_arg(row.length_scalar_arg) else {
+            return false;
+        };
+        if layout == LinuxLayout::Ilp32 && scalar > u64::from(u32::MAX) {
+            return false;
+        }
+        *out = EvidenceStart {
+            ev_cell: scalar,
+            ev_ts_ns: start_ts_ns,
+            ev_kind: LENGTH_KIND_VSCALAR,
+            ev_layout: layout_code,
+            ev_flags: 0,
+            reserved: [0; 12],
+        };
+        true
+    } else {
+        // A corrupt row (both or neither position set) retains nothing.
+        false
+    }
+}
+
+/// Production length-evidence return adapter body (spec §5.1, §8.2):
+/// resolve the retained evidence against the return RV and the owned
+/// lifetime. `evidence` is the stash row (the caller holds a copy;
+/// the BPF wrapper deletes the row on every path). `start_ts_ns` is
+/// the START row's timestamp (`None` when the row is gone). Refused
+/// joins, stamp/layout mismatches, failure RVs and unknown kinds
+/// resolve without reading; S-cells read once on CKR_OK and
+/// CKR_BUFFER_TOO_SMALL (the exact required length, kept as
+/// corroboration userspace-side); V-scalars resolve the snapshot on
+/// CKR_OK alone. No retry after return.
+#[inline(always)]
+pub fn adapter_length_return(
+    evidence: &EvidenceStart,
+    start_ts_ns: Option<u64>,
+    rv: u64,
+    layout: LinuxLayout,
+    joined: bool,
+    mut reader: impl crate::WordReader,
+) -> LengthReturnVerdict {
+    use LengthReturnVerdict::{StashMismatch, Unavailable, Value};
+    if !joined {
+        return Unavailable;
+    }
+    let layout_code = match layout {
+        LinuxLayout::Lp64 => OBJECT_LAYOUT_LP64,
+        LinuxLayout::Ilp32 => OBJECT_LAYOUT_ILP32,
+    };
+    if evidence.ev_layout != layout_code {
+        return StashMismatch;
+    }
+    if start_ts_ns != Some(evidence.ev_ts_ns) {
+        return StashMismatch;
+    }
+    if evidence.ev_kind == LENGTH_KIND_SCELL {
+        // PENDING never reads (a pending result is never a length);
+        // failure RVs never read; no retry after return.
+        if rv != CKR_OK && rv != CKR_BUFFER_TOO_SMALL {
+            return Unavailable;
+        }
+        let Ok(value) = reader.read_word(evidence.ev_cell, layout) else {
+            return Unavailable;
+        };
+        if layout == LinuxLayout::Ilp32 && value > u64::from(u32::MAX) {
+            return Unavailable;
+        }
+        Value(value)
+    } else if evidence.ev_kind == LENGTH_KIND_VSCALAR {
+        if rv != CKR_OK {
+            return Unavailable;
+        }
+        Value(evidence.ev_cell)
+    } else {
+        Unavailable
+    }
 }
 
 #[inline(always)]
@@ -3576,9 +3790,7 @@ mod tests {
     // Length-evidence adapters (v0.8.0 keymeta Task 2, spec §5.1/§8.2).
     // ------------------------------------------------------------------
 
-    use crate::evidence_table::{
-        LENGTH_CAPACITY_MAX, LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR,
-    };
+    use crate::evidence_table::{LENGTH_CAPACITY_MAX, LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR};
     use crate::object_capture::{CKR_BUFFER_TOO_SMALL, CKR_OK, CKR_PENDING};
     use crate::object_wire::{OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64};
 
@@ -3678,6 +3890,18 @@ mod tests {
         }
     }
 
+    /// Whole-row zero assertion without `Debug` (stash rows hold target
+    /// words and deliberately lack it, like the other stash rows):
+    /// fieldwise equality with the default row.
+    fn assert_evidence_zeroed(out: &EvidenceStart, context: &str) {
+        assert_eq!(out.ev_cell, 0, "{context}: cell");
+        assert_eq!(out.ev_ts_ns, 0, "{context}: stamp");
+        assert_eq!(out.ev_kind, 0, "{context}: kind");
+        assert_eq!(out.ev_layout, 0, "{context}: layout");
+        assert_eq!(out.ev_flags, 0, "{context}: flags");
+        assert_eq!(out.reserved, [0; 12], "{context}: reserved");
+    }
+
     /// Every S-shape (LP64 + ia32): a disjoint cell with an admitted
     /// capacity retains (one capacity read at the cell), stamping the
     /// cell pointer, the START timestamp and the S kind. The heap-buffer/
@@ -3699,33 +3923,30 @@ mod tests {
                 let base = 0x10_0000u64;
                 let capacity = 256u64;
                 let mut spy = LengthSpy::new(
-                    length_args(&[
-                        (cell_arg, Some(cell)),
-                        (base_arg, Some(base)),
-                    ]),
+                    length_args(&[(cell_arg, Some(cell)), (base_arg, Some(base))]),
                     Ok(capacity),
                 );
                 let mut out = EvidenceStart::default();
                 assert!(
-                    spy.run_entry(
-                        &mut out,
-                        length_descriptor(name),
-                        layout,
-                        0x3030,
-                    ),
+                    spy.run_entry(&mut out, length_descriptor(name), layout, 0x3030,),
                     "{name} {layout:?}: disjoint cell retains"
                 );
                 assert_eq!(out.ev_cell, cell, "{name} {layout:?}: retained cell");
                 assert_eq!(out.ev_ts_ns, 0x3030, "{name} {layout:?}: START stamp");
                 assert_eq!(out.ev_kind, LENGTH_KIND_SCELL, "{name} {layout:?}: S kind");
-                assert_eq!(out.ev_layout, layout_code(layout), "{name} {layout:?}: layout");
-                assert_eq!(spy.reads.as_slice(), &[cell], "{name} {layout:?}: one capacity read");
+                assert_eq!(
+                    out.ev_layout,
+                    layout_code(layout),
+                    "{name} {layout:?}: layout"
+                );
+                assert_eq!(
+                    spy.reads.as_slice(),
+                    &[cell],
+                    "{name} {layout:?}: one capacity read"
+                );
                 // The below-buffer layout is equally disjoint and retains.
                 let mut spy = LengthSpy::new(
-                    length_args(&[
-                        (cell_arg, Some(base - 0x1000)),
-                        (base_arg, Some(base)),
-                    ]),
+                    length_args(&[(cell_arg, Some(base - 0x1000)), (base_arg, Some(base))]),
                     Ok(capacity),
                 );
                 let mut out = EvidenceStart::default();
@@ -3750,26 +3971,43 @@ mod tests {
         ];
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             for (name, scalar_arg, scalar) in shapes {
-                let mut spy = LengthSpy::new(
-                    length_args(&[(scalar_arg, Some(scalar))]),
-                    Err(()),
-                );
+                let mut spy = LengthSpy::new(length_args(&[(scalar_arg, Some(scalar))]), Err(()));
                 let mut out = EvidenceStart::default();
                 assert!(
-                    spy.run_entry(
-                        &mut out,
-                        length_descriptor(name),
-                        layout,
-                        0x4040,
-                    ),
+                    spy.run_entry(&mut out, length_descriptor(name), layout, 0x4040,),
                     "{name} {layout:?}: scalar snapshots"
                 );
                 assert_eq!(out.ev_cell, scalar, "{name} {layout:?}: snapshot held");
                 assert_eq!(out.ev_ts_ns, 0x4040, "{name} {layout:?}: START stamp");
-                assert_eq!(out.ev_kind, LENGTH_KIND_VSCALAR, "{name} {layout:?}: V kind");
-                assert_eq!(out.ev_layout, layout_code(layout), "{name} {layout:?}: layout");
-                assert!(spy.reads.is_empty(), "{name} {layout:?}: V snapshots read nothing");
+                assert_eq!(
+                    out.ev_kind, LENGTH_KIND_VSCALAR,
+                    "{name} {layout:?}: V kind"
+                );
+                assert_eq!(
+                    out.ev_layout,
+                    layout_code(layout),
+                    "{name} {layout:?}: layout"
+                );
+                assert!(
+                    spy.reads.is_empty(),
+                    "{name} {layout:?}: V snapshots read nothing"
+                );
             }
+        }
+    }
+
+    /// An unreadable V-scalar fetch retains nothing with zero reads.
+    #[test]
+    fn length_entry_refuses_unreadable_scalar_fetch() {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let mut spy = LengthSpy::new(length_args(&[]), Err(()));
+            let mut out = EvidenceStart::default();
+            assert!(
+                !spy.run_entry(&mut out, length_descriptor("C_Verify"), layout, 1),
+                "{layout:?}: unreadable scalar refuses"
+            );
+            assert_evidence_zeroed(&out, "refused retains zero");
+            assert!(spy.reads.is_empty(), "{layout:?}: zero reads");
         }
     }
 
@@ -3779,16 +4017,14 @@ mod tests {
     fn length_entry_refuses_null_and_unreadable_cells() {
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             for cell in [None, Some(0)] {
-                let mut spy = LengthSpy::new(
-                    length_args(&[(4, cell), (3, Some(0x10_0000))]),
-                    Ok(256),
-                );
+                let mut spy =
+                    LengthSpy::new(length_args(&[(4, cell), (3, Some(0x10_0000))]), Ok(256));
                 let mut out = EvidenceStart::default();
                 assert!(
                     !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
                     "{layout:?} cell {cell:?}: no retention"
                 );
-                assert_eq!(out, EvidenceStart::default(), "{layout:?}: refused retains zero");
+                assert_evidence_zeroed(&out, "refused retains zero");
                 assert!(spy.reads.is_empty(), "{layout:?}: null cell reads nothing");
             }
             // An unreadable capacity word refuses the same way.
@@ -3801,7 +4037,7 @@ mod tests {
                 !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
                 "{layout:?}: unreadable capacity refuses"
             );
-            assert_eq!(out, EvidenceStart::default());
+            assert_evidence_zeroed(&out, "refused retains zero");
             assert_eq!(spy.reads.as_slice(), &[0x20_0000]);
         }
     }
@@ -3827,7 +4063,7 @@ mod tests {
                     !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
                     "{layout:?} capacity {capacity}: absurd refuses"
                 );
-                assert_eq!(out, EvidenceStart::default());
+                assert_evidence_zeroed(&out, "refused retains zero");
             }
             // Exactly 1 MiB is admitted (the bound is inclusive): the
             // span [base, base + 1MiB) ends exactly where the disjoint
@@ -3853,8 +4089,11 @@ mod tests {
                 !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
                 "{layout:?}: faulting cell span refuses"
             );
-            assert_eq!(out, EvidenceStart::default());
-            assert!(spy.reads.is_empty(), "{layout:?}: faulting span reads nothing");
+            assert_evidence_zeroed(&out, "refused retains zero");
+            assert!(
+                spy.reads.is_empty(),
+                "{layout:?}: faulting span reads nothing"
+            );
         }
     }
 
@@ -3868,7 +4107,12 @@ mod tests {
         let capacity = 256u64;
         // Inside, at the base, one byte inside the end, and straddling
         // the end by one byte: all overlap, all refuse.
-        for cell in [base, base + 1, base + capacity - 1, base + capacity - word + 1] {
+        for cell in [
+            base,
+            base + 1,
+            base + capacity - 1,
+            base + capacity - word + 1,
+        ] {
             let mut spy = LengthSpy::new(
                 length_args(&[(4, Some(cell)), (3, Some(base))]),
                 Ok(capacity),
@@ -3878,8 +4122,12 @@ mod tests {
                 !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
                 "cell {cell:#x} overlaps and refuses"
             );
-            assert_eq!(out, EvidenceStart::default());
-            assert_eq!(spy.reads.as_slice(), &[cell], "overlap refuses after the capacity read");
+            assert_evidence_zeroed(&out, "refused retains zero");
+            assert_eq!(
+                spy.reads.as_slice(),
+                &[cell],
+                "overlap refuses after the capacity read"
+            );
         }
         // Exactly adjacent on either side is disjoint and retains.
         for cell in [base - word, base + capacity] {
@@ -3903,7 +4151,7 @@ mod tests {
             !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
             "base+C overflow refuses"
         );
-        assert_eq!(out, EvidenceStart::default());
+        assert_evidence_zeroed(&out, "refused retains zero");
         // An unreadable base fetch refuses: disjointness against an
         // unknown base is unprovable (fail closed, unlike NULL).
         let mut spy = LengthSpy::new(length_args(&[(4, Some(0x20_0000))]), Ok(256));
@@ -3912,7 +4160,7 @@ mod tests {
             !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
             "unreadable base refuses"
         );
-        assert_eq!(out, EvidenceStart::default());
+        assert_evidence_zeroed(&out, "refused retains zero");
     }
 
     /// Null-base rule (§5.1): a NULL base skips the disjointness check
@@ -3956,10 +4204,7 @@ mod tests {
     #[test]
     fn length_entry_refuses_hostile_widths() {
         // ia32 V-scalar with high bits: refused, nothing retained.
-        let mut spy = LengthSpy::new(
-            length_args(&[(4, Some(256 | (1 << 32)))]),
-            Err(()),
-        );
+        let mut spy = LengthSpy::new(length_args(&[(4, Some(256 | (1 << 32)))]), Err(()));
         let mut out = EvidenceStart::default();
         assert!(
             !spy.run_entry(
@@ -3970,7 +4215,7 @@ mod tests {
             ),
             "ia32 high-bit scalar refuses"
         );
-        assert_eq!(out, EvidenceStart::default());
+        assert_evidence_zeroed(&out, "refused retains zero");
         assert!(spy.reads.is_empty());
         // ia32 S-cell capacity with high bits (injected reader): refused.
         let mut spy = LengthSpy::new(
@@ -3982,7 +4227,7 @@ mod tests {
             !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Ilp32, 1),
             "ia32 high-bit capacity refuses"
         );
-        assert_eq!(out, EvidenceStart::default());
+        assert_evidence_zeroed(&out, "refused retains zero");
         // LP64 V-scalar passes full-width and unmasked: the OR-aliased
         // word is held exactly, and finite classification (userspace)
         // refuses it by equality — the adapter never truncates.
@@ -4012,7 +4257,7 @@ mod tests {
             !spy.run_entry(&mut out, length_descriptor("C_Sign"), LinuxLayout::Lp64, 1),
             "LP64 OR-aliased capacity refuses by bound, never masked"
         );
-        assert_eq!(out, EvidenceStart::default());
+        assert_evidence_zeroed(&out, "refused retains zero");
     }
 
     /// Non-evidence descriptors (count-only zero, unlisted functions,
@@ -4021,7 +4266,13 @@ mod tests {
     fn length_entry_rejects_non_evidence_descriptors() {
         use crate::MAX_DESCRIPTORS;
         let mut cases = vec![0, MAX_DESCRIPTORS, MAX_DESCRIPTORS + 1, u32::MAX];
-        for name in ["C_Initialize", "C_SignInit", "C_GetInfo", "C_GetTokenInfo", "C_GetMechanismInfo"] {
+        for name in [
+            "C_Initialize",
+            "C_SignInit",
+            "C_GetInfo",
+            "C_GetTokenInfo",
+            "C_GetMechanismInfo",
+        ] {
             cases.push(length_descriptor(name));
         }
         for descriptor in cases {
@@ -4041,7 +4292,7 @@ mod tests {
                     !spy.run_entry(&mut out, descriptor, layout, 1),
                     "descriptor {descriptor} {layout:?}: no retention"
                 );
-                assert_eq!(out, EvidenceStart::default());
+                assert_evidence_zeroed(&out, "refused retains zero");
                 assert!(spy.reads.is_empty(), "descriptor {descriptor}: zero reads");
             }
         }
@@ -4148,7 +4399,11 @@ mod tests {
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             for kind in [LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR] {
                 let evidence = EvidenceStart {
-                    ev_cell: if kind == LENGTH_KIND_SCELL { 0x20_0000 } else { 256 },
+                    ev_cell: if kind == LENGTH_KIND_SCELL {
+                        0x20_0000
+                    } else {
+                        256
+                    },
                     ev_ts_ns: 0x3030,
                     ev_kind: kind,
                     ev_layout: layout_code(layout),
@@ -4162,7 +4417,10 @@ mod tests {
                         LengthReturnVerdict::Unavailable,
                         "{layout:?} kind {kind}: RV {rv:#x} never reads"
                     );
-                    assert!(spy.reads.is_empty(), "{layout:?} kind {kind}: RV {rv:#x} zero reads");
+                    assert!(
+                        spy.reads.is_empty(),
+                        "{layout:?} kind {kind}: RV {rv:#x} zero reads"
+                    );
                 }
             }
         }

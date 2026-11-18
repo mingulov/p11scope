@@ -380,7 +380,7 @@ impl Harness {
         scope: &Scope,
         pins: &PinnedObjects,
     ) -> Result<Self> {
-        let spec = super::journal::JournalSpec;
+        let spec = super::journal::JournalSpec { key_sizes: false };
         spec.prepare().map_err(anyhow::Error::msg)?;
         let session = Session::start_with_selected(
             plan,
@@ -1255,7 +1255,7 @@ fn privileged_downgrade_in_place_journal_skips_begin_lp64() -> Result<()> {
             crate::EBPF_JOURNAL_OBJECT.is_empty(),
             "an omitted build must embed no journal bytes"
         );
-        let spec = super::journal::JournalSpec;
+        let spec = super::journal::JournalSpec { key_sizes: false };
         let error = spec
             .prepare()
             .err()
@@ -1432,7 +1432,7 @@ fn privileged_downgrade_in_place_journal_irrelevant_skips_silently_lp64() -> Res
             crate::EBPF_JOURNAL_OBJECT.is_empty(),
             "an omitted build must embed no journal bytes"
         );
-        let spec = super::journal::JournalSpec;
+        let spec = super::journal::JournalSpec { key_sizes: false };
         let error = spec
             .prepare()
             .err()
@@ -1555,7 +1555,7 @@ fn privileged_planned_count_only_journal_call_gaps_with_evidence_lp64() -> Resul
             crate::EBPF_JOURNAL_OBJECT.is_empty(),
             "an omitted build must embed no journal bytes"
         );
-        let spec = super::journal::JournalSpec;
+        let spec = super::journal::JournalSpec { key_sizes: false };
         let error = spec
             .prepare()
             .err()
@@ -4969,7 +4969,7 @@ fn privileged_journal_ready_exec_after_closure_publishes_ready() -> Result<()> {
             crate::EBPF_JOURNAL_OBJECT.is_empty(),
             "an omitted build must embed no journal bytes"
         );
-        let spec = super::journal::JournalSpec;
+        let spec = super::journal::JournalSpec { key_sizes: false };
         let error = spec
             .prepare()
             .err()

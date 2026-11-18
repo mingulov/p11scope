@@ -6378,7 +6378,10 @@ mod joint_terminal_tests {
         // factory with or without a journal request: no BPF access,
         // no bypass under the flag.
         use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
-        for journal in [None, Some(&crate::attach::journal::JournalSpec)] {
+        for journal in [
+            None,
+            Some(&crate::attach::journal::JournalSpec { key_sizes: false }),
+        ] {
             let attach = AttestedSubset::scripted(
                 crate::plan::AttachPlan::from_slots(vec![]),
                 PinnedObjects::empty(),

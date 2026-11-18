@@ -310,6 +310,10 @@ pub struct InventoryArgs {
     /// `--key-operations`: opt-in per-key tracking (linked journal lane).
     /// Default off; refused under `--capture scan`, like `--manifest`.
     pub key_operations: bool,
+    /// `--key-sizes`: also infer key sizes from operation lengths
+    /// (v0.8.0 keymeta, spec §10.5). Valid only with
+    /// `--key-operations`; refused under P0 builds. Default off.
+    pub key_sizes: bool,
     pub hooks: HookRegistry,
     pub json: bool,
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 1024 default.
@@ -819,19 +823,19 @@ exit codes: 0 every requested lane passed; 1 a requested lane is unavailable (--
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP_HEAD: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
+                   [--key-operations] [--key-sizes] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
+                   [--key-operations] [--key-sizes] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
+                   [--key-operations] [--key-sizes] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
@@ -854,6 +858,7 @@ Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, 
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads through the inventory lane, with one interval row per input; requires auto or native.
 --forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
 --key-operations also tracks which key each operation used (needs --capture auto or native; start the observer before the application for best coverage). Without it you still get per-provider function and mechanism counts.
+--key-sizes also infers key sizes from operation lengths (needs --key-operations; off by default - token-reported and creation-template sizes and inferred families are still shown without it).
 Per-key results appear under object_observations in --json and in the key operations: line.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 ";
@@ -1977,6 +1982,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut prearm_modules = Vec::new();
     let mut forwarding_modules = Vec::new();
     let mut key_operations = false;
+    let mut key_sizes = false;
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
     let mut max_scan_pids: Option<usize> = None;
@@ -2075,6 +2081,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                 forwarding_modules.push(require_path(&mut args, "--forwarding-module")?)
             }
             "--key-operations" => key_operations = true,
+            "--key-sizes" => key_sizes = true,
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
             "--quiet" => quiet = true,
@@ -2297,6 +2304,16 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             "--key-operations requires --capture auto or native",
         ));
     }
+    // P0 builds omit the length programs, so the flag refuses before
+    // any other sizes check (a P0 run cannot do sizes at all).
+    if key_sizes && cfg!(feature = "stub-object-attributes") {
+        return Err(usage_err(
+            "--key-sizes requires a FULL build (P0 omits length capture)",
+        ));
+    }
+    if key_sizes && !key_operations {
+        return Err(usage_err("--key-sizes requires --key-operations"));
+    }
     if diagnostics.is_some() && capture == Some(CaptureMode::Scan) {
         return Err(usage_err("--diagnostics requires --capture auto or native"));
     }
@@ -2323,6 +2340,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         prearm_modules,
         forwarding_modules,
         key_operations,
+        key_sizes,
         hooks,
         json,
         max_scan_pids,
@@ -7736,13 +7754,7 @@ mod tests {
         // requires-key-operations refusal) and beside --key-operations.
         for argv in [
             vec!["inventory", "--pid", "7", "--key-sizes"],
-            vec![
-                "inventory",
-                "--pid",
-                "7",
-                "--key-operations",
-                "--key-sizes",
-            ],
+            vec!["inventory", "--pid", "7", "--key-operations", "--key-sizes"],
         ] {
             assert!(
                 matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
@@ -7755,14 +7767,15 @@ mod tests {
     #[test]
     fn inventory_help_names_key_sizes_flag() {
         // The flag, its usage slot beside --key-operations, and the
-        // exact §10.5 sentence are pinned where the inventory flag
-        // surface is pinned.
+        // §10.5 sentence are pinned where the inventory flag surface
+        // is pinned. The sentence renders the spec's em-dash as a
+        // hyphen-minus: human output stays ASCII-only (render twin).
         let help = HelpTopic::Inventory.text();
         assert!(help.contains("[--key-sizes]"), "{help}");
         assert!(
             help.contains(
                 "--key-sizes also infers key sizes from operation lengths \
-                 (needs --key-operations; off by default — token-reported and \
+                 (needs --key-operations; off by default - token-reported and \
                  creation-template sizes and inferred families are still shown \
                  without it)."
             ),

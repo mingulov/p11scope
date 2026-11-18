@@ -1089,7 +1089,7 @@ fn pin_root_refusals_retire() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
     let returned = source_between(
         &source,
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // Ready/agreement refusal arms retire ownership before returning, in

@@ -1979,6 +1979,10 @@ pub struct Session {
     /// sessions. Nothing selects journal yet, so this stays false until the
     /// activation packet threads a journal selection.
     journal: bool,
+    /// This journal session rides `--key-sizes` length capture: length
+    /// endpoints link the length pair. Retained beside `journal`;
+    /// meaningless (always false) without it.
+    key_sizes: bool,
     /// Linkage of the attachment the attested start sealed: `None` until a
     /// successful native seal retains its derived linkage. The producers
     /// drain derives its linkage from this retained sealed fact, never from
@@ -3057,9 +3061,15 @@ fn downgrade_entry_program(
     policy: CapturePolicy,
     object_has_unsafe: bool,
     target_abi: ElfAbi,
+    descriptor: u32,
+    key_sizes: bool,
 ) -> &'static str {
     if journal {
-        "p11_entry_journal"
+        // In-place narrowing keeps the link: a length slot narrowed
+        // under `--key-sizes` keeps its length entry (whose adapter
+        // refuses the narrowed descriptor, so the call still counts
+        // without length evidence), like the base pair elsewhere.
+        journal::journal_entry_program(descriptor, key_sizes)
     } else {
         entry_program(semantics, policy, object_has_unsafe, target_abi)
     }
@@ -3270,13 +3280,17 @@ fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
 
 fn static_probe_side(program: &str) -> Option<ProbeSide> {
     match program {
-        "p11_return" | "p11_counter_bank_return" | "p11_return_journal" => Some(ProbeSide::Return),
+        "p11_return"
+        | "p11_counter_bank_return"
+        | "p11_return_journal"
+        | "p11_return_journal_length" => Some(ProbeSide::Return),
         "p11_entry"
         | "p11_entry_ia32"
         | "p11_entry_template"
         | "p11_entry_template_types"
         | "p11_entry_template_pair"
         | "p11_entry_journal"
+        | "p11_entry_journal_length"
         | "p11_counter_bank_entry" => Some(ProbeSide::Entry),
         _ => None,
     }
@@ -3917,7 +3931,7 @@ pub(crate) enum JournalPairPreflight {
 /// build gate resolves the embedded bytes, then the same parsed-object
 /// derivation as the seal decides. Doctor renders this verbatim.
 pub(crate) fn journal_pair_preflight() -> JournalPairPreflight {
-    match journal::JournalSpec.prepare() {
+    match (journal::JournalSpec { key_sizes: false }).prepare() {
         Ok(prepared) => journal_pair_preflight_from_bytes(prepared.object),
         // Preparation refuses only through the build gate today, so a
         // refusal here means the build omits the production object.
@@ -4459,6 +4473,7 @@ fn group_static_slots(
         StaticRoots::Detailed,
         None,
         false,
+        false,
     )
     .expect("every selected Detailed target has retained pinned facts")
 }
@@ -4477,6 +4492,7 @@ fn counter_attach_path_is_valid(path: &Path) -> bool {
         })
 }
 
+#[allow(clippy::too_many_arguments)] // Same explicit grouping seam; the journal length flag joins the journal selection.
 fn group_static_slots_with_roots(
     slots: &[Slot],
     policy: CapturePolicy,
@@ -4485,6 +4501,7 @@ fn group_static_slots_with_roots(
     roots: StaticRoots,
     expected_counter_mode: Option<CounterMode>,
     journal: bool,
+    key_sizes: bool,
 ) -> Result<Vec<StaticGroup>> {
     if roots == StaticRoots::CounterBanks {
         if policy.counter_mode() != expected_counter_mode || object_has_unsafe {
@@ -4508,8 +4525,10 @@ fn group_static_slots_with_roots(
         }
     }
     // Journal sessions reuse Detailed roots with the pair swapped: the
-    // journal build carries no unsafe/ia32 entry variants, so every slot
-    // resolves the single journal entry program. A counter/journal
+    // journal build carries no unsafe/ia32 entry variants. With
+    // `--key-sizes`, length endpoints resolve the length entry and
+    // split into their own groups per path (Multi +G/+G); every other
+    // slot resolves the single journal entry program. A counter/journal
     // combination is refused at preparation; journal takes precedence here.
     let return_program = if journal {
         "p11_return_journal"
@@ -4531,7 +4550,7 @@ fn group_static_slots_with_roots(
             unreachable!("static attach points are absolute with cookies");
         };
         let program = if journal {
-            "p11_entry_journal"
+            journal::journal_entry_program(slot.descriptor_index, key_sizes)
         } else if roots == StaticRoots::CounterBanks {
             "p11_counter_bank_entry"
         } else {
@@ -4546,18 +4565,29 @@ fn group_static_slots_with_roots(
                 cookie,
             });
     }
-    Ok(by_key
-        .into_iter()
-        .map(|((path, entry_program), mut members)| {
-            members.sort_by_key(|member| member.slot.index);
-            StaticGroup {
-                path,
-                entry_program,
-                return_program,
-                members,
-            }
-        })
-        .collect())
+    // Per-group returns (spec §8.6): each journal group names its own
+    // return program alongside its entry program, and a mixed pair is
+    // refused loudly (it would strand the stash). Iteration order is
+    // the map's key order, as before.
+    let mut groups = Vec::with_capacity(by_key.len());
+    for ((path, entry_program), mut members) in by_key {
+        members.sort_by_key(|member| member.slot.index);
+        let return_program = if journal {
+            journal::journal_return_program(entry_program)
+        } else {
+            return_program
+        };
+        if journal {
+            journal::validate_journal_group_pair(entry_program, return_program)?;
+        }
+        groups.push(StaticGroup {
+            path,
+            entry_program,
+            return_program,
+            members,
+        });
+    }
+    Ok(groups)
 }
 
 fn reserve_counter_multi_link_capacity(
@@ -5412,13 +5442,36 @@ fn attach_targets_observed_with_roots(
         roots,
         expected_counter_mode,
         false,
+        false,
         abi_for,
         attach,
         completed_at,
     )
 }
 
-#[allow(clippy::too_many_arguments)] // The prepared counter mode joins the existing explicit attach seam; bundling would churn both ends for no gain.
+#[allow(clippy::too_many_arguments)]
+// The prepared counter mode joins the existing explicit attach seam; bundling would churn both ends for no gain.
+/// Singles journal link plan (spec §8.6): the (entry, return)
+/// program pair per slot index. With the flag on, length endpoints
+/// substitute the length pair at their already-linked sites (+0/+0
+/// links); every other slot keeps the base pair in both modes. The
+/// singles attach below consumes this plan; entry and return always
+/// pair (a mixed plan is refused at grouping time for Multi and by
+/// construction here).
+pub(crate) fn singles_journal_link_plan(
+    slots: &[Slot],
+    key_sizes: bool,
+) -> Vec<(u32, &'static str, &'static str)> {
+    slots
+        .iter()
+        .map(|slot| {
+            let entry = journal::journal_entry_program(slot.descriptor_index, key_sizes);
+            (slot.index, entry, journal::journal_return_program(entry))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)] // Same explicit seam as the non-journal entry above.
 fn attach_targets_observed_with_roots_journal(
     slots: &[Slot],
     policy: CapturePolicy,
@@ -5426,6 +5479,7 @@ fn attach_targets_observed_with_roots_journal(
     roots: StaticRoots,
     expected_counter_mode: Option<CounterMode>,
     journal: bool,
+    key_sizes: bool,
     mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
     mut attach: impl FnMut(
         &'static str,
@@ -5454,11 +5508,28 @@ fn attach_targets_observed_with_roots_journal(
     };
     // Journal sessions reuse Detailed roots with the pair swapped: the
     // journal return overrides the pinned ordinary selection above. A
-    // counter/journal combination is refused at preparation.
+    // counter/journal combination is refused at preparation. With
+    // `--key-sizes`, length slots substitute the length pair per slot
+    // (spec §8.6); the plan below carries the per-slot pairs and both
+    // loops consult it, so entry and return never mix.
     let return_program = if journal {
         "p11_return_journal"
     } else {
         return_program
+    };
+    let journal_plan: BTreeMap<u32, (&'static str, &'static str)> = if journal {
+        singles_journal_link_plan(slots, key_sizes)
+            .into_iter()
+            .map(|(index, entry, ret)| (index, (entry, ret)))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let journal_slot = |slot: &Slot| -> (&'static str, &'static str) {
+        journal_plan
+            .get(&slot.index)
+            .copied()
+            .expect("every journal slot is planned")
     };
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
@@ -5499,7 +5570,12 @@ fn attach_targets_observed_with_roots_journal(
         }
     };
     for (slot, _) in &targets {
-        let attempt = attach(return_program, slot, slot_attach_point(slot));
+        let slot_return = if journal {
+            journal_slot(slot).1
+        } else {
+            return_program
+        };
+        let attempt = attach(slot_return, slot, slot_attach_point(slot));
         timings
             .entry(slot.index)
             .or_default()
@@ -5507,8 +5583,8 @@ fn attach_targets_observed_with_roots_journal(
         match attempt.result {
             Ok(()) => {
                 successful.insert(
-                    static_endpoint(return_program, slot.index)
-                        .expect("p11_return is a static endpoint"),
+                    static_endpoint(slot_return, slot.index)
+                        .expect("selected return program is a static endpoint"),
                 );
                 return_attached.insert(slot.index);
             }
@@ -5534,7 +5610,11 @@ fn attach_targets_observed_with_roots_journal(
     }
 
     let entry_programs: &[&str] = if journal {
-        &["p11_entry_journal"]
+        if key_sizes {
+            &["p11_entry_journal", "p11_entry_journal_length"]
+        } else {
+            &["p11_entry_journal"]
+        }
     } else if roots == StaticRoots::CounterBanks {
         &["p11_counter_bank_entry"]
     } else if object_has_unsafe {
@@ -5554,6 +5634,7 @@ fn attach_targets_observed_with_roots_journal(
                 || (!journal
                     && roots == StaticRoots::Detailed
                     && entry_program(&slot.semantics, policy, object_has_unsafe, *abi) != *program)
+                || (journal && journal_slot(slot).0 != *program)
             {
                 continue;
             }
@@ -6842,6 +6923,7 @@ fn load_capture_object_with_images(
         full_images,
         crate::EBPF_OBJECT,
         stats_slots,
+        None,
     )
 }
 
@@ -6852,6 +6934,7 @@ fn load_capture_object_bytes_with_images(
     full_images: bool,
     object: &[u8],
     stats_slots: Option<u32>,
+    evidence_start_entries: Option<u32>,
 ) -> std::result::Result<Ebpf, aya::EbpfError> {
     let full_image_maps = IMAGE_IDENTITY_TICKET_LIMIT as u32;
     let image_maps = if full_images { full_image_maps } else { 1 };
@@ -6867,6 +6950,11 @@ fn load_capture_object_bytes_with_images(
     if let Some(slots) = stats_slots {
         loader.map_max_entries("STATS", slots);
         loader.map_max_entries("SLOT_COUNT_ONLY", slots);
+    }
+    // Journal sessions size the length stash by flag (spec §8.2);
+    // objects without the map ignore the override.
+    if let Some(entries) = evidence_start_entries {
+        loader.map_max_entries("EVIDENCE_START", entries);
     }
     loader.load(object)
 }
@@ -7124,6 +7212,7 @@ fn prepare_session_with(
     object_has_unsafe: bool,
     roots: StaticRoots,
     journal: bool,
+    key_sizes: bool,
     mut operation: impl FnMut(SessionPreparation) -> Result<()>,
 ) -> Result<()> {
     use SessionPreparation::*;
@@ -7150,7 +7239,7 @@ fn prepare_session_with(
         operation(step)?;
     }
     if journal {
-        for name in journal::journal_expected_programs() {
+        for name in journal::journal_load_programs(key_sizes) {
             operation(LoadProgram(name))?;
         }
     } else {
@@ -8173,6 +8262,12 @@ impl Session {
         // default. The disclosure uses the same resolver.
         let events_bytes =
             crate::run::resolve_capture_ring_bytes(policy, journal.is_some(), ring_bytes);
+        // The stash reservation follows the flag (spec §8.2): journal
+        // sessions override `EVIDENCE_START` to full or one row; other
+        // objects carry no such map and ignore the override.
+        let evidence_start_entries = journal
+            .as_ref()
+            .map(|prepared| journal::evidence_start_entries(prepared.key_sizes));
         let mut ebpf = load_capture_object_bytes_with_images(
             host.btf(),
             events_bytes,
@@ -8180,6 +8275,7 @@ impl Session {
             policy.wants_instance_hooks(),
             object,
             stats_slots,
+            evidence_start_entries,
         )
         .context("loading BPF object with required task storage")?;
         let native_selection =
@@ -8196,267 +8292,278 @@ impl Session {
         let mut prepared_instance = None;
         let mut prepared_owner_limit = None;
         let mut unpublished_mechanisms = 0u64;
-        // The option served selection above; only the flag reaches preparation.
+        // The option served selection above; only the flags reach preparation.
+        let key_sizes = journal.as_ref().is_some_and(|prepared| prepared.key_sizes);
         let journal = journal.is_some();
-        let preparation = prepare_session_with(object_has_unsafe, roots, journal, |step| {
-            match step {
-                SessionPreparation::ValidatePolicy => {
-                    validate_policy_maps(&ebpf, object_has_unsafe)
-                        .context("validating exact policy-map metadata")?;
-                    validate_pid_start_tick_map(&ebpf, roots, journal)
-                        .context("validating exact PID witness map metadata")?;
-                    if journal {
-                        journal::validate_journal_maps(&ebpf)
-                            .context("validating exact journal map metadata")?;
-                    }
-                }
-                SessionPreparation::ValidateRuntime => {
-                    validate_runtime_maps(&ebpf, discovery_ring_bytes(scope))
-                        .context("validating live-discovery runtime maps")?;
-                    image_query::prepare_maps(&ebpf, policy.wants_instance_hooks())?;
-                    // The journal object always carries its marker control
-                    // map; the birth-marker feature verdict stays Detailed.
-                    if !journal {
-                        instance::prepare_marker_control(&ebpf, roots)?;
-                    } else {
-                        journal::prepare_journal_marker_control(&ebpf)?;
-                    }
-                    selected_detailed::validate_maps(&ebpf)?;
-                }
-                SessionPreparation::ValidateStopGate => {
-                    validate_stop_gate(&ebpf).context("stop gate unavailable")?;
-                    let data = stop_gate_map_data(&ebpf).context("stop gate unavailable")?;
-                    stop_gate = Some(
-                        StopGate::from_map_fd(data.fd().as_fd())
-                            .context("stop gate unavailable")?,
-                    );
-                }
-                SessionPreparation::ValidatePrograms => {
-                    (if journal {
-                        journal::validate_journal_inventory(&ebpf)
-                    } else if roots == StaticRoots::Detailed {
-                        validate_program_inventory(&ebpf, object_has_unsafe)
-                    } else {
-                        validate_program_inventory_with_roots(&ebpf, object_has_unsafe, roots)
-                    })
-                    .context("validating exact eBPF program inventory")?;
-                }
-                SessionPreparation::PublishScope => {
-                    // I4: the witness binds only when the object carries
-                    // its map; anything else skips the /proc read. The
-                    // selected pin, or the owned child's, anchors the
-                    // read against a PID reused during the object load.
-                    let pid_start = if crate::scope::reads_pid_witness(
-                        scope,
-                        ebpf.map("PID_START_TICK").is_some(),
-                    ) {
-                        let pin = selected.or_else(|| owned_child.map(|child| child.pin()));
-                        crate::scope::pid_start_tick_of(scope, pin)
-                            .context("publishing scope and capture policy")?
-                    } else {
-                        None
-                    };
-                    // A run-tree session publishes the owned child's
-                    // pause row beside the cgroup filter; unowned
-                    // sessions publish no PID row.
-                    crate::scope::publish(
-                        &mut ebpf,
-                        scope,
-                        policy,
-                        generation_token,
-                        track_short_lived,
-                        pid_start,
-                        owned_child.map(|child| child.pid()),
-                    )
-                    .context("publishing scope and capture policy")?;
-                    debug_assert!(process_creation_capture_enabled(scope, policy));
-                }
-                SessionPreparation::PrepareIdentity => {
-                    // Per-object gate (C1): counter sessions load the
-                    // gate-free counter object even in gate-1 builds.
-                    let gate = identity_gate_required(counter.is_some());
-                    prepare_identity(&mut ebpf, scope, owned_child, gate)
-                        .context("preparing required image identity and thread ownership")?;
-                    // START metadata is immutable. Retain the same validated
-                    // capacity-derived limit initialized and read back above.
-                    prepared_owner_limit = Some(owner_limit_from_start(&ebpf)?);
-                }
-                SessionPreparation::PublishDescriptors => {
-                    let mut semantics: Array<_, SlotSemantics> =
-                        Array::try_from(ebpf.map_mut("DESCRIPTORS").context("DESCRIPTORS map")?)?;
-                    publish_descriptors(
-                        &mut semantics,
-                        |semantics, index, value| {
-                            semantics.set(index, value, 0).map_err(anyhow::Error::from)
-                        },
-                        |semantics| {
-                            semantics
-                                .iter()
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(anyhow::Error::from)
-                        },
-                    )
-                    .context("publishing DESCRIPTORS")?;
-                }
-                SessionPreparation::PublishAsync => {
-                    publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
-                }
-                SessionPreparation::PublishShapes => {
-                    // Embedded defaults with no vendor registry overlay:
-                    // every vendor's ids publish by number through the
-                    // generic unregistered path. Vendor names live only in
-                    // the display-only `vendor_mechanisms` table, which
-                    // never gates publication. This binary ships statically
-                    // and has no config-file plumbing yet. A future task
-                    // can thread a path through here without touching the
-                    // publish-before-attach placement.
-                    let registry = pkcs11_types::mechanism_registry::MechanismRegistry::load(None)
-                        .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
-                    let publication = crate::shapes::publish(&mut ebpf, &registry)
-                        .context("publishing MECH_SHAPE")?;
-                    unpublished_mechanisms = publication.unpublished;
-                }
-                SessionPreparation::PublishAttributes => {
-                    publish_attribute_catalog(&mut ebpf, unsafe_enabled)
-                        .context("publishing ATTR_BOOL_BITS")?;
-                }
-                SessionPreparation::PublishObjects => {
-                    publish_object_custody_maps(&mut ebpf)
-                        .context("publishing OBJECT_DESCRIPTORS")?;
-                }
-                SessionPreparation::PublishJournalClasses => {
-                    let mut classes: Array<_, u32> = Array::try_from(
-                        ebpf.map_mut("JOURNAL_CLASSES")
-                            .context("JOURNAL_CLASSES map")?,
-                    )?;
-                    journal::publish_journal_classes(
-                        &mut classes,
-                        |classes, index, value| {
-                            classes.set(index, value, 0).map_err(anyhow::Error::from)
-                        },
-                        |classes| {
-                            classes
-                                .iter()
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(anyhow::Error::from)
-                        },
-                    )
-                    .context("publishing JOURNAL_CLASSES")?;
-                }
-                SessionPreparation::FreezePublished => {
-                    freeze_published_maps(&ebpf).context("freezing published policy maps")?;
-                    // I4: the witness content publishes at PublishScope
-                    // above; freeze it with the published maps exactly where
-                    // the object binds births (the journal object, or a
-                    // marker build's Detailed object). Validation already
-                    // required the map here, so a miss errors loudly.
-                    if roots == StaticRoots::Detailed
-                        && pid_witness_expected(journal, cfg!(p11scope_birth_marker))
-                    {
-                        let map = ebpf.map("PID_START_TICK").context("PID_START_TICK map")?;
-                        freeze_map("PID_START_TICK", map)?;
-                    }
-                }
-                SessionPreparation::SelectScope => {
-                    uprobe_scope = if let Some(pin) = selected {
-                        UProbeScope::OneProcess(
-                            NonZeroU32::new(pin.pid()).context("selected pid must be nonzero")?,
-                        )
-                    } else {
-                        match scope {
-                            Scope::Pid(pid) => UProbeScope::OneProcess(
-                                std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
-                            ),
-                            // Cgroup and system scoping are enforced in BPF, so the
-                            // probe itself is process-wide and the CONFIG bit decides.
-                            Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses,
+        let preparation =
+            prepare_session_with(object_has_unsafe, roots, journal, key_sizes, |step| {
+                match step {
+                    SessionPreparation::ValidatePolicy => {
+                        validate_policy_maps(&ebpf, object_has_unsafe)
+                            .context("validating exact policy-map metadata")?;
+                        validate_pid_start_tick_map(&ebpf, roots, journal)
+                            .context("validating exact PID witness map metadata")?;
+                        if journal {
+                            journal::validate_journal_maps(&ebpf, key_sizes)
+                                .context("validating exact journal map metadata")?;
                         }
-                    };
-                }
-                SessionPreparation::LoadProgram(prog_name) => {
-                    if matches!(prog_name, "sched_process_exec" | "sched_process_exit") {
-                        let prog: &mut RawTracePoint = ebpf
-                            .program_mut(prog_name)
-                            .with_context(|| format!("program {prog_name} missing from object"))?
-                            .try_into()?;
-                        prog.load()
-                            .with_context(|| format!("loading required raw {prog_name}"))?;
-                    } else if prog_name == "task_newtask" {
-                        let prog: &mut BtfTracePoint = ebpf
-                            .program_mut(prog_name)
-                            .context("program task_newtask missing from object")?
-                            .try_into()?;
-                        prog.load("task_newtask", host.btf())
-                            .context("loading required typed task_newtask")?;
-                    } else {
-                        let prog: &mut UProbe = ebpf
-                            .program_mut(prog_name)
-                            .with_context(|| format!("program {prog_name} missing from object"))?
-                            .try_into()?;
-                        if loads_with_multi_flag(backend, prog_name, dynamic_multi) {
-                            prog.load_multi()
-                                .with_context(|| format!("loading {prog_name} for multi attach"))?;
+                    }
+                    SessionPreparation::ValidateRuntime => {
+                        validate_runtime_maps(&ebpf, discovery_ring_bytes(scope))
+                            .context("validating live-discovery runtime maps")?;
+                        image_query::prepare_maps(&ebpf, policy.wants_instance_hooks())?;
+                        // The journal object always carries its marker control
+                        // map; the birth-marker feature verdict stays Detailed.
+                        if !journal {
+                            instance::prepare_marker_control(&ebpf, roots)?;
                         } else {
-                            prog.load()
-                                .with_context(|| format!("loading {prog_name}"))?;
+                            journal::prepare_journal_marker_control(&ebpf)?;
+                        }
+                        selected_detailed::validate_maps(&ebpf)?;
+                    }
+                    SessionPreparation::ValidateStopGate => {
+                        validate_stop_gate(&ebpf).context("stop gate unavailable")?;
+                        let data = stop_gate_map_data(&ebpf).context("stop gate unavailable")?;
+                        stop_gate = Some(
+                            StopGate::from_map_fd(data.fd().as_fd())
+                                .context("stop gate unavailable")?,
+                        );
+                    }
+                    SessionPreparation::ValidatePrograms => {
+                        (if journal {
+                            journal::validate_journal_inventory(&ebpf)
+                        } else if roots == StaticRoots::Detailed {
+                            validate_program_inventory(&ebpf, object_has_unsafe)
+                        } else {
+                            validate_program_inventory_with_roots(&ebpf, object_has_unsafe, roots)
+                        })
+                        .context("validating exact eBPF program inventory")?;
+                    }
+                    SessionPreparation::PublishScope => {
+                        // I4: the witness binds only when the object carries
+                        // its map; anything else skips the /proc read. The
+                        // selected pin, or the owned child's, anchors the
+                        // read against a PID reused during the object load.
+                        let pid_start = if crate::scope::reads_pid_witness(
+                            scope,
+                            ebpf.map("PID_START_TICK").is_some(),
+                        ) {
+                            let pin = selected.or_else(|| owned_child.map(|child| child.pin()));
+                            crate::scope::pid_start_tick_of(scope, pin)
+                                .context("publishing scope and capture policy")?
+                        } else {
+                            None
+                        };
+                        // A run-tree session publishes the owned child's
+                        // pause row beside the cgroup filter; unowned
+                        // sessions publish no PID row.
+                        crate::scope::publish(
+                            &mut ebpf,
+                            scope,
+                            policy,
+                            generation_token,
+                            track_short_lived,
+                            pid_start,
+                            owned_child.map(|child| child.pid()),
+                        )
+                        .context("publishing scope and capture policy")?;
+                        debug_assert!(process_creation_capture_enabled(scope, policy));
+                    }
+                    SessionPreparation::PrepareIdentity => {
+                        // Per-object gate (C1): counter sessions load the
+                        // gate-free counter object even in gate-1 builds.
+                        let gate = identity_gate_required(counter.is_some());
+                        prepare_identity(&mut ebpf, scope, owned_child, gate)
+                            .context("preparing required image identity and thread ownership")?;
+                        // START metadata is immutable. Retain the same validated
+                        // capacity-derived limit initialized and read back above.
+                        prepared_owner_limit = Some(owner_limit_from_start(&ebpf)?);
+                    }
+                    SessionPreparation::PublishDescriptors => {
+                        let mut semantics: Array<_, SlotSemantics> = Array::try_from(
+                            ebpf.map_mut("DESCRIPTORS").context("DESCRIPTORS map")?,
+                        )?;
+                        publish_descriptors(
+                            &mut semantics,
+                            |semantics, index, value| {
+                                semantics.set(index, value, 0).map_err(anyhow::Error::from)
+                            },
+                            |semantics| {
+                                semantics
+                                    .iter()
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map_err(anyhow::Error::from)
+                            },
+                        )
+                        .context("publishing DESCRIPTORS")?;
+                    }
+                    SessionPreparation::PublishAsync => {
+                        publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
+                    }
+                    SessionPreparation::PublishShapes => {
+                        // Embedded defaults with no vendor registry overlay:
+                        // every vendor's ids publish by number through the
+                        // generic unregistered path. Vendor names live only in
+                        // the display-only `vendor_mechanisms` table, which
+                        // never gates publication. This binary ships statically
+                        // and has no config-file plumbing yet. A future task
+                        // can thread a path through here without touching the
+                        // publish-before-attach placement.
+                        let registry =
+                            pkcs11_types::mechanism_registry::MechanismRegistry::load(None)
+                                .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
+                        let publication = crate::shapes::publish(&mut ebpf, &registry)
+                            .context("publishing MECH_SHAPE")?;
+                        unpublished_mechanisms = publication.unpublished;
+                    }
+                    SessionPreparation::PublishAttributes => {
+                        publish_attribute_catalog(&mut ebpf, unsafe_enabled)
+                            .context("publishing ATTR_BOOL_BITS")?;
+                    }
+                    SessionPreparation::PublishObjects => {
+                        publish_object_custody_maps(&mut ebpf)
+                            .context("publishing OBJECT_DESCRIPTORS")?;
+                    }
+                    SessionPreparation::PublishJournalClasses => {
+                        let mut classes: Array<_, u32> = Array::try_from(
+                            ebpf.map_mut("JOURNAL_CLASSES")
+                                .context("JOURNAL_CLASSES map")?,
+                        )?;
+                        journal::publish_journal_classes(
+                            &mut classes,
+                            |classes, index, value| {
+                                classes.set(index, value, 0).map_err(anyhow::Error::from)
+                            },
+                            |classes| {
+                                classes
+                                    .iter()
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map_err(anyhow::Error::from)
+                            },
+                        )
+                        .context("publishing JOURNAL_CLASSES")?;
+                    }
+                    SessionPreparation::FreezePublished => {
+                        freeze_published_maps(&ebpf).context("freezing published policy maps")?;
+                        // I4: the witness content publishes at PublishScope
+                        // above; freeze it with the published maps exactly where
+                        // the object binds births (the journal object, or a
+                        // marker build's Detailed object). Validation already
+                        // required the map here, so a miss errors loudly.
+                        if roots == StaticRoots::Detailed
+                            && pid_witness_expected(journal, cfg!(p11scope_birth_marker))
+                        {
+                            let map = ebpf.map("PID_START_TICK").context("PID_START_TICK map")?;
+                            freeze_map("PID_START_TICK", map)?;
                         }
                     }
-                }
-                SessionPreparation::LoadImagePrograms => {
-                    if selected.is_some() {
-                        selected_detailed::load_bootstrap(&mut ebpf, host.btf())?;
+                    SessionPreparation::SelectScope => {
+                        uprobe_scope = if let Some(pin) = selected {
+                            UProbeScope::OneProcess(
+                                NonZeroU32::new(pin.pid())
+                                    .context("selected pid must be nonzero")?,
+                            )
+                        } else {
+                            match scope {
+                                Scope::Pid(pid) => UProbeScope::OneProcess(
+                                    std::num::NonZeroU32::new(*pid)
+                                        .context("pid must be non-zero")?,
+                                ),
+                                // Cgroup and system scoping are enforced in BPF, so the
+                                // probe itself is process-wide and the CONFIG bit decides.
+                                Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses,
+                            }
+                        };
                     }
-                    let query_refusal = match domain {
-                        Some(domain) => {
-                            match image_query::ImageQueryOwner::load(
-                                &mut ebpf,
-                                host.btf(),
-                                domain,
-                                host.supports_pidfd_iter_selector(),
-                            ) {
-                                Ok(owner) => {
-                                    image_query = Some(owner);
-                                    None
-                                }
-                                Err(error) => Some(format!("{error:#}")),
+                    SessionPreparation::LoadProgram(prog_name) => {
+                        if matches!(prog_name, "sched_process_exec" | "sched_process_exit") {
+                            let prog: &mut RawTracePoint = ebpf
+                                .program_mut(prog_name)
+                                .with_context(|| {
+                                    format!("program {prog_name} missing from object")
+                                })?
+                                .try_into()?;
+                            prog.load()
+                                .with_context(|| format!("loading required raw {prog_name}"))?;
+                        } else if prog_name == "task_newtask" {
+                            let prog: &mut BtfTracePoint = ebpf
+                                .program_mut(prog_name)
+                                .context("program task_newtask missing from object")?
+                                .try_into()?;
+                            prog.load("task_newtask", host.btf())
+                                .context("loading required typed task_newtask")?;
+                        } else {
+                            let prog: &mut UProbe = ebpf
+                                .program_mut(prog_name)
+                                .with_context(|| {
+                                    format!("program {prog_name} missing from object")
+                                })?
+                                .try_into()?;
+                            if loads_with_multi_flag(backend, prog_name, dynamic_multi) {
+                                prog.load_multi().with_context(|| {
+                                    format!("loading {prog_name} for multi attach")
+                                })?;
+                            } else {
+                                prog.load()
+                                    .with_context(|| format!("loading {prog_name}"))?;
                             }
                         }
-                        None => None,
-                    };
-                    prepared_instance = Some(InstanceTracking::prepare(
-                        &mut ebpf,
-                        host.btf(),
-                        policy,
-                        query_refusal,
-                    ));
+                    }
+                    SessionPreparation::LoadImagePrograms => {
+                        if selected.is_some() {
+                            selected_detailed::load_bootstrap(&mut ebpf, host.btf())?;
+                        }
+                        let query_refusal = match domain {
+                            Some(domain) => {
+                                match image_query::ImageQueryOwner::load(
+                                    &mut ebpf,
+                                    host.btf(),
+                                    domain,
+                                    host.supports_pidfd_iter_selector(),
+                                ) {
+                                    Ok(owner) => {
+                                        image_query = Some(owner);
+                                        None
+                                    }
+                                    Err(error) => Some(format!("{error:#}")),
+                                }
+                            }
+                            None => None,
+                        };
+                        prepared_instance = Some(InstanceTracking::prepare(
+                            &mut ebpf,
+                            host.btf(),
+                            policy,
+                            query_refusal,
+                        ));
+                    }
+                    SessionPreparation::LoadCounterPrograms => {
+                        counter
+                            .as_ref()
+                            .context("counter preparation requires its selected profile")?
+                            .validate_and_load(&mut ebpf, backend)?;
+                    }
+                    SessionPreparation::FreezeDeferred(name) => {
+                        freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)
+                            .with_context(|| format!("freezing {name}"))?;
+                    }
+                    SessionPreparation::PublishTailCalls => {
+                        publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)
+                            .context("publishing and freezing tail calls")?;
+                    }
+                    SessionPreparation::PrepareEventsDomain => {
+                        let events_domain = events::EventsDomain::from_events(&ebpf)?;
+                        let discovery_domain = events::DiscoveryDomain::from_discovery(&ebpf)?;
+                        root_seed = owned_child.map(|child| RootSeed {
+                            pin: child.seed_pin(),
+                            domain: events_domain.clone(),
+                        });
+                        prepared_domain = Some(events_domain);
+                        prepared_discovery_domain = Some(discovery_domain);
+                    }
                 }
-                SessionPreparation::LoadCounterPrograms => {
-                    counter
-                        .as_ref()
-                        .context("counter preparation requires its selected profile")?
-                        .validate_and_load(&mut ebpf, backend)?;
-                }
-                SessionPreparation::FreezeDeferred(name) => {
-                    freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)
-                        .with_context(|| format!("freezing {name}"))?;
-                }
-                SessionPreparation::PublishTailCalls => {
-                    publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)
-                        .context("publishing and freezing tail calls")?;
-                }
-                SessionPreparation::PrepareEventsDomain => {
-                    let events_domain = events::EventsDomain::from_events(&ebpf)?;
-                    let discovery_domain = events::DiscoveryDomain::from_discovery(&ebpf)?;
-                    root_seed = owned_child.map(|child| RootSeed {
-                        pin: child.seed_pin(),
-                        domain: events_domain.clone(),
-                    });
-                    prepared_domain = Some(events_domain);
-                    prepared_discovery_domain = Some(discovery_domain);
-                }
-            }
-            Ok(())
-        });
+                Ok(())
+            });
         // No producer has been attached yet. A selected attempt takes custody
         // of this complete owner before attaching its first lifecycle link.
         preparation?;
@@ -8532,6 +8639,7 @@ impl Session {
                 reexec_diagnostic: None,
                 last_counter_stage_check: None,
                 journal,
+                key_sizes,
                 sealed_journal_linked: None,
                 counter_banks: counter
                     .map(|prepared| prepared.banks.with_detail_child_ring_bytes(ring_bytes)),
@@ -9627,7 +9735,13 @@ impl Session {
             .as_ref()
             .map(|banks| banks.geometry_mode());
         let outcome = if self.backend == AttachBackend::Multi {
-            self.attach_targets_multi(targets, &attach_targets, roots, self.journal)?
+            self.attach_targets_multi(
+                targets,
+                &attach_targets,
+                roots,
+                self.journal,
+                self.key_sizes,
+            )?
         } else {
             let ebpf = &mut self.ebpf;
             let links = &mut self.links;
@@ -9657,7 +9771,10 @@ impl Session {
                             .filter(|diag| diag.active())
                             .map(|diag| {
                                 diag.begin(
-                                    if program == "p11_return" || program == "p11_return_journal" {
+                                    if program == "p11_return"
+                                        || program == "p11_return_journal"
+                                        || program == "p11_return_journal_length"
+                                    {
                                         DiagnosticPhase::NativeReturn
                                     } else {
                                         DiagnosticPhase::NativeEntry
@@ -9707,6 +9824,7 @@ impl Session {
                     roots,
                     counter_mode,
                     true,
+                    self.key_sizes,
                     abi_for,
                     attach,
                     |_| monotonic_ns(),
@@ -9834,6 +9952,7 @@ impl Session {
         attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
         roots: StaticRoots,
         journal: bool,
+        key_sizes: bool,
     ) -> Result<AttachOutcome> {
         let counter_mode = self
             .counter_banks
@@ -9847,6 +9966,7 @@ impl Session {
             roots,
             counter_mode,
             journal,
+            key_sizes,
         )?;
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
@@ -10036,7 +10156,7 @@ impl Session {
                 continue;
             }
             let expected_entry = if self.journal {
-                "p11_entry_journal"
+                journal::journal_entry_program(slot.descriptor_index, self.key_sizes)
             } else {
                 "p11_entry"
             };
@@ -10072,6 +10192,8 @@ impl Session {
                 self.policy,
                 self.embedded_flavor.unsafe_present,
                 retained.abi,
+                slot.descriptor_index,
+                self.key_sizes,
             );
             if resolved != expected_entry {
                 outcome.refused.push((
@@ -10649,16 +10771,17 @@ impl Session {
             StaticRoots::Detailed,
             None,
             self.journal,
+            self.key_sizes,
         )
         .expect("every selected Detailed target has retained pinned facts");
         let rebuilt_groups = affected_group_count(&self.links, affected);
+        // Per-group returns (spec §8.6, like the multi path above):
+        // rebuilt length groups need the length return FD, so collect
+        // every group's own return program instead of one session-wide
+        // name.
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
-        programs.insert(if self.journal {
-            "p11_return_journal"
-        } else {
-            "p11_return"
-        });
+        programs.extend(groups.iter().map(|group| group.return_program));
         let mut prog_fds = BTreeMap::new();
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
@@ -11226,7 +11349,7 @@ impl Session {
             .map(|diag| {
                 let phase = match &link {
                     RegisteredLink::UProbe {
-                        program: "p11_return" | "p11_return_journal",
+                        program: "p11_return" | "p11_return_journal" | "p11_return_journal_length",
                         ..
                     } => DiagnosticPhase::NativeReturn,
                     RegisteredLink::UProbe { .. } => DiagnosticPhase::NativeEntry,
@@ -12509,6 +12632,7 @@ mod capture_policy {
                 StaticRoots::CounterBanks,
                 Some(CounterMode::Counts),
                 false,
+                false,
             );
             assert!(refused.is_err(), "{policy:?} must not take bank roots");
         }
@@ -12524,6 +12648,7 @@ mod capture_policy {
                 &std::collections::BTreeMap::new(),
                 StaticRoots::CounterBanks,
                 Some(mode),
+                false,
                 false,
             );
             assert!(accepted.is_ok(), "{mode:?} takes bank roots");
@@ -12543,6 +12668,7 @@ mod capture_policy {
                     StaticRoots::CounterBanks,
                     Some(other),
                     false,
+                    false,
                 );
                 assert!(
                     refused.is_err(),
@@ -12556,6 +12682,7 @@ mod capture_policy {
                 &std::collections::BTreeMap::new(),
                 StaticRoots::CounterBanks,
                 None,
+                false,
                 false,
             );
             assert!(
@@ -12899,8 +13026,9 @@ mod tests {
                 return false;
             };
             downgrade.contains("downgrade_entry_program(")
-                && helper.contains("p11_entry_journal")
-                && helper.contains("entry_program(")
+                && helper.contains("journal::journal_entry_program(descriptor, key_sizes)")
+                && helper
+                    .contains("entry_program(semantics, policy, object_has_unsafe, target_abi)")
         }
         let source = include_str!("attach.rs");
         assert!(
@@ -12909,7 +13037,10 @@ mod tests {
         );
         for (signature, marker) in [
             ("    pub fn downgrade_in_place(", "downgrade_entry_program("),
-            ("fn downgrade_entry_program(", "p11_entry_journal"),
+            (
+                "fn downgrade_entry_program(",
+                "journal::journal_entry_program(descriptor, key_sizes)",
+            ),
             (
                 "fn downgrade_entry_program(",
                 "entry_program(semantics, policy, object_has_unsafe, target_abi)",
@@ -12947,14 +13078,27 @@ mod tests {
         };
         let safe = super::CapturePolicy::Allowlisted;
         let unsafe_policy = super::CapturePolicy::UnsafeUnvalidatedMetadata;
-        for (journal, semantics, policy, object_has_unsafe, abi, expected) in [
-            (false, &count_only, safe, false, ElfAbi::Lp64, "p11_entry"),
+        let sign = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let init = crate::kinds::function_id("C_SignInit").unwrap() + 1;
+        for (journal, semantics, policy, object_has_unsafe, abi, descriptor, key_sizes, expected) in [
+            (
+                false,
+                &count_only,
+                safe,
+                false,
+                ElfAbi::Lp64,
+                0,
+                false,
+                "p11_entry",
+            ),
             (
                 false,
                 &template_pair,
                 unsafe_policy,
                 true,
                 ElfAbi::Lp64,
+                0,
+                false,
                 "p11_entry_template_pair",
             ),
             (
@@ -12963,6 +13107,8 @@ mod tests {
                 unsafe_policy,
                 true,
                 ElfAbi::Lp64,
+                0,
+                false,
                 "p11_entry_template_types",
             ),
             (
@@ -12971,6 +13117,8 @@ mod tests {
                 unsafe_policy,
                 true,
                 ElfAbi::Lp64,
+                0,
+                false,
                 "p11_entry_template",
             ),
             (
@@ -12979,6 +13127,8 @@ mod tests {
                 safe,
                 true,
                 ElfAbi::Ilp32,
+                0,
+                false,
                 "p11_entry_ia32",
             ),
             (
@@ -12987,6 +13137,8 @@ mod tests {
                 safe,
                 false,
                 ElfAbi::Lp64,
+                init,
+                false,
                 "p11_entry_journal",
             ),
             (
@@ -12995,13 +13147,55 @@ mod tests {
                 unsafe_policy,
                 true,
                 ElfAbi::Ilp32,
+                init,
+                false,
+                "p11_entry_journal",
+            ),
+            // Length slots narrowed under --key-sizes keep their length
+            // entry (in-place); without the flag they keep the base pair.
+            (
+                true,
+                &count_only,
+                safe,
+                false,
+                ElfAbi::Lp64,
+                sign,
+                true,
+                "p11_entry_journal_length",
+            ),
+            (
+                true,
+                &count_only,
+                safe,
+                false,
+                ElfAbi::Lp64,
+                sign,
+                false,
+                "p11_entry_journal",
+            ),
+            (
+                true,
+                &count_only,
+                safe,
+                false,
+                ElfAbi::Lp64,
+                init,
+                true,
                 "p11_entry_journal",
             ),
         ] {
             assert_eq!(
-                super::downgrade_entry_program(journal, semantics, policy, object_has_unsafe, abi),
+                super::downgrade_entry_program(
+                    journal,
+                    semantics,
+                    policy,
+                    object_has_unsafe,
+                    abi,
+                    descriptor,
+                    key_sizes
+                ),
                 expected,
-                "journal={journal} abi={abi:?}"
+                "journal={journal} abi={abi:?} descriptor={descriptor} key_sizes={key_sizes}"
             );
         }
     }
@@ -14420,6 +14614,16 @@ mod tests {
             static_probe_side("p11_entry_journal"),
             Some(ProbeSide::Entry)
         );
+        // The length pair routes identically (v0.8.0 keymeta Task 2):
+        // singles substitution and multi grouping resolve both roots.
+        assert_eq!(
+            static_probe_side("p11_return_journal_length"),
+            Some(ProbeSide::Return)
+        );
+        assert_eq!(
+            static_probe_side("p11_entry_journal_length"),
+            Some(ProbeSide::Entry)
+        );
         assert_eq!(
             super::static_endpoint("p11_return_journal", 7),
             Some((7, ProbeSide::Return))
@@ -14479,8 +14683,12 @@ mod tests {
             "the rebuild regroups with the session's journal selection"
         );
         assert!(
-            rebuild.contains("p11_return_journal"),
-            "the rebuild resolves the journal return fd on journal sessions"
+            rebuild.contains("self.key_sizes"),
+            "the rebuild regroups with the session's length selection"
+        );
+        assert!(
+            rebuild.contains("group.return_program"),
+            "the rebuild resolves per-group return fds (length groups take the length return)"
         );
         let attach = body(
             production,
@@ -17621,7 +17829,7 @@ mod tests {
             let deferred_frozen = std::cell::Cell::new(0);
             let activation_called = std::cell::Cell::new(false);
             let preparation =
-                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, false, |step| {
                     if step == SessionPreparation::LoadImagePrograms {
                         assert_eq!(deferred_frozen.get(), 0);
                         image_loaded.set(true);
@@ -17652,7 +17860,7 @@ mod tests {
             for fail_counter in [false, true] {
                 let mut seen = Vec::new();
                 let mut activated = false;
-                let preparation = prepare_session_with(false, roots, false, |step| {
+                let preparation = prepare_session_with(false, roots, false, false, |step| {
                     if step == SessionPreparation::LoadCounterPrograms {
                         anyhow::ensure!(
                             !seen.iter().any(|step| matches!(
@@ -17706,7 +17914,7 @@ mod tests {
         }
     }
 
-    fn expected_preparation_journal() -> Vec<SessionPreparation> {
+    fn expected_preparation_journal(key_sizes: bool) -> Vec<SessionPreparation> {
         use SessionPreparation::*;
         let mut steps = vec![
             ValidatePolicy,
@@ -17725,7 +17933,7 @@ mod tests {
             SelectScope,
         ];
         steps.extend(
-            super::journal::journal_expected_programs()
+            super::journal::journal_load_programs(key_sizes)
                 .into_iter()
                 .map(LoadProgram),
         );
@@ -17748,22 +17956,48 @@ mod tests {
     #[test]
     fn journal_preparation_orders_classes_before_freeze_and_pair_at_load() {
         let mut ordinary = Vec::new();
-        prepare_session_with(false, StaticRoots::Detailed, false, |step| {
+        prepare_session_with(false, StaticRoots::Detailed, false, false, |step| {
             ordinary.push(step);
             Ok(())
         })
         .unwrap();
         assert_eq!(ordinary, expected_preparation(false));
-        let expected = expected_preparation_journal();
-        for unsafe_object in [false, true] {
-            let mut seen = Vec::new();
-            prepare_session_with(unsafe_object, StaticRoots::Detailed, true, |step| {
-                seen.push(step);
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(seen, expected);
+        for key_sizes in [false, true] {
+            let expected = expected_preparation_journal(key_sizes);
+            for unsafe_object in [false, true] {
+                let mut seen = Vec::new();
+                prepare_session_with(
+                    unsafe_object,
+                    StaticRoots::Detailed,
+                    true,
+                    key_sizes,
+                    |step| {
+                        seen.push(step);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(seen, expected, "key_sizes={key_sizes}");
+            }
+            let loads: Vec<_> = expected
+                .iter()
+                .filter_map(|step| match step {
+                    SessionPreparation::LoadProgram(name) => Some(*name),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                loads.contains(&"p11_entry_journal_length"),
+                key_sizes,
+                "key_sizes={key_sizes}: length entry loads iff flagged"
+            );
+            assert_eq!(
+                loads.contains(&"p11_return_journal_length"),
+                key_sizes,
+                "key_sizes={key_sizes}: length return loads iff flagged"
+            );
         }
+        let expected = expected_preparation_journal(false);
         let classes = expected
             .iter()
             .position(|step| *step == SessionPreparation::PublishJournalClasses)
@@ -17810,13 +18044,14 @@ mod tests {
         for fail_classes in [false, true] {
             let mut seen = Vec::new();
             let mut activated = false;
-            let preparation = prepare_session_with(false, StaticRoots::Detailed, true, |step| {
-                seen.push(step);
-                if fail_classes && step == SessionPreparation::PublishJournalClasses {
-                    anyhow::bail!("injected journal class fill failure");
-                }
-                Ok(())
-            });
+            let preparation =
+                prepare_session_with(false, StaticRoots::Detailed, true, false, |step| {
+                    seen.push(step);
+                    if fail_classes && step == SessionPreparation::PublishJournalClasses {
+                        anyhow::bail!("injected journal class fill failure");
+                    }
+                    Ok(())
+                });
             let result = activate_after_preparation_with(preparation, || {
                 activated = true;
                 Ok(())
@@ -17856,7 +18091,7 @@ mod tests {
             AttachBackend::Singles,
             None,
             None,
-            Some(&journal::JournalSpec),
+            Some(&journal::JournalSpec { key_sizes: false }),
             false,
             None,
         )
@@ -17875,6 +18110,7 @@ mod tests {
         let scope = Scope::System;
         let prepared = journal::JournalPreparation {
             object: b"not an ELF object",
+            key_sizes: false,
         };
         let error = Session::prepare_inner_unlinked_with_object(
             &scope,
@@ -17906,6 +18142,7 @@ mod tests {
         let scope = Scope::System;
         let prepared = journal::JournalPreparation {
             object: crate::EBPF_OBJECT,
+            key_sizes: false,
         };
         let error = Session::prepare_inner_unlinked_with_object(
             &scope,
@@ -17952,7 +18189,7 @@ mod tests {
             AttachBackend::Singles,
             None,
             Some(&counter),
-            Some(&journal::JournalSpec),
+            Some(&journal::JournalSpec { key_sizes: false }),
             false,
             None,
         )
@@ -17974,6 +18211,7 @@ mod tests {
         let scope = Scope::System;
         let prepared = journal::JournalPreparation {
             object: b"not an ELF object",
+            key_sizes: false,
         };
         let error = Session::prepare_inner_unlinked_with_object(
             &scope,
@@ -18001,7 +18239,7 @@ mod tests {
     fn preparation_contract_runs_every_phase_successfully() {
         for unsafe_object in [false, true] {
             let mut seen = Vec::new();
-            prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
+            prepare_session_with(unsafe_object, StaticRoots::Detailed, false, false, |step| {
                 seen.push(step);
                 Ok(())
             })
@@ -18018,7 +18256,7 @@ mod tests {
             let mut activation_calls = 0;
             let mut attach_calls = Vec::new();
             let preparation_result =
-                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, false, |step| {
                     preparation.push(step);
                     Ok(())
                 });
@@ -18067,14 +18305,19 @@ mod tests {
                 let mut seen = Vec::new();
                 let mut activation_calls = 0;
                 let mut attach_calls = 0;
-                let preparation_result =
-                    prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |step| {
+                let preparation_result = prepare_session_with(
+                    unsafe_object,
+                    StaticRoots::Detailed,
+                    false,
+                    false,
+                    |step| {
                         seen.push(step);
                         if seen.len() == fail + 1 {
                             return Err(Injected(fail).into());
                         }
                         Ok(())
-                    });
+                    },
+                );
                 let error = activate_after_preparation_with(preparation_result, || {
                     activation_calls += 1;
                     attach_lifecycle_with(
@@ -18110,7 +18353,9 @@ mod tests {
         for unsafe_object in [false, true] {
             let mut activation_calls = 0;
             let preparation =
-                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, |_| Ok(()));
+                prepare_session_with(unsafe_object, StaticRoots::Detailed, false, false, |_| {
+                    Ok(())
+                });
             let result: Result<()> = activate_after_preparation_with(preparation, || {
                 activation_calls += 1;
                 Err(ActivationFailure.into())
@@ -19181,6 +19426,7 @@ mod tests {
             StaticRoots::CounterBanks,
             Some(CounterMode::Counts),
             false,
+            false,
         )
         .unwrap();
         assert_eq!(groups.len(), 2);
@@ -19270,6 +19516,7 @@ mod tests {
                 StaticRoots::CounterBanks,
                 Some(CounterMode::Counts),
                 false,
+                false,
             );
             assert!(refused.is_err());
         }
@@ -19314,6 +19561,7 @@ mod tests {
                 StaticRoots::CounterBanks,
                 Some(mode),
                 false,
+                false,
             );
             assert!(accepted.is_ok(), "{mode:?} Lp64 twin groups");
             let mut ia32 = targets.clone();
@@ -19325,6 +19573,7 @@ mod tests {
                 &ia32,
                 StaticRoots::CounterBanks,
                 Some(mode),
+                false,
                 false,
             )
             .expect_err("ia32 slot must refuse grouping");
@@ -19351,6 +19600,7 @@ mod tests {
                 &missing,
                 StaticRoots::CounterBanks,
                 Some(mode),
+                false,
                 false,
             )
             .expect_err("missing facts must refuse grouping");
@@ -19387,6 +19637,7 @@ mod tests {
             &ia32,
             StaticRoots::CounterBanks,
             None,
+            false,
             false,
         )
         .expect_err("fallback must refuse grouping");
@@ -19437,6 +19688,7 @@ mod tests {
                 StaticRoots::CounterBanks,
                 Some(CounterMode::Counts),
                 false,
+                false,
             )
             .unwrap();
             let fresh_groups: Vec<StaticGroup> = group_static_slots_with_roots(
@@ -19446,6 +19698,7 @@ mod tests {
                 &all_targets,
                 StaticRoots::CounterBanks,
                 Some(CounterMode::Counts),
+                false,
                 false,
             )
             .unwrap();
@@ -20815,6 +21068,7 @@ mod tests {
                 StaticRoots::Detailed,
                 None,
                 true,
+                false,
             )
             .unwrap();
             assert_eq!(groups.len(), 2, "{policy:?}: one group per path");
@@ -21078,6 +21332,7 @@ mod tests {
             StaticRoots::Detailed,
             None,
             true,
+            false,
             |_| Ok(ElfAbi::Lp64),
             |program, slot, _| {
                 pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
@@ -26242,7 +26497,7 @@ mod tests {
     fn attested_start_gates_journal_before_any_probe_or_load() {
         let (subset, _dir) = SealDrainScene::attest().into_subset();
         let scope = super::Scope::Pid(std::process::id());
-        let spec = super::journal::JournalSpec;
+        let spec = super::journal::JournalSpec { key_sizes: false };
         let attempted = super::Session::start_attested(
             subset,
             &scope,
@@ -26640,7 +26895,10 @@ mod tests {
 
         let cell = CollectedSessionCell::build()?;
         if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
-            let mut session = start_selected(&cell, Some(&super::journal::JournalSpec))?;
+            let mut session = start_selected(
+                &cell,
+                Some(&super::journal::JournalSpec { key_sizes: false }),
+            )?;
             anyhow::ensure!(
                 session.attach_failures().is_empty(),
                 "attach failures: {:?}",
@@ -26679,7 +26937,10 @@ mod tests {
             );
             session.detach_producers()?;
         } else {
-            let refused = start_selected(&cell, Some(&super::journal::JournalSpec));
+            let refused = start_selected(
+                &cell,
+                Some(&super::journal::JournalSpec { key_sizes: false }),
+            );
             let error = refused.err().context("omitted journal build refuses")?;
             anyhow::ensure!(
                 format!("{error:#}").contains("journal-pair-unavailable-in-build"),
@@ -26788,13 +27049,14 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(groups.len(), 3, "length splits /a.so, /b.so keeps one group");
+        assert_eq!(
+            groups.len(),
+            3,
+            "length splits /a.so, /b.so keeps one group"
+        );
         for group in &groups {
-            super::journal::validate_journal_group_pair(
-                group.entry_program,
-                group.return_program,
-            )
-            .unwrap();
+            super::journal::validate_journal_group_pair(group.entry_program, group.return_program)
+                .unwrap();
         }
         let length_groups: Vec<_> = groups
             .iter()
@@ -26880,10 +27142,15 @@ mod tests {
             true,
         )
         .unwrap();
-        // Two distinct length-endpoint paths (/a.so, /b.so): +2/+2.
+        // /a.so splits (length + base), /b.so holds only a length slot
+        // and keeps one group: +1/+1 here. Each length path with base
+        // siblings adds exactly one group (Multi +G/+G bounds it).
         assert_eq!(count_links(&off), (2, 2));
-        assert_eq!(count_links(&on), (4, 4));
-        for group in on.iter().filter(|group| group_member_indices(group).contains(&3u32)) {
+        assert_eq!(count_links(&on), (3, 3));
+        for group in on
+            .iter()
+            .filter(|group| group_member_indices(group).contains(&3u32))
+        {
             assert_eq!(group.entry_program, PROGRAMS[0], "count-only stays base");
             assert_eq!(group.return_program, PROGRAMS[1]);
         }

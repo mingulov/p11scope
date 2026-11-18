@@ -1100,3 +1100,419 @@ fn cbom_text_names_tokens_verbose_only() {
         "head byte-stable without tokens, got:\n{concise}"
     );
 }
+
+// Departed-fold twins: callers folded into `modules[].departed_use`
+// rejoin the CBOM as application components, app->provider joins and
+// mechanism totals; fold bounds stay named unknowns.
+
+fn departed_identity(caller: &str, path: Option<&str>, lifecycle: &str) -> Value {
+    json!({
+        "caller": caller, "pid": 4242, "start_time": 1000, "incarnation": 0,
+        "exe": path.map(|path| json!({
+            "dev": 1, "ino": 100,
+            "mtime_secs": 10, "mtime_nanos": 0,
+            "path": path
+        })),
+        "authority": "scan_pinned", "lifecycle": lifecycle,
+        "lifecycle_reason": "process exited (pid names no live process)",
+        "first_seen_ns": 110, "last_seen_ns": 190,
+        "exec_observed": true, "metadata_status": "historical"
+    })
+}
+
+fn departed_overflow(mechs: u64, calls: u64, errors: u64) -> Value {
+    json!({"mechs": mechs, "calls": calls, "errors": errors})
+}
+
+/// A producer-shaped aggregate: the converter reads callers,
+/// mechanisms, overflow, identities, saturation and drops, and
+/// ignores the accounting subtrees it does not project.
+fn departed_use(
+    callers: u64,
+    edges: u64,
+    mechanisms: Value,
+    identities: Vec<Value>,
+    saturated: bool,
+    dropped: u64,
+    overflow: Value,
+) -> Value {
+    json!({
+        "first_ns": 100, "callers": callers, "edges": edges,
+        "entries": {
+            "count": 3, "saturated": 0, "first_min_ns": 101, "last_max_ns": 202,
+            "in_flight": 0, "logical": 3, "forwarding": 0,
+            "observation": {"observed": 1},
+            "coverage": {
+                "counted": 1, "witnessed": 0, "watched_no_use": 0,
+                "lossy": 0, "pid_exit": 0, "unknown": {},
+                "since_min_ns": 101, "until_max_ns": null, "first_min_ns": null,
+            },
+        },
+        "mapping": {
+            "state": {"mapped": 0, "ended": 1, "uncertain": 0},
+            "evidence": {"deep_scan": 1, "maps_match": 0},
+            "interruptions": 0, "first_min_ns": 101, "last_max_ns": 202,
+            "reasons": {"process exited (pid names no live process)": 1},
+            "reasons_overflow": 0,
+        },
+        "semantics": {"labels": {"observed": 1}},
+        "mechanisms": mechanisms,
+        "mechanisms_overflow": overflow,
+        "operations": null,
+        "instances": {
+            "folded": 0, "observed": 0, "uncertain": 0, "retired": 0,
+            "settled_live": 0, "reasons": {},
+            "null_reasons": 0, "first_min_ns": null, "last_max_ns": null,
+            "api_returns": 0, "api_returns_saturated_rows": 0,
+            "historical_only_returns": 0, "lossy_rows": 0, "loss_reasons": {},
+        },
+        "identities": identities,
+        "identities_saturated": saturated, "identities_dropped": dropped,
+    })
+}
+
+fn module_with_departed(id: &str, path: &str, sha256: &str, departed: Value) -> Value {
+    let mut module = module(id, path, Some(sha256));
+    module["departed_use"] = departed;
+    module
+}
+
+fn component_properties(component: &Value) -> Vec<(&str, &str)> {
+    component["properties"]
+        .as_array()
+        .expect("properties")
+        .iter()
+        .map(|property| {
+            (
+                property["name"].as_str().expect("name"),
+                property["value"].as_str().expect("value"),
+            )
+        })
+        .collect()
+}
+
+fn metadata_value(document: &Value, name: &str) -> Value {
+    document
+        .pointer("/metadata/properties")
+        .and_then(Value::as_array)
+        .expect("metadata properties")
+        .iter()
+        .find(|property| property["name"] == name)
+        .unwrap_or_else(|| panic!("metadata property {name}"))
+        .get("value")
+        .expect("value")
+        .clone()
+}
+
+#[test]
+fn cbom_folded_departed_matches_the_alive_control() {
+    let control = inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"a".repeat(64)))],
+        vec![edge(
+            "c0",
+            "m0",
+            Some(vec![mechanism_row(
+                4231,
+                Some("CKM_AES_GCM"),
+                &["encrypt"],
+                10,
+            )]),
+        )],
+    );
+    let departed = departed_use(
+        1,
+        1,
+        json!([mechanism_row(4231, Some("CKM_AES_GCM"), &["encrypt"], 10,)]),
+        vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+        false,
+        0,
+        departed_overflow(0, 0, 0),
+    );
+    let folded = inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"a".repeat(64),
+            departed,
+        )],
+        vec![],
+    );
+    let control = parse_input(&control).unwrap();
+    let folded = parse_input(&folded).unwrap();
+    // Same application, same incarnations; only the attribution differs.
+    assert_eq!(folded.applications.len(), 1);
+    assert_eq!(folded.applications[0].path, control.applications[0].path);
+    assert_eq!(
+        folded.applications[0].incarnations,
+        control.applications[0].incarnations
+    );
+    assert_eq!(control.applications[0].departed_incarnations, 0);
+    assert_eq!(folded.applications[0].departed_incarnations, 1);
+    assert_eq!(control.applications[0].lifecycles, vec!["mapped"]);
+    assert_eq!(folded.applications[0].lifecycles, vec!["exited"]);
+    // Same mechanism totals, same rows, same provenance.
+    assert_eq!(folded.mechanisms.len(), 1);
+    let (expected, actual) = (&control.mechanisms[0], &folded.mechanisms[0]);
+    assert_eq!(actual.id, expected.id);
+    assert_eq!(actual.name, expected.name);
+    assert_eq!(actual.calls, expected.calls);
+    assert_eq!(actual.errors, expected.errors);
+    assert_eq!(actual.operations, expected.operations);
+    assert_eq!(actual.functions, expected.functions);
+    assert_eq!(actual.returns, expected.returns);
+    assert_eq!(actual.rows, expected.rows);
+    assert_eq!(actual.bom_ref, expected.bom_ref);
+    // Same joins: the single folded caller proves the same edges.
+    assert_eq!(folded.dependencies, control.dependencies);
+    assert_eq!(folded.dependencies.len(), 3);
+    // No unknowns either way: nothing dropped, saturated or past bounds.
+    assert_eq!(folded.unknowns.departed_identities_dropped, 0);
+    assert_eq!(folded.unknowns.departed_identities_saturated, 0);
+    assert_eq!(folded.unknowns.departed_mechs_overflow, 0);
+    assert_eq!(folded.unknowns.departed_mechs_overflow_calls, 0);
+    assert_eq!(folded.unknowns.departed_mechs_overflow_errors, 0);
+    assert_eq!(folded.unknowns.departed_links_withheld, 0);
+    // Rendered JSON matches except the departed marker on the application.
+    let control_document = super::render::render_json(&control);
+    let folded_document = super::render::render_json(&folded);
+    assert_eq!(
+        folded_document["dependencies"],
+        control_document["dependencies"]
+    );
+    assert_eq!(folded_document["metadata"], control_document["metadata"]);
+    let control_app = library_component(&control_document, "p11scope:caller:0");
+    let folded_app = library_component(&folded_document, "p11scope:caller:0");
+    assert_eq!(folded_app["name"], control_app["name"]);
+    let folded_props = component_properties(&folded_app);
+    assert!(
+        folded_props.contains(&("p11scope:departed_incarnations", "1")),
+        "folded application carries the departed marker, got: {folded_props:?}"
+    );
+    assert!(
+        !component_properties(&control_app)
+            .iter()
+            .any(|(name, _)| *name == "p11scope:departed_incarnations"),
+        "the live control carries no departed marker"
+    );
+    // Concise text is byte-identical; verbose names the departed incarnation.
+    let mut control_text = Vec::new();
+    super::render::render_concise(&control, &mut control_text).unwrap();
+    let mut folded_text = Vec::new();
+    super::render::render_concise(&folded, &mut folded_text).unwrap();
+    assert_eq!(folded_text, control_text);
+    let mut verbose = Vec::new();
+    super::render::render_verbose(&folded, &mut verbose).unwrap();
+    let verbose = String::from_utf8(verbose).unwrap();
+    assert!(verbose.contains("1 departed"), "{verbose}");
+}
+
+#[test]
+fn cbom_departed_incarnations_merge_into_the_live_application() {
+    let departed = departed_use(
+        2,
+        2,
+        json!([mechanism_row(592, Some("CKM_SHA256"), &["digest"], 4)]),
+        vec![
+            departed_identity("c1", Some("/bin/driver"), "exited"),
+            departed_identity("c2", Some("/bin/gone"), "exec_retired"),
+        ],
+        false,
+        0,
+        departed_overflow(0, 0, 0),
+    );
+    let bytes = inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"b".repeat(64),
+            departed,
+        )],
+        vec![edge("c0", "m0", None)],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.applications.len(), 2);
+    let driver = projection
+        .applications
+        .iter()
+        .find(|app| app.path == "/bin/driver")
+        .expect("the live path keeps one component");
+    assert_eq!(driver.incarnations, 2);
+    assert_eq!(driver.departed_incarnations, 1);
+    assert_eq!(driver.lifecycles, vec!["exited", "mapped"]);
+    let gone = projection
+        .applications
+        .iter()
+        .find(|app| app.path == "/bin/gone")
+        .expect("the departed-only path mints a component");
+    assert_eq!(gone.incarnations, 1);
+    assert_eq!(gone.departed_incarnations, 1);
+    // Both applications join the provider they were folded at.
+    for app in ["p11scope:caller:0", "p11scope:caller:1"] {
+        assert!(
+            projection
+                .dependencies
+                .contains(&(app.to_string(), "p11scope:module:0".to_string())),
+            "missing {app} -> provider, got: {:?}",
+            projection.dependencies
+        );
+    }
+}
+
+#[test]
+fn cbom_departed_multi_caller_names_bounds_and_withholds_linkage() {
+    let departed = departed_use(
+        2,
+        3,
+        json!([
+            mechanism_row(4231, Some("CKM_AES_GCM"), &["encrypt"], 10),
+            mechanism_row(4231, Some("CKM_AES_GCM"), &["decrypt"], 5),
+            mechanism_row(9999, None, &["encrypt"], 2),
+        ]),
+        vec![
+            departed_identity("c0", Some("/bin/first"), "exited"),
+            departed_identity("c1", Some("/bin/second"), "exec_retired"),
+            departed_identity("c2", None, "exited"),
+            json!({"pid": 9}),
+        ],
+        true,
+        3,
+        departed_overflow(2, 40, 5),
+    );
+    let bytes = inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"b".repeat(64),
+            departed,
+        )],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.applications.len(), 2);
+    assert_eq!(projection.unknowns.callers_unknown_exe, 1);
+    assert_eq!(projection.unknowns.callers_skipped, 1);
+    // Departed rows union into the same per-id totals.
+    assert_eq!(projection.mechanisms.len(), 2);
+    let gcm = projection
+        .mechanisms
+        .iter()
+        .find(|mechanism| mechanism.id == 4231)
+        .expect("the folded id");
+    assert_eq!(gcm.calls, 15);
+    assert_eq!(gcm.rows, 2);
+    assert_eq!(gcm.operations, vec!["decrypt", "encrypt"]);
+    assert_eq!(projection.unknowns.mechanisms_unnamed, 1);
+    assert_eq!(projection.unknowns.mechanisms_unknown_primitive, 1);
+    // Every fold bound is a named unknown.
+    assert_eq!(projection.unknowns.departed_identities_dropped, 3);
+    assert_eq!(projection.unknowns.departed_identities_saturated, 1);
+    assert_eq!(projection.unknowns.departed_mechs_overflow, 2);
+    assert_eq!(projection.unknowns.departed_mechs_overflow_calls, 40);
+    assert_eq!(projection.unknowns.departed_mechs_overflow_errors, 5);
+    assert_eq!(projection.unknowns.departed_links_withheld, 1);
+    // Applications join their provider and the provider joins its
+    // mechanisms; per-app mechanism pairs are withheld, not guessed.
+    for app in ["p11scope:caller:0", "p11scope:caller:1"] {
+        assert!(
+            projection
+                .dependencies
+                .contains(&(app.to_string(), "p11scope:module:0".to_string())),
+            "missing {app} -> provider, got: {:?}",
+            projection.dependencies
+        );
+    }
+    for mechanism in ["p11scope:mechanism:0x1087", "p11scope:mechanism:0x270f"] {
+        assert!(
+            projection
+                .dependencies
+                .contains(&("p11scope:module:0".to_string(), mechanism.to_string())),
+            "missing provider -> {mechanism}, got: {:?}",
+            projection.dependencies
+        );
+    }
+    assert!(
+        !projection.dependencies.iter().any(|(from, to)| {
+            from.starts_with("p11scope:caller:") && to.starts_with("p11scope:mechanism:")
+        }),
+        "no guessed app->mechanism pairs, got: {:?}",
+        projection.dependencies
+    );
+    // JSON metadata names every departed unknown.
+    let document = super::render::render_json(&projection);
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_identities_dropped"),
+        "3"
+    );
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_identities_saturated"),
+        "1"
+    );
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_mech_overflow"),
+        "2"
+    );
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_mech_overflow_calls"),
+        "40"
+    );
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_mech_overflow_errors"),
+        "5"
+    );
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_links_withheld"),
+        "1"
+    );
+    // Concise text names them too.
+    let mut concise = Vec::new();
+    super::render::render_concise(&projection, &mut concise).unwrap();
+    let concise = String::from_utf8(concise).unwrap();
+    for expected in [
+        "3 departed identities dropped",
+        "1 module with saturated departed identities",
+        "2 departed mechanisms past bounds (40 calls, 5 errors)",
+        "1 module with withheld departed mechanism linkage",
+    ] {
+        assert!(
+            concise.contains(expected),
+            "coverage names {expected:?}, got:\n{concise}"
+        );
+    }
+}
+
+#[test]
+fn cbom_departed_rows_count_toward_the_row_bound() {
+    let departed = departed_use(
+        1,
+        1,
+        json!([mechanism_row(4231, Some("CKM_AES_GCM"), &["encrypt"], 10)]),
+        vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+        false,
+        0,
+        departed_overflow(0, 0, 0),
+    );
+    let bytes = inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"c".repeat(64),
+            departed,
+        )],
+        vec![],
+    );
+    // 1 module + 1 folded identity + 1 folded mechanism = 3 rows.
+    let limits = crate::inventory_diff::input::InputLimits {
+        rows: 2,
+        ..crate::inventory_diff::input::InputLimits::default()
+    };
+    let error = parse_input_with_limits(&bytes, limits)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("inventory row limit exceeded"), "{error}");
+    assert!(parse_input(&bytes).is_ok());
+}

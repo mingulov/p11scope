@@ -67,12 +67,26 @@ pub(super) struct Unknowns {
     pub keys_unknown_type: u64,
     pub keys_unjoinable: u64,
     pub objects_skipped_non_key: u64,
+    /// Folded identities past the per-module/run-wide bounds, summed.
+    pub departed_identities_dropped: u64,
+    /// Modules whose folded identity list saturated, counted.
+    pub departed_identities_saturated: u64,
+    /// Folded mechanism rows past the bounds, with their calls/errors.
+    pub departed_mechs_overflow: u64,
+    pub departed_mechs_overflow_calls: u64,
+    pub departed_mechs_overflow_errors: u64,
+    /// Modules whose folded app-to-mechanism pairs stay unlinked: the
+    /// fold keeps per-module totals, not caller x mechanism pairs.
+    pub departed_links_withheld: u64,
 }
 
 #[derive(Debug)]
 pub(super) struct Application {
     pub path: String,
     pub incarnations: u64,
+    /// Incarnations rejoined from `departed_use` aggregates (0 for
+    /// live-only applications); part of `incarnations`.
+    pub departed_incarnations: u64,
     pub lifecycles: Vec<String>,
     pub bom_ref: String,
 }
@@ -366,6 +380,7 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
         out.applications.push(Application {
             path: path.clone(),
             incarnations: app_incarnations.get(path).copied().unwrap_or(0),
+            departed_incarnations: 0,
             lifecycles: app_lifecycles
                 .get(path)
                 .map(|set| set.iter().cloned().collect())

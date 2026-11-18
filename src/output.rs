@@ -74,6 +74,12 @@ pub struct AtomicFile {
     /// directory, applied at commit on the open descriptor.
     handover: Option<(u32, u32)>,
     cleanup: bool,
+    /// Test-only sync fault: when `Some(errno)`, the pre-handover
+    /// `sync_all` fails with that errno instead of syncing, so the
+    /// sync-failure fallback is behaviorally pinned without fault
+    /// injection. Production builds have no such field.
+    #[cfg(test)]
+    fail_sync_with: Option<i32>,
 }
 
 impl AtomicFile {
@@ -139,6 +145,8 @@ impl AtomicFile {
                         owner,
                         handover,
                         cleanup: true,
+                        #[cfg(test)]
+                        fail_sync_with: None,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1518,6 +1526,7 @@ mod tests {
             owner: unsafe { libc::geteuid() },
             handover: None,
             cleanup: true,
+            fail_sync_with: None,
         }
     }
 
@@ -2766,14 +2775,15 @@ mod tests {
 
     /// A handover that fails at commit — the create-time probe passed
     /// but the filesystem refused the real file (a vfat/exfat gid,
-    /// FUSE/NFS, a quota move) — still publishes the finished report
-    /// creator-owned 0600 with a warning naming the path, instead of
-    /// unlinking an hours-long capture. Runs unprivileged: handing to a
-    /// foreign uid fails EPERM without root, which is exactly the
+    /// FUSE/NFS, a quota move) — saves the finished capture to the
+    /// recovery dir instead of publishing an unhanded report or
+    /// unlinking an hours-long capture, and fails (exit 1: the
+    /// requested `-o` does not exist). Runs unprivileged: handing to
+    /// a foreign uid fails EPERM without root, which is exactly the
     /// probe-passed/commit-refused race this covers (the fixture sets
     /// the handover directly, past the create-time probe).
     #[test]
-    fn commit_handover_failure_publishes_the_creator_owned_report() {
+    fn commit_handover_failure_falls_back_to_recovered_dir() {
         use std::os::unix::fs::MetadataExt as _;
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("skipped: needs a non-root caller (fchown must fail)");
@@ -2781,6 +2791,8 @@ mod tests {
         }
         let dir = private_tempdir();
         let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
         let mut a = atomic_file_test_fixture(&path);
         // A uid that is never the caller; fchown needs no passwd entry.
         let foreign = if unsafe { libc::geteuid() } == 65534 {
@@ -2790,28 +2802,26 @@ mod tests {
         };
         a.handover = Some((foreign, foreign));
         std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
-        a.commit().unwrap();
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"{\"ok\":true}",
-            "the finished capture is published, not deleted"
+        let _override = hold_recovered_override(&recovered_base);
+        let error = a.commit().unwrap_err();
+        assert!(
+            error.contains("handing output"),
+            "the error keeps the handover refusal, got: {error}"
         );
-        let metadata = std::fs::metadata(&path).unwrap();
-        assert_eq!(
-            metadata.permissions().mode() & 0o777,
-            0o600,
-            "the unhanded report stays private"
+        assert!(
+            error.contains("capture saved to"),
+            "the error names the fallback, got: {error}"
         );
-        assert_eq!(
-            metadata.uid(),
-            unsafe { libc::geteuid() },
-            "the unhanded report keeps its creator ownership"
-        );
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            1,
-            "only the final remains, no temp leftover"
-        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        let files = recovered_files(&recovered_base);
+        assert_eq!(files.len(), 1, "one fallback file: {files:?}");
+        assert_recovered_name(&files[0], "json");
+        let saved = recovered_base.join(&files[0]);
+        assert_eq!(std::fs::read(&saved).unwrap(), b"{\"ok\":true}");
+        let metadata = std::fs::metadata(&saved).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
     }
 
     /// Post-handover durability pin: the commit-time `fchown`/`fchmod`
@@ -2984,14 +2994,14 @@ mod tests {
         );
     }
 
-    /// The commit-time fallback, pinned structurally: a handover that
-    /// fails at commit returns the warning to print — naming the path —
-    /// instead of failing, and `commit` prints it and publishes the
-    /// finished report. (The warning goes to stderr, which libtest
-    /// captures; the source pin plus the publish twin above prove the
-    /// path executes.)
+    /// The commit-time handover failure, pinned structurally: a
+    /// handover that fails at commit returns the error naming the path —
+    /// instead of publishing an unhanded report — and `commit` routes it
+    /// to the recovery dir. (The fallback line goes to stderr, which
+    /// libtest captures; the source pin plus the fallback twin above
+    /// prove the path executes.)
     #[test]
-    fn commit_handover_failure_warns_naming_the_path() {
+    fn commit_handover_failure_falls_back_naming_the_path() {
         let source = include_str!("output.rs");
         let production = source.split_once("mod tests").unwrap().0;
         let handover = production
@@ -3002,12 +3012,16 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            handover.contains("warning"),
-            "the commit-time handover failure carries a warning, not an unlink"
+            handover.contains("Err("),
+            "the commit-time handover failure returns an error, not a publish-with-warning"
         );
         assert!(
             handover.contains("final_path.display()"),
-            "the warning names the report path"
+            "the handover error names the report path"
+        );
+        assert!(
+            !handover.contains("Ok(Some"),
+            "no handover failure falls back to publishing the unhanded report"
         );
         let commit = production
             .split_once("pub fn commit(mut self)")
@@ -3022,7 +3036,7 @@ mod tests {
         );
         assert!(
             commit.contains("eprintln!"),
-            "commit prints the handover warning (bounded in production, captured in tests)"
+            "commit prints the fallback line (bounded in production, captured in tests)"
         );
     }
 
@@ -3061,19 +3075,22 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
     }
 
-    /// A handover refusal followed by a publish failure still keeps the
-    /// finished temp, naming it — the error states both failures and the
-    /// kept path. Runs unprivileged: handing to a foreign uid fails EPERM
-    /// without root (the fixture sets the handover directly, past the
-    /// create-time probe), and the final-is-directory swap fails publish.
+    /// A handover refusal (with a publish failure waiting behind it)
+    /// saves the finished capture to the recovery dir and fails — the
+    /// error states the handover refusal and the fallback path. Runs
+    /// unprivileged: handing to a foreign uid fails EPERM without root
+    /// (the fixture sets the handover directly, past the create-time
+    /// probe), and the final-is-directory swap would fail publish next.
     #[test]
-    fn commit_handover_and_publish_failures_keep_the_temp() {
+    fn commit_handover_and_publish_failures_fall_back_to_recovered_dir() {
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("skipped: needs a non-root caller (fchown must fail)");
             return;
         }
         let dir = private_tempdir();
         let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
         std::fs::write(&path, b"old").unwrap();
         let mut a = atomic_file_test_fixture(&path);
         let foreign = if unsafe { libc::geteuid() } == 65534 {
@@ -3085,36 +3102,33 @@ mod tests {
         std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
+        let _override = hold_recovered_override(&recovered_base);
         let error = a.commit().unwrap_err();
         assert!(
-            error.contains("kept"),
-            "the error says the temp was kept, got: {error}"
+            error.contains("capture saved to"),
+            "the error names the fallback, got: {error}"
         );
         assert!(
             error.contains("handing output"),
             "the error keeps the handover refusal, got: {error}"
         );
-        let litter = temp_litter(dir.path());
-        assert_eq!(litter.len(), 1, "the finished temp is kept, not deleted");
-        assert!(
-            error.contains(&litter[0]),
-            "the error names the kept temp, got: {error}"
-        );
+        assert!(!path.is_file(), "the requested -o does not exist");
+        let files = recovered_files(&recovered_base);
+        assert_eq!(files.len(), 1, "one fallback file: {files:?}");
         assert_eq!(
-            std::fs::read(dir.path().join(&litter[0])).unwrap(),
-            b"{\"ok\":true}",
-            "the kept temp holds the finished capture"
+            std::fs::read(recovered_base.join(&files[0])).unwrap(),
+            b"{\"ok\":true}"
         );
-        std::fs::remove_file(dir.path().join(&litter[0])).unwrap();
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
         std::fs::remove_dir(&path).unwrap();
     }
 
-    /// The handover warning is emitted only after the publish result is
-    /// known, stating what actually happened — `commit` publishes first,
-    /// then prints. Structural: stderr is libtest-captured, so the
-    /// ordering is pinned on the source.
+    /// The fallback line is emitted only after both commit attempts
+    /// are known, stating what actually happened — `commit` retries
+    /// once, then prints the recovery result. Structural: stderr is
+    /// libtest-captured, so the ordering is pinned on the source.
     #[test]
-    fn commit_emits_the_handover_warning_only_after_publish() {
+    fn commit_emits_the_fallback_line_only_after_both_attempts() {
         let source = include_str!("output.rs");
         let production = source.split_once("mod tests").unwrap().0;
         let commit = production
@@ -3124,24 +3138,29 @@ mod tests {
             .split_once("fn publish(")
             .unwrap()
             .0;
-        let publish = commit
-            .find("publish()")
-            .expect("commit must publish the finished report");
+        let attempt = commit
+            .find("try_commit_once()")
+            .expect("commit must attempt the publish before falling back");
         let warn = commit
             .find("eprintln!")
-            .expect("commit must print the handover warning");
+            .expect("commit must print the fallback line");
         assert!(
-            publish < warn,
-            "the warning is emitted only after the publish result is known"
+            attempt < warn,
+            "the fallback line is emitted only after the attempts are known"
+        );
+        assert!(
+            commit.matches("try_commit_once()").count() >= 2,
+            "commit must retry once before falling back"
         );
     }
 
-    /// The whole commit-time handover sequence falls back to publishing
-    /// with a warning, not just the fchown: post-fchown chmod/sync
-    /// failures return a warning instead of failing, so the finished
-    /// report is published rather than unlinked.
+    /// The whole commit-time handover sequence fails the commit (to
+    /// the recovery dir), not just the fchown: post-fchown chmod/sync
+    /// failures return an error instead of publishing, so the finished
+    /// capture is saved to the recovery dir rather than published
+    /// unhanded or unlinked.
     #[test]
-    fn hand_over_at_commit_falls_back_on_chmod_and_sync_failures() {
+    fn hand_over_at_commit_fails_on_chmod_and_sync_failures() {
         let source = include_str!("output.rs");
         let production = source.split_once("mod tests").unwrap().0;
         let handover = production
@@ -3152,12 +3171,12 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            !handover.contains('?'),
-            "handover-sequence failures must fall back to publish, never `?`-fail"
+            !handover.contains("Ok(Some"),
+            "no handover-sequence failure falls back to publishing"
         );
         assert!(
-            handover.matches("Ok(Some").count() >= 3,
-            "fchown, chmod and sync failures each carry a warning"
+            handover.matches("Err(").count() >= 3,
+            "fchown, chmod and sync failures each return an error to the recovery path"
         );
     }
 
@@ -3264,6 +3283,350 @@ mod tests {
         assert!(
             commit.contains("hand_over_at_commit"),
             "AtomicFile::commit must hand the finished report over before publishing it"
+        );
+    }
+
+    /// Serializes tests that override the recovery directory: the
+    /// override is a process-global env var, so concurrent tests would
+    /// race on it.
+    static RECOVERED_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the override lock and the env var for one fallback test.
+    /// Unsets the var on drop.
+    struct RecoveredOverrideGuard<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+    }
+
+    fn hold_recovered_override(dir: &Path) -> RecoveredOverrideGuard<'_> {
+        // A sibling twin that panicked while holding the lock must not
+        // cascade into this test: recover the guard and fail (or pass)
+        // on this test's own assertions.
+        let lock = RECOVERED_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: under the process-wide override lock, no other test
+        // thread touches this variable.
+        unsafe {
+            std::env::set_var("P11SCOPE_TEST_RECOVERED_DIR", dir);
+        }
+        RecoveredOverrideGuard { _lock: lock }
+    }
+
+    impl Drop for RecoveredOverrideGuard<'_> {
+        fn drop(&mut self) {
+            // SAFETY: still under the override lock; ours is the only writer.
+            unsafe {
+                std::env::remove_var("P11SCOPE_TEST_RECOVERED_DIR");
+            }
+        }
+    }
+
+    /// Lists entries in the recovery dir (names only); empty when the
+    /// dir does not exist yet.
+    fn recovered_files(dir: &Path) -> Vec<String> {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// A fallback name is `p11scope-<yyyymmddThhmmssZ>-<pid>[.<seq>].<ext>`.
+    fn assert_recovered_name(name: &str, ext: &str) {
+        assert!(name.starts_with("p11scope-"), "fallback name prefix: {name}");
+        assert!(name.ends_with(&format!(".{ext}")), "fallback name ext: {name}");
+        let rest = &name["p11scope-".len()..name.len() - ext.len() - 1];
+        let (timestamp, pid_part) = rest.split_once('-').expect("fallback name has a pid part");
+        assert_eq!(timestamp.len(), 16, "fallback timestamp length: {name}");
+        assert!(
+            timestamp.as_bytes()[8] == b'T' && timestamp.ends_with('Z'),
+            "fallback timestamp shape: {name}"
+        );
+        assert!(
+            timestamp[..8].bytes().all(|b| b.is_ascii_digit()),
+            "fallback date digits: {name}"
+        );
+        assert!(
+            timestamp[9..15].bytes().all(|b| b.is_ascii_digit()),
+            "fallback time digits: {name}"
+        );
+        let pid = pid_part.split('.').next().unwrap();
+        assert_eq!(pid, &std::process::id().to_string(), "fallback pid: {name}");
+    }
+
+    /// A pre-handover `sync_all` refusal (EIO here) retries once, then
+    /// saves the finished capture to the recovery dir instead of
+    /// deleting it, and fails the commit (exit 1: the requested `-o`
+    /// does not exist).
+    #[test]
+    fn commit_sync_failure_falls_back_to_recovered_dir() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&recovered_base);
+        let error = a.commit().unwrap_err();
+        assert!(
+            error.contains("capture saved to"),
+            "the error names the fallback, got: {error}"
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        let files = recovered_files(&recovered_base);
+        assert_eq!(files.len(), 1, "one fallback file: {files:?}");
+        assert_recovered_name(&files[0], "json");
+        let saved = recovered_base.join(&files[0]);
+        assert!(
+            error.contains(&saved.display().to_string()),
+            "the error names the fallback path, got: {error}"
+        );
+        assert_eq!(std::fs::read(&saved).unwrap(), b"{\"ok\":true}");
+        let metadata = std::fs::metadata(&saved).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// ENOSPC surfacing at the pre-handover sync saves the capture to
+    /// the recovery dir with the errno text, and fails (exit 1).
+    #[test]
+    fn commit_enospc_at_write_falls_back_to_recovered_dir() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::ENOSPC);
+        let _override = hold_recovered_override(&recovered_base);
+        let error = a.commit().unwrap_err();
+        assert!(
+            error.contains("No space left on device"),
+            "the error carries the ENOSPC text, got: {error}"
+        );
+        assert!(
+            error.contains("capture saved to"),
+            "the error names the fallback, got: {error}"
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        let files = recovered_files(&recovered_base);
+        assert_eq!(files.len(), 1, "one fallback file: {files:?}");
+        assert_eq!(
+            std::fs::read(recovered_base.join(&files[0])).unwrap(),
+            b"{\"ok\":true}"
+        );
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A publish rename refused with EACCES (read-only destination
+    /// dir) retries once, then saves to the recovery dir and fails.
+    /// The read-only dir also blocks the temp unlink, so the temp may
+    /// remain beside the destination; the capture itself is safe in
+    /// the fallback.
+    #[test]
+    fn commit_publish_io_failure_falls_back_to_recovered_dir() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _override = hold_recovered_override(&recovered_base);
+        let error = a.commit().unwrap_err();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            error.contains("capture saved to"),
+            "the error names the fallback, got: {error}"
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        let files = recovered_files(&recovered_base);
+        assert_eq!(files.len(), 1, "one fallback file: {files:?}");
+        assert_eq!(
+            std::fs::read(recovered_base.join(&files[0])).unwrap(),
+            b"{\"ok\":true}"
+        );
+    }
+
+    /// A recovery base pre-planted as a symlink is refused: no file is
+    /// created through it, and the commit reports both errors with
+    /// `capture lost` (exit 1).
+    #[test]
+    fn recovered_dir_refuses_a_symlink() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let plant = private_tempdir();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&link);
+        let error = a.commit().unwrap_err();
+        assert!(error.contains("capture lost"), "got: {error}");
+        assert!(
+            error.contains("also failed"),
+            "the error names the fallback failure, got: {error}"
+        );
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused symlink"
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+    }
+
+    /// A recovery base owned by another user (here the root-owned
+    /// `/usr`, mode and owner both untrusted) is refused with
+    /// `capture lost`; nothing is created inside it.
+    #[test]
+    fn recovered_dir_refuses_a_foreign_owned_dir() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: needs a non-root caller (the base must be foreign)");
+            return;
+        }
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(Path::new("/usr"));
+        let error = a.commit().unwrap_err();
+        assert!(error.contains("capture lost"), "got: {error}");
+        assert!(
+            error.contains("also failed"),
+            "the error names the fallback failure, got: {error}"
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+    }
+
+    /// A recovery base with group/other bits (0777 here) is refused
+    /// with `capture lost`; no fallback file appears in it.
+    #[test]
+    fn recovered_dir_refuses_a_permissive_dir() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let plant = private_tempdir();
+        let base = plant.path().join("p11scope-recovered");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&base);
+        let error = a.commit().unwrap_err();
+        assert!(error.contains("capture lost"), "got: {error}");
+        assert!(
+            error.contains("also failed"),
+            "the error names the fallback failure, got: {error}"
+        );
+        assert_eq!(
+            recovered_files(&base),
+            Vec::<String>::new(),
+            "no fallback file in the refused dir"
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Both the `-o` commit and the recovery save fail: the error
+    /// carries both failures with `capture lost` (exit 1), nothing is
+    /// written to stdout by the commit, and no report exists at `-o`.
+    #[test]
+    fn commit_both_fail_reports_both_errors_and_loses_capture() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let plant = private_tempdir();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::ENOSPC);
+        let _override = hold_recovered_override(&link);
+        let error = a.commit().unwrap_err();
+        assert!(
+            error.contains("No space left on device"),
+            "the error carries the -o failure, got: {error}"
+        );
+        assert!(
+            error.contains("also failed"),
+            "the error carries the fallback failure, got: {error}"
+        );
+        assert!(error.contains("capture lost"), "got: {error}");
+        assert!(!path.exists(), "the requested -o does not exist");
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused link"
+        );
+    }
+
+    /// The pre-capture preflight warns (one advisory stderr line, never
+    /// a refusal) when the destination filesystem is short on free
+    /// space. Structural: free space cannot be arranged unprivileged,
+    /// so the check and its `may not fit` wording are pinned on the
+    /// source; `create` still returns `Ok` on this path by construction
+    /// (the warning is printed, not returned).
+    #[test]
+    fn create_warns_when_the_destination_may_not_fit() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let create = production
+            .split_once("pub fn create(path: &Path) -> Result<AtomicFile, String>")
+            .unwrap()
+            .1
+            .split_once("pub fn file(")
+            .unwrap()
+            .0;
+        assert!(
+            create.contains("fstatvfs") || create.contains("statvfs"),
+            "create must check destination free space before the capture"
+        );
+        assert!(
+            create.contains("may not fit"),
+            "the advisory warning must say the report may not fit"
+        );
+    }
+
+    /// After the capture, no failure path unlinks the temp before a
+    /// fallback has been tried: the commit routes sync/handover/rename
+    /// I/O failures to the recovery dir, and names both the fallback
+    /// save and the terminal loss. Structural companion to the
+    /// behavioral twins above.
+    #[test]
+    fn commit_routes_io_failures_to_the_recovery_dir() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        assert!(
+            production.contains("p11scope-recovered"),
+            "the commit fallback must target the recovery dir"
+        );
+        assert!(
+            production.contains("capture saved to"),
+            "a saved fallback must be announced"
+        );
+        assert!(
+            production.contains("capture lost"),
+            "a double failure must say the capture is lost"
+        );
+        let commit = production
+            .split_once("pub fn commit(mut self)")
+            .unwrap()
+            .1
+            .split_once("fn publish(")
+            .unwrap()
+            .0;
+        assert!(
+            !commit.contains("self.temp_file.sync_all().map_err"),
+            "the pre-handover sync must not `?`-fail and delete the capture"
         );
     }
 }

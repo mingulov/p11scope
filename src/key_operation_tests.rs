@@ -30272,3 +30272,453 @@ fn keymeta_size_further_counts_distinct_once() {
     assert_eq!(state.further, 1);
     assert_eq!(state.completions, 5);
 }
+
+/// A terminal after its join is lost types and sizes nothing: the
+/// proved row closes `key_join_lost`, the terminal counts once in
+/// the unknown summary, and no family, size or mismatch accrues to
+/// the historic key.
+#[test]
+fn keymeta_lost_join_has_no_inference() {
+    use crate::semantics_key_use::{UNKNOWN_CATEGORIES, UNKNOWN_REASONS};
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.keyuse.retire_object(ids[0]);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        Some(255),
+    );
+    let buckets: Vec<_> = ctx.keyuse.aggregates().values().collect();
+    assert_eq!(buckets.len(), 1, "one proved bucket");
+    assert_eq!(
+        (buckets[0].completed, buckets[0].key_join_lost),
+        (0, 1),
+        "the retired row closes lost, never completed"
+    );
+    let cat = UNKNOWN_CATEGORIES
+        .iter()
+        .position(|known| *known == "sign")
+        .expect("sign category");
+    let why = UNKNOWN_REASONS
+        .iter()
+        .position(|known| *known == "key_join_lost")
+        .expect("lost reason");
+    let unknown = &ctx.keyuse.unknown_counters()[cat * UNKNOWN_REASONS.len() + why];
+    assert_eq!(unknown.completed, 1, "the terminal routes once to unknown");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the row retains its inference entry");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(inferred.family.value, None);
+    assert_eq!(inferred.family.completions, 0);
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(inferred.size.detail, None);
+    assert_eq!(inferred.size.completions, 0);
+    assert_eq!(
+        ctx.keyuse.key_use_evidence().corroboration_mismatches,
+        0,
+        "a lost join feeds no mismatch denominator"
+    );
+}
+
+/// The intact-binding control for the lost-join negative: the same
+/// terminal through a live binding infers family and size and counts
+/// its corroboration mismatch.
+#[test]
+fn keymeta_intact_join_infers_through_same_terminal() {
+    use crate::semantics_key_use::{UNKNOWN_CATEGORIES, UNKNOWN_REASONS};
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        Some(255),
+    );
+    let buckets: Vec<_> = ctx.keyuse.aggregates().values().collect();
+    assert_eq!(buckets.len(), 1, "one proved bucket");
+    assert_eq!(
+        (buckets[0].completed, buckets[0].key_join_lost),
+        (1, 0),
+        "the live row completes"
+    );
+    let cat = UNKNOWN_CATEGORIES
+        .iter()
+        .position(|known| *known == "sign")
+        .expect("sign category");
+    let why = UNKNOWN_REASONS
+        .iter()
+        .position(|known| *known == "key_join_lost")
+        .expect("lost reason");
+    let unknown = &ctx.keyuse.unknown_counters()[cat * UNKNOWN_REASONS.len() + why];
+    assert_eq!(unknown.completed, 0, "no lost terminal routes unknown");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.family.completions, 1);
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Rsa {
+            size_class: Some(2048),
+            modulus_bytes: 256,
+        })
+    );
+    assert_eq!(inferred.size.completions, 1);
+    assert_eq!(
+        ctx.keyuse.key_use_evidence().corroboration_mismatches,
+        1,
+        "the live terminal disagrees with its corroboration"
+    );
+}
+
+/// Size further-details stay distinct past the remembered cap: 67
+/// admitted RSA lengths plus two repeats of the last count 65
+/// further distinct values, never 67, while the first two details
+/// stay pinned.
+#[test]
+fn keymeta_size_further_stays_distinct_past_cap() {
+    use crate::semantics_key_use::{SizeInput, SizeState};
+    let mut state = SizeState::default();
+    let mut lengths: Vec<u64> = (128u64..=194u64).collect();
+    lengths.push(194);
+    lengths.push(194);
+    assert_eq!(lengths.len(), 69, "67 distinct plus two repeats");
+    for length in lengths {
+        state.accumulate_size(
+            None,
+            Some(0x0001),
+            Some(EvidenceTag::SignOutput),
+            SizeInput::Value(length),
+        );
+    }
+    assert_eq!(state.status, InferredStatus::Conflicting);
+    assert_eq!(state.completions, 69);
+    assert_eq!(
+        state.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Rsa {
+            size_class: Some(1024),
+            modulus_bytes: 128,
+        }),
+        "the first length stays pinned"
+    );
+    assert_eq!(
+        state.conflict_detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Rsa {
+            size_class: None,
+            modulus_bytes: 129,
+        }),
+        "the second length stays pinned"
+    );
+    assert_eq!(
+        state.further, 65,
+        "65 additional distinct values, repeats never recount"
+    );
+}
+
+/// A later same-family mechanism rechecks its qualifier: a Montgomery
+/// key used with ECDH1 then ECMQV conflicts on the second completion,
+/// in both orders, while a typeless key stays inferred.
+#[test]
+fn keymeta_same_family_rechecks_later_mechanism() {
+    for (first, second) in [(0x1050u64, 0x1052u64), (0x1052u64, 0x1050u64)] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        let receipt = KeymetaCtx::receipt(
+            ids[0],
+            "C_DeriveKey",
+            0,
+            KeyRole::BaseKey,
+            Some(KeyLabel::Ec {
+                curve: SafeCurve::X25519,
+            }),
+        );
+        ctx.direct("C_DeriveKey", 7, Some(first), &[receipt], 100, None, None)
+            .expect("first derive completes");
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "derive", "base_key", "x25519")
+            .expect("the derive row infers");
+        assert_eq!(inferred.family.completions, 1, "first {first:#x}");
+        let receipt = KeymetaCtx::receipt(
+            ids[0],
+            "C_DeriveKey",
+            0,
+            KeyRole::BaseKey,
+            Some(KeyLabel::Ec {
+                curve: SafeCurve::X25519,
+            }),
+        );
+        ctx.direct("C_DeriveKey", 7, Some(second), &[receipt], 200, None, None)
+            .expect("second derive completes");
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "derive", "base_key", "x25519")
+            .expect("the derive row infers");
+        assert_eq!(
+            inferred.family.status,
+            InferredStatus::Conflicting,
+            "order {first:#x} then {second:#x} conflicts"
+        );
+        assert_eq!(inferred.family.completions, 2);
+        assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    }
+    // Missing-type control: no established type, the same pair stays
+    // inferred with both completions counted.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    for (mechanism, ts) in [(0x1050u64, 100u64), (0x1052u64, 200u64)] {
+        let receipt = KeymetaCtx::receipt(ids[0], "C_DeriveKey", 0, KeyRole::BaseKey, None);
+        ctx.direct("C_DeriveKey", 7, Some(mechanism), &[receipt], ts, None, None)
+            .expect("typeless derive completes");
+    }
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "derive", "base_key", "unknown")
+        .expect("the typeless row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    assert_eq!(inferred.family.completions, 2);
+}
+
+/// A frozen type-only established fact still gates family: a real
+/// sealed query for class plus RSA key type, without modulus bits,
+/// rows unknown yet conflicts with an ECDSA completion.
+#[test]
+fn keymeta_type_only_checks_family() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let query = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(&mut scene, &mut staging, &mut joint, &mut keyuse, &mut sink, &query);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0x1041, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = crate::key_operation_projection::producer::commit(
+        1,
+        &[&staging],
+        &scene.model.project(),
+        &keyuse,
+    );
+    let object = committed.objects.first().expect("one created object");
+    assert_eq!(object.established.class.status, "value");
+    assert_eq!(object.established.class.scalar, Some(3));
+    assert_eq!(object.established.class.source, Some("query"));
+    assert_eq!(object.established.key_type.status, "value");
+    assert_eq!(object.established.key_type.scalar, Some(0));
+    assert_eq!(object.established.key_type.source, Some("query"));
+    assert_eq!(
+        object.established.modulus_bits.status, "unknown",
+        "no modulus bits were ever established"
+    );
+    assert_eq!(object.label, None, "type-only establishes no combined label");
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("one sign row");
+    assert_eq!(row.metadata_at_use, "unknown");
+    assert_eq!(row.completed, 1);
+    let inferred = row.inferred.as_ref().expect("the sign row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    assert_eq!(inferred.family.completions, 1);
+    assert_eq!(
+        inferred.family.status,
+        InferredStatus::Conflicting,
+        "ECDSA against established RSA type conflicts"
+    );
+}
+
+/// A rowless park refusal still discloses in a versioned section: with
+/// no proved rows the refusal promotes the section to v7 carrying the
+/// named gap, never a v1 section with a v7-only gap and never PARTIAL.
+#[test]
+fn keymeta_rowless_park_refusal_promotes_to_v7() {
+    use crate::key_operation_projection::producer::commit;
+    let ids = KeymetaCtx::object_ids(3);
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    let mut sink = Vec::new();
+    let mut ledger = StagingLedger::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    for (n, view) in [ids[1], ids[2]].into_iter().enumerate() {
+        let mut receipt = KeymetaCtx::receipt(
+            ids[0],
+            "C_UnwrapKey",
+            0,
+            KeyRole::UnwrappingKey,
+            None,
+        );
+        receipt.attribution_valid = false;
+        let mut c = call("C_UnwrapKey", 7, CkRv::OK.0, 100 + n as u64 * 100);
+        c.mechanism = 0x2109;
+        c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NONE;
+        let origin = EffectOrigin::from(&c);
+        let before = sink.len();
+        edge.observe_joint_with_resources(
+            &c,
+            &origin,
+            &[receipt],
+            &CompletionEvidence {
+                length: Some(LengthOutcome::Value(32)),
+                fresh_view: Some(view.as_u64()),
+            },
+            &mut sink,
+        )
+        .expect("replay");
+        assert_eq!(sink.len(), before + 1, "unwrap {n} emits");
+        let effect = sink.last().cloned().expect("effect");
+        keyuse.observe_effect(instance, &effect, Some(&mut ledger), None);
+    }
+    let evidence = keyuse.key_use_evidence();
+    assert_eq!(evidence.parked_refused, 1);
+    assert!(
+        !evidence.partial,
+        "a refused park is inference-side, never row loss"
+    );
+    assert!(
+        keyuse.aggregates().is_empty(),
+        "unproved receipts reserve no proved rows"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    assert_eq!(committed.reason, "none");
+    assert!(
+        committed.key_operations.is_empty(),
+        "rowless: no proved rows to carry inference"
+    );
+    let gap = committed
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "wrapped_park_refused")
+        .expect("the refusal publishes as a named gap");
+    assert_eq!(gap.subject, "key_operation");
+    assert_eq!(gap.repeats, 1);
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        7,
+        "a v7-only gap promotes its section to v7"
+    );
+}
+
+/// The v7 size-detail schema is a discriminated set of closed
+/// alternatives: valid RSA and wrapped-material details validate,
+/// while a foreign field, a missing required field and an
+/// inappropriate evidence tag do not.
+#[test]
+fn key_operation_schema_v7_detail_validates_closed_variants() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v7.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let detail_schema = schema_file
+        .pointer("/$defs/size_detail")
+        .expect("size_detail present")
+        .clone();
+    let validator = jsonschema::options()
+        .build(&detail_schema)
+        .expect("detail schema builds");
+    let good_rsa = serde_json::json!({
+        "kind": "rsa",
+        "size_class": 2048,
+        "modulus_bytes": 256,
+        "evidence": "sign_output",
+    });
+    let good_wrapped = serde_json::json!({
+        "kind": "wrapped_material",
+        "material_octets": 24,
+        "octets": 32,
+        "evidence": "wrap_output",
+        "about": "wrapped",
+    });
+    assert!(validator.is_valid(&good_rsa), "valid RSA detail validates");
+    assert!(
+        validator.is_valid(&good_wrapped),
+        "valid wrapped-material detail validates"
+    );
+    let foreign_field = serde_json::json!({
+        "kind": "rsa",
+        "size_class": 2048,
+        "modulus_bytes": 256,
+        "evidence": "sign_output",
+        "curve": "ed25519",
+    });
+    assert!(
+        !validator.is_valid(&foreign_field),
+        "an RSA detail with a foreign curve field is refused"
+    );
+    let missing_required = serde_json::json!({
+        "kind": "rsa",
+        "size_class": 2048,
+        "evidence": "sign_output",
+    });
+    assert!(
+        !validator.is_valid(&missing_required),
+        "an RSA detail without modulus_bytes is refused"
+    );
+    let bad_evidence = serde_json::json!({
+        "kind": "rsa",
+        "size_class": 2048,
+        "modulus_bytes": 256,
+        "evidence": "decapsulate_input",
+    });
+    assert!(
+        !validator.is_valid(&bad_evidence),
+        "an RSA detail with KEM evidence is refused"
+    );
+    let bad_class = serde_json::json!({
+        "kind": "rsa",
+        "size_class": 9,
+        "modulus_bytes": 256,
+        "evidence": "sign_output",
+    });
+    assert!(
+        !validator.is_valid(&bad_class),
+        "an RSA detail with an arbitrary class is refused"
+    );
+}

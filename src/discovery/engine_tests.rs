@@ -39223,6 +39223,107 @@ fn live_union_preserves_finished_scan_without_new_static_table() {
 }
 
 #[test]
+fn merge_scanned_module_caps_tables_per_module_with_counted_overflow() {
+    // A run-long union cannot grow one module's tables without bound:
+    // past MAX_MERGED_TABLES_PER_MODULE, fresh tables drop and count
+    // instead of appending, and interfaces that pointed at a dropped
+    // table keep their row with no table link.
+    let table = |slot: u64| ScannedTable {
+        version: (3, 0),
+        walk: "full",
+        entries: vec![],
+        null_entries: vec![],
+        unpinned: vec![],
+        address: 0x1000 + slot,
+        file_offset: Some(slot),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |tables: Vec<ScannedTable>, interfaces: Vec<ScannedInterface>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces,
+    };
+    let interface = |table: Option<usize>| ScannedInterface {
+        index: 0,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table,
+    };
+    let cap = MAX_MERGED_TABLES_PER_MODULE as u64;
+    // A fresh module past the cap truncates on entry and counts the
+    // dropped tables; the interface to a dropped table detaches.
+    let mut entered = Vec::new();
+    let dropped = merge_scanned_module(
+        &mut entered,
+        module(
+            (0..cap + 3).map(table).collect(),
+            vec![
+                interface(Some(0)),
+                interface(Some(MAX_MERGED_TABLES_PER_MODULE)),
+            ],
+        ),
+    );
+    assert_eq!(dropped, 3);
+    assert_eq!(entered.len(), 1);
+    assert_eq!(entered[0].tables.len(), MAX_MERGED_TABLES_PER_MODULE);
+    assert_eq!(entered[0].interfaces.len(), 2);
+    assert_eq!(entered[0].interfaces[0].table, Some(0));
+    assert_eq!(entered[0].interfaces[1].table, None);
+    assert!(
+        !entered[0].tables_scan_finished,
+        "a truncating skip clears the finished claim"
+    );
+    // A union past the cap drops and counts the fresh tables without
+    // growing, and re-opens finished-ness like any new static table.
+    let mut merged = vec![module((0..cap).map(table).collect(), vec![])];
+    let dropped = merge_scanned_module(
+        &mut merged,
+        module(vec![table(10_000), table(10_001)], vec![]),
+    );
+    assert_eq!(dropped, 2);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].tables.len(), MAX_MERGED_TABLES_PER_MODULE);
+    assert!(
+        !merged[0].tables_scan_finished,
+        "a dropped static table re-opens finished-ness"
+    );
+    // Identical tables re-merge free: nothing appends, nothing drops.
+    let dropped = merge_scanned_module(
+        &mut merged,
+        module((0..cap).map(table).collect(), vec![]),
+    );
+    assert_eq!(dropped, 0);
+    assert_eq!(merged[0].tables.len(), MAX_MERGED_TABLES_PER_MODULE);
+    // Under the cap nothing changes: fresh tables still append free.
+    let mut small = vec![module(vec![table(0)], vec![])];
+    let dropped = merge_scanned_module(&mut small, module(vec![table(1)], vec![]));
+    assert_eq!(dropped, 0);
+    assert_eq!(small[0].tables.len(), 2);
+}
+
+#[test]
 fn incomplete_rescan_preserves_double_load_detection() {
     // F7d: the revalidated-rescan union preserves positive
     // double-load evidence in both directions — a retained `true`

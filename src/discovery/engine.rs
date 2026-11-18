@@ -31215,9 +31215,12 @@ impl Engine {
         // rescanned live. Pins without modules are inert (bind needs raw
         // modules), so refreshed pins carry in cgroup scope (a closed
         // membership: turnover, not ambient churn) or while unadmitted
-        // newcomers wait anywhere; the modules carry below still needs
-        // successor evidence everywhere, and the loader ownership gate
-        // reads claims (dropped either way) and closes as before.
+        // newcomers wait anywhere. Rescanned-empty modules ride only in
+        // owned runs (member turnover is expected by design there, and
+        // newcomer marks race the spawn they would gate on); everywhere
+        // else the rescan authoritatively dropped them. The loader
+        // ownership gate reads claims (dropped either way) and closes as
+        // before.
         let carry_objects: BTreeSet<PinnedObjectId> = if self.admits_generations() {
             self.plan
                 .slots
@@ -31234,7 +31237,7 @@ impl Engine {
             } else {
                 Vec::new()
             };
-        let preserve_modules_refreshed = !self.newcomer_first_seen.is_empty();
+        let preserve_modules_refreshed = self.owned_run_pid.is_some();
         if declined.is_empty()
             && self.plan_rebuild_stable
             && !fast_path_disabled
@@ -31308,10 +31311,9 @@ impl Engine {
                     && !refreshed_ids.contains(&module.scanned.view)
                     || (removed.contains(&module.scanned.view)
                         && carry_objects.contains(&module.object))
-                    // A rescanned-empty view's modules ride only with
-                    // successor evidence (see `preserve_modules_refreshed`
-                    // above): without it the rescan authoritatively dropped
-                    // them.
+                    // A rescanned-empty view's modules ride only in owned
+                    // runs (see `preserve_modules_refreshed` above):
+                    // elsewhere the rescan authoritatively dropped them.
                     || (preserve_modules_refreshed
                         && refreshed_ids.contains(&module.scanned.view)
                         && carry_objects.contains(&module.object))

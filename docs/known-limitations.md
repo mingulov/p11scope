@@ -701,6 +701,19 @@ last 2 minutes. The broad inventory keeps running to the end of the
 window with exact call counts, and detailed-tracking probes stay
 attached until exit.
 
+### Established key metadata can miss a repeated attribute past the eighth slot
+
+Key metadata promotes a successful creation call's own observed
+template cells to established facts. The observer retains only the
+first eight template attributes, so a kind that repeats with a
+different value after the eighth slot is invisible: on a provider
+that honors the last occurrence, the promoted value is the earlier
+one, not the effective one. Repeats inside the retained window flag
+a conflict and never promote, and unseen fields on truncated
+templates otherwise stay unknown with the named truncation reason.
+A later `C_GetAttributeValue` read surfaces the disagreement as a
+conflict rather than leaving the stale value established.
+
 ### Calls through the p11-kit proxy can publish no mechanism names
 
 Since v0.7.0, ELF interposition under p11-kit-proxy no longer

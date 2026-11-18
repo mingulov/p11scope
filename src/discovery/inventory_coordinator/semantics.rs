@@ -1014,7 +1014,10 @@ impl SemanticBindingRefusal {
 /// attribution — and it vetoes the other-caller shortcut for its
 /// ticket, so a late row for a folded caller barriers instead of
 /// disposing. Entries drop when their domain retires; past the cap
-/// the proofs fail closed (see `folded_images_saturated`).
+/// the refused ticket's domain saturates and its proofs fail closed
+/// until that domain's authenticated retirement (see
+/// `folded_saturated_domains`). Within a live domain the latch stays
+/// sticky: no same-domain drain cut exists.
 const MAX_FOLDED_IMAGE_NEGATIVES: usize = MAX_INSTANCES;
 
 /// Accepted semantic bindings: one stable Arc per accepted caller, bounded
@@ -1038,10 +1041,18 @@ pub(crate) struct SemanticBindingSet {
     /// Negative-only tombstones of folded callers' images (see
     /// [`MAX_FOLDED_IMAGE_NEGATIVES`]).
     folded_images: HashSet<(NativeDomainId, u64)>,
-    /// The negative index saturated: a distinct folded ticket past
-    /// the cap was refused, so both other-caller proofs fail closed
-    /// (sticky; domain retirement still discards that domain's
-    /// entries, but the shortcut stays refused).
+    /// Domains whose negative index saturated: a distinct folded
+    /// ticket past the cap was refused, so that domain's
+    /// other-caller proofs fail closed. Sticky within the live
+    /// domain; its authenticated retirement discards both the
+    /// domain's entries and its saturation, so a newly bound domain
+    /// proves healthy tickets again.
+    folded_saturated_domains: HashSet<NativeDomainId>,
+    /// Sticky ever-saturated witness for the saturation twin: set
+    /// beside [`Self::folded_saturated_domains`] on the first
+    /// overflow and never cleared. Enforcement reads the per-domain
+    /// set; this bool only pins that saturation happened.
+    #[cfg(test)]
     folded_images_saturated: bool,
     /// One move-only H0 custody reservation per successful physical successor.
     /// An accepted owner receipt consumes it, including a provider/scope refusal.
@@ -1130,6 +1141,8 @@ impl SemanticBindingSet {
             refresh_find_visits: 0,
             admission_images: HashMap::new(),
             folded_images: HashSet::new(),
+            folded_saturated_domains: HashSet::new(),
+            #[cfg(test)]
             folded_images_saturated: false,
             successors: HashMap::new(),
             refused_successors: HashMap::new(),
@@ -1176,9 +1189,11 @@ impl SemanticBindingSet {
     /// so the coordinator can clear their transient tail markers too.
     /// The index is rebuilt (positions shift) and cursors clamped;
     /// installed storage keeps its lease (the maps stay installed
-    /// with holes until the next install replaces them). A saturated
-    /// negative index stays saturated: retirement discards entries,
-    /// never the fail-closed latch.
+    /// with holes until the next install replaces them). The
+    /// authenticated retirement also discharges the domain's
+    /// saturation: its overflow uncertainty is proven drained, so a
+    /// newly bound domain proves healthy tickets again. Every other
+    /// domain's saturation is preserved.
     #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by retire_joint_domain.
     pub(crate) fn retire_domain(&mut self, domain: NativeDomainId) -> Vec<CallerId> {
         let mut removed = BTreeSet::new();
@@ -1218,9 +1233,12 @@ impl SemanticBindingSet {
             }
         }
         // Tombstones drop with their domain even when no live entry
-        // names it: a fully folded domain leaves only negatives.
+        // names it: a fully folded domain leaves only negatives. The
+        // domain's saturation discharges with them: the authenticated
+        // retirement proves its overflow uncertainty drained.
         self.folded_images
             .retain(|(folded_domain, _)| *folded_domain != domain);
+        self.folded_saturated_domains.remove(&domain);
         removed.into_iter().collect()
     }
 
@@ -1290,17 +1308,23 @@ impl SemanticBindingSet {
     /// Remember one folded caller's ticket as negative-only evidence.
     /// An unknown image (zero cookie) needs no entry: it never proves
     /// another caller. A repeat ticket is already remembered. Past
-    /// the cap the index saturates and both other-caller proofs fail
-    /// closed.
+    /// the cap the refused ticket's domain saturates and its
+    /// other-caller proofs fail closed until its authenticated
+    /// retirement; every other domain keeps proving from its own
+    /// stored tickets.
     fn remember_folded_image(&mut self, domain: NativeDomainId, cookie: u64) {
-        if cookie == 0 || self.folded_images_saturated {
+        if cookie == 0 || self.folded_saturated_domains.contains(&domain) {
             return;
         }
         if self.folded_images.contains(&(domain, cookie)) {
             return;
         }
         if self.folded_images.len() >= MAX_FOLDED_IMAGE_NEGATIVES {
-            self.folded_images_saturated = true;
+            self.folded_saturated_domains.insert(domain);
+            #[cfg(test)]
+            {
+                self.folded_images_saturated = true;
+            }
             return;
         }
         self.folded_images.insert((domain, cookie));
@@ -1331,14 +1355,14 @@ impl SemanticBindingSet {
     /// Whether an unrouted call's record proves a caller other than every
     /// bound Joint caller of its domain, so its lost position need not
     /// barrier their history. Fails closed: an unknown image (zero
-    /// cookie), no bindings, a saturated folded-image index, any
-    /// binding, admission history or folded tombstone of another
-    /// domain (a different ticket space), or a cookie equal to any
-    /// bound, historically admitted or folded image all keep the
-    /// barrier. Tickets are per thread group and never reused within
-    /// a domain, so a different nonzero cookie of the same domain is
-    /// a different process; an exec keeps its cookie and therefore
-    /// still matches.
+    /// cookie), no bindings, a saturated folded-image index for this
+    /// domain, any binding, admission history or folded tombstone of
+    /// another domain (a different ticket space), or a cookie equal
+    /// to any bound, historically admitted or folded image all keep
+    /// the barrier. Tickets are per thread group and never reused
+    /// within a domain, so a different nonzero cookie of the same
+    /// domain is a different process; an exec keeps its cookie and
+    /// therefore still matches.
     pub(crate) fn proves_unbound_caller(
         &self,
         domain: NativeDomainId,
@@ -1347,7 +1371,7 @@ impl SemanticBindingSet {
         let cookie = image.task_cookie;
         cookie != 0
             && !self.bindings.is_empty()
-            && !self.folded_images_saturated
+            && !self.folded_saturated_domains.contains(&domain)
             && self.bindings.iter().all(|binding| {
                 binding.domain() == domain
                     && binding.image().task_cookie != 0
@@ -1373,12 +1397,12 @@ impl SemanticBindingSet {
     /// whose own binding and admission history then hold its cookie
     /// and defeat [`Self::proves_unbound_caller`]. Fails closed: the
     /// call's exact image must itself be refused, a saturated
-    /// folded-image index refuses, and every binding or admission
-    /// history sharing its cookie must be refused too — an unrefused
-    /// same-cookie image (an exec keeps the cookie) could own the
-    /// call and keeps the barrier. A folded same-cookie tombstone
-    /// also keeps the barrier: the forgotten image might be an
-    /// unrefused exec.
+    /// folded-image index for this domain refuses, and every binding
+    /// or admission history sharing its cookie must be refused too —
+    /// an unrefused same-cookie image (an exec keeps the cookie)
+    /// could own the call and keeps the barrier. A folded
+    /// same-cookie tombstone also keeps the barrier: the forgotten
+    /// image might be an unrefused exec.
     pub(crate) fn proves_refused_other_caller(
         &self,
         domain: NativeDomainId,
@@ -1388,7 +1412,7 @@ impl SemanticBindingSet {
         let cookie = image.task_cookie;
         cookie != 0
             && !self.bindings.is_empty()
-            && !self.folded_images_saturated
+            && !self.folded_saturated_domains.contains(&domain)
             && image_refused(image)
             && self.bindings.iter().all(|binding| {
                 binding.domain() == domain

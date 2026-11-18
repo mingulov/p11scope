@@ -7527,6 +7527,150 @@ mod finalizer_history_tests {
             "saturation refuses the shortcut, never the live sibling"
         );
     }
+
+    /// F2 retirement twin: a saturated domain's overflow uncertainty
+    /// dies with its authenticated retirement. Domain A folds 4,097
+    /// distinct tickets (saturating the negative index) and refuses
+    /// both other-caller proofs while live; draining h3 without
+    /// retiring clears nothing (no same-domain cut: the live latch
+    /// stays sticky). Retirement runs through the real seal-drained
+    /// path — refused while h3 evidence pends, then the retained
+    /// proof retires once drained. A newly bound domain B then proves
+    /// a healthy unrelated ticket through both proofs and the real
+    /// H3 disposition: the retired domain's latch must not follow it.
+    #[test]
+    fn saturated_domain_retirement_discharges_its_overflow_latch_for_the_next_domain() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        const SIBLING: u64 = 41;
+        const HEALTHY: u64 = 99;
+        let (mut coordinator, lane_a, domain_a) = drop_test_lanes();
+        // A second lane mints the newly bound domain B.
+        let pid = std::process::id();
+        let fixture = HistoryFixture::new();
+        let mut lane_b =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("the second lane starts");
+        let domain_b = lane_b.domain();
+        assert_ne!(domain_a, domain_b, "the lanes mint distinct domains");
+        // A binds a sibling and saturates its negative index through
+        // the real fold.
+        let sibling = ImageIdentity {
+            task_cookie: SIBLING,
+            exec_id: 1,
+        };
+        bind_image(&mut coordinator, domain_a, 9000, sibling);
+        admit_history(&mut coordinator, domain_a, 9000, sibling);
+        for cycle in 0..4097u64 {
+            let CallerId(id) = admit_self(&mut coordinator);
+            assert!(id < 9000, "the sibling id stays clear of adapter rows");
+            let image = ImageIdentity {
+                task_cookie: 40_000 + cycle,
+                exec_id: 1,
+            };
+            bind_image(&mut coordinator, domain_a, id, image);
+            admit_history(&mut coordinator, domain_a, id, image);
+            assert_eq!(
+                retire_and_fold(&mut coordinator, CallerId(id), 200 + cycle),
+                1,
+                "cycle {cycle}: the rendered exited row folds"
+            );
+        }
+        let healthy = ImageIdentity {
+            task_cookie: HEALTHY,
+            exec_id: 1,
+        };
+        assert!(
+            !coordinator
+                .semantic_bindings
+                .proves_unbound_caller(domain_a, healthy),
+            "a saturated live domain refuses the unbound shortcut"
+        );
+        assert!(
+            !coordinator
+                .semantic_bindings
+                .proves_refused_other_caller(domain_a, healthy, |_| true),
+            "a saturated live domain refuses the refused shortcut"
+        );
+        // H3 drains but the domain stays live: the latch is sticky
+        // within the active domain (no same-domain cut exists).
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain_a));
+        assert!(
+            !coordinator
+                .semantic_bindings
+                .proves_unbound_caller(domain_a, healthy),
+            "draining h3 without retiring keeps the live latch"
+        );
+        // Seal-drained retirement: refused while h3 evidence pends,
+        // then the retained proof retires once drained.
+        assert!(!lane_a.has_joint_frame(), "the test lane starts frameless");
+        coordinator
+            .semantic_finalizer
+            .as_mut()
+            .expect("the live namespace survives")
+            .h3_pending = Some(H3DispositionEvidence::genesis());
+        let (completion, err) = coordinator
+            .retire_joint_domain_with_lane(
+                &lane_a,
+                crate::inventory_promotion::lifecycle::SessionNativeCompletion::scripted(domain_a),
+            )
+            .expect_err("h3 evidence stays live");
+        assert_eq!(err, JointRetireRefusal::PendingWork);
+        coordinator
+            .semantic_finalizer
+            .as_mut()
+            .expect("the refusal keeps the namespace")
+            .h3_pending = None;
+        coordinator
+            .retire_joint_domain_with_lane(&lane_a, completion)
+            .expect("drained evidence retires");
+        assert!(
+            coordinator.semantic_bindings.get(CallerId(9000)).is_none(),
+            "retirement removes the old domain's bindings"
+        );
+        // B binds fresh: both proofs hold for a healthy ticket.
+        let sibling_b = ImageIdentity {
+            task_cookie: SIBLING,
+            exec_id: 1,
+        };
+        bind_image(&mut coordinator, domain_b, 9001, sibling_b);
+        admit_history(&mut coordinator, domain_b, 9001, sibling_b);
+        assert!(
+            coordinator
+                .semantic_bindings
+                .proves_unbound_caller(domain_b, healthy),
+            "the retired domain's latch must not refuse the next domain's unbound shortcut"
+        );
+        assert!(
+            coordinator
+                .semantic_bindings
+                .proves_refused_other_caller(domain_b, healthy, |_| true),
+            "the retired domain's latch must not refuse the next domain's refused shortcut"
+        );
+        // Real H3 disposition: B's healthy shed disposes, never barriers.
+        let evidence = commit_outcomes(
+            &mut coordinator,
+            &mut lane_b,
+            domain_b,
+            vec![
+                invalidation_at(
+                    domain_b,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain_b, HEALTHY, 2),
+            ],
+        );
+        assert!(
+            matches!(
+                evidence,
+                H3DispositionEvidence::Clean {
+                    staged_max: 2,
+                    pending_floor: None
+                }
+            ),
+            "the newly bound domain's healthy shed disposes: {evidence:?}"
+        );
+    }
 }
 
 #[cfg(test)]

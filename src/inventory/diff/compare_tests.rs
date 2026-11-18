@@ -2020,6 +2020,171 @@ fn departed_use_differences_change_the_module_diff() {
     assert_ne!(same, changed_back, "symmetric");
 }
 
+fn departed_identity_json(caller: &str, path: Option<&str>, lifecycle: &str) -> Value {
+    json!({
+        "caller": caller, "pid": 4242, "start_time": 1000, "incarnation": 0,
+        "exe": path.map(|path| json!({"dev": 1, "ino": 100, "path": path})),
+        "authority": "scan_pinned", "lifecycle": lifecycle,
+        "lifecycle_reason": "process exited (pid names no live process)",
+        "exec_observed": true, "metadata_status": "historical",
+    })
+}
+
+fn departed_use_json(callers: u64, edges: u64, identities: Vec<Value>) -> Value {
+    json!({
+        "first_ns": 100, "callers": callers, "edges": edges,
+        "entries": {
+            "count": 9, "saturated": 0, "first_min_ns": 101, "last_max_ns": 102,
+            "in_flight": 0, "logical": 9, "forwarding": 0,
+            "observation": {"observed": 1},
+            "coverage": {
+                "counted": 1, "witnessed": 0, "watched_no_use": 0,
+                "lossy": 0, "pid_exit": 0, "unknown": {},
+                "since_min_ns": 101, "until_max_ns": null, "first_min_ns": null,
+            },
+        },
+        "mapping": {
+            "state": {"mapped": 0, "ended": 1, "uncertain": 0},
+            "evidence": {"deep_scan": 1, "maps_match": 0},
+            "interruptions": 0, "first_min_ns": 101, "last_max_ns": 102,
+            "reasons": {}, "reasons_overflow": 0,
+        },
+        "semantics": {"labels": {"observed": 1}},
+        "mechanisms": [], "mechanisms_overflow": {"mechs": 0, "calls": 0, "errors": 0},
+        "operations": null,
+        "instances": {
+            "folded": 0, "observed": 0, "uncertain": 0, "retired": 0,
+            "settled_live": 0, "reasons": {}, "null_reasons": 0,
+            "first_min_ns": null, "last_max_ns": null, "api_returns": 0,
+            "api_returns_saturated_rows": 0, "historical_only_returns": 0,
+            "lossy_rows": 0, "loss_reasons": {},
+        },
+        "identities": identities, "identities_saturated": false, "identities_dropped": 0,
+    })
+}
+
+/// A live edge folded between snapshots keeps its application
+/// group: presence stays `both` (never a false `before_only`) and
+/// the fold transition names `departed_use` beside the presence and
+/// population changes.
+#[test]
+fn folded_live_edge_keeps_its_application_group() {
+    let before = document();
+    let mut after = document();
+    after["callers"] = json!([]);
+    after["edges"] = json!([]);
+    after["gaps"] = json!([]);
+    after["modules"][0]["departed_use"] = departed_use_json(
+        1,
+        1,
+        vec![departed_identity_json("c0", Some("/bin/driver"), "exited")],
+    );
+    let report = compare(&snapshot(&before), &snapshot(&after));
+    assert_eq!(report.summary.application_groups_compared, 1);
+    assert_eq!(report.application_changes.len(), 1);
+    let change = &report.application_changes[0];
+    assert_eq!(app_path(&report, change), "/bin/driver");
+    assert_eq!(change.presence, Presence::Both);
+    assert_eq!(
+        change.changes,
+        vec![
+            "caller_population",
+            "content_presence",
+            "departed_use",
+            "lifecycle"
+        ]
+    );
+}
+
+/// Folded-only identities define application groups: a departed
+/// path with no live edge anywhere still counts as a compared
+/// group with its own change row.
+#[test]
+fn departed_only_identities_define_application_groups() {
+    let mut before = document();
+    before["callers"] = json!([]);
+    before["edges"] = json!([]);
+    before["gaps"] = json!([]);
+    let mut after = before.clone();
+    after["modules"][0]["departed_use"] = departed_use_json(
+        1,
+        1,
+        vec![departed_identity_json("c9", Some("/bin/gone"), "exited")],
+    );
+    let report = compare(&snapshot(&before), &snapshot(&after));
+    assert_eq!(report.comparison.application_paths, vec!["/bin/gone"]);
+    assert_eq!(report.summary.application_groups_compared, 1);
+    assert_eq!(report.application_changes.len(), 1);
+    let change = &report.application_changes[0];
+    assert_eq!(change.presence, Presence::AfterOnly);
+    assert_eq!(change.changes, vec!["content_presence"]);
+}
+
+/// Guard: identical folded snapshots report no application change
+/// (folded rows compare like live rows, silently when equal).
+#[test]
+fn identical_folded_snapshots_report_no_application_change() {
+    let mut before = document();
+    before["callers"] = json!([]);
+    before["edges"] = json!([]);
+    before["gaps"] = json!([]);
+    before["modules"][0]["departed_use"] = departed_use_json(
+        1,
+        1,
+        vec![departed_identity_json("c0", Some("/bin/driver"), "exited")],
+    );
+    let after = before.clone();
+    let report = compare(&snapshot(&before), &snapshot(&after));
+    assert_eq!(report.summary.application_groups_compared, 1);
+    assert!(
+        report.application_changes.is_empty(),
+        "equal folded rows stay silent: {:?}",
+        report.application_changes
+    );
+}
+
+/// Changed folded identities and counts report `departed_use` on
+/// their application group.
+#[test]
+fn changed_folded_use_reports_departed_use() {
+    let mut before = document();
+    before["callers"] = json!([]);
+    before["edges"] = json!([]);
+    before["gaps"] = json!([]);
+    before["modules"][0]["departed_use"] = departed_use_json(
+        1,
+        1,
+        vec![departed_identity_json("c0", Some("/bin/driver"), "exited")],
+    );
+    // One more folded identity on the same path.
+    let mut added = before.clone();
+    added["modules"][0]["departed_use"] = departed_use_json(
+        2,
+        2,
+        vec![
+            departed_identity_json("c0", Some("/bin/driver"), "exited"),
+            departed_identity_json("c1", Some("/bin/driver"), "exec_retired"),
+        ],
+    );
+    let report = compare(&snapshot(&before), &snapshot(&added));
+    assert_eq!(report.application_changes.len(), 1);
+    let change = &report.application_changes[0];
+    assert_eq!(change.presence, Presence::Both);
+    assert_eq!(change.changes, vec!["departed_use", "lifecycle"]);
+    // Same identities, bumped aggregate counts.
+    let mut bumped = before.clone();
+    bumped["modules"][0]["departed_use"] = departed_use_json(
+        2,
+        2,
+        vec![departed_identity_json("c0", Some("/bin/driver"), "exited")],
+    );
+    let report = compare(&snapshot(&before), &snapshot(&bumped));
+    assert_eq!(report.application_changes.len(), 1);
+    let change = &report.application_changes[0];
+    assert_eq!(change.presence, Presence::Both);
+    assert_eq!(change.changes, vec!["departed_use", "lifecycle"]);
+}
+
 #[test]
 fn native_semantic_resource_budgets_do_not_change_physical_diff() {
     let old = document();

@@ -2658,7 +2658,6 @@ fn assemble(
         bind_gaps,
         mut count_manifests,
     } = bound;
-    let mut bind_gaps = bind_gaps;
     if attributed
         .as_ref()
         .is_some_and(|attributed| !attributed.changed.is_empty() || !attributed.refused.is_empty())
@@ -2960,11 +2959,13 @@ fn assemble(
     // record to one pid-less entry (the engine's convention; per-pid
     // reasons live in the process table), then split verified absence
     // (notes) from real losses (skipped) on the scan's own vocabulary.
+    // Bind gaps travel separately: they name refused entries, never
+    // verified absence, so the split files them as losses without
+    // consulting reason text.
     let mut gaps: Vec<PidGap> = std::mem::take(&mut collection.scope_gaps);
     for member in &collection.members {
         gaps.extend(member.gaps.iter().cloned());
     }
-    gaps.append(&mut bind_gaps);
     let deep = collection.scanned();
     let matched_count = swept_by_pid.len();
     let (unexamined, unexamined_objects, unavailable, losses) = match &attributed {
@@ -3079,7 +3080,7 @@ fn assemble(
             reason,
         }));
     }
-    let (skipped, mut notes) = split_gaps(gaps);
+    let (skipped, mut notes) = split_gaps(gaps, bind_gaps);
     // Kernel threads examined this pass: one counted note, never one gap
     // per thread.
     if let Some(note) = kernel_thread_absence_note(collection.budget.kernel_thread_absences()) {
@@ -3198,8 +3199,11 @@ fn matched_observation(pid: u32, matched: &MatchedObject) -> Observation {
 /// Split gaps into real losses (`skipped`) and verified absence (`notes`)
 /// on the scan's own truncating vocabulary, after deduping exact repeats
 /// and collapsing the generic unreadable-member record to one pid-less
-/// entry. Pure, so the split is unit-testable.
-fn split_gaps(gaps: Vec<PidGap>) -> (Vec<PidGap>, Vec<PidGap>) {
+/// entry. Bind gaps are always losses — they name refused entries, never
+/// verified absence — so they bypass the vocabulary check entirely and a
+/// pathname containing the absence marker cannot reclassify them. Pure,
+/// so the split is unit-testable.
+fn split_gaps(gaps: Vec<PidGap>, bind_gaps: Vec<PidGap>) -> (Vec<PidGap>, Vec<PidGap>) {
     let mut seen = BTreeSet::new();
     let mut generic_seen = false;
     let mut skipped = Vec::new();
@@ -3220,6 +3224,19 @@ fn split_gaps(gaps: Vec<PidGap>) -> (Vec<PidGap>, Vec<PidGap>) {
         } else {
             notes.push(gap);
         }
+    }
+    for mut gap in bind_gaps {
+        if gap.generic {
+            if generic_seen {
+                continue;
+            }
+            generic_seen = true;
+            gap.pid = None;
+        }
+        if !seen.insert((gap.pid, gap.subject.clone(), gap.reason.clone())) {
+            continue;
+        }
+        skipped.push(gap);
     }
     let by_gap = |left: &PidGap, right: &PidGap| {
         (left.pid.is_none(), left.pid, &left.subject, &left.reason).cmp(&(
@@ -9537,32 +9554,35 @@ int main(int argc, char **argv) {
                 },
             )
         };
-        let (skipped, notes) = split_gaps(vec![
-            generic(7),
-            generic(9),
-            PidGap::member(
-                7,
-                Skipped {
-                    subject: "/opt/a.so".into(),
-                    reason: "identity_mismatch: mapping (8:1, 5) != opened (8:1, 6)".into(),
-                },
-            ),
-            PidGap::member(
-                9,
-                Skipped {
-                    subject: "/opt/b.so".into(),
-                    reason: "no function table was found in its file-backed data".into(),
-                },
-            ),
-            // Exact repeats collapse.
-            PidGap::member(
-                9,
-                Skipped {
-                    subject: "/opt/b.so".into(),
-                    reason: "no function table was found in its file-backed data".into(),
-                },
-            ),
-        ]);
+        let (skipped, notes) = split_gaps(
+            vec![
+                generic(7),
+                generic(9),
+                PidGap::member(
+                    7,
+                    Skipped {
+                        subject: "/opt/a.so".into(),
+                        reason: "identity_mismatch: mapping (8:1, 5) != opened (8:1, 6)".into(),
+                    },
+                ),
+                PidGap::member(
+                    9,
+                    Skipped {
+                        subject: "/opt/b.so".into(),
+                        reason: "no function table was found in its file-backed data".into(),
+                    },
+                ),
+                // Exact repeats collapse.
+                PidGap::member(
+                    9,
+                    Skipped {
+                        subject: "/opt/b.so".into(),
+                        reason: "no function table was found in its file-backed data".into(),
+                    },
+                ),
+            ],
+            vec![],
+        );
         assert_eq!(skipped.len(), 2, "{skipped:?}");
         assert!(
             skipped.iter().any(|gap| gap.pid.is_none()),

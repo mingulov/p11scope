@@ -6152,11 +6152,24 @@ fn scan_skip(subject: &str, reason: String) -> Skipped {
 /// absent: a deleted mapping may still carry executable code, so it
 /// truncates (fail closed) like any other unproven omission.
 pub(crate) fn scan_skip_truncates(reason: &str) -> bool {
-    !(reason.contains(NO_TABLE_FOUND_MARKER)
+    !(is_no_table_found_reason(reason)
         || reason == HINT_NOT_MAPPED_REASON
         || reason == NO_ABSOLUTE_PATHNAME_REASON
         || reason == "ambiguous \\012 pathname"
         || reason == "non-UTF-8 pathname")
+}
+
+/// Whether `reason` is the scan's own verified-absence vocabulary for a
+/// fully examined module with no table. Anchored to the start of the
+/// generated wording (with its optional `--module`-hint prefix): binder
+/// and other refusal reasons embed a pathname first, so a substring
+/// match would let a directory component containing the marker turn a
+/// loss into verified absence.
+fn is_no_table_found_reason(reason: &str) -> bool {
+    reason.starts_with(NO_TABLE_FOUND_MARKER)
+        || reason
+            .strip_prefix("matched a --module hint; ")
+            .is_some_and(|rest| rest.starts_with(NO_TABLE_FOUND_MARKER))
 }
 
 /// A visited module left with no decoded table because a table-decode

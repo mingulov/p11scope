@@ -11080,7 +11080,7 @@ fn capture_profile(
                     || {
                         write_json_report(out_file.file(), &streamed)?;
                         poll_terminal_cancellation();
-                        out_file.commit().map_err(anyhow::Error::msg)?;
+                        commit_streamed_report(out_file)?;
                         poll_terminal_cancellation();
                         Ok(())
                     },
@@ -11140,7 +11140,7 @@ fn capture_profile(
                     || {
                         write_json_report(out_file.file(), &streamed)?;
                         poll_terminal_cancellation();
-                        out_file.commit().map_err(anyhow::Error::msg)?;
+                        commit_streamed_report(out_file)?;
                         poll_terminal_cancellation();
                         Ok(())
                     },
@@ -11302,15 +11302,41 @@ fn fallback_streamed_report_to_stdout(
     }
 }
 
+/// Commits a streamed `-o` report for terminal publication. A commit
+/// the output layer already saved to the recovery dir becomes a typed
+/// [`crate::output::CommitFailure`], so the publisher suppresses the
+/// stdout rescue (the bytes are safe; a rescue would deliver twice).
+/// Every other failure — a double failure (`capture lost`), a kept
+/// temp, or a pre-commit write error — stays a plain message, and the
+/// stdout rescue remains the last resort.
+fn commit_streamed_report(out_file: crate::output::AtomicFile) -> Result<()> {
+    match out_file.commit_with_outcome() {
+        Ok(()) => Ok(()),
+        Err(failure) if failure.saved_to_recovery().is_some() => Err(anyhow::Error::new(failure)),
+        Err(failure) => Err(anyhow::Error::msg(failure.into_message())),
+    }
+}
+
+/// Whether an `-o` error already names a recovery-dir save: only the
+/// typed [`crate::output::CommitFailure`] a streamed commit wraps,
+/// never a string match — so only that path suppresses the rescue.
+fn commit_saved_to_recovery(out_error: &anyhow::Error) -> bool {
+    out_error
+        .downcast_ref::<crate::output::CommitFailure>()
+        .is_some_and(|failure| failure.saved_to_recovery().is_some())
+}
+
 /// Terminal publication across its two sinks: the `-o` write runs even
 /// when the live frame already hard-failed, and a failed `-o` write
 /// rescues the rendered document to stdout — which carries display frames
 /// only, never the JSON report, so the rescue is a new delivery, not a
-/// duplicate. `frame_error` is the saved live-frame result (`None` when no
-/// frame was due or it wrote); `write_out` performs the real `-o` write
-/// plus atomic commit, and `rescue_to_bytes` streams the rescue document.
-/// A rescued report still returns the `-o` error, so the run exits
-/// nonzero; drops under stdout backpressure stay the caller's
+/// duplicate — unless the output layer already saved the capture to the
+/// recovery dir, which suppresses the rescue (no second stderr line, no
+/// duplicate bytes). `frame_error` is the saved live-frame result (`None`
+/// when no frame was due or it wrote); `write_out` performs the real `-o`
+/// write plus atomic commit, and `rescue_to_bytes` streams the rescue
+/// document. A rescued report still returns the `-o` error, so the run
+/// exits nonzero; drops under stdout backpressure stay the caller's
 /// `collect_sink_drops` accounting. B2: both sinks stream sections.
 fn publish_streamed_report_with_fallback<W, R>(
     stdout: &mut dyn Write,
@@ -11337,6 +11363,12 @@ where
         },
         Err(out_error) => Err(match frame_error {
             Some(frame) => also_failed(out_error, frame, "terminal stdout frame"),
+            // The output layer already saved this capture to the
+            // recovery dir and printed its line: suppress the stdout
+            // rescue (no second stderr line, no duplicate bytes).
+            // Every other `-o` error still rescues — stdout is the
+            // last resort after `capture lost`.
+            None if commit_saved_to_recovery(&out_error) => out_error,
             None => fallback_streamed_report_to_stdout(
                 stdout,
                 stdout_open,
@@ -33238,7 +33270,9 @@ int main(int argc, char **argv) {
         let text = format!("{error:#}");
         assert!(text.contains("capture lost"), "{text}");
         assert!(
-            error.downcast_ref::<crate::output::CommitFailure>().is_none(),
+            error
+                .downcast_ref::<crate::output::CommitFailure>()
+                .is_none(),
             "a lost capture stays a plain error so the rescue fires: {text}"
         );
         assert!(

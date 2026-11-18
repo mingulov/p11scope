@@ -3,7 +3,7 @@
 //! Atomic output publication: private temp file beside the target, identity
 //! re-verified, fsync, rename.
 
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -94,6 +94,67 @@ enum AttemptFailure {
     Refused(String),
     Failed(String),
 }
+
+/// Why an `-o` commit failed: what became of the finished capture. The
+/// message is the operator-facing line (also printed to stderr); the
+/// kind tells callers with another delivery whether one is still needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitFailureKind {
+    /// The capture was saved to the recovery dir; the message names
+    /// the path. It must not be delivered again elsewhere (no stdout
+    /// duplicate).
+    SavedToRecovery,
+    /// Both the `-o` save and the recovery save failed; the message
+    /// carries both errors with `capture lost`. Another delivery may
+    /// still rescue the capture as a last resort.
+    RecoveryFailed,
+    /// The temp was kept beside the destination (a final-name security
+    /// refusal or a failed tamper check); no fallback was tried.
+    KeptTemp,
+}
+
+/// A failed `-o` commit: the operator-facing message plus what became
+/// of the finished capture. The streamed profile/metrics publisher
+/// wraps a `SavedToRecovery` failure typed (via `anyhow::Error::new`)
+/// so the stdout rescue suppresses itself; every other failure
+/// travels as its plain message and keeps the rescue.
+#[derive(Debug, Clone)]
+pub struct CommitFailure {
+    message: String,
+    kind: CommitFailureKind,
+    saved: Option<PathBuf>,
+}
+
+impl CommitFailure {
+    /// The operator-facing line (also printed to stderr).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The operator-facing line, moved out.
+    pub fn into_message(self) -> String {
+        self.message
+    }
+
+    /// What became of the finished capture.
+    pub fn kind(&self) -> CommitFailureKind {
+        self.kind
+    }
+
+    /// The recovery-dir path holding the finished capture, if the
+    /// commit saved one there.
+    pub fn saved_to_recovery(&self) -> Option<&Path> {
+        self.saved.as_deref()
+    }
+}
+
+impl std::fmt::Display for CommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CommitFailure {}
 
 impl AtomicFile {
     /// Opens the parent directory, refuses a final name that exists and is
@@ -241,14 +302,32 @@ impl AtomicFile {
     /// the capture, no failure path unlinks the temp before a fallback
     /// has been tried; when both the `-o` save and the recovery save
     /// fail, the error carries both failures with `capture lost`.
+    /// `commit_with_outcome` reports the same failure typed, so callers
+    /// with another delivery (the profile/metrics stdout rescue) can
+    /// tell a recovery-dir save — which must not be rescued again —
+    /// from a loss.
     pub fn commit(mut self) -> Result<(), String> {
+        self.commit_with_outcome()
+            .map_err(|failure| failure.into_message())
+    }
+
+    /// The typed commit: the same publish, retry and recovery-dir
+    /// fallback as [`AtomicFile::commit`], but the failure carries
+    /// what became of the finished capture. A saved fallback must not
+    /// be delivered again elsewhere; a lost or kept capture may still
+    /// be rescued as a last resort.
+    pub fn commit_with_outcome(mut self) -> Result<(), CommitFailure> {
         if let Err(error) = self.verify_temp_identity() {
             // Fail-closed tamper check: the name is no longer this run's
             // file (or a concurrent chmod/fchown raced the two stats).
             // Never delete, never publish, never fall back — leave
             // whatever stands at the name for inspection.
             self.cleanup = false;
-            return Err(error);
+            return Err(CommitFailure {
+                message: error,
+                kind: CommitFailureKind::KeptTemp,
+                saved: None,
+            });
         }
         let first = self.try_commit_once();
         if first.is_ok() {
@@ -265,25 +344,35 @@ impl AtomicFile {
                     "p11scope: warning: {refusal}; kept {} (report not deleted)",
                     temp_path.display()
                 );
-                Err(format!(
-                    "{refusal}; kept {} (report not deleted)",
-                    temp_path.display()
-                ))
+                Err(CommitFailure {
+                    message: format!(
+                        "{refusal}; kept {} (report not deleted)",
+                        temp_path.display()
+                    ),
+                    kind: CommitFailureKind::KeptTemp,
+                    saved: None,
+                })
             }
             AttemptFailure::Failed(e1) => {
                 let base = recovered_base_dir();
                 match save_recovered_capture(&self.temp_file, &self.final_path, &base) {
                     Ok(saved) => {
+                        let euid = unsafe { libc::geteuid() } as u32;
+                        let note = recovery_saved_note(euid, account_name(euid).as_deref());
                         eprintln!(
-                            "p11scope: writing {} failed: {e1}; capture saved to {} (root-only, mode 0600)",
+                            "p11scope: writing {} failed: {e1}; capture saved to {} {note}",
                             self.final_path.display(),
                             saved.display()
                         );
-                        Err(format!(
-                            "writing {} failed: {e1}; capture saved to {} (root-only, mode 0600)",
-                            self.final_path.display(),
-                            saved.display()
-                        ))
+                        Err(CommitFailure {
+                            message: format!(
+                                "writing {} failed: {e1}; capture saved to {} {note}",
+                                self.final_path.display(),
+                                saved.display()
+                            ),
+                            kind: CommitFailureKind::SavedToRecovery,
+                            saved: Some(saved),
+                        })
                     }
                     Err(e2) => {
                         eprintln!(
@@ -291,11 +380,15 @@ impl AtomicFile {
                             self.final_path.display(),
                             base.display()
                         );
-                        Err(format!(
-                            "writing {} failed: {e1}; saving to {} also failed: {e2}; capture lost",
-                            self.final_path.display(),
-                            base.display()
-                        ))
+                        Err(CommitFailure {
+                            message: format!(
+                                "writing {} failed: {e1}; saving to {} also failed: {e2}; capture lost",
+                                self.final_path.display(),
+                                base.display()
+                            ),
+                            kind: CommitFailureKind::RecoveryFailed,
+                            saved: None,
+                        })
                     }
                 }
                 // cleanup stays true: Drop unlinks the temp only while it
@@ -1706,6 +1799,45 @@ fn fallback_timestamp() -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { y + 1 } else { y };
     format!("{year:04}{month:02}{day:02}T{hour:02}{min:02}{sec:02}Z")
+}
+
+/// The ownership note for a saved fallback, true for the actual
+/// owner: root keeps `(root-only, mode 0600)`; anyone else names who
+/// can read the `0600` file — their login name, or `uid <euid>`
+/// without a passwd entry (a container bind mount's host owner
+/// normally has none). Pure in its inputs, so both directions pin
+/// without privilege.
+fn recovery_saved_note(euid: u32, owner_name: Option<&str>) -> String {
+    if euid == 0 {
+        return "(root-only, mode 0600)".to_string();
+    }
+    match owner_name {
+        Some(name) => format!("(mode 0600, readable only by {name})"),
+        None => format!("(mode 0600, readable only by uid {euid})"),
+    }
+}
+
+/// The login name for `uid`, if the account database knows one.
+fn account_name(uid: u32) -> Option<String> {
+    let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 16 * 1024];
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut account,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() || account.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_name` is a NUL-terminated string owned by
+    // `buffer`, which outlives the copy below.
+    let name = unsafe { CStr::from_ptr(account.pw_name) };
+    Some(name.to_string_lossy().into_owned())
 }
 
 /// Saves the finished temp file's bytes to a new `0600` file in the

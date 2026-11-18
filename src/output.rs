@@ -2591,12 +2591,17 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// Failure twin for the commit-time handover: if the `fchown` at
-    /// commit fails, `commit` fails closed and the creator-owned temp is
-    /// unlinked — no half-handed file, no leftover, no final. Runs
-    /// unprivileged: handing to a foreign uid fails EPERM without root.
+    /// A handover that fails at commit — the create-time probe passed
+    /// but the filesystem refused the real file (a vfat/exfat gid,
+    /// FUSE/NFS, a quota move) — still publishes the finished report
+    /// creator-owned 0600 with a warning naming the path, instead of
+    /// unlinking an hours-long capture. Runs unprivileged: handing to a
+    /// foreign uid fails EPERM without root, which is exactly the
+    /// probe-passed/commit-refused race this covers (the fixture sets
+    /// the handover directly, past the create-time probe).
     #[test]
-    fn commit_handover_failure_unlinks_the_creator_owned_temp() {
+    fn commit_handover_failure_publishes_the_creator_owned_report() {
+        use std::os::unix::fs::MetadataExt as _;
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("skipped: needs a non-root caller (fchown must fail)");
             return;
@@ -2612,16 +2617,27 @@ mod tests {
         };
         a.handover = Some((foreign, foreign));
         std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
-        let error = a.commit().unwrap_err();
-        assert!(
-            error.contains("handing output"),
-            "fail-closed handover error, got: {error}"
+        a.commit().unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"ok\":true}",
+            "the finished capture is published, not deleted"
         );
-        assert!(!path.exists(), "no final on handover failure");
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "the unhanded report stays private"
+        );
+        assert_eq!(
+            metadata.uid(),
+            unsafe { libc::geteuid() },
+            "the unhanded report keeps its creator ownership"
+        );
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
-            0,
-            "no leftover temp on handover failure"
+            1,
+            "only the final remains, no temp leftover"
         );
     }
 
@@ -2691,6 +2707,91 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().count(),
             1,
             "only the final remains, no temp leftover"
+        );
+    }
+
+    /// The create-time probe, pinned structurally: `AtomicFile::create`
+    /// proves the handover on a throwaway sibling (fchown + unlink, same
+    /// directory) before the real temp exists, so a refusal aborts before
+    /// any capture — while the live temp itself is still never handed
+    /// over until commit (see `handover_happens_at_commit_not_at_create`).
+    #[test]
+    fn create_probes_the_handover_on_a_throwaway_before_the_temp_exists() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let create = production
+            .split_once("pub fn create(path: &Path) -> Result<AtomicFile, String>")
+            .unwrap()
+            .1
+            .split_once("pub fn file(")
+            .unwrap()
+            .0;
+        let probe = create
+            .find("probe_handover")
+            .expect("create must probe the handover on a throwaway sibling");
+        let temp = create
+            .find("openat_profile")
+            .expect("create opens the real temp beside the final name");
+        assert!(
+            probe < temp,
+            "the probe runs before the real temp exists, so a refusal aborts before any capture"
+        );
+        let helper = production
+            .split_once("fn probe_handover(")
+            .expect("the probe helper exists")
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            helper.contains("handover_new_file"),
+            "the probe hands its throwaway over with the same helper as commit"
+        );
+        assert!(
+            helper.contains("unlinkat"),
+            "the probe removes its throwaway on both paths"
+        );
+    }
+
+    /// The commit-time fallback, pinned structurally: a handover that
+    /// fails at commit returns the warning to print — naming the path —
+    /// instead of failing, and `commit` prints it and publishes the
+    /// finished report. (The warning goes to stderr, which libtest
+    /// captures; the source pin plus the publish twin above prove the
+    /// path executes.)
+    #[test]
+    fn commit_handover_failure_warns_naming_the_path() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let handover = production
+            .split_once("fn hand_over_at_commit(")
+            .unwrap()
+            .1
+            .split_once("fn verify_temp_identity(")
+            .unwrap()
+            .0;
+        assert!(
+            handover.contains("warning"),
+            "the commit-time handover failure carries a warning, not an unlink"
+        );
+        assert!(
+            handover.contains("final_path.display()"),
+            "the warning names the report path"
+        );
+        let commit = production
+            .split_once("pub fn commit(mut self)")
+            .unwrap()
+            .1
+            .split_once("fn publish(")
+            .unwrap()
+            .0;
+        assert!(
+            commit.contains("hand_over_at_commit"),
+            "commit still hands the finished report over before publishing it"
+        );
+        assert!(
+            commit.contains("eprintln!"),
+            "commit prints the handover warning (bounded in production, captured in tests)"
         );
     }
 

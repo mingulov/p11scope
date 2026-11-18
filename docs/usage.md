@@ -1487,7 +1487,25 @@ Limits that matter in pods:
   created files are handed to UID:GID (GID defaults to UID), still
   private `0600`. The mode, type and symlink checks are unchanged,
   and without the flag a foreign-owned directory is refused naming
-  the exact `--output-owner` fix. If the profile or metrics report
+  the exact `--output-owner` fix. Before the capture, when the
+  destination filesystem holds less than a rough report size class
+  (1 MiB), one advisory stderr line warns the report may not fit;
+  the capture still starts. After the capture, a finished report is
+  never deleted before a fallback has been tried: a sync, handover
+  or rename I/O failure (a full disk, a quota, a read-only remount,
+  a refused `fchown`) retries the commit once, then saves the
+  capture to the recovery dir `/var/tmp/p11scope-recovered/` —
+  created `0700` owner-only (a planted symlink, foreign-owned or
+  permissive dir is refused), file `0600`
+  `p11scope-<yyyymmddThhmmssZ>-<pid>.<ext>`, fsynced file and dir —
+  with one stderr line naming the `-o` error and the saved path,
+  and the command exits 1 because the requested `-o` does not
+  exist. When the recovery save fails too, one stderr line carries
+  both errors with `capture lost` and the command exits 1; the
+  output layer writes nothing to stdout. A final-name security
+  refusal (a FIFO, socket, symlink, device or directory at `-o`)
+  instead keeps the temp beside the destination with a warning
+  naming it, without a fallback. If the profile or metrics report
   cannot be written to
   `-o` (a full disk, a quota, a read-only remount), the
   already-rendered JSON document is rescued to stdout instead of

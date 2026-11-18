@@ -1067,6 +1067,83 @@ mod tests {
     }
 
     #[test]
+    fn info_decode_refuses_nonzero_trailer_slack() {
+        // Spec §17.4: trailer bytes past payload_len are zero; the
+        // writer zero-fills the 120-byte payload window.
+        let good = provider_record();
+        // First slack byte (payload_len 76, slack starts at 56 + 76).
+        let mut first = good.clone();
+        first[56 + 76] = 1;
+        assert_eq!(
+            decode_info_record(&first),
+            Err("nonzero_trailer_slack"),
+            "nonzero first slack byte refuses"
+        );
+        // Last trailer byte.
+        let mut last = good.clone();
+        last[175] = 0xFF;
+        assert_eq!(
+            decode_info_record(&last),
+            Err("nonzero_trailer_slack"),
+            "nonzero last slack byte refuses"
+        );
+        // Short-payload kind (mechanism LP64, payload_len 24): slack
+        // starts at 56 + 24.
+        let mech = full_mech_lp64();
+        let short = record_bytes(INFO_KIND_MECHANISM, INFO_LAYOUT_LP64, &mech, 5, 1082, 11);
+        let mut slacked = short.clone();
+        slacked[56 + 24] = 1;
+        assert_eq!(
+            decode_info_record(&slacked),
+            Err("nonzero_trailer_slack"),
+            "nonzero slack on a short payload refuses"
+        );
+        // Zero slack still decodes.
+        decode_info_record(&good).expect("zero-slack record decodes");
+    }
+
+    #[test]
+    fn info_decode_refuses_nonzero_slot_for_provider_kind() {
+        // Spec §17.4: slot is 0 for C_GetInfo records.
+        let mut bytes = provider_record();
+        bytes[32..40].copy_from_slice(&5u64.to_le_bytes());
+        assert_eq!(
+            decode_info_record(&bytes),
+            Err("nonzero_slot"),
+            "provider record with nonzero slot refuses"
+        );
+        // Token rows may carry a slot (healthy control).
+        let full = full_token_lp64();
+        let payload = payload_of(&full, &TOKEN_RANGES_LP64);
+        let token = record_bytes(INFO_KIND_TOKEN, INFO_LAYOUT_LP64, &payload, 3, 0, 11);
+        decode_info_record(&token).expect("token record with a slot decodes");
+    }
+
+    #[test]
+    fn info_decode_refuses_nonzero_mechanism_for_provider_and_token() {
+        // Spec §17.4: mechanism is 0 for C_GetInfo and C_GetTokenInfo.
+        let mut provider = provider_record();
+        provider[40..48].copy_from_slice(&7u64.to_le_bytes());
+        assert_eq!(
+            decode_info_record(&provider),
+            Err("nonzero_mechanism"),
+            "provider record with nonzero mechanism refuses"
+        );
+        let full = full_token_lp64();
+        let payload = payload_of(&full, &TOKEN_RANGES_LP64);
+        let token = record_bytes(INFO_KIND_TOKEN, INFO_LAYOUT_LP64, &payload, 3, 7, 11);
+        assert_eq!(
+            decode_info_record(&token),
+            Err("nonzero_mechanism"),
+            "token record with nonzero mechanism refuses"
+        );
+        // Mechanism rows carry a mechanism id (healthy control).
+        let mech = full_mech_lp64();
+        let row = record_bytes(INFO_KIND_MECHANISM, INFO_LAYOUT_LP64, &mech, 5, 1082, 11);
+        decode_info_record(&row).expect("mechanism record with an id decodes");
+    }
+
+    #[test]
     fn info_trim_trims_padded_strings_and_refuses_non_utf8() {
         assert_eq!(trim_padded(b"SoftHSM   "), Ok("SoftHSM".to_string()));
         assert_eq!(trim_padded(b"A\0B      "), Ok("A".to_string()));

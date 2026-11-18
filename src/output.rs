@@ -80,7 +80,9 @@ impl AtomicFile {
     /// `path` with `openat(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC, 0o600)`,
     /// retrying seq 0..128 on collision. The handover target is decided
     /// here but applied at commit, so the live temp stays creator-owned
-    /// 0600 for the whole capture.
+    /// 0600 for the whole capture; before the temp exists the target is
+    /// proven on a throwaway sibling (fchown + unlink, same directory),
+    /// so a refusal aborts before any capture instead of after it.
     pub fn create(path: &Path) -> Result<AtomicFile, String> {
         if path.as_os_str().as_bytes().last() == Some(&b'/') {
             return Err(format!(
@@ -101,6 +103,9 @@ impl AtomicFile {
         let final_name = c_name(final_name, "output file name")?;
         check_final_name(&directory, &final_name, &final_path)?;
         let handover = handover_target_for(&directory, &final_path)?;
+        if let Some(target) = handover {
+            probe_handover(&directory, target, &final_path)?;
+        }
         for sequence in 0..128u32 {
             let temp_name =
                 CString::new(format!(".p11scope.{}.{}.tmp", std::process::id(), sequence))
@@ -177,8 +182,11 @@ impl AtomicFile {
     /// Re-verifies the temp identity (regular file, same dev/ino, owner ==
     /// creator, mode & 0o077 == 0), `sync_all`, hands the finished file to
     /// the handover target decided at creation and syncs the new
-    /// owner/mode, re-checks the final name, then renames over it. On any
-    /// error the temp file is unlinked by `Drop`.
+    /// owner/mode, re-checks the final name, then renames over it. A
+    /// handover the create-time probe passed but the filesystem refuses
+    /// here still publishes the finished report creator-owned 0600 with
+    /// a warning naming the path, instead of unlinking the capture;
+    /// every other error unlinks the temp by `Drop`.
     pub fn commit(mut self) -> Result<(), String> {
         self.verify_temp_identity()?;
         self.temp_file.sync_all().map_err(|error| {
@@ -187,7 +195,9 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
-        self.hand_over_at_commit()?;
+        if let Some(warning) = self.hand_over_at_commit()? {
+            eprintln!("{warning}");
+        }
         self.publish()?;
         // The report is published at this point; a directory fsync that the
         // filesystem cannot honour must not turn a complete run into a failure.
@@ -240,15 +250,26 @@ impl AtomicFile {
     /// descriptor, never by path, so no symlink can redirect it, then a
     /// sync of the new owner/mode so a crash cannot persist the later
     /// rename with pre-handover ownership. Without a target this keeps
-    /// the creator's ownership. Once the `fchown` succeeds the recorded
-    /// owner is the target, so a later failure still unlinks this run's
-    /// file through `Drop`.
-    fn hand_over_at_commit(&mut self) -> Result<(), String> {
+    /// the creator's ownership and reports no warning. Once the `fchown`
+    /// succeeds the recorded owner is the target, so a later failure
+    /// still unlinks this run's file through `Drop`.
+    ///
+    /// A `fchown` that fails here — the create-time probe passed but the
+    /// filesystem refused the real file — returns the warning to print
+    /// instead of failing: the caller publishes the finished report
+    /// creator-owned 0600 (root-owned whenever a handover arms, which
+    /// needs root) rather than unlinking it.
+    fn hand_over_at_commit(&mut self) -> Result<Option<String>, String> {
         use std::os::unix::fs::PermissionsExt as _;
         let Some((uid, gid)) = self.handover else {
-            return Ok(());
+            return Ok(None);
         };
-        handover_new_file(&self.temp_file, Some((uid, gid)), &self.final_path)?;
+        if let Err(error) = handover_new_file(&self.temp_file, Some((uid, gid)), &self.final_path) {
+            return Ok(Some(format!(
+                "p11scope: warning: {error}; published {} root-owned 0600 instead",
+                self.final_path.display()
+            )));
+        }
         self.owner = uid;
         self.temp_file
             .set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -267,7 +288,7 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
-        Ok(())
+        Ok(None)
     }
 
     fn verify_temp_identity(&self) -> Result<(), String> {
@@ -535,10 +556,21 @@ fn create_private_stream_with(path: &Path, unnamed: bool) -> Result<PrivateStrea
     })
 }
 
-/// Hands a stream file the sink itself created to the sudo invoker.
-/// A pre-existing file is never handed over. On failure a file
-/// created at the name is unlinked again while it is still ours; an
-/// unnamed file has no name to clean up.
+/// Hands a stream file the sink itself created to the handover target.
+///
+/// Why at creation, while `AtomicFile` hands over at commit: a stream
+/// has no commit point. It publishes incrementally to its final name —
+/// truncated at `begin`, appended line by line, rotated mid-run — so
+/// there is no later atomic rename to hand over at. Each rotation
+/// creates a new file that must be handed over immediately (retention
+/// eviction only accepts files the target owns), and the recipient
+/// reads the growing file during the capture. The residual window is
+/// accepted and narrow: only a file this sink created is ever handed
+/// over — a pre-existing file is never handed over, only reused when
+/// the target already owns it — and a handover refusal here aborts
+/// before any line is written. On failure a file created at the name
+/// is unlinked again while it is still ours; an unnamed file has no
+/// name to clean up.
 fn handover_stream_file(
     directory: &std::fs::File,
     name: &CString,
@@ -1033,8 +1065,10 @@ fn handover_target_for(
 /// Hands a sink file to its handover target: `fchown` on the open
 /// descriptor, never by path, so no symlink can redirect it. The file
 /// mode (`0600`) is unchanged by `fchown`. `None` keeps the caller's
-/// ownership. Callers unlink on failure: `AtomicFile` through `Drop`,
-/// streams directly.
+/// ownership. A refused throwaway is unlinked by its caller (the
+/// create-time probe, or a stream that just created its file); a
+/// refused finished report is published creator-owned with a warning
+/// instead (see `hand_over_at_commit`).
 fn handover_new_file(
     file: &std::fs::File,
     target: Option<(u32, u32)>,
@@ -1051,6 +1085,57 @@ fn handover_new_file(
         ));
     }
     Ok(())
+}
+
+/// Proves the handover target can receive a file in this directory
+/// before the capture starts: creates a throwaway
+/// `.p11scope.<pid>.probe.<seq>.tmp` sibling with the same private
+/// create as the real temp, hands it over with the same helper as
+/// commit, and unlinks it again. A refusal (a vfat/exfat gid,
+/// FUSE/NFS, a quota move) therefore aborts in `create`, before any
+/// capture — the real temp never exists, let alone holds hours of
+/// work. The probe passing does not promise commit will: the
+/// filesystem can still refuse the real file later, and then commit
+/// publishes creator-owned with a warning instead of unlinking.
+fn probe_handover(
+    directory: &std::fs::File,
+    target: (u32, u32),
+    final_path: &Path,
+) -> Result<(), String> {
+    for sequence in 0..128u32 {
+        let probe_name = CString::new(format!(
+            ".p11scope.{}.probe.{}.tmp",
+            std::process::id(),
+            sequence
+        ))
+        .expect("generated handover probe name has no NUL");
+        match openat_profile(directory, &probe_name) {
+            Ok(probe_file) => {
+                if let Err(error) = handover_new_file(&probe_file, Some(target), final_path) {
+                    let _ = unlinkat(directory, &probe_name);
+                    return Err(error);
+                }
+                unlinkat(directory, &probe_name).map_err(|error| {
+                    format!(
+                        "removing handover probe beside {} failed: {error}",
+                        final_path.display()
+                    )
+                })?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "probing handover beside {} failed: {error}",
+                    final_path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "cannot allocate a handover probe beside {}",
+        final_path.display()
+    ))
 }
 
 /// Opens the trace target without truncating it, and says how its file
@@ -2707,6 +2792,63 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().count(),
             1,
             "only the final remains, no temp leftover"
+        );
+    }
+
+    /// Create-time probe failure twin: handing the throwaway to a
+    /// foreign uid fails unprivileged, so the probe reports the handover
+    /// error before any capture — and leaves no probe file behind.
+    #[test]
+    fn handover_probe_failure_aborts_before_capture_without_litter() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: needs a non-root caller (fchown must fail)");
+            return;
+        }
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        // A uid that is never the caller; fchown needs no passwd entry.
+        let foreign = if unsafe { libc::geteuid() } == 65534 {
+            65533
+        } else {
+            65534
+        };
+        let error = probe_handover(&directory, (foreign, foreign), &path).unwrap_err();
+        assert!(
+            error.contains("handing output"),
+            "the probe reports the handover refusal, got: {error}"
+        );
+        assert!(
+            error.contains(&path.display().to_string()),
+            "the probe error names the report path, got: {error}"
+        );
+        assert!(!path.exists(), "no final on probe failure");
+        assert_eq!(
+            temp_litter(dir.path()),
+            Vec::<String>::new(),
+            "no probe leftover on probe failure"
+        );
+    }
+
+    /// Healthy twin: handing the throwaway to the caller's own uid/gid
+    /// succeeds unprivileged, and the probe removes its file.
+    #[test]
+    fn handover_probe_to_self_succeeds_and_removes_its_file() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: needs a non-root caller (root hands over for real)");
+            return;
+        }
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        probe_handover(&directory, (uid, gid), &path).unwrap();
+        assert!(!path.exists(), "the probe creates no final");
+        assert_eq!(
+            temp_litter(dir.path()),
+            Vec::<String>::new(),
+            "the probe removes its throwaway"
         );
     }
 

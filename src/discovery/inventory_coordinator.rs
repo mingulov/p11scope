@@ -1280,7 +1280,7 @@ impl FoldStride {
     /// stop source asks to abort.
     fn unit(&mut self, stop: &dyn Fn() -> bool) -> bool {
         self.used = self.used.saturating_add(1);
-        self.used % FOLD_PLAN_STRIDE == 0 && stop()
+        self.used.is_multiple_of(FOLD_PLAN_STRIDE) && stop()
     }
 }
 
@@ -5923,8 +5923,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// [`Self::retire_rendered_callers`] with an explicit stop query:
-    /// the production wrapper passes the live query, and tests pin
-    /// mid-stride aborts with a counting one.
+    /// tests pin mid-stride aborts with a counting one. The plain
+    /// entry builds the live query from the wired sources itself.
     pub(crate) fn retire_rendered_callers_with_stop(
         &mut self,
         now_ns: u64,
@@ -11380,16 +11380,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// Whether the run must stop: the local flag or the operator's
-    /// live signal counter.
-    fn stop_requested(&self) -> bool {
-        self.stopped
-            || self
-                .stop_source
-                .as_ref()
-                .is_some_and(|source| source.load(Ordering::SeqCst) > 0)
-    }
-
     /// Wire the operator's live signal counter (the run's `StopFlag`
     /// source) so the fold's planning strides observe a stop
     /// delivered mid-call. The run setup calls this once; stagings
@@ -11399,10 +11389,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.stop_source = Some(source);
     }
 
-    /// An owned stop query over the current sources, for callers that
-    /// already hold the coordinator mutably (the fold wrapper): the
-    /// local flag's current value plus the live counter, if wired.
-    pub(crate) fn stop_query(&self) -> Arc<dyn Fn() -> bool> {
+    /// An owned stop query over the current sources: the local
+    /// flag's current value plus the live counter, if wired.
+    fn stop_query(&self) -> Arc<dyn Fn() -> bool> {
         let stopped = self.stopped;
         let source = self.stop_source.clone();
         Arc::new(move || {

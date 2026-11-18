@@ -28648,6 +28648,366 @@ fn keymeta_flag_off_drops_wrapped_parks() {
     assert_eq!(inferred.size.completions, 0);
 }
 
+/// An unusable-association AES-KW wrap parks only admitted material:
+/// a wrap output above the admission bound (8200) parks nothing, so
+/// the wrapped view's first proved row carries no parked size and no
+/// park slot is consumed; the admitted bound (8199) parks and
+/// forward-fills with its wrap tag. A refused park never blocks a
+/// later admitted park for the same view (first park wins applies to
+/// admitted parks only).
+#[test]
+fn keymeta_wrap_park_refuses_above_bound_material() {
+    use crate::keymeta::WRAPPED_MATERIAL_MAX;
+    // Above the bound: 8200 refuses on the direct path, so the park
+    // route must refuse it too.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let mut wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    wrapped.attribution_valid = false;
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
+        None,
+    )
+    .expect("wrap completes");
+    assert_eq!(
+        ctx.keyuse.key_use_evidence().parked_refused,
+        0,
+        "an admission refusal is silent, never a capacity refusal"
+    );
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row exists");
+    assert_eq!(
+        inferred.size.detail, None,
+        "no parked detail above the bound"
+    );
+    assert_eq!(inferred.size.completions, 0, "no parked completion");
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+    // On the bound: 8199 parks and forward-fills with its wrap tag.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let mut wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    wrapped.attribution_valid = false;
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 8)),
+        None,
+    )
+    .expect("wrap completes");
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row carries the park");
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: WRAPPED_MATERIAL_MAX,
+                octets: WRAPPED_MATERIAL_MAX + 8,
+            },
+            EvidenceTag::WrapOutput,
+        ))
+    );
+    assert_eq!(inferred.size.completions, 1);
+    // A refused park occupies no slot: an admitted wrap for the same
+    // view parks after the refusal and forward-fills.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    for length in [WRAPPED_MATERIAL_MAX + 9, WRAPPED_MATERIAL_MAX + 8] {
+        let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+        let mut wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+        wrapped.attribution_valid = false;
+        ctx.direct(
+            "C_WrapKey",
+            7,
+            Some(0x2109),
+            &[wrapping, wrapped],
+            100,
+            Some(LengthOutcome::Value(length)),
+            None,
+        )
+        .expect("wrap completes");
+    }
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row carries the admitted park");
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: WRAPPED_MATERIAL_MAX,
+                octets: WRAPPED_MATERIAL_MAX + 8,
+            },
+            EvidenceTag::WrapOutput,
+        )),
+        "the refused park blocked nothing"
+    );
+}
+
+/// A fresh-view AES-KW unwrap parks only admitted material: an
+/// unwrap input above the admission bound (8200) parks nothing, so
+/// the fresh view's first proved row carries no parked size and no
+/// park slot is consumed; the admitted bound (8199) parks and
+/// forward-fills with its unwrap tag.
+#[test]
+fn keymeta_unwrap_park_refuses_above_bound_material() {
+    use crate::keymeta::WRAPPED_MATERIAL_MAX;
+    // Above the bound: 8200 refuses on the direct path, so U1 must
+    // refuse it too.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x2109),
+        &[unwrapping],
+        100,
+        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
+        Some(ids[1].as_u64()),
+    )
+    .expect("unwrap completes");
+    assert_eq!(
+        ctx.keyuse.key_use_evidence().parked_refused,
+        0,
+        "an admission refusal is silent, never a capacity refusal"
+    );
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row exists");
+    assert_eq!(
+        inferred.size.detail, None,
+        "no parked detail above the bound"
+    );
+    assert_eq!(inferred.size.completions, 0, "no parked completion");
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+    // On the bound: 8199 parks and forward-fills with its unwrap tag.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x2109),
+        &[unwrapping],
+        100,
+        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 8)),
+        Some(ids[1].as_u64()),
+    )
+    .expect("unwrap completes");
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row carries the park");
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: WRAPPED_MATERIAL_MAX,
+                octets: WRAPPED_MATERIAL_MAX + 8,
+            },
+            EvidenceTag::UnwrapInput,
+        ))
+    );
+    assert_eq!(inferred.size.completions, 1);
+    // A refused park occupies no slot: an admitted unwrap for the
+    // same view parks after the refusal and forward-fills.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    for (n, length) in [WRAPPED_MATERIAL_MAX + 9, WRAPPED_MATERIAL_MAX + 8]
+        .into_iter()
+        .enumerate()
+    {
+        let unwrapping =
+            KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+        ctx.direct(
+            "C_UnwrapKey",
+            7,
+            Some(0x2109),
+            &[unwrapping],
+            100 + n as u64 * 100,
+            Some(LengthOutcome::Value(length)),
+            Some(ids[1].as_u64()),
+        )
+        .expect("unwrap completes");
+    }
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row carries the admitted park");
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: WRAPPED_MATERIAL_MAX,
+                octets: WRAPPED_MATERIAL_MAX + 8,
+            },
+            EvidenceTag::UnwrapInput,
+        )),
+        "the refused park blocked nothing"
+    );
+}
+
+/// Above-bound wrapped evidence never publishes: a refused park
+/// forward-fills nothing onto a two-valued row (no capped-fallback
+/// inflation), and a direct above-bound completion after two admitted
+/// values counts its completion while the pinned pair and the further
+/// count stand.
+#[test]
+fn keymeta_above_bound_wrapped_evidence_never_publishes() {
+    use crate::keymeta::WRAPPED_MATERIAL_MAX;
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    // Two admitted wraps pin the pair on the wrapped row.
+    for length in [32u64, 40u64] {
+        let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+        let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+        ctx.direct(
+            "C_WrapKey",
+            7,
+            Some(0x2109),
+            &[wrapping, wrapped],
+            100,
+            Some(LengthOutcome::Value(length)),
+            None,
+        )
+        .expect("wrap completes");
+    }
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row pins two values");
+    assert_eq!(inferred.size.status, InferredStatus::Conflicting);
+    assert_eq!(inferred.size.completions, 2);
+    assert_eq!(inferred.size.further, 0);
+    // A refused park for the same view forward-fills nothing on the
+    // next touch: the further count stands.
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let mut wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    wrapped.attribution_valid = false;
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        200,
+        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
+        None,
+    )
+    .expect("wrap completes");
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        300,
+        Some(LengthOutcome::Value(32)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row stands");
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: 24,
+                octets: 32,
+            },
+            EvidenceTag::WrapOutput,
+        ))
+    );
+    assert_eq!(
+        inferred.size.conflict_detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: 32,
+                octets: 40,
+            },
+            EvidenceTag::WrapOutput,
+        ))
+    );
+    assert_eq!(
+        inferred.size.further, 0,
+        "the refused park inflates nothing"
+    );
+    assert_eq!(inferred.size.completions, 3);
+    // A direct above-bound completion counts while the pinned pair
+    // and the further count stand.
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        400,
+        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row stands");
+    assert_eq!(inferred.size.status, InferredStatus::Conflicting);
+    assert_eq!(inferred.size.completions, 4);
+    assert_eq!(inferred.size.further, 0);
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: 24,
+                octets: 32,
+            },
+            EvidenceTag::WrapOutput,
+        ))
+    );
+    assert_eq!(
+        inferred.size.conflict_detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: 32,
+                octets: 40,
+            },
+            EvidenceTag::WrapOutput,
+        ))
+    );
+}
+
 /// Off-mode counts no corroboration mismatches: a stale terminal
 /// pair with the flag off is not evidence of anything.
 #[test]

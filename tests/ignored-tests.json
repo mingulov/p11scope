@@ -746,6 +746,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/attach/object_stop.rs",
+      "path": "attach::object_stop::tests::evidence_stop_scrubs_real_stash_after_q",
+      "reason": "privileged: creates an actual EVIDENCE_START map and retains map FDs",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/confirm_shards_tests.rs",
       "path": "discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe",
       "reason": "root (map_files): proves real children's ranges",

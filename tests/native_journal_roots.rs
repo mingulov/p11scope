@@ -538,7 +538,10 @@ fn length_stash_lifecycle_pins_insert_delete_and_failure_counts() {
             return false;
         };
         text.contains("let _ = EVIDENCE_START.remove(key);")
-            && text.matches("bump_evidence(EVIDENCE_LENGTH_STASH_MISMATCHES)").count() >= 2
+            && text
+                .matches("bump_evidence(EVIDENCE_LENGTH_STASH_MISMATCHES)")
+                .count()
+                >= 2
     }
     assert!(
         stash_contract(SOURCE),

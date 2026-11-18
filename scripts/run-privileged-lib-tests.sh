@@ -298,10 +298,12 @@ attach::lifecycle_tests::privileged_detailed_nonleader_exit_preserves_same_slot_
 attach::lifecycle_tests::privileged_detailed_nonleader_exit_reclaims_start_and_preserves_leader
 # Object-stop scrub cells over actual native OBJECT_START/STOP_GATE map
 # definitions (owned maps only, each well under a second): scrub after
-# quiescence, refusal without proven Q, and no false success on a frozen map.
+# quiescence, refusal without proven Q, no false success on a frozen map,
+# and the EVIDENCE_START stash scrub after quiescence.
 attach::object_stop::tests::object_stop_scrubs_real_retained_map_after_q
 attach::object_stop::tests::object_stop_refuses_real_unproven_q_without_mutation
 attach::object_stop::tests::object_stop_reports_real_scrub_failure
+attach::object_stop::tests::evidence_stop_scrubs_real_stash_after_q
 # R1 native-retirement cells over a real Detailed Session with an owned
 # provider child (each well under a minute): Multi close at Q then mint,
 # Singles deferral to the terminal detach, and the partial-group guards.

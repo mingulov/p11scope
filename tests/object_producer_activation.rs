@@ -2078,7 +2078,11 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
     // OutputFailed-only.
     let roots =
         std::fs::read_to_string("crates/ebpf/src/journal_roots.rs").expect("read journal roots");
-    let journal = source_between(&roots, "let joined = unsafe { continuity_joins", "let Some(reason)");
+    let journal = source_between(
+        &roots,
+        "let joined = unsafe { continuity_joins",
+        "let Some(reason)",
+    );
     assert!(
         refused_join_accounting_guards_hold(journal),
         "journal copy: refused arm must guard exactly one unmatched and one semantic bump from the helper"

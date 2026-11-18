@@ -5835,6 +5835,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.rendered_callers.extend(ids.iter().copied());
     }
 
+    /// Drop carried rows the current publication did not certify. A
+    /// credit-deferred row's old membership must not authorize its
+    /// fold once its terminal payload changed while a revision waits
+    /// in the stream FIFO (the post-fold forget would erase the
+    /// digest and the queued update together). The streaming wrapper
+    /// calls this with its freshly certified set before noting;
+    /// rows that stay eligible are re-noted every pass, so dropping
+    /// them here only defers them until their revision lands.
+    pub(crate) fn retain_rendered_callers(&mut self, certified: &BTreeSet<CallerId>) {
+        self.rendered_callers.retain(|id| certified.contains(id));
+    }
+
     /// Retire rendered caller rows whose process is proven ended into the
     /// counted aggregates. A row referenced by a pending row, an owner,
     /// a handoff, a pending binder row or the capture target keeps its

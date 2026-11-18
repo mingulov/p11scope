@@ -8952,6 +8952,15 @@ fn retire_rendered_callers<Source: ProcessSource>(
     } else {
         ids
     };
+    // The carry from a credit-deferred pass must not authorize a
+    // fold this pass excludes: intersect first, so a caller whose
+    // terminal payload changed while its revision waits in the FIFO
+    // keeps its row (and its queued update) until the revision lands.
+    // Still-eligible rows are re-noted every pass, so the
+    // intersection only defers, never strands.
+    let certified: BTreeSet<crate::discovery::caller_registry::CallerId> =
+        foldable.iter().copied().collect();
+    coordinator.retain_rendered_callers(&certified);
     coordinator.note_rendered_callers(&foldable);
     let receipt = coordinator.retire_rendered_callers(now_ns, subset);
     // Folded rows left the snapshot: drop their stream digests so the

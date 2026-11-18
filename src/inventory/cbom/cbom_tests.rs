@@ -1598,6 +1598,127 @@ fn cbom_folded_caller_at_two_modules_counts_one_incarnation() {
 }
 
 #[test]
+fn cbom_folded_pathless_caller_at_two_modules_counts_unknown_once() {
+    // The fold writes the same caller identity into every module
+    // the caller touched; a pathless caller counts one unknown, not
+    // one per module.
+    let folded = inventory_document(
+        vec![],
+        vec![
+            module_with_departed(
+                "m0",
+                "/lib/a.so",
+                &"a".repeat(64),
+                departed_use(
+                    1,
+                    1,
+                    json!([]),
+                    vec![departed_identity("c0", None, "exited")],
+                    false,
+                    0,
+                    departed_overflow(0, 0, 0),
+                ),
+            ),
+            module_with_departed(
+                "m1",
+                "/lib/b.so",
+                &"b".repeat(64),
+                departed_use(
+                    1,
+                    1,
+                    json!([]),
+                    vec![departed_identity("c0", None, "exited")],
+                    false,
+                    0,
+                    departed_overflow(0, 0, 0),
+                ),
+            ),
+        ],
+        vec![],
+    );
+    let folded = parse_input(&folded).unwrap();
+    assert_eq!(
+        folded.unknowns.callers_unknown_exe, 1,
+        "one pathless caller counts once across modules"
+    );
+    // Negative control: two distinct pathless callers still count two.
+    let two = inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/a.so",
+            &"a".repeat(64),
+            departed_use(
+                2,
+                2,
+                json!([]),
+                vec![
+                    departed_identity("c0", None, "exited"),
+                    departed_identity("c1", None, "exec_retired"),
+                ],
+                false,
+                0,
+                departed_overflow(0, 0, 0),
+            ),
+        )],
+        vec![],
+    );
+    let two = parse_input(&two).unwrap();
+    assert_eq!(
+        two.unknowns.callers_unknown_exe, 2,
+        "distinct pathless callers each count"
+    );
+    // A contradictory row (pathless in one module, pathed in
+    // another) names both facts: the pathless sighting must not
+    // consume the caller's incarnation.
+    let mixed = inventory_document(
+        vec![],
+        vec![
+            module_with_departed(
+                "m0",
+                "/lib/a.so",
+                &"a".repeat(64),
+                departed_use(
+                    1,
+                    1,
+                    json!([]),
+                    vec![departed_identity("c0", None, "exited")],
+                    false,
+                    0,
+                    departed_overflow(0, 0, 0),
+                ),
+            ),
+            module_with_departed(
+                "m1",
+                "/lib/b.so",
+                &"b".repeat(64),
+                departed_use(
+                    1,
+                    1,
+                    json!([]),
+                    vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+                    false,
+                    0,
+                    departed_overflow(0, 0, 0),
+                ),
+            ),
+        ],
+        vec![],
+    );
+    let mixed = parse_input(&mixed).unwrap();
+    assert_eq!(
+        mixed.unknowns.callers_unknown_exe, 1,
+        "the pathless sighting stays named"
+    );
+    assert_eq!(
+        mixed.applications.len(),
+        1,
+        "the pathed sighting still joins its component"
+    );
+    assert_eq!(mixed.applications[0].incarnations, 1);
+}
+
+#[test]
 fn cbom_departed_single_path_incomplete_withholds_and_counts_linkage() {
     // Every incomplete aggregate with rows withholds its
     // app->mechanism pairs and counts the module once, even with a

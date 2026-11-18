@@ -9471,7 +9471,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                         .expect("placed module is registered"),
                                     ordinary_checkpoint: match pending.origin {
                                         PendingCountOrigin::Ordinary(checkpoint) => checkpoint,
-                                        _ => unreachable!("checked original token"),
+                                        PendingCountOrigin::Untracked
+                                        | PendingCountOrigin::Recovered(_) => {
+                                            unreachable!("checked original token")
+                                        }
                                     },
                                     epoch: None,
                                     scan: None,

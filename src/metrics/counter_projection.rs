@@ -798,7 +798,11 @@ impl CounterCapture {
                     let failure = match observation {
                         CounterObservation::Unavailable(issue) => CounterFailure::Collection(issue),
                         CounterObservation::ReadFailed(stage) => CounterFailure::Read(stage),
-                        _ => unreachable!("invalid folded rows cannot establish a baseline"),
+                        CounterObservation::Initial
+                        | CounterObservation::Advanced { .. }
+                        | CounterObservation::GenerationChanged { .. } => {
+                            unreachable!("invalid folded rows cannot establish a baseline")
+                        }
                     };
                     return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
                 }

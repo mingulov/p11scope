@@ -1247,7 +1247,9 @@ impl SessionFinalizerState {
         }
         match self.pending_semantic.take() {
             Some(PendingSemanticBatch::Collected(batch)) => Some(batch),
-            _ => unreachable!("the single handoff phase was checked before take"),
+            Some(PendingSemanticBatch::Prepared(_)) | None => {
+                unreachable!("the single handoff phase was checked before take")
+            }
         }
     }
 }

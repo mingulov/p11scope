@@ -1961,7 +1961,10 @@ impl BankDirectory {
         self.positions = positions;
         self.budget = match plan.admission_policy() {
             crate::plan::AdmissionPolicy::Counters(budget) => Some(budget),
-            _ => unreachable!("validated counter policy"),
+            crate::plan::AdmissionPolicy::Detailed(_)
+            | crate::plan::AdmissionPolicy::Inventory(_) => {
+                unreachable!("validated counter policy")
+            }
         };
         self.next_transaction = transaction.get().checked_add(1).and_then(NonZeroU64::new);
         let mut links_attempted = false;

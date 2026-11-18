@@ -1865,7 +1865,36 @@ impl CallerRegistry {
         match &self.staged[at] {
             Mutation::NoteInstance(input) => &input.key,
             Mutation::ObserveInstanceSemantic(input) => &input.key,
-            _ => unreachable!("only original registration/call rows enter this index"),
+            Mutation::InstanceSemanticLoss(_)
+            | Mutation::RetireInstance(_)
+            | Mutation::NoteMapping { .. }
+            | Mutation::ObserveEntries { .. }
+            | Mutation::SetInFlight { .. }
+            | Mutation::ObserveSemantic { .. }
+            | Mutation::NoteSemanticLoss { .. }
+            | Mutation::NoteRefreshLoss { .. }
+            | Mutation::NoteCountedLoss
+            | Mutation::NoteCountedPidExit
+            | Mutation::NoteWitness { .. }
+            | Mutation::NoteBoundWitness { .. }
+            | Mutation::NoteUnboundWitness { .. }
+            | Mutation::NoteUnresolvedWitness
+            | Mutation::NoteUseBeforeAdmission { .. }
+            | Mutation::NoteWitnessCensus { .. }
+            | Mutation::NoteCoverage { .. }
+            | Mutation::NoteCountedUse { .. }
+            | Mutation::NotePendingCount { .. }
+            | Mutation::NotePairsUncounted { .. }
+            | Mutation::NoteHealthRegression { .. }
+            | Mutation::EndWatches { .. }
+            | Mutation::RetireCaller { .. }
+            | Mutation::NoteModuleAbsent { .. }
+            | Mutation::NoteMemberUnscanned { .. }
+            | Mutation::RecordGap { .. }
+            | Mutation::RecordKeyedGap { .. }
+            | Mutation::RecordAggregatedUnrouted { .. } => {
+                unreachable!("only original registration/call rows enter this index")
+            }
         }
     }
 

@@ -4364,7 +4364,9 @@ fn format_observer_end_handoff_note(end: CaptureEnd, pid: u32) -> String {
         CaptureEnd::Error => "capture failed",
         CaptureEnd::LimitReached => "event budget exhausted",
         CaptureEnd::DurationExpired => "duration expired but pause cleanup failed",
-        other => unreachable!("observer-side settlement reached for {other:?}"),
+        CaptureEnd::TargetExit | CaptureEnd::Signal => {
+            unreachable!("observer-side settlement reached for {end:?}")
+        }
     };
     format!(
         "p11scope: {reason}; handed back live child pid {pid} \

@@ -39,9 +39,13 @@ impl FileIdentity {
 
 /// A private temp file created beside a target path, published to that path
 /// with an identity-verified `rename(2)` on `commit`. If never committed the
-/// temp file is unlinked by `Drop`; a finished capture is never deleted by
-/// `commit` — a publish failure keeps the temp for the operator with a
-/// warning naming it.
+/// temp file is unlinked by `Drop`; after the capture, no failure path
+/// unlinks the temp before a fallback has been tried — a sync, handover
+/// or rename I/O failure retries once, then saves the finished capture to
+/// the recovery dir (`/var/tmp/p11scope-recovered/`, 0700 owner-only, file
+/// 0600) and fails (exit 1: the requested `-o` does not exist). Only a
+/// final-name security refusal keeps the temp beside the destination with
+/// a warning naming it, without a fallback.
 ///
 /// Final-name policy (RB-1/HIGH-3, superseding F-48's "never stat the final
 /// name"): `rename(2)` atomically replaces any non-directory, so renaming
@@ -82,10 +86,19 @@ pub struct AtomicFile {
     fail_sync_with: Option<i32>,
 }
 
+/// Why one commit attempt failed: a final-name security refusal keeps
+/// the temp beside the destination without a fallback, while a sync,
+/// handover or rename I/O error retries once, then falls back to the
+/// recovery dir.
+enum AttemptFailure {
+    Refused(String),
+    Failed(String),
+}
+
 impl AtomicFile {
     /// Opens the parent directory, refuses a final name that exists and is
     /// not a regular file, and creates `.p11scope.<pid>.<seq>.tmp` beside
-    /// `path` with `openat(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC, 0o600)`,
+    /// `path` with `openat(O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW|O_CLOEXEC, 0o600)`,
     /// retrying seq 0..128 on collision. The handover target is decided
     /// here but applied at commit, so the live temp stays creator-owned
     /// 0600 for the whole capture; before the temp exists the target is
@@ -135,6 +148,30 @@ impl AtomicFile {
                     }
                     let identity = FileIdentity::from_metadata(&metadata);
                     let owner = unsafe { libc::geteuid() };
+                    // Advisory pre-capture free-space check: one stderr
+                    // line when the destination filesystem holds less
+                    // than a rough report size class (1 MiB; profiles run
+                    // tens of KiB to a few MiB), never a refusal. An
+                    // unstatable filesystem just skips it.
+                    {
+                        const FREE_SPACE_FLOOR: u64 = 1 << 20;
+                        let mut statvfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+                        // SAFETY: fstatvfs writes a plain output struct on
+                        // success; on failure the contents are untouched
+                        // and the advisory is skipped.
+                        if unsafe { libc::fstatvfs(directory.as_raw_fd(), statvfs.as_mut_ptr()) }
+                            == 0
+                        {
+                            let statvfs = unsafe { statvfs.assume_init() };
+                            let free = statvfs.f_bavail.saturating_mul(statvfs.f_frsize);
+                            if free < FREE_SPACE_FLOOR {
+                                eprintln!(
+                                    "p11scope: warning: only {free} bytes free on the filesystem for {}; the report may not fit",
+                                    final_path.display()
+                                );
+                            }
+                        }
+                    }
                     return Ok(Self {
                         directory,
                         temp_file,
@@ -189,89 +226,127 @@ impl AtomicFile {
         }
     }
 
-    /// Re-verifies the temp identity (regular file, same dev/ino, owner ==
-    /// creator, mode & 0o077 == 0), `sync_all`, hands the finished file to
-    /// the handover target decided at creation and syncs the new
-    /// owner/mode, re-checks the final name, then renames over it. A
-    /// handover-sequence failure the create-time probe passed but the
-    /// filesystem refuses here (fchown, chmod or post-handover sync) still
-    /// publishes the finished report with a warning naming the path,
-    /// instead of unlinking the capture; the warning is printed only after
-    /// the publish result is known, stating what actually happened. Only a
-    /// publish (rename) failure keeps the finished temp beside the final
-    /// name, with a warning naming the kept path — the capture is never
-    /// deleted.
+    /// Re-verifies the temp identity (regular file, same dev/ino, owner,
+    /// mode & 0o077 == 0), then attempts the publish — pre-handover
+    /// `sync_all`, handover to the target decided at creation, re-check
+    /// of the final name, rename — twice: the first I/O failure retries
+    /// once for transient NFS/FUSE hiccups, and a second failure saves
+    /// the finished capture to the recovery dir
+    /// (`/var/tmp/p11scope-recovered/`, 0700 owner-only, file 0600
+    /// `p11scope-<yyyymmddThhmmssZ>-<pid>.<ext>`) instead of unlinking
+    /// it, and fails (exit 1: the requested `-o` does not exist). Only a
+    /// final-name security refusal keeps the temp beside the destination
+    /// with a warning naming it, without a fallback. A tampered temp
+    /// (identity check) fails closed with the temp left in place. After
+    /// the capture, no failure path unlinks the temp before a fallback
+    /// has been tried; when both the `-o` save and the recovery save
+    /// fail, the error carries both failures with `capture lost`.
     pub fn commit(mut self) -> Result<(), String> {
-        self.verify_temp_identity()?;
-        self.temp_file.sync_all().map_err(|error| {
-            format!(
-                "syncing temporary output beside {} failed: {error}",
-                self.final_path.display()
-            )
-        })?;
-        let pending = self.hand_over_at_commit()?;
-        match self.publish() {
-            Ok(()) => {
-                // The report is published at this point; a directory fsync that the
-                // filesystem cannot honour must not turn a complete run into a failure.
-                let _ = self.directory.sync_all();
-                self.cleanup = false;
-                if let Some(pending) = pending {
-                    let published = match self.handover {
-                        Some((uid, _)) if self.owner == uid => format!(
-                            "published {} as handed over instead",
-                            self.final_path.display()
-                        ),
-                        _ => format!(
-                            "published {} root-owned 0600 instead",
-                            self.final_path.display()
-                        ),
-                    };
-                    eprintln!("{pending}; {published}");
-                }
-                Ok(())
-            }
-            Err(publish_error) => {
+        if let Err(error) = self.verify_temp_identity() {
+            // Fail-closed tamper check: the name is no longer this run's
+            // file (or a concurrent chmod/fchown raced the two stats).
+            // Never delete, never publish, never fall back — leave
+            // whatever stands at the name for inspection.
+            self.cleanup = false;
+            return Err(error);
+        }
+        let first = self.try_commit_once();
+        if first.is_ok() {
+            return Ok(());
+        }
+        if self.try_commit_once().is_ok() {
+            return Ok(());
+        }
+        match first.expect_err("a failed first attempt carries its error") {
+            AttemptFailure::Refused(refusal) => {
                 self.cleanup = false;
                 let temp_path = self.temp_path();
-                if let Some(pending) = pending {
-                    eprintln!(
-                        "{pending}; {publish_error}; kept {} (report not deleted)",
-                        temp_path.display()
-                    );
-                    let issue = pending
-                        .strip_prefix("p11scope: warning: ")
-                        .unwrap_or(&pending);
-                    Err(format!(
-                        "{issue}; {publish_error}; kept {} (report not deleted)",
-                        temp_path.display()
-                    ))
-                } else {
-                    eprintln!(
-                        "p11scope: warning: {publish_error}; kept {} (report not deleted)",
-                        temp_path.display()
-                    );
-                    Err(format!(
-                        "{publish_error}; kept {} (report not deleted)",
-                        temp_path.display()
-                    ))
+                eprintln!(
+                    "p11scope: warning: {refusal}; kept {} (report not deleted)",
+                    temp_path.display()
+                );
+                Err(format!(
+                    "{refusal}; kept {} (report not deleted)",
+                    temp_path.display()
+                ))
+            }
+            AttemptFailure::Failed(e1) => {
+                let base = recovered_base_dir();
+                match save_recovered_capture(&self.temp_file, &self.final_path, &base) {
+                    Ok(saved) => {
+                        eprintln!(
+                            "p11scope: writing {} failed: {e1}; capture saved to {} (root-only, mode 0600)",
+                            self.final_path.display(),
+                            saved.display()
+                        );
+                        Err(format!(
+                            "writing {} failed: {e1}; capture saved to {} (root-only, mode 0600)",
+                            self.final_path.display(),
+                            saved.display()
+                        ))
+                    }
+                    Err(e2) => {
+                        eprintln!(
+                            "p11scope: writing {} failed: {e1}; saving to {} also failed: {e2}; capture lost",
+                            self.final_path.display(),
+                            base.display()
+                        );
+                        Err(format!(
+                            "writing {} failed: {e1}; saving to {} also failed: {e2}; capture lost",
+                            self.final_path.display(),
+                            base.display()
+                        ))
+                    }
                 }
+                // cleanup stays true: Drop unlinks the temp only while it
+                // is still this run's private file.
             }
         }
+    }
+
+    /// One publish attempt: pre-handover sync, handover to the target
+    /// decided at creation, re-check of the final name, rename. On
+    /// success the temp is published and cleanup is disarmed. On failure
+    /// the temp is untouched for the retry and the fallback.
+    fn try_commit_once(&mut self) -> Result<(), AttemptFailure> {
+        #[cfg(test)]
+        if let Some(errno) = self.fail_sync_with {
+            return Err(AttemptFailure::Failed(format!(
+                "syncing temporary output beside {} failed: {}",
+                self.final_path.display(),
+                std::io::Error::from_raw_os_error(errno)
+            )));
+        }
+        if let Err(error) = self.temp_file.sync_all() {
+            return Err(AttemptFailure::Failed(format!(
+                "syncing temporary output beside {} failed: {error}",
+                self.final_path.display()
+            )));
+        }
+        self.hand_over_at_commit().map_err(AttemptFailure::Failed)?;
+        self.publish()?;
+        // The report is published at this point; a directory fsync that the
+        // filesystem cannot honour must not turn a complete run into a failure.
+        let _ = self.directory.sync_all();
+        self.cleanup = false;
+        Ok(())
     }
 
     /// The rename itself, fail-closed on the final name: an absent name is
     /// claimed with `RENAME_NOREPLACE`; anything that exists there is checked
     /// to be a regular file first. A filesystem without `RENAME_NOREPLACE`
-    /// (EINVAL) falls back to the checked plain rename.
-    fn publish(&self) -> Result<(), String> {
+    /// (EINVAL) falls back to the checked plain rename. A security refusal
+    /// (non-regular final name) is `Refused` (keep the temp, no fallback);
+    /// a rename errno is `Failed` (retry, then fall back).
+    fn publish(&self) -> Result<(), AttemptFailure> {
         let failed = |error: std::io::Error| {
-            format!(
+            AttemptFailure::Failed(format!(
                 "publishing output {} failed: {error}",
                 self.final_path.display()
-            )
+            ))
         };
-        let present = check_final_name(&self.directory, &self.final_name, &self.final_path)?;
+        let present = check_final_name(&self.directory, &self.final_name, &self.final_path)
+            .map_err(AttemptFailure::Refused)?;
         if !present {
             match renameat_noreplace(
                 &self.directory,
@@ -285,7 +360,8 @@ impl AtomicFile {
                 // is there now before the plain rename below.
                 Err(error) if matches!(error.raw_os_error(), Some(code) if code == libc::EEXIST || code == libc::EINVAL) =>
                 {
-                    check_final_name(&self.directory, &self.final_name, &self.final_path)?;
+                    check_final_name(&self.directory, &self.final_name, &self.final_path)
+                        .map_err(AttemptFailure::Refused)?;
                 }
                 Err(error) => return Err(failed(error)),
             }
@@ -318,47 +394,45 @@ impl AtomicFile {
     /// descriptor, never by path, so no symlink can redirect it, then a
     /// sync of the new owner/mode so a crash cannot persist the later
     /// rename with pre-handover ownership. Without a target this keeps
-    /// the creator's ownership and reports no warning. Once the `fchown`
-    /// succeeds the recorded owner is the target.
+    /// the creator's ownership. Once the `fchown` succeeds the recorded
+    /// owner is the target.
     ///
     /// Any failure in this sequence — the create-time probe passed but
     /// the filesystem refused the real file (`fchown`), or the
-    /// post-handover chmod/sync refused — returns the pending warning
-    /// instead of failing: the caller still publishes the finished report
-    /// (creator-owned 0600 when the `fchown` refused, which is root-owned
-    /// whenever a handover arms, since that needs root; as handed over
-    /// when the `fchown` succeeded) and prints the warning only after the
-    /// publish result is known.
-    fn hand_over_at_commit(&mut self) -> Result<Option<String>, String> {
+    /// post-handover chmod/sync refused — returns the error naming the
+    /// path: the caller retries once, then saves the finished capture to
+    /// the recovery dir instead of publishing an unhanded report.
+    // The fchown site keeps its explicit `return Err` (rather than `?`)
+    // so the three failure sites stay parallel and pinnable.
+    #[allow(clippy::question_mark)]
+    fn hand_over_at_commit(&mut self) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt as _;
         let Some((uid, gid)) = self.handover else {
-            return Ok(None);
+            return Ok(());
         };
         if let Err(error) = handover_new_file(&self.temp_file, Some((uid, gid)), &self.final_path) {
-            return Ok(Some(format!("p11scope: warning: {error}")));
+            return Err(error);
         }
         self.owner = uid;
         if let Err(error) = self
             .temp_file
             .set_permissions(std::fs::Permissions::from_mode(0o600))
         {
-            let error = format!(
+            return Err(format!(
                 "setting output {} private after handing it to uid {uid}, gid {gid} failed: {error}",
                 self.final_path.display()
-            );
-            return Ok(Some(format!("p11scope: warning: {error}")));
+            ));
         }
         // Persist the new owner/mode before publication: without this
         // sync an OS crash between commit and inode writeback could
         // persist the rename with pre-handover ownership.
         if let Err(error) = self.temp_file.sync_all() {
-            let error = format!(
+            return Err(format!(
                 "syncing output {} after handing it to uid {uid}, gid {gid} failed: {error}",
                 self.final_path.display()
-            );
-            return Ok(Some(format!("p11scope: warning: {error}")));
+            ));
         }
-        Ok(None)
+        Ok(())
     }
 
     fn verify_temp_identity(&self) -> Result<(), String> {
@@ -1137,7 +1211,7 @@ fn handover_target_for(
 /// mode (`0600`) is unchanged by `fchown`. `None` keeps the caller's
 /// ownership. A refused throwaway is unlinked by its caller (the
 /// create-time probe, or a stream that just created its file); a
-/// refused finished report is published creator-owned with a warning
+/// refused finished report fails the commit to the recovery dir
 /// instead (see `hand_over_at_commit`).
 fn handover_new_file(
     file: &std::fs::File,
@@ -1166,8 +1240,9 @@ fn handover_new_file(
 /// capture — the real temp never exists, let alone holds hours of
 /// work. The probe passing does not promise commit will: the
 /// filesystem can still refuse the real file later, and then commit
-/// publishes creator-owned with a warning instead of unlinking. A
-/// throwaway the probe cannot remove is reported, never left silently.
+/// saves the finished capture to the recovery dir instead of unlinking
+/// it. A throwaway the probe cannot remove is reported, never left
+/// silently.
 fn probe_handover(
     directory: &std::fs::File,
     target: (u32, u32),
@@ -1357,11 +1432,14 @@ fn linkat_unnamed(
 }
 
 fn openat_profile(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
+    // O_RDWR (not O_WRONLY): the recovery fallback copies the finished
+    // temp's bytes from the held descriptor, which needs read access.
+    // The file stays 0600 owner-only; readable only by its creator.
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600,
         )
     };
@@ -1493,6 +1571,234 @@ fn unlinkat(directory: &std::fs::File, name: &CString) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// The fixed recovery dir for finished captures whose `-o` commit fails.
+/// Tests override it with `P11SCOPE_TEST_RECOVERED_DIR`; production always
+/// uses `/var/tmp/p11scope-recovered` (fixed behaviour, no knob).
+fn recovered_base_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from("/var/tmp/p11scope-recovered")
+}
+
+/// Opens the recovery dir, creating it `0700` when absent, and refuses a
+/// planted impostor: the held dir must be a real directory owned by the
+/// caller with no group/other bits. All descriptor-relative (`mkdirat` /
+/// `openat` on the retained parent, `fstat` on the held dir), never by
+/// re-resolved pathname, so a symlink at the base cannot redirect root's
+/// write and another user's dir is never reused.
+fn open_recovered_dir(base: &Path) -> Result<std::fs::File, String> {
+    let name = base
+        .file_name()
+        .ok_or_else(|| format!("recovery directory {} has no file name", base.display()))?;
+    let name = c_name(name, "recovery directory name")?;
+    let mut parent_path = base
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .to_path_buf();
+    if parent_path.as_os_str().is_empty() {
+        parent_path = PathBuf::from(".");
+    }
+    let parent_c = CString::new(parent_path.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "recovery parent {} contains a NUL byte",
+            parent_path.display()
+        )
+    })?;
+    // SAFETY: a NUL-terminated path that outlives the call; the returned
+    // fd is owned below on success.
+    let parent_fd = unsafe {
+        libc::open(
+            parent_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if parent_fd == -1 {
+        return Err(format!(
+            "opening recovery parent {} failed: {}",
+            parent_path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: open succeeded, so the fd is owned.
+    let parent = unsafe { std::fs::File::from_raw_fd(parent_fd) };
+    // SAFETY: both the dir fd and the NUL-terminated name outlive the call.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(format!(
+                "creating recovery directory {} failed: {error}",
+                base.display()
+            ));
+        }
+    }
+    // SAFETY: same lifetime as above; O_NOFOLLOW refuses a symlink base.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(format!(
+            "opening recovery directory {} failed: {}; refusing it",
+            base.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: openat succeeded, so the fd is owned.
+    let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = dir.metadata().map_err(|error| {
+        format!(
+            "checking recovery directory {} failed: {error}; refusing it",
+            base.display()
+        )
+    })?;
+    // NB: mode bits, not the is_dir helper — the retained-directory
+    // pin forbids that path-lookup-shaped call in production code.
+    if metadata.mode() & libc::S_IFMT != libc::S_IFDIR {
+        return Err(format!(
+            "recovery directory {} is not a directory; refusing it",
+            base.display()
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        return Err(format!(
+            "recovery directory {} is owned by uid {}, not {euid}; refusing it",
+            base.display(),
+            metadata.uid()
+        ));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "recovery directory {} has mode {:04o} (group/other bits); refusing it",
+            base.display(),
+            metadata.mode() & 0o7777
+        ));
+    }
+    Ok(dir)
+}
+
+/// Current UTC time as `yyyymmddThhmmssZ` for recovery names. Civil date
+/// from days per Howard Hinnant's `civil_from_days` (same construction
+/// as the run report clock, without a date dependency).
+fn fallback_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}{month:02}{day:02}T{hour:02}{min:02}{sec:02}Z")
+}
+
+/// Saves the finished temp file's bytes to a new `0600` file in the
+/// recovery dir: `p11scope-<yyyymmddThhmmssZ>-<pid>[.<seq>].<ext>`
+/// (the `-o` extension, `json` when absent) via
+/// `O_CREAT|O_EXCL|O_NOFOLLOW`, then `fsync` of the file and the dir.
+/// A partial file on write/sync failure is unlinked again. Returns the
+/// saved path.
+fn save_recovered_capture(
+    temp_file: &std::fs::File,
+    dest: &Path,
+    base: &Path,
+) -> Result<PathBuf, String> {
+    let dir = open_recovered_dir(base)?;
+    let ext = dest
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty() && !ext.contains('/') && !ext.contains('\0'))
+        .unwrap_or("json");
+    let timestamp = fallback_timestamp();
+    let pid = std::process::id();
+    for seq in 0..128u32 {
+        let name = if seq == 0 {
+            format!("p11scope-{timestamp}-{pid}.{ext}")
+        } else {
+            format!("p11scope-{timestamp}-{pid}.{seq}.{ext}")
+        };
+        let c_name = CString::new(name.clone()).expect("generated recovery name has no NUL");
+        // SAFETY: the dir fd and the NUL-terminated name outlive the call;
+        // the returned fd is owned below on success.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                continue;
+            }
+            return Err(format!(
+                "creating recovery file {name} in {} failed: {error}",
+                base.display()
+            ));
+        }
+        // SAFETY: openat succeeded, so the fd is owned.
+        let mut out = unsafe { std::fs::File::from_raw_fd(fd) };
+        let cleanup = |dir: &std::fs::File, name: &CString| {
+            let _ = unlinkat(dir, name);
+        };
+        // An independent offset via a clone, so the temp's own offset is
+        // untouched for the operator when the temp is kept.
+        let mut src = temp_file.try_clone().map_err(|error| {
+            cleanup(&dir, &c_name);
+            format!("reading finished capture for recovery failed: {error}")
+        })?;
+        use std::io::{Seek as _, SeekFrom};
+        if let Err(error) = src.seek(SeekFrom::Start(0)) {
+            cleanup(&dir, &c_name);
+            return Err(format!(
+                "reading finished capture for recovery failed: {error}"
+            ));
+        }
+        if let Err(error) = std::io::copy(&mut src, &mut out) {
+            cleanup(&dir, &c_name);
+            return Err(format!(
+                "writing recovery file {name} in {} failed: {error}",
+                base.display()
+            ));
+        }
+        if let Err(error) = out.sync_all() {
+            cleanup(&dir, &c_name);
+            return Err(format!(
+                "syncing recovery file {name} in {} failed: {error}",
+                base.display()
+            ));
+        }
+        if let Err(error) = dir.sync_all() {
+            cleanup(&dir, &c_name);
+            return Err(format!(
+                "syncing recovery directory {} failed: {error}",
+                base.display()
+            ));
+        }
+        return Ok(base.join(name));
+    }
+    Err(format!(
+        "cannot allocate a unique recovery file in {}",
+        base.display()
+    ))
 }
 
 #[cfg(test)]
@@ -3334,8 +3640,14 @@ mod tests {
 
     /// A fallback name is `p11scope-<yyyymmddThhmmssZ>-<pid>[.<seq>].<ext>`.
     fn assert_recovered_name(name: &str, ext: &str) {
-        assert!(name.starts_with("p11scope-"), "fallback name prefix: {name}");
-        assert!(name.ends_with(&format!(".{ext}")), "fallback name ext: {name}");
+        assert!(
+            name.starts_with("p11scope-"),
+            "fallback name prefix: {name}"
+        );
+        assert!(
+            name.ends_with(&format!(".{ext}")),
+            "fallback name ext: {name}"
+        );
         let rest = &name["p11scope-".len()..name.len() - ext.len() - 1];
         let (timestamp, pid_part) = rest.split_once('-').expect("fallback name has a pid part");
         assert_eq!(timestamp.len(), 16, "fallback timestamp length: {name}");

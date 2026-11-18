@@ -5182,6 +5182,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         deadline_ns: u64,
         now_ns: u64,
     ) -> PassReport {
+        // One shared teardown-deferral window for this catalog pass
+        // (covering `scan_pass` too): the owner scans below inherit
+        // the previous pass's spent budget without this reset.
+        self.engine.begin_teardown_pass();
         if self.stopped {
             return self.stopped_pass_report("a catalog pass");
         }
@@ -7951,6 +7955,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.note_exec_loss_from_binder(batch.domain);
             }
             NativeBatch::Lifecycle(batch) => {
+                // One shared teardown-deferral window for this staging
+                // pass, like the discovery entries: the coordinator
+                // engine's budget otherwise depletes monotonically
+                // across the capture.
+                self.engine.begin_teardown_pass();
                 self.lifecycle_high_water_bytes = self
                     .lifecycle_high_water_bytes
                     .max(batch.drain_high_water_bytes);
@@ -11759,6 +11768,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         mut lane: Option<&mut AttestedSemanticLane>,
         acquisition: Option<&mut dyn ImageAcquisition>,
     ) -> Result<PublicationCompletion> {
+        // One shared teardown-deferral window for this publication:
+        // the owner and refresh scans below inherit the previous
+        // pass's spent budget without this reset.
+        self.engine.begin_teardown_pass();
         self.retry_pending_leader_exits();
         // Original cgroup custody is still in self during the fallible engine
         // tail. Scoped preparation/staging then has no later fallible tail.

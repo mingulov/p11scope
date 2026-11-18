@@ -809,10 +809,10 @@ pub struct Engine {
     polled_pids: BTreeSet<u32>,
     /// The capture's operator-stop flag, checked between work items.
     cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Shared teardown-deferral budget for the current pass / tick: at most
-    /// 1 s of teardown waiting in total. Owned per pass through
-    /// `begin_teardown_pass` at each pass entry; scans charge it via
-    /// `scan_and_pin_with_proof`.
+    /// Shared teardown-deferral budget for the current window: at most
+    /// 1 s of teardown waiting in total across every scan sharing it.
+    /// Owned per window through `begin_teardown_pass` at each pass
+    /// entry; scans charge it via `scan_and_pin_with_proof`.
     teardown_deferral: TeardownDeferralBudget,
     scope: Scope,
     hooks: HookRegistry,
@@ -7672,18 +7672,19 @@ fn mid_scan_exit_proven(view: &ProcessView) -> bool {
     process::whole_group_proven_exited(view)
 }
 
-/// One shared teardown-deferral budget per discovery pass / live tick:
-/// at most 1 s of teardown waiting in total across every scan in the pass.
-/// When spent, remaining teardown cases skip the wait and stay loud as
-/// before (their whole-group proof runs once, unproven, without waiting).
-/// Busy home desktops are the target: N simultaneous teardowns must not
-/// stall discovery N x 1 s.
+/// One shared teardown-deferral budget per window: at most 1 s of
+/// teardown waiting in total across every scan sharing the window.
+/// Each dispatch entry opens a fresh window through
+/// `begin_teardown_pass`. When spent, remaining teardown cases skip the
+/// wait and stay loud as before (their whole-group proof runs once,
+/// unproven, without waiting). Busy home desktops are the target: N
+/// simultaneous teardowns must not stall discovery N x 1 s.
 #[derive(Debug, Clone)]
 pub(crate) struct TeardownDeferralBudget {
     remaining: std::time::Duration,
 }
 
-/// Total teardown waiting one pass / tick may spend, across all its scans.
+/// Total teardown waiting one window may spend, across all its scans.
 const TEARDOWN_DEFERRAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
 
 impl TeardownDeferralBudget {
@@ -7714,22 +7715,30 @@ impl Default for TeardownDeferralBudget {
 }
 
 impl Engine {
-    /// Starts one discovery pass's shared teardown-deferral budget.
+    /// Starts one dispatch entry's shared teardown-deferral window.
     ///
-    /// The single owner of the per-pass budget: every dispatch pass that
-    /// can scan calls this exactly once at its entry, before any scan — a
-    /// discovery batch (`apply_discovery_batch_inner`, covering its record,
-    /// pending-loader, arm-catch-up and terminal phases), a backlog quantum
-    /// (`service_backlog_quantum_inner`), a collected-finish pass
-    /// (`service_collected_finish_records_inner`, covering its record and
-    /// terminal-batch drains), an inventory tick (`refresh_inventory`, which
-    /// reseeds its own window even nested in a batch), and an owned-tree
-    /// watch run (`owned_tree_watch`). The initial discover pass
-    /// (`discover_plan`) keeps its equivalent inline reset: source-needle
-    /// tests pin its exact text. Scans share the pass budget through the
-    /// field; the next pass's call discards the leftover, so no pass
-    /// inherits a spent budget and files false loud gaps.
-    fn begin_teardown_pass(&mut self) {
+    /// The single owner of the per-window budget: every dispatch pass
+    /// that can scan calls this exactly once at its entry, before any
+    /// scan — a discovery batch (`apply_discovery_batch_inner`, covering
+    /// its record, pending-loader, arm-catch-up and terminal phases), a
+    /// backlog quantum (`service_backlog_quantum_inner`), a
+    /// collected-finish pass (`service_collected_finish_records_inner`,
+    /// covering its record and terminal-batch drains), an inventory tick
+    /// (`refresh_inventory`, which reseeds its own window even nested in
+    /// a batch), an owned-tree watch run (`owned_tree_watch`), a
+    /// coordinator staging pass (the `Lifecycle` arm of
+    /// `InventoryCoordinator::stage_native`), a coordinator
+    /// physical-publication pass
+    /// (`InventoryCoordinator::prepare_physical_publication`, covering
+    /// its owner and refresh scans), and a coordinator catalog pass
+    /// (`InventoryCoordinator::apply_catalog`, covering `scan_pass`
+    /// too). The initial discover pass (`discover_plan`) keeps its
+    /// equivalent inline reset: source-needle tests pin its exact text.
+    /// Scans share the window budget through the field; the next
+    /// entry's call discards the leftover, so no pass inherits a spent
+    /// budget and files false loud gaps. Each entry opens its own
+    /// window, so the cap is per window, not per outermost batch.
+    pub(crate) fn begin_teardown_pass(&mut self) {
         self.teardown_deferral = TeardownDeferralBudget::new();
     }
 }

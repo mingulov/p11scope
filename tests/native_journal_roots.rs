@@ -399,8 +399,7 @@ fn length_stash_fetches_only_masked_args_with_literal_indices() {
             "unguarded {marker}"
         );
     }
-    let tail =
-        SOURCE[start..].replacen("length_entry_fetch_mask(descriptor)", "REMOVED", 1);
+    let tail = SOURCE[start..].replacen("length_entry_fetch_mask(descriptor)", "REMOVED", 1);
     assert!(
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
         "an unmasked stash must fail the contract"
@@ -410,7 +409,8 @@ fn length_stash_fetches_only_masked_args_with_literal_indices() {
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
         "an index-0 fetch must fail the contract"
     );
-    let tail = SOURCE[start..].replacen("arg_u64(ctx, 1, layout)", "arg_u64(ctx, index, layout)", 1);
+    let tail =
+        SOURCE[start..].replacen("arg_u64(ctx, 1, layout)", "arg_u64(ctx, index, layout)", 1);
     assert!(
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
         "a dynamic fetch index must fail the contract"
@@ -546,10 +546,11 @@ fn length_end_stamps_the_cookie_derived_function_on_the_modeled_path() {
 }
 
 /// Length stash lifecycle (v0.8.0 keymeta Task 2): the entry wrapper
-/// inserts on retention (overwrite), deletes on refusal (a stale row
-/// is never trusted) and counts full-map insert failures. The
-/// return wrapper deletes unconditionally (every emission deletes)
-/// and counts stamp/layout mismatches on its own cell.
+/// inserts on retention (overwrite), deletes on both refusals (the
+/// zero-mask refusal before any fetch and the adapter refusal — a
+/// stale row is never trusted) and counts full-map insert failures.
+/// The return wrapper deletes unconditionally (every emission
+/// deletes) and counts stamp/layout mismatches on its own cell.
 #[test]
 fn length_stash_lifecycle_pins_insert_delete_and_failure_counts() {
     const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
@@ -564,7 +565,7 @@ fn length_stash_lifecycle_pins_insert_delete_and_failure_counts() {
             return false;
         };
         text.contains("EVIDENCE_START.insert(key, &row, 0)")
-            && text.contains("EVIDENCE_START.remove(key)")
+            && text.matches("EVIDENCE_START.remove(key)").count() >= 2
             && text.contains("bump_evidence(EVIDENCE_LENGTH_INSERT_FAILURES)")
     }
     fn trailer_contract(source: &str) -> bool {

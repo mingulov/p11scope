@@ -17,7 +17,7 @@
 //! Provenance: `docs/superpowers/specs/2026-11-14-v080-keymeta-design.md`
 //! §5.1, §8.1, §8.2.
 
-use crate::ARG_NONE;
+use crate::{ARG_NONE, MAX_DESCRIPTORS};
 
 /// Length-trailer protocol version (spec §8.3).
 pub const LENGTH_TRAILER_VERSION: u16 = 1;
@@ -295,6 +295,44 @@ pub const fn length_entry_descriptor(descriptor: u32, switched: bool) -> u32 {
         0
     } else {
         descriptor
+    }
+}
+
+/// Entry-fetch mask for one canonical descriptor (spec §5.1,
+/// §8.2): the exact argument words the length entry may acquire, as
+/// a bit per index. S rows mask their cell plus their disjointness
+/// base (the only two argument words the S guards consult); V rows
+/// mask their scalar alone. Zero refuses before any fetch:
+/// count-only, narrowed, out-of-range, unlisted, corrupt and info
+/// descriptors acquire nothing — acquisition itself is bounded by
+/// the approved named positions. An ordinal match like
+/// [`evidence_position`]: no `function_name()` call, no static
+/// table, no rodata.
+#[inline(always)]
+pub fn length_entry_fetch_mask(descriptor: u32) -> u8 {
+    if descriptor == 0 || descriptor >= MAX_DESCRIPTORS {
+        return 0;
+    }
+    let function = descriptor - 1;
+    let Some(row) = evidence_position(function) else {
+        return 0;
+    };
+    if row.info {
+        return 0;
+    }
+    if row.length_cell_arg != ARG_NONE && row.length_scalar_arg == ARG_NONE {
+        let base = length_buffer_base(function);
+        if base == ARG_NONE || base > 6 || row.length_cell_arg > 6 {
+            return 0;
+        }
+        (1u8 << row.length_cell_arg) | (1u8 << base)
+    } else if row.length_scalar_arg != ARG_NONE && row.length_cell_arg == ARG_NONE {
+        if row.length_scalar_arg > 6 {
+            return 0;
+        }
+        1u8 << row.length_scalar_arg
+    } else {
+        0
     }
 }
 
@@ -646,7 +684,11 @@ mod tests {
         }
         // Every refusal shape masks zero: narrowed/count-only zero,
         // unlisted endpoints, the three info markers, out-of-range.
-        assert_eq!(length_entry_fetch_mask(0), 0, "narrowed/count-only: no fetch");
+        assert_eq!(
+            length_entry_fetch_mask(0),
+            0,
+            "narrowed/count-only: no fetch"
+        );
         for name in [
             "C_Initialize",
             "C_GetSlotInfo",
@@ -688,7 +730,11 @@ mod tests {
                 length_kind_for_descriptor(descriptor).is_some(),
                 "descriptor {descriptor}: mask and return dispatch agree"
             );
-            assert_eq!(mask & 0x01, 0, "descriptor {descriptor}: index 0 never fetched");
+            assert_eq!(
+                mask & 0x01,
+                0,
+                "descriptor {descriptor}: index 0 never fetched"
+            );
             if mask & 0x40 != 0 {
                 assert!(
                     kem.contains(&descriptor),

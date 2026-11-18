@@ -4323,8 +4323,8 @@ mod tests {
     /// extra acquisition fails here.
     #[test]
     fn length_entry_adapter_fetches_only_masked_positions() {
-        use crate::MAX_DESCRIPTORS;
         use crate::evidence_table::length_entry_fetch_mask;
+        use crate::MAX_DESCRIPTORS;
         let s_rows = [
             ("C_Sign", 4u8, 3u8),
             ("C_SignRecover", 4, 3),
@@ -4367,10 +4367,7 @@ mod tests {
                 );
             }
             for (name, scalar_arg) in v_rows {
-                let mut spy = LengthSpy::new(
-                    length_args(&[(scalar_arg, Some(128))]),
-                    Ok(256),
-                );
+                let mut spy = LengthSpy::new(length_args(&[(scalar_arg, Some(128))]), Ok(256));
                 let mut out = EvidenceStart::default();
                 let descriptor = length_descriptor(name);
                 assert!(

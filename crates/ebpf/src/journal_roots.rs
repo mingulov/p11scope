@@ -565,7 +565,9 @@ pub(super) mod program {
     use core::ffi::c_void;
     #[cfg(not(feature = "stub-object-attributes"))]
     use p11scope_ebpf_common::evidence_table::length_entry_descriptor;
-    use p11scope_ebpf_common::evidence_table::{LENGTH_KIND_SCELL, length_kind_for_descriptor};
+    use p11scope_ebpf_common::evidence_table::{
+        LENGTH_KIND_SCELL, length_entry_fetch_mask, length_kind_for_descriptor,
+    };
     use p11scope_ebpf_common::object_flow::{
         EvidenceStart, LengthReturnVerdict, adapter_length_entry, adapter_length_return,
     };
@@ -627,9 +629,16 @@ pub(super) mod program {
     /// never trusted), count full-map insert failures. The START
     /// timestamp binds the return (fix9 R4); a missing row binds zero,
     /// which the return mismatches (fail closed). Outlined (not
-    /// inlined): the 32-byte row, the pre-fetched argument array and
+    /// inlined): the 32-byte row, the fetched argument array and
     /// the adapter spills stay out of the root frame, keeping the
     /// entry call chain inside the unmodified 512-byte bound.
+    ///
+    /// Acquisition is bounded by the row's entry-fetch mask: a zero
+    /// mask (count-only, narrowed, unlisted, corrupt, info) deletes
+    /// any stale row and returns before the first fetch, and every
+    /// fetched index is a compile-time-constant literal guarded by
+    /// its mask bit. Index 0 is never an approved length position
+    /// and is never fetched.
     #[cfg_attr(feature = "stub-object-attributes", allow(dead_code))]
     #[inline(never)]
     fn stash_length_entry(
@@ -638,48 +647,64 @@ pub(super) mod program {
         descriptor: u32,
         layout: LinuxLayout,
     ) {
+        // Refuse before any acquisition: the mask names exactly the
+        // approved argument words for this descriptor, and zero
+        // deletes any stale row without touching target memory.
+        let mask = length_entry_fetch_mask(descriptor);
+        if mask == 0 {
+            let _ = EVIDENCE_START.remove(key);
+            return;
+        }
         let start_ts_ns = unsafe { p11_owner_start_get(key, 0).as_ref() }.map(|start| start.ts_ns);
         let mut row = EvidenceStart::default();
-        // Pre-fetch every argument slot with a compile-time-constant
-        // index. The adapter selects positions at runtime, but a
-        // dynamic index into `arg_u64` becomes register-offset
-        // pt_regs arithmetic (`ctx += reg`), which the verifier
-        // rejects ("dereference of modified ctx ptr" on 6.6/6.12/
-        // 7.0). Slots 0..=5 are the LP64 registers; 6 is the SP+8
-        // stack slot (spec §8.2). Words start zeroed beside a
-        // validity mask: a `None` payload is undef, and LLVM spills
-        // the stale R0 as that payload, which the verifier rejects
-        // (`R0 !read_ok`). The fetch closure only indexes these
-        // arrays, never `arg_u64`.
+        // Fetch only masked positions, each with a
+        // compile-time-constant index. The adapter selects positions
+        // at runtime, but a dynamic index into `arg_u64` becomes
+        // register-offset pt_regs arithmetic (`ctx += reg`), which
+        // the verifier rejects ("dereference of modified ctx ptr" on
+        // 6.6/6.12/7.0). Slots 1..=5 are the LP64 registers; 6 is
+        // the SP+8 stack slot (spec §8.2). Words start zeroed
+        // beside a validity mask: a `None` payload is undef, and
+        // LLVM spills the stale R0 as that payload, which the
+        // verifier rejects (`R0 !read_ok`). The fetch closure only
+        // indexes these arrays, never `arg_u64`.
         let mut words = [0u64; 7];
         let mut present: u8 = 0;
-        if let Ok(word) = arg_u64(ctx, 0, layout) {
-            words[0] = word;
-            present |= 0x01;
+        if mask & 0x02 != 0 {
+            if let Ok(word) = arg_u64(ctx, 1, layout) {
+                words[1] = word;
+                present |= 0x02;
+            }
         }
-        if let Ok(word) = arg_u64(ctx, 1, layout) {
-            words[1] = word;
-            present |= 0x02;
+        if mask & 0x04 != 0 {
+            if let Ok(word) = arg_u64(ctx, 2, layout) {
+                words[2] = word;
+                present |= 0x04;
+            }
         }
-        if let Ok(word) = arg_u64(ctx, 2, layout) {
-            words[2] = word;
-            present |= 0x04;
+        if mask & 0x08 != 0 {
+            if let Ok(word) = arg_u64(ctx, 3, layout) {
+                words[3] = word;
+                present |= 0x08;
+            }
         }
-        if let Ok(word) = arg_u64(ctx, 3, layout) {
-            words[3] = word;
-            present |= 0x08;
+        if mask & 0x10 != 0 {
+            if let Ok(word) = arg_u64(ctx, 4, layout) {
+                words[4] = word;
+                present |= 0x10;
+            }
         }
-        if let Ok(word) = arg_u64(ctx, 4, layout) {
-            words[4] = word;
-            present |= 0x10;
+        if mask & 0x20 != 0 {
+            if let Ok(word) = arg_u64(ctx, 5, layout) {
+                words[5] = word;
+                present |= 0x20;
+            }
         }
-        if let Ok(word) = arg_u64(ctx, 5, layout) {
-            words[5] = word;
-            present |= 0x20;
-        }
-        if let Ok(word) = arg_u64(ctx, 6, layout) {
-            words[6] = word;
-            present |= 0x40;
+        if mask & 0x40 != 0 {
+            if let Ok(word) = arg_u64(ctx, 6, layout) {
+                words[6] = word;
+                present |= 0x40;
+            }
         }
         let mut fetch = |index: u8| {
             if index < 7 && present & (1 << index) != 0 {

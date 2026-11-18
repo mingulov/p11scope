@@ -12465,6 +12465,30 @@ fn truncate_module_tables_to_cap(module: &mut ScannedModule) -> u64 {
     u64::try_from(dropped).unwrap_or(u64::MAX)
 }
 
+/// Same-table re-decode across scans: two static instances with the
+/// same file offset (the table's identity — runtime addresses are
+/// generation-local and never identify a table across remaps), same
+/// version, walk and decoded content. A re-decode unions with the
+/// retained instance (the fresher scan's address wins); only genuinely
+/// new tables (a new offset, new content, or an unprovable offset)
+/// stay rivals. Live instances never match here — a live observation
+/// twins with (not into) a static instance at another address, as
+/// before. Without this, a re-decode through changed map entries
+/// twins one static table, defeats the exactly-one-static-table legs,
+/// drops every descriptor, and churns the capture through a replace +
+/// async-retire coverage hole (Mode-B single-row loss).
+fn same_table_redecode(known: &ScannedTable, incoming: &ScannedTable) -> bool {
+    !known.live_return
+        && !incoming.live_return
+        && known.file_offset.is_some()
+        && known.file_offset == incoming.file_offset
+        && known.version == incoming.version
+        && known.walk == incoming.walk
+        && known.entries == incoming.entries
+        && known.null_entries == incoming.null_entries
+        && known.unpinned == incoming.unpinned
+}
+
 /// Union `incoming` into its same-file module, or file it beside its
 /// ABI-mismatched twin. Returns how many fresh tables the per-module
 /// cap dropped (counted overflow, never silent): callers accumulate it
@@ -12533,7 +12557,10 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         let typed_live = table.live_return
             && !table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
         let incoming_is_static = !table.live_return;
-        let index = existing.tables.iter().position(|known| *known == table);
+        let index = existing
+            .tables
+            .iter()
+            .position(|known| *known == table || same_table_redecode(known, &table));
         table_indices.push(match index {
             Some(index) => {
                 if typed_live
@@ -12553,6 +12580,11 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 }
                 existing.tables[index].live_return |= table.live_return;
                 existing.tables[index].manifest_supported |= table.manifest_supported;
+                // A same-table re-decode brings the fresher scan's
+                // address: across a remap the retained address is
+                // unmapped, and across a double mapping either address
+                // reads the same table while the generation lives.
+                existing.tables[index].address = table.address;
                 // The extension proof unions like the other monotonic
                 // observation flags: an equal table is `PartialEq`-equal
                 // with or without the flag, so a later full-extent decode

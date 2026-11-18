@@ -39655,14 +39655,14 @@ fn live_union_preserves_finished_scan_without_new_static_table() {
     // the static table keeps its sole-complete grant instead of
     // churning the capture through a detach+reattach static episode.
     // A genuinely new static table still re-opens finished-ness.
-    let table = |address: u64, live_return: bool| ScannedTable {
+    let table = |address: u64, file_offset: Option<u64>, live_return: bool| ScannedTable {
         version: (2, 40),
         walk: "full",
         entries: vec![],
         null_entries: vec![],
         unpinned: vec![],
         address,
-        file_offset: Some(0),
+        file_offset,
         live_return,
         manifest_supported: false,
         extension_impossible: false,
@@ -39690,10 +39690,10 @@ fn live_union_preserves_finished_scan_without_new_static_table() {
         tables,
         interfaces: vec![],
     };
-    let mut confirmed = vec![module(true, vec![table(0x1000, false)])];
+    let mut confirmed = vec![module(true, vec![table(0x1000, Some(0), false)])];
     merge_scanned_module(
         &mut confirmed,
-        module(false, vec![table(0x7f00_0000, true)]),
+        module(false, vec![table(0x7f00_0000, Some(0), true)]),
     );
     assert_eq!(confirmed.len(), 1);
     assert_eq!(confirmed[0].tables.len(), 2);
@@ -39701,8 +39701,14 @@ fn live_union_preserves_finished_scan_without_new_static_table() {
         confirmed[0].tables_scan_finished,
         "a pure-live union preserves the finished scan"
     );
-    let mut reopened = vec![module(true, vec![table(0x1000, false)])];
-    merge_scanned_module(&mut reopened, module(true, vec![table(0x2000, false)]));
+    // A genuinely new static table (a new file offset here — a same-key
+    // re-decode at a new address unions instead) still re-opens
+    // finished-ness.
+    let mut reopened = vec![module(true, vec![table(0x1000, Some(0), false)])];
+    merge_scanned_module(
+        &mut reopened,
+        module(true, vec![table(0x2000, Some(0x500), false)]),
+    );
     assert_eq!(reopened[0].tables.len(), 2);
     assert!(
         !reopened[0].tables_scan_finished,
@@ -39806,6 +39812,100 @@ fn merge_scanned_module_caps_tables_per_module_with_counted_overflow() {
     let dropped = merge_scanned_module(&mut small, module(vec![table(1)], vec![]));
     assert_eq!(dropped, 0);
     assert_eq!(small[0].tables.len(), 2);
+}
+
+#[test]
+fn rescan_same_table_new_address_unions_without_reopening_finished() {
+    // Mode-B single-row trigger (v0.8.0): the same provider table (same
+    // file offset, version and decoded content) re-decoded at a new
+    // runtime address — a second mapping of one file, or a re-decode
+    // through changed map entries — is one table, not a rival. Runtime
+    // addresses are generation-local (`ScannedTable::file_offset` doc:
+    // they "never identify a table across remaps"), so the union must
+    // keep a single table and preserve the finished scan; twins would
+    // defeat the exactly-one-static-table legs, drop every descriptor,
+    // and churn the capture through a replace + async-retire hole with
+    // no recovery (dead-view currency livelock). A table with different
+    // content at the same offset stays a rival (torn read or changed
+    // file), as does a table at a genuinely new offset.
+    let table = |address: u64, file_offset: Option<u64>, name: &'static str| ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name,
+            object: ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 42,
+            },
+            object_path: "/opt/p.so".into(),
+            file_offset: 0x100,
+        }],
+        null_entries: vec![],
+        unpinned: vec![],
+        address,
+        file_offset,
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let module = |finished: bool, tables: Vec<ScannedTable>| ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        tables_scan_finished: finished,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces: vec![],
+    };
+    // Same key, same content, new address: union, finished preserved,
+    // fresher address wins (correct across a remap, harmless for a
+    // double mapping while the generation lives).
+    let mut merged = vec![module(true, vec![table(0x1000, Some(0), "C_GetSlotList")])];
+    merge_scanned_module(
+        &mut merged,
+        module(true, vec![table(0x2000, Some(0), "C_GetSlotList")]),
+    );
+    assert_eq!(merged.len(), 1, "same module unions, not twins");
+    assert_eq!(
+        merged[0].tables.len(),
+        1,
+        "same table at a new address unions, not rivals"
+    );
+    assert_eq!(merged[0].tables[0].address, 0x2000);
+    assert!(
+        merged[0].tables_scan_finished,
+        "a same-table re-decode preserves the finished scan"
+    );
+    // Same offset, different content: still a rival (torn read or a
+    // changed file must re-open finished-ness).
+    let mut rival = vec![module(true, vec![table(0x1000, Some(0), "C_GetSlotList")])];
+    merge_scanned_module(
+        &mut rival,
+        module(true, vec![table(0x2000, Some(0), "C_GetTokenInfo")]),
+    );
+    assert_eq!(
+        rival[0].tables.len(),
+        2,
+        "different content at one offset stays rival twins"
+    );
+    assert!(
+        !rival[0].tables_scan_finished,
+        "rival content still re-opens finished-ness"
+    );
 }
 
 #[test]

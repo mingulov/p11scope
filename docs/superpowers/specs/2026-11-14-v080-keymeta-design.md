@@ -594,14 +594,20 @@ range). No map entry renders a bit range anywhere (owner 07:52,
   class, 56 → DSA 2048/224 class, 64 → DSA 2048/256-or-3072 class
   (ambiguous, said so). Legacy; same adapter, table rows only.
 - AES-KW subset (`CKM_AES_KEY_WRAP` only) × `wrap_output`:
-  output L → wrapped-key material L−8 octets, attributed to the
-  WRAPPED key (input 1) as `wrapped_material` evidence — it sizes
-  the wrapped key, never the wrapping key. `KEY_WRAP_PAD`/KWP/
+  output L → wrapped-key material L−8 octets, admitted for
+  material 0..=8191 (L 8..=8199), attributed to the WRAPPED key
+  (input 1) as `wrapped_material` evidence — it sizes the wrapped
+  key, never the wrapping key. Above the bound the length is
+  `unsupported` with reason `outside_admission_bound` (anti-alias
+  admission bound, the RSA 64..=2048 precedent — widening later is
+  an amendment row, not new capture). `KEY_WRAP_PAD`/KWP/
   PKCS7 (padded) → `unknown` with reason `padding_ambiguity`
   (L−8 is an upper bound, not a size).
 - AES-KW subset (`CKM_AES_KEY_WRAP` only) × `unwrap_input` (U1):
   input L → unwrapped-key material L−8 octets about the fresh
-  view. The fresh view has no row at unwrap time, so U1 parks on
+  view, under the same 0..=8191 admission bound (above it
+  `unsupported` with `outside_admission_bound`, never parked).
+  The fresh view has no row at unwrap time, so admitted U1 parks on
   the view and the view's first sealed row carries it (§5.4, §9);
   padded variants → `padding_ambiguity` as above. (RSA-subset
   × `unwrap_input` needs no parking: it sizes the unwrapping key,
@@ -661,7 +667,9 @@ The reducer attributes the terminal length to the receipt's key
 aggregate row as `inferred_size` (new row keys, §10); the frozen
 `metadata_at_use` is untouched. Evidence about a key with no
 sealed row yet (U1 about the fresh unwrap view; `wrapped_material`
-about a wrapped key with no rows) parks on the key's view; the
+about a wrapped key with no rows) parks on the key's view when the
+§5.2 map admits it (above-bound AES-KW lengths park nothing,
+forward-fill nothing and consume no slot); the
 key's first sealed row carries it as its initial `inferred_size`
 (forward-fill onto a new row — never a `metadata_at_use` rewrite,
 so the no-backfill pins stand). Parked evidence expires with the

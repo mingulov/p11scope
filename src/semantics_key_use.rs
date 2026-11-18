@@ -3349,7 +3349,7 @@ impl KeyUseReducer {
         fresh_view: Option<u64>,
     ) {
         use crate::keymeta::{
-            EvidenceTag, LengthOutcome, REASON_OPERATION_KEY_ONLY, SizeDetail,
+            EvidenceTag, LengthOutcome, REASON_OPERATION_KEY_ONLY, SizeOutcome, classify_size,
             evidence_tag_for_category, is_aes_kw_family,
         };
         let tag = evidence_tag_for_category(category);
@@ -3438,20 +3438,20 @@ impl KeyUseReducer {
                 }
                 AssocBucket::Unknown(_) => {
                     // An unusable wrapped association still names its
-                    // view: park AES-KW material about it.
+                    // view: park admitted AES-KW material about it —
+                    // the same admission decision as the direct path,
+                    // so no route publishes a refused size.
                     if category == "wrap"
                         && receipt.role == KeyRole::WrappedKey
                         && mechanism == Some(crate::keymeta::AES_KW_ID)
                         && let Some(LengthOutcome::Value(value)) = length
-                        && let Some(material) = value.checked_sub(8)
+                        && let SizeOutcome::Inferred(detail) =
+                            classify_size(mechanism, EvidenceTag::WrapOutput, value)
                     {
                         self.park_wrapped(
                             receipt.key.as_u64(),
                             ParkedSize {
-                                detail: SizeDetail::WrappedMaterial {
-                                    material_octets: material,
-                                    octets: value,
-                                },
+                                detail,
                                 tag: EvidenceTag::WrapOutput,
                             },
                         );
@@ -3459,21 +3459,21 @@ impl KeyUseReducer {
                 }
             }
         }
-        // U1: AES-KW unwrap material about the fresh view parks on
-        // the view (exact-one seal proof, valued lengths only).
+        // U1: admitted AES-KW unwrap material about the fresh view
+        // parks on the view (exact-one seal proof, valued admitted
+        // lengths only — refused lengths park nothing and consume no
+        // slot).
         if category == "unwrap"
             && mechanism == Some(crate::keymeta::AES_KW_ID)
             && let Some(LengthOutcome::Value(value)) = length
             && let Some(view) = fresh_view
-            && let Some(material) = value.checked_sub(8)
+            && let SizeOutcome::Inferred(detail) =
+                classify_size(mechanism, EvidenceTag::UnwrapInput, value)
         {
             self.park_wrapped(
                 view,
                 ParkedSize {
-                    detail: SizeDetail::WrappedMaterial {
-                        material_octets: material,
-                        octets: value,
-                    },
+                    detail,
                     tag: EvidenceTag::UnwrapInput,
                 },
             );

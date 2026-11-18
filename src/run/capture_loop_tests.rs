@@ -3538,7 +3538,7 @@ fn degraded_terminal_publishes_before_failing_with_terminal_error() {
         .find("terminal_seal_errors(")
         .expect("run_terminal builds the seal union");
     let commit = terminal
-        .find("out_file.commit()")
+        .find("commit_streamed_report(out_file)")
         .expect("run_terminal publishes the -o report");
     let failure = terminal
         .rfind("if let Some(error) = terminal_error {\n            return Err(error);")
@@ -3560,6 +3560,30 @@ fn degraded_terminal_publishes_before_failing_with_terminal_error() {
                 "combine_terminal_errors([snapshot_error, degraded_error, pinned_error])"
             ),
         "the helper folds the degraded read error between the fallback and pinned errors"
+    );
+}
+
+/// Both streamed sinks commit through the recovery-aware helper: the
+/// profile and metrics closures share one mapping (a recovery-dir save
+/// suppresses the stdout rescue; anything else keeps it as the last
+/// resort), so neither site can drift to a bare commit.
+#[test]
+fn both_streamed_sinks_commit_through_the_recovery_aware_helper() {
+    let source = include_str!("../run.rs");
+    let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+    let terminal = production
+        .split_once("fn run_terminal(")
+        .unwrap()
+        .1
+        .split_once("\nfn write_json_report")
+        .unwrap()
+        .0;
+    assert_eq!(
+        terminal
+            .matches("commit_streamed_report(out_file)")
+            .count(),
+        2,
+        "the profile and metrics closures share the recovery-aware commit helper"
     );
 }
 

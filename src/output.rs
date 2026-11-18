@@ -3703,6 +3703,47 @@ mod tests {
         assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
     }
 
+    /// The saved-fallback line names the actual owner truthfully: root
+    /// keeps `(root-only, mode 0600)`; anyone else gets `(mode 0600,
+    /// readable only by <user>)` with their login name (or `uid <euid>`
+    /// without a passwd entry) — never `root-only` for a file root
+    /// does not own.
+    #[test]
+    fn commit_saved_line_names_the_actual_owner() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&recovered_base);
+        let error = a.commit().unwrap_err();
+        assert!(
+            error.contains("capture saved to"),
+            "the error names the fallback, got: {error}"
+        );
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            assert!(
+                error.contains("(root-only, mode 0600)"),
+                "a root-owned fallback keeps root-only, got: {error}"
+            );
+        } else {
+            assert!(
+                error.contains("(mode 0600, readable only by "),
+                "a user-owned fallback names its reader, got: {error}"
+            );
+            assert!(
+                !error.contains("root-only"),
+                "root-only must not print for a file root does not own, got: {error}"
+            );
+        }
+        assert!(!path.exists(), "the requested -o does not exist");
+        let files = recovered_files(&recovered_base);
+        assert_eq!(files.len(), 1, "one fallback file: {files:?}");
+    }
+
     /// ENOSPC surfacing at the pre-handover sync saves the capture to
     /// the recovery dir with the errno text, and fails (exit 1).
     #[test]

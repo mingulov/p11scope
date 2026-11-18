@@ -1959,6 +1959,99 @@ class AsyncV6NewsiteTwins(unittest.TestCase):
                                         "object label invalid"):
                 oracle.compare_stream(stream, collision, joint, "joint")
 
+    def test_v7_stream_dispatch(self):
+        oracle = require_oracle(self)
+
+        def inferred_pair():
+            return (
+                {"status": "inferred", "value": "rsa", "completions": 1},
+                {"status": "inferred",
+                 "detail": {"kind": "rsa", "size_class": 2048,
+                            "modulus_bytes": 256,
+                            "evidence": "sign_output"},
+                 "completions": 1},
+            )
+
+        def v7_pair(key_version):
+            collision, joint, _single = paired(oracle, "poll_msg")
+            stream = healthy_stream(collision, joint)
+            joint["version"] = 7
+            joint["unattributed"] = []
+            for row in joint["key_operations"]:
+                family, size = inferred_pair()
+                row["inferred_family"] = family
+                row["inferred_size"] = size
+                row["inferred_family"]["completions"] = row["completed"]
+                row["inferred_size"]["completions"] = row["completed"]
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    line["event"]["version"] = 6
+                elif line["kind"] == "key_operations_observed":
+                    line["event"]["version"] = key_version
+                    if key_version >= 7 and line["event"]["bucket"] == "known":
+                        family, size = inferred_pair()
+                        line["event"]["row"]["inferred_family"] = family
+                        line["event"]["row"]["inferred_size"] = size
+                        line["event"]["row"]["inferred_family"]["completions"] = \
+                            line["event"]["row"]["completed"]
+                        line["event"]["row"]["inferred_size"]["completions"] = \
+                            line["event"]["row"]["completed"]
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 7
+            return collision, joint, stream
+
+        with self.subTest("v7 stream validates and reconciles"):
+            collision, joint, stream = v7_pair(7)
+            oracle.validate_snapshot(joint, "joint")
+            oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("mixed v6-to-v7 stream reconciles"):
+            collision, joint, _single = paired(oracle, "poll_msg")
+            stream = healthy_stream(collision, joint)
+            joint["version"] = 7
+            joint["unattributed"] = []
+            for row in joint["key_operations"]:
+                family, size = inferred_pair()
+                row["inferred_family"] = family
+                row["inferred_size"] = size
+                row["inferred_family"]["completions"] = row["completed"]
+                row["inferred_size"]["completions"] = row["completed"]
+            last_by_key = {}
+            for line in stream:
+                if line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if line["event"]["bucket"] == "known":
+                        key = (row["instance"], row["object"], row["category"],
+                               row["role"], row["metadata_at_use"])
+                        last_by_key[key] = line
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    line["event"]["version"] = 6
+                elif line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if line["event"]["bucket"] == "known":
+                        key = (row["instance"], row["object"], row["category"],
+                               row["role"], row["metadata_at_use"])
+                        if line is last_by_key[key]:
+                            line["event"]["version"] = 7
+                            family, size = inferred_pair()
+                            row["inferred_family"] = family
+                            row["inferred_size"] = size
+                            row["inferred_family"]["completions"] = row["completed"]
+                            row["inferred_size"]["completions"] = row["completed"]
+                        else:
+                            line["event"]["version"] = 6
+                    else:
+                        line["event"]["version"] = 6
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 7
+            oracle.validate_snapshot(joint, "joint")
+            oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("future version still refused"):
+            collision, joint, stream = v7_pair(7)
+            stream[0]["event"]["version"] = 8
+            with self.assertRaisesRegex(oracle.LedgerError, "version"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+
 
 class CollisionEmissionTests(unittest.TestCase):
     def build_provider(self, tmp, m32=False):

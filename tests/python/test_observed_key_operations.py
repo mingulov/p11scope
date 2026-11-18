@@ -1011,6 +1011,88 @@ class ObservedRsaTests(unittest.TestCase):
             facts = ORACLE.check_section(mutated)
             self.assertEqual(len(facts["gaps"]["rows"]), 2)
 
+    def test_h9_v7_size_detail_closed_variants(self):
+        # Closed per-kind variants (§10.2): valid RSA and wrapped
+        # details qualify; a foreign field, a missing required field,
+        # an inappropriate evidence tag, an arbitrary class and an
+        # unconstrained curve do not — in both detail slots.
+        section = observed("clean.json")
+        section["version"] = 7
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for name, block in (("requested", row["requested"]),
+                                ("established", row["established"])):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None, "source": None,
+                                          "reason": None}
+                for cell_name, cell in block.items():
+                    if cell_name == "parameter_set":
+                        continue
+                    if name == "established" and cell["status"] == "value":
+                        cell["source"] = "query"
+                    else:
+                        cell["source"] = None
+                    cell["reason"] = None
+            row["queries"]["parameter_set"] = "not_queried"
+        for row in section["key_operations"]:
+            row["inferred_family"] = {"status": "inferred", "value": "rsa",
+                                      "completions": 1}
+            row["inferred_size"] = {
+                "status": "inferred",
+                "detail": {"kind": "rsa", "size_class": 2048,
+                           "modulus_bytes": 256,
+                           "evidence": "sign_output"},
+                "completions": 1}
+        good_wrapped = {"kind": "wrapped_material", "material_octets": 24,
+                        "octets": 32, "evidence": "wrap_output",
+                        "about": "wrapped"}
+        refused = {
+            "foreign field": {"kind": "rsa", "size_class": 2048,
+                              "modulus_bytes": 256,
+                              "evidence": "sign_output",
+                              "curve": "ed25519"},
+            "missing required": {"kind": "rsa", "size_class": 2048,
+                                 "evidence": "sign_output"},
+            "bad evidence": {"kind": "rsa", "size_class": 2048,
+                             "modulus_bytes": 256,
+                             "evidence": "decapsulate_input"},
+            "bad class": {"kind": "rsa", "size_class": 9,
+                          "modulus_bytes": 256,
+                          "evidence": "sign_output"},
+            "bad curve": {"kind": "ec", "curve": "p999", "octets": 64,
+                          "evidence": "sign_output"},
+        }
+        with self.subTest("valid wrapped qualifies in both slots"):
+            for slot in ("detail", "conflict_detail"):
+                mutated = copy.deepcopy(section)
+                mutated["key_operations"][0]["inferred_size"][slot] = dict(
+                    good_wrapped)
+                ORACLE.check_section(mutated)
+        for label, detail in refused.items():
+            for slot in ("detail", "conflict_detail"):
+                with self.subTest(f"{label} refused in {slot}"):
+                    mutated = copy.deepcopy(section)
+                    mutated["key_operations"][0]["inferred_size"][slot] = dict(
+                        detail)
+                    with self.assertRaises(ORACLE.OracleRefusal):
+                        ORACLE.check_section(mutated)
+
+    def test_h9_v1_refuses_v7_gaps(self):
+        # Version-aware gap vocabulary: v7-only reasons qualify in v7
+        # (pinned above) and are refused below v7, never silently
+        # dropped.
+        section = observed("clean.json")
+        assert section["version"] == 1
+        for reason in ("corroboration_mismatch", "wrapped_park_refused"):
+            with self.subTest(reason=reason):
+                mutated = copy.deepcopy(section)
+                mutated["gaps"] = {
+                    "rows": [{"subject": "key_operation", "reason": reason,
+                              "repeats": 1}],
+                    "suppressed": 0}
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    ORACLE.check_section(mutated)
+
     def test_h9_v6_section_checks_structurally(self):
         # v6 shape with the cell's RSA key rows: the new-site content
         # rides the object views (key_type 66, value_len 48, hkdf_384

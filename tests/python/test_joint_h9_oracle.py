@@ -1003,6 +1003,108 @@ class StreamTwins(unittest.TestCase):
                                         "object label invalid"):
                 oracle.compare_stream(stream, [first, second], snapshot)
 
+    def test_h9_v7_stream_dispatch(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+
+        def inferred_pair():
+            return (
+                {"status": "inferred", "value": "rsa", "completions": 1},
+                {"status": "inferred",
+                 "detail": {"kind": "rsa", "size_class": 2048,
+                            "modulus_bytes": 256,
+                            "evidence": "sign_output"},
+                 "completions": 1},
+            )
+
+        def v7_snapshot():
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 7
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                family, size = inferred_pair()
+                row["inferred_family"] = family
+                row["inferred_size"] = size
+            return snapshot
+
+        def v7_stream(snapshot, key_version):
+            stream = healthy_stream([first, second], snapshot)
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    line["event"]["version"] = 6
+                elif line["kind"] == "key_operations_observed":
+                    line["event"]["version"] = key_version
+                    if key_version >= 7 and line["event"]["bucket"] == "known":
+                        family, size = inferred_pair()
+                        line["event"]["row"]["inferred_family"] = family
+                        line["event"]["row"]["inferred_size"] = size
+                        # Cumulative completions stay 1: the fixture rows
+                        # complete once, so the inferred block matches.
+                        line["event"]["row"]["inferred_family"]["completions"] = \
+                            line["event"]["row"]["completed"]
+                        line["event"]["row"]["inferred_size"]["completions"] = \
+                            line["event"]["row"]["completed"]
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 7
+            # The snapshot rows carry completions matching the final
+            # cumulative counts; align the inferred blocks likewise.
+            for row in snapshot["key_operations"]:
+                row["inferred_family"]["completions"] = row["completed"]
+                row["inferred_size"]["completions"] = row["completed"]
+            return stream
+
+        with self.subTest("v7 stream validates and reconciles"):
+            snapshot = v7_snapshot()
+            stream = v7_stream(snapshot, 7)
+            oracle.validate_snapshot(snapshot)
+            oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("mixed v6-to-v7 stream reconciles"):
+            snapshot = v7_snapshot()
+            stream = healthy_stream([first, second], snapshot)
+            # Early key revisions ride v6 without inferred keys; the
+            # last revision per row rides v7 with them, matching the
+            # snapshot. Object rows ride v6 throughout.
+            last_by_key = {}
+            for line in stream:
+                if line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if line["event"]["bucket"] == "known":
+                        key = (row["instance"], row["object"], row["category"],
+                               row["role"], row["metadata_at_use"])
+                        last_by_key[key] = line
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    line["event"]["version"] = 6
+                elif line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if line["event"]["bucket"] == "known":
+                        key = (row["instance"], row["object"], row["category"],
+                               row["role"], row["metadata_at_use"])
+                        if line is last_by_key[key]:
+                            line["event"]["version"] = 7
+                            family, size = inferred_pair()
+                            row["inferred_family"] = family
+                            row["inferred_size"] = size
+                            row["inferred_family"]["completions"] = row["completed"]
+                            row["inferred_size"]["completions"] = row["completed"]
+                        else:
+                            line["event"]["version"] = 6
+                    else:
+                        line["event"]["version"] = 6
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 7
+            for row in snapshot["key_operations"]:
+                row["inferred_family"]["completions"] = row["completed"]
+                row["inferred_size"]["completions"] = row["completed"]
+            oracle.validate_snapshot(snapshot)
+            oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("future version still refused"):
+            snapshot = v7_snapshot()
+            stream = v7_stream(snapshot, 7)
+            stream[0]["event"]["version"] = 8
+            with self.assertRaisesRegex(oracle.LedgerError, "version"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+
     def test_h9_stream_version_refusals(self):
         oracle = require_oracle(self)
         _, _, first, second = validated_pair(oracle, "interleave")

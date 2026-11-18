@@ -5452,6 +5452,24 @@ def self_test():
             ev.insert(at + 1, staged)
             return {"events": _account(ev, +1)}
         case("jsonl-edge-folded-excused", None, folded_edge)
+        def folded_edge_exact(s, d, dash, stale=0):
+            # One clean, unrotated folded edge with its module departed
+            # summary: the summary's edge count and entries sum must
+            # match the folded edge's last record exactly. stale > 0
+            # stages the credit-deferred shape — the stream's last
+            # record behind the folded aggregate — which must fail.
+            kw = folded_edge(s, d, dash)
+            staged = next(e for e in kw["events"] if e["kind"] == "edge_observed"
+                          and e["event"].get("caller") == "c900")
+            count = staged["event"]["entries"]["count"]
+            module = next(m for m in d["modules"] if m["id"] == staged["event"]["module"])
+            module["departed_use"] = {"edges": 1,
+                                      "entries": {"count": count + stale, "saturated": 0}}
+            return kw
+        case("jsonl-edge-folded-exact-count", None,
+             lambda s, d, dash: folded_edge_exact(s, d, dash))
+        case("jsonl-edge-folded-stale-count", "AGREE-EDGE-EVENTS",
+             lambda s, d, dash: folded_edge_exact(s, d, dash, stale=5))
         case("jsonl-edge-folded-unaccounted", "AGREE-EDGE-EVENTS",
              lambda s, d, dash: folded_edge(s, d, dash, folded=0))
         case("jsonl-edge-folded-overcounted", "AGREE-EDGE-EVENTS",

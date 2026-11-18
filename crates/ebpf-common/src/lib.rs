@@ -1290,7 +1290,14 @@ pub const EVIDENCE_SEMANTIC_CAPTURE_FAILURES: u32 = 5;
 pub const EVIDENCE_TEMPLATE_TAIL_FAILURES: u32 = 6;
 pub const EVIDENCE_UNREGISTERED_MECHANISMS: u32 = 7;
 pub const EVIDENCE_ABI_REFUSALS: u32 = 8;
-pub const EVIDENCE_CELLS: u32 = 9;
+/// Length stash insert failures (spec §8.2): the `EVIDENCE_START`
+/// insert failed (full map), so the call runs without retention.
+pub const EVIDENCE_LENGTH_INSERT_FAILURES: u32 = 9;
+/// Length stash mismatches (spec §8.2): the return's START stamp or
+/// layout disagreed with the retained row; deleted and counted, never
+/// a guessed length.
+pub const EVIDENCE_LENGTH_STASH_MISMATCHES: u32 = 10;
+pub const EVIDENCE_CELLS: u32 = 11;
 
 /// Hash-map capacities. The opt-in induced-gap build shrinks both maps so
 /// their independent failure counters can be exercised deterministically.
@@ -2414,6 +2421,8 @@ mod tests {
             EVIDENCE_TEMPLATE_TAIL_FAILURES,
             EVIDENCE_UNREGISTERED_MECHANISMS,
             EVIDENCE_ABI_REFUSALS,
+            EVIDENCE_LENGTH_INSERT_FAILURES,
+            EVIDENCE_LENGTH_STASH_MISMATCHES,
         ];
         for (position, index) in indices.iter().enumerate() {
             assert_eq!(*index as usize, position);

@@ -8,8 +8,11 @@ the same per-slot SLOT_COUNT_ONLY switch as Detailed. The generic
 outlined `object_return` monomorphization lives only in the journal
 object (the Oct 29 split removed it from default/unsafe), and its
 mangled name carries a build hash, so consumers are selected by exact
-C name or by exact mangled fragment plus a uniqueness assertion —
-never by the loose "object_return" suffix, which matches nothing.
+C name or by exact mangled fragment — never by the loose
+"object_return" suffix, which matches nothing. Since v0.8.0 keymeta
+Task 2 each return consumer instantiates twice (the base 632-byte
+form and the 648-byte END+length form); every instantiation is proven
+individually, and completeness covers the grown proven set.
 """
 
 import os
@@ -27,6 +30,8 @@ DISASSEMBLY = None
 # stable across builds; the surrounding crate hashes are not pinned.
 ENTRY_ROOT = "p11_entry_journal"
 RETURN_ROOT = "p11_return_journal"
+LENGTH_ENTRY_ROOT = "p11_entry_journal_length"
+LENGTH_RETURN_ROOT = "p11_return_journal_length"
 CAPTURE_ENTRY_FRAGMENT = "13capture_entry"
 ORDINARY_RETURN_FRAGMENT = "15ordinary_return"
 OBJECT_RETURN_FRAGMENT = "13object_return"
@@ -34,15 +39,23 @@ OBJECT_RETURN_FRAGMENT = "13object_return"
 
 def select(fragment=None, exact=None):
     """Select exactly one consumer block by exact C name or mangled fragment."""
+    matches = select_all(fragment=fragment, exact=exact)
+    if len(matches) != 1:
+        raise AssertionError((exact or fragment, len(matches)))
+    return matches[0]
+
+
+def select_all(fragment=None, exact=None):
+    """Select every consumer block matching the exact C name or fragment."""
     split = CHECKER["sections"](DISASSEMBLY)
     matches = [(section, name, lines)
                for section in ("uprobe", "uretprobe", ".text")
                for name, lines in CHECKER["D"].function_blocks(split[section]).items()
                if (exact is not None and name == exact)
                or (fragment is not None and fragment in name)]
-    if len(matches) != 1:
-        raise AssertionError((exact or fragment, len(matches)))
-    return matches[0]
+    if not matches:
+        raise AssertionError((exact or fragment, 0))
+    return matches
 
 
 def consumer_case(section, name, lines):
@@ -105,15 +118,17 @@ class JournalDescriptorSourceTests(unittest.TestCase):
         self.assertGreaterEqual(seen, 1, "the journal entry consults the object marker")
 
     def test_journal_returns_prove_their_descriptor_source(self):
-        """Both journal return consumers gate DESCRIPTORS on the unset side."""
+        """Every journal return instantiation gates DESCRIPTORS on the unset side."""
         for fragment in (ORDINARY_RETURN_FRAGMENT, OBJECT_RETURN_FRAGMENT):
-            with self.subTest(fragment=fragment):
-                section, name, lines = select(fragment=fragment)
-                self.assertEqual(section, ".text")
-                report = descriptor_source_case(section, name, lines)
-                self.assertEqual(report["descriptor_source"], "count_only_gated")
-                self.assertGreaterEqual(len(report["switch_lookups"]), 1)
-                self.assertEqual(report["set_arm_argument_reads"], [])
+            matches = select_all(fragment=fragment)
+            self.assertEqual(len(matches), 2, f"{fragment}: base + length instantiations")
+            for section, name, lines in matches:
+                with self.subTest(fragment=fragment, name=name):
+                    self.assertEqual(section, ".text")
+                    report = descriptor_source_case(section, name, lines)
+                    self.assertEqual(report["descriptor_source"], "count_only_gated")
+                    self.assertGreaterEqual(len(report["switch_lookups"]), 1)
+                    self.assertEqual(report["set_arm_argument_reads"], [])
 
     def test_journal_roots_delegate_to_proven_consumers(self):
         """The journal roots exist and the entry root calls the proven capture."""
@@ -121,6 +136,10 @@ class JournalDescriptorSourceTests(unittest.TestCase):
         self.assertEqual(entry_section, "uprobe")
         return_section, return_name, _ = select(exact=RETURN_ROOT)
         self.assertEqual(return_section, "uretprobe")
+        length_entry_section, length_entry_name, _ = select(exact=LENGTH_ENTRY_ROOT)
+        self.assertEqual(length_entry_section, "uprobe")
+        length_return_section, _, _ = select(exact=LENGTH_RETURN_ROOT)
+        self.assertEqual(length_return_section, "uretprobe")
         _, capture_name, _ = select(fragment=CAPTURE_ENTRY_FRAGMENT)
         split = CHECKER["sections"](DISASSEMBLY)
         text = CHECKER["joined"](split, entry_section, ".text")
@@ -128,6 +147,10 @@ class JournalDescriptorSourceTests(unittest.TestCase):
                    if caller == entry_name and target is not None]
         self.assertIn(capture_name, targets,
                       "p11_entry_journal must call the proven capture entry")
+        length_targets = [target for caller, _, _, target in CHECKER["D"].internal_call_targets(text)
+                          if caller == length_entry_name and target is not None]
+        self.assertIn(capture_name, length_targets,
+                      "p11_entry_journal_length must call the proven capture entry")
 
     def test_journal_removal_rejects_the_descriptor_source(self):
         """Switch/flag removal and polarity flip reject the journal proof."""
@@ -151,10 +174,13 @@ class JournalDescriptorSourceTests(unittest.TestCase):
                                        mutate(DISASSEMBLY, name, pc, old, new))
 
     def test_journal_switch_reads_live_only_in_proven_consumers(self):
-        """Completeness: only the three proven consumers read the switch."""
+        """Completeness: only the proven consumers read the switch."""
         split = CHECKER["sections"](DISASSEMBLY)
-        proven = {select(fragment=fragment)[1] for fragment in (
-            CAPTURE_ENTRY_FRAGMENT, ORDINARY_RETURN_FRAGMENT, OBJECT_RETURN_FRAGMENT)}
+        proven = {name for fragment in (
+            CAPTURE_ENTRY_FRAGMENT, ORDINARY_RETURN_FRAGMENT, OBJECT_RETURN_FRAGMENT)
+            for _, name, _ in select_all(fragment=fragment)}
+        # Capture plus both instantiations of each return consumer.
+        self.assertEqual(len(proven), 5)
         readers = set()
         for section in ("uprobe", "uretprobe", ".text"):
             for name, lines in CHECKER["D"].function_blocks(split[section]).items():

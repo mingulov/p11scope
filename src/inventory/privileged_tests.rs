@@ -5005,7 +5005,7 @@ fn start_joint_lane_with_journal(
         .subset
         .context("the conversion subset prepares")?;
     let scope = Scope::System;
-    let spec = crate::attach::journal::JournalSpec;
+    let spec = crate::attach::journal::JournalSpec { key_sizes: false };
     let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
         attach_subset,
         convert_subset,
@@ -5032,7 +5032,7 @@ fn refuse_linked_without_journal(
     report: &str,
 ) -> Result<()> {
     use anyhow::Context as _;
-    let spec = crate::attach::journal::JournalSpec;
+    let spec = crate::attach::journal::JournalSpec { key_sizes: false };
     let error = spec
         .prepare()
         .err()
@@ -10540,7 +10540,7 @@ fn privileged_joint_init_latches_producer_linkage() -> Result<()> {
             .subset
             .context("the conversion subset prepares")?;
         let scope = Scope::System;
-        let spec = crate::attach::journal::JournalSpec;
+        let spec = crate::attach::journal::JournalSpec { key_sizes: false };
         let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
             attach_subset,
             convert_subset,

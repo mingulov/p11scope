@@ -239,6 +239,240 @@ fn end_header_and_absent_tail_initialize_every_byte_in_poisoned_storage() {
 }
 
 #[test]
+fn end_length_header_trailer_and_absent_tail_initialize_in_poisoned_storage() {
+    use p11scope_ebpf_common::evidence_table::{
+        LENGTH_KIND_SCELL, LENGTH_STATUS_OK, LENGTH_TRAILER_VERSION,
+    };
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_END_FULL_BYTES, JOURNAL_END_LENGTH_BYTES, JOURNAL_END_TAIL_ABSENT,
+        JOURNAL_END_UNJOURNALED, JOURNAL_KIND_END, JOURNAL_VERSION, JournalEndLength,
+        LengthTrailer,
+    };
+    // v0.8.0 keymeta Task 2: the 648-byte writer shares the header and
+    // absent-tail rules with the 632-byte writer, corrects the length
+    // field, and stores the carried trailer verbatim.
+    for absent in [false, true] {
+        for tracked in [false, true] {
+            let mut storage = std::mem::MaybeUninit::<JournalEndLength>::uninit();
+            unsafe {
+                storage
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .write_bytes(0xa5, JOURNAL_END_LENGTH_BYTES)
+            };
+            let words = root_writers::ReturnWords {
+                thread: if tracked { 41 } else { 0 },
+                sequence: if tracked { 7 } else { 0 },
+                flags: if tracked {
+                    0
+                } else {
+                    u32::from(JOURNAL_END_UNJOURNALED)
+                },
+                pad: 0,
+            };
+            let trailer = LengthTrailer {
+                version: LENGTH_TRAILER_VERSION,
+                kind: LENGTH_KIND_SCELL,
+                status: LENGTH_STATUS_OK,
+                reserved: [0; 4],
+                value: 256,
+            };
+            let wrote = unsafe {
+                root_writers::initialize_end_length(storage.as_mut_ptr(), &words, absent, &trailer)
+            };
+            assert!(wrote);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), JOURNAL_END_LENGTH_BYTES)
+            };
+            let mut expected = [0u8; 24];
+            expected[..2].copy_from_slice(&JOURNAL_VERSION.to_ne_bytes());
+            expected[2..4].copy_from_slice(&(JOURNAL_END_LENGTH_BYTES as u16).to_ne_bytes());
+            expected[4] = JOURNAL_KIND_END;
+            expected[5] = words.flags as u8 | if absent { JOURNAL_END_TAIL_ABSENT } else { 0 };
+            expected[8..16].copy_from_slice(&words.thread.to_ne_bytes());
+            expected[16..24].copy_from_slice(&words.sequence.to_ne_bytes());
+            assert_eq!(&bytes[..24], &expected);
+            assert!(bytes[24..392].iter().all(|byte| *byte == 0xa5));
+            assert!(
+                bytes[392..JOURNAL_END_FULL_BYTES]
+                    .iter()
+                    .all(|byte| *byte == if absent { 0 } else { 0xa5 })
+            );
+            let mut expected_trailer = [0u8; 16];
+            expected_trailer[..2].copy_from_slice(&LENGTH_TRAILER_VERSION.to_ne_bytes());
+            expected_trailer[2] = LENGTH_KIND_SCELL;
+            expected_trailer[3] = LENGTH_STATUS_OK;
+            expected_trailer[8..16].copy_from_slice(&256u64.to_ne_bytes());
+            assert_eq!(&bytes[JOURNAL_END_FULL_BYTES..], &expected_trailer);
+        }
+    }
+    // A refused flag conversion writes no byte (the reservation stays
+    // poisoned) and reports false.
+    let mut storage = std::mem::MaybeUninit::<JournalEndLength>::uninit();
+    unsafe {
+        storage
+            .as_mut_ptr()
+            .cast::<u8>()
+            .write_bytes(0xa5, JOURNAL_END_LENGTH_BYTES)
+    };
+    let words = root_writers::ReturnWords {
+        thread: 41,
+        sequence: 7,
+        flags: 0x100,
+        pad: 0,
+    };
+    let trailer = LengthTrailer {
+        version: LENGTH_TRAILER_VERSION,
+        kind: LENGTH_KIND_SCELL,
+        status: LENGTH_STATUS_OK,
+        reserved: [0; 4],
+        value: 256,
+    };
+    let wrote = unsafe {
+        root_writers::initialize_end_length(storage.as_mut_ptr(), &words, false, &trailer)
+    };
+    assert!(!wrote);
+    let bytes = unsafe {
+        std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), JOURNAL_END_LENGTH_BYTES)
+    };
+    assert!(bytes.iter().all(|byte| *byte == 0xa5));
+}
+
+/// Length stash (v0.8.0 keymeta Task 2): every register argument is
+/// read with a compile-time-constant index. A dynamic index into
+/// `arg_u64` becomes register-offset pt_regs arithmetic (`ctx +=
+/// reg`), which the kernel verifier rejects with "dereference of
+/// modified ctx ptr" on every kernel (observed on 6.6/6.12/7.0);
+/// the adapter selects positions at runtime, so the stash
+/// pre-fetches args 0..=6 (LP64 regs plus the SP+8 stack slot)
+/// with literals and the fetch closure only indexes that array.
+#[test]
+fn length_stash_prefetches_register_args_with_literal_indices() {
+    const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
+    fn stash_body(source: &str) -> Option<&str> {
+        source
+            .split_once("    fn stash_length_entry(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+    }
+    fn contract(source: &str) -> bool {
+        let Some(text) = stash_body(source) else {
+            return false;
+        };
+        (0..=6).all(|index| text.contains(&format!("arg_u64(ctx, {index}, layout)")))
+            && !text.contains("arg_u64(ctx, index")
+    }
+    assert!(
+        contract(SOURCE),
+        "stash_length_entry must pre-fetch args 0..=6 with literal indices"
+    );
+    let start = SOURCE.find("    fn stash_length_entry(").unwrap();
+    for index in 0..=6 {
+        let marker = format!("arg_u64(ctx, {index}, layout)");
+        let tail = SOURCE[start..].replacen(&marker, "REMOVED", 1);
+        assert!(
+            !contract(&format!("{}{}", &SOURCE[..start], tail)),
+            "removed {marker}"
+        );
+    }
+    let tail =
+        SOURCE[start..].replacen("arg_u64(ctx, 0, layout)", "arg_u64(ctx, index, layout)", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "a dynamic fetch index must fail the contract"
+    );
+}
+
+/// Length trailer (v0.8.0 keymeta Task 2): the START stamp lookup
+/// null-checks its pointer through an explicit `is_null` branch
+/// before any field load. Folding the lookup into an
+/// `as_ref().map(ts)` Option chain lets LLVM merge the null check
+/// with the adapter's downstream flag arithmetic into a bitwise OR
+/// on the map pointer itself, which the verifier rejects ("bitwise
+/// operator |= on pointer prohibited", observed on 7.0).
+#[test]
+fn length_trailer_null_checks_the_start_pointer_explicitly() {
+    const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
+    fn trailer_body(source: &str) -> Option<&str> {
+        source
+            .split_once("    pub(crate) fn length_trailer_for_return(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+    }
+    fn contract(source: &str) -> bool {
+        let Some(text) = trailer_body(source) else {
+            return false;
+        };
+        text.contains("start.is_null()") && !text.contains(".map(|start| start.ts_ns)")
+    }
+    assert!(
+        contract(SOURCE),
+        "length_trailer_for_return must null-check the START pointer explicitly"
+    );
+    let start = SOURCE
+        .find("    pub(crate) fn length_trailer_for_return(")
+        .unwrap();
+    let tail = SOURCE[start..].replacen("start.is_null()", "REMOVED", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "removed start.is_null()"
+    );
+    let tail = SOURCE[start..].replacen(
+        "Some(unsafe { (*start).ts_ns })",
+        "unsafe { p11_owner_start_get(key, 0).as_ref() }.map(|start| start.ts_ns)",
+        1,
+    );
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "an as_ref().map chain must fail the contract"
+    );
+}
+
+/// Length END (v0.8.0 keymeta Task 2): the 648 path stamps the
+/// cookie-derived function ordinal into the payload's target
+/// function. Sync START rows leave it `FUNCTION_NONE`, and the
+/// trailer validator matches the kind against the
+/// function-addressed evidence row — a 648 carrying -1 fails
+/// closed, shedding every length call (observed: 172 arrivals, 0
+/// decodes, all joins lost). The root's length dispatch
+/// guarantees a valid length descriptor here.
+#[test]
+fn length_end_stamps_the_cookie_derived_function() {
+    const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
+    fn return_body(source: &str) -> Option<&str> {
+        source
+            .split_once("    pub(crate) fn ordinary_return<Record: ReturnPayload>(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+    }
+    fn contract(source: &str) -> bool {
+        let Some(text) = return_body(source) else {
+            return false;
+        };
+        text.contains("if Record::LENGTH {")
+            && text.contains("cookie_descriptor(cookie_of(&ctx))")
+            && text.contains("event.target_function).write(descriptor - 1)")
+    }
+    assert!(
+        contract(SOURCE),
+        "ordinary_return must stamp the cookie-derived function on the 648 path"
+    );
+    let start = SOURCE
+        .find("    pub(crate) fn ordinary_return<Record: ReturnPayload>(")
+        .unwrap();
+    for marker in [
+        "cookie_descriptor(cookie_of(&ctx))",
+        "event.target_function).write(descriptor - 1)",
+    ] {
+        let tail = SOURCE[start..].replacen(marker, "REMOVED", 1);
+        assert!(
+            !contract(&format!("{}{}", &SOURCE[..start], tail)),
+            "removed {marker}"
+        );
+    }
+}
+
+#[test]
 fn routing_words_are_sampled_once_and_stored_before_the_next_sampler() {
     use p11scope_ebpf_common::Event;
     use root_writers::RoutingWord;

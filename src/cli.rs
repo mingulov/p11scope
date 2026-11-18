@@ -313,8 +313,6 @@ pub struct InventoryArgs {
     /// `--key-sizes`: also infer key sizes from operation lengths
     /// (v0.8.0 keymeta, spec §10.5). Valid only with
     /// `--key-operations`; refused under P0 builds. Default off.
-    /// Length capture (Task 2 BPF) is pending: until it lands,
-    /// flag-on sizes stay unknown with `no_length_evidence`.
     pub key_sizes: bool,
     pub hooks: HookRegistry,
     pub json: bool,

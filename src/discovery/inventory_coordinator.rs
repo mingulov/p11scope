@@ -529,11 +529,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// from "off"). Set once at run setup; harnesses leave it false.
     key_operations_requested: bool,
     /// Whether `--key-sizes` was requested for this run (v0.8.0
-    /// keymeta Task 3 userspace): the Joint key-use reducer admits
-    /// length evidence and the text renderer shows sizes. Set once at
-    /// run setup beside `key_operations_requested`; harnesses leave
-    /// it false. Task 2 BPF length capture is pending: until it
-    /// lands, flag-on runs observe no lengths.
+    /// keymeta): the journal length programs load and link, the
+    /// stash reserves fully, the Joint key-use reducer admits
+    /// length evidence and the text renderer shows sizes. Set once
+    /// at run setup beside `key_operations_requested`; harnesses
+    /// leave it false.
     key_sizes_requested: bool,
     /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
     /// validation, pin and held-FD custody for supported auto/native
@@ -1461,11 +1461,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.key_operations_requested
     }
 
-    /// Record the run's `--key-sizes` request for the userspace
-    /// inference lane, and pose it on the Joint key-use reducer
-    /// (off-mode lengths drop with `size_inference_off`, never as
-    /// absent evidence). Length programs arrive with BPF length
-    /// capture; until then flag-on runs observe no lengths.
+    /// Record the run's `--key-sizes` request for the journal lane,
+    /// and pose it on the Joint key-use reducer (off-mode lengths
+    /// drop with `size_inference_off`, never as absent evidence).
     pub(crate) fn set_key_sizes_requested(&mut self, requested: bool) {
         self.key_sizes_requested = requested;
         self.registry.set_joint_key_sizes(requested);

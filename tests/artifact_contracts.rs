@@ -1380,7 +1380,7 @@ fn assert_live_discovery_host_contract(
         ),
         (
             "SessionPreparation::PrepareEventsDomain",
-            "            }\n            Ok(())",
+            "                }\n                Ok(())",
             "events::EventsDomain::from_events(&ebpf)",
         ),
     ] {
@@ -1623,7 +1623,7 @@ fn assert_static_attach_scheduling_contract(attach: &str) -> Result<(), String> 
         "fn attach_targets_observed_with_roots(",
         "fn standard_async_catalog",
     )?;
-    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
+    let return_attach = "attach(slot_return, slot, slot_attach_point(slot))";
     require_before(
         scheduling,
         "collect::<Result<Vec<_>>>()?",
@@ -1929,7 +1929,7 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
         "fn standard_async_catalog",
     );
     assert_static_attach_scheduling_contract(&attach).unwrap();
-    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
+    let return_attach = "attach(slot_return, slot, slot_attach_point(slot))";
     require_before(
         scheduling,
         "collect::<Result<Vec<_>>>()?",
@@ -6523,7 +6523,7 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         "fn attach_targets_observed_with_roots(",
         "fn standard_async_catalog",
     );
-    let return_attach = "attach(return_program, slot, slot_attach_point(slot))";
+    let return_attach = "attach(slot_return, slot, slot_attach_point(slot))";
     let entry_attach = "attach(program, slot, slot_attach_point(slot))";
     let late_return = scheduling
         .replacen(return_attach, "missing_return()", 1)
@@ -15248,7 +15248,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         "object aggregate gate must return before any submit"
     );
     assert!(
-        object.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)\n                .is_err()\n            {\n                unsafe { p11_object_fault() };\n                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n            }\n            return 0;\n        }"),
+        object.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)\n                .is_err()\n            {\n                unsafe { p11_object_fault() };\n                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n            }\n            if Record::LENGTH {\n                length_return_abandon(&key);\n            }\n            return 0;\n        }"),
         "object aggregate gate must retire, then return before any submit"
     );
 
@@ -17105,10 +17105,7 @@ fn keymeta_task2_length_capture_off_mode_identity_and_routing() {
             "no ordinary root leaks into the journal object ({root} present)"
         );
     }
-    let length = [
-        "p11_entry_journal_length",
-        "p11_return_journal_length",
-    ];
+    let length = ["p11_entry_journal_length", "p11_return_journal_length"];
     if p0 {
         for root in length {
             assert!(
@@ -17200,8 +17197,7 @@ fn keymeta_task2_length_capture_off_mode_identity_and_routing() {
     );
     // The shared evidence vocabulary pins the grown cell count.
     assert!(
-        read("crates/ebpf-common/src/lib.rs")
-            .contains("pub const EVIDENCE_CELLS: u32 = 11;"),
+        read("crates/ebpf-common/src/lib.rs").contains("pub const EVIDENCE_CELLS: u32 = 11;"),
         "EVIDENCE_CELLS pins the two length cells"
     );
 }

@@ -880,11 +880,10 @@ pub fn run(
     identity_backend_explicit: bool,
     caller_metadata: crate::cli::CallerMetadataMode,
     key_operations: bool,
-    // `--key-sizes`: opt-in size inference beside `--key-operations`
-    // (spec §10.5). Programmatic callers face the same refusals as
-    // the CLI (below); the run records it on the coordinator.
-    // Task 2 BPF length capture is pending: until it lands, flag-on
-    // runs observe no lengths (sizes stay unknown).
+    // `--key-sizes`: opt-in length capture and size inference beside
+    // `--key-operations` (spec §10.5). Programmatic callers face the
+    // same refusals as the CLI (below); the run records it on the
+    // coordinator.
     key_sizes: bool,
     quiet: bool,
 ) -> Result<i32> {
@@ -903,8 +902,8 @@ pub fn run(
     if key_operations && capture == CaptureMode::Scan {
         anyhow::bail!("--key-operations requires --capture auto or native");
     }
-    // The sizes opt-in gates before any load, mirroring the parse
-    // refusals for programmatic callers (spec §10.5).
+    // The opt-in gates before any load, mirroring the parse refusals
+    // for programmatic callers (spec §10.5).
     if key_sizes && cfg!(feature = "stub-object-attributes") {
         anyhow::bail!("--key-sizes requires a FULL build (P0 omits length capture)");
     }
@@ -1508,11 +1507,10 @@ fn run_with_terminal_budget(
     // start when set (scan pairings and omitted builds already refused
     // at the run entry); the run stays ordinary otherwise.
     key_operations: bool,
-    // `--key-sizes`: size inference rides the linked journal start when
-    // set (spec §10.5; refused without `--key-operations` at the run
-    // entry). Recorded on the coordinator; the lane reads it there.
-    // Task 2 BPF length capture is pending: until it lands, flag-on
-    // runs observe no lengths.
+    // `--key-sizes`: length capture and size inference ride the linked
+    // journal start when set (spec §10.5; refused without
+    // `--key-operations` at the run entry). Recorded on the
+    // coordinator; the lane reads it there.
     key_sizes: bool,
 ) -> Result<i32> {
     let (engine_scope, numbering) = scope.into().resolve()?;
@@ -6084,7 +6082,9 @@ fn start_semantic_lane(
         return fallback_shell(coordinator, scope, backend, scan_subset);
     }
     if key_operations {
-        let spec = crate::attach::journal::JournalSpec;
+        let spec = crate::attach::journal::JournalSpec {
+            key_sizes: coordinator.key_sizes_requested(),
+        };
         // Guard refusals at the mints disclose and end the startup
         // here, exactly as without the flag: only a refused journal
         // *start* retries ordinary, never a refused subset. The
@@ -6274,7 +6274,7 @@ fn note_key_operations_subset_refused(
 /// causes win over the coarse live refusal so a missing pair or a
 /// build without the object is never hidden behind it.
 fn key_operations_refusal_reason(refusal: &crate::inventory_semantics::SemanticRefusal) -> String {
-    if let Err(error) = crate::attach::journal::JournalSpec.prepare() {
+    if let Err(error) = (crate::attach::journal::JournalSpec { key_sizes: false }).prepare() {
         return format!("{error:#}");
     }
     key_operations_refusal_reason_from(crate::attach::journal_pair_preflight(), refusal)

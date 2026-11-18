@@ -861,7 +861,7 @@ fn object_producer_find_emits_result_cell_not_array_base() {
     let source = bpf_source();
     let returned = source_between(
         &source,
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // The Find section is populated on the return path (bounded element
@@ -920,7 +920,7 @@ fn object_producer_derive_return_requires_s1_match() {
     let source = bpf_source();
     let returned = source_between(
         &source,
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // The S1 return-time mechanism read supplies Derive return evidence,
@@ -971,7 +971,7 @@ fn object_producer_publication_lifts_gate_only_on_attested_lane() {
     // 368-byte reservation and never touch the tail.
     let returned = source_between(
         &source,
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     assert!(
@@ -1033,7 +1033,7 @@ fn object_marker_arms_only_under_allowlisted_policy() {
     let entry = source_between(
         &source,
         "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
     );
     // The seed starts ordinary: no marker without the policy branch.
     assert!(
@@ -1099,7 +1099,7 @@ fn object_kem_entry_runs_only_through_the_shared_adapter() {
     let entry = source_between(
         &source,
         "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
     );
     assert_eq!(
         entry.matches("object_entry_kem(").count(),
@@ -1142,7 +1142,7 @@ fn object_kem_policy_and_flavor_zero_new_reads() {
     let entry = source_between(
         &source,
         "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
     );
     assert!(
         entry.contains("object_required: 0,"),
@@ -2078,7 +2078,7 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
     // OutputFailed-only.
     let roots =
         std::fs::read_to_string("crates/ebpf/src/journal_roots.rs").expect("read journal roots");
-    let journal = source_between(&roots, "if !unsafe { continuity_joins", "let Some(reason)");
+    let journal = source_between(&roots, "let joined = unsafe { continuity_joins", "let Some(reason)");
     assert!(
         refused_join_accounting_guards_hold(journal),
         "journal copy: refused arm must guard exactly one unmatched and one semantic bump from the helper"
@@ -3360,6 +3360,14 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// the completed-entry switched bit, plus their comment lines):
 /// 152253 B, measured with this same lexer on the integrated source;
 /// the previous pin matches its parent.
+/// Re-baselined for v0.8.0 keymeta Task 2 length evidence (the only
+/// BPF source changes: the journal-gated EVIDENCE_START stash map,
+/// the length_return_abandon helper plus its stub, the LENGTH const
+/// parameter on p11_return_impl with the abandon arms and the
+/// JournalEndLength/JournalEndFull dispatch monomorphizations, and
+/// the ReturnPayload::LENGTH const, plus their comment lines):
+/// 154859 B, measured with this same lexer on the integrated source;
+/// the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3369,8 +3377,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            152253,
-            "ca116a0809f161fe26b7c89486a36495e85f68b05a815c90e469e30ac786e08f"
+            154859,
+            "ebeeca21e2f87c09a662236c43c01fe14ddf42c068674bcc404b07c78a95b02a"
         ),
         "stripped BPF dump must stay byte-identical"
     );

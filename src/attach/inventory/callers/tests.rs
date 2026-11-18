@@ -90,7 +90,15 @@ fn map_fixture() -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
             1,
             0,
         ),
-        ("EVIDENCE", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 9, 0),
+        (
+            "EVIDENCE",
+            K::PerCpuArray,
+            MapType::PerCpuArray,
+            4,
+            8,
+            11,
+            0,
+        ),
         ("COUNTERS", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 5, 0),
         (
             "PRODUCED",

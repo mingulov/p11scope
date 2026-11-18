@@ -2357,7 +2357,7 @@ mod tests {
                 "COUNTER_HEALTH",
                 native_map(BPF_MAP_TYPE_PERCPU_ARRAY, 4, 8, 2),
             ),
-            ("EVIDENCE", native_map(BPF_MAP_TYPE_PERCPU_ARRAY, 4, 8, 9)),
+            ("EVIDENCE", native_map(BPF_MAP_TYPE_PERCPU_ARRAY, 4, 8, 11)),
             ("OWNER_CTL", native_map(BPF_MAP_TYPE_ARRAY, 4, 56, 1)),
             ("COOKIE_CTL", native_map(BPF_MAP_TYPE_ARRAY, 4, 40, 1)),
             ("ROOT_CTL", native_map(BPF_MAP_TYPE_ARRAY, 4, 64, 1)),

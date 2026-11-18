@@ -19,7 +19,12 @@
 //! `function ordinal + 1` convention shared by START markers, H7 tails and
 //! the static capture descriptors.
 
+use crate::evidence_table::{
+    evidence_position, LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR, LENGTH_STATUS_OK,
+    LENGTH_STATUS_UNAVAILABLE, LENGTH_TRAILER_VERSION,
+};
 use crate::instance;
+use crate::object_flow::LengthReturnVerdict;
 use crate::object_policy::object_descriptor;
 use crate::object_wire::{
     valid_attribute_list, validate_object_tail, ObjectDescriptorWire, ObjectEventRecord,
@@ -36,12 +41,19 @@ pub const JOURNAL_BEGIN_BYTES: usize = 224;
 pub const JOURNAL_END_FULL_BYTES: usize = 632;
 pub const JOURNAL_END_COMPACT_BYTES: usize = 472;
 pub const JOURNAL_ABANDON_BYTES: usize = 64;
+/// The END+length form (spec §8.3): the full END plus the 16-byte
+/// length trailer. Emitted only by the journal length programs under
+/// `--key-sizes`; dispatch is by exact length only.
+pub const JOURNAL_END_LENGTH_BYTES: usize = 648;
+/// The 16-byte length trailer: version, kind, status, reserved, value.
+pub const LENGTH_TRAILER_BYTES: usize = 16;
 
 /// Ring occupancy per record form, including the 8-byte ring header.
 pub const JOURNAL_BEGIN_RING_BYTES: usize = JOURNAL_BEGIN_BYTES + 8;
 pub const JOURNAL_END_FULL_RING_BYTES: usize = JOURNAL_END_FULL_BYTES + 8;
 pub const JOURNAL_END_COMPACT_RING_BYTES: usize = JOURNAL_END_COMPACT_BYTES + 8;
 pub const JOURNAL_ABANDON_RING_BYTES: usize = JOURNAL_ABANDON_BYTES + 8;
+pub const JOURNAL_END_LENGTH_RING_BYTES: usize = JOURNAL_END_LENGTH_BYTES + 8;
 
 /// Journal record kinds.
 pub const JOURNAL_KIND_BEGIN: u8 = 1;
@@ -88,6 +100,37 @@ pub struct JournalEndFull {
     pub payload: ObjectEventRecord,
 }
 
+/// Unvalidated frozen 16-byte length trailer (spec §8.3): the version,
+/// the S/V evidence kind, the OK/unavailable status, four reserved
+/// bytes (doubling as alignment before the word), and the length word
+/// (zero unless the status is OK). Reserved bytes and the
+/// unavailable-zero rule are validated by [`validate_end`]; the kind
+/// additionally matches the endpoint's evidence row. Like the other
+/// journal wire types, deliberately no `Debug`.
+///
+/// A BPF producer initializes it in reserved ring storage beside the
+/// END, never on its stack.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LengthTrailer {
+    pub version: u16,
+    pub kind: u8,
+    pub status: u8,
+    pub reserved: [u8; 4],
+    pub value: u64,
+}
+
+/// Unvalidated frozen 648-byte END+length: the full END followed by
+/// the length trailer. No `Debug`: payload words are private. Same
+/// reserve-and-fill emission rule as [`JournalEndFull`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct JournalEndLength {
+    pub header: JournalEndHeader,
+    pub payload: ObjectEventRecord,
+    pub trailer: LengthTrailer,
+}
+
 // Pin the production ABI, including the inherited private continuity and
 // object tail. Header field boundaries and the last payload word account for
 // every byte: no implicit header, inter-record or trailing padding is allowed.
@@ -127,6 +170,28 @@ const _: () = {
     assert!(
         offset_of!(JournalEndFull, payload) + size_of::<ObjectEventRecord>()
             == size_of::<JournalEndFull>()
+    );
+
+    assert!(size_of::<LengthTrailer>() == LENGTH_TRAILER_BYTES);
+    assert!(align_of::<LengthTrailer>() == 8);
+    assert!(offset_of!(LengthTrailer, version) == 0);
+    assert!(offset_of!(LengthTrailer, kind) == 2);
+    assert!(offset_of!(LengthTrailer, status) == 3);
+    assert!(offset_of!(LengthTrailer, reserved) == 4);
+    assert!(offset_of!(LengthTrailer, value) == 8);
+    assert!(offset_of!(LengthTrailer, value) + size_of::<u64>() == size_of::<LengthTrailer>());
+
+    assert!(size_of::<JournalEndLength>() == JOURNAL_END_LENGTH_BYTES);
+    assert!(align_of::<JournalEndLength>() == 8);
+    assert!(offset_of!(JournalEndLength, header) == 0);
+    assert!(offset_of!(JournalEndLength, payload) == JOURNAL_COMMON_BYTES);
+    assert!(
+        offset_of!(JournalEndLength, trailer)
+            == JOURNAL_COMMON_BYTES + size_of::<ObjectEventRecord>()
+    );
+    assert!(
+        offset_of!(JournalEndLength, trailer) + size_of::<LengthTrailer>()
+            == size_of::<JournalEndLength>()
     );
 };
 
@@ -332,12 +397,13 @@ impl core::fmt::Debug for ValidatedJournalBegin {
     }
 }
 
-/// One validated END record (full 632-byte or compact 472-byte form).
-/// Constructible only through [`validate_end`]. Holds raw target words:
-/// deliberately redacted `Debug`.
+/// One validated END record (full 632-byte, compact 472-byte, or
+/// END+length 648-byte form). Constructible only through
+/// [`validate_end`]. Holds raw target words: deliberately redacted
+/// `Debug`.
 #[derive(Clone, Copy)]
 pub struct ValidatedJournalEnd {
-    raw: [u8; JOURNAL_END_FULL_BYTES],
+    raw: [u8; JOURNAL_END_LENGTH_BYTES],
     raw_len: usize,
 }
 
@@ -355,6 +421,34 @@ impl ValidatedJournalEnd {
     /// Whether this END arrived in the compact form.
     pub fn compact(&self) -> bool {
         self.raw_len == JOURNAL_END_COMPACT_BYTES
+    }
+
+    /// Whether this END arrived in the END+length form (carrying the
+    /// validated 16-byte trailer past the 608-byte payload).
+    pub fn length(&self) -> bool {
+        self.raw_len == JOURNAL_END_LENGTH_BYTES
+    }
+
+    /// The validated length trailer, present exactly on the END+length
+    /// form. The bytes were validated at construction; this re-reads
+    /// the pinned offsets without re-matching the row.
+    pub fn length_trailer(&self) -> Option<LengthTrailer> {
+        if !self.length() {
+            return None;
+        }
+        let base = JOURNAL_END_FULL_BYTES;
+        Some(LengthTrailer {
+            version: journal_u16(&self.raw, base),
+            kind: self.raw[base + 2],
+            status: self.raw[base + 3],
+            reserved: [
+                self.raw[base + 4],
+                self.raw[base + 5],
+                self.raw[base + 6],
+                self.raw[base + 7],
+            ],
+            value: journal_u64(&self.raw, base + 8),
+        })
     }
 
     /// Whether the object tail is absent (all-zero tail, no object row).
@@ -397,7 +491,9 @@ impl ValidatedJournalEnd {
     /// The reconstructed exact 608-byte H7 completed payload. For the full
     /// form this is the carried payload; for the compact form it is the
     /// carried prefix/suffix with the 160 omitted zero bytes restored, so
-    /// both forms yield byte-identical payloads.
+    /// both forms yield byte-identical payloads. For the END+length form
+    /// this is the carried 608-byte prefix (the trailer past it is read
+    /// through [`ValidatedJournalEnd::length_trailer`], never here).
     pub fn payload_bytes(&self) -> [u8; OBJECT_TAIL_BYTES + 368] {
         let mut payload = [0u8; OBJECT_TAIL_BYTES + 368];
         if self.compact() {
@@ -407,6 +503,8 @@ impl ValidatedJournalEnd {
             payload[COMPACT_OMIT_END..].copy_from_slice(
                 &self.raw[JOURNAL_COMMON_BYTES + COMPACT_OMIT_START..self.raw_len],
             );
+        } else if self.length() {
+            payload.copy_from_slice(&self.raw[JOURNAL_COMMON_BYTES..JOURNAL_END_FULL_BYTES]);
         } else {
             payload.copy_from_slice(&self.raw[JOURNAL_COMMON_BYTES..self.raw_len]);
         }
@@ -578,18 +676,24 @@ pub fn validate_begin(
     Some(ValidatedJournalBegin { bytes: owned })
 }
 
-/// Validate one complete END record in either the full (632-byte) or the
-/// compact (472-byte) form. Both forms must reconstruct the exact same
-/// 608-byte H7 completed payload: event type CALL, affiliation at most 1,
-/// and either a validated all-zero absent tail (only with `descriptor`
-/// `None` and the absent bit set) or the exact H7 tail validator against
-/// the frozen row. A tracked END has a nonzero key; only UNJOURNALED has
-/// both key words zero and is delivered through ordinary transport.
+/// Validate one complete END record in the full (632-byte), compact
+/// (472-byte) or END+length (648-byte) form. Every form must
+/// reconstruct the exact same 608-byte H7 completed payload: event
+/// type CALL, affiliation at most 1, and either a validated all-zero
+/// absent tail (only with `descriptor` `None` and the absent bit set)
+/// or the exact H7 tail validator against the frozen row. The
+/// END+length form additionally validates its 16-byte trailer against
+/// the call's evidence row. A tracked END has a nonzero key; only
+/// UNJOURNALED has both key words zero and is delivered through
+/// ordinary transport.
 pub fn validate_end(
     bytes: &[u8],
     descriptor: Option<&ObjectDescriptorWire>,
 ) -> Option<ValidatedJournalEnd> {
-    if bytes.len() != JOURNAL_END_FULL_BYTES && bytes.len() != JOURNAL_END_COMPACT_BYTES {
+    if bytes.len() != JOURNAL_END_FULL_BYTES
+        && bytes.len() != JOURNAL_END_COMPACT_BYTES
+        && bytes.len() != JOURNAL_END_LENGTH_BYTES
+    {
         return None;
     }
     if !valid_common_header_shape(bytes, bytes.len(), JOURNAL_KIND_END)
@@ -598,7 +702,7 @@ pub fn validate_end(
         return None;
     }
     let tail_absent = bytes[5] & JOURNAL_END_TAIL_ABSENT != 0;
-    let mut owned = [0u8; JOURNAL_END_FULL_BYTES];
+    let mut owned = [0u8; JOURNAL_END_LENGTH_BYTES];
     owned[..bytes.len()].copy_from_slice(bytes);
     let end = ValidatedJournalEnd {
         raw: owned,
@@ -622,7 +726,83 @@ pub fn validate_end(
             return None;
         }
     }
+    if end.length() {
+        // The trailer measures the completed call named by the
+        // payload's target function (payload offset 108: thirteen
+        // 8-byte Event words, then slot and target function).
+        let function = journal_u32(&payload, 108);
+        validate_length_trailer(&bytes[JOURNAL_END_FULL_BYTES..], function)?;
+    }
     Some(end)
+}
+
+/// Build the length trailer for one return verdict under the given
+/// endpoint kind (resolved by the caller): OK carries the word, every
+/// other verdict carries status unavailable with a zero value. The
+/// BPF length return builds every trailer through this mapping, so
+/// the producer side matches [`validate_end`].
+pub fn length_trailer_for_verdict(kind: u8, verdict: LengthReturnVerdict) -> LengthTrailer {
+    let (status, value) = match verdict {
+        LengthReturnVerdict::Value(word) => (LENGTH_STATUS_OK, word),
+        LengthReturnVerdict::Unavailable | LengthReturnVerdict::StashMismatch => {
+            (LENGTH_STATUS_UNAVAILABLE, 0)
+        }
+    };
+    LengthTrailer {
+        version: LENGTH_TRAILER_VERSION,
+        kind,
+        status,
+        reserved: [0; 4],
+        value,
+    }
+}
+
+/// Validate one 16-byte length trailer against the completed call's
+/// evidence row: exact version, finite kind and status, zero
+/// reserved, zero value unless OK, and the kind matching the
+/// endpoint's S/V row. A trailer on a function without a length row
+/// (or an info row) refuses. Returns the trailer on success.
+fn validate_length_trailer(trailer: &[u8], function: u32) -> Option<LengthTrailer> {
+    if trailer.len() != LENGTH_TRAILER_BYTES {
+        return None;
+    }
+    let version = journal_u16(trailer, 0);
+    let kind = trailer[2];
+    let status = trailer[3];
+    let value = journal_u64(trailer, 8);
+    if version != LENGTH_TRAILER_VERSION {
+        return None;
+    }
+    if status != LENGTH_STATUS_OK && status != LENGTH_STATUS_UNAVAILABLE {
+        return None;
+    }
+    if status == LENGTH_STATUS_UNAVAILABLE && value != 0 {
+        return None;
+    }
+    if trailer[4..8].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let row = evidence_position(function)?;
+    if row.info {
+        return None;
+    }
+    let want = if row.length_cell_arg != ARG_NONE && row.length_scalar_arg == ARG_NONE {
+        LENGTH_KIND_SCELL
+    } else if row.length_scalar_arg != ARG_NONE && row.length_cell_arg == ARG_NONE {
+        LENGTH_KIND_VSCALAR
+    } else {
+        return None;
+    };
+    if kind != want {
+        return None;
+    }
+    Some(LengthTrailer {
+        version,
+        kind,
+        status,
+        reserved: [trailer[4], trailer[5], trailer[6], trailer[7]],
+        value,
+    })
 }
 
 /// Validate one complete 64-byte ABANDON record: exact version/length/kind,
@@ -719,14 +899,16 @@ pub fn decode_journal_record(
             let index = journal_u32(bytes, 108);
             validate_begin(bytes, live_row(index, descriptors)).map(JournalRecord::Begin)
         }
-        JOURNAL_END_FULL_BYTES | JOURNAL_END_COMPACT_BYTES => {
+        JOURNAL_END_FULL_BYTES | JOURNAL_END_COMPACT_BYTES | JOURNAL_END_LENGTH_BYTES => {
             if bytes[5] & JOURNAL_END_TAIL_ABSENT != 0 {
                 return validate_end(bytes, None).map(JournalRecord::End);
             }
-            let index = if bytes.len() == JOURNAL_END_FULL_BYTES {
-                journal_u32(bytes, JOURNAL_COMMON_BYTES + 372)
-            } else {
+            // The tail descriptor word sits at the full-form offset in
+            // both 632 and 648 (the trailer rides past the payload).
+            let index = if bytes.len() == JOURNAL_END_COMPACT_BYTES {
                 journal_u32(bytes, compact_tail_index_offset())
+            } else {
+                journal_u32(bytes, JOURNAL_COMMON_BYTES + 372)
             };
             validate_end(bytes, live_row(index, descriptors)).map(JournalRecord::End)
         }
@@ -1173,7 +1355,9 @@ mod tests {
         assert!(!end.unjournaled());
         assert_eq!(end.thread(), record.header.thread);
         assert_eq!(end.sequence(), record.header.sequence);
-        let carried = end.length_trailer().expect("the trailer rides the validated END");
+        let carried = end
+            .length_trailer()
+            .expect("the trailer rides the validated END");
         assert_eq!(carried.version, LENGTH_TRAILER_VERSION);
         assert_eq!(carried.kind, LENGTH_KIND_SCELL);
         assert_eq!(carried.status, LENGTH_STATUS_OK);
@@ -1212,10 +1396,13 @@ mod tests {
         assert_eq!(decoded.length_trailer().unwrap().value, 40);
         // Absent-tail V endpoint (C_Verify, tracked).
         let verify = tracked_absent_end_for_twin("C_Verify");
-        let verify_bytes = end_length_bytes_twin(&verify, &ok_trailer_twin(LENGTH_KIND_VSCALAR, 64));
-        let verify_end =
-            validate_end(&verify_bytes, None).expect("trailered V END validates");
-        assert_eq!(verify_end.length_trailer().unwrap().kind, LENGTH_KIND_VSCALAR);
+        let verify_bytes =
+            end_length_bytes_twin(&verify, &ok_trailer_twin(LENGTH_KIND_VSCALAR, 64));
+        let verify_end = validate_end(&verify_bytes, None).expect("trailered V END validates");
+        assert_eq!(
+            verify_end.length_trailer().unwrap().kind,
+            LENGTH_KIND_VSCALAR
+        );
         // An unavailable trailer (status 0, zero value) validates: the
         // completion stands, the length is unknown.
         let unavailable = LengthTrailer {
@@ -1251,13 +1438,20 @@ mod tests {
             ("kind 99", LengthTrailer { kind: 99, ..good }),
             (
                 "V kind at an S endpoint",
-                LengthTrailer { kind: LENGTH_KIND_VSCALAR, ..good },
+                LengthTrailer {
+                    kind: LENGTH_KIND_VSCALAR,
+                    ..good
+                },
             ),
             ("status 2", LengthTrailer { status: 2, ..good }),
             ("status 99", LengthTrailer { status: 99, ..good }),
             (
                 "nonzero value on unavailable",
-                LengthTrailer { status: LENGTH_STATUS_UNAVAILABLE, value: 1, ..good },
+                LengthTrailer {
+                    status: LENGTH_STATUS_UNAVAILABLE,
+                    value: 1,
+                    ..good
+                },
             ),
         ];
         for (name, trailer) in cases {
@@ -1338,6 +1532,34 @@ mod tests {
         assert!(decode_journal_record(&bytes[..JOURNAL_END_FULL_BYTES], &rows).is_none());
     }
 
+    /// Verdict mapping: OK carries the word under the endpoint's
+    /// kind; every other verdict carries status unavailable with a
+    /// zero value. The BPF length return builds every trailer through
+    /// this mapping, so the producer side matches the validator.
+    #[test]
+    fn length_trailer_for_verdict_maps_status_and_value() {
+        use crate::object_flow::LengthReturnVerdict;
+        for kind in [LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR] {
+            let ok = length_trailer_for_verdict(kind, LengthReturnVerdict::Value(256));
+            assert_eq!(ok.version, LENGTH_TRAILER_VERSION);
+            assert_eq!(ok.kind, kind);
+            assert_eq!(ok.status, LENGTH_STATUS_OK);
+            assert_eq!(ok.value, 256);
+            assert_eq!(ok.reserved, [0; 4]);
+            for verdict in [
+                LengthReturnVerdict::Unavailable,
+                LengthReturnVerdict::StashMismatch,
+            ] {
+                let unavailable = length_trailer_for_verdict(kind, verdict);
+                assert_eq!(unavailable.version, LENGTH_TRAILER_VERSION);
+                assert_eq!(unavailable.kind, kind);
+                assert_eq!(unavailable.status, LENGTH_STATUS_UNAVAILABLE);
+                assert_eq!(unavailable.value, 0);
+                assert_eq!(unavailable.reserved, [0; 4]);
+            }
+        }
+    }
+
     /// The trailer is exactly 16 bytes with pinned offsets; the
     /// END+length form is exactly 648 bytes (632 + 16).
     #[test]
@@ -1346,10 +1568,7 @@ mod tests {
         assert_eq!(size_of::<LengthTrailer>(), 16);
         assert_eq!(size_of::<JournalEndLength>(), JOURNAL_END_LENGTH_BYTES);
         assert_eq!(JOURNAL_END_LENGTH_BYTES, 648);
-        assert_eq!(
-            JOURNAL_END_LENGTH_RING_BYTES,
-            JOURNAL_END_LENGTH_BYTES + 8
-        );
+        assert_eq!(JOURNAL_END_LENGTH_RING_BYTES, JOURNAL_END_LENGTH_BYTES + 8);
         assert_eq!(offset_of!(LengthTrailer, version), 0);
         assert_eq!(offset_of!(LengthTrailer, kind), 2);
         assert_eq!(offset_of!(LengthTrailer, status), 3);

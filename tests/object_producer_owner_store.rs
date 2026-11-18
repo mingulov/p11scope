@@ -126,7 +126,7 @@ fn object_producer_missing_side_state_faults_before_return() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
     let returned = source_between(
         &source,
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     assert!(
@@ -380,7 +380,7 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("BPF return source");
     let dispatch = source_between(
         &source,
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn p11_return_impl<const JOURNAL: bool, const LENGTH: bool>(ctx: RetProbeContext) -> u32 {",
         "struct ReturnAccounting",
     );
     let whole_dispatch = dispatch;
@@ -393,13 +393,15 @@ fn object_producer_return_branches_preserve_owned_lifetimes() {
     let journal_dispatch = &dispatch[..ordinary_at];
     assert!(
         journal_dispatch.contains(
-            "if JOURNAL {\n        return if unsafe { (*start).object_required } == 0 {\n            journal_roots::program::ordinary_return(ctx, &key, start, flags, layout)\n        } else {\n            object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(\n                ctx, &key, start, flags, layout,\n            )\n        };\n    }"
+            "if JOURNAL {\n        return if unsafe { (*start).object_required } == 0 {\n            if LENGTH {\n                journal_roots::program::ordinary_return::<JournalEndLength>(\n                    ctx, &key, start, flags, layout,\n                )\n            } else {\n                journal_roots::program::ordinary_return::<JournalEndFull>(\n                    ctx, &key, start, flags, layout,\n                )\n            }\n        } else if LENGTH {\n            object_return::<true, JournalEndLength>(ctx, &key, start, flags, layout)\n        } else {\n            object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(\n                ctx, &key, start, flags, layout,\n            )\n        };\n    }"
         ),
         "journal dispatch must tail-route through a plain else to the journal instantiation"
     );
     for half in [
-        "journal_roots::program::ordinary_return(ctx, &key, start, flags, layout)",
+        "journal_roots::program::ordinary_return::<JournalEndFull>(",
+        "journal_roots::program::ordinary_return::<JournalEndLength>(",
         "object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(",
+        "object_return::<true, JournalEndLength>(",
     ] {
         assert_eq!(
             journal_dispatch.matches(half).count(),
@@ -2009,6 +2011,36 @@ def check_frames(data, report, diagnostic=False, wide=False, marker=False):
     report.append('frames, chains and three mutations refuse as required')
 
 
+def check_journal_frames(data, report, p0=False):
+    # Journal-object frame bound (v0.8.0 keymeta Task 2, spec section 8.5):
+    # the same unmodified 512-byte call-chain limit covers the base
+    # pair plus the length pair (FULL) or the base pair alone (P0,
+    # which omits the length programs). Map shapes ride the
+    # contracts/flavor checks, not this mode.
+    elf, raws, offsets, bodies, relocations = bodies_and_relocations(data)
+    base = ['p11_entry_journal', 'p11_return_journal']
+    length = ['p11_entry_journal_length', 'p11_return_journal_length']
+    for name in base:
+        only(bodies, name)
+    if p0:
+        for name in length:
+            matches = [key for key, symbol in bodies.items() if symbol[0] == name]
+            assert not matches, f'P0 journal must omit {name}'
+        roots = base
+    else:
+        for name in length:
+            only(bodies, name)
+        roots = base + length
+    for name in roots:
+        key = only(bodies, name)
+        total, path = longest_chain(raws, bodies, relocations, offsets, key)
+        depth = frame_of(body_of(raws, bodies, key))[0]
+        assert total <= ROOT_CHAIN_BOUND, \
+            f'{name} chain {total} exceeds {ROOT_CHAIN_BOUND}: {" -> ".join(path)}'
+        report.append(f'journal root {name}: chain={total} own-frame={depth}')
+    report.append('journal frames, chains and pair presence refuse as required')
+
+
 def check_return_fault(data, report):
     calls = fault_calls_to(data, 'p11_return')
     assert calls, 'p11_return must call the fault leaf on terminal-drain failure'
@@ -2286,6 +2318,8 @@ def main():
         check_exec_exit_fault(data, report)
     elif mode in ('scrubs', 'scrubs-wide'):
         check_scrubs(data, report, wide=mode == 'scrubs-wide')
+    elif mode in ('journal-frames', 'journal-frames-p0'):
+        check_journal_frames(data, report, p0=(mode == 'journal-frames-p0'))
     else:
         raise AssertionError(f'unknown checker mode {mode}')
     print('\n'.join(report))

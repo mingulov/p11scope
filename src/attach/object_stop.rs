@@ -8,6 +8,17 @@ use anyhow::{Context as _, Result, bail};
 use aya::Ebpf;
 use aya::maps::{HashMap, Map, MapType};
 
+/// Maps the stop scrub empties after quiescence: (name, value bytes,
+/// journal-only, own-max-entries). `OBJECT_START` scrubs on every
+/// Detailed-family object against the START capacity; `EVIDENCE_START`
+/// (v0.8.0 keymeta Task 2, spec §8.2) scrubs on journal objects
+/// against its own (flag-dependent) capacity. The scrub below consumes
+/// this table; the default suite pins it exactly.
+pub(super) const STOP_SCRUB_TABLE: [(&str, usize, bool, bool); 2] = [
+    ("OBJECT_START", 432, false, false),
+    ("EVIDENCE_START", 32, true, true),
+];
+
 pub(super) fn scrub_after_quiescence(ebpf: &mut Ebpf, gate: &StopGate) -> Result<usize> {
     if !gate.quiescent() {
         bail!("OBJECT_START scrub requires proven native quiescence");
@@ -16,27 +27,50 @@ pub(super) fn scrub_after_quiescence(ebpf: &mut Ebpf, gate: &StopGate) -> Result
         Map::HashMap(data) => read_map_metadata("START", data)?.max_entries,
         _ => bail!("unexpected START map variant for object scrub"),
     };
-    scrub_map_after_quiescence(
-        ebpf.map_mut("OBJECT_START")
-            .context("OBJECT_START map for stop scrub")?,
-        gate,
-        start_max,
-    )
+    let journal = ebpf.map("JOURNAL_START").is_some();
+    let mut cleared = 0;
+    for (name, width, journal_only, own_max) in STOP_SCRUB_TABLE {
+        if journal_only && !journal {
+            continue;
+        }
+        let map = ebpf
+            .map_mut(name)
+            .with_context(|| format!("{name} map for stop scrub"))?;
+        let max_entries = if own_max {
+            match &*map {
+                Map::HashMap(data) => read_map_metadata(name, data)?.max_entries,
+                _ => bail!("unexpected {name} map variant for stop scrub"),
+            }
+        } else {
+            start_max
+        };
+        cleared += match width {
+            432 => scrub_named_map_after_quiescence::<432>(map, gate, max_entries, name)?,
+            32 => scrub_named_map_after_quiescence::<32>(map, gate, max_entries, name)?,
+            _ => bail!("unknown stop-scrub width for {name}"),
+        };
+    }
+    Ok(cleared)
 }
 
-fn scrub_map_after_quiescence(map: &mut Map, gate: &StopGate, max_entries: u32) -> Result<usize> {
+fn scrub_named_map_after_quiescence<const N: usize>(
+    map: &mut Map,
+    gate: &StopGate,
+    max_entries: u32,
+    name: &'static str,
+) -> Result<usize> {
     if !gate.quiescent() {
-        bail!("OBJECT_START scrub requires proven native quiescence");
+        bail!("{name} scrub requires proven native quiescence");
     }
     let Map::HashMap(data) = &*map else {
-        bail!("unexpected OBJECT_START map variant for stop scrub");
+        bail!("unexpected {name} map variant for stop scrub");
     };
     validate_map_metadata(
-        "OBJECT_START",
+        name,
         data,
-        map_metadata(MapType::Hash, 16, 432, max_entries, 0),
+        map_metadata(MapType::Hash, 16, N as u32, max_entries, 0),
     )?;
-    let mut table: HashMap<_, [u8; 16], [u8; 432]> = HashMap::try_from(map)?;
+    let mut table: HashMap<_, [u8; 16], [u8; N]> = HashMap::try_from(map)?;
     // Restart at the first key after removal. Deleting the iterator's current
     // key would make GET_NEXT_KEY restart too; Q prevents producer insertion,
     // and the actual capacity bounds both visits and total retirement work.
@@ -45,37 +79,37 @@ fn scrub_map_after_quiescence(map: &mut Map, gate: &StopGate, max_entries: u32) 
             .keys()
             .next()
             .transpose()
-            .context("enumerating stopped OBJECT_START")?
+            .with_context(|| format!("enumerating stopped {name}"))?
         else {
             return Ok(cleared as usize);
         };
         if !gate.quiescent() {
-            bail!("OBJECT_START scrub lost native quiescence");
+            bail!("{name} scrub lost native quiescence");
         }
         // BPF_EXIST forbids manufacturing an owner. Zero and verify before
         // removal so a failed delete leaves no private pointer/capacity bytes.
         table
-            .insert(key, [0; 432], 2)
-            .context("zeroing stopped OBJECT_START")?;
+            .insert(key, [0; N], 2)
+            .with_context(|| format!("zeroing stopped {name}"))?;
         if table
             .get(&key, 0)
-            .context("reading stopped OBJECT_START zero")?
-            != [0; 432]
+            .with_context(|| format!("reading stopped {name} zero"))?
+            != [0; N]
         {
-            bail!("stopped OBJECT_START zero readback differs");
+            bail!("stopped {name} zero readback differs");
         }
         table
             .remove(&key)
-            .context("removing stopped OBJECT_START")?;
+            .with_context(|| format!("removing stopped {name}"))?;
     }
     if table
         .keys()
         .next()
         .transpose()
-        .context("checking stopped OBJECT_START emptiness")?
+        .with_context(|| format!("checking stopped {name} emptiness"))?
         .is_some()
     {
-        bail!("OBJECT_START remains populated after its exact capacity bound");
+        bail!("{name} remains populated after its exact capacity bound");
     }
     Ok(max_entries as usize)
 }
@@ -132,7 +166,10 @@ mod tests {
         let (mut object, _gate_map, gate, retained) = fixture()?;
         gate.request_stop();
         assert!(gate.quiescent());
-        assert_eq!(scrub_map_after_quiescence(&mut object, &gate, 2)?, 2);
+        assert_eq!(
+            scrub_named_map_after_quiescence::<432>(&mut object, &gate, 2, "OBJECT_START")?,
+            2
+        );
         drop(object);
         assert_eq!(
             retained.keys().count(),
@@ -140,10 +177,11 @@ mod tests {
             "retained FD must observe complete removal"
         );
         assert_eq!(
-            scrub_map_after_quiescence(
+            scrub_named_map_after_quiescence::<432>(
                 &mut Map::HashMap(create_map("OBJECT_START", 2)?),
                 &gate,
-                2
+                2,
+                "OBJECT_START"
             )?,
             0
         );
@@ -206,7 +244,10 @@ mod tests {
             let mut table: Array<_, u64> = Array::try_from(&mut gate_map)?;
             table.set(0, word, 0)?;
             assert!(!gate.quiescent());
-            assert!(scrub_map_after_quiescence(&mut object, &gate, 2).is_err());
+            assert!(
+                scrub_named_map_after_quiescence::<432>(&mut object, &gate, 2, "OBJECT_START")
+                    .is_err()
+            );
             assert_eq!(retained.get(&[0x11; 16], 0)?, [0xa5; 432]);
             assert_eq!(retained.get(&[0x22; 16], 0)?, [0x5a; 432]);
             assert_eq!(retained.keys().count(), 2);
@@ -1140,7 +1181,9 @@ mod tests {
             std::io::Error::last_os_error()
         );
         gate.request_stop();
-        assert!(scrub_map_after_quiescence(&mut object, &gate, 2).is_err());
+        assert!(
+            scrub_named_map_after_quiescence::<432>(&mut object, &gate, 2, "OBJECT_START").is_err()
+        );
         assert_eq!(retained.get(&[0x11; 16], 0)?, [0xa5; 432]);
         Ok(())
     }

@@ -776,9 +776,11 @@ fn native_semantic_resource_final_types_pinned() {
     // (four u64s, one u32 and padding), and its Option is48 B. The per-open
     // ledger charge uses the complete size_of::<OpenEntry>(), including
     // padding; population and pool caps stay fixed.
+    // v0.8.0 keymeta Task 2 grows the validated END by the 16-byte length
+    // trailer (632 to 648, spec section 8.3); the retained END grows with it.
     let open_bytes = crate::semantics_objects::journal::JournalAdapter::open_entry_size_for_test();
-    if open_bytes != 1160 + 48 {
-        mismatches.push(("journal::OpenEntry", open_bytes, 1160 + 48));
+    if open_bytes != 1160 + 48 + 16 {
+        mismatches.push(("journal::OpenEntry", open_bytes, 1160 + 48 + 16));
     }
     pin!(
         crate::semantic_capture::TickOutcome,

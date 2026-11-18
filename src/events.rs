@@ -1484,7 +1484,7 @@ impl<S: RecordSource> EventDrain<S> {
     ) -> DispatchPoll {
         use p11scope_ebpf_common::object_journal::{
             JOURNAL_ABANDON_BYTES, JOURNAL_BEGIN_BYTES, JOURNAL_END_COMPACT_BYTES,
-            JOURNAL_END_FULL_BYTES,
+            JOURNAL_END_FULL_BYTES, JOURNAL_END_LENGTH_BYTES,
         };
         let mut left = quantum;
         let mut attempted = 0usize;
@@ -1510,6 +1510,7 @@ impl<S: RecordSource> EventDrain<S> {
                 JOURNAL_BEGIN_BYTES
                 | JOURNAL_END_FULL_BYTES
                 | JOURNAL_END_COMPACT_BYTES
+                | JOURNAL_END_LENGTH_BYTES
                 | JOURNAL_ABANDON_BYTES => {
                     decode_journal_record(&item, descriptors).and_then(|record| {
                         if let JournalRecord::End(end) = &record {
@@ -1883,7 +1884,7 @@ pub(crate) fn poll_dispatched_records_to_position<S: BoundedRecordSource>(
 ) -> Result<(bool, bool)> {
     use p11scope_ebpf_common::object_journal::{
         JOURNAL_ABANDON_BYTES, JOURNAL_BEGIN_BYTES, JOURNAL_END_COMPACT_BYTES,
-        JOURNAL_END_FULL_BYTES,
+        JOURNAL_END_FULL_BYTES, JOURNAL_END_LENGTH_BYTES,
     };
     let mut left = quantum;
     loop {
@@ -1904,6 +1905,7 @@ pub(crate) fn poll_dispatched_records_to_position<S: BoundedRecordSource>(
                     JOURNAL_BEGIN_BYTES
                     | JOURNAL_END_FULL_BYTES
                     | JOURNAL_END_COMPACT_BYTES
+                    | JOURNAL_END_LENGTH_BYTES
                     | JOURNAL_ABANDON_BYTES => match decode_journal_record(&item, descriptors) {
                         Some(JournalRecord::End(end)) if end.unjournaled() => {
                             project_journal_end_payload(&end, descriptors)
@@ -5966,7 +5968,11 @@ mod tests {
         };
         let function = tests::function_id("C_Sign");
         let begin = tests::begin_bytes(1, 1, function, 0);
-        let full = tests::end_bytes_absent(&begin, 0, tests::ENTRY_NS + 100);
+        let mut full = tests::end_bytes_absent(&begin, 0, tests::ENTRY_NS + 100);
+        // The fixture leaves the payload's target function zero; the
+        // producer fills it from START, and the trailer row-match reads
+        // it (payload offset 108: Event.target_function).
+        full[24 + 108..24 + 112].copy_from_slice(&function.to_le_bytes());
         let trailer = LengthTrailer {
             version: LENGTH_TRAILER_VERSION,
             kind: LENGTH_KIND_SCELL,
@@ -5978,10 +5984,7 @@ mod tests {
         // integer fields; its exact 16-byte layout is pinned in
         // ebpf-common, and the journal validator re-checks it below.
         let trailer_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                (&trailer as *const LengthTrailer).cast::<u8>(),
-                16,
-            )
+            std::slice::from_raw_parts((&trailer as *const LengthTrailer).cast::<u8>(), 16)
         };
         let mut wire = vec![0u8; JOURNAL_END_LENGTH_BYTES];
         wire[..JOURNAL_END_FULL_BYTES].copy_from_slice(&full);
@@ -6026,7 +6029,13 @@ mod tests {
                 ControlFlow::Continue(())
             },
         );
-        assert_eq!(poll, DispatchPoll { attempted: 1, backlog: false });
+        assert_eq!(
+            poll,
+            DispatchPoll {
+                attempted: 1,
+                backlog: false
+            }
+        );
         assert_eq!(journaled, 1);
         assert_eq!(drain.malformed(), 0);
         // Bounded poll routes identically.
@@ -6093,7 +6102,10 @@ mod tests {
                 );
                 assert_eq!(
                     poll,
-                    DispatchPoll { attempted: wires.len(), backlog: false }
+                    DispatchPoll {
+                        attempted: wires.len(),
+                        backlog: false
+                    }
                 );
             }
             assert_eq!(drain.malformed(), wires.len() as u64, "bounded={bounded}");
@@ -6129,13 +6141,7 @@ mod tests {
         assert_eq!(event_368.len(), 368);
         let record_608 = ordinary_object_transport_record(12);
         assert_eq!(record_608.len(), 608);
-        let source = CursorScript::scripted([
-            begin,
-            full.to_vec(),
-            compact,
-            event_368,
-            record_608,
-        ]);
+        let source = CursorScript::scripted([begin, full.to_vec(), compact, event_368, record_608]);
         let mut drain = EventDrain::over(source);
         let mut journaled = 0;
         let mut ordinaries = 0;
@@ -6151,7 +6157,13 @@ mod tests {
                 ControlFlow::Continue(())
             },
         );
-        assert_eq!(poll, DispatchPoll { attempted: 5, backlog: false });
+        assert_eq!(
+            poll,
+            DispatchPoll {
+                attempted: 5,
+                backlog: false
+            }
+        );
         assert_eq!(journaled, 3, "BEGIN + END + compact END route journal");
         assert_eq!(ordinaries, 2, "368 + 608 route ordinary");
         assert_eq!(drain.malformed(), 0);

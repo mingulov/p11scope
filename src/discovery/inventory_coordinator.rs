@@ -5908,16 +5908,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if !self.semantic_bindings.foldable(id) {
                 continue;
             }
+            // The stop and credit gate stays pure: a re-queued row
+            // keeps its binder evidence until its own fold runs, so
+            // this check precedes the clearing below.
+            if self.stopped || credits == 0 {
+                self.rendered_callers.insert(id);
+                self.rendered_callers.extend(rest.map(|(id, _)| id));
+                break;
+            }
             // A pending binder row still needs its incarnation snapshot;
             // keep the record until that row decides.
             let plan = release.as_ref().expect("a candidate implies a plan");
             if !self.binder.apply_retired_release(plan, id) {
                 continue;
-            }
-            if self.stopped || credits == 0 {
-                self.rendered_callers.insert(id);
-                self.rendered_callers.extend(rest.map(|(id, _)| id));
-                break;
             }
             if folded.is_none() {
                 folded = Some(self.fold_context(subset));

@@ -39310,10 +39310,7 @@ fn merge_scanned_module_caps_tables_per_module_with_counted_overflow() {
         "a dropped static table re-opens finished-ness"
     );
     // Identical tables re-merge free: nothing appends, nothing drops.
-    let dropped = merge_scanned_module(
-        &mut merged,
-        module((0..cap).map(table).collect(), vec![]),
-    );
+    let dropped = merge_scanned_module(&mut merged, module((0..cap).map(table).collect(), vec![]));
     assert_eq!(dropped, 0);
     assert_eq!(merged[0].tables.len(), MAX_MERGED_TABLES_PER_MODULE);
     // Under the cap nothing changes: fresh tables still append free.

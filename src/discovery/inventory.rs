@@ -1102,7 +1102,7 @@ impl Engine {
             .map(|module| module.scanned.clone())
             .collect();
         for module in facts.modules {
-            merge_scanned_module(&mut modules, module);
+            merge_scanned_module_counted(&mut modules, module, &mut self.merge_tables_dropped);
         }
         pins.reset_scan_pin_claims();
         let candidate = self.live_candidate(pins, modules, Vec::new())?;

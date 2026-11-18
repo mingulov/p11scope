@@ -501,6 +501,10 @@ pub struct Engine {
     learned_event_loss: u64,
     /// Learned candidates refused by the per-capture file cap.
     learned_cap_skipped: u64,
+    /// Fresh tables the per-module merge cap dropped (counted overflow,
+    /// never silent). Drops are only possible past 64 distinct tables
+    /// for one module, far above any legitimate provider surface.
+    merge_tables_dropped: u64,
     /// A learned staging, or an owned member's bounded rescan after an
     /// incomplete scan, owes an expedited discovery frame so attach lands
     /// promptly instead of at the next cadence boundary.
@@ -12384,7 +12388,42 @@ fn refreshed_scans_equal(
         )
 }
 
-fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
+/// Tables kept per module by `merge_scanned_module`. A provider file
+/// holds a legacy function list plus a handful of versioned interface
+/// tables (single digits); 64 is far above any legitimate surface while
+/// bounding run-long union growth (the run-learned store already caps
+/// modules, not tables per module). Past it, fresh tables drop and count
+/// instead of appending.
+const MAX_MERGED_TABLES_PER_MODULE: usize = 64;
+
+/// Truncate an over-cap module before it enters the store: tables past
+/// the cap drop and count, interfaces that pointed at them keep their
+/// row with no table link, and the finished claim clears (a truncating
+/// skip, like any other: the stored module no longer spans the whole
+/// surface, so the sole-complete grant must not fire on it).
+fn truncate_module_tables_to_cap(module: &mut ScannedModule) -> u64 {
+    if module.tables.len() <= MAX_MERGED_TABLES_PER_MODULE {
+        return 0;
+    }
+    let dropped = module.tables.len() - MAX_MERGED_TABLES_PER_MODULE;
+    module.tables.truncate(MAX_MERGED_TABLES_PER_MODULE);
+    for interface in &mut module.interfaces {
+        if interface
+            .table
+            .is_some_and(|index| index >= MAX_MERGED_TABLES_PER_MODULE)
+        {
+            interface.table = None;
+        }
+    }
+    module.tables_scan_finished = false;
+    u64::try_from(dropped).unwrap_or(u64::MAX)
+}
+
+/// Union `incoming` into its same-file module, or file it beside its
+/// ABI-mismatched twin. Returns how many fresh tables the per-module
+/// cap dropped (counted overflow, never silent): callers accumulate it
+/// on the engine. Identical tables dedup free and never count.
+fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) -> u64 {
     let Some(position) = modules.iter().position(|module| {
         module.view == incoming.view
             && module.mount_namespace == incoming.mount_namespace
@@ -12392,15 +12431,17 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
             && module.path == incoming.path
             && module.pre_copy_up == incoming.pre_copy_up
     }) else {
+        let dropped = truncate_module_tables_to_cap(&mut incoming);
         modules.push(incoming);
-        return;
+        return dropped;
     };
     if matches!(
         (modules[position].decoder_abi, incoming.decoder_abi),
         (Some(existing), Some(incoming)) if existing != incoming
     ) {
+        let dropped = truncate_module_tables_to_cap(&mut incoming);
         modules.push(incoming);
-        return;
+        return dropped;
     }
     let existing = &mut modules[position];
     if existing.decoder_abi.is_none() {
@@ -12439,8 +12480,9 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
             existing.exports.push(export);
         }
     }
-    let mut table_indices = Vec::new();
+    let mut table_indices: Vec<Option<usize>> = Vec::new();
     let mut typed_live_tables = BTreeSet::new();
+    let mut dropped = 0u64;
     for (incoming_index, table) in incoming.tables.drain(..).enumerate() {
         let typed_live = table.live_return
             && !table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
@@ -12474,25 +12516,36 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 // never by union. This needs a writable table and lasts
                 // until that rescan.
                 existing.tables[index].extension_impossible |= table.extension_impossible;
-                index
+                Some(index)
             }
             None => {
-                appended_static |= incoming_is_static;
-                existing.tables.push(table);
-                let index = existing.tables.len() - 1;
-                if typed_live {
-                    typed_live_tables.insert(index);
+                if existing.tables.len() >= MAX_MERGED_TABLES_PER_MODULE {
+                    // Past the cap the fresh table drops and counts; a
+                    // dropped static table still re-opens finished-ness
+                    // (the union no longer spans the whole surface).
+                    dropped = dropped.saturating_add(1);
+                    appended_static |= incoming_is_static;
+                    None
+                } else {
+                    appended_static |= incoming_is_static;
+                    existing.tables.push(table);
+                    let index = existing.tables.len() - 1;
+                    if typed_live {
+                        typed_live_tables.insert(index);
+                    }
+                    Some(index)
                 }
-                index
             }
         });
     }
     existing.tables_scan_finished =
         finished_before && (incoming_finished || incoming_pure_live) && !appended_static;
     for mut interface in incoming.interfaces.drain(..) {
+        // A dropped table has no merged index: the interface keeps its
+        // row with no table link, like an out-of-range incoming index.
         interface.table = interface
             .table
-            .and_then(|index| table_indices.get(index).copied());
+            .and_then(|index| table_indices.get(index).copied().flatten());
         if interface.name_class != "exact_standard"
             && interface
                 .table
@@ -12516,6 +12569,19 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
             existing.interfaces.push(interface);
         }
     }
+    dropped
+}
+
+/// Union one module and accumulate the per-module cap's counted
+/// overflow into `dropped`: every rebuild and harvest path counts
+/// through this one line, so a refused table is never silent.
+fn merge_scanned_module_counted(
+    modules: &mut Vec<ScannedModule>,
+    incoming: ScannedModule,
+    dropped: &mut u64,
+) {
+    let fresh = merge_scanned_module(modules, incoming);
+    *dropped = dropped.saturating_add(fresh);
 }
 
 fn usable_path(maps: &MapIndex<'_>, mapping: &MapEntry) -> Option<PathBuf> {
@@ -13810,6 +13876,7 @@ impl Engine {
             learned_staged_files: 0,
             learned_event_loss: 0,
             learned_cap_skipped: 0,
+            merge_tables_dropped: 0,
             learned_frame_owed: false,
             owned_watch_unproven: BTreeMap::new(),
             owned_incomplete_scans: BTreeMap::new(),
@@ -15273,6 +15340,11 @@ impl Engine {
     /// Learned candidates refused by the per-capture file cap.
     pub(crate) fn learned_cap_skipped(&self) -> u64 {
         self.learned_cap_skipped
+    }
+
+    /// Fresh tables the per-module merge cap dropped.
+    pub(crate) fn merge_tables_dropped(&self) -> u64 {
+        self.merge_tables_dropped
     }
 
     /// Consume the learned-staging (or owned incomplete-rescan)
@@ -21290,7 +21362,7 @@ impl Engine {
             self.views[position].view_admission(),
             std::slice::from_ref(&lowered),
         );
-        merge_scanned_module(&mut raw_modules, lowered);
+        merge_scanned_module_counted(&mut raw_modules, lowered, &mut self.merge_tables_dropped);
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
@@ -22050,12 +22122,20 @@ impl Engine {
                 // counts and finished flags the scan disproved retire
                 // instead of lingering in the union.
                 for module in found {
-                    merge_scanned_module(&mut raw_modules, module);
+                    merge_scanned_module_counted(
+                        &mut raw_modules,
+                        module,
+                        &mut self.merge_tables_dropped,
+                    );
                 }
             } else {
                 let mut retained = retained;
                 for module in found {
-                    merge_scanned_module(&mut retained, module);
+                    merge_scanned_module_counted(
+                        &mut retained,
+                        module,
+                        &mut self.merge_tables_dropped,
+                    );
                 }
                 raw_modules.extend(retained);
             }
@@ -22132,7 +22212,11 @@ impl Engine {
                 .collect();
             if found_complete {
                 for module in kept_found {
-                    merge_scanned_module(&mut raw_modules, module);
+                    merge_scanned_module_counted(
+                        &mut raw_modules,
+                        module,
+                        &mut self.merge_tables_dropped,
+                    );
                 }
             } else {
                 let mut kept_retained: Vec<_> = retained
@@ -22143,7 +22227,11 @@ impl Engine {
                     })
                     .collect();
                 for module in kept_found {
-                    merge_scanned_module(&mut kept_retained, module);
+                    merge_scanned_module_counted(
+                        &mut kept_retained,
+                        module,
+                        &mut self.merge_tables_dropped,
+                    );
                 }
                 raw_modules.extend(kept_retained);
             }
@@ -22168,7 +22256,11 @@ impl Engine {
                 .map(|module| module.scanned.clone())
                 .collect();
             for module in found {
-                merge_scanned_module(&mut raw_modules, module);
+                merge_scanned_module_counted(
+                    &mut raw_modules,
+                    module,
+                    &mut self.merge_tables_dropped,
+                );
             }
             (candidate_pins, raw_modules)
         };
@@ -23181,7 +23273,11 @@ impl Engine {
             pins.alias_scanned_module_under(&module, Self::RUN_LEARNED_VIEW_ID);
         }
         let before = self.run_learned_modules.clone();
-        merge_scanned_module(&mut self.run_learned_modules, module);
+        merge_scanned_module_counted(
+            &mut self.run_learned_modules,
+            module,
+            &mut self.merge_tables_dropped,
+        );
         if crate::run::capture_diagnostics_on() {
             eprintln!(
                 "p11scope: run-learned tables for {}: {} tables {} interfaces (store {} modules)",
@@ -30992,13 +31088,21 @@ impl Engine {
         for (view, modules, pins) in refreshed {
             skipped.extend(candidate_pins.replace_view_pins(*view, pins.clone(), &[]));
             for module in modules {
-                merge_scanned_module(&mut raw_modules, module.clone());
+                merge_scanned_module_counted(
+                    &mut raw_modules,
+                    module.clone(),
+                    &mut self.merge_tables_dropped,
+                );
             }
         }
         for (_, modules, pins) in new_views {
             skipped.extend(candidate_pins.absorb(pins.clone()));
             for module in modules {
-                merge_scanned_module(&mut raw_modules, module.clone());
+                merge_scanned_module_counted(
+                    &mut raw_modules,
+                    module.clone(),
+                    &mut self.merge_tables_dropped,
+                );
             }
         }
         self.stage_timings.span(

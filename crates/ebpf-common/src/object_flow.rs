@@ -4065,6 +4065,21 @@ mod tests {
                 );
                 assert_evidence_zeroed(&out, "refused retains zero");
             }
+            // Far-cell geometry pins the 1 MiB bound itself: the cell
+            // sits beyond base+capacity for an absurd capacity, so only
+            // the bound refuses (disjointness and overflow guards pass).
+            // Without the bound this shape would retain.
+            let far_capacity = LENGTH_CAPACITY_MAX + 1;
+            let mut spy = LengthSpy::new(
+                length_args(&[(4, Some(0x40_0000)), (3, Some(0x10_0000))]),
+                Ok(far_capacity),
+            );
+            let mut out = EvidenceStart::default();
+            assert!(
+                !spy.run_entry(&mut out, length_descriptor("C_Sign"), layout, 1),
+                "{layout:?}: far-cell absurd capacity refuses by the bound"
+            );
+            assert_evidence_zeroed(&out, "refused retains zero");
             // Exactly 1 MiB is admitted (the bound is inclusive): the
             // span [base, base + 1MiB) ends exactly where the disjoint
             // cell starts, so this shape retains.

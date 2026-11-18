@@ -1495,6 +1495,26 @@ mod tests {
         );
     }
 
+    /// Modeled-path stamp twin: a present-tail Wrap 648 carrying
+    /// `FUNCTION_NONE` (the unstamped BPF shape) refuses wholesale,
+    /// losing the completion; with the cookie-derived stamp it
+    /// validates. Documents fail-closed and the BPF stamp requirement.
+    #[test]
+    fn end_length_function_none_wrap_refuses_and_stamped_validates() {
+        use crate::FUNCTION_NONE;
+        let (mut wrap, descriptor) = tracked_wrap_end_twin();
+        let trailer = ok_trailer_twin(LENGTH_KIND_SCELL, 40);
+        assert!(
+            validate_end(&end_length_bytes_twin(&wrap, &trailer), Some(&descriptor)).is_some(),
+            "the stamped Wrap 648 validates (positive control)"
+        );
+        wrap.payload.base.event.target_function = FUNCTION_NONE;
+        assert!(
+            validate_end(&end_length_bytes_twin(&wrap, &trailer), Some(&descriptor)).is_none(),
+            "the unstamped FUNCTION_NONE Wrap 648 refuses"
+        );
+    }
+
     /// Dispatch twins: 648 accepts; the dropped carriers (488/760/600)
     /// and every neighbor stay malformed; the legacy forms
     /// (224/632/472/368/608) are unchanged.

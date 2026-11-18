@@ -472,6 +472,144 @@ fn length_end_stamps_the_cookie_derived_function() {
     }
 }
 
+/// Length END on the modeled path (v0.8.0 keymeta Task 2): the
+/// object-branch 648 path stamps the cookie-derived function
+/// ordinal into the payload's target function, like the ordinary
+/// path. Sync START rows leave it `FUNCTION_NONE`, and the trailer
+/// validator refuses a `FUNCTION_NONE` 648 wholesale, losing the
+/// completion. The root's length dispatch guarantees a valid length
+/// descriptor here; `object_return` reuses its validated
+/// `descriptor` local.
+#[test]
+fn length_end_stamps_the_cookie_derived_function_on_the_modeled_path() {
+    const SOURCE: &str = include_str!("../crates/ebpf/src/main.rs");
+    fn return_body(source: &str) -> Option<&str> {
+        source
+            .split_once("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\n}\n").map(|(text, _)| text))
+    }
+    fn contract(source: &str) -> bool {
+        let Some(text) = return_body(source) else {
+            return false;
+        };
+        text.contains("if Record::LENGTH")
+            && text.contains("base.event.target_function).write(descriptor - 1)")
+    }
+    assert!(
+        contract(SOURCE),
+        "object_return must stamp the cookie-derived function on the 648 path"
+    );
+    let start = SOURCE
+        .find("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+        .unwrap();
+    let marker = "base.event.target_function).write(descriptor - 1)";
+    let tail = SOURCE[start..].replacen(marker, "REMOVED", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "removed {marker}"
+    );
+}
+
+/// Length stash lifecycle (v0.8.0 keymeta Task 2): the entry wrapper
+/// inserts on retention (overwrite), deletes on refusal (a stale row
+/// is never trusted) and counts full-map insert failures. The
+/// return wrapper deletes unconditionally (every emission deletes)
+/// and counts stamp/layout mismatches on its own cell.
+#[test]
+fn length_stash_lifecycle_pins_insert_delete_and_failure_counts() {
+    const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
+    fn body<'a>(source: &'a str, marker: &str) -> Option<&'a str> {
+        source
+            .split_once(marker)
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
+    }
+    fn stash_contract(source: &str) -> bool {
+        let Some(text) = body(source, "    fn stash_length_entry(") else {
+            return false;
+        };
+        text.contains("EVIDENCE_START.insert(key, &row, 0)")
+            && text.contains("EVIDENCE_START.remove(key)")
+            && text.contains("bump_evidence(EVIDENCE_LENGTH_INSERT_FAILURES)")
+    }
+    fn trailer_contract(source: &str) -> bool {
+        let Some(text) = body(source, "    pub(crate) fn length_trailer_for_return(") else {
+            return false;
+        };
+        text.contains("let _ = EVIDENCE_START.remove(key);")
+            && text.matches("bump_evidence(EVIDENCE_LENGTH_STASH_MISMATCHES)").count() >= 2
+    }
+    assert!(
+        stash_contract(SOURCE),
+        "stash_length_entry must insert on retention, delete on refusal and bump insert failures"
+    );
+    assert!(
+        trailer_contract(SOURCE),
+        "length_trailer_for_return must delete unconditionally and bump mismatches"
+    );
+    let stash_start = SOURCE.find("    fn stash_length_entry(").unwrap();
+    for marker in [
+        "EVIDENCE_START.insert(key, &row, 0)",
+        "EVIDENCE_START.remove(key)",
+        "bump_evidence(EVIDENCE_LENGTH_INSERT_FAILURES)",
+    ] {
+        let tail = SOURCE[stash_start..].replacen(marker, "REMOVED", 1);
+        assert!(
+            !stash_contract(&format!("{}{}", &SOURCE[..stash_start], tail)),
+            "removed {marker}"
+        );
+    }
+    let trailer_start = SOURCE
+        .find("    pub(crate) fn length_trailer_for_return(")
+        .unwrap();
+    for marker in [
+        "let _ = EVIDENCE_START.remove(key);",
+        "bump_evidence(EVIDENCE_LENGTH_STASH_MISMATCHES)",
+    ] {
+        let tail = SOURCE[trailer_start..].replacen(marker, "REMOVED", 1);
+        assert!(
+            !trailer_contract(&format!("{}{}", &SOURCE[..trailer_start], tail)),
+            "removed {marker}"
+        );
+    }
+}
+
+/// Length stash on unemitted modeled returns (v0.8.0 keymeta Task 2):
+/// an object-branch return that never emits never resolves its
+/// trailer (which deletes), so it abandons the stash row; otherwise
+/// the row lingers until key reuse or stop scrub.
+#[test]
+fn length_object_return_abandons_the_stash_when_unemitted() {
+    const SOURCE: &str = include_str!("../crates/ebpf/src/main.rs");
+    fn return_body(source: &str) -> Option<&str> {
+        source
+            .split_once("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\n}\n").map(|(text, _)| text))
+    }
+    fn contract(source: &str) -> bool {
+        let Some(text) = return_body(source) else {
+            return false;
+        };
+        text.contains("if Record::LENGTH && !emitted")
+            && text.contains("length_return_abandon(&key)")
+    }
+    assert!(
+        contract(SOURCE),
+        "object_return must abandon the stash when LENGTH and !emitted"
+    );
+    let start = SOURCE
+        .find("fn object_return<const JOURNAL: bool, Record: ReturnPayload>(")
+        .unwrap();
+    let marker = "if Record::LENGTH && !emitted";
+    let tail = SOURCE[start..].replacen(marker, "REMOVED", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "removed {marker}"
+    );
+}
+
 #[test]
 fn routing_words_are_sampled_once_and_stored_before_the_next_sampler() {
     use p11scope_ebpf_common::Event;

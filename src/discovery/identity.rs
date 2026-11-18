@@ -1420,6 +1420,13 @@ pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: RawToId,
     rejected_keys: BTreeSet<ObjectKey>,
+    /// Transient pin-failure marks per viewing process (a scan that could
+    /// not prove its file, e.g. a child that exited mid-scan): refused
+    /// observations are skipped, never group rejections, so one view's
+    /// refused pin cannot nuke committed coverage for the same key. A
+    /// refusal pairing with another view's refusal, or with the same
+    /// view's filed observation, still publishes ambiguity.
+    refused_keys: BTreeSet<(ProcessViewId, ObjectKey)>,
     ambiguous_keys: BTreeSet<ObjectKey>,
     ambiguity_published: BTreeSet<ObjectKey>,
     ownership: BTreeMap<ProcessViewId, ViewClaims>,
@@ -1462,6 +1469,7 @@ impl Clone for PinnedObjects {
             by_id: self.by_id.clone(),
             raw_to_id: self.raw_to_id.clone(),
             rejected_keys: self.rejected_keys.clone(),
+            refused_keys: self.refused_keys.clone(),
             ambiguous_keys: self.ambiguous_keys.clone(),
             ambiguity_published: self.ambiguity_published.clone(),
             ownership: self.ownership.clone(),
@@ -1598,6 +1606,7 @@ impl PinnedObjects {
             by_id: BTreeMap::new(),
             raw_to_id: RawToId::default(),
             rejected_keys: BTreeSet::new(),
+            refused_keys: BTreeSet::new(),
             ambiguous_keys: BTreeSet::new(),
             ambiguity_published: BTreeSet::new(),
             ownership: BTreeMap::new(),
@@ -1806,6 +1815,16 @@ impl PinnedObjects {
         for key in other.rejected_keys {
             self.reject_observation(key);
         }
+        for (view, key) in &other.refused_keys {
+            if self
+                .refused_keys
+                .iter()
+                .any(|(other_view, other_key)| *other_view != *view && *other_key == *key)
+            {
+                self.ambiguous_keys.insert(*key);
+            }
+        }
+        self.refused_keys.extend(other.refused_keys);
         self.ambiguous_keys.extend(other.ambiguous_keys);
         self.ambiguity_published.extend(other.ambiguity_published);
         for (view, claims) in other.ownership {
@@ -2791,6 +2810,41 @@ impl PinnedObjects {
 
     pub fn view_claims(&self, view: ProcessViewId) -> Option<&ViewClaims> {
         self.ownership.get(&view)
+    }
+
+    /// Scrubs one possibly-partially-filed raw observation (pin-failure
+    /// path): drops its raw filing and any by-id entries left with no
+    /// raws at all, plus their ownership claims. Never touches
+    /// rejected_keys: a failed observation is skipped, not a group
+    /// rejection, so one view's refused pin cannot nuke committed
+    /// coverage for the same key.
+    pub(crate) fn scrub_raw(&mut self, raw: &RawObjectInstance) {
+        if self.raw_to_id.remove(raw).is_none() {
+            return;
+        }
+        self.bump_revision();
+        let live: BTreeSet<PinnedObjectId> = self.raw_to_id.values().copied().collect();
+        let dropped: BTreeSet<PinnedObjectId> = self
+            .by_id
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
+        if dropped.is_empty() {
+            return;
+        }
+        self.by_id.retain(|id, _| !dropped.contains(id));
+        for claims in self.ownership.values_mut() {
+            claims.tables.retain(|id| !dropped.contains(id));
+            claims.targets.retain(|(id, _)| !dropped.contains(id));
+            claims.pins.retain(|id| !dropped.contains(id));
+        }
+        self.ownership.retain(|_, claims| {
+            !(claims.tables.is_empty() && claims.targets.is_empty() && claims.pins.is_empty())
+        });
+        for raws in self.raw_ownership.values_mut() {
+            raws.retain(|raw| self.raw_to_id.contains_key(raw));
+        }
     }
 
     /// Ids that stay resolvable without ownership claims anywhere: the
@@ -10031,7 +10085,18 @@ fn record_scanned_candidate(
 ) {
     match candidate {
         Ok(entry) => {
-            if let Some(id) = pinned.insert_entry(entry, skipped) {
+            // A view that already refused this key contradicts itself by
+            // filing it now: group-reject like the reverse order, so the
+            // pairing is order-free. Other views' refusals never poison
+            // this filing.
+            if pinned.refused_keys.contains(&(view, entry.raw.key)) {
+                pinned.reject_observation(entry.raw.key);
+                pinned.ambiguous_keys.insert(entry.raw.key);
+                skipped.push(Skipped {
+                    subject: entry.raw.path.clone(),
+                    reason: "refused observation contradicts filed observation".to_string(),
+                });
+            } else if let Some(id) = pinned.insert_entry(entry, skipped) {
                 pinned.ownership.entry(view).or_default().pins.push(id);
                 pinned.raw_ownership.entry(view).or_default().insert(raw);
             }
@@ -10054,14 +10119,35 @@ fn record_scanned_candidate(
             });
         }
         Err(PinFailure::Refused(reason)) => {
-            // A missing mapping identity or digest makes every equal raw-key
-            // observation incomparable. Remember the failed member so a candidate
-            // from another process view cannot become receiver-wins authority.
-            // A pre-copy-up failure refuses only itself: its proof stands on
-            // its own file, so it never nukes the key — and neither does a
-            // plain failure while a proven pre observation is kept.
-            if !raw.pre_copy_up && !pinned.has_pre_copy_up_for_key(raw.key) {
-                pinned.reject_observation(raw.key);
+            // A missing mapping identity or digest fails this observation
+            // only: scrub its possibly-partial filing and mark the refusal
+            // (repeated refusals still publish ambiguity at absorb), but
+            // never group-reject the key — one view's refused pin (a child
+            // that exited mid-scan) must not nuke committed coverage for
+            // the same key. A failed observation filed nothing
+            // authoritative, so it cannot become receiver-wins authority
+            // either way. A pre-copy-up failure refuses only itself: its
+            // proof stands on its own file — and a plain failure while a
+            // proven pre observation is kept leaves no refusal mark either.
+            if !raw.pre_copy_up {
+                let view_filed = pinned
+                    .raw_ownership
+                    .get(&view)
+                    .is_some_and(|raws| raws.iter().any(|filed| filed.key == raw.key));
+                pinned.scrub_raw(&raw);
+                if !pinned.has_pre_copy_up_for_key(raw.key) {
+                    // Another view's refusal of the same key pairs into
+                    // ambiguity here (same-store pairing; cross-store
+                    // pairing happens at absorb).
+                    let pair = pinned
+                        .refused_keys
+                        .iter()
+                        .any(|(other, key)| *other != view && *key == raw.key);
+                    pinned.refused_keys.insert((view, raw.key));
+                    if view_filed || pair {
+                        pinned.ambiguous_keys.insert(raw.key);
+                    }
+                }
             }
             skipped.push(Skipped {
                 subject: raw.path,

@@ -13066,8 +13066,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Stop the coordinator (H6 slice 2): no new scan, attach,
     /// successor/name admission, or retry starts afterwards. Held exec
     /// handoffs release their custody now; staged facts still drain
-    /// through `commit_batch`.
-    #[cfg_attr(not(test), allow(dead_code))] // Production stop wiring lands with the runtime consumer.
+    /// through `commit_batch`. The classic loop calls this exactly
+    /// once per run through `LaneHost::stop_coordinator`.
     pub(crate) fn stop(&mut self) {
         if self.stopped {
             return;

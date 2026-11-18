@@ -194,6 +194,7 @@ struct ElfHeaderLayout {
     o_phnum: usize,
     o_shentsize: usize,
     o_shnum: usize,
+    phdr: usize,
     shdr: usize,
     o_info: usize,
     o_size: usize,
@@ -207,6 +208,7 @@ const ELF_LAYOUT64: ElfHeaderLayout = ElfHeaderLayout {
     o_phnum: 56,
     o_shentsize: 58,
     o_shnum: 60,
+    phdr: 56,
     shdr: 64,
     o_info: 44,
     o_size: 32,
@@ -220,6 +222,7 @@ const ELF_LAYOUT32: ElfHeaderLayout = ElfHeaderLayout {
     o_phnum: 44,
     o_shentsize: 46,
     o_shnum: 48,
+    phdr: 32,
     shdr: 40,
     o_info: 28,
     o_size: 20,
@@ -320,6 +323,7 @@ pub fn table_bounds_from_header(
         o_phnum,
         o_shentsize,
         o_shnum,
+        phdr,
         shdr,
         o_info,
         o_size,
@@ -349,7 +353,15 @@ pub fn table_bounds_from_header(
         }
         Some(bytes)
     });
-    let phnum = if e_phnum < 0xffff {
+    // A wrong entry size zeroes that table's count before any
+    // bounds or charging: the parser requires the exact class size
+    // and refuses the file without a per-entry walk, so the counts
+    // would bill a walk that never happens — a zero program size
+    // with PN_XNUM computes 0 bytes against a billion-scale count
+    // and would otherwise stop the scan pass for later providers.
+    let phnum = if phentsize as usize != phdr {
+        0
+    } else if e_phnum < 0xffff {
         e_phnum
     } else {
         let Some(section0) = section0.flatten() else {
@@ -357,7 +369,9 @@ pub fn table_bounds_from_header(
         };
         word::<4>(section0, o_info).unwrap_or(0)
     };
-    let shnum = if e_shnum > 0 {
+    let shnum = if shentsize as usize != shdr {
+        0
+    } else if e_shnum > 0 {
         e_shnum
     } else {
         let shoff = if class == 2 {

@@ -7334,17 +7334,17 @@ mod conservative_copy {
                 let Some(path) = self.normalized.take() else {
                     return Ok(None);
                 };
-                let namespace = self
-                    .module
-                    .as_ref()
-                    .ok_or(GraphRefusal::Identity)?
-                    .mount_namespace;
+                let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
                 let raw = RawObjectInstance {
-                    mount_namespace: Some(namespace),
+                    mount_namespace: Some(module.mount_namespace),
                     key,
                     path,
                     prearm: false,
-                    pre_copy_up: false,
+                    // The proof marker exactly like
+                    // `RawObjectInstance::scanned`: the provider row
+                    // of a pre-copy-up module files pre, dependency
+                    // entries file plain.
+                    pre_copy_up: module.pre_copy_up.is_some() && key == module.key,
                 };
                 Ok(pins.raw_to_id.get(&raw).copied())
             }

@@ -3579,9 +3579,7 @@ fn both_streamed_sinks_commit_through_the_recovery_aware_helper() {
         .unwrap()
         .0;
     assert_eq!(
-        terminal
-            .matches("commit_streamed_report(out_file)")
-            .count(),
+        terminal.matches("commit_streamed_report(out_file)").count(),
         2,
         "the profile and metrics closures share the recovery-aware commit helper"
     );

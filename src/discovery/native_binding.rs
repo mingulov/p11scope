@@ -698,6 +698,22 @@ pub(crate) struct BinderReleasePlan {
     owned: HashMap<CallerId, Vec<(usize, DomainCookie, u64)>>,
 }
 
+impl BinderReleasePlan {
+    /// Whether the plan vetoes this caller's release: a pending row
+    /// still needs its incarnation snapshot. Pure, so the fold loop
+    /// consults it before building its per-fold indexes and only
+    /// builds for a caller that will actually fold.
+    pub(crate) fn vetoes(&self, id: CallerId) -> bool {
+        self.vetoed.contains(&id)
+    }
+
+    /// Cookie sequences the plan would clear for this caller: the
+    /// fold's per-caller member pacing counts them before folding.
+    pub(crate) fn owned_len(&self, id: CallerId) -> usize {
+        self.owned.get(&id).map_or(0, Vec::len)
+    }
+}
+
 /// The binder: per-domain state, decisions and transitions for the
 /// coordinator to stage, and the census.
 pub(crate) struct NativeBinder {
@@ -1035,8 +1051,14 @@ impl NativeBinder {
     /// every cookie sequence per publication, never one full scan per
     /// caller. Clearing stays per fold ([`Self::apply_retired_release`]),
     /// so a credit-deferred caller keeps its evidence until its own
-    /// fold runs.
-    pub(crate) fn plan_retired_release(&mut self) -> BinderReleasePlan {
+    /// fold runs. The scan counts every examined row through `unit`
+    /// and aborts (returning `None`) when it asks: planning is pure,
+    /// so the caller requeues its whole carry and the next pass
+    /// rebuilds the plan from scratch.
+    pub(crate) fn plan_retired_release(
+        &mut self,
+        mut unit: impl FnMut() -> bool,
+    ) -> Option<BinderReleasePlan> {
         let mut vetoed: HashSet<CallerId> = HashSet::new();
         let mut owned: HashMap<CallerId, Vec<(usize, DomainCookie, u64)>> = HashMap::new();
         for (index, domain) in self.domains.iter().enumerate() {
@@ -1044,6 +1066,9 @@ impl NativeBinder {
                 #[cfg(test)]
                 {
                     self.release_pending_visits = self.release_pending_visits.saturating_add(1);
+                }
+                if unit() {
+                    return None;
                 }
                 if let Some(sighting) = pending.sighting.as_ref() {
                     vetoed.insert(sighting.caller);
@@ -1058,6 +1083,9 @@ impl NativeBinder {
                     {
                         self.release_cookie_visits = self.release_cookie_visits.saturating_add(1);
                     }
+                    if unit() {
+                        return None;
+                    }
                     if let Some(bound) = seen.bound {
                         owned
                             .entry(bound)
@@ -1067,7 +1095,7 @@ impl NativeBinder {
                 }
             }
         }
-        BinderReleasePlan { vetoed, owned }
+        Some(BinderReleasePlan { vetoed, owned })
     }
 
     /// Release one retired caller's binder evidence under a release

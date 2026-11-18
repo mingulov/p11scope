@@ -1963,14 +1963,32 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// orders incarnations of one numeric pid; once no row for the pid
     /// remains, a later reuse cannot collide with one and starts a fresh
     /// admission order. Bounded by the retained caller budget, so the
-    /// once-per-ever pid map cannot grow on a busy host.
-    pub(crate) fn prune_incarnations(&mut self) {
-        let held: BTreeSet<u32> = self
-            .callers
-            .values()
-            .map(|tracked| tracked.record.pid)
-            .collect();
-        self.incarnations.retain(|pid, _| held.contains(pid));
+    /// once-per-ever pid map cannot grow on a busy host. The held-pid
+    /// collection counts through `unit` and the prune is all-or-nothing:
+    /// when `unit` asks to abort, nothing is pruned and the next call
+    /// retries (a partial held set could drop a live pid's counter).
+    pub(crate) fn prune_incarnations(&mut self, mut unit: impl FnMut() -> bool) {
+        let mut held = BTreeSet::new();
+        for tracked in self.callers.values() {
+            held.insert(tracked.record.pid);
+            if unit() {
+                return;
+            }
+        }
+        let mut stale = Vec::new();
+        for pid in self.incarnations.keys() {
+            if !held.contains(pid) {
+                stale.push(*pid);
+            }
+            if unit() {
+                return;
+            }
+        }
+        // Memory-only bulk removal of plain counters, bounded by the
+        // retained caller budget.
+        for pid in stale {
+            self.incarnations.remove(&pid);
+        }
     }
 
     /// A natively proven exec transition (Task 6 C4): the live incarnation
@@ -9863,7 +9881,7 @@ pub(crate) mod tests {
         assert!(matches!(events[0], CallerEvent::Exited { id, .. } if id == first));
         // A retained retired row still needs the pid's counter: a reused
         // pid must mint a distinct incarnation while any row is visible.
-        adapter.prune_incarnations();
+        adapter.prune_incarnations(|| false);
         assert_eq!(adapter.memory_lens().incarnations.len, 1);
         source.spawn(4242, 2000);
         let mut observed = BTreeSet::new();
@@ -9885,7 +9903,7 @@ pub(crate) mod tests {
         source.kill(4242);
         adapter.reconcile(&BTreeSet::new(), &mut |_| AUTHORITY, 40);
         assert!(adapter.forget_caller(second));
-        adapter.prune_incarnations();
+        adapter.prune_incarnations(|| false);
         assert_eq!(
             adapter.memory_lens().incarnations.len,
             0,
@@ -9897,7 +9915,7 @@ pub(crate) mod tests {
         source.spawn(4242, 3000);
         let third = adapter.admit(4242, AUTHORITY, 50).unwrap();
         assert_eq!(adapter.record(third).unwrap().incarnation, 0);
-        adapter.prune_incarnations();
+        adapter.prune_incarnations(|| false);
         assert_eq!(adapter.memory_lens().incarnations.len, 1);
     }
 

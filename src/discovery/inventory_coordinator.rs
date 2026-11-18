@@ -80,6 +80,7 @@ use p11scope_ebpf_common::inventory_callers::CallerEvidence;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[path = "inventory_count_eligibility.rs"]
@@ -788,6 +789,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// attach, successor/name admission, or retry starts afterwards; staged
     /// facts still drain through `commit_batch`.
     stopped: bool,
+    /// The operator's live signal counter (the run's `StopFlag` source):
+    /// the departed-caller fold paces its planning strides against it,
+    /// so a stop delivered mid-fold aborts the plan within one stride
+    /// instead of waiting out whole-table scans. `None` (tests and
+    /// stagings without a run) leaves the local `stopped` flag as the
+    /// only source.
+    stop_source: Option<Arc<AtomicUsize>>,
     /// Distinct (pid, producer task ticket) EXEC hooks that drained
     /// since the last completed scan pass (`apply_catalog` clears): the
     /// post-pass newcomers the terminal disclosure names. The ticket is
@@ -1241,8 +1249,40 @@ struct PairFoldWork {
 
 /// Callers folded per retire call: burst retirement drains over
 /// passes instead of delaying one publication, and the remainder
-/// resumes next pass without a re-note.
+/// resumes next pass without a re-note. One credit folds one caller
+/// plus up to [`FOLD_PLAN_STRIDE`] of its member units (cookies,
+/// pairs, edges, instances, pidfd custody); a high-fanout caller
+/// spends one extra credit per further stride, so member work paces
+/// the call instead of riding free.
 const FOLD_CALLERS_PER_PUBLICATION: usize = 1024;
+
+/// Planning units between stop checks in one retire call: the
+/// INV-2 stride. Every planning scan counts its examined units
+/// through one shared cursor and aborts when the stop source asks,
+/// so a stop lands within one stride instead of past whole-table
+/// scans. Planning is pure (indexes rebuild next pass) and each
+/// single-caller fold stays atomic, so an abort only defers work.
+const FOLD_PLAN_STRIDE: u64 = 64;
+
+/// One retire call's planning stride cursor: counts examined units
+/// across every planning scan and asks the stop source every
+/// [`FOLD_PLAN_STRIDE`] units.
+struct FoldStride {
+    used: u64,
+}
+
+impl FoldStride {
+    fn new() -> Self {
+        Self { used: 0 }
+    }
+
+    /// Count one examined unit; true when the stride lapped and the
+    /// stop source asks to abort.
+    fn unit(&mut self, stop: &dyn Fn() -> bool) -> bool {
+        self.used = self.used.saturating_add(1);
+        self.used % FOLD_PLAN_STRIDE == 0 && stop()
+    }
+}
 
 /// What one caller's fold removed: whether it carried attributed
 /// calls plus the folded row keys (the seam drops their stream
@@ -1414,6 +1454,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             identity_budget_exhausted: false,
             staged_retirements: BTreeSet::new(),
             stopped: false,
+            stop_source: None,
             post_pass_exec_newcomers: BTreeSet::new(),
             scan_freshness: BTreeSet::new(),
             maps_prior: BTreeMap::new(),
@@ -5862,23 +5903,85 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// and re-queues whatever it did not reach, so the remainder
     /// resumes next pass without a re-note. Returns how many rows
     /// retired and what folded.
+    ///
+    /// Bounded work: the entry gate runs before any planning, every
+    /// planning scan counts its units through one shared
+    /// [`FOLD_PLAN_STRIDE`] cursor and aborts on stop (planning is
+    /// pure, so the next pass rebuilds it), each fold spends one
+    /// credit plus one per further member stride, and released pidfd
+    /// custody drains through one explicit handoff outside the
+    /// per-caller loop. Each single-caller fold stays atomic: an
+    /// abort only defers whole rows. The stop query covers the local
+    /// flag and the wired operator counter alike.
     pub(crate) fn retire_rendered_callers(
         &mut self,
         now_ns: u64,
         subset: Option<&AttestedSubset>,
     ) -> FoldReceipt {
-        let rendered = std::mem::take(&mut self.rendered_callers);
-        if rendered.is_empty() {
+        let query = self.stop_query();
+        self.retire_rendered_callers_with_stop(now_ns, subset, query.as_ref())
+    }
+
+    /// [`Self::retire_rendered_callers`] with an explicit stop query:
+    /// the production wrapper passes the live query, and tests pin
+    /// mid-stride aborts with a counting one.
+    pub(crate) fn retire_rendered_callers_with_stop(
+        &mut self,
+        now_ns: u64,
+        subset: Option<&AttestedSubset>,
+        stop: &dyn Fn() -> bool,
+    ) -> FoldReceipt {
+        if self.rendered_callers.is_empty() {
             return FoldReceipt::default();
         }
+        // The entry gate runs before any planning: a stopped
+        // retirement plans nothing, folds nothing, and leaves the
+        // carry intact for the resume.
+        if stop() {
+            return FoldReceipt::default();
+        }
+        // Released pidfd custody drains here, in one explicit place
+        // outside the per-caller fold loop: every return path below
+        // converges on this drop, so no last-owner close runs inside
+        // a fold credit and no release strands on an abort.
+        let mut handoff: Vec<Arc<PidPin>> = Vec::new();
+        let receipt = self.retire_inner(now_ns, subset, stop, &mut handoff);
+        drop(handoff);
+        receipt
+    }
+
+    /// One retirement pass under an explicit stop query, with
+    /// released pidfd custody handed out for the caller's drain.
+    fn retire_inner(
+        &mut self,
+        now_ns: u64,
+        subset: Option<&AttestedSubset>,
+        stop: &dyn Fn() -> bool,
+        handoff: &mut Vec<Arc<PidPin>>,
+    ) -> FoldReceipt {
+        let mut stride = FoldStride::new();
         // One referenced-caller set per call, not one scan per candidate:
         // steady state can render the whole caller budget every pass.
-        let referenced = self.referenced_callers();
+        // The scan is pure: an abort leaves the carry untaken.
+        let Some(referenced) = self.referenced_callers(|| stride.unit(stop)) else {
+            return FoldReceipt::default();
+        };
         // Phase 1: fold candidates through the cheap per-row checks.
         // Missing, live and referenced rows drop here and re-note from
-        // the view next pass, as before.
+        // the view next pass, as before. An abort requeues everything
+        // taken: the filtered candidates beside the unreached rest.
+        let rendered: Vec<CallerId> = std::mem::take(&mut self.rendered_callers)
+            .into_iter()
+            .collect();
         let mut candidates = Vec::new();
-        for id in rendered {
+        for (index, id) in rendered.iter().copied().enumerate() {
+            if stride.unit(stop) {
+                self.rendered_callers
+                    .extend(candidates.iter().map(|(id, _)| *id));
+                self.rendered_callers
+                    .extend(rendered[index..].iter().copied());
+                return FoldReceipt::default();
+            }
             let Some(record) = self.adapter.record(id) else {
                 continue;
             };
@@ -5897,15 +6000,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // Phase 2: one binder release plan for every candidate
         // (skipped when no candidate exists: most passes retire
-        // nothing and must not scan).
+        // nothing and must not scan). The plan is pure: an abort
+        // discards it and every candidate waits for the rebuild.
         let mut release = None;
         if !candidates.is_empty() {
-            release = Some(self.binder.plan_retired_release());
+            let Some(plan) = self.binder.plan_retired_release(|| stride.unit(stop)) else {
+                self.rendered_callers
+                    .extend(candidates.iter().map(|(id, _)| *id));
+                return FoldReceipt::default();
+            };
+            release = Some(plan);
         }
         // Phase 3: folds with bounded credits and stop checks. Vetoed
         // rows drop (the view re-notes them); stop and credit breaks
         // re-queue the unreached remainder for the next pass.
-        // The fold indexes build lazily on the first foldable caller:
+        // The fold indexes build lazily on the first folding caller:
         // most passes retire nothing.
         let mut folded: Option<FoldContext> = None;
         let mut pairs: Option<PairFoldWork> = None;
@@ -5923,21 +6032,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // The stop and credit gate stays pure: a re-queued row
             // keeps its binder evidence until its own fold runs, so
             // this check precedes the clearing below.
-            if self.stopped || credits == 0 {
+            if stop() || credits == 0 {
                 self.rendered_callers.insert(id);
                 self.rendered_callers.extend(rest.map(|(id, _)| id));
                 break;
             }
             // A pending binder row still needs its incarnation snapshot;
-            // keep the record until that row decides.
+            // keep the record until that row decides. The pure veto
+            // check runs before the lazy index build, so a vetoed row
+            // never pays for indexes it will not use.
             let plan = release.as_ref().expect("a candidate implies a plan");
-            if !self.binder.apply_retired_release(plan, id) {
+            if plan.vetoes(id) {
                 continue;
             }
             if folded.is_none() {
-                folded = Some(self.fold_context(subset));
-                pairs = Some(self.pair_fold_work());
+                let Some(ctx) = self.fold_context(subset, || stride.unit(stop)) else {
+                    // The pure index build aborted: the current row
+                    // and the unreached remainder wait (no clearing
+                    // ran yet for this row, so its evidence is
+                    // intact). Folds already completed keep their
+                    // receipt.
+                    self.rendered_callers.insert(id);
+                    self.rendered_callers.extend(rest.map(|(id, _)| id));
+                    break;
+                };
+                let Some(work) = self.pair_fold_work(|| stride.unit(stop)) else {
+                    self.rendered_callers.insert(id);
+                    self.rendered_callers.extend(rest.map(|(id, _)| id));
+                    break;
+                };
+                folded = Some(ctx);
+                pairs = Some(work);
             }
+            // The member pacing counts this caller's units before
+            // folding: cookies, pair targets and recoveries, edges,
+            // instances and pidfd custody. Clearing runs now (the
+            // veto was checked above), so a folded row's evidence
+            // clears exactly once, in its own fold.
+            if !self.binder.apply_retired_release(plan, id) {
+                continue;
+            }
+            let pairs_ref = pairs.as_ref().expect("indexes build before the first fold");
+            let ctx_ref = folded
+                .as_ref()
+                .expect("indexes build before the first fold");
+            let units = plan
+                .owned_len(id)
+                .saturating_add(pairs_ref.targets.get(&id).map_or(0, Vec::len))
+                .saturating_add(pairs_ref.recoveries.get(&id).map_or(0, Vec::len))
+                .saturating_add(self.registry.edges_of(id).count())
+                .saturating_add(ctx_ref.instances_by_caller.get(&id).map_or(0, Vec::len))
+                .saturating_add(self.semantic_bindings.fold_pin_count(id));
+            let cost = 1usize.saturating_add(units / FOLD_PLAN_STRIDE as usize);
             let folded_caller = self.fold_caller_rendered_state(
                 id,
                 &record,
@@ -5946,7 +6092,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 now_ns,
             );
             if self.adapter.forget_caller(id) {
-                self.semantic_bindings.release_folded_caller(id);
+                self.semantic_bindings.release_folded_caller(id, handoff);
                 self.count_ownership.forget_caller(id);
                 if let Some(metadata) = self.caller_metadata.as_mut() {
                     metadata.forget(id);
@@ -5961,13 +6107,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 receipt.retired += 1;
                 receipt.folded_edges.extend(folded_caller.edges);
                 receipt.folded_instances.extend(folded_caller.instances);
-                credits = credits.saturating_sub(1);
+                credits = credits.saturating_sub(cost);
             }
         }
         // Every forgotten row releases its pid's incarnation counter;
         // the map then tracks only retained rows (bounded by the caller
-        // budget), never every pid the capture ever met.
-        self.adapter.prune_incarnations();
+        // budget), never every pid the capture ever met. The prune is
+        // all-or-nothing: an abort skips it and the receipt stands.
+        self.adapter.prune_incarnations(|| stride.unit(stop));
         receipt
     }
 
@@ -5981,32 +6128,47 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Modules of the seated lane subset (mirrors the terminal
     /// computation): provider modules the subset's required objects
     /// prove. Shared by the terminal counts and the fold's carried
-    /// contributions so both judge the same set.
-    fn subset_module_ids(&self, subset: &AttestedSubset) -> BTreeSet<ModuleId> {
+    /// contributions so both judge the same set. Counts every
+    /// examined module through `unit` and aborts (`None`) when it
+    /// asks; the scan is pure, so the caller retries.
+    fn subset_module_ids(
+        &self,
+        subset: &AttestedSubset,
+        mut unit: impl FnMut() -> bool,
+    ) -> Option<BTreeSet<ModuleId>> {
         let required = subset.required();
         if required.is_empty() {
-            return BTreeSet::new();
+            return Some(BTreeSet::new());
         }
-        self.registry
-            .modules()
-            .filter(|module| {
-                required
-                    .keys()
-                    .any(|object| subset.proves_provider_module(*object, &module.key))
-            })
-            .map(|module| module.id)
-            .collect()
+        let mut ids = BTreeSet::new();
+        for module in self.registry.modules() {
+            if required
+                .keys()
+                .any(|object| subset.proves_provider_module(*object, &module.key))
+            {
+                ids.insert(module.id);
+            }
+            if unit() {
+                return None;
+            }
+        }
+        Some(ids)
     }
 
     /// Index one retire call's pair work by owning caller, plus
     /// recovery-order positions: one scan of each pair table per
-    /// publication, never one full scan per caller.
-    fn pair_fold_work(&mut self) -> PairFoldWork {
+    /// publication, never one full scan per caller. Counts every
+    /// examined row through `unit` and aborts (`None`) when it asks;
+    /// the index is pure, so the caller requeues and rebuilds.
+    fn pair_fold_work(&mut self, mut unit: impl FnMut() -> bool) -> Option<PairFoldWork> {
         let mut targets: HashMap<CallerId, Vec<PairKey>> = HashMap::new();
         for (key, target) in &self.pair_targets {
             #[cfg(test)]
             {
                 self.fold_pair_target_visits = self.fold_pair_target_visits.saturating_add(1);
+            }
+            if unit() {
+                return None;
             }
             match target {
                 PairTarget::Bound { caller, .. }
@@ -6023,17 +6185,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 self.fold_pair_recovery_visits = self.fold_pair_recovery_visits.saturating_add(1);
             }
+            if unit() {
+                return None;
+            }
             recoveries.entry(recovery.caller).or_default().push(*key);
         }
         let mut order_pos: HashMap<PairKey, usize> = HashMap::new();
         for (pos, key) in self.recovery_order.iter().enumerate() {
             order_pos.insert(*key, pos);
+            if unit() {
+                return None;
+            }
         }
-        PairFoldWork {
+        Some(PairFoldWork {
             targets,
             recoveries,
             order_pos,
-        }
+        })
     }
 
     /// Remove one key from the recovery service order through the
@@ -6078,63 +6246,84 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// claimed instance children (for edge labels), forwarding-layer
     /// modules (for the entries split), and the terminal subset
     /// modules (for carried Joint-terminal contributions, when a lane
-    /// is seated).
-    fn fold_context(&self, subset: Option<&AttestedSubset>) -> FoldContext {
+    /// is seated). Counts every examined row through `unit` and
+    /// aborts (`None`) when it asks; the index is pure, so the caller
+    /// requeues and rebuilds. The forwarding match itself stays
+    /// unstrided: it stats each declared input once (never per
+    /// module), bounded by the run's declared inputs.
+    fn fold_context(
+        &self,
+        subset: Option<&AttestedSubset>,
+        mut unit: impl FnMut() -> bool,
+    ) -> Option<FoldContext> {
         let mut instances_by_caller: HashMap<CallerId, Vec<RegistryInstanceId>> = HashMap::new();
         for record in self.registry.instances() {
             instances_by_caller
                 .entry(record.caller)
                 .or_default()
                 .push(record.id);
+            if unit() {
+                return None;
+            }
         }
-        let claimed_children: BTreeSet<(CallerId, ModuleId)> = self
-            .registry
-            .instance_semantic_edges()
-            .filter(|row| {
-                row.semantics
-                    .as_ref()
-                    .is_some_and(crate::semantics_edge::EdgeSemantics::has_claims)
-            })
-            .map(|row| (row.caller, row.module))
-            .collect();
-        let module_keys: Vec<(ModuleId, String, (u64, u64), u64)> = self
-            .registry
-            .modules()
-            .map(|module| {
-                let (major, minor, ino) = match &module.key {
-                    ModuleKey::Physical {
-                        dev_major,
-                        dev_minor,
-                        ino,
-                        ..
-                    } => (*dev_major, *dev_minor, *ino),
-                    ModuleKey::Unidentified { .. } => (0, 0, 0),
-                };
-                (
-                    module.id,
-                    module.paths.iter().next().cloned().unwrap_or_default(),
-                    (major, minor),
+        let mut claimed_children: BTreeSet<(CallerId, ModuleId)> = BTreeSet::new();
+        for row in self.registry.instance_semantic_edges() {
+            if row
+                .semantics
+                .as_ref()
+                .is_some_and(crate::semantics_edge::EdgeSemantics::has_claims)
+            {
+                claimed_children.insert((row.caller, row.module));
+            }
+            if unit() {
+                return None;
+            }
+        }
+        let mut module_keys: Vec<(ModuleId, String, (u64, u64), u64)> = Vec::new();
+        for module in self.registry.modules() {
+            let (major, minor, ino) = match &module.key {
+                ModuleKey::Physical {
+                    dev_major,
+                    dev_minor,
                     ino,
-                )
-            })
-            .collect();
+                    ..
+                } => (*dev_major, *dev_minor, *ino),
+                ModuleKey::Unidentified { .. } => (0, 0, 0),
+            };
+            module_keys.push((
+                module.id,
+                module.paths.iter().next().cloned().unwrap_or_default(),
+                (major, minor),
+                ino,
+            ));
+            if unit() {
+                return None;
+            }
+        }
         let (forwarding_declared, _) =
             crate::render::match_forwarding_inputs(self.forwarding_inputs(), &module_keys);
         let mut forwarding: BTreeSet<ModuleId> = forwarding_declared.into_iter().collect();
-        forwarding.extend(self.registry.modules().filter_map(|module| {
-            matches!(
+        for module in self.registry.modules() {
+            if matches!(
                 module.admission_class.as_deref(),
                 Some("closure_array" | "closure-array")
-            )
-            .then_some(module.id)
-        }));
-        let subset_modules = subset.map(|subset| self.subset_module_ids(subset));
-        FoldContext {
+            ) {
+                forwarding.insert(module.id);
+            }
+            if unit() {
+                return None;
+            }
+        }
+        let mut subset_modules = None;
+        if let Some(subset) = subset {
+            subset_modules = Some(self.subset_module_ids(subset, &mut unit)?);
+        }
+        Some(FoldContext {
             instances_by_caller,
             claimed_children,
             forwarding,
             subset_modules,
-        }
+        })
     }
 
     /// Fold one proven-ended caller's edges and instances into their
@@ -6310,20 +6499,47 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// one pass over those tables. Edges, instances, pairs and
     /// recoveries fold instead of pinning (their facts move to the
     /// departed aggregate and the dropped-pair machinery); gaps name
-    /// folded callers by label and never pin either.
-    fn referenced_callers(&self) -> BTreeSet<CallerId> {
+    /// folded callers by label and never pin either. Counts every
+    /// examined row through `unit` and aborts (`None`) when it asks;
+    /// the scan is pure, so the caller requeues and retries.
+    fn referenced_callers(&self, mut unit: impl FnMut() -> bool) -> Option<BTreeSet<CallerId>> {
         let mut referenced = BTreeSet::new();
         if let Some(capture) = self.capture.as_ref()
             && let Some(bound) = capture.bound
         {
             referenced.insert(bound);
         }
-        referenced.extend(self.owners.keys().copied());
-        referenced.extend(self.pending_successors.keys().copied());
-        referenced.extend(self.pending_leader_exits.keys().copied());
-        referenced.extend(self.pending_adjudication.keys().copied());
-        referenced.extend(self.pending_ids.values().map(|pending| pending.caller));
-        referenced
+        for id in self.owners.keys().copied() {
+            referenced.insert(id);
+            if unit() {
+                return None;
+            }
+        }
+        for id in self.pending_successors.keys().copied() {
+            referenced.insert(id);
+            if unit() {
+                return None;
+            }
+        }
+        for id in self.pending_leader_exits.keys().copied() {
+            referenced.insert(id);
+            if unit() {
+                return None;
+            }
+        }
+        for id in self.pending_adjudication.keys().copied() {
+            referenced.insert(id);
+            if unit() {
+                return None;
+            }
+        }
+        for pending in self.pending_ids.values() {
+            referenced.insert(pending.caller);
+            if unit() {
+                return None;
+            }
+        }
+        Some(referenced)
     }
 
     /// Caller rows retired into the counted aggregate.
@@ -11164,6 +11380,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Whether the run must stop: the local flag or the operator's
+    /// live signal counter.
+    fn stop_requested(&self) -> bool {
+        self.stopped
+            || self
+                .stop_source
+                .as_ref()
+                .is_some_and(|source| source.load(Ordering::SeqCst) > 0)
+    }
+
+    /// Wire the operator's live signal counter (the run's `StopFlag`
+    /// source) so the fold's planning strides observe a stop
+    /// delivered mid-call. The run setup calls this once; stagings
+    /// without a run keep `None` and the local flag stays the only
+    /// source.
+    pub(crate) fn set_stop_source(&mut self, source: Arc<AtomicUsize>) {
+        self.stop_source = Some(source);
+    }
+
+    /// An owned stop query over the current sources, for callers that
+    /// already hold the coordinator mutably (the fold wrapper): the
+    /// local flag's current value plus the live counter, if wired.
+    pub(crate) fn stop_query(&self) -> Arc<dyn Fn() -> bool> {
+        let stopped = self.stopped;
+        let source = self.stop_source.clone();
+        Arc::new(move || {
+            stopped
+                || source
+                    .as_ref()
+                    .is_some_and(|count| count.load(Ordering::SeqCst) > 0)
+        })
+    }
+
     /// Stop the coordinator (H6 slice 2): no new scan, attach,
     /// successor/name admission, or retry starts afterwards. Held exec
     /// handoffs release their custody now; staged facts still drain
@@ -11658,7 +11907,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return false;
         }
         self.reported_callers_never_admitted = true;
-        let subset_modules = self.subset_module_ids(lane.subset());
+        let subset_modules = self
+            .subset_module_ids(lane.subset(), || false)
+            .expect("a never-abort scan completes");
         if subset_modules.is_empty() {
             return false;
         }
@@ -11719,7 +11970,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return false;
         }
         self.reported_admitted_without_joins = true;
-        let subset_modules = self.subset_module_ids(lane.subset());
+        let subset_modules = self
+            .subset_module_ids(lane.subset(), || false)
+            .expect("a never-abort scan completes");
         if subset_modules.is_empty() {
             return false;
         }
@@ -11766,7 +12019,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return false;
         }
         self.reported_callers_refused_admission = true;
-        let subset_modules = self.subset_module_ids(lane.subset());
+        let subset_modules = self
+            .subset_module_ids(lane.subset(), || false)
+            .expect("a never-abort scan completes");
         if subset_modules.is_empty() {
             return false;
         }
@@ -25156,10 +25411,11 @@ exit 0
             ),
         );
         let stalled = PairKey::scripted(domain, 1500, 0, 0);
-        native.scene.coordinator.recoveries.insert(
-            stalled,
-            PairRecovery::scripted(heavy, 0, ModuleId(3)),
-        );
+        native
+            .scene
+            .coordinator
+            .recoveries
+            .insert(stalled, PairRecovery::scripted(heavy, 0, ModuleId(3)));
         native.scene.coordinator.recovery_order.push(target);
         native.scene.coordinator.recovery_order.push(stalled);
         let mut ids = vec![heavy];
@@ -25243,6 +25499,179 @@ exit 0
         assert!(
             native.scene.coordinator.recoveries.is_empty(),
             "no stalled recovery survives its caller"
+        );
+    }
+
+    /// F4 stride twin: a stop delivered one stride into planning
+    /// aborts the pure plan mid-scan — nothing folds, the carry stays
+    /// whole — and the next pass rebuilds the plan and folds every
+    /// row exactly once.
+    #[test]
+    fn fold_plan_aborts_mid_stride_on_stop_and_resumes_exact() {
+        let (mut native, live) = NativeScene::new();
+        let domain = native.domain;
+        for row in 0..8u64 {
+            native
+                .scene
+                .coordinator
+                .binder
+                .stage_pending_sighting_for_test(domain, live, 9000 + row);
+        }
+        let mut ids = Vec::new();
+        for caller in 0..8u32 {
+            let id = stage_exited_caller(&mut native, 5020 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
+        }
+        // Far more sequences than one stride: the abort must land
+        // mid-scan, with most of the table unexamined.
+        for sequence in 0..300u64 {
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                50_000 + sequence,
+                sequence,
+                Some(ids[0]),
+            );
+        }
+        native.scene.coordinator.note_rendered_callers(&ids);
+        // Quiet at the entry gate, tripped at the first stride check:
+        // the abort lands exactly one nonzero stride in.
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 1
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retired,
+            0,
+            "a mid-stride stop folds nothing"
+        );
+        assert_eq!(
+            checks.get(),
+            2,
+            "the entry gate plus exactly one stride check ran"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .release_pending_visits_for_test(),
+            8,
+            "the small pending table scans whole before the trip"
+        );
+        let cookies = native
+            .scene
+            .coordinator
+            .binder
+            .release_cookie_visits_for_test();
+        assert!(
+            cookies > 0 && cookies < 308,
+            "the cookie scan aborts partway: {cookies} of 308"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_callers.len(),
+            8,
+            "every row waits out the stop in the carry"
+        );
+        for id in &ids {
+            assert!(
+                native.scene.coordinator.adapter.record(*id).is_some(),
+                "no row folds on the aborted pass"
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            8,
+            "the next pass rebuilds the plan and folds every row"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "the resumed fold clears every cookie exactly once"
+        );
+    }
+
+    /// F4 wiring twin: the fold honors the wired operator signal
+    /// counter — quiet folds normally, set stops the pass, cleared
+    /// resumes — through the same query the run setup wires.
+    #[test]
+    fn fold_stop_query_observes_the_wired_signal_counter() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for caller in 0..4u32 {
+            let id = stage_exited_caller(&mut native, 5040 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            if caller < 2 {
+                first.push(id);
+            } else {
+                second.push(id);
+            }
+        }
+        let signals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native
+            .scene
+            .coordinator
+            .set_stop_source(std::sync::Arc::clone(&signals));
+        native.scene.coordinator.note_rendered_callers(&first);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            2,
+            "a quiet counter folds normally"
+        );
+        signals.store(1, std::sync::atomic::Ordering::SeqCst);
+        native.scene.coordinator.note_rendered_callers(&second);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a set counter stops the pass"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_callers.len(),
+            2,
+            "every row waits out the stop in the carry"
+        );
+        signals.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            2,
+            "clearing the counter resumes without a re-note"
         );
     }
 

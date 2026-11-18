@@ -2937,6 +2937,166 @@ mod tests {
         );
     }
 
+    /// A publish failure keeps the finished temp for the operator with a
+    /// warning naming it, never deleting the capture. Arranged by
+    /// replacing the final with a directory after create, so the
+    /// commit-time final check fails while the directory stays writable
+    /// (Drop could unlink, but must not).
+    #[test]
+    fn commit_publish_failure_keeps_the_temp_naming_it() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        std::fs::write(&path, b"old").unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = a.commit().unwrap_err();
+        assert!(
+            error.contains("kept"),
+            "the publish error says the temp was kept, got: {error}"
+        );
+        let litter = temp_litter(dir.path());
+        assert_eq!(litter.len(), 1, "the finished temp is kept, not deleted");
+        let kept = dir.path().join(&litter[0]);
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"{\"ok\":true}",
+            "the kept temp holds the finished capture"
+        );
+        assert!(
+            error.contains(&litter[0]),
+            "the error names the kept temp file, got: {error}"
+        );
+        std::fs::remove_file(&kept).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    /// A handover refusal followed by a publish failure still keeps the
+    /// finished temp, naming it — the error states both failures and the
+    /// kept path. Runs unprivileged: handing to a foreign uid fails EPERM
+    /// without root (the fixture sets the handover directly, past the
+    /// create-time probe), and the final-is-directory swap fails publish.
+    #[test]
+    fn commit_handover_and_publish_failures_keep_the_temp() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: needs a non-root caller (fchown must fail)");
+            return;
+        }
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        std::fs::write(&path, b"old").unwrap();
+        let mut a = atomic_file_test_fixture(&path);
+        let foreign = if unsafe { libc::geteuid() } == 65534 {
+            65533
+        } else {
+            65534
+        };
+        a.handover = Some((foreign, foreign));
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = a.commit().unwrap_err();
+        assert!(
+            error.contains("kept"),
+            "the error says the temp was kept, got: {error}"
+        );
+        assert!(
+            error.contains("handing output"),
+            "the error keeps the handover refusal, got: {error}"
+        );
+        let litter = temp_litter(dir.path());
+        assert_eq!(litter.len(), 1, "the finished temp is kept, not deleted");
+        assert!(
+            error.contains(&litter[0]),
+            "the error names the kept temp, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(&litter[0])).unwrap(),
+            b"{\"ok\":true}",
+            "the kept temp holds the finished capture"
+        );
+        std::fs::remove_file(dir.path().join(&litter[0])).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    /// The handover warning is emitted only after the publish result is
+    /// known, stating what actually happened — `commit` publishes first,
+    /// then prints. Structural: stderr is libtest-captured, so the
+    /// ordering is pinned on the source.
+    #[test]
+    fn commit_emits_the_handover_warning_only_after_publish() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let commit = production
+            .split_once("pub fn commit(mut self)")
+            .unwrap()
+            .1
+            .split_once("fn publish(")
+            .unwrap()
+            .0;
+        let publish = commit
+            .find("publish()")
+            .expect("commit must publish the finished report");
+        let warn = commit
+            .find("eprintln!")
+            .expect("commit must print the handover warning");
+        assert!(
+            publish < warn,
+            "the warning is emitted only after the publish result is known"
+        );
+    }
+
+    /// The whole commit-time handover sequence falls back to publishing
+    /// with a warning, not just the fchown: post-fchown chmod/sync
+    /// failures return a warning instead of failing, so the finished
+    /// report is published rather than unlinked.
+    #[test]
+    fn hand_over_at_commit_falls_back_on_chmod_and_sync_failures() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let handover = production
+            .split_once("fn hand_over_at_commit(")
+            .unwrap()
+            .1
+            .split_once("fn verify_temp_identity(")
+            .unwrap()
+            .0;
+        assert!(
+            !handover.contains('?'),
+            "handover-sequence failures must fall back to publish, never `?`-fail"
+        );
+        assert!(
+            handover.matches("Ok(Some").count() >= 3,
+            "fchown, chmod and sync failures each carry a warning"
+        );
+    }
+
+    /// The create-time probe reports its throwaway-cleanup failure
+    /// instead of swallowing it — no `let _`-ignored unlink, both the
+    /// refusal and success paths name the probe removal.
+    #[test]
+    fn probe_handover_reports_its_cleanup_failure() {
+        let source = include_str!("output.rs");
+        let production = source.split_once("mod tests").unwrap().0;
+        let helper = production
+            .split_once("fn probe_handover(")
+            .expect("the probe helper exists")
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            !helper.contains("let _"),
+            "the probe must report its unlink failure, never `let _`-ignore it"
+        );
+        assert_eq!(
+            helper.matches("removing handover probe").count(),
+            2,
+            "both the refusal and success paths report a probe-removal failure"
+        );
+    }
+
     // RB-1/HIGH-3 supersede SYSPLAN residual F-48's "never stat the final
     // name": the final name is checked, but only through the retained
     // trusted directory with AT_SYMLINK_NOFOLLOW (`metadata_at`), never by a

@@ -1506,16 +1506,19 @@ Limits that matter in pods:
   refusal (a FIFO, socket, symlink, device or directory at `-o`)
   instead keeps the temp beside the destination with a warning
   naming it, without a fallback. If the profile or metrics report
-  cannot be written to
-  `-o` (a full disk, a quota, a read-only remount), the
-  already-rendered JSON document is rescued to stdout instead of
+  cannot be written to `-o` and the recovery dir did not save it
+  either (both saves failed, a security refusal kept the temp, or
+  the write failed before the commit), the already-rendered JSON
+  document is rescued to stdout as the last resort instead of
   being lost: one stderr line names the failed path and says the
   report follows on stdout, and the run still exits nonzero naming
   the `-o` error (and, under stdout backpressure, any shed rescue
-  bytes). The rescue is one compact JSON document on its own line,
-  marked inside with a top-level `delivery` object naming the failed
-  path and error, so it stays machine-separable even when stderr is
-  lost; see the rescued-delivery section of
+  bytes). When the recovery dir did save the capture, there is no
+  stdout rescue — the bytes are safe in the fallback, so a rescue
+  would deliver twice. The rescue is one compact JSON document on
+  its own line, marked inside with a top-level `delivery` object
+  naming the failed path and error, so it stays machine-separable
+  even when stderr is lost; see the rescued-delivery section of
   `docs/schema/observed-profile-v3.md`. Stdout carries display
   frames only for profile and metrics, never the JSON report, so the
   rescue is a new delivery, not a duplicate. A hard stdout error on

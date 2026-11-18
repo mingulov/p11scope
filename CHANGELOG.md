@@ -24,6 +24,7 @@ versioned separately and are opaque, exact dispatch keys.
   (`may not fit`); the capture still starts. Final-name security
   refusals still keep the temp beside the destination without a
   fallback.
+
 - R2 new-site key metadata on `--key-operations` object views
   (section version 6): a successful creation return promotes its own
   observed finite template cells to established with per-field
@@ -85,6 +86,11 @@ versioned separately and are opaque, exact dispatch keys.
   scope-only losses count `unmatched_returns` instead of latching a
   scope fault; the metrics reader now tracks whether the RV table
   is a lower bound.
+- A profile/metrics `-o` failure the recovery dir already saved no
+  longer also rescues the report to stdout; the stdout rescue now
+  fires only as the last resort, after the recovery save failed. The
+  saved-fallback line names the actual owner (`mode 0600, readable
+  only by <user>`; `root-only` only for root-owned files).
 
 ## [0.7.1] - 2026-11-17
 

@@ -12583,17 +12583,29 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 // A same-table re-decode brings the fresher scan's
                 // address: across a remap the retained address is
                 // unmapped, and across a double mapping either address
-                // reads the same table while the generation lives.
+                // reads the same table while the generation lives. A
+                // changed address is exactly the remap match: full
+                // equality already requires address equality, so any
+                // other match moved.
+                let remapped = existing.tables[index].address != table.address;
                 existing.tables[index].address = table.address;
-                // The extension proof unions like the other monotonic
-                // observation flags: an equal table is `PartialEq`-equal
-                // with or without the flag, so a later full-extent decode
-                // whose first failure refutes nothing cannot clear an
-                // earlier proof. Clearing happens only by complete-scan
-                // replacement (the view's modules are rebuilt outright),
-                // never by union. This needs a writable table and lasts
-                // until that rescan.
-                existing.tables[index].extension_impossible |= table.extension_impossible;
+                // The extension proof is mapping evidence, not a monotonic
+                // observation flag: across a remap the retained mapping's
+                // tail verdict says nothing about the fresh mapping's
+                // tail, so the union takes the fresh decode's verdict and
+                // never carries proof the fresh decode lacks. A
+                // same-address re-decode keeps the monotonic union: an
+                // equal table is `PartialEq`-equal with or without the
+                // flag, so a later full-extent decode whose first failure
+                // refutes nothing cannot clear an earlier proof. Clearing
+                // happens only by complete-scan replacement (the view's
+                // modules are rebuilt outright), never by union. This
+                // needs a writable table and lasts until that rescan.
+                if remapped {
+                    existing.tables[index].extension_impossible = table.extension_impossible;
+                } else {
+                    existing.tables[index].extension_impossible |= table.extension_impossible;
+                }
                 Some(index)
             }
             None => {

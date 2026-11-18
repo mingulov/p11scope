@@ -2684,11 +2684,13 @@ pub struct ScannedTable {
     /// `68..92`, refuting the 92-wide and 104-wide layouts. Executable
     /// anonymous memory and executable unusable-path mappings never set
     /// it. Set only by `decode_candidate`; truncation,
-    /// `decode_observed_words`, and anchor recovery never set it. Unioned
-    /// by `merge_scanned_module` like the other monotonic observation
-    /// flags — a later full-extent decode that refutes nothing cannot
-    /// clear an earlier proof until a complete rescan replaces the
-    /// module — and ignored by `PartialEq`.
+    /// `decode_observed_words`, and anchor recovery never set it. A
+    /// same-address re-decode unions it like the other monotonic
+    /// observation flags — a later full-extent decode that refutes
+    /// nothing cannot clear an earlier proof until a complete rescan
+    /// replaces the module — but a remap onto a new address takes the
+    /// fresh decode's verdict: the union never carries proof the fresh
+    /// decode lacks (see `merge_scanned_module`). Ignored by `PartialEq`.
     pub extension_impossible: bool,
 }
 

@@ -16,6 +16,8 @@ use crate::key_operation_projection::{
     KeyAggRow, MetadataBlock, MetadataField, ObjectObservations, ObjectRow, ObsStatus,
     QueriesBlock, SECONDARY_ROLE, SessionRow, UnknownAggRow, object_observations_json,
 };
+use crate::keymeta::{EvidenceTag, KeyFamily, SizeDetail};
+use crate::semantics_key_use::{FamilyState, InferredStatus, RowInference, SizeState};
 
 /// A captured scale presentation carrying `observations`, the way the
 /// live loop embeds a committed revision (mirrors
@@ -66,6 +68,7 @@ fn key_row(
         unknown: 0,
         active,
         key_join_lost: 0,
+        inferred: None,
     }
 }
 
@@ -3116,5 +3119,377 @@ fn provider_json_emits_v8_section_through_render_path() {
     assert_eq!(
         document["modules"][0]["provider_info"]["description"],
         "SoftHSM v2"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Keymeta Task 3 (R2 RED): inferred-key text twins (concise
+// parenthetical, -v detail, off-mode hint). The GREEN commit renders
+// them; every twin below fails until then.
+// ---------------------------------------------------------------------------
+
+/// One proved row with v7 inference attached.
+fn key_row_inferred(
+    object: u64,
+    category: &'static str,
+    role: &'static str,
+    completed: u64,
+    metadata: &'static str,
+    inferred: RowInference,
+) -> KeyAggRow {
+    let mut row = key_row(category, role, completed, 0, 0, "operations");
+    row.object = object;
+    row.metadata_at_use = metadata;
+    row.inferred = Some(inferred);
+    row
+}
+
+fn inferred_rsa_2048(completions: u64) -> RowInference {
+    RowInference {
+        family: FamilyState {
+            status: InferredStatus::Inferred,
+            value: Some(KeyFamily::Rsa),
+            completions,
+            value_completions: completions,
+            conflict_value: None,
+            conflict_completions: 0,
+            further: 0,
+            reason: None,
+        },
+        size: SizeState {
+            status: InferredStatus::Inferred,
+            detail: Some((
+                SizeDetail::Rsa {
+                    size_class: Some(2048),
+                    modulus_bytes: 256,
+                },
+                EvidenceTag::SignOutput,
+            )),
+            completions,
+            conflict_detail: None,
+            further: 0,
+            reason: None,
+        },
+    }
+}
+
+fn inferred_family_only(family: KeyFamily, completions: u64) -> RowInference {
+    RowInference {
+        family: FamilyState {
+            status: InferredStatus::Inferred,
+            value: Some(family),
+            completions,
+            value_completions: completions,
+            conflict_value: None,
+            conflict_completions: 0,
+            further: 0,
+            reason: None,
+        },
+        size: SizeState::default(),
+    }
+}
+
+/// Concise tallies gain the parenthetical where inference adds
+/// information (unknown-metadata rows): valued segments plus the
+/// unknown residual.
+#[test]
+fn key_ops_concise_parenthetical_with_sizes() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        10,
+        "unknown",
+        inferred_rsa_2048(10),
+    ));
+    observations.key_operations.push(key_row_inferred(
+        12,
+        "sign",
+        "key",
+        2,
+        "unknown",
+        RowInference::default(),
+    ));
+    let presentation = key_ops_presentation(observations);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&snapshot);
+    assert!(
+        block
+            .iter()
+            .any(|line| line.contains("(probably RSA 2048: 10; unknown: 2)")),
+        "sign tally carries the parenthetical:\n{snapshot}"
+    );
+}
+
+/// Without sizes the same tallies read family-only.
+#[test]
+fn key_ops_concise_parenthetical_family_only() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        10,
+        "unknown",
+        inferred_family_only(KeyFamily::Rsa, 10),
+    ));
+    observations.key_operations.push(key_row_inferred(
+        12,
+        "sign",
+        "key",
+        2,
+        "unknown",
+        RowInference::default(),
+    ));
+    let presentation = key_ops_presentation(observations);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&snapshot);
+    assert!(
+        block
+            .iter()
+            .any(|line| line.contains("(probably RSA: 10; unknown: 2)")),
+        "sign tally reads family-only:\n{snapshot}"
+    );
+}
+
+/// No inferred content anywhere: concise renders exactly as today
+/// (byte-stable when v7 is absent).
+#[test]
+fn key_ops_concise_stable_without_v7() {
+    let mut observations = populated(9);
+    observations
+        .key_operations
+        .push(key_row("sign", "key", 12, 0, 0, "operations"));
+    let presentation = key_ops_presentation(observations);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&snapshot);
+    assert!(
+        block.iter().all(|line| !line.contains("probably")),
+        "no parenthetical without inference:\n{snapshot}"
+    );
+    assert!(
+        block
+            .iter()
+            .any(|line| line.contains("sign 12 completed, 0 returned errors")),
+        "tally keeps today's shape:\n{snapshot}"
+    );
+}
+
+/// `-v` details one line per inferred row, with the exact §10.3
+/// fragments.
+#[test]
+fn key_ops_verbose_row_detail() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        10,
+        "unknown",
+        inferred_rsa_2048(10),
+    ));
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&snapshot);
+    assert_eq!(
+        block
+            .iter()
+            .find(|line| line.contains("probably RSA (from mechanism)"))
+            .copied(),
+        Some(
+            "  key row test-instance object 11 sign key (unknown): probably RSA (from mechanism); RSA 2048 (from signature length)"
+        ),
+        "exact -v row line:\n{snapshot}"
+    );
+}
+
+/// `-v` conflict, unknown-reason, `+N more`, secret-key and XEdDSA
+/// fragments.
+#[test]
+fn key_ops_verbose_conflict_and_reasons() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        10,
+        "unknown",
+        RowInference {
+            family: FamilyState {
+                status: InferredStatus::Conflicting,
+                value: Some(KeyFamily::Rsa),
+                completions: 10,
+                value_completions: 9,
+                conflict_value: Some(KeyFamily::Ec),
+                conflict_completions: 1,
+                further: 2,
+                reason: None,
+            },
+            size: SizeState {
+                status: InferredStatus::Conflicting,
+                detail: Some((
+                    SizeDetail::Rsa {
+                        size_class: Some(2048),
+                        modulus_bytes: 256,
+                    },
+                    EvidenceTag::SignOutput,
+                )),
+                completions: 10,
+                conflict_detail: Some((
+                    SizeDetail::Rsa {
+                        size_class: Some(3072),
+                        modulus_bytes: 384,
+                    },
+                    EvidenceTag::SignOutput,
+                )),
+                further: 1,
+                reason: None,
+            },
+        },
+    ));
+    observations.key_operations.push(key_row_inferred(
+        12,
+        "verify",
+        "key",
+        3,
+        "unknown",
+        RowInference {
+            family: FamilyState {
+                status: InferredStatus::Inferred,
+                value: Some(KeyFamily::Xeddsa),
+                completions: 3,
+                value_completions: 3,
+                conflict_value: None,
+                conflict_completions: 0,
+                further: 0,
+                reason: None,
+            },
+            size: SizeState {
+                status: InferredStatus::Unknown,
+                detail: None,
+                completions: 3,
+                conflict_detail: None,
+                further: 0,
+                reason: Some(crate::keymeta::REASON_VARIABLE_LENGTH_ENCODING),
+            },
+        },
+    ));
+    observations.key_operations.push(key_row_inferred(
+        13,
+        "derive",
+        "base_key",
+        4,
+        "unknown",
+        inferred_family_only(KeyFamily::Secret, 4),
+    ));
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&snapshot);
+    for fragment in [
+        "family conflicting (RSA: 9, EC: 1, +2 more)",
+        "RSA 2048 (from signature length), +2 more conflicting size",
+        "probably XEdDSA (from mechanism)",
+        "size unknown (variable-length encoding)",
+        "probably secret-key (from mechanism)",
+    ] {
+        assert!(
+            block.iter().any(|line| line.contains(fragment)),
+            "fragment {fragment:?}:\n{snapshot}"
+        );
+    }
+}
+
+/// Without `--key-sizes`, `-v` prints the one-line size hint once per
+/// run; with the flag, or in concise text, it stays silent.
+#[test]
+fn key_ops_verbose_off_hint() {
+    const HINT: &str = "sizes from operation lengths need --key-sizes (families, creation and token-reported sizes still shown)";
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "sign",
+        "key",
+        10,
+        "unknown",
+        inferred_family_only(KeyFamily::Rsa, 10),
+    ));
+    // Flag off (the harness never requests sizes): hint once in -v.
+    let presentation = key_ops_presentation(observations.clone());
+    assert!(
+        !presentation.key_sizes_requested,
+        "the harness leaves sizes off"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert_eq!(
+        block.iter().filter(|line| line.contains(HINT)).count(),
+        1,
+        "hint exactly once:\n{verbose}"
+    );
+    // Concise stays silent even without the flag.
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(!concise.contains(HINT), "concise never hints:\n{concise}");
+    // Flag on: silent in -v too.
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(!verbose.contains(HINT), "no hint with the flag:\n{verbose}");
+}
+
+/// A lone wrapped-material size tallies under its own label in
+/// concise text.
+#[test]
+fn key_ops_concise_wrapped_material() {
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "encrypt",
+        "key",
+        2,
+        "unknown",
+        RowInference {
+            family: FamilyState {
+                status: InferredStatus::Inferred,
+                value: Some(KeyFamily::Aes),
+                completions: 2,
+                value_completions: 2,
+                conflict_value: None,
+                conflict_completions: 0,
+                further: 0,
+                reason: None,
+            },
+            size: SizeState {
+                status: InferredStatus::Inferred,
+                detail: Some((
+                    SizeDetail::WrappedMaterial {
+                        material_octets: 24,
+                        octets: 32,
+                    },
+                    EvidenceTag::UnwrapInput,
+                )),
+                completions: 2,
+                conflict_detail: None,
+                further: 0,
+                reason: None,
+            },
+        },
+    ));
+    let presentation = key_ops_presentation(observations);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&snapshot);
+    assert!(
+        block
+            .iter()
+            .any(|line| line.contains("(probably AES wrapped material 24 bytes: 2)")),
+        "wrapped tally:\n{snapshot}"
     );
 }

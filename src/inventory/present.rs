@@ -690,6 +690,10 @@ pub(crate) struct Presentation {
     /// only: distinguishes "requested but unavailable" from "off";
     /// JSON keeps the observations and gaps).
     pub key_operations_requested: bool,
+    /// Whether `--key-sizes` was requested for this run (text only:
+    /// without it `-v` prints the one-line size hint; JSON keeps the
+    /// observations). Sizes render from row states, never this flag.
+    pub key_sizes_requested: bool,
     /// Whether the run carries manifests (text only: without one no
     /// semantic start is attempted, so no refusal gap exists).
     pub manifests_present: bool,
@@ -1149,6 +1153,7 @@ impl Presentation {
                 native_exec_prune_overflow: coordinator.exec_prune_overflow(),
             },
             key_operations_requested: coordinator.key_operations_requested(),
+            key_sizes_requested: coordinator.key_sizes_requested(),
             manifests_present: coordinator.has_manifests(),
             joint_audit_subjects: {
                 let diagnosis = coordinator.joint_audit_subject_diagnosis();

@@ -28713,3 +28713,404 @@ fn keymeta_seal_carries_no_length_without_capture() {
         "a base-form END settles with no length"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Keymeta Task 3 (R2 RED): v7 contract twins (schema pins, closed JSON
+// shapes, version trigger, revision bytes). The GREEN commit renders
+// them; the rendering twins fail until then.
+// ---------------------------------------------------------------------------
+
+/// The v7 schema pins the inferred-keys contract: 15 proved-row keys
+/// (frozen 13 plus the pair), the closed inferred shapes with exact
+/// enums, and the section version constant.
+#[test]
+fn key_operation_schema_v7_pins_inferred_keys() {
+    use crate::key_operation_projection::contract::{
+        INFERRED_FAMILY_KEYS, INFERRED_SIZE_KEYS, KEY_ROW_KEYS, KEY_ROW_KEYS_V7,
+    };
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v7.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let table =
+        |keys: &[&str]| -> Vec<String> { sorted(keys.iter().map(|key| key.to_string()).collect()) };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    let names = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 7);
+    assert_eq!(KEY_ROW_KEYS.len(), 13, "frozen v1-v6 row keys");
+    assert_eq!(
+        required("/$defs/key_row/required"),
+        table(&KEY_ROW_KEYS_V7),
+        "v7 rows require all 15 keys"
+    );
+    assert_eq!(
+        required("/$defs/inferred_family/required"),
+        table(&["status", "value", "completions"]),
+        "conflict keys stay optional"
+    );
+    assert_eq!(
+        required("/$defs/inferred_size/required"),
+        table(&["status", "detail", "completions"]),
+        "conflict keys stay optional"
+    );
+    assert_eq!(
+        INFERRED_FAMILY_KEYS.to_vec(),
+        vec![
+            "status",
+            "value",
+            "completions",
+            "conflict_value",
+            "conflict_completions",
+            "further_conflicts",
+        ]
+    );
+    assert_eq!(
+        INFERRED_SIZE_KEYS.to_vec(),
+        vec![
+            "status",
+            "detail",
+            "completions",
+            "conflict_detail",
+            "further_conflicts",
+        ]
+    );
+    assert_eq!(
+        names("/$defs/inferred_family/properties/status/enum"),
+        table(&["inferred", "unknown", "conflicting", "unsupported"])
+    );
+    assert_eq!(
+        names("/$defs/inferred_family/properties/value/enum").len(),
+        21,
+        "twenty-one family values"
+    );
+    assert_eq!(
+        names("/$defs/size_detail/properties/kind/enum"),
+        table(&[
+            "rsa",
+            "rsa_nonstandard",
+            "ec",
+            "eddsa",
+            "dsa_class",
+            "pqc_set",
+            "wrapped_material",
+        ])
+    );
+    assert_eq!(
+        names("/$defs/size_detail/properties/evidence/enum"),
+        table(&[
+            "sign_output",
+            "verify_input",
+            "encrypt_output",
+            "decrypt_input",
+            "wrap_output",
+            "unwrap_input",
+            "encapsulate_output",
+            "decapsulate_input",
+        ])
+    );
+    assert_eq!(
+        names("/$defs/size_detail/properties/curve/enum"),
+        table(&["p256", "p384", "p521", "ed25519", "ed448"])
+    );
+    assert_eq!(
+        names("/$defs/size_detail/properties/label/enum"),
+        table(&["dsa_1024", "dsa_2048_224", "dsa_2048_256_or_3072"])
+    );
+    assert_eq!(
+        names("/$defs/size_detail/properties/parameter_set/enum").len(),
+        12,
+        "twelve PQC parameter sets"
+    );
+}
+
+/// Proved rows render the closed v7 shapes exactly, with conflict
+/// keys omitted unless present.
+#[test]
+fn key_row_json_v7_renders_inferred_keys() {
+    use crate::key_operation_projection::{KeyAggRow, key_row_json};
+    use crate::semantics_key_use::{FamilyState, SizeState};
+    let row = KeyAggRow {
+        instance: "i3".to_string(),
+        object: 7,
+        category: "sign",
+        role: "key",
+        metadata_at_use: "unknown",
+        unit: "operations",
+        started: 12,
+        completed: 12,
+        failed: 0,
+        cancelled: 0,
+        unknown: 0,
+        active: 0,
+        key_join_lost: 0,
+        inferred: Some(RowInference {
+            family: FamilyState {
+                status: InferredStatus::Conflicting,
+                value: Some(KeyFamily::Rsa),
+                completions: 12,
+                value_completions: 9,
+                conflict_value: Some(KeyFamily::Ec),
+                conflict_completions: 1,
+                further: 2,
+                reason: None,
+            },
+            size: SizeState {
+                status: InferredStatus::Conflicting,
+                detail: Some((
+                    SizeDetail::Rsa {
+                        size_class: Some(2048),
+                        modulus_bytes: 256,
+                    },
+                    EvidenceTag::SignOutput,
+                )),
+                completions: 12,
+                conflict_detail: Some((
+                    SizeDetail::Rsa {
+                        size_class: Some(3072),
+                        modulus_bytes: 384,
+                    },
+                    EvidenceTag::SignOutput,
+                )),
+                further: 1,
+                reason: None,
+            },
+        }),
+    };
+    let rendered = key_row_json(&row);
+    assert_eq!(
+        rendered,
+        serde_json::json!({
+            "instance": "i3",
+            "object": 7,
+            "category": "sign",
+            "role": "key",
+            "metadata_at_use": "unknown",
+            "unit": "operations",
+            "started": 12,
+            "completed": 12,
+            "failed": 0,
+            "cancelled": 0,
+            "unknown": 0,
+            "active": 0,
+            "key_join_lost": 0,
+            "inferred_family": {
+                "status": "conflicting",
+                "value": "rsa",
+                "completions": 12,
+                "conflict_value": "ec",
+                "conflict_completions": 1,
+                "further_conflicts": 2
+            },
+            "inferred_size": {
+                "status": "conflicting",
+                "detail": {"kind": "rsa", "size_class": 2048,
+                           "modulus_bytes": 256, "evidence": "sign_output"},
+                "completions": 12,
+                "conflict_detail": {"kind": "rsa", "size_class": 3072,
+                                    "modulus_bytes": 384,
+                                    "evidence": "sign_output"},
+                "further_conflicts": 1
+            }
+        })
+    );
+    // Unknown renders null details with no reason key and no conflict
+    // keys; valued-only rows omit conflict and further keys.
+    let row = KeyAggRow {
+        inferred: Some(RowInference {
+            family: FamilyState {
+                status: InferredStatus::Unknown,
+                value: None,
+                completions: 2,
+                value_completions: 0,
+                conflict_value: None,
+                conflict_completions: 0,
+                further: 0,
+                reason: Some(crate::keymeta::REASON_UNLISTED_MECHANISM),
+            },
+            size: SizeState {
+                status: InferredStatus::Inferred,
+                detail: Some((
+                    SizeDetail::WrappedMaterial {
+                        material_octets: 24,
+                        octets: 32,
+                    },
+                    EvidenceTag::WrapOutput,
+                )),
+                completions: 2,
+                conflict_detail: None,
+                further: 0,
+                reason: None,
+            },
+        }),
+        ..row
+    };
+    let rendered = key_row_json(&row);
+    assert_eq!(
+        rendered["inferred_family"],
+        serde_json::json!({
+            "status": "unknown",
+            "value": null,
+            "completions": 2
+        })
+    );
+    assert_eq!(
+        rendered["inferred_size"],
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "wrapped_material", "material_octets": 24,
+                       "octets": 32, "evidence": "wrap_output",
+                       "about": "wrapped"},
+            "completions": 2
+        })
+    );
+}
+
+/// Every inferred-key transition changes the row's JSON bytes, so the
+/// digest-driven JSONL emitter re-sends the row at its new revision.
+#[test]
+fn key_row_json_revision_changes_bytes() {
+    use crate::key_operation_projection::{KeyAggRow, key_row_json};
+    use crate::semantics_key_use::{FamilyState, SizeState};
+    let row = |size_class: Option<u16>| KeyAggRow {
+        instance: "i3".to_string(),
+        object: 7,
+        category: "sign",
+        role: "key",
+        metadata_at_use: "unknown",
+        unit: "operations",
+        started: 1,
+        completed: 1,
+        failed: 0,
+        cancelled: 0,
+        unknown: 0,
+        active: 0,
+        key_join_lost: 0,
+        inferred: Some(RowInference {
+            family: FamilyState {
+                status: InferredStatus::Inferred,
+                value: Some(KeyFamily::Rsa),
+                completions: 1,
+                value_completions: 1,
+                conflict_value: None,
+                conflict_completions: 0,
+                further: 0,
+                reason: None,
+            },
+            size: SizeState {
+                status: InferredStatus::Inferred,
+                detail: Some((
+                    SizeDetail::Rsa {
+                        size_class,
+                        modulus_bytes: 256,
+                    },
+                    EvidenceTag::SignOutput,
+                )),
+                completions: 1,
+                conflict_detail: None,
+                further: 0,
+                reason: None,
+            },
+        }),
+    };
+    let before = serde_json::to_string(&key_row_json(&row(Some(2048)))).unwrap();
+    let after = serde_json::to_string(&key_row_json(&row(Some(3072)))).unwrap();
+    assert_ne!(before, after, "valued transitions change row bytes");
+    assert!(before.contains("2048"), "the class renders:\n{before}");
+}
+
+/// The section version is v7 exactly when a row carries non-blank
+/// inferred content; the off-mode hint alone never triggers it.
+#[test]
+fn observations_version_v7_triggers_on_inferred_content() {
+    use crate::key_operation_projection::{
+        KeyAggRow, ObjectObservations, ObsStatus, observations_version,
+    };
+    use crate::semantics_key_use::{FamilyState, SizeState};
+    let row = |inferred: Option<RowInference>| KeyAggRow {
+        instance: "i3".to_string(),
+        object: 7,
+        category: "sign",
+        role: "key",
+        metadata_at_use: "unknown",
+        unit: "operations",
+        started: 1,
+        completed: 1,
+        failed: 0,
+        cancelled: 0,
+        unknown: 0,
+        active: 0,
+        key_join_lost: 0,
+        inferred,
+    };
+    let version_of = |rows: Vec<KeyAggRow>| {
+        let mut observations = ObjectObservations::unavailable(1, "none");
+        observations.status = ObsStatus::Populated;
+        observations.reason = "none";
+        observations.key_operations = rows;
+        observations_version(&observations)
+    };
+    // Valued family alone emits v7.
+    assert_eq!(
+        version_of(vec![row(Some(RowInference {
+            family: FamilyState {
+                status: InferredStatus::Inferred,
+                value: Some(KeyFamily::Rsa),
+                completions: 1,
+                value_completions: 1,
+                conflict_value: None,
+                conflict_completions: 0,
+                further: 0,
+                reason: None,
+            },
+            size: SizeState::default(),
+        }))]),
+        7
+    );
+    // Blank rows and the off-mode hint alone stay below v7.
+    assert_eq!(version_of(vec![row(None)]), 1);
+    assert_eq!(
+        version_of(vec![row(Some(RowInference {
+            family: FamilyState::default(),
+            size: SizeState {
+                status: InferredStatus::Unknown,
+                detail: None,
+                completions: 0,
+                conflict_detail: None,
+                further: 0,
+                reason: Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF),
+            },
+        }))]),
+        1
+    );
+}

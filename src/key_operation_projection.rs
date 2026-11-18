@@ -54,6 +54,11 @@ pub(crate) const OBSERVATIONS_VERSION_V5: u8 = 5;
 /// curve names. The renderer emits v6 exactly when such content is
 /// present; v1–v5 output stays byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
+/// Section version 7 (keymeta inferred keys): v6 vocabulary plus the
+/// `inferred_family`/`inferred_size` row keys. The renderer emits v7
+/// exactly when a row carries non-blank inferred content; v1–v6
+/// output stays byte-stable.
+pub(crate) const OBSERVATIONS_VERSION_V7: u8 = 7;
 /// The named reason an unseen metadata field carries at v6 when its
 /// creation template carried more than the eight observed cells
 /// (controller KEYMETA-T1 rulings 2026-11-16, ruling 2). The closed
@@ -433,6 +438,46 @@ pub(crate) mod contract {
         "active",
         "key_join_lost",
     ];
+    /// H9 section v7 proved-key row keys: the frozen 13 plus the
+    /// `inferred_family`/`inferred_size` keys. v1–v6 rows keep the
+    /// frozen 13; v7 sections carry all 15 on every proved row.
+    pub(crate) const KEY_ROW_KEYS_V7: [&str; 15] = [
+        "instance",
+        "object",
+        "category",
+        "role",
+        "metadata_at_use",
+        "unit",
+        "started",
+        "completed",
+        "failed",
+        "cancelled",
+        "unknown",
+        "active",
+        "key_join_lost",
+        "inferred_family",
+        "inferred_size",
+    ];
+    /// The closed `inferred_family` keys (§10.2): reasons ride `-v`
+    /// text, never this shape.
+    pub(crate) const INFERRED_FAMILY_KEYS: [&str; 6] = [
+        "status",
+        "value",
+        "completions",
+        "conflict_value",
+        "conflict_completions",
+        "further_conflicts",
+    ];
+    /// The closed `inferred_size` keys (§10.2): reasons ride `-v`
+    /// text, never this shape (`conflict_completions` is absent by
+    /// design — `conflict_detail` is the second-value carrier).
+    pub(crate) const INFERRED_SIZE_KEYS: [&str; 5] = [
+        "status",
+        "detail",
+        "completions",
+        "conflict_detail",
+        "further_conflicts",
+    ];
 
     /// Frozen unknown-key reasons (H9 §82).
     pub(crate) const UNKNOWN_REASONS: [&str; 6] = [
@@ -740,6 +785,10 @@ pub(crate) struct KeyAggRow {
     pub unknown: u64,
     pub active: u64,
     pub key_join_lost: u64,
+    /// v7 inferred keys (§10.2): `Some` on every proved row of a v7
+    /// section (blank states render unknown), `None` below v7, so
+    /// v1–v6 rows keep the frozen 13 keys byte-stable.
+    pub inferred: Option<crate::semantics_key_use::RowInference>,
 }
 
 /// One capture-wide unknown-key summary row: terminals partitioned
@@ -1023,9 +1072,10 @@ pub(crate) fn object_row_json(row: &ObjectRow, version: u8) -> serde_json::Value
     })
 }
 
-/// Render one proved-key aggregate row: the exact frozen keys.
+/// Render one proved-key aggregate row: the exact frozen keys,
+/// plus the v7 inferred keys exactly when the row carries them.
 pub(crate) fn key_row_json(row: &KeyAggRow) -> serde_json::Value {
-    serde_json::json!({
+    let mut rendered = serde_json::json!({
         "instance": row.instance,
         "object": row.object,
         "category": row.category,
@@ -1039,7 +1089,33 @@ pub(crate) fn key_row_json(row: &KeyAggRow) -> serde_json::Value {
         "unknown": row.unknown,
         "active": row.active,
         "key_join_lost": row.key_join_lost,
-    })
+    });
+    if let Some(inferred) = row.inferred.as_ref() {
+        let object = rendered.as_object_mut().expect("row object");
+        object.insert(
+            "inferred_family".to_string(),
+            inferred_family_json(&inferred.family),
+        );
+        object.insert(
+            "inferred_size".to_string(),
+            inferred_size_json(&inferred.size),
+        );
+    }
+    rendered
+}
+
+/// Render one inferred family (§10.2 closed shape).
+pub(crate) fn inferred_family_json(
+    _family: &crate::semantics_key_use::FamilyState,
+) -> serde_json::Value {
+    // RED STUB: the GREEN commit renders the closed shape.
+    serde_json::Value::Null
+}
+
+/// Render one inferred size (§10.2 closed shape).
+pub(crate) fn inferred_size_json(_size: &crate::semantics_key_use::SizeState) -> serde_json::Value {
+    // RED STUB: the GREEN commit renders the closed shape.
+    serde_json::Value::Null
 }
 
 /// Render one unknown-key summary row: the exact frozen keys (no
@@ -1198,7 +1274,21 @@ fn block_has_creation_source(block: &MetadataBlock) -> bool {
     })
 }
 
+/// Keymeta v7 content: any proved row carrying non-blank inferred
+/// keys (§10.1 — family alone emits v7; the off-mode size hint never
+/// triggers a version on its own).
+fn has_inferred_content(observations: &ObjectObservations) -> bool {
+    observations.key_operations.iter().any(|row| {
+        row.inferred
+            .as_ref()
+            .is_some_and(|keys| keys.is_v7_content())
+    })
+}
+
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
+    if has_inferred_content(observations) {
+        return OBSERVATIONS_VERSION_V7;
+    }
     if has_newsite_content(observations) {
         return OBSERVATIONS_VERSION_V6;
     }
@@ -1587,6 +1677,9 @@ pub(crate) mod producer {
                 unknown: counters.unknown,
                 active: counters.active,
                 key_join_lost: counters.key_join_lost,
+                // RED STUB: the GREEN commit fills inferred keys on
+                // every row of a v7 section, None below v7.
+                inferred: None,
             });
         }
         key_rows.sort_by(|a, b| {

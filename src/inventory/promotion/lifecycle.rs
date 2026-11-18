@@ -1366,6 +1366,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         ),
         prearm: Vec::new(),
         key_operations_requested: false,
+        key_sizes_requested: false,
         manifests_present: false,
         joint_audit_subjects: None,
         provider_observations: None,

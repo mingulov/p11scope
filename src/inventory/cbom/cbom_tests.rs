@@ -1805,3 +1805,157 @@ fn cbom_departed_rows_without_a_module_id_stay_named_unknowns() {
         "coverage names the unjoinable row, got:\n{concise}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Keymeta Task 3 (R2 RED): K4 qualification, provenance tallies, HKDF key
+// type and inferred exclusion. The GREEN commit renders them; the tally
+// and HKDF twins fail until then (qualification and exclusion pin
+// behavior that already holds).
+// ---------------------------------------------------------------------------
+
+/// One v7 inventory document: an HKDF object with mixed-source
+/// established facts plus a deliberately mismatched inferred row
+/// (RSA-2048 inferred on the HKDF key — CBOM must never repeat it).
+fn keymeta_v7_document() -> Vec<u8> {
+    let mut document: Value = serde_json::from_slice(&inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"c".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+    ))
+    .unwrap();
+    document["instances"] = json!([
+        {"id": "i0", "caller": "c0", "module": "m0", "state": "observed",
+         "reason": null, "first_seen_ns": 110, "last_seen_ns": 190}
+    ]);
+    let slot = |value: Value, source: Value| json!({"status": "value", "value": value, "source": source, "reason": Value::Null});
+    document["object_observations"] = json!({
+        "version": 7, "revision": 1, "status": "populated", "reason": "none",
+        "sessions": [{"session": 0, "origin": "opened", "status": "live"}],
+        "objects": [
+            {
+                "object": 0, "session": 0, "origin": "created",
+                "creation": "generate", "birth": {"start_ns": 1, "end_ns": 2},
+                "lifetime": "live", "lifetime_reason": null,
+                "attribution": "valid", "attribution_reason": null,
+                "requested": metadata_block(Some(4), Some(66), Some(32)),
+                "established": {
+                    "class": slot(json!(4), json!("query")),
+                    "key_type": slot(json!(66), json!("creation_success")),
+                    "token": slot(json!(0), json!("query")),
+                    "value_len": slot(json!(32), json!("creation_success")),
+                    "modulus_bits": {"status": "unknown", "value": Value::Null},
+                    "ec_params": {"status": "unknown", "value": Value::Null}
+                },
+                "queries": {"class": "established", "key_type": "established",
+                            "token": "established", "value_len": "established",
+                            "modulus_bits": "not_queried", "ec_params": "not_queried",
+                            "parameter_set": "not_queried"},
+                "label": "hkdf_256",
+                "successful_references": 2,
+                "successful_key_references": 2,
+                "accessing_sessions": 1
+            }
+        ],
+        "key_operations": [
+            {
+                "instance": "i0", "object": 0, "category": "sign",
+                "role": "key", "metadata_at_use": "unknown",
+                "unit": "operations", "started": 1, "completed": 1,
+                "failed": 0, "cancelled": 0, "unknown": 0, "active": 0,
+                "key_join_lost": 0,
+                "inferred_family": {"status": "inferred", "value": "rsa",
+                                    "completions": 1},
+                "inferred_size": {"status": "inferred",
+                                  "detail": {"kind": "rsa", "size_class": 2048,
+                                             "modulus_bytes": 256,
+                                             "evidence": "sign_output"},
+                                  "completions": 1}
+            }
+        ],
+        "unknown_key_operations": [],
+        "unattributed": [],
+        "gaps": {"rows": [], "suppressed": 0},
+        "budgets": {
+            "key_rows": {"limit": 65536, "occupied": 1, "refused": 0},
+            "object_rows": {"limit": 8192, "occupied": 1, "refused": 0},
+            "unknown_rows": {"occupied": 0},
+            "encoded_bytes": 10,
+            "allocation_refused": false,
+            "refusal_reason": "none"
+        }
+    });
+    serde_json::to_vec(&document).unwrap()
+}
+
+/// K4: `creation_success` facts qualify as established (promotion
+/// soundness rests on provider compliance, like queries).
+#[test]
+fn cbom_qualifies_creation_success_as_established() {
+    let projection = parse_input(&keymeta_v7_document()).unwrap();
+    assert_eq!(projection.keys.len(), 1);
+    assert_eq!(projection.keys[0].key_type, Some(66));
+    assert_eq!(projection.keys[0].size_bits, Some(256));
+}
+
+/// The exporter records per-slot sources in metadata provenance
+/// tallies (query vs creation_success vs unrecorded).
+#[test]
+fn cbom_records_source_provenance_tallies() {
+    let projection = parse_input(&keymeta_v7_document()).unwrap();
+    let document = super::render::render_json(&projection);
+    let properties = document["metadata"]["properties"]
+        .as_array()
+        .expect("metadata properties");
+    let tally = |name: &str| {
+        properties
+            .iter()
+            .find(|prop| prop["name"] == name)
+            .unwrap_or_else(|| panic!("{name} tally"))["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(tally("p11scope:established_source_query"), "2");
+    assert_eq!(tally("p11scope:established_source_creation_success"), "2");
+    assert_eq!(tally("p11scope:established_source_unrecorded"), "0");
+}
+
+/// Key type 66 renders HKDF, never `unknown`.
+#[test]
+fn cbom_names_hkdf_key_type() {
+    let projection = parse_input(&keymeta_v7_document()).unwrap();
+    let document = super::render::render_json(&projection);
+    let components = document["components"].as_array().expect("components");
+    let key = components
+        .iter()
+        .find(|component| component["bom-ref"] == "p11scope:key:0")
+        .expect("key component");
+    let properties = key["properties"].as_array().expect("key properties");
+    let key_type = properties
+        .iter()
+        .find(|prop| prop["name"] == "p11scope:key_type")
+        .expect("key_type property");
+    assert_eq!(key_type["value"], "66 (hkdf)");
+}
+
+/// Inferred facts never qualify for established CBOM fields: the
+/// deliberately mismatched RSA-2048 inference leaves no trace.
+#[test]
+fn cbom_excludes_inferred_facts() {
+    let projection = parse_input(&keymeta_v7_document()).unwrap();
+    let document = super::render::render_json(&projection);
+    let components = document["components"].as_array().expect("components");
+    let key = components
+        .iter()
+        .find(|component| component["bom-ref"] == "p11scope:key:0")
+        .expect("key component");
+    let related = &key["cryptoProperties"]["relatedCryptoMaterialProperties"];
+    assert_eq!(related["size"], 256, "established size only");
+    let rendered = serde_json::to_string(key).unwrap();
+    for leaked in ["rsa", "2048", "inferred"] {
+        assert!(
+            !rendered.contains(leaked),
+            "no {leaked:?} leaks into the key component:\n{rendered}"
+        );
+    }
+}

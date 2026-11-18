@@ -275,6 +275,25 @@ pub(crate) fn masked_rsa_class(_octets: u64) -> String {
     "?".to_string()
 }
 
+/// Whether two size details are the same size (§10.2): same detail
+/// kind plus size params. The evidence tag never enters (it is not a
+/// parameter), so same-size evidence keeps the first tag by
+/// construction.
+pub(crate) fn same_size(_a: &SizeDetail, _b: &SizeDetail) -> bool {
+    // RED STUB.
+    false
+}
+
+/// The concise combined label for one valued family plus one valued
+/// size ("RSA 2048", "EC P-256", "Ed25519", "DSA 1024-bit class",
+/// "ML-KEM-768", "AES wrapped material 24 bytes"). Self-sufficient
+/// size displays (EdDSA curves, PQC sets) stand alone; every other
+/// kind names the family.
+pub(crate) fn concise_label(_family: KeyFamily, _detail: &SizeDetail) -> String {
+    // RED STUB.
+    "?".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1816,6 +1835,163 @@ mod tests {
         assert_eq!(size_family(&ec), Some(KeyFamily::Ec));
         assert_eq!(size_family(&pqc), Some(KeyFamily::MlKem));
         assert_eq!(size_family(&wrapped), None);
+    }
+
+    /// Same-size comparison ignores evidence tags by construction
+    /// (tags are not parameters): equal kinds with equal params match
+    /// across tags; any param or kind difference does not.
+    #[test]
+    fn same_size_ignores_tags() {
+        let rsa = || SizeDetail::Rsa {
+            size_class: Some(2048),
+            modulus_bytes: 256,
+        };
+        assert!(same_size(&rsa(), &rsa()));
+        assert!(!same_size(
+            &rsa(),
+            &SizeDetail::Rsa {
+                size_class: Some(3072),
+                modulus_bytes: 384,
+            }
+        ));
+        assert!(!same_size(
+            &rsa(),
+            &SizeDetail::Rsa {
+                size_class: None,
+                modulus_bytes: 256,
+            }
+        ));
+        assert!(same_size(
+            &SizeDetail::Ec {
+                curve: "p256",
+                octets: 64,
+            },
+            &SizeDetail::Ec {
+                curve: "p256",
+                octets: 64,
+            }
+        ));
+        assert!(!same_size(
+            &SizeDetail::Ec {
+                curve: "p256",
+                octets: 64,
+            },
+            &SizeDetail::Ec {
+                curve: "p384",
+                octets: 96,
+            }
+        ));
+        assert!(!same_size(
+            &rsa(),
+            &SizeDetail::WrappedMaterial {
+                material_octets: 24,
+                octets: 32,
+            }
+        ));
+    }
+
+    /// Concise combined labels per size kind.
+    #[test]
+    fn concise_labels() {
+        let rsa = SizeDetail::Rsa {
+            size_class: Some(2048),
+            modulus_bytes: 256,
+        };
+        assert_eq!(concise_label(KeyFamily::Rsa, &rsa), "RSA 2048");
+        let masked = SizeDetail::Rsa {
+            size_class: None,
+            modulus_bytes: 257,
+        };
+        assert_eq!(
+            concise_label(KeyFamily::Rsa, &masked),
+            "RSA (non-standard length)"
+        );
+        let ec = SizeDetail::Ec {
+            curve: "p256",
+            octets: 64,
+        };
+        assert_eq!(concise_label(KeyFamily::Ec, &ec), "EC P-256");
+        let eddsa = SizeDetail::Eddsa {
+            curve: "ed25519",
+            octets: 64,
+        };
+        assert_eq!(concise_label(KeyFamily::Eddsa, &eddsa), "Ed25519");
+        let dsa = SizeDetail::DsaClass {
+            label: "dsa_1024",
+            octets: 40,
+        };
+        assert_eq!(concise_label(KeyFamily::Dsa, &dsa), "DSA 1024-bit class");
+        let pqc = SizeDetail::PqcSet {
+            parameter_set: "ml_kem_768",
+            octets: 1088,
+        };
+        assert_eq!(concise_label(KeyFamily::MlKem, &pqc), "ML-KEM-768");
+        let wrapped = SizeDetail::WrappedMaterial {
+            material_octets: 24,
+            octets: 32,
+        };
+        assert_eq!(
+            concise_label(KeyFamily::Aes, &wrapped),
+            "AES wrapped material 24 bytes"
+        );
+    }
+
+    /// Verbose fragments for the remaining size kinds: DSA classes,
+    /// EdDSA curves, PQC sets with the SHA-2/SHAKE ambiguity said
+    /// aloud, and the U1 noun.
+    #[test]
+    fn verbose_fragments() {
+        use EvidenceTag::*;
+        let dsa = SizeDetail::DsaClass {
+            label: "dsa_2048_224",
+            octets: 56,
+        };
+        assert_eq!(
+            size_verbose(&dsa, SignOutput),
+            "DSA 2048/224 class (from signature length)"
+        );
+        let eddsa = SizeDetail::Eddsa {
+            curve: "ed448",
+            octets: 114,
+        };
+        assert_eq!(
+            size_verbose(&eddsa, VerifyInput),
+            "Ed448 (from signature length)"
+        );
+        let pqc = SizeDetail::PqcSet {
+            parameter_set: "slh_dsa_128s",
+            octets: 7856,
+        };
+        assert_eq!(
+            size_verbose(&pqc, SignOutput),
+            "SLH-DSA-128s (from signature length; SHA-2/SHAKE ambiguous)"
+        );
+        let ml = SizeDetail::PqcSet {
+            parameter_set: "ml_kem_768",
+            octets: 1088,
+        };
+        assert_eq!(
+            size_verbose(&ml, DecapsulateInput),
+            "ML-KEM-768 (from ciphertext length)"
+        );
+        let wrapped = SizeDetail::WrappedMaterial {
+            material_octets: 24,
+            octets: 32,
+        };
+        assert_eq!(
+            size_verbose(&wrapped, UnwrapInput),
+            "wrapped material 24 bytes (from 32-byte wrapped key)"
+        );
+        assert_eq!(
+            size_verbose(
+                &SizeDetail::Rsa {
+                    size_class: Some(2048),
+                    modulus_bytes: 256,
+                },
+                UnwrapInput,
+            ),
+            "RSA 2048 (from unwrap input length)"
+        );
     }
 
     /// Reason display phrases (explicit, never mechanical).

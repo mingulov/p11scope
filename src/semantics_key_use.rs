@@ -2341,12 +2341,16 @@ pub(crate) enum InferredStatus {
 /// value stays pinned with its supporting completions, a second
 /// distinct specific family rides the conflict pair, and further
 /// distinct values count without listing. The `secret` superclass
-/// accumulates beside any family and never flips.
+/// accumulates beside any family and never flips. `completions`
+/// counts every completion carrying family evidence (specific,
+/// secret-beside and further values alike); `value_completions`
+/// counts the first value's own support for the `-v` pair display.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FamilyState {
     pub status: InferredStatus,
     pub value: Option<crate::keymeta::KeyFamily>,
     pub completions: u64,
+    pub value_completions: u64,
     pub conflict_value: Option<crate::keymeta::KeyFamily>,
     pub conflict_completions: u64,
     pub further: u64,

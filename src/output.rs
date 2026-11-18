@@ -38,8 +38,10 @@ impl FileIdentity {
 }
 
 /// A private temp file created beside a target path, published to that path
-/// with an identity-verified `rename(2)` on `commit`. If never committed (or
-/// if `commit` fails), the temp file is unlinked by `Drop`.
+/// with an identity-verified `rename(2)` on `commit`. If never committed the
+/// temp file is unlinked by `Drop`; a finished capture is never deleted by
+/// `commit` — a publish failure keeps the temp for the operator with a
+/// warning naming it.
 ///
 /// Final-name policy (RB-1/HIGH-3, superseding F-48's "never stat the final
 /// name"): `rename(2)` atomically replaces any non-directory, so renaming
@@ -183,10 +185,14 @@ impl AtomicFile {
     /// creator, mode & 0o077 == 0), `sync_all`, hands the finished file to
     /// the handover target decided at creation and syncs the new
     /// owner/mode, re-checks the final name, then renames over it. A
-    /// handover the create-time probe passed but the filesystem refuses
-    /// here still publishes the finished report creator-owned 0600 with
-    /// a warning naming the path, instead of unlinking the capture;
-    /// every other error unlinks the temp by `Drop`.
+    /// handover-sequence failure the create-time probe passed but the
+    /// filesystem refuses here (fchown, chmod or post-handover sync) still
+    /// publishes the finished report with a warning naming the path,
+    /// instead of unlinking the capture; the warning is printed only after
+    /// the publish result is known, stating what actually happened. Only a
+    /// publish (rename) failure keeps the finished temp beside the final
+    /// name, with a warning naming the kept path — the capture is never
+    /// deleted.
     pub fn commit(mut self) -> Result<(), String> {
         self.verify_temp_identity()?;
         self.temp_file.sync_all().map_err(|error| {
@@ -195,15 +201,55 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
-        if let Some(warning) = self.hand_over_at_commit()? {
-            eprintln!("{warning}");
+        let pending = self.hand_over_at_commit()?;
+        match self.publish() {
+            Ok(()) => {
+                // The report is published at this point; a directory fsync that the
+                // filesystem cannot honour must not turn a complete run into a failure.
+                let _ = self.directory.sync_all();
+                self.cleanup = false;
+                if let Some(pending) = pending {
+                    let published = match self.handover {
+                        Some((uid, _)) if self.owner == uid => format!(
+                            "published {} as handed over instead",
+                            self.final_path.display()
+                        ),
+                        _ => format!(
+                            "published {} root-owned 0600 instead",
+                            self.final_path.display()
+                        ),
+                    };
+                    eprintln!("{pending}; {published}");
+                }
+                Ok(())
+            }
+            Err(publish_error) => {
+                self.cleanup = false;
+                let temp_path = self.temp_path();
+                if let Some(pending) = pending {
+                    eprintln!(
+                        "{pending}; {publish_error}; kept {} (report not deleted)",
+                        temp_path.display()
+                    );
+                    let issue = pending
+                        .strip_prefix("p11scope: warning: ")
+                        .unwrap_or(&pending);
+                    Err(format!(
+                        "{issue}; {publish_error}; kept {} (report not deleted)",
+                        temp_path.display()
+                    ))
+                } else {
+                    eprintln!(
+                        "p11scope: warning: {publish_error}; kept {} (report not deleted)",
+                        temp_path.display()
+                    );
+                    Err(format!(
+                        "{publish_error}; kept {} (report not deleted)",
+                        temp_path.display()
+                    ))
+                }
+            }
         }
-        self.publish()?;
-        // The report is published at this point; a directory fsync that the
-        // filesystem cannot honour must not turn a complete run into a failure.
-        let _ = self.directory.sync_all();
-        self.cleanup = false;
-        Ok(())
     }
 
     /// The rename itself, fail-closed on the final name: an absent name is
@@ -245,49 +291,65 @@ impl AtomicFile {
         .map_err(failed)
     }
 
+    /// The temp sibling's path beside the final name, for the kept-temp
+    /// warning when publish fails. The names are generated without NUL and
+    /// the final path always has a parent (checked in `create`).
+    fn temp_path(&self) -> PathBuf {
+        let name = self
+            .temp_name
+            .to_str()
+            .expect("generated temporary output name is UTF-8");
+        self.final_path
+            .parent()
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|| PathBuf::from(name))
+    }
+
     /// Hands the finished report to the handover target decided at
     /// creation: `fchown` plus an explicit `0600` on the open
     /// descriptor, never by path, so no symlink can redirect it, then a
     /// sync of the new owner/mode so a crash cannot persist the later
     /// rename with pre-handover ownership. Without a target this keeps
     /// the creator's ownership and reports no warning. Once the `fchown`
-    /// succeeds the recorded owner is the target, so a later failure
-    /// still unlinks this run's file through `Drop`.
+    /// succeeds the recorded owner is the target.
     ///
-    /// A `fchown` that fails here — the create-time probe passed but the
-    /// filesystem refused the real file — returns the warning to print
-    /// instead of failing: the caller publishes the finished report
-    /// creator-owned 0600 (root-owned whenever a handover arms, which
-    /// needs root) rather than unlinking it.
+    /// Any failure in this sequence — the create-time probe passed but
+    /// the filesystem refused the real file (`fchown`), or the
+    /// post-handover chmod/sync refused — returns the pending warning
+    /// instead of failing: the caller still publishes the finished report
+    /// (creator-owned 0600 when the `fchown` refused, which is root-owned
+    /// whenever a handover arms, since that needs root; as handed over
+    /// when the `fchown` succeeded) and prints the warning only after the
+    /// publish result is known.
     fn hand_over_at_commit(&mut self) -> Result<Option<String>, String> {
         use std::os::unix::fs::PermissionsExt as _;
         let Some((uid, gid)) = self.handover else {
             return Ok(None);
         };
         if let Err(error) = handover_new_file(&self.temp_file, Some((uid, gid)), &self.final_path) {
-            return Ok(Some(format!(
-                "p11scope: warning: {error}; published {} root-owned 0600 instead",
-                self.final_path.display()
-            )));
+            return Ok(Some(format!("p11scope: warning: {error}")));
         }
         self.owner = uid;
-        self.temp_file
+        if let Err(error) = self
+            .temp_file
             .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| {
-                format!(
-                    "setting output {} private after handing it to uid {uid}, gid {gid} failed: {error}",
-                    self.final_path.display()
-                )
-            })?;
+        {
+            let error = format!(
+                "setting output {} private after handing it to uid {uid}, gid {gid} failed: {error}",
+                self.final_path.display()
+            );
+            return Ok(Some(format!("p11scope: warning: {error}")));
+        }
         // Persist the new owner/mode before publication: without this
         // sync an OS crash between commit and inode writeback could
         // persist the rename with pre-handover ownership.
-        self.temp_file.sync_all().map_err(|error| {
-            format!(
+        if let Err(error) = self.temp_file.sync_all() {
+            let error = format!(
                 "syncing output {} after handing it to uid {uid}, gid {gid} failed: {error}",
                 self.final_path.display()
-            )
-        })?;
+            );
+            return Ok(Some(format!("p11scope: warning: {error}")));
+        }
         Ok(None)
     }
 
@@ -1096,7 +1158,8 @@ fn handover_new_file(
 /// capture — the real temp never exists, let alone holds hours of
 /// work. The probe passing does not promise commit will: the
 /// filesystem can still refuse the real file later, and then commit
-/// publishes creator-owned with a warning instead of unlinking.
+/// publishes creator-owned with a warning instead of unlinking. A
+/// throwaway the probe cannot remove is reported, never left silently.
 fn probe_handover(
     directory: &std::fs::File,
     target: (u32, u32),
@@ -1112,7 +1175,12 @@ fn probe_handover(
         match openat_profile(directory, &probe_name) {
             Ok(probe_file) => {
                 if let Err(error) = handover_new_file(&probe_file, Some(target), final_path) {
-                    let _ = unlinkat(directory, &probe_name);
+                    unlinkat(directory, &probe_name).map_err(|unlink_error| {
+                        format!(
+                            "{error}; removing handover probe beside {} failed: {unlink_error}",
+                            final_path.display()
+                        )
+                    })?;
                     return Err(error);
                 }
                 unlinkat(directory, &probe_name).map_err(|error| {
@@ -1860,7 +1928,17 @@ mod tests {
             .expect_err("a FIFO that appeared must be refused");
         assert!(error.contains("a FIFO"), "{error}");
         assert!(file_type(&path).is_fifo());
-        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+        // The refused capture is kept for the operator, never deleted.
+        assert!(error.contains("kept"), "{error}");
+        let litter = temp_litter(dir.path());
+        assert_eq!(litter.len(), 1, "the refused capture is kept, not deleted");
+        assert!(error.contains(&litter[0]), "{error}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&litter[0])).unwrap(),
+            b"{}",
+            "the kept temp holds the finished capture"
+        );
+        std::fs::remove_file(dir.path().join(&litter[0])).unwrap();
     }
 
     #[test]
@@ -1880,7 +1958,17 @@ mod tests {
         assert!(error.contains("a symbolic link"), "{error}");
         assert!(file_type(&path).is_symlink());
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"do not touch");
-        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+        // The refused capture is kept for the operator, never deleted.
+        assert!(error.contains("kept"), "{error}");
+        let litter = temp_litter(dir.path());
+        assert_eq!(litter.len(), 1, "the refused capture is kept, not deleted");
+        assert!(error.contains(&litter[0]), "{error}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&litter[0])).unwrap(),
+            b"{}",
+            "the kept temp holds the finished capture"
+        );
+        std::fs::remove_file(dir.path().join(&litter[0])).unwrap();
     }
 
     /// A regular file that appeared at a name that was absent at create is
@@ -2727,11 +2815,12 @@ mod tests {
     }
 
     /// Post-handover durability pin: the commit-time `fchown`/`fchmod`
-    /// must be followed by a fail-closed file sync before publication,
-    /// or an OS crash could persist the rename with pre-handover
-    /// ownership. Structural: `fsync` success is invisible, so the
-    /// ordering and the named error are pinned on the source; the
-    /// healthy twin below proves the pinned path executes.
+    /// must be followed by a file sync before publication, or an OS crash
+    /// could persist the rename with pre-handover ownership. A refusal
+    /// falls back to publishing with a warning, never silently ignored.
+    /// Structural: `fsync` success is invisible, so the ordering and the
+    /// named error are pinned on the source; the healthy twin below proves
+    /// the pinned path executes.
     #[test]
     fn commit_handover_syncs_the_handed_over_file_before_publish() {
         let source = include_str!("output.rs");
@@ -2762,7 +2851,7 @@ mod tests {
         );
         assert!(
             !handover.contains("let _"),
-            "the post-handover sync must fail closed, never `let _`-ignored"
+            "the post-handover sync failure must be reported, never `let _`-ignored"
         );
     }
 

@@ -1194,6 +1194,242 @@ fn generational_candidate_carries_active_provider_across_view_removal() {
 }
 
 #[test]
+fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
+    // System scope only: cgroup scope preserves carried ids across
+    // refreshes explicitly, which masks the purge below; the
+    // claimlessness invariant itself is scope-independent.
+    // Candidate 1 is a removal carry: the exited view's provider module
+    // rides for its still-attached object WITHOUT ownership claims
+    // under the retired view (resolvable but claimless is the carried
+    // shape). Candidate 2 is an unrelated owner's refresh with an empty
+    // preserve set: it must not purge the carried pin while the carried
+    // slot is still needed. A rebind that files claims under the retired
+    // view breaks the derived carried classification, and the unrelated
+    // refresh then drops the provider with a missing-pin bind skip.
+    let raw_a = overlay_module(overlay_key(86));
+    let raw_b = overlay_module(overlay_key(87));
+    let mut pins = overlay_pins(&[(raw_a.key, OVERLAY_SHA, 1), (raw_b.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw_a, raw_b], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut engine = Engine::empty();
+    engine.scope = crate::attach::Scope::System;
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    let view_a = engine.modules[0].scanned.view;
+    let view_b = engine.modules[1].scanned.view;
+    let object_a = engine.modules[0].object;
+    let slot_active = |candidate: &LiveCandidate, object: PinnedObjectId| {
+        candidate
+            .plan
+            .slots
+            .iter()
+            .any(|slot| candidate.plan.is_active(slot.index) && slot.object == object)
+    };
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| engine.plan.is_active(slot.index) && slot.object == object_a),
+        "the fixture starts attached"
+    );
+    let removed: BTreeSet<ProcessViewId> = BTreeSet::from([view_a]);
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let carried = engine
+        .inventory_candidate(&removed, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        slot_active(&carried, object_a),
+        "generational scope keeps the attached slot when only its scan view exits"
+    );
+    assert!(
+        carried.modules.iter().any(|module| module.object == object_a),
+        "the provider module survives the exit"
+    );
+    assert!(
+        carried.pinned.summary(object_a).is_some(),
+        "the pin survives with the slots"
+    );
+    assert!(
+        carried.pinned.view_claims(view_a).is_none(),
+        "the removal carry files no claims under the retired view"
+    );
+    assert!(
+        carried.pinned.carried_ids().contains(&object_a),
+        "the carried pin reads as carried coverage"
+    );
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    // Empty preserve set: System scope with no newcomers waiting (pinned
+    // so the purge below cannot pass vacuously behind a preserve).
+    assert!(
+        engine.newcomer_first_seen.is_empty(),
+        "no newcomers wait, so the refresh preserves nothing"
+    );
+    let refreshed = vec![(view_b, Vec::new(), PinnedObjects::empty())];
+    let next = engine
+        .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        next.pinned.summary(object_a).is_some(),
+        "an unrelated refresh never purges a needed carried pin"
+    );
+    assert!(
+        next.modules.iter().any(|module| module.object == object_a),
+        "the carried module still binds after the refresh"
+    );
+    assert!(
+        slot_active(&next, object_a),
+        "the carried slot stays attached across the refresh"
+    );
+}
+
+#[test]
+fn carried_coverage_survives_stale_retirement_after_real_carry() {
+    // The stale-retirement guard reads the derived carried
+    // classification (`carried_ids`): it must see the removal carry as
+    // carried, not as claimed-by-a-dead-view. Unlike the staged twin,
+    // this one runs the real assembly → bind path before retiring.
+    let (mut engine, _, object, _) = engine_with_overlay(88);
+    engine.scope = crate::attach::Scope::System;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+    let view = engine.modules[0].scanned.view;
+    let removed: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let mut carried = engine
+        .inventory_candidate(&removed, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        carried.pinned.summary(object).is_some(),
+        "the carry keeps the pin resolvable"
+    );
+    let stale: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+    let mut session = ScriptedSession::default();
+    let mut outcome = super::ApplyOutcome::default();
+    engine.retire_stale_candidate_sources(&mut session, &mut carried, &stale, &mut outcome);
+    assert!(
+        carried.plan.is_active(0),
+        "stale retirement keeps slots carried by a real removal"
+    );
+    assert!(
+        carried.pinned.summary(object).is_some(),
+        "stale retirement keeps the pin carried by a real removal"
+    );
+    assert!(
+        !carried.modules.is_empty(),
+        "stale retirement keeps the module carried by a real removal"
+    );
+}
+
+#[test]
+fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
+    // The conservative carry has the same rebind shape as the inventory
+    // one: retired views' modules ride for still-attached objects, and
+    // the replay rebind must not file ownership claims under the retired
+    // view for them.
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let (mut engine, _, object, _) = engine_with_overlay(89);
+    engine.scope = cgroup;
+    engine.owned_run_pid = Some(424242);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+    let view = engine.modules[0].scanned.view;
+    let retirements: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+    let keys: BTreeSet<ObjectKey> = BTreeSet::new();
+    let carried = engine.conservative_candidate(&retirements, &keys).unwrap();
+    assert!(
+        carried.plan.is_active(0),
+        "an owned run keeps attached slots across the replay"
+    );
+    assert!(
+        !carried.plan.modules.is_empty(),
+        "the provider module survives the replay"
+    );
+    assert!(
+        carried.pinned.summary(object).is_some(),
+        "the pin survives with the slots"
+    );
+    assert!(
+        carried.pinned.view_claims(view).is_none(),
+        "the replay files no claims under the retired view"
+    );
+    assert!(
+        carried.pinned.carried_ids().contains(&object),
+        "the replayed pin reads as carried coverage"
+    );
+}
+
+#[test]
+fn loader_rebind_keeps_carried_provider_claimless() {
+    // A loader scan that rebuilds the candidate after a generational
+    // removal carry must not file ownership claims under the retired
+    // view either: the carried provider keeps its exact attached targets
+    // without the dead view owning them, so later purges still spare
+    // its pins. The full-rebuild assert pins the test to the rebind
+    // path (a cached-plan shortcut would pass vacuously).
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.cold_engine();
+    let victim = ProcessViewId(220);
+    let object = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == victim)
+        .expect("the victim provider is bound")
+        .object;
+    let removed: BTreeSet<ProcessViewId> = BTreeSet::from([victim]);
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let carried = engine
+        .inventory_candidate(&removed, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        carried.plan.slots.iter().any(|slot| {
+            carried.plan.is_active(slot.index) && slot.object == object
+        }),
+        "the carry keeps the victim's slots attached"
+    );
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    engine.views.retain(|view| view.id() != victim);
+    let (candidate, loader) = fixture.candidate(&mut engine, false);
+    assert!(
+        candidate.built_by_full_rebuild,
+        "the loader scan rebuilds (no cached-plan shortcut)"
+    );
+    assert!(
+        candidate.pinned.summary(loader).is_some(),
+        "the exact loader pin survives"
+    );
+    assert!(
+        candidate.pinned.view_claims(victim).is_none(),
+        "the loader rebind files no claims under the retired view"
+    );
+    assert!(
+        candidate.pinned.summary(object).is_some(),
+        "the carried pin stays resolvable across the loader scan"
+    );
+    assert!(
+        candidate.modules.iter().any(|module| module.object == object),
+        "the carried module stays bound across the loader scan"
+    );
+}
+
+#[test]
 fn generational_fast_path_carries_pins_for_active_slots_across_view_removal() {
     let dir = tempfile::tempdir().expect("scope dir");
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");

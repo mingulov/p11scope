@@ -5500,6 +5500,48 @@ def self_test():
              lambda s, d, dash: folded_edge_exact(s, d, dash))
         case("jsonl-edge-folded-stale-count", "AGREE-EDGE-EVENTS",
              lambda s, d, dash: folded_edge_exact(s, d, dash, stale=5))
+        def folded_edge_missing_stream(s, d, dash):
+            # The folded edge's stream record is gone while its budget
+            # and module aggregate stay: a silent terminal loss the
+            # count comparison must catch, including zero events.
+            kw = folded_edge_exact(s, d, dash)
+            ev = [e for e in kw["events"]
+                  if not (e["kind"] == "edge_observed" and e["event"].get("caller") == "c900")]
+            return {"events": _account(ev, -1)}
+        case("jsonl-edge-folded-missing-stream", "AGREE-EDGE-EVENTS",
+             folded_edge_missing_stream)
+        def folded_edge_saturated_sum(s, d, dash):
+            # Two unsaturated folded edges whose exact sum overflows
+            # u64: the producer saturates the aggregate (its saturated
+            # flag counts only saturated inputs), so the oracle must
+            # add saturating too.
+            max64 = (1 << 64) - 1
+            gone, gone2 = "c900", "c901"
+            d["budgets"]["callers"].update(retired=2, late_refused=0)
+            d["budgets"].setdefault("edges", {}).update(folded=2)
+            extra = [("caller_event", {"event": "admitted", "caller": gone}),
+                     ("caller_event", {"event": "retired", "caller": gone,
+                                       "reason": "synthetic retirement"}),
+                     ("caller_event", {"event": "admitted", "caller": gone2}),
+                     ("caller_event", {"event": "retired", "caller": gone2,
+                                       "reason": "synthetic retirement"})]
+            ev = s.events(d, True, extra)
+            model = next(e for e in ev if e["kind"] == "edge_observed")
+            at = next(i for i, e in enumerate(ev) if e["kind"] == "edge_observed")
+            first = _deep(model)
+            first["event"]["caller"] = gone
+            first["event"]["entries"]["count"] = max64 - 1
+            second = _deep(model)
+            second["event"]["caller"] = gone2
+            second["event"]["entries"]["count"] = 3
+            ev.insert(at + 1, first)
+            ev.insert(at + 2, second)
+            module = next(m for m in d["modules"] if m["id"] == model["event"]["module"])
+            module["departed_use"] = {"edges": 2,
+                                      "entries": {"count": max64, "saturated": 0}}
+            return {"events": _account(ev, +2)}
+        case("jsonl-edge-folded-saturated-sum", None,
+             folded_edge_saturated_sum)
         case("jsonl-edge-folded-unaccounted", "AGREE-EDGE-EVENTS",
              lambda s, d, dash: folded_edge(s, d, dash, folded=0))
         case("jsonl-edge-folded-overcounted", "AGREE-EDGE-EVENTS",

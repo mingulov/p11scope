@@ -161,6 +161,17 @@ versioned separately and are opaque, exact dispatch keys.
   per further member stride past the base rate, and drains released
   pidfd custody through one explicit handoff outside the per-caller
   loop, keeping single-caller folds atomic.
+- A saturated folded-ticket index fails closed per domain and
+  discharges with that domain's authenticated retirement, so a newly
+  bound domain proves healthy tickets again; within a live domain
+  the latch stays sticky.
+- Fold admission charges each caller's member work before running
+  it: a caller that does not fit the remaining credits waits for a
+  fresh window, terminal certification and declared-layer matching
+  pace against the live stop signal, rows leave the carry as
+  decided so an abort keeps its suffix without rebuilding it, and
+  released pidfd custody closes through a bounded queue serviced
+  one pin per stop check.
 
 ## [0.7.1] - 2026-11-17
 

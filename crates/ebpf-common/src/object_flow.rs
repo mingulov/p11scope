@@ -4427,6 +4427,193 @@ mod tests {
         }
     }
 
+    /// Production-boundary acquisition twin (§5.1, §8.2): the BPF
+    /// stash acquires through the shared
+    /// `acquire_length_entry_args`, so this spy exercises the actual
+    /// guarded fetch expression — no downstream seam stands between
+    /// the spy and the reads. For every length row on both ABIs the
+    /// fetch sequence is exactly the mask's indices in ascending
+    /// order, every masked slot is populated with its own word, and
+    /// the presence mask equals the entry-fetch mask. Every refusal
+    /// shape resolves a zero mask and fetches nothing: the stash
+    /// deletes any stale row and returns before the acquisition
+    /// call. Each single-bit mask fetches exactly its own index,
+    /// binding every guard to its literal; a failed fetch attempt is
+    /// still observed while its slot stays zero and unset.
+    #[test]
+    fn length_entry_acquisition_fetches_exactly_masked_positions() {
+        use super::acquire_length_entry_args;
+        use crate::MAX_DESCRIPTORS;
+        use crate::evidence_table::length_entry_fetch_mask;
+        // Scripted acquisition run: index-tagged words, so a swapped
+        // slot fails loudly instead of hiding behind a constant.
+        // `fail` scripts one failed fetch attempt.
+        let run = |layout: LinuxLayout, mask: u8, fail: Option<u8>| {
+            let mut fetches = Vec::new();
+            let (words, present) = acquire_length_entry_args(
+                &(),
+                layout,
+                mask,
+                |_: &(), index: u8, _: LinuxLayout| -> Result<u64, ()> {
+                    fetches.push(index);
+                    if fail == Some(index) {
+                        return Err(());
+                    }
+                    Ok(0x1_0000 + u64::from(index))
+                },
+            );
+            (fetches, words, present)
+        };
+        let s_rows: [(&str, [u8; 2]); 6] = [
+            ("C_Sign", [3, 4]),
+            ("C_SignRecover", [3, 4]),
+            ("C_SignFinal", [1, 2]),
+            ("C_Encrypt", [3, 4]),
+            ("C_WrapKey", [4, 5]),
+            ("C_EncapsulateKey", [5, 6]),
+        ];
+        let v_rows: [(&str, u8); 5] = [
+            ("C_Verify", 4),
+            ("C_VerifyFinal", 2),
+            ("C_Decrypt", 2),
+            ("C_UnwrapKey", 4),
+            ("C_DecapsulateKey", 6),
+        ];
+        // The Tier-2 RED controls name these descriptors exactly:
+        // 31/C_Encrypt authorizes [3, 4], 35/C_Decrypt authorizes [2].
+        assert_eq!(length_descriptor("C_Encrypt"), 31);
+        assert_eq!(length_descriptor("C_Decrypt"), 35);
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            for (name, sequence) in s_rows {
+                let descriptor = length_descriptor(name);
+                let mask = length_entry_fetch_mask(descriptor);
+                assert_eq!(
+                    mask,
+                    (1 << sequence[0]) | (1 << sequence[1]),
+                    "{name}: mask covers exactly the fetched words"
+                );
+                let (fetches, words, present) = run(layout, mask, None);
+                assert_eq!(
+                    fetches.as_slice(),
+                    &sequence,
+                    "{name} {layout:?}: ascending mask order, nothing else"
+                );
+                assert_eq!(present, mask, "{name} {layout:?}: presence equals the mask");
+                assert_eq!(words[0], 0, "{name} {layout:?}: index 0 never fetched");
+                for index in 1..=6u8 {
+                    let expected = if mask & (1 << index) != 0 {
+                        0x1_0000 + u64::from(index)
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        words[index as usize],
+                        expected,
+                        "{name} {layout:?}: slot {index}"
+                    );
+                }
+            }
+            for (name, scalar) in v_rows {
+                let descriptor = length_descriptor(name);
+                let mask = length_entry_fetch_mask(descriptor);
+                assert_eq!(
+                    mask,
+                    1 << scalar,
+                    "{name}: mask covers exactly the fetched word"
+                );
+                let (fetches, words, present) = run(layout, mask, None);
+                assert_eq!(
+                    fetches.as_slice(),
+                    &[scalar],
+                    "{name} {layout:?}: scalar alone, nothing else"
+                );
+                assert_eq!(present, mask, "{name} {layout:?}: presence equals the mask");
+                assert_eq!(words[0], 0, "{name} {layout:?}: index 0 never fetched");
+                for index in 1..=6u8 {
+                    let expected = if index == scalar {
+                        0x1_0000 + u64::from(index)
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        words[index as usize],
+                        expected,
+                        "{name} {layout:?}: slot {index}"
+                    );
+                }
+            }
+            // Single-bit guard binding: each mask bit fetches exactly
+            // its own index, binding every guard to its literal.
+            for index in 1..=6u8 {
+                let (fetches, words, present) = run(layout, 1 << index, None);
+                assert_eq!(
+                    fetches.as_slice(),
+                    &[index],
+                    "{layout:?}: bit {index} fetches index {index} alone"
+                );
+                assert_eq!(
+                    present,
+                    1 << index,
+                    "{layout:?}: bit {index} sets only its presence bit"
+                );
+                assert_eq!(
+                    words[index as usize],
+                    0x1_0000 + u64::from(index),
+                    "{layout:?}: bit {index} populates its slot"
+                );
+            }
+            // A failed fetch attempt is still an observed
+            // acquisition; its slot stays zero and unset.
+            let (fetches, words, present) = run(layout, 0x18, Some(3));
+            assert_eq!(
+                fetches.as_slice(),
+                &[3, 4],
+                "{layout:?}: the failed attempt is still observed"
+            );
+            assert_eq!(present, 0x10, "{layout:?}: the failed slot stays unset");
+            assert_eq!(words[3], 0, "{layout:?}: the failed slot stays zero");
+            assert_eq!(
+                words[4], 0x1_0004,
+                "{layout:?}: the surviving slot keeps its word"
+            );
+            // Refusal shapes resolve a zero mask: the stash deletes
+            // any stale row and returns before the acquisition call,
+            // so the spy observes nothing. A zero mask handed to the
+            // shared expression directly fetches nothing either.
+            let mut refused = vec![0, MAX_DESCRIPTORS, MAX_DESCRIPTORS + 1, u32::MAX];
+            for name in [
+                "C_Initialize",
+                "C_SignInit",
+                "C_GetInfo",
+                "C_GetTokenInfo",
+                "C_GetMechanismInfo",
+            ] {
+                refused.push(length_descriptor(name));
+            }
+            for descriptor in refused {
+                assert_eq!(
+                    length_entry_fetch_mask(descriptor),
+                    0,
+                    "descriptor {descriptor}: mask refuses before any fetch"
+                );
+                let (fetches, words, present) = run(layout, 0, None);
+                assert!(
+                    fetches.is_empty(),
+                    "descriptor {descriptor} {layout:?}: zero fetches"
+                );
+                assert_eq!(
+                    present, 0,
+                    "descriptor {descriptor} {layout:?}: zero presence"
+                );
+                assert_eq!(
+                    words,
+                    [0u64; 7],
+                    "descriptor {descriptor} {layout:?}: zero words"
+                );
+            }
+        }
+    }
+
     /// Terminal CKR_OK reads: S-cells read the word once at the
     /// retained cell (query shapes included — BPF cannot tell, so it
     /// reads and userspace drops the value); V-scalars resolve to the

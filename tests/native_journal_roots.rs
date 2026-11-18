@@ -338,18 +338,16 @@ fn end_length_header_trailer_and_absent_tail_initialize_in_poisoned_storage() {
     assert!(bytes.iter().all(|byte| *byte == 0xa5));
 }
 
-/// Length stash (v0.8.0 keymeta Task 2): only the approved named
-/// argument words are acquired, each with a compile-time-constant
-/// index. A dynamic index into `arg_u64` becomes register-offset
-/// pt_regs arithmetic (`ctx += reg`), which the kernel verifier
-/// rejects with "dereference of modified ctx ptr" on every kernel
-/// (observed on 6.6/6.12/7.0); the indices stay literal, but every
-/// fetch is guarded by the row's entry-fetch mask, and a zero mask
-/// (count-only, narrowed, unlisted, corrupt, info) deletes any
-/// stale row and returns before the first fetch. Index 0 is never
-/// an approved length position and is never fetched.
+/// Length stash (v0.8.0 keymeta Task 2): every entry acquisition
+/// flows through the shared `acquire_length_entry_args` — one
+/// guarded fetch expression whose exact sequence the ebpf-common
+/// twin asserts with a spy at the production boundary — and a zero
+/// mask (count-only, narrowed, unlisted, corrupt, info) deletes any
+/// stale row and returns before that call. No direct `arg_u64`
+/// fetch may remain in the stash body: an extra read there would
+/// bypass the shared guard-to-index binding the twin pins.
 #[test]
-fn length_stash_fetches_only_masked_args_with_literal_indices() {
+fn length_stash_acquires_only_through_the_shared_masked_call() {
     const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
     fn stash_body(source: &str) -> Option<&str> {
         source
@@ -361,59 +359,126 @@ fn length_stash_fetches_only_masked_args_with_literal_indices() {
         let Some(text) = stash_body(source) else {
             return false;
         };
-        // The mask refusal precedes the first acquisition: the head
-        // before the first fetch resolves the mask, deletes any
-        // stale row and returns on zero.
-        let Some(first_fetch) = text.find("arg_u64(ctx,") else {
+        // The mask refusal precedes the acquisition: the head before
+        // the shared call resolves the mask, deletes any stale row
+        // and returns on zero.
+        let Some(acquire) = text.find("acquire_length_entry_args(") else {
             return false;
         };
-        let head = &text[..first_fetch];
+        let head = &text[..acquire];
         head.contains("length_entry_fetch_mask(descriptor)")
             && head.contains("EVIDENCE_START.remove(key)")
             && head.contains("return;")
-            // Every fetched index is a guarded literal; index 0 is
-            // never fetched and no dynamic index exists.
-            && (1..=6).all(|index| {
-                text.contains(&format!("arg_u64(ctx, {index}, layout)"))
-                    && text.contains(&format!("if mask & 0x{:02x} != 0", 1u8 << index))
-            })
-            && !text.contains("arg_u64(ctx, 0, layout)")
-            && !text.contains("arg_u64(ctx, index")
+            // Every acquisition runs inside the shared call; no
+            // direct fetch survives beside it.
+            && !text.contains("arg_u64(ctx,")
     }
     assert!(
         contract(SOURCE),
-        "stash_length_entry must refuse on a zero mask before fetching, then fetch only masked args 1..=6 with guarded literal indices"
+        "stash_length_entry must refuse on a zero mask before acquiring, then acquire only through acquire_length_entry_args with no direct arg_u64 fetch"
     );
     let start = SOURCE.find("    fn stash_length_entry(").unwrap();
-    for index in 1..=6 {
-        let marker = format!("arg_u64(ctx, {index}, layout)");
-        let tail = SOURCE[start..].replacen(&marker, "REMOVED", 1);
-        assert!(
-            !contract(&format!("{}{}", &SOURCE[..start], tail)),
-            "removed {marker}"
-        );
-        let guard = format!("if mask & 0x{:02x} != 0", 1u8 << index);
-        let tail = SOURCE[start..].replacen(&guard, "if true", 1);
-        assert!(
-            !contract(&format!("{}{}", &SOURCE[..start], tail)),
-            "unguarded {marker}"
-        );
-    }
+    let tail = SOURCE[start..].replacen("acquire_length_entry_args(", "REMOVED(", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "a stash that bypasses the shared call must fail the contract"
+    );
+    let tail = SOURCE[start..].replacen(
+        "        let mut fetch = ",
+        "        let _ = arg_u64(ctx, 6, layout);\n        let mut fetch = ",
+        1,
+    );
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "an extra direct fetch beside the shared call must fail the contract"
+    );
     let tail = SOURCE[start..].replacen("length_entry_fetch_mask(descriptor)", "REMOVED", 1);
     assert!(
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
         "an unmasked stash must fail the contract"
     );
-    let tail = SOURCE[start..].replacen("arg_u64(ctx, 1, layout)", "arg_u64(ctx, 0, layout)", 1);
+}
+
+/// Shared length acquisition (v0.8.0 keymeta Task 2): the
+/// production fetch expression binds each guard to its own literal
+/// index — six `fetch(ctx, N, layout)` calls, each exactly once,
+/// each under `mask & (1 << N)`, nothing else. A dynamic index
+/// becomes register-offset pt_regs arithmetic (`ctx += reg`),
+/// which the kernel verifier rejects with "dereference of modified
+/// ctx ptr" on every kernel (observed on 6.6/6.12/7.0); index 0 is
+/// never an approved length position. The ebpf-common behavioral
+/// twin asserts the same binding by executing the shared
+/// expression; this pin locks the structure.
+#[test]
+fn length_acquisition_binds_each_guard_to_its_literal_index() {
+    const SOURCE: &str = include_str!("../crates/ebpf-common/src/object_flow.rs");
+    fn acquire_body(source: &str) -> Option<&str> {
+        source
+            .split_once("pub fn acquire_length_entry_args(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("\n}\n").map(|(text, _)| text))
+    }
+    fn guard_before(text: &str, position: usize) -> Option<u8> {
+        let guard = text[..position].rfind("if mask & 0x")?;
+        let digits = text.get(guard + "if mask & 0x".len()..guard + "if mask & 0x".len() + 2)?;
+        u8::from_str_radix(digits, 16).ok()
+    }
+    fn contract(source: &str) -> bool {
+        let Some(text) = acquire_body(source) else {
+            return false;
+        };
+        // Exactly six fetch calls exist, each literal exactly once,
+        // and each sits under its own mask bit.
+        text.matches("fetch(ctx, ").count() == 6
+            && (1..=6u8).all(|index| {
+                let marker = format!("fetch(ctx, {index}, layout)");
+                if text.matches(&marker).count() != 1 {
+                    return false;
+                }
+                let position = text.find(&marker).expect("counted once");
+                guard_before(text, position) == Some(1u8 << index)
+            })
+    }
+    assert!(
+        contract(SOURCE),
+        "acquire_length_entry_args must fetch each literal index 1..=6 exactly once, each under its own mask bit"
+    );
+    let start = SOURCE.find("pub fn acquire_length_entry_args(").unwrap();
+    // Swapped guard bits 1/2: the descriptor-35 shape (C_Decrypt,
+    // authorized [2]) would acquire index 1 instead.
+    let tail = SOURCE[start..]
+        .replacen("if mask & 0x02 != 0", "if mask & 0xZZ != 0", 1)
+        .replacen("if mask & 0x04 != 0", "if mask & 0x02 != 0", 1)
+        .replacen("if mask & 0xZZ != 0", "if mask & 0x04 != 0", 1);
     assert!(
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
-        "an index-0 fetch must fail the contract"
+        "swapped guard bits must fail the contract"
     );
-    let tail =
-        SOURCE[start..].replacen("arg_u64(ctx, 1, layout)", "arg_u64(ctx, index, layout)", 1);
+    // An extra seventh-argument fetch: the descriptor-31 shape
+    // (C_Encrypt, authorized [3, 4]) would acquire [3, 4, 6].
+    let tail = SOURCE[start..].replacen(
+        "    (words, present)",
+        "    let _ = fetch(ctx, 6, layout);\n    (words, present)",
+        1,
+    );
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "an extra fetch must fail the contract"
+    );
+    let tail = SOURCE[start..].replacen("fetch(ctx, 3, layout)", "REMOVED", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "a removed fetch must fail the contract"
+    );
+    let tail = SOURCE[start..].replacen("fetch(ctx, 3, layout)", "fetch(ctx, index, layout)", 1);
     assert!(
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
         "a dynamic fetch index must fail the contract"
+    );
+    let tail = SOURCE[start..].replacen("fetch(ctx, 3, layout)", "fetch(ctx, 0, layout)", 1);
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "an index-0 fetch must fail the contract"
     );
 }
 

@@ -143,6 +143,24 @@ versioned separately and are opaque, exact dispatch keys.
   removed against a live snapshot.
 - `inventory cbom` counts a folded caller without an executable
   path once, not once per module it touched.
+- The streaming fold re-certifies carried callers every pass: a
+  credit-deferred row whose terminal payload changed while its
+  revision waited in the FIFO keeps its row until the revision
+  lands, instead of folding on stale membership and erasing the
+  queued update with its digest.
+- Folding a caller keeps a negative-only record of its ticket: late
+  rows for a folded image still barrier the bound Joint history
+  (same-cookie execs included) instead of disposing as another
+  caller's, while healthy unrelated tickets still dispose; past
+  4,096 folded tickets both other-caller proofs fail closed.
+- Folding the last Joint feed of a capture that exhausted the
+  key-row budget keeps the `partial/row_budget_exhausted` status
+  instead of clearing to populated while the refusal stands.
+- The fold paces its planning scans in stop-checked 64-unit strides
+  against the operator's live stop signal, spends one extra credit
+  per further member stride past the base rate, and drains released
+  pidfd custody through one explicit handoff outside the per-caller
+  loop, keeping single-caller folds atomic.
 
 ## [0.7.1] - 2026-11-17
 

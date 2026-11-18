@@ -7,9 +7,9 @@
 
 use super::*;
 use crate::discovery::caller_registry::{
-    AdmissionChange, AdmissionState, CallerId, CoverageNote, ExeResolution, ImageAuthority,
-    ModuleInfo, ModuleKey, RegistryGap, RegistryLimits, UnboundExe, UnboundPid, UnknownReason,
-    UseCoverage,
+    AdmissionChange, AdmissionState, CallerId, CallerLifecycle, CoverageNote, DepartedIdentity,
+    DepartedUse, ExeIdentity, ExeResolution, ImageAuthority, ModuleInfo, ModuleKey, RegistryGap,
+    RegistryLimits, UnboundExe, UnboundPid, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::inventory::{render_json, render_text};
@@ -3871,6 +3871,96 @@ fn concise_snapshot_names_folded_callers_with_calls() {
         out.lines()
             .any(|line| line == "5 departed callers folded with 144 calls"),
         "{out}"
+    );
+}
+
+/// Folded modules stay visible in concise text: every module with a
+/// departed aggregate gets its own summary line with counts and the
+/// folded caller paths, and the empty-view absence line never prints
+/// while folded associations exist.
+#[test]
+fn concise_snapshot_names_folded_modules_and_gates_the_absence_line() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    assert!(!presentation.modules.is_empty(), "fixture must map a module");
+    let module = presentation.modules[0].id;
+    let name = module_display_name(&presentation, module);
+    let mut departed = DepartedUse::default();
+    departed.callers = 2;
+    departed.edges = 3;
+    departed.entries = 9;
+    departed.identities_dropped = 3;
+    for (slot, caller) in [4242u32, 4243].into_iter().enumerate() {
+        let id = CallerId(caller);
+        departed.identities.insert(
+            id,
+            DepartedIdentity {
+                caller: id,
+                pid: caller,
+                start_time: Some(1000),
+                incarnation: 0,
+                exe: Some(ExeIdentity {
+                    dev: 1,
+                    ino: 100 + slot as u64,
+                    mtime_secs: 10,
+                    mtime_nanos: 0,
+                    path: Some(format!("/bin/driver-{slot}")),
+                }),
+                authority: ImageAuthority::ScanPinned,
+                lifecycle: CallerLifecycle::Exited,
+                lifecycle_reason: Some(
+                    "process exited (pid names no live process)".to_string(),
+                ),
+                first_seen_ns: 110,
+                last_seen_ns: 190,
+                exec_observed: true,
+                metadata_status: None,
+            },
+        );
+    }
+    presentation.modules[0].departed_use = Some(departed);
+    // Every live row folded: no edges left, but the module's folded
+    // associations stay on the view.
+    presentation.edges.clear();
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let line = out
+        .lines()
+        .find(|line| line.starts_with(&format!("{name}:")))
+        .unwrap_or_else(|| panic!("concise names the folded module: {out}"));
+    assert!(
+        line.contains("2 departed callers")
+            && line.contains("9 entries")
+            && line.contains("3 edges"),
+        "the folded line carries exact counts: {line}"
+    );
+    assert!(
+        line.contains("driver-0") && line.contains("driver-1"),
+        "the folded line names the folded caller paths: {line}"
+    );
+    assert!(
+        line.contains("+3 identities past the bound"),
+        "the folded line names the dropped identities: {line}"
+    );
+    assert!(
+        !out.contains("No application/module associations observed"),
+        "no absence line while folded associations exist: {out}"
+    );
+    // Mixed view: live edges keep their grouped line beside the
+    // folded one.
+    let mut mixed = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    assert!(!mixed.edges.is_empty(), "fixture must hold live edges");
+    mixed.modules[0].departed_use = presentation.modules[0].departed_use.clone();
+    let name = module_display_name(&mixed, mixed.modules[0].id);
+    let out = render_snapshot_with_verbosity(&mixed, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.lines()
+            .any(|line| line.starts_with(&format!("{name}:")) && line.contains("mapped by")),
+        "the live grouped line stays: {out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line.starts_with(&format!("{name}:")) && line.contains("departed")),
+        "the folded line joins it: {out}"
     );
 }
 

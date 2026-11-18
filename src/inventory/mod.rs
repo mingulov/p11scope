@@ -1991,7 +1991,14 @@ fn run_with_terminal_budget(
                     let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
                 }
                 drop(presentation);
-                retire_rendered_callers(driver, &stream, &mut stream_state, now_ns);
+                let subset = driver.semantic.as_ref().map(|lane| lane.subset());
+                retire_rendered_callers(
+                    &mut *driver.coordinator,
+                    subset,
+                    &stream,
+                    &mut stream_state,
+                    now_ns,
+                );
                 // The pass freed its pin batch and transient view; hand
                 // the peak back now that both are dead (see
                 // `reclaim_pass_heap`).
@@ -8844,8 +8851,9 @@ fn stream_view_guarded(
 /// facts; the coordinator only drops state that no later render can need.
 /// The final view is captured after this, so every caller still present
 /// there keeps its row.
-fn retire_rendered_callers(
-    driver: &mut ClassicDriver<'_>,
+fn retire_rendered_callers<Source: ProcessSource>(
+    coordinator: &mut InventoryCoordinator<Source>,
+    subset: Option<&crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset>,
     stream: &EventLogState,
     state: &mut StreamState,
     now_ns: u64,
@@ -8867,7 +8875,7 @@ fn retire_rendered_callers(
             crate::discovery::caller_registry::CallerId,
             Vec<crate::discovery::caller_registry::instance_input::RegistryInstanceId>,
         > = BTreeMap::new();
-        for record in driver.coordinator.registry().instances() {
+        for record in coordinator.registry().instances() {
             instances_by_caller
                 .entry(record.caller)
                 .or_default()
@@ -8875,8 +8883,7 @@ fn retire_rendered_callers(
         }
         ids.into_iter()
             .filter(|id| {
-                driver
-                    .coordinator
+                coordinator
                     .registry()
                     .edges_of(*id)
                     .all(|edge| state.edges.has_record(*id, edge.module))
@@ -8890,9 +8897,8 @@ fn retire_rendered_callers(
     } else {
         ids
     };
-    driver.coordinator.note_rendered_callers(&foldable);
-    let subset = driver.semantic.as_ref().map(|lane| lane.subset());
-    let receipt = driver.coordinator.retire_rendered_callers(now_ns, subset);
+    coordinator.note_rendered_callers(&foldable);
+    let receipt = coordinator.retire_rendered_callers(now_ns, subset);
     // Folded rows left the snapshot: drop their stream digests so the
     // emitters stay bounded by live rows.
     for (caller, module) in receipt.folded_edges {
@@ -9163,7 +9169,14 @@ fn run_dashboard(
                     }
                     display.offer(display_view);
                 }
-                retire_rendered_callers(driver, &stream, &mut stream_state, now_ns);
+                let subset = driver.semantic.as_ref().map(|lane| lane.subset());
+                retire_rendered_callers(
+                    &mut *driver.coordinator,
+                    subset,
+                    &stream,
+                    &mut stream_state,
+                    now_ns,
+                );
                 // A0 periodic line: every loop pass publishes through
                 // this arm, so the 60 s check lives here.
                 driver.coordinator.maybe_emit_memory_line();

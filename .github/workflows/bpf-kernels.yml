@@ -747,6 +747,7 @@ jobs:
             -o "$GITHUB_WORKSPACE/bpf-load-gate1-journal/manifest.json"
           scripts/check-bpf-load-journal.sh --object journal-gate1 \
             --expect-journal "$BPF_EXPECT_JOURNAL" \
+            --key-sizes 1 \
             "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope" \
             "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/verifier-stats-probe.so" \
             "$GITHUB_WORKSPACE/bpf-load-gate1-journal/manifest.json" \

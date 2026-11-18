@@ -1707,6 +1707,14 @@ fn run_with_terminal_budget(
     coordinator.set_forwarding(forwarding_modules.to_vec());
     coordinator.set_key_sizes_requested(key_sizes);
     coordinator.set_key_operations_requested(key_operations);
+    // The departed-caller fold paces its planning strides against
+    // the operator's live signal counter (when the run has one), so
+    // a stop delivered mid-fold aborts within one stride. The
+    // dashboard path moves this same coordinator, so one wiring
+    // covers both loops.
+    if let Some(source) = operator_stop_source.as_ref() {
+        coordinator.set_stop_source(std::sync::Arc::clone(source));
+    }
     // Packet 6.13 round-2 (F5): the startup pinning above is retained
     // for the run, its proved offsets lower into the run's attach set
     // before passes, and one interval row per input renders in `prearm[]`.
@@ -8962,7 +8970,11 @@ fn retire_rendered_callers<Source: ProcessSource>(
         foldable.iter().copied().collect();
     coordinator.retain_rendered_callers(&certified);
     coordinator.note_rendered_callers(&foldable);
-    let receipt = coordinator.retire_rendered_callers(now_ns, subset);
+    // The fold paces its planning strides against the live stop
+    // query (the local flag plus the operator counter, when wired),
+    // so a stop delivered mid-fold aborts within one stride.
+    let query = coordinator.stop_query();
+    let receipt = coordinator.retire_rendered_callers_with_stop(now_ns, subset, query.as_ref());
     // Folded rows left the snapshot: drop their stream digests so the
     // emitters stay bounded by live rows.
     for (caller, module) in receipt.folded_edges {

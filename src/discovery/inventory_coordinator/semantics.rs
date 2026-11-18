@@ -1239,19 +1239,21 @@ impl SemanticBindingSet {
     }
 
     /// Release one folded caller's semantic binding, accepted-scan
-    /// history and successor reservations, dropping their pidfd
-    /// custody so the semantic budget recycles with the caller slots.
-    /// A negative-only (domain, ticket) tombstone survives the
-    /// release, so a late row for the forgotten image still barriers
-    /// instead of taking the other-caller disposal. Call only after
-    /// [`Self::foldable`] (a retained sealed gap must drain first)
-    /// and after the adapter row is forgotten (late rows then fail
-    /// closed on the gone record).
-    pub(crate) fn release_folded_caller(&mut self, caller: CallerId) {
+    /// history and successor reservations, so the semantic budget
+    /// recycles with the caller slots. Their pidfd custody moves to
+    /// the caller's handoff instead of dropping here: no last-owner
+    /// close runs inside the per-caller fold loop. A negative-only
+    /// (domain, ticket) tombstone survives the release, so a late row
+    /// for the forgotten image still barriers instead of taking the
+    /// other-caller disposal. Call only after [`Self::foldable`] (a
+    /// retained sealed gap must drain first) and after the adapter row
+    /// is forgotten (late rows then fail closed on the gone record).
+    pub(crate) fn release_folded_caller(&mut self, caller: CallerId, pins: &mut Vec<Arc<PidPin>>) {
         let mut image = None;
         if let Some(at) = self.index.remove(&caller) {
             let binding = self.bindings.swap_remove(at);
             image = Some((binding.domain(), binding.image().task_cookie));
+            pins.push(binding.pin);
             if let Some(moved) = self.bindings.get(at) {
                 self.index.insert(moved.caller(), at);
             }
@@ -1262,11 +1264,27 @@ impl SemanticBindingSet {
         }
         if let Some(history) = self.admission_images.remove(&caller) {
             image.get_or_insert((history.domain, history.image.task_cookie));
+            pins.push(history.pin);
         }
-        self.release_successor(caller);
+        if let Some(successor) = self.successors.remove(&caller) {
+            pins.push(successor.custody.pin);
+        }
+        if let Some(successor) = self.refused_successors.remove(&caller) {
+            pins.push(successor.custody.pin);
+        }
         if let Some((domain, cookie)) = image {
             self.remember_folded_image(domain, cookie);
         }
+    }
+
+    /// Pidfd custody arcs this caller's release would hand out
+    /// (binding, history and successor reservations): the fold's
+    /// per-caller member pacing counts them before folding.
+    pub(crate) fn fold_pin_count(&self, caller: CallerId) -> usize {
+        usize::from(self.index.contains_key(&caller))
+            .saturating_add(usize::from(self.admission_images.contains_key(&caller)))
+            .saturating_add(usize::from(self.successors.contains_key(&caller)))
+            .saturating_add(usize::from(self.refused_successors.contains_key(&caller)))
     }
 
     /// Remember one folded caller's ticket as negative-only evidence.
@@ -1339,9 +1357,12 @@ impl SemanticBindingSet {
                 .admission_images
                 .values()
                 .all(|history| history.domain == domain && history.image.task_cookie != cookie)
-            && self.folded_images.iter().all(|(folded_domain, folded_cookie)| {
-                *folded_domain == domain && *folded_cookie != cookie
-            })
+            && self
+                .folded_images
+                .iter()
+                .all(|(folded_domain, folded_cookie)| {
+                    *folded_domain == domain && *folded_cookie != cookie
+                })
     }
 
     /// Whether an unrouted call of a journal-refused image proves a
@@ -1378,9 +1399,12 @@ impl SemanticBindingSet {
                 history.domain == domain
                     && (history.image.task_cookie != cookie || image_refused(history.image))
             })
-            && self.folded_images.iter().all(|(folded_domain, folded_cookie)| {
-                *folded_domain == domain && *folded_cookie != cookie
-            })
+            && self
+                .folded_images
+                .iter()
+                .all(|(folded_domain, folded_cookie)| {
+                    *folded_domain == domain && *folded_cookie != cookie
+                })
     }
 
     /// Whether a bound caller holds this Detailed ticket: proven-image
@@ -7173,9 +7197,11 @@ mod finalizer_history_tests {
         use std::collections::BTreeSet;
         let pid = std::process::id();
         let observed = BTreeSet::from([pid]);
-        let events = coordinator
-            .adapter_mut()
-            .reconcile(&observed, &mut |_| ImageAuthority::ScanPinned, 100);
+        let events = coordinator.adapter_mut().reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            100,
+        );
         coordinator.apply_reconcile_events(&events, 100);
         coordinator
             .adapter()
@@ -7218,7 +7244,10 @@ mod finalizer_history_tests {
         {
             let (mut coordinator, mut lane, domain) = drop_test_lanes();
             let CallerId(folded) = admit_self(&mut coordinator);
-            assert_ne!(folded, 9000, "the sibling id stays clear of the adapter row");
+            assert_ne!(
+                folded, 9000,
+                "the sibling id stays clear of the adapter row"
+            );
             let image = ImageIdentity {
                 task_cookie: FOLDED,
                 exec_id: 1,
@@ -7237,10 +7266,7 @@ mod finalizer_history_tests {
                 "the rendered exited row folds"
             );
             assert!(
-                coordinator
-                    .adapter()
-                    .record(CallerId(folded))
-                    .is_none(),
+                coordinator.adapter().record(CallerId(folded)).is_none(),
                 "the folded row leaves the adapter"
             );
             assert!(
@@ -7251,10 +7277,7 @@ mod finalizer_history_tests {
                 "no binding survives for the folded caller"
             );
             assert!(
-                coordinator
-                    .semantic_bindings
-                    .get(CallerId(9000))
-                    .is_some(),
+                coordinator.semantic_bindings.get(CallerId(9000)).is_some(),
                 "the sibling stays bound"
             );
             assert!(
@@ -7316,7 +7339,10 @@ mod finalizer_history_tests {
         use crate::semantics_objects::journal::H3DispositionEvidence;
         let (mut coordinator, mut lane, domain) = drop_test_lanes();
         let CallerId(folded) = admit_self(&mut coordinator);
-        assert_ne!(folded, 9000, "the sibling id stays clear of the adapter row");
+        assert_ne!(
+            folded, 9000,
+            "the sibling id stays clear of the adapter row"
+        );
         let foreign = ImageIdentity {
             task_cookie: 77,
             exec_id: 3,
@@ -7382,10 +7408,7 @@ mod finalizer_history_tests {
             "the rendered exited row folds"
         );
         assert!(
-            coordinator
-                .adapter()
-                .record(CallerId(folded))
-                .is_none(),
+            coordinator.adapter().record(CallerId(folded)).is_none(),
             "the folded row leaves the adapter"
         );
         let second = commit_outcomes(

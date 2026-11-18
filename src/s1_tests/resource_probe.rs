@@ -817,10 +817,13 @@ fn native_semantic_resource_final_types_pinned() {
     // pass at 568 bytes on this candidate).
     // +8 (handle table): the entry's filed handle carries its table
     // row id (`TableHandle`), so the watched target grows one u64.
-    // The N/N+1 populations still bind (their tests pass at 576).
+    // +16 (function starts): the entry carries the proven function-entry
+    // offsets (`Entry.function_starts`, an `Arc<[u64]>` fat pointer), the
+    // strict bind's target-safety witness for uncorroborated entries.
+    // The N/N+1 populations still bind (their tests pass at 592).
     pin!(
         crate::semantic_capture::CurrentPartitionReceipt,
-        512 + size_of::<RetainedBirth>()
+        528 + size_of::<RetainedBirth>()
     );
     pin!(crate::semantic_capture::Invalidation, 72);
     pin!(crate::semantic_capture::InvalidationScope, 48);

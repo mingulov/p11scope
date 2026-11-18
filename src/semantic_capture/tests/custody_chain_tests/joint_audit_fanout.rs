@@ -31467,12 +31467,15 @@ fn joint_machine_receipt_model_sizes_and_collect_growth() {
     // entry carries the held fd's own `st_dev` (`fd_dev`) so snapshot
     // twins on one mount separate. +8 (handle table): the entry's
     // filed handle carries its table row id (`TableHandle`).
+    // +16 (function starts): the entry carries the proven function-entry
+    // offsets (`Entry.function_starts`, an `Arc<[u64]>` fat pointer), the
+    // strict bind's target-safety witness for uncorroborated entries.
     // Re-audited: the worst-case 1,024-partition transaction below
     // still binds within the 160 MiB pool at this size, so the
     // reservation holds.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
-        576
+        592
     );
     assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 784);
     assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);

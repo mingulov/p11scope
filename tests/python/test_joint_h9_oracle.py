@@ -1017,6 +1017,16 @@ class StreamTwins(unittest.TestCase):
                  "completions": 1},
             )
 
+        def v6_objects(snapshot):
+            # Producer-shaped v7 object rows inherit the v6 metadata
+            # fields (parameter_set in both blocks and queries).
+            for row in snapshot["objects"]:
+                for block in (row["requested"], row["established"]):
+                    block["parameter_set"] = {"status": "unknown",
+                                              "value": None}
+                row["queries"]["parameter_set"] = "not_queried"
+            return snapshot
+
         def v7_snapshot():
             snapshot = healthy_snapshot([first, second])
             snapshot["version"] = 7
@@ -1025,13 +1035,39 @@ class StreamTwins(unittest.TestCase):
                 family, size = inferred_pair()
                 row["inferred_family"] = family
                 row["inferred_size"] = size
-            return snapshot
+            return v6_objects(snapshot)
+
+        def promote_objects(stream):
+            # An early v6 object revision plus a v7 replacement tied
+            # to the promotion pass the marker announces.
+            revisions = [line["event"]["revision"] for line in stream
+                         if line["kind"] in ("object_observed",
+                                             "key_operations_observed")]
+            at_ns = max(line["at_ns"] for line in stream
+                        if line["kind"] == "key_operations_observed") + 50
+            replacements = []
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    replacements.append(
+                        {"schema": "p11scope/inventory-events/v1",
+                         "seq": 0, "at_ns": at_ns,
+                         "kind": "object_observed",
+                         "event": {"revision": max(revisions) + 1,
+                                   "version": 7,
+                                   "row": copy.deepcopy(
+                                       line["event"]["row"])}})
+            marker = next(index for index, line in enumerate(stream)
+                          if line["kind"] == "pass_committed")
+            stream[marker:marker] = replacements
+            for seq, line in enumerate(stream):
+                line["seq"] = seq
+            return stream
 
         def v7_stream(snapshot, key_version):
             stream = healthy_stream([first, second], snapshot)
             for line in stream:
                 if line["kind"] == "object_observed":
-                    line["event"]["version"] = 6
+                    line["event"]["version"] = 7
                 elif line["kind"] == "key_operations_observed":
                     line["event"]["version"] = key_version
                     if key_version >= 7 and line["event"]["bucket"] == "known":
@@ -1056,6 +1092,13 @@ class StreamTwins(unittest.TestCase):
         with self.subTest("v7 stream validates and reconciles"):
             snapshot = v7_snapshot()
             stream = v7_stream(snapshot, 7)
+            objects = [line for line in stream
+                       if line["kind"] == "object_observed"]
+            self.assertTrue(objects, "the stream carries object rows")
+            self.assertTrue(all(line["event"]["version"] == 7
+                                for line in objects),
+                            "the producer stamps every row, objects "
+                            "included, with the publication version")
             oracle.validate_snapshot(snapshot)
             oracle.compare_stream(stream, [first, second], snapshot)
         with self.subTest("mixed v6-to-v7 stream reconciles"):
@@ -1063,7 +1106,8 @@ class StreamTwins(unittest.TestCase):
             stream = healthy_stream([first, second], snapshot)
             # Early key revisions ride v6 without inferred keys; the
             # last revision per row rides v7 with them, matching the
-            # snapshot. Object rows ride v6 throughout.
+            # snapshot. Objects carry an early v6 revision plus a v7
+            # replacement tied to the promotion pass.
             last_by_key = {}
             for line in stream:
                 if line["kind"] == "key_operations_observed":
@@ -1098,6 +1142,17 @@ class StreamTwins(unittest.TestCase):
             for row in snapshot["key_operations"]:
                 row["inferred_family"]["completions"] = row["completed"]
                 row["inferred_size"]["completions"] = row["completed"]
+            stream = promote_objects(stream)
+            versions = {}
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    versions.setdefault(line["event"]["row"]["object"],
+                                        []).append(line["event"]["version"])
+            self.assertTrue(versions, "the stream carries object rows")
+            self.assertTrue(all(sorted(seen) == [6, 7]
+                                for seen in versions.values()),
+                            "each object rides an early v6 revision "
+                            "plus a v7 replacement")
             oracle.validate_snapshot(snapshot)
             oracle.compare_stream(stream, [first, second], snapshot)
         with self.subTest("future version still refused"):

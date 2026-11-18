@@ -12841,6 +12841,32 @@ mod bind_collection_strict_tests {
             1,
             "the proved sibling keeps its provider object"
         );
+        let object = &catalog.objects[0];
+        assert_eq!(
+            object.observations.len(),
+            1,
+            "one deep-scan observation per provider object"
+        );
+        assert_eq!(object.observations[0].pid, pid);
+        let tables = &object.observations[0].tables;
+        assert_eq!(tables.len(), 1, "the bound table survives assembly");
+        assert_eq!(tables[0].entries.len(), 1, "{:?}", tables[0].entries);
+        assert_eq!(tables[0].entries[0].file_offset, proved);
+        assert_eq!(tables[0].unpinned.len(), 1, "{:?}", tables[0].unpinned);
+        assert_eq!(tables[0].unpinned[0].subject, "C_Initialize");
+        assert!(
+            tables[0].unpinned[0]
+                .reason
+                .contains("not a proven function entry"),
+            "{}",
+            tables[0].unpinned[0].reason
+        );
+        match &object.admission {
+            AdmissionRecord::Admitted { endpoints, .. } => {
+                assert_eq!(*endpoints, 1, "the proved sibling admits one endpoint");
+            }
+            other => panic!("the proved sibling stays admitted: {other:?}"),
+        }
     }
 
     /// Bind gaps file by source, not by reason text: every binder

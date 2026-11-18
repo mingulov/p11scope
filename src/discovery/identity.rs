@@ -11633,14 +11633,17 @@ mod tests {
     }
 
     /// One file observed through two device domains merges: on btrfs
-    /// the mount-table/maps device names the filesystem (e.g. 0:35)
+    /// the mount-table device names the filesystem (e.g. 0:35)
     /// while fstat names the subvolume's anonymous device (e.g. 0:37).
     /// Two production scan pins of one real file through two views
     /// must merge into one object with no skip, no rejection and no
     /// ambiguity — a subvolume never collides with itself. Live: real
     /// file, real views of self, real mount table. Portable: the merge
     /// must hold on every filesystem (where the domains coincide the
-    /// same assertions apply).
+    /// same assertions apply). The scripted twin below locks the same
+    /// merge when the two observations disagree on device; the
+    /// mount-table-vs-MAPS pair is out of scope here (the kernel
+    /// probe is only required to agree with the mount-table key).
     #[test]
     fn one_file_two_domains_merges_without_ambiguity() {
         let view_a = ProcessView::open(ProcessViewId(101), std::process::id()).unwrap();
@@ -11670,10 +11673,11 @@ mod tests {
 
     /// Cross-table twin of the merge above: the same file resolved
     /// through a second mount table carries a different mount id while
-    /// remaining one attach target. Exact and retained comparisons
-    /// merge on proof (same pin, digest and kernel file), and the
-    /// absorb merges too. Portable: the mount id is scripted on a
-    /// clone of a real pin.
+    /// remaining one attach target. The twin holds a second open of
+    /// the file, so the kernel-file proof compares two distinct fds.
+    /// Exact and retained comparisons merge on proof (same pin,
+    /// digest and kernel file), and the absorb merges too. Portable:
+    /// the mount id is scripted on a clone of a real pin.
     #[test]
     fn same_file_across_mount_tables_compares_equal_on_proof() {
         let view = ProcessView::open(ProcessViewId(111), std::process::id()).unwrap();
@@ -11692,6 +11696,14 @@ mod tests {
             .insert_entry(entry_b, &mut insert_skipped)
             .expect("the lone twin files");
         assert!(insert_skipped.is_empty(), "{insert_skipped:?}");
+        let second = std::sync::Arc::new(
+            p11scope_manifest::identity::open_object(Path::new(&entry_a.path)).unwrap(),
+        );
+        reback(&mut other, &second);
+        assert!(
+            !entry_a.file.ptr_eq(&other.by_id.get(&id_b).unwrap().file),
+            "the twin holds a distinct open of one file"
+        );
         assert!(pins.exactly_matches(id_a, &other, id_b));
         let retained = RetainedInventoryTarget {
             entry: entry_a,
@@ -11702,6 +11714,120 @@ mod tests {
         let skipped = merged.absorb(other);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert_eq!(merged.pinned().count(), 1);
+        assert!(merged.ambiguous_keys.is_empty());
+    }
+
+    /// Scripted two-domain twin of the merge above: two production
+    /// scan pins of one real file through two views (two distinct
+    /// opens), with the second observation carrying the other
+    /// domain's device — the reported shape of one inode seen under
+    /// two device numbers. Exact and retained comparisons merge on
+    /// proof (same pin, digest and kernel file), and the absorb
+    /// merges too. Portable: the divergent device is scripted on a
+    /// real pin, so the escape is exercised on every filesystem.
+    #[test]
+    fn device_divergent_twin_of_one_file_merges_on_proof() {
+        let view_a = ProcessView::open(ProcessViewId(121), std::process::id()).unwrap();
+        let view_b = ProcessView::open(ProcessViewId(122), std::process::id()).unwrap();
+        let module_a = test_fixture::small_owned_module(&view_a);
+        let module_b = test_fixture::small_owned_module(&view_b);
+        let mut budget = CaptureWorkBudget::default();
+        let (pins_a, skipped_a) =
+            pin_scanned_view_objects(&view_a, std::slice::from_ref(&module_a), &mut budget)
+                .unwrap();
+        let (mut pins_b, skipped_b) =
+            pin_scanned_view_objects(&view_b, std::slice::from_ref(&module_b), &mut budget)
+                .unwrap();
+        assert!(skipped_a.is_empty(), "{skipped_a:?}");
+        assert!(skipped_b.is_empty(), "{skipped_b:?}");
+        let id_a = pins_a.pinned().next().unwrap().id;
+        let id_b = pins_b.pinned().next().unwrap().id;
+        let entry_a = pins_a.by_id.get(&id_a).unwrap().clone();
+        assert!(
+            !entry_a.file.ptr_eq(&pins_b.by_id.get(&id_b).unwrap().file),
+            "the twin holds a distinct open of one file"
+        );
+        for entry in pins_b.by_id.values_mut() {
+            entry.mapping.device_minor = entry.mapping.device_minor.wrapping_add(1);
+        }
+        let entry_b = pins_b.by_id.get(&id_b).unwrap();
+        assert_ne!(
+            (entry_a.mapping.device_major, entry_a.mapping.device_minor),
+            (entry_b.mapping.device_major, entry_b.mapping.device_minor),
+            "the twin carries the other domain's device"
+        );
+        assert!(pins_a.exactly_matches(id_a, &pins_b, id_b));
+        let retained = RetainedInventoryTarget {
+            entry: entry_a.clone(),
+            changed: std::cell::Cell::new(false),
+        };
+        assert!(retained.same_object_as(&pins_b, id_b));
+        let mut merged = pins_a;
+        let skipped = merged.absorb(pins_b);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(merged.pinned().count(), 1);
+        assert!(
+            merged
+                .newly_rejected_keys(&PinnedObjects::empty())
+                .is_empty()
+        );
+        assert!(merged.ambiguous_keys.is_empty());
+    }
+
+    /// Negative twin of the merge above: the same device-divergent
+    /// locus, but the second observation is a different real file
+    /// (different digest, different kernel file) re-filed under the
+    /// first file's raw — a rebound path. The escape must refuse:
+    /// the newcomer is refused as version skew, the kept object
+    /// still names the first file's bytes, and nothing merges.
+    #[test]
+    fn device_divergent_twin_of_a_different_file_is_refused_as_skew() {
+        let view_a = ProcessView::open(ProcessViewId(131), std::process::id()).unwrap();
+        let view_b = ProcessView::open(ProcessViewId(132), std::process::id()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let other_path = second_owned_object(&dir);
+        let module_a = test_fixture::small_owned_module(&view_a);
+        let module_b = module_over_path(&view_b, &other_path);
+        let mut budget = CaptureWorkBudget::default();
+        let (pins_a, skipped_a) =
+            pin_scanned_view_objects(&view_a, std::slice::from_ref(&module_a), &mut budget)
+                .unwrap();
+        let (mut pins_b, skipped_b) =
+            pin_scanned_view_objects(&view_b, std::slice::from_ref(&module_b), &mut budget)
+                .unwrap();
+        assert!(skipped_a.is_empty(), "{skipped_a:?}");
+        assert!(skipped_b.is_empty(), "{skipped_b:?}");
+        let id_a = pins_a.pinned().next().unwrap().id;
+        let entry_a = pins_a.by_id.get(&id_a).unwrap().clone();
+        let (_raw_b, id_b) = pins_b.raw_to_id.pop_first().unwrap();
+        let entry_b = pins_b.by_id.get(&id_b).unwrap();
+        assert_ne!(
+            entry_a.sha256, entry_b.sha256,
+            "the twin needs distinct bytes"
+        );
+        assert!(
+            !same_kernel_file(&entry_a.file, &entry_b.file),
+            "the twin needs a distinct file"
+        );
+        pins_b.raw_to_id.insert(entry_a.raw.clone(), id_b);
+        let twin = pins_b.by_id.get_mut(&id_b).unwrap();
+        twin.mapping.device_minor = twin.mapping.device_minor.wrapping_add(1);
+        let mut merged = pins_a;
+        let skipped = merged.absorb(pins_b);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0]
+                .reason
+                .contains("divergent observation was not pinned"),
+            "{skipped:?}"
+        );
+        assert_eq!(merged.pinned().count(), 1);
+        assert_eq!(merged.by_id.get(&id_a).unwrap().sha256, entry_a.sha256);
+        assert!(
+            merged
+                .newly_rejected_keys(&PinnedObjects::empty())
+                .is_empty()
+        );
         assert!(merged.ambiguous_keys.is_empty());
     }
 
@@ -11742,24 +11868,63 @@ mod tests {
             maps_key,
             &mut budget
         ));
+        // The bridge branch, portably: the fd key names the fstat
+        // domain while the maps key names the mount-table domain. On
+        // btrfs they already differ; elsewhere the scripted device
+        // stands in for the subvolume's anonymous device, so the
+        // equal-keys fast path cannot accept first.
+        let mut split_fd_key = fd_key;
+        if split_fd_key == maps_key {
+            split_fd_key.device.minor = split_fd_key.device.minor.wrapping_add(1);
+            if split_fd_key == maps_key {
+                split_fd_key.device.major = split_fd_key.device.major.wrapping_add(1);
+            }
+        }
+        assert_ne!(split_fd_key, maps_key);
+        assert!(
+            unresolved_fd_matches_maps(&file, split_fd_key, maps_key, &mut budget),
+            "the kernel rendering bridges the split identity"
+        );
+        // Negative: a foreign fd never stands for this maps key.
+        let foreign_dir = tempfile::tempdir().unwrap();
+        let foreign_path = second_owned_object(&foreign_dir);
+        let foreign = p11scope_manifest::identity::open_object(&foreign_path).unwrap();
+        assert!(
+            !unresolved_fd_matches_maps(&foreign, split_fd_key, maps_key, &mut budget),
+            "a foreign fd must refuse"
+        );
     }
 
     /// Live dual-subvolume lock: one ELF on each of two btrfs
-    /// subvolumes, each carrying mountinfo/maps and fstat domains that
-    /// differ, pins twice and merges per file with no ambiguity.
-    /// Gated on `P11SCOPE_TEST_BTRFS_FILES=<elf>:<elf>` (two regular
-    /// ELF files on btrfs); unset skips. Fail-closed: paths without
-    /// the duality fail instead of passing vacuously.
+    /// subvolumes, each carrying the fstat-vs-mountinfo device split
+    /// (fstat names the subvolume's anonymous device, the mount table
+    /// the filesystem device), pins twice and merges per file with no
+    /// ambiguity. Runs only in the privileged btrfs campaign, which
+    /// stages the pair on its loop mount and exports
+    /// `P11SCOPE_TEST_BTRFS_FILES=<elf>:<elf>`; unset fails closed so
+    /// a wiring break never passes silently. Fail-closed: paths
+    /// without the duality, or two paths on one subvolume, fail
+    /// instead of passing vacuously. The mount-table-vs-MAPS pair is
+    /// out of scope here (the kernel probe is only required to agree
+    /// with the mount-table key).
     #[test]
+    #[ignore = "privileged: btrfs two-subvolume merge lock, staged by the btrfs campaign (root, loop-mounted btrfs)"]
     fn btrfs_live_two_subvolumes_merge_per_file() {
-        let Some(pair) = std::env::var("P11SCOPE_TEST_BTRFS_FILES").ok() else {
-            eprintln!("P11SCOPE_TEST_BTRFS_FILES is unset; skipping the live btrfs pair");
-            return;
-        };
+        use std::os::unix::fs::MetadataExt as _;
+        let pair = std::env::var("P11SCOPE_TEST_BTRFS_FILES")
+            .expect("P11SCOPE_TEST_BTRFS_FILES is unset; the btrfs campaign stages the live pair");
         let Some((first, second)) = pair.split_once(':') else {
             panic!("P11SCOPE_TEST_BTRFS_FILES must be <elf>:<elf>, got {pair:?}");
         };
         assert!(!first.is_empty() && !second.is_empty());
+        // Two subvolumes, not two files on one: the anonymous fstat
+        // devices must differ.
+        let first_dev = std::fs::metadata(first).unwrap().dev();
+        let second_dev = std::fs::metadata(second).unwrap().dev();
+        assert_ne!(
+            first_dev, second_dev,
+            "the live pair needs two btrfs subvolumes, got one device ({first_dev}) for {first:?} and {second:?}"
+        );
         assert_two_domain_merge_for(first, ProcessViewId(301), ProcessViewId(302));
         assert_two_domain_merge_for(second, ProcessViewId(303), ProcessViewId(304));
     }
@@ -11823,6 +11988,65 @@ mod tests {
                 .is_empty(),
             "{path}"
         );
+    }
+
+    /// A second gcc-built fixture object with distinct bytes: the
+    /// negative twins' different real file. Mirrors
+    /// [`test_fixture::small_owned_object`] with its own marker so
+    /// the digest differs; built per call into the caller's dir.
+    fn second_owned_object(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let source = dir.path().join("second-owned-object.c");
+        let path = dir.path().join("second-owned-object.so");
+        std::fs::write(
+            &source,
+            "const char p11scope_second_owned_marker[] = \"SECOND-OWNED-0001\";\n\
+             int p11scope_second_owned_entry(void) { return 0; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&path)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success(),
+            "the second owned fixture must compile"
+        );
+        path
+    }
+
+    /// A scan module over an explicit object path: the shape
+    /// [`test_fixture::small_owned_module`] builds, keyed by the
+    /// path's own mount-table key so pinning it exercises the real
+    /// open/identity path.
+    fn module_over_path(view: &ProcessView, path: &std::path::Path) -> ScannedModule {
+        let file = p11scope_manifest::identity::open_object(path).unwrap();
+        let mapping = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        let key = ObjectKey {
+            device: Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        ScannedModule {
+            key_is_identity: false,
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: None,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            path: path.display().to_string(),
+            tables_scan_finished: false,
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        }
     }
 
     /// v0.8.0: a chrome-sized sparse object pins under a sufficient

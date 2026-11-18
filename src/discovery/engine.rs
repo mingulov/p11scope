@@ -38950,6 +38950,12 @@ impl Engine {
         terminal_dispatch: bool,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<DiscoveryBatchOutcome> {
+        // One shared teardown-deferral budget for this batch: the record
+        // and loader phases below scan before the inventory tick's own
+        // reset (which is also conditional on the tick running), so the
+        // budget resets here or loader scans inherit the previous tick's
+        // spent budget and file false loud gaps on busy hosts.
+        self.teardown_deferral = TeardownDeferralBudget::new();
         self.charge_discovery_drain(records.len(), malformed);
         self.held_records = if self.pause_owned_batch {
             records.iter().map(held_record_key).collect()

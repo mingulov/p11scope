@@ -801,7 +801,27 @@ pub(crate) fn classified_validated_object(
 }
 
 fn file_offset(object: &object::File<'_>, address: u64) -> Option<u64> {
+    translate_file_offset(object, address, false)
+}
+
+/// `file_offset` restricted to executable segments: a function-entry
+/// proof must resolve through a `PF_X` segment, so an address in a
+/// data segment (a decoy symbol, a corrupt unwind entry) translates
+/// to no file offset and contributes no proof. Data lookups keep the
+/// unrestricted `file_offset` above.
+fn executable_file_offset(object: &object::File<'_>, address: u64) -> Option<u64> {
+    translate_file_offset(object, address, true)
+}
+
+fn translate_file_offset(
+    object: &object::File<'_>,
+    address: u64,
+    executable_only: bool,
+) -> Option<u64> {
     object.segments().find_map(|segment| {
+        if executable_only && !segment.permissions().executable() {
+            return None;
+        }
         let start = segment.address();
         let end = start.checked_add(segment.size())?;
         if !(start..end).contains(&address) {
@@ -1315,7 +1335,9 @@ pub(crate) fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&s
 
 /// File offsets of proven function entries: every `STT_FUNC` definition in
 /// `.dynsym`/`.symtab` plus every `.eh_frame_hdr` FDE start, mapped through
-/// the load segments. Sorted, deduplicated. Best-effort over already-parsed
+/// the executable load segments only. A symbol or FDE start in a data
+/// segment contributes nothing — a uprobe is never proven at a data
+/// offset. Sorted, deduplicated. Best-effort over already-parsed
 /// bytes: a corrupt unwind table contributes nothing (its symbols still
 /// count), and an absent `.eh_frame_hdr` is simply no FDE proof — the
 /// caller fails closed when the set is empty. No I/O.
@@ -1325,7 +1347,7 @@ pub(crate) fn function_starts_in_object(object: &object::File<'_>) -> Vec<u64> {
         if !symbol.is_definition() || symbol.kind() != SymbolKind::Text {
             continue;
         }
-        if let Some(offset) = file_offset(object, symbol.address()) {
+        if let Some(offset) = executable_file_offset(object, symbol.address()) {
             starts.push(offset);
         }
     }
@@ -1393,7 +1415,7 @@ fn eh_frame_hdr_starts(object: &object::File<'_>, section_address: u64, data: &[
             break;
         };
         pos = next;
-        if let Some(offset) = file_offset(object, location) {
+        if let Some(offset) = executable_file_offset(object, location) {
             starts.push(offset);
         }
     }

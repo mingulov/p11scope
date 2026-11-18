@@ -99,11 +99,12 @@ pub struct InspectedObject {
     /// segment), so `exports` may be incomplete.
     pub witness_fault: bool,
     /// File offsets of proven function entries (every `STT_FUNC`
-    /// definition plus every `.eh_frame_hdr` FDE start), sorted and
-    /// deduplicated. The target-safety witness for uncorroborated table
-    /// entries: a uprobe is only placed at an offset in this set (or at
-    /// an export-agreed offset) or the entry is refused. Empty when the
-    /// object carries no symbol or unwind proof.
+    /// definition plus every `.eh_frame_hdr` FDE start resolving
+    /// through an executable segment), sorted and deduplicated. The
+    /// target-safety witness for uncorroborated table entries: a uprobe
+    /// is only placed at an offset in this set (or at an export-agreed
+    /// offset) or the entry is refused. Empty when the object carries
+    /// no symbol or unwind proof.
     pub function_starts: Vec<u64>,
 }
 

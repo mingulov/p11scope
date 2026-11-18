@@ -23054,15 +23054,55 @@ impl Engine {
     /// its own bindable pins across proving-view retire and reuse,
     /// instead of borrowing the transient view's rows. Proofs whose
     /// raws already alias there union tables only, without
-    /// re-absorbing. Bounded by the learned-file cap as a second
-    /// 32-entry budget beside the file store: past it the tables
-    /// refuse loudly through their own finite cap row, counted in
-    /// the same `learned_cap_skipped` as the files. A harvest that
-    /// changes the store owes the expedited frame and the learned
-    /// apply, so members the first-map stop holds resume with table
-    /// probes attached instead of at their bound.
+    /// re-absorbing. A proof from a new generation of the file
+    /// (same union key, new digest) refuses loudly with the finite
+    /// replaced-file row instead of unioning: an older generation's
+    /// tables are never reused for a new generation. Bounded by the
+    /// learned-file cap as a second 32-entry budget beside the file
+    /// store: past it the tables refuse loudly through their own
+    /// finite cap row, counted in the same `learned_cap_skipped` as
+    /// the files. A harvest that changes the store owes the
+    /// expedited frame and the learned apply, so members the
+    /// first-map stop holds resume with table probes attached
+    /// instead of at their bound.
     fn harvest_run_learned_tables(&mut self, pins: &mut PinnedObjects, proof: &OwnedLearnProof) {
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
+            return;
+        }
+        // File-generation check: the union below keys on
+        // (mount namespace, key, path) with no digest, so a proof
+        // from a NEW generation of the file (same key after an
+        // in-place rewrite or inode reuse) would union its tables
+        // into the older generation's stored module and bind them
+        // against the older generation's pins. Both digests present
+        // and different means the file was replaced: refuse the
+        // incoming tables loudly with the finite replaced-file
+        // reason (no schema change) and keep the stored module
+        // intact. A missing digest proves no change (production
+        // pins always carry one), so only a proven mismatch refuses.
+        let generation_changed = pins
+            .summary(proof.object)
+            .map(|summary| summary.sha256)
+            .filter(|digest| !digest.is_empty())
+            .zip(
+                self.pinned
+                    .id_for_scanned(&proof.module, proof.module.key, &proof.module.path)
+                    .and_then(|id| self.pinned.summary(id))
+                    .map(|summary| summary.sha256)
+                    .filter(|digest| !digest.is_empty()),
+            )
+            .is_some_and(|(incoming, committed)| incoming != committed);
+        if generation_changed {
+            self.mark_partial(
+                crate::render::LEARNED_SKIP_SUBJECT,
+                crate::render::LEARNED_REPLACED_DELETED_REASON,
+            );
+            if crate::run::capture_diagnostics_on() {
+                eprintln!(
+                    "p11scope: run-learned tables for {} refused: a new file generation replaced the learned one",
+                    proof.path
+                );
+            }
             return;
         }
         let mut module = proof.module.clone();

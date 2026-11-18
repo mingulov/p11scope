@@ -268,14 +268,16 @@ struct Entry {
     build_id: Option<String>,
     abi: ElfAbi,
     /// The object's own `.dynsym` definitions of standard PKCS#11 function
-    /// names, `(name, file offset)`, read from the bytes that were hashed.
-    /// Export linkage's witness (`scan::export_agreement`); file-derived, so
-    /// every entry for one digest carries the same list.
+    /// names, `(name, file offset)`, read from the bytes that were hashed
+    /// and kept only at executable offsets. Export linkage's witness
+    /// (`scan::export_agreement`); file-derived, so every entry for one
+    /// digest carries the same list.
     exports: Arc<[(String, u64)]>,
     /// File offsets of proven function entries (every `STT_FUNC`
-    /// definition plus every `.eh_frame_hdr` FDE start), sorted and
-    /// deduplicated, read from the bytes that were hashed. The strict
-    /// bind's target-safety witness for uncorroborated entries.
+    /// definition plus every `.eh_frame_hdr` FDE start resolving
+    /// through an executable segment), sorted and deduplicated, read
+    /// from the bytes that were hashed. The strict bind's
+    /// target-safety witness for uncorroborated entries.
     function_starts: Arc<[u64]>,
     /// A 3.x interface getter name appears among the object's dynamic
     /// symbols in any symbol type, including non-definitions absent from
@@ -424,8 +426,27 @@ impl ProvedEntry {
                     _ => None,
                 },
                 abi: inspected.abi,
-                exports: inspected.exports.clone().into(),
-                function_starts: inspected.function_starts.clone().into(),
+                // Attach authority requires PF_X: only executable
+                // offsets prove entries, so a data-segment export or
+                // start can never satisfy export agreement or the
+                // function-start proof below. Scan evidence keeps its
+                // full visibility (snapshot exports stay ungated) and
+                // pre-arm keeps its own proved/non-executable split;
+                // only the pin's proof lists are executable-gated.
+                exports: inspected
+                    .exports
+                    .iter()
+                    .filter(|(_, offset)| inspected.contains_executable_offset(*offset))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into(),
+                function_starts: inspected
+                    .function_starts
+                    .iter()
+                    .copied()
+                    .filter(|offset| inspected.contains_executable_offset(*offset))
+                    .collect::<Vec<_>>()
+                    .into(),
                 getter_present: inspected.getter_present,
                 witness_fault: inspected.witness_fault,
                 verified_ns,

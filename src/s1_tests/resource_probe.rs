@@ -852,6 +852,14 @@ fn native_semantic_resource_final_types_pinned() {
         40
     );
     pin!(crate::inventory_semantics::SemanticCaptureSummary, 48);
+    // Task 7 provider/token/mechanism projection: two row Vecs
+    // (tokens, mechanisms) plus the four u64 section gaps
+    // (2 x 24 + 4 x 8 = 80 B, niche-filled inline).
+    pin!(crate::inventory_provider_info::ProviderObservations, 80);
+    pin!(
+        Option<crate::inventory_provider_info::ProviderObservations>,
+        80
+    );
     // +24 (c9e1dd977): one inline Vec of pre-arm interval rows, one row
     // per `--prearm-module` input; the pin was never re-measured for it.
     // v0.6.0 `--exclude-module`: two more inline Vecs (excluded files,
@@ -877,6 +885,12 @@ fn native_semantic_resource_final_types_pinned() {
     // mechanism and identity overflow, folded instances. The
     // folded-claims bool packs with the pre-existing bool, adding
     // nothing; the per-module departed aggregate sits behind a Vec.
+    // +80 (provider-observations publication): the optional
+    // top-level `provider_observations` — two row Vecs (tokens,
+    // mechanisms) plus the four u64 section gaps, niche-filled
+    // inline (2 x 24 + 4 x 8). The per-module
+    // `modules[].provider_info` rides the modules Vec and adds no
+    // inline byte here.
     pin!(
         crate::inventory_present::Presentation,
         1384 + size_of::<crate::inventory_present::PresentationRenderIndex>()
@@ -887,6 +901,8 @@ fn native_semantic_resource_final_types_pinned() {
                     crate::discovery::engine::inventory_coordinator::JointAuditSubjectDiagnosis,
                 >,
             >()
+            // provider/token/mechanism projection: provider_observations
+            + size_of::<Option<crate::inventory_provider_info::ProviderObservations>>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.
     pin!(p11scope_ebpf_common::EventRecord, 368);

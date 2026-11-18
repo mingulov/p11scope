@@ -3247,9 +3247,10 @@ impl KeyUseReducer {
         // lengths, which always leave non-blank rows behind). A lost
         // join feeds neither inference nor the mismatch denominator:
         // the terminal's key proof was invalidated (§§5.4, 9).
-        let attributed = open.associations.iter().any(|assoc| {
-            matches!(assoc.bucket, AssocBucket::Proved(_)) && !assoc.lost
-        });
+        let attributed = open
+            .associations
+            .iter()
+            .any(|assoc| matches!(assoc.bucket, AssocBucket::Proved(_)) && !assoc.lost);
         // Off-mode counts nothing (§9 stale/replayed rule): without
         // admitted lengths a terminal pair is not evidence.
         if self.key_sizes

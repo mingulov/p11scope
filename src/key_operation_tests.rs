@@ -30497,8 +30497,16 @@ fn keymeta_same_family_rechecks_later_mechanism() {
     let mut ctx = KeymetaCtx::new();
     for (mechanism, ts) in [(0x1050u64, 100u64), (0x1052u64, 200u64)] {
         let receipt = KeymetaCtx::receipt(ids[0], "C_DeriveKey", 0, KeyRole::BaseKey, None);
-        ctx.direct("C_DeriveKey", 7, Some(mechanism), &[receipt], ts, None, None)
-            .expect("typeless derive completes");
+        ctx.direct(
+            "C_DeriveKey",
+            7,
+            Some(mechanism),
+            &[receipt],
+            ts,
+            None,
+            None,
+        )
+        .expect("typeless derive completes");
     }
     let inferred = ctx
         .inference(ids[0].as_u64(), "derive", "base_key", "unknown")
@@ -30531,7 +30539,14 @@ fn keymeta_type_only_checks_family() {
         getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16)],
         ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
     };
-    drive_quantum(&mut scene, &mut staging, &mut joint, &mut keyuse, &mut sink, &query);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &query,
+    );
     drive_quantum(
         &mut scene,
         &mut staging,
@@ -30565,7 +30580,10 @@ fn keymeta_type_only_checks_family() {
         object.established.modulus_bits.status, "unknown",
         "no modulus bits were ever established"
     );
-    assert_eq!(object.label, None, "type-only establishes no combined label");
+    assert_eq!(
+        object.label, None,
+        "type-only establishes no combined label"
+    );
     let row = committed
         .key_operations
         .iter()
@@ -30600,13 +30618,8 @@ fn keymeta_rowless_park_refusal_promotes_to_v7() {
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     for (n, view) in [ids[1], ids[2]].into_iter().enumerate() {
-        let mut receipt = KeymetaCtx::receipt(
-            ids[0],
-            "C_UnwrapKey",
-            0,
-            KeyRole::UnwrappingKey,
-            None,
-        );
+        let mut receipt =
+            KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
         receipt.attribution_valid = false;
         let mut c = call("C_UnwrapKey", 7, CkRv::OK.0, 100 + n as u64 * 100);
         c.mechanism = 0x2109;

@@ -1628,6 +1628,101 @@ const _: () = assert!((InstanceReason::SemanticResourceCapacity as u32) < 32);
 const _: () = assert!(std::mem::size_of::<NegativeRecord>() <= 64);
 const _: () = assert!(!std::mem::needs_drop::<NegativeRecord>());
 
+/// Bounded capture-owned H9 evidence folded from departed feeds: the
+/// finite unattributed counters and the final authority latches of
+/// every feed the departed-caller fold removed. The live-feed census
+/// (`joint_feeds`, the `stagings` array) drops the folded feed, but
+/// its counts and its ended-segment authority survive here, so
+/// proved rows keep their status and named loss counts are never
+/// erased by a retirement. Fixed size: seven counters, three flags.
+#[derive(Debug, Default)]
+pub(crate) struct FoldedJointEvidence {
+    pre_attach_direct: u64,
+    history_disposed: u64,
+    degraded_loss_direct: u64,
+    watchdog_unsealed: u64,
+    unsealable_direct: u64,
+    fallback_replayed: u64,
+    degraded_fallback_direct: u64,
+    lost: bool,
+    fallback: bool,
+    joint_history: bool,
+}
+
+impl FoldedJointEvidence {
+    /// Fold one departing feed's finite counters and final authority.
+    /// Called after any retirement-time disposal, so counts disposed
+    /// as part of the retirement are carried too.
+    fn fold_feed(&mut self, feed: &crate::semantics_key_use::JointStaging) {
+        use crate::semantics_key_use::FeedMode;
+        self.pre_attach_direct = self
+            .pre_attach_direct
+            .saturating_add(feed.pre_attach_direct());
+        self.history_disposed = self
+            .history_disposed
+            .saturating_add(feed.history_disposed());
+        self.degraded_loss_direct = self
+            .degraded_loss_direct
+            .saturating_add(feed.degraded_loss_direct());
+        self.watchdog_unsealed = self
+            .watchdog_unsealed
+            .saturating_add(feed.watchdog_unsealed());
+        self.unsealable_direct = self
+            .unsealable_direct
+            .saturating_add(feed.unsealable_direct());
+        self.fallback_replayed = self
+            .fallback_replayed
+            .saturating_add(feed.fallback_replayed());
+        self.degraded_fallback_direct = self
+            .degraded_fallback_direct
+            .saturating_add(feed.degraded_fallback_direct());
+        self.lost = self.lost
+            || feed.degraded_loss()
+            || feed.watchdog_tripped()
+            || feed.history_disposed_since_resume() > 0;
+        self.fallback = self.fallback || feed.fell_back();
+        self.joint_history = self.joint_history || feed.mode() == FeedMode::Joint;
+    }
+
+    /// The folded counters as named unattributed rows, in the frozen
+    /// publication order, with the same reason mapping as the live
+    /// feed projection. Zero reasons are omitted by the caller.
+    pub(crate) fn rows(&self) -> [(&'static str, u64); 5] {
+        [
+            ("started_before_attach", self.pre_attach_direct),
+            (
+                "record_lost",
+                self.history_disposed
+                    .saturating_add(self.degraded_loss_direct),
+            ),
+            ("watchdog_no_progress", self.watchdog_unsealed),
+            ("unmodelled_call_shape", self.unsealable_direct),
+            (
+                "proof_refused_fallback",
+                self.fallback_replayed
+                    .saturating_add(self.degraded_fallback_direct),
+            ),
+        ]
+    }
+
+    /// Whether any folded feed ended in real loss.
+    pub(crate) fn lost(&self) -> bool {
+        self.lost
+    }
+
+    /// Whether any folded feed ended in proof-only refusal.
+    pub(crate) fn fell_back(&self) -> bool {
+        self.fallback
+    }
+
+    /// Whether any folded feed was Joint: per-key tracking started
+    /// and delivered there, so surviving rows are history, never a
+    /// bootstrap that never started.
+    pub(crate) fn joint_history(&self) -> bool {
+        self.joint_history
+    }
+}
+
 pub(super) struct InstanceState {
     records: BTreeMap<RegistryInstanceId, InstanceRecord>,
     semantics: BTreeMap<RegistryInstanceId, InstanceSemanticRecord>,
@@ -1669,6 +1764,11 @@ pub(super) struct InstanceState {
     /// the conservation sum stays exact without one entry per folded
     /// caller. Added wherever `instance_calls_refused` is summed.
     folded_instance_calls_refused: u64,
+    /// The departed feeds' H9 counters and final authority, folded
+    /// by `take_instance_for_fold` and read wherever the live
+    /// `stagings` array feeds the key projection, so a retirement
+    /// never hides proved rows or erases named loss counts.
+    folded_joint: FoldedJointEvidence,
     /// Callers with at least one refused instance registration: a
     /// registration refused for cause (identity, capacity, ...)
     /// leaves no instance, so without this mark the terminal
@@ -1711,6 +1811,7 @@ impl Default for InstanceState {
             joint_backstop_routed: 0,
             instance_calls_refused: BTreeMap::new(),
             folded_instance_calls_refused: 0,
+            folded_joint: FoldedJointEvidence::default(),
             registration_refused_callers: BTreeSet::new(),
             first_birth_capacity: None,
         }
@@ -2979,6 +3080,9 @@ impl CallerRegistry {
                 for row in crate::key_operation_projection::producer::unattributed(&stagings) {
                     observations.add_unattributed(row.reason, row.count);
                 }
+                for (reason, count) in self.instance_state.folded_joint.rows() {
+                    observations.add_unattributed(reason, count);
+                }
                 observations.add_unattributed("foreign_or_unproven_caller", refused);
                 if !observations.unattributed.is_empty() {
                     // Same reason precedence as the producer: a
@@ -2987,39 +3091,36 @@ impl CallerRegistry {
                     // Semantic loss before any delivery disposes staged
                     // history while the feed stays Joint: the disposed
                     // count since the last clean resume is itself the
-                    // loss (same precedence as the producer).
+                    // loss (same precedence as the producer). Folded
+                    // feeds lend their final authority the same way.
                     if stagings.iter().any(|staging| {
                         staging.degraded_loss()
                             || staging.watchdog_tripped()
                             || staging.history_disposed_since_resume() > 0
-                    }) {
+                    }) || self.instance_state.folded_joint.lost
+                    {
                         observations.reason = "authority_lost";
-                    } else if stagings.iter().any(|staging| staging.fell_back()) {
+                    } else if stagings.iter().any(|staging| staging.fell_back())
+                        || self.instance_state.folded_joint.fallback
+                    {
                         observations.reason = "proof_refused_fallback";
                     }
                 }
             }
             return observations;
         };
-        let mut observations = if linked {
-            crate::key_operation_projection::producer::commit(
-                revision,
-                &stagings,
-                projection,
-                &self.joint_keyuse,
-            )
-        } else {
-            // The linkage derives from the latched flag, never a
-            // literal: this arm means unlinked only while the branch
-            // above tests `linked`.
+        // The linkage derives from the latched flag, never a
+        // literal: one commit entry for both worlds, carrying the
+        // folded departed-feed evidence beside the live census.
+        let mut observations =
             crate::key_operation_projection::producer::commit_with_journal_linked(
                 revision,
                 &stagings,
                 projection,
                 &self.joint_keyuse,
+                &self.instance_state.folded_joint,
                 linked,
-            )
-        };
+            );
         observations.add_unattributed("foreign_or_unproven_caller", refused);
         observations
     }
@@ -3106,6 +3207,18 @@ impl CallerRegistry {
         if semantic.as_ref().is_some_and(|row| row.semantics.is_some()) {
             debug_assert!(self.instance_state.occupied > 0);
             self.instance_state.occupied = self.instance_state.occupied.saturating_sub(1);
+        }
+        // The departing feed's finite counters and final authority
+        // fold into the bounded capture-owned evidence (read after
+        // the retirement-time disposal above, so disposed counts are
+        // carried too), and a Joint feed leaving the census
+        // decrements the live-feed count like every other Joint exit.
+        if let Some(taken) = semantic.as_ref() {
+            let was_joint = taken.feed.mode() == FeedMode::Joint;
+            self.instance_state.folded_joint.fold_feed(&taken.feed);
+            if was_joint {
+                self.joint_feeds = self.joint_feeds.saturating_sub(1);
+            }
         }
         if let Some(refused) = self
             .instance_state

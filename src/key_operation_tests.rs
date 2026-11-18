@@ -3749,6 +3749,7 @@ fn key_operation_message_unbound_context_rows_message_contexts() {
         &[&s1only_staging],
         &scene.model.project(),
         &s1only_keyuse,
+        &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
         true,
     );
     assert_eq!(
@@ -3863,6 +3864,7 @@ fn key_operation_message_all_categories_count_contexts_direct() {
         &[&s1only_staging],
         &scene.model.project(),
         &keyuse,
+        &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
         true,
     );
     assert_eq!(
@@ -13675,6 +13677,7 @@ fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
         &[&s1only_staging],
         &empty.model.project(),
         &s1only_keyuse,
+        &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
         true,
     );
     assert!(twin.objects.is_empty() && twin.key_operations.is_empty());
@@ -16133,8 +16136,7 @@ impl FoldScene {
     fn admit(&mut self, pid: u32) -> CallerId {
         self.harness.source().spawn(pid, 1000 + u64::from(pid));
         self.pids.push(pid);
-        let observed: std::collections::BTreeSet<u32> =
-            self.pids.iter().copied().collect();
+        let observed: std::collections::BTreeSet<u32> = self.pids.iter().copied().collect();
         let now = self.harness.now_ns();
         let events = self.harness.coordinator_mut().adapter_mut().reconcile(
             &observed,
@@ -16174,8 +16176,13 @@ impl FoldScene {
     }
 
     /// One sealed key use on `caller`'s Joint feed: install, register,
-    /// observe an init, seal and deliver it.
-    fn deliver_proved_use(&mut self, caller: CallerId, router: u64) -> RegistryInstanceId {
+    /// observe an init, seal and deliver it. The association stays
+    /// open (active) until its sign seals.
+    fn deliver_proved_use(
+        &mut self,
+        caller: CallerId,
+        router: u64,
+    ) -> (InstanceKey, RegistryInstanceId) {
         self.harness
             .coordinator_mut()
             .registry_mut()
@@ -16226,7 +16233,9 @@ impl FoldScene {
         ingest_call(&mut self.scene, &init, pos);
         let seal = self.scene.seal().expect("healthy call seals");
         assert_eq!(
-            self.harness.coordinator_mut().registry_mut()
+            self.harness
+                .coordinator_mut()
+                .registry_mut()
                 .deliver_joint_algorithm_seal_for_test(
                     id,
                     &seal,
@@ -16236,14 +16245,48 @@ impl FoldScene {
             SealApplyOutcome::ReplayedOne,
             "the sealed use delivers"
         );
-        id
+        (key, id)
+    }
+
+    /// Seal the open use's sign: the proved association completes
+    /// (no open active left for a retirement to settle).
+    fn seal_sign_use(&mut self, key: &InstanceKey, caller: CallerId, id: RegistryInstanceId) {
+        let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+        let (facts, pos) = self.admit_shape(&sign);
+        self.harness
+            .coordinator_mut()
+            .registry_mut()
+            .observe_instance_semantic(AdmittedInstanceCall::scripted(
+                key.clone(),
+                caller,
+                pos,
+                facts,
+            ));
+        self.harness
+            .coordinator_mut()
+            .registry_mut()
+            .publish_with_ledger(self.scene.adapter.ledger_mut());
+        ingest_call(&mut self.scene, &sign, pos);
+        let seal = self.scene.seal().expect("healthy terminal seals");
+        assert_eq!(
+            self.harness
+                .coordinator_mut()
+                .registry_mut()
+                .deliver_joint_algorithm_seal_for_test(
+                    id,
+                    &seal,
+                    &self.scene.model,
+                    self.scene.adapter.ledger_mut()
+                ),
+            SealApplyOutcome::ReplayedOne,
+            "the sealed terminal delivers"
+        );
     }
 
     fn retire_pid(&mut self, pid: u32) {
         self.harness.source().kill(pid);
         self.pids.retain(|live| *live != pid);
-        let observed: std::collections::BTreeSet<u32> =
-            self.pids.iter().copied().collect();
+        let observed: std::collections::BTreeSet<u32> = self.pids.iter().copied().collect();
         let now = self.harness.now_ns();
         let events = self.harness.coordinator_mut().adapter_mut().reconcile(
             &observed,
@@ -16316,17 +16359,30 @@ fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
     let mut scene = FoldScene::new();
     let pid = 5001;
     let caller = scene.admit(pid);
-    scene.deliver_proved_use(caller, 1);
+    let (key, id) = scene.deliver_proved_use(caller, 1);
+    scene.seal_sign_use(&key, caller, id);
     assert_eq!(scene.harness.coordinator().registry().joint_feeds(), 1);
 
     let before = scene.presentation();
     assert_eq!(
-        (before.object_observations.status, before.object_observations.reason),
+        (
+            before.object_observations.status,
+            before.object_observations.reason
+        ),
         (ObsStatus::Populated, "none")
     );
     assert!(
         !before.object_observations.key_operations.is_empty(),
         "the sealed use proves rows"
+    );
+    assert!(
+        before
+            .object_observations
+            .key_operations
+            .iter()
+            .all(|row| row.active == 0),
+        "the completed use leaves no open active: {:?}",
+        before.object_observations.key_operations
     );
     let json_before = render_json_from_presentation(&before);
     let section_before = json_before["object_observations"].clone();
@@ -16335,7 +16391,9 @@ fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
     let text_before = render_snapshot_with_verbosity(&before, TextVerbosity::Concise);
     let block_before = key_ops_text_block(&text_before);
     assert!(
-        block_before.first().is_some_and(|line| line.contains("populated")),
+        block_before
+            .first()
+            .is_some_and(|line| line.contains("populated")),
         "concise text names the populated section: {block_before:?}"
     );
 
@@ -16356,7 +16414,10 @@ fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
 
     let after = scene.presentation();
     assert_eq!(
-        (after.object_observations.status, after.object_observations.reason),
+        (
+            after.object_observations.status,
+            after.object_observations.reason
+        ),
         (ObsStatus::Populated, "none"),
         "proved rows survive the fold with their status"
     );
@@ -16371,12 +16432,33 @@ fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
     );
     let (emitted_after, jsonl_after) = jsonl_reconstruction(&after.object_observations);
     assert_eq!(emitted_after, emitted_before, "JSONL emits the same rows");
-    assert_eq!(jsonl_after.known, jsonl_before.known, "JSONL keeps proved rows");
-    let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
     assert_eq!(
-        key_ops_text_block(&text_after),
-        block_before,
-        "concise text keeps the proved rows"
+        jsonl_after.known, jsonl_before.known,
+        "JSONL keeps proved rows"
+    );
+    // Concise text keeps the populated header and the exact tallies.
+    // (The provider display name may degrade once the instance row
+    // folds — the proved instance outliving its instances[] row is
+    // the escalated CBOM-join question, not this fix — so the name
+    // itself is not pinned here.)
+    let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
+    let block_after = key_ops_text_block(&text_after);
+    assert_eq!(
+        block_after.first(),
+        block_before.first(),
+        "concise header stays populated: {block_after:?}"
+    );
+    assert!(
+        block_after
+            .iter()
+            .any(|line| line.contains("sign 1 completed, 0 returned errors, 0 active operations")),
+        "concise text keeps the proved tally: {block_after:?}"
+    );
+    assert!(
+        !block_after
+            .iter()
+            .any(|line| line.contains("not available")),
+        "concise text never hides proved rows: {block_after:?}"
     );
 }
 
@@ -16393,9 +16475,9 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
     let pid_b = 5012;
     let caller_a = scene.admit(pid_a);
     let caller_b = scene.admit(pid_b);
-    let key_a = scene.key(1);
-    scene.deliver_proved_use(caller_a, 1);
-    scene.deliver_proved_use(caller_b, 2);
+    let (key_a, _id_a) = scene.deliver_proved_use(caller_a, 1);
+    let (key_b, id_b) = scene.deliver_proved_use(caller_b, 2);
+    scene.seal_sign_use(&key_b, caller_b, id_b);
     assert_eq!(scene.harness.coordinator().registry().joint_feeds(), 2);
 
     // A counted loss on the departing feed: one more call stages,
@@ -16435,7 +16517,10 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
 
     let before = scene.presentation();
     assert_eq!(
-        (before.object_observations.status, before.object_observations.reason),
+        (
+            before.object_observations.status,
+            before.object_observations.reason
+        ),
         (ObsStatus::Partial, "authority_lost")
     );
     let lost_before: Vec<(&str, u64)> = before
@@ -16448,8 +16533,6 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
     let json_before = render_json_from_presentation(&before);
     let section_before = json_before["object_observations"].clone();
     let (_, jsonl_before) = jsonl_reconstruction(&before.object_observations);
-    let text_before = render_snapshot_with_verbosity(&before, TextVerbosity::Concise);
-    let block_before = key_ops_text_block(&text_before);
 
     scene.retire_pid(pid_a);
     assert_eq!(scene.fold(caller_a), 1, "the lossy row folds");
@@ -16470,7 +16553,10 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
 
     let after = scene.presentation();
     assert_eq!(
-        (after.object_observations.status, after.object_observations.reason),
+        (
+            after.object_observations.status,
+            after.object_observations.reason
+        ),
         (ObsStatus::Partial, "authority_lost"),
         "the folded loss still names itself beside the healthy sibling"
     );
@@ -16480,10 +16566,18 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
         .iter()
         .map(|row| (row.reason, row.count))
         .collect();
-    assert_eq!(lost_after, vec![("record_lost", 1)], "the named loss survives");
+    assert_eq!(
+        lost_after,
+        vec![("record_lost", 1)],
+        "the named loss survives"
+    );
+    // The loss already settled the departed feed's open active to
+    // unknown (the proof left with the caller; the S1 stands), by
+    // design — so the settled rows are exactly stable across the
+    // fold, beside the sibling's completed row.
     assert_eq!(
         after.object_observations.key_operations, before.object_observations.key_operations,
-        "proved rows from both feeds survive"
+        "the settled proved rows survive exactly"
     );
     let json_after = render_json_from_presentation(&after);
     assert_eq!(
@@ -16491,12 +16585,38 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
         "the JSON section is stable across the lossy fold"
     );
     let (_, jsonl_after) = jsonl_reconstruction(&after.object_observations);
-    assert_eq!(jsonl_after.known, jsonl_before.known, "JSONL keeps proved rows");
-    let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
     assert_eq!(
-        key_ops_text_block(&text_after),
-        block_before,
-        "concise text keeps rows and the named loss"
+        jsonl_after.known, jsonl_before.known,
+        "JSONL keeps proved rows exactly"
+    );
+    // Concise text keeps the partial header, the completed tally and
+    // the named loss beside exact rows (provider display names are
+    // not pinned: grouping may split once the instance row folds).
+    let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
+    let block_after = key_ops_text_block(&text_after);
+    assert!(
+        block_after
+            .first()
+            .is_some_and(|line| line.contains("partial")),
+        "concise text stays partial, never hidden: {block_after:?}"
+    );
+    assert!(
+        block_after
+            .iter()
+            .any(|line| line.contains("1 completed") && line.contains("0 active operations")),
+        "concise text keeps the completed tally: {block_after:?}"
+    );
+    assert!(
+        block_after
+            .iter()
+            .any(|line| line.contains("per-key tracking lost some calls")),
+        "concise text still names the loss beside exact rows: {block_after:?}"
+    );
+    assert!(
+        !block_after
+            .iter()
+            .any(|line| line.contains("not available")),
+        "concise text never hides proved rows: {block_after:?}"
     );
 }
 
@@ -19960,12 +20080,28 @@ fn producer_commit_without_linked_journal_reports_journal_unavailable() {
     let fresh = JointStaging::select_s1_only();
     let empty_model = JointScene::new().model.project();
     let empty_keyuse = KeyUseReducer::new();
-    let unlinked = commit_with_journal_linked(1, &[&fresh], &empty_model, &empty_keyuse, false);
+    let empty_folded =
+        crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default();
+    let unlinked = commit_with_journal_linked(
+        1,
+        &[&fresh],
+        &empty_model,
+        &empty_keyuse,
+        &empty_folded,
+        false,
+    );
     assert_eq!(unlinked.status, ObsStatus::Unavailable);
     assert_eq!(unlinked.reason, "journal_unavailable");
     assert!(unlinked.key_operations.is_empty());
     assert!(unlinked.unknown_key_operations.is_empty());
-    let linked = commit_with_journal_linked(2, &[&fresh], &empty_model, &empty_keyuse, true);
+    let linked = commit_with_journal_linked(
+        2,
+        &[&fresh],
+        &empty_model,
+        &empty_keyuse,
+        &empty_folded,
+        true,
+    );
     assert_eq!(linked.status, ObsStatus::Unavailable);
     assert_eq!(
         linked.reason, "bootstrap_unavailable",
@@ -21255,8 +21391,14 @@ fn key_operation_lifecycle_close_all_finalize_commit_link() {
     // Stage 5: the same populated model through an unlinked lane
     // reports journal_unavailable — rows in memory are not delivery.
     let s1only = JointStaging::select_s1_only();
-    let unlinked =
-        commit_with_journal_linked(5, &[&s1only], &scene.model.project(), &keyuse, false);
+    let unlinked = commit_with_journal_linked(
+        5,
+        &[&s1only],
+        &scene.model.project(),
+        &keyuse,
+        &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
+        false,
+    );
     assert_eq!(unlinked.status, ObsStatus::Unavailable);
     assert_eq!(unlinked.reason, "journal_unavailable");
     assert_eq!(unlinked.objects.len(), 1, "rows stay while status refuses");

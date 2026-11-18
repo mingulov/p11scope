@@ -8434,7 +8434,13 @@ int main(int argc, char **argv) {
             }
             let mut provider = module(PROVIDER);
             provider.view = ProcessViewId(0);
-            let pins = view_pin(&provider, 21, SHA, 1, false);
+            let mut pins = view_pin(&provider, 21, SHA, 1, false);
+            // These twins exercise admission/attribution over a bound
+            // provider, not bind refusal: backfill the synthetic entry
+            // offsets as proven function starts (the same test-only
+            // proof the engine twins use), so the strict inventory
+            // bind admits them.
+            pins.prove_scanned_entries_for_test(std::slice::from_ref(&provider));
             Collection {
                 enumerated: sweep.iter().map(|(pid, _)| *pid).collect(),
                 selected: vec![10_000, 20_000],
@@ -8531,6 +8537,12 @@ int main(int argc, char **argv) {
             hints: &[PathBuf],
         ) -> Catalog {
             let mut collection = over_cap(&[]);
+            // The lowered provider replaces the over-cap module, so its
+            // own synthetic offsets need the same test-only
+            // function-start proof (see `over_cap`).
+            collection.members[0]
+                .pins
+                .prove_scanned_entries_for_test(std::slice::from_ref(&provider));
             collection.members[0].modules = vec![provider];
             let snapshots: HashMap<u32, Vec<MapEntry>> = collection.sweep.iter().cloned().collect();
             let bound = bind_collection(&mut collection);

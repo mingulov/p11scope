@@ -893,14 +893,19 @@ def check_section(section):
 
 
 def _require_v7_content(section):
-    """A v7 section carries a non-blank inferred key on some row: a
+    """A v7 section carries a non-blank inferred key on some row — a
     valued, conflicting or unsupported state, or an unknown carrying
-    completions."""
+    completions — or a valid published v7-only gap (gap-driven v7,
+    rows or rowless). The gaps passed `_check_gaps` before this runs,
+    so a listed v7-only reason is already well-formed."""
     for row in section["key_operations"]:
         for name in ("inferred_family", "inferred_size"):
             block = row[name]
             if block["status"] != "unknown" or block["completions"] > 0:
                 return
+    for row in section["gaps"]["rows"]:
+        if row["subject"] == "key_operation" and row["reason"] in V7_ONLY_GAPS:
+            return
     _require(False, "v7 section without inferred content")
 
 

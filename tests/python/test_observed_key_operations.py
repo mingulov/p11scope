@@ -1093,6 +1093,58 @@ class ObservedRsaTests(unittest.TestCase):
                 with self.assertRaises(ORACLE.OracleRefusal):
                     ORACLE.check_section(mutated)
 
+    def test_h9_v7_gap_content_qualifies_without_inferred_rows(self):
+        # Gap-driven v7: a valid published v7-only gap counts as v7
+        # content, so a capture with only blank inferred rows — or no
+        # proved rows at all — still qualifies. A v7 section with
+        # neither stays refused (pinned above).
+        section = observed("clean.json")
+        section["version"] = 7
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for name, block in (("requested", row["requested"]),
+                                ("established", row["established"])):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None, "source": None,
+                                          "reason": None}
+                for cell_name, cell in block.items():
+                    if cell_name == "parameter_set":
+                        continue
+                    if name == "established" and cell["status"] == "value":
+                        cell["source"] = "query"
+                    else:
+                        cell["source"] = None
+                    cell["reason"] = None
+            row["queries"]["parameter_set"] = "not_queried"
+        for row in section["key_operations"]:
+            row["inferred_family"] = {"status": "unknown",
+                                      "value": None, "completions": 0}
+            row["inferred_size"] = {"status": "unknown",
+                                    "detail": None, "completions": 0}
+        with self.subTest("blank rows plus v7 gaps qualify"):
+            mutated = copy.deepcopy(section)
+            mutated["gaps"] = {
+                "rows": [
+                    {"subject": "key_operation",
+                     "reason": "corroboration_mismatch", "repeats": 2},
+                    {"subject": "key_operation",
+                     "reason": "wrapped_park_refused", "repeats": 1}],
+                "suppressed": 0}
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(len(facts["rows"]), 2)
+            self.assertEqual(len(facts["gaps"]["rows"]), 2)
+        with self.subTest("rowless v7 with a park gap qualifies"):
+            mutated = copy.deepcopy(section)
+            mutated["key_operations"] = []
+            mutated["budgets"]["key_rows"]["occupied"] = 0
+            mutated["gaps"] = {
+                "rows": [{"subject": "key_operation",
+                          "reason": "wrapped_park_refused", "repeats": 1}],
+                "suppressed": 0}
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(facts["rows"], [])
+            self.assertEqual(len(facts["gaps"]["rows"]), 1)
+
     def test_h9_v6_section_checks_structurally(self):
         # v6 shape with the cell's RSA key rows: the new-site content
         # rides the object views (key_type 66, value_len 48, hkdf_384

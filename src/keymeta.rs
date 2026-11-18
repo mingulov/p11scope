@@ -344,6 +344,33 @@ pub(crate) enum EstablishedKind {
     Poly1305,
 }
 
+/// Map one established key-type code to its §4.5 kind with dummy
+/// size params (family checks ignore sizes; size checks use the
+/// combined label, never this). `None` for unlisted codes: the
+/// inference stands alone, never conflicting.
+pub(crate) fn established_type_kind(key_type: u16) -> Option<EstablishedKind> {
+    match key_type {
+        0x00 => Some(EstablishedKind::Rsa { bits: 0 }),
+        0x01 => Some(EstablishedKind::Dsa),
+        0x02 => Some(EstablishedKind::Dh),
+        0x03 => Some(EstablishedKind::Ec {
+            curve: SafeCurve::Secp256r1,
+        }),
+        0x04 => Some(EstablishedKind::X9_42Dh),
+        0x10 => Some(EstablishedKind::GenericSecret { bytes: 0 }),
+        0x1f => Some(EstablishedKind::Aes { bytes: 0 }),
+        0x40 => Some(EstablishedKind::Edwards {
+            curve: SafeCurve::Ed25519,
+        }),
+        0x41 => Some(EstablishedKind::Montgomery),
+        0x42 => Some(EstablishedKind::Hkdf { bytes: 0 }),
+        0x49 => Some(EstablishedKind::MlKem { set: "" }),
+        0x4a => Some(EstablishedKind::MlDsa { set: "" }),
+        0x4b => Some(EstablishedKind::SlhDsa { set: "" }),
+        _ => None,
+    }
+}
+
 /// Map one established [`KeyLabel`] to its §4.5 kind. PQC codes map
 /// to their parameter-set spellings (the §10.2 `parameter_set`
 /// vocabulary); Montgomery/Edwards curves split by name.

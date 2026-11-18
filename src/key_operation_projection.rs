@@ -1408,8 +1408,21 @@ fn has_inferred_content(observations: &ObjectObservations) -> bool {
     })
 }
 
+/// v7-only gap content: a refusal or residual that v1–v6 never carry.
+/// A rowless park refusal still promotes its section to v7, so the
+/// named gap never rides a version whose vocabulary forbids it.
+fn has_v7_gap_content(observations: &ObjectObservations) -> bool {
+    observations.gaps.iter().any(|gap| {
+        gap.subject == "key_operation"
+            && matches!(
+                gap.reason,
+                "corroboration_mismatch" | "wrapped_park_refused"
+            )
+    })
+}
+
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
-    if has_inferred_content(observations) {
+    if has_inferred_content(observations) || has_v7_gap_content(observations) {
         return OBSERVATIONS_VERSION_V7;
     }
     if has_newsite_content(observations) {

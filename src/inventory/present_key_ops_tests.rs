@@ -3179,6 +3179,7 @@ fn inferred_rsa_2048(completions: u64) -> RowInference {
             further: 0,
             reason: None,
             further_seen: Vec::new(),
+            rsa_further_seen: [0; 32],
         },
     }
 }
@@ -3363,6 +3364,7 @@ fn key_ops_verbose_conflict_and_reasons() {
                 further: 1,
                 reason: None,
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         },
     ));
@@ -3392,6 +3394,7 @@ fn key_ops_verbose_conflict_and_reasons() {
                 further: 0,
                 reason: Some(crate::keymeta::REASON_VARIABLE_LENGTH_ENCODING),
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         },
     ));
@@ -3496,6 +3499,7 @@ fn key_ops_concise_wrapped_material() {
                 further: 0,
                 reason: None,
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         },
     ));
@@ -3550,6 +3554,7 @@ fn key_ops_verbose_size_conflict_established_mismatch() {
                 further: 0,
                 reason: None,
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         },
     ));

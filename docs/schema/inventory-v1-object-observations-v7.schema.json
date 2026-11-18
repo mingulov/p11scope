@@ -1214,7 +1214,90 @@
           "const": "wrapped",
           "description": "Wrapped material is always about the wrapped key."
         }
-      }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["kind", "size_class", "modulus_bytes", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "rsa"},
+                "size_class": {"enum": [1024, 2048, 3072, 4096]},
+                "modulus_bytes": {"enum": [128, 256, 384, 512]},
+                "evidence": {"enum": ["sign_output", "verify_input", "encrypt_output", "decrypt_input", "wrap_output", "unwrap_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "modulus_bytes", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "rsa_nonstandard"},
+                "modulus_bytes": {"type": "integer", "minimum": 64, "maximum": 2048},
+                "evidence": {"enum": ["sign_output", "verify_input", "encrypt_output", "decrypt_input", "wrap_output", "unwrap_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "curve", "octets", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "ec"},
+                "curve": {"enum": ["p256", "p384", "p521"]},
+                "octets": {"enum": [64, 96, 132]},
+                "evidence": {"enum": ["sign_output", "verify_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "curve", "octets", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "eddsa"},
+                "curve": {"enum": ["ed25519", "ed448"]},
+                "octets": {"enum": [64, 114]},
+                "evidence": {"enum": ["sign_output", "verify_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "label", "octets", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "dsa_class"},
+                "label": {"enum": ["dsa_1024", "dsa_2048_224", "dsa_2048_256_or_3072"]},
+                "octets": {"enum": [40, 56, 64]},
+                "evidence": {"enum": ["sign_output", "verify_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "parameter_set", "octets", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "pqc_set"},
+                "parameter_set": {"enum": ["ml_kem_512", "ml_kem_768", "ml_kem_1024", "ml_dsa_44", "ml_dsa_65", "ml_dsa_87", "slh_dsa_128s", "slh_dsa_128f", "slh_dsa_192s", "slh_dsa_192f", "slh_dsa_256s", "slh_dsa_256f"]},
+                "octets": {"enum": [768, 1088, 1568, 2420, 3309, 4627, 7856, 17088, 16224, 35664, 29792, 49856]},
+                "evidence": {"enum": ["encapsulate_output", "decapsulate_input", "sign_output", "verify_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "material_octets", "octets", "evidence", "about"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "wrapped_material"},
+                "material_octets": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "octets": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "evidence": {"enum": ["wrap_output", "unwrap_input"]},
+                "about": {"const": "wrapped"}
+              }
+            }
+          ]
+        }
+      ]
     },
     "unknown_reason": {
       "enum": [

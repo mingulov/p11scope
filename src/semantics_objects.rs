@@ -862,6 +862,11 @@ pub(crate) enum ObjectEffect {
         /// The resolved combined label at the join (own established
         /// or pair-inherited size).
         label: Option<KeyLabel>,
+        /// The established key-type code at the join (keymeta §4.5
+        /// left side): `Some` when the view's key type is an
+        /// established non-conflicting scalar, even without the size
+        /// or curve that a combined label needs.
+        key_type: Option<u16>,
         /// Whether attribution was valid at the join.
         attribution_valid: bool,
         /// Whether the view's origin is first-observed (DEMO-4 late

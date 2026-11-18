@@ -526,6 +526,16 @@ impl ViewRecord {
         matches!(self.origin, ViewOrigin::Created(_)) && self.attribution == Attribution::Valid
     }
 
+    /// The established key-type code, when non-conflicting (keymeta
+    /// §4.5 left side): frozen even without the size or curve a
+    /// combined label needs.
+    fn frozen_key_type(&self) -> Option<u16> {
+        match self.established[field_index(SafeAttributeKind::KeyType)] {
+            FieldState::Value(FieldValue::Scalar(value)) => Some(value),
+            _ => None,
+        }
+    }
+
     fn label(&self) -> Option<KeyLabel> {
         let field = |kind| self.established[field_index(kind)];
         let scalar = |kind| match field(kind) {
@@ -690,6 +700,7 @@ enum DeferredInput {
         key_use: bool,
         metadata: super::KeyMetadataFlags,
         label: Option<super::KeyLabel>,
+        key_type: Option<u16>,
         attribution_valid: bool,
         first_observed: bool,
         lost: bool,
@@ -2712,6 +2723,7 @@ impl ModelState {
                                     key_use,
                                     metadata: Self::metadata_flags_of(view),
                                     label: self.resolved_label(id),
+                                    key_type: view.frozen_key_type(),
                                     attribution_valid: view.attribution
                                         == super::Attribution::Valid,
                                     first_observed: matches!(
@@ -3076,6 +3088,7 @@ impl ModelState {
         };
         let metadata = Self::metadata_flags_of(view);
         let label = self.resolved_label(id);
+        let key_type = view.frozen_key_type();
         let attribution_valid = view.attribution == super::Attribution::Valid;
         let first_observed = matches!(view.origin, ViewOrigin::FirstObserved);
         if let Some(view) = self.objects.get_mut(&id) {
@@ -3091,6 +3104,7 @@ impl ModelState {
                 input,
                 metadata,
                 label,
+                key_type,
                 attribution_valid,
                 first_observed,
             });
@@ -4657,6 +4671,7 @@ impl ModelState {
                 key_use,
                 metadata,
                 label,
+                key_type,
                 attribution_valid,
                 first_observed,
                 lost: false,
@@ -4678,6 +4693,7 @@ impl ModelState {
                 input: u8::try_from(index).ok(),
                 metadata: *metadata,
                 label: *label,
+                key_type: *key_type,
                 attribution_valid: *attribution_valid,
                 first_observed: *first_observed,
             });
@@ -5608,6 +5624,7 @@ mod tests {
                 key_use,
                 metadata,
                 label,
+                key_type,
                 attribution_valid,
                 first_observed,
                 lost,
@@ -5621,6 +5638,7 @@ mod tests {
                 assert_eq!(metadata, ModelState::metadata_flags_of(&view));
                 assert_eq!(label, view.label());
                 assert_eq!(label, Some(super::KeyLabel::Aes { value_len: 16 }));
+                assert_eq!(key_type, Some(0x1f), "the key type freezes with the label");
                 assert!(attribution_valid);
                 assert!(!lost);
             }
@@ -6788,6 +6806,7 @@ mod tests {
                     input,
                     metadata,
                     label,
+                    key_type: _,
                     attribution_valid,
                     first_observed: _,
                 } => Some((

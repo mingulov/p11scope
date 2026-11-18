@@ -9220,6 +9220,7 @@ fn key_operation_schema_contract() {
                 conflicted,
             },
             label,
+            key_type: None,
             attribution_valid,
             first_observed: false,
             lost: false,
@@ -19886,6 +19887,7 @@ fn key_operation_joint_async_pending_mints_deferred_origin() {
                 input,
                 metadata: _,
                 label,
+                key_type: _,
                 attribution_valid,
                 first_observed: _,
             } => Some((*call, *key_use, *input, *label, *attribution_valid)),
@@ -27227,6 +27229,7 @@ impl KeymetaCtx {
                 conflicted: 0,
             },
             label,
+            key_type: None,
             attribution_valid: true,
             first_observed: false,
             lost: false,
@@ -29338,6 +29341,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 further: 1,
                 reason: None,
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         }),
     };
@@ -29407,6 +29411,7 @@ fn key_row_json_v7_renders_inferred_keys() {
                 further: 0,
                 reason: None,
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         }),
         ..row
@@ -29478,6 +29483,7 @@ fn key_row_json_revision_changes_bytes() {
                 further: 0,
                 reason: None,
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         }),
     };
@@ -29550,6 +29556,7 @@ fn observations_version_v7_triggers_on_inferred_content() {
                 further: 0,
                 reason: Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF),
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         }))]),
         4
@@ -29598,6 +29605,7 @@ fn keymeta_same_value_repeats_never_conflict() {
     for _ in 0..2 {
         size.accumulate_size(
             None,
+            None,
             Some(0x0001),
             Some(EvidenceTag::SignOutput),
             SizeInput::Value(256),
@@ -29627,11 +29635,13 @@ fn keymeta_weaker_evidence_never_disturbs_valued() {
     let mut size = SizeState::default();
     size.accumulate_size(
         None,
+        None,
         Some(0x0001),
         Some(EvidenceTag::SignOutput),
         SizeInput::Value(256),
     );
     size.accumulate_size(
+        None,
         None,
         Some(0x1087),
         Some(EvidenceTag::EncryptOutput),
@@ -29649,12 +29659,14 @@ fn keymeta_valued_upgrades_unsupported_and_unknown() {
     let mut size = SizeState::default();
     size.accumulate_size(
         None,
+        None,
         Some(0x0121),
         Some(EvidenceTag::EncryptOutput),
         SizeInput::Value(64),
     );
     assert_eq!(size.status, InferredStatus::Unsupported);
     size.accumulate_size(
+        None,
         None,
         Some(0x0001),
         Some(EvidenceTag::SignOutput),
@@ -29665,11 +29677,13 @@ fn keymeta_valued_upgrades_unsupported_and_unknown() {
     let mut size = SizeState::default();
     size.accumulate_size(
         None,
+        None,
         Some(0x0121),
         Some(EvidenceTag::EncryptOutput),
         SizeInput::Value(64),
     );
     size.accumulate_size(
+        None,
         None,
         Some(0x1087),
         Some(EvidenceTag::EncryptOutput),
@@ -29754,6 +29768,7 @@ fn observations_version_no_evidence_stays_below_v7() {
                 further: 0,
                 reason: Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE),
                 further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
             },
         }),
     }];
@@ -30263,6 +30278,7 @@ fn keymeta_size_further_counts_distinct_once() {
     for length in [256u64, 384, 128, 128, 128] {
         state.accumulate_size(
             None,
+            None,
             Some(0x0001),
             Some(EvidenceTag::SignOutput),
             SizeInput::Value(length),
@@ -30399,6 +30415,7 @@ fn keymeta_size_further_stays_distinct_past_cap() {
     assert_eq!(lengths.len(), 69, "67 distinct plus two repeats");
     for length in lengths {
         state.accumulate_size(
+            None,
             None,
             Some(0x0001),
             Some(EvidenceTag::SignOutput),

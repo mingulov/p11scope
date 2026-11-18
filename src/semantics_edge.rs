@@ -296,6 +296,10 @@ pub(crate) struct KeyReceipt {
     /// Established-only combined label snapshot (sizes/curve, never
     /// key material): `None` when unestablished at use.
     pub label: Option<crate::semantics_objects::KeyLabel>,
+    /// Established key-type code snapshot (keymeta §4.5 left side):
+    /// `Some` when the key type is established non-conflicting at
+    /// use, even without a combined label.
+    pub key_type: Option<u16>,
     /// Whether the viewed attribution was valid at use (H9 §72: a
     /// label needs valid attribution plus non-conflicting fields).
     pub attribution_valid: bool,

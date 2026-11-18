@@ -2367,10 +2367,16 @@ pub(crate) struct FamilyState {
 /// same detail kind plus size params — the evidence tag does not
 /// count, and the detail keeps the first tag. `unsupported` never
 /// overwrites `inferred` and never flips to `conflicting`.
-/// At most 64 remembered further size details per row: distinct
-/// sizes are unbounded (hostile callers vary lengths), so the
-/// dedup set caps while `further` keeps counting past it.
+/// RSA further values track exactly in a 1985-bit bitmap (64..=2048
+/// modulus octets); non-RSA further values deduplicate in a capped
+/// set (the finite non-RSA total is 20, so the cap never binds them;
+/// wrapped-material per-row distinct stays small in practice).
 pub(crate) const FURTHER_SEEN_CAP: usize = 64;
+/// RSA admitted octet bounds (§5.2): 64..=2048 inclusive.
+pub(crate) const RSA_FURTHER_MIN: u64 = 64;
+pub(crate) const RSA_FURTHER_MAX: u64 = 2048;
+/// Bitmap words covering the 1985 RSA octets (32×64).
+pub(crate) const RSA_FURTHER_WORDS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SizeState {
@@ -2380,9 +2386,11 @@ pub(crate) struct SizeState {
     pub conflict_detail: Option<(crate::keymeta::SizeDetail, crate::keymeta::EvidenceTag)>,
     pub further: u64,
     pub reason: Option<&'static str>,
-    /// Remembered further size details for repeat suppression
+    /// Remembered non-RSA further size details for repeat suppression
     /// (capped at [`FURTHER_SEEN_CAP`]; tags never compared).
     pub further_seen: Vec<crate::keymeta::SizeDetail>,
+    /// Exact RSA further-octet bitmap, bit `octets - 64`.
+    pub rsa_further_seen: [u64; RSA_FURTHER_WORDS],
 }
 
 /// One completion's size input after flag/trailer resolution: the
@@ -2492,6 +2500,15 @@ impl FamilyState {
             }
             Some(current) if current == family => {
                 self.value_completions = self.value_completions.saturating_add(1);
+                // Every specific-family completion rechecks its own
+                // mechanism qualifier (§4.5): a later ECMQV on a
+                // Montgomery key conflicts even though the family name
+                // repeats. Only flips to conflicting, never back.
+                if let Some(kind) = established
+                    && !families_compatible(family, mechanism, kind)
+                {
+                    self.status = InferredStatus::Conflicting;
+                }
             }
             Some(_) => match self.conflict_value {
                 None => {
@@ -2519,9 +2536,13 @@ impl SizeState {
     /// upgrades unknowns, same sizes keep the first tag, distinct
     /// sizes conflict with extras counted once each, and
     /// `unsupported` never overwrites `inferred` nor flips.
+    /// `established` is the combined size/curve label (exact params);
+    /// `established_type` is the key type alone (§4.5 family gate when
+    /// no combined label exists).
     pub(crate) fn accumulate_size(
         &mut self,
         established: Option<crate::keymeta::EstablishedKind>,
+        established_type: Option<crate::keymeta::EstablishedKind>,
         mechanism: Option<u64>,
         tag: Option<crate::keymeta::EvidenceTag>,
         input: SizeInput,
@@ -2579,7 +2600,13 @@ impl SizeState {
                         }
                     }
                     SizeOutcome::Inferred(detail) => {
-                        self.accumulate_detail(established, mechanism, tag, detail);
+                        self.accumulate_detail(
+                            established,
+                            established_type,
+                            mechanism,
+                            tag,
+                            detail,
+                        );
                     }
                 }
             }
@@ -2593,11 +2620,12 @@ impl SizeState {
     fn accumulate_detail(
         &mut self,
         established: Option<crate::keymeta::EstablishedKind>,
+        established_type: Option<crate::keymeta::EstablishedKind>,
         mechanism: Option<u64>,
         tag: crate::keymeta::EvidenceTag,
         detail: crate::keymeta::SizeDetail,
     ) {
-        use crate::keymeta::{same_size, size_compatible};
+        use crate::keymeta::{families_compatible, same_size, size_compatible, size_family};
         match self.detail.as_ref() {
             None => {
                 self.detail = Some((detail.clone(), tag));
@@ -2606,6 +2634,14 @@ impl SizeState {
                 if let (Some(kind), Some(mechanism)) = (established, mechanism)
                     && !size_compatible(&detail, mechanism, kind)
                 {
+                    self.status = InferredStatus::Conflicting;
+                } else if established.is_none()
+                    && let (Some(type_kind), Some(mechanism)) = (established_type, mechanism)
+                    && let Some(family) = size_family(&detail)
+                    && !families_compatible(family, mechanism, type_kind)
+                {
+                    // Type-only: no size params to contradict, but the
+                    // implied family still gates (§4.5).
                     self.status = InferredStatus::Conflicting;
                 }
             }
@@ -2619,7 +2655,19 @@ impl SizeState {
                 }
                 Some((second, _)) if same_size(second, &detail) => {}
                 Some(_) => {
-                    if !self
+                    // RSA further octets track exactly in the bitmap;
+                    // non-RSA further values deduplicate in the capped
+                    // set (finite total 20, so exact for them).
+                    if let crate::keymeta::SizeDetail::Rsa { modulus_bytes, .. } = &detail
+                        && (RSA_FURTHER_MIN..=RSA_FURTHER_MAX).contains(modulus_bytes)
+                    {
+                        let bit = (modulus_bytes - RSA_FURTHER_MIN) as usize;
+                        let (word, offset) = (bit / 64, bit % 64);
+                        if self.rsa_further_seen[word] & (1u64 << offset) == 0 {
+                            self.rsa_further_seen[word] |= 1u64 << offset;
+                            self.further = self.further.saturating_add(1);
+                        }
+                    } else if !self
                         .further_seen
                         .iter()
                         .any(|seen| same_size(seen, &detail))
@@ -2653,10 +2701,14 @@ struct OpenAssoc {
     key: ObjectId,
     lost: bool,
     primary: bool,
-    /// The receipt's frozen established key type (§4.5 left side),
+    /// The receipt's frozen combined label (§3 size params),
     /// snapshotted at admission: a later query never re-opens the
     /// compatibility comparison.
     established: Option<crate::keymeta::EstablishedKind>,
+    /// The receipt's frozen established key type (§4.5 left side),
+    /// even without a combined label: a later query never re-opens
+    /// the comparison.
+    established_type: Option<crate::keymeta::EstablishedKind>,
 }
 
 /// One receipt resolved to its bucket at admission, before any
@@ -3011,6 +3063,10 @@ impl KeyUseReducer {
                         lost: false,
                         primary: slot.primary,
                         established: receipt.label.map(crate::keymeta::established_kind),
+                        established_type: receipt
+                            .key_type
+                            .and_then(crate::keymeta::established_type_kind)
+                            .or_else(|| receipt.label.map(crate::keymeta::established_kind)),
                     })
                     .collect();
                 if receipts.is_empty() {
@@ -3188,11 +3244,12 @@ impl KeyUseReducer {
         // Residuals attach to rows: unattributed completions partition
         // unknown (existing) and feed no mismatch counter, so the gap
         // never escapes a v7 section (mismatches imply admitted
-        // lengths, which always leave non-blank rows behind).
-        let attributed = open
-            .associations
-            .iter()
-            .any(|assoc| matches!(assoc.bucket, AssocBucket::Proved(_)));
+        // lengths, which always leave non-blank rows behind). A lost
+        // join feeds neither inference nor the mismatch denominator:
+        // the terminal's key proof was invalidated (§§5.4, 9).
+        let attributed = open.associations.iter().any(|assoc| {
+            matches!(assoc.bucket, AssocBucket::Proved(_)) && !assoc.lost
+        });
         // Off-mode counts nothing (§9 stale/replayed rule): without
         // admitted lengths a terminal pair is not evidence.
         if self.key_sizes
@@ -3211,6 +3268,9 @@ impl KeyUseReducer {
             (true, Some(LengthOutcome::Value(value))) => SizeInput::Value(value),
         };
         for assoc in &open.associations {
+            if assoc.lost {
+                continue;
+            }
             let AssocBucket::Proved(bucket) = assoc.bucket else {
                 continue;
             };
@@ -3219,13 +3279,19 @@ impl KeyUseReducer {
                     .entry(bucket)
                     .or_default()
                     .family
-                    .accumulate_family(assoc.established, mechanism);
+                    .accumulate_family(assoc.established_type, mechanism);
             }
             self.inferred
                 .entry(bucket)
                 .or_default()
                 .size
-                .accumulate_size(assoc.established, open.mechanism, tag, input);
+                .accumulate_size(
+                    assoc.established,
+                    assoc.established_type,
+                    open.mechanism,
+                    tag,
+                    input,
+                );
         }
     }
 
@@ -3260,6 +3326,10 @@ impl KeyUseReducer {
             );
         for (slot, receipt) in resolved.iter().zip(receipts.iter()) {
             let established = receipt.label.map(crate::keymeta::established_kind);
+            let established_type = receipt
+                .key_type
+                .and_then(crate::keymeta::established_type_kind)
+                .or(established);
             match slot.bucket {
                 AssocBucket::Proved(bucket) => {
                     self.forward_fill(bucket, established);
@@ -3290,7 +3360,7 @@ impl KeyUseReducer {
                                     .entry(bucket)
                                     .or_default()
                                     .family
-                                    .accumulate_family(established, mechanism);
+                                    .accumulate_family(established_type, mechanism);
                             }
                         }
                         KeyRole::OperationKey | KeyRole::Other => {}
@@ -3322,7 +3392,7 @@ impl KeyUseReducer {
                         .entry(bucket)
                         .or_default()
                         .size
-                        .accumulate_size(established, mechanism, tag, input);
+                        .accumulate_size(established, established_type, mechanism, tag, input);
                 }
                 AssocBucket::Unknown(_) => {
                     // An unusable wrapped association still names its
@@ -3415,11 +3485,12 @@ impl KeyUseReducer {
         let state = self.inferred.entry(bucket).or_default();
         // The parked completion carried admitted length evidence, so
         // it counts; the detail then competes through the shared
-        // path (wrapped shapes imply no mechanism qualifier).
+        // path (wrapped shapes imply no mechanism qualifier and no
+        // family, so the type gate is vacuous).
         state.size.completions = state.size.completions.saturating_add(1);
         state
             .size
-            .accumulate_detail(established, None, parked.tag, parked.detail);
+            .accumulate_detail(established, None, None, parked.tag, parked.detail);
     }
 
     /// Whether every new proved bucket in one resolution fits the
@@ -3765,6 +3836,7 @@ impl KeyUseReducer {
                 input,
                 metadata,
                 label,
+                key_type,
                 attribution_valid,
                 first_observed,
                 ..
@@ -3787,6 +3859,7 @@ impl KeyUseReducer {
                 position,
                 metadata: *metadata,
                 label: *label,
+                key_type: *key_type,
                 attribution_valid: *attribution_valid,
                 first_observed: *first_observed,
                 lost: false,

@@ -110,7 +110,11 @@ versioned separately and are opaque, exact dispatch keys.
   rows or erases named loss counts: the fold carries the departing
   feed's finite counters and final authority into bounded
   capture-owned evidence, proved rows keep their status on JSON,
-  JSONL and text, and the live-feed census decrements.
+  JSONL and text, and the live-feed census decrements. A key
+  operation whose instance row folded still loses its
+  provider/application join in CBOM (`keys_unjoinable`) and reads
+  as an unidentified provider in concise text; rows and counts
+  stay exact.
 - Folded callers release their semantic binding, accepted-scan
   history and pidfd custody once quiescent, so the semantic budget
   recycles with the caller slots instead of refusing the 4,097th
@@ -125,6 +129,20 @@ versioned separately and are opaque, exact dispatch keys.
   publication instead of once per exited caller, folds at most
   1,024 callers per call with the remainder resuming next pass,
   and stops promptly on stop, keeping every count exact.
+- The fold's stop and per-publication credit gate now runs before
+  binder clearing, so a re-queued caller keeps its cookie bindings
+  and cached attribution until its own fold runs.
+- Concise inventory text names every module with folded departed
+  callers on its own summary line (exact folded counts, up to three
+  folded caller paths, past-the-bound tails), and the empty-view
+  absence line no longer prints while folded associations exist.
+- `inventory diff` joins folded callers into application groups:
+  departed identities with a recorded path define the same group
+  their live edge did, so a folded group keeps presence `both`
+  with the new `departed_use` change code instead of reading as
+  removed against a live snapshot.
+- `inventory cbom` counts a folded caller without an executable
+  path once, not once per module it touched.
 
 ## [0.7.1] - 2026-11-17
 

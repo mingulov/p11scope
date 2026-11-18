@@ -27174,4 +27174,86 @@ mod tests {
             assert_eq!(*ret, want_return, "slot {index}: flag on return");
         }
     }
+
+    fn length_group_slot_aliased(
+        index: u32,
+        descriptor_name: &str,
+        names: &[&str],
+    ) -> crate::plan::Slot {
+        let mut slot = length_group_slot(index, descriptor_name);
+        slot.names = names.iter().map(ToString::to_string).collect();
+        slot.aliased = slot.names.len() >= 2;
+        slot
+    }
+
+    /// Multi routing twin (§8.6): a `C_Verify`/`C_VerifyFinal` slot
+    /// (canonical `C_Verify` descriptor, conflicting scalar args 4
+    /// vs 2) stays in a base group with the flag on, while a
+    /// single-name `C_VerifyFinal` slot splits into its own length
+    /// group. Length stays unavailable on the conflict, exact on
+    /// the single name.
+    #[test]
+    fn journal_length_grouping_keeps_conflicting_alias_on_base_multi() {
+        use super::journal::{LENGTH_PROGRAMS, PROGRAMS};
+        let slots = vec![
+            length_group_slot_aliased(0, "C_Verify", &["C_Verify", "C_VerifyFinal"]),
+            length_group_slot_aliased(1, "C_VerifyFinal", &["C_VerifyFinal"]),
+        ];
+        assert_eq!(
+            slots[0].descriptor_index,
+            crate::kinds::function_id("C_Verify").unwrap() + 1
+        );
+        let targets = group_targets(&[(0, "/a.so", ElfAbi::Lp64), (1, "/a.so", ElfAbi::Lp64)]);
+        let groups = group_static_slots_with_roots(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            &targets,
+            StaticRoots::Detailed,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 2, "conflict splits base from length");
+        for group in &groups {
+            super::journal::validate_journal_group_pair(group.entry_program, group.return_program)
+                .unwrap();
+            let members = group_member_indices(group);
+            if members.contains(&0) {
+                assert_eq!(members, vec![0]);
+                assert_eq!(group.entry_program, PROGRAMS[0], "conflict stays base");
+                assert_eq!(group.return_program, PROGRAMS[1]);
+            } else {
+                assert_eq!(members, vec![1]);
+                assert_eq!(group.entry_program, LENGTH_PROGRAMS[0], "single takes length");
+                assert_eq!(group.return_program, LENGTH_PROGRAMS[1]);
+            }
+        }
+    }
+
+    /// Singles routing twin (§8.6): the same conflicting alias keeps
+    /// the base pair in the per-slot link plan with the flag on,
+    /// while the single-name slot substitutes the length pair.
+    #[test]
+    fn journal_length_link_plan_keeps_conflicting_alias_on_base_singles() {
+        use super::journal::{LENGTH_PROGRAMS, PROGRAMS};
+        let slots = vec![
+            length_group_slot_aliased(0, "C_Verify", &["C_Verify", "C_VerifyFinal"]),
+            length_group_slot_aliased(1, "C_VerifyFinal", &["C_VerifyFinal"]),
+        ];
+        let plan = singles_journal_link_plan(&slots, true);
+        assert_eq!(
+            plan,
+            vec![
+                (0, PROGRAMS[0], PROGRAMS[1]),
+                (1, LENGTH_PROGRAMS[0], LENGTH_PROGRAMS[1]),
+            ]
+        );
+        let plan = singles_journal_link_plan(&slots, false);
+        assert_eq!(
+            plan,
+            vec![(0, PROGRAMS[0], PROGRAMS[1]), (1, PROGRAMS[0], PROGRAMS[1]),]
+        );
+    }
 }

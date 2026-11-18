@@ -590,4 +590,93 @@ mod tests {
         let conflicting = vec!["C_SignInit".to_string(), "C_VerifyInit".to_string()];
         assert_eq!(descriptor_index(&conflicting), (0, true));
     }
+
+    /// Length-position agreement (v0.8.0 keymeta Task 2, spec §8.6):
+    /// every name at one slot must agree on the same length shape
+    /// (S cell + disjointness base, or V scalar) before the slot
+    /// links the length pair. `C_Verify` and `C_VerifyFinal` share
+    /// their S1 shape and carry no object protocol, so the existing
+    /// alias verdict agrees — but their length scalars differ (arg 4
+    /// vs arg 2), so the length shape conflicts and the slot keeps
+    /// the base pair with length unavailable.
+    #[test]
+    fn length_agreement_requires_one_shape_across_names() {
+        use p11scope_ebpf_common::ARG_NONE;
+        // The alias premise: one S1 shape, no object protocol, one
+        // canonical descriptor — the existing verdict agrees.
+        assert_eq!(descriptor("C_Verify"), descriptor("C_VerifyFinal"));
+        assert_eq!(object_descriptor("C_Verify"), None);
+        assert_eq!(object_descriptor("C_VerifyFinal"), None);
+        let pair = vec!["C_Verify".to_string(), "C_VerifyFinal".to_string()];
+        assert_eq!(
+            descriptor_index(&pair),
+            (function_id("C_Verify").unwrap() + 1, false)
+        );
+        // The length shapes conflict (scalar arg 4 vs arg 2): no
+        // length pair, while each single name keeps its own shape.
+        assert_eq!(length_agreement(&pair), None);
+        assert_eq!(
+            length_agreement(&["C_Verify".to_string()]),
+            length_shape_for_ordinal(function_id("C_Verify").unwrap())
+        );
+        assert_eq!(
+            length_agreement(&["C_VerifyFinal".to_string()]),
+            length_shape_for_ordinal(function_id("C_VerifyFinal").unwrap())
+        );
+        assert_ne!(
+            length_shape_for_ordinal(function_id("C_Verify").unwrap()),
+            length_shape_for_ordinal(function_id("C_VerifyFinal").unwrap())
+        );
+        // Identical shapes agree, even across two names: C_Sign and
+        // C_SignRecover share cell arg 4 with base arg 3.
+        let sign_pair = vec!["C_Sign".to_string(), "C_SignRecover".to_string()];
+        assert_eq!(
+            length_agreement(&sign_pair),
+            length_agreement(&["C_Sign".to_string()])
+        );
+        assert_ne!(length_agreement(&sign_pair), None);
+        // Indeterminate shapes agree with nothing: a length name
+        // beside a name without a length position keeps the base.
+        for names in [
+            vec!["C_Sign".to_string(), "C_SignInit".to_string()],
+            vec!["C_Verify".to_string(), "C_GetInfo".to_string()],
+            vec!["C_SignInit".to_string()],
+            vec!["C_GetInfo".to_string()],
+            vec!["C_NotAStandardFunction".to_string()],
+            vec![],
+        ] {
+            assert_eq!(length_agreement(&names), None, "{names:?} agrees with nothing");
+        }
+        // Every length endpoint agrees with itself alone.
+        for name in [
+            "C_Sign",
+            "C_SignRecover",
+            "C_SignFinal",
+            "C_Verify",
+            "C_VerifyFinal",
+            "C_Encrypt",
+            "C_Decrypt",
+            "C_WrapKey",
+            "C_UnwrapKey",
+            "C_EncapsulateKey",
+            "C_DecapsulateKey",
+        ] {
+            let agreed = length_agreement(&[name.to_string()]);
+            assert_eq!(
+                agreed,
+                length_shape_for_ordinal(function_id(name).unwrap()),
+                "{name} agrees with itself"
+            );
+            let shape = agreed.expect("a length endpoint has a shape");
+            let scalar_set = shape.scalar != ARG_NONE;
+            let cell_set = shape.cell != ARG_NONE;
+            assert!(
+                scalar_set ^ cell_set,
+                "{name} carries exactly one length shape"
+            );
+            if cell_set {
+                assert_ne!(shape.base, ARG_NONE, "{name} S-row carries its base");
+            }
+        }
+    }
 }

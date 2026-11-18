@@ -880,6 +880,80 @@ mod tests {
         }
     }
 
+    /// Length entry selection across aliased names: a slot links the
+    /// length entry only when its canonical descriptor names a length
+    /// endpoint AND every name at the slot agrees on the canonical
+    /// row's length shape. A `C_Verify`/`C_VerifyFinal` slot keeps
+    /// the base entry with the flag on (conflicting scalar args 4
+    /// vs 2); each single name keeps its own length entry; a
+    /// descriptor/names skew keeps the base entry fail-closed.
+    #[test]
+    fn journal_length_entry_program_requires_name_agreement() {
+        use super::{
+            LENGTH_PROGRAMS, PROGRAMS, journal_entry_program_for_names, slot_takes_length_pair,
+        };
+        fn descriptor(name: &str) -> u32 {
+            crate::kinds::function_id(name).unwrap() + 1
+        }
+        fn names(list: &[&str]) -> Vec<String> {
+            list.iter().map(ToString::to_string).collect()
+        }
+        // The conflicting alias: canonical C_Verify descriptor, two
+        // names, two scalar shapes — base in both modes.
+        let pair = names(&["C_Verify", "C_VerifyFinal"]);
+        assert!(!slot_takes_length_pair(descriptor("C_Verify"), &pair));
+        for key_sizes in [false, true] {
+            assert_eq!(
+                journal_entry_program_for_names(descriptor("C_Verify"), &pair, key_sizes),
+                PROGRAMS[0],
+                "aliased Verify slot keeps the base entry"
+            );
+        }
+        // Each single name keeps its own length entry with the flag.
+        for name in ["C_Verify", "C_VerifyFinal"] {
+            let single = names(&[name]);
+            assert!(slot_takes_length_pair(descriptor(name), &single));
+            assert_eq!(
+                journal_entry_program_for_names(descriptor(name), &single, true),
+                LENGTH_PROGRAMS[0],
+                "{name} links the length entry"
+            );
+            assert_eq!(
+                journal_entry_program_for_names(descriptor(name), &single, false),
+                PROGRAMS[0],
+                "{name} links the base entry without the flag"
+            );
+        }
+        // Identical shapes agree: C_Sign/C_SignRecover share cell 4
+        // with base 3, so the alias links the length entry.
+        let signs = names(&["C_Sign", "C_SignRecover"]);
+        assert!(slot_takes_length_pair(descriptor("C_Sign"), &signs));
+        assert_eq!(
+            journal_entry_program_for_names(descriptor("C_Sign"), &signs, true),
+            LENGTH_PROGRAMS[0]
+        );
+        // Indeterminate and skewed slots keep the base entry: a
+        // length name beside a name without a shape, an empty name
+        // set, and a descriptor that is not the names' shape.
+        for (candidate, slot_names) in [
+            (descriptor("C_Sign"), names(&["C_Sign", "C_SignInit"])),
+            (descriptor("C_Verify"), names(&["C_Verify", "C_GetInfo"])),
+            (descriptor("C_Sign"), names(&[])),
+            (descriptor("C_Sign"), names(&["C_Verify"])),
+            (descriptor("C_Verify"), names(&["C_Sign"])),
+            (0, names(&["C_Sign"])),
+        ] {
+            assert!(
+                !slot_takes_length_pair(candidate, &slot_names),
+                "descriptor {candidate} with {slot_names:?} keeps the base pair"
+            );
+            assert_eq!(
+                journal_entry_program_for_names(candidate, &slot_names, true),
+                PROGRAMS[0]
+            );
+        }
+    }
+
     /// Per-group returns derive from the group's entry program, and a
     /// mixed pair (entry+return never mixed) is refused loudly: a mixed
     /// plan would strand the stash and is a planner bug.

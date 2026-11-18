@@ -7,6 +7,7 @@
 
 pub mod counter_policy;
 pub mod inventory_callers;
+pub mod inventory_info;
 pub mod object_capture;
 pub mod object_flow;
 pub mod object_journal;

@@ -15,20 +15,21 @@
 //! → module and the header identity → caller incarnation itself) and
 //! calls [`InfoJoin::note_aliased_endpoint`] /
 //! [`InfoJoin::note_return_deferred`] for the attach-side gaps; the
-//! BPF half also mirrors the §17.1 read lists into `ebpf-common`
-//! consts (adopting the kind/layout/status/version codes below) and
-//! extends the root-crate LP64 cross-check there. Until then this
-//! module's decode/join surface is test-driven only.
+//! BPF half fills the shared `InfoTrailer` layout and mirrors the
+//! §17.1 read lists into `ebpf-common` consts (adopting the
+//! kind/layout/status/version codes below), and extends the
+//! root-crate LP64 cross-check there. Until then this module's
+//! decode/join surface is test-driven only.
 
 #![allow(dead_code)] // TODO(Task 7 BPF half): remove once the INFO drain feeds the join.
 
 use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 use crate::discovery::caller_registry::{CallerId, ModuleId};
+use p11scope_ebpf_common::inventory_info::{
+    INFO_HEADER_LEN, INFO_PAYLOAD_MAX, INFO_RECORD_LEN, InfoTrailer,
+};
 use std::collections::BTreeMap;
 
-/// 176-byte inventory info record: 48-byte header + 128-byte trailer
-/// (spec §17.4).
-pub(crate) const INFO_RECORD_LEN: usize = 176;
 /// Info trailer version carried in every record.
 pub(crate) const INFO_VERSION: u16 = 1;
 /// Info kinds: `C_GetInfo` / `C_GetTokenInfo` / `C_GetMechanismInfo`.
@@ -76,7 +77,7 @@ pub(crate) struct InfoRecord {
     pub mechanism: u64,
     pub status: u8,
     pub payload_len: u8,
-    pub payload: [u8; 120],
+    pub payload: [u8; INFO_PAYLOAD_MAX],
 }
 
 fn le_u16(bytes: &[u8], off: usize) -> u16 {
@@ -101,10 +102,12 @@ fn le_u64(bytes: &[u8], off: usize) -> u64 {
 }
 
 /// Decode + validate one 176-byte record: exact length, known
-/// header kind/layout with zero reserved, then trailer version,
-/// kind/layout agreement, known status, exact payload length and
-/// zero reserved (spec §17.4). Refusals carry named reasons.
-/// Endpoint resolution (known endpoint → module) is the drain's job.
+/// header kind/layout with zero reserved, the slot/mechanism
+/// placement rules, then trailer version, kind/layout agreement,
+/// known status, exact payload length, zero reserved and zero
+/// trailer slack past `payload_len` (spec §17.4). Refusals carry
+/// named reasons. Endpoint resolution (known endpoint → module) is
+/// the drain's job.
 pub(crate) fn decode_info_record(bytes: &[u8]) -> Result<InfoRecord, &'static str> {
     if bytes.len() != INFO_RECORD_LEN {
         return Err("bad_length");
@@ -123,33 +126,58 @@ pub(crate) fn decode_info_record(bytes: &[u8]) -> Result<InfoRecord, &'static st
     if bytes[6..8] != [0, 0] || bytes[12..16] != [0, 0, 0, 0] {
         return Err("nonzero_reserved");
     }
-    if le_u16(bytes, 48) != INFO_VERSION {
+    // Slot/mechanism placement (spec §17.4): slot is 0 for
+    // C_GetInfo, mechanism is 0 for C_GetInfo/C_GetTokenInfo.
+    let slot = le_u64(bytes, 32);
+    let mechanism = le_u64(bytes, 40);
+    if kind == INFO_KIND_PROVIDER && slot != 0 {
+        return Err("nonzero_slot");
+    }
+    if kind != INFO_KIND_MECHANISM && mechanism != 0 {
+        return Err("nonzero_mechanism");
+    }
+    // Trailer field positions come from the shared InfoTrailer
+    // layout, never from copied numbers.
+    let trailer = INFO_HEADER_LEN;
+    let version_at = trailer + core::mem::offset_of!(InfoTrailer, version);
+    let kind_at = trailer + core::mem::offset_of!(InfoTrailer, kind);
+    let status_at = trailer + core::mem::offset_of!(InfoTrailer, status);
+    let layout_at = trailer + core::mem::offset_of!(InfoTrailer, layout);
+    let payload_len_at = trailer + core::mem::offset_of!(InfoTrailer, payload_len);
+    let reserved_at = trailer + core::mem::offset_of!(InfoTrailer, reserved);
+    let payload_at = trailer + core::mem::offset_of!(InfoTrailer, payload);
+    debug_assert_eq!(payload_at + INFO_PAYLOAD_MAX, INFO_RECORD_LEN);
+    if le_u16(bytes, version_at) != INFO_VERSION {
         return Err("unknown_version");
     }
-    if bytes[50] != kind {
+    if bytes[kind_at] != kind {
         return Err("kind_mismatch");
     }
-    if bytes[52] != layout {
+    if bytes[layout_at] != layout {
         return Err("layout_mismatch");
     }
-    let status = bytes[51];
+    let status = bytes[status_at];
     if status != INFO_STATUS_OK && status != INFO_STATUS_UNAVAILABLE {
         return Err("unknown_status");
     }
-    // NOTE: the design's trailer field list sums to 129 bytes
-    // (6 fixed + 3 reserved + 120 payload) against its own 128-byte
-    // trailer. The reserved run is 2 bytes here ([54..56)), keeping
-    // the 176/128/120 headline sizes and the payload semantics; the
-    // BPF half must encode this same map (see the module TODO).
-    if bytes[54..56] != [0, 0] {
+    if bytes[reserved_at..reserved_at + 2] != [0, 0] {
         return Err("nonzero_reserved");
     }
-    let payload_len = bytes[53];
+    let payload_len = bytes[payload_len_at];
     if Some(payload_len) != info_payload_len(kind, layout) {
         return Err("bad_payload_len");
     }
-    let mut payload = [0u8; 120];
-    payload.copy_from_slice(&bytes[56..176]);
+    // Trailer slack past payload_len is zero-filled by the writer;
+    // nonzero bytes are a writer bug and refuse (spec §17.4).
+    let payload_end = payload_at + INFO_PAYLOAD_MAX;
+    if bytes[payload_at + usize::from(payload_len)..payload_end]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err("nonzero_trailer_slack");
+    }
+    let mut payload = [0u8; INFO_PAYLOAD_MAX];
+    payload.copy_from_slice(&bytes[payload_at..payload_end]);
     Ok(InfoRecord {
         endpoint: le_u32(bytes, 0),
         kind,
@@ -157,8 +185,8 @@ pub(crate) fn decode_info_record(bytes: &[u8]) -> Result<InfoRecord, &'static st
         host_tgid: le_u32(bytes, 8),
         task_cookie: le_u64(bytes, 16),
         exec_id: le_u64(bytes, 24),
-        slot: le_u64(bytes, 32),
-        mechanism: le_u64(bytes, 40),
+        slot,
+        mechanism,
         status,
         payload_len,
         payload,
@@ -1183,14 +1211,15 @@ mod tests {
         assert_eq!(values.pin_min_len, 4);
         assert_eq!(values.pin_max_len, 255);
 
-        // Trailer slack past payload_len is ignored, never parsed.
+        // Trailer slack past payload_len refuses: nonzero slack
+        // is a writer bug, never silently ignored (spec §17.4).
         let mut slacked = provider_record();
         slacked[56 + 76..].fill(0xFF);
-        let record = decode_info_record(&slacked).expect("slacked record decodes");
-        let InfoValues::Provider(values) = parse_info_payload(&record) else {
-            panic!("provider kind parses provider values");
-        };
-        assert_eq!(values.description, Ok("SoftHSM v2".to_string()));
+        assert_eq!(
+            decode_info_record(&slacked),
+            Err("nonzero_trailer_slack"),
+            "0xFF trailer slack refuses"
+        );
     }
 
     #[test]

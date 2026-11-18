@@ -2509,7 +2509,7 @@ the base-program hashes (§8.5 — keymeta lanes never re-hash;
 the integrator re-records on non-keymeta base changes).
 
 Wire: the 128-byte info trailer (`version: u16`, `kind: u8`,
-`status: u8`, `layout: u8`, `payload_len: u8`, 3 reserved bytes,
+`status: u8`, `layout: u8`, `payload_len: u8`, 2 reserved bytes,
 `payload: [u8; 120]` — payload_len is exact per (kind, layout):
 76/72 for `CK_INFO`, 76/64 for token ranges, 24/12 for mechanism
 info) rides one carrier: the 176-B inventory info record (48-B
@@ -2543,11 +2543,18 @@ shared zero caller (a shared zero caller would mix per-process
 slot numbers — the fix8 C2 hazard). `mechanism` is 0 for
 `C_GetInfo`/`C_GetTokenInfo` and `slot` is 0 for `C_GetInfo`.
 The join reads header words
-per the kind (the provider kind ignores slot) and keys by
+per the kind (slot is 0 on the provider kind, which keys by
+module alone) and keys by
 (module via endpoint, caller incarnation, slot[, mechanism])
 (§17.5). The record validator is exact length + header (known
-endpoint, known kind, layout, zero reserved) + trailer
-(version + kind + layout + payload_len + zero reserved). This
+endpoint, known kind, layout, zero reserved, slot 0 for
+C_GetInfo, mechanism 0 for C_GetInfo/C_GetTokenInfo) + trailer
+(version + kind + layout + payload_len + zero reserved + zero
+slack past payload_len — the writer zero-fills the 120-byte
+payload window). The `InfoTrailer` struct in `crates/ebpf-common`
+(`inventory_info`) owns this layout with const offset/size
+asserts; the decoder indexes through it and the BPF writer fills
+it. This
 keeps the v2-tail-union alternative beaten on validator surface:
 the union would fork `validate_object_tail` with a union tag
 plus per-action offsets, while the record adds standalone

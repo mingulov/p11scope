@@ -1007,6 +1007,16 @@ impl SemanticBindingRefusal {
     }
 }
 
+/// Negative-only tombstones of folded callers' images, bounded
+/// separately from the live semantic budget: departed callers charge
+/// this index, never the binding cap. Each entry is a (domain,
+/// task_cookie) pair only — no pidfd, no incarnation, no positive
+/// attribution — and it vetoes the other-caller shortcut for its
+/// ticket, so a late row for a folded caller barriers instead of
+/// disposing. Entries drop when their domain retires; past the cap
+/// the proofs fail closed (see `folded_images_saturated`).
+const MAX_FOLDED_IMAGE_NEGATIVES: usize = MAX_INSTANCES;
+
 /// Accepted semantic bindings: one stable Arc per accepted caller, bounded
 /// by H0's binding capacity. Contiguous storage doubles as the tick window:
 /// a persistent cursor rotates a fair slice into place, so ticks never
@@ -1025,6 +1035,14 @@ pub(crate) struct SemanticBindingSet {
     /// A later Detailed exec cannot silently reuse the chosen scan-pinned
     /// incarnation merely because its executable pathname/inode stayed equal.
     admission_images: HashMap<CallerId, SemanticAdmissionHistory>,
+    /// Negative-only tombstones of folded callers' images (see
+    /// [`MAX_FOLDED_IMAGE_NEGATIVES`]).
+    folded_images: HashSet<(NativeDomainId, u64)>,
+    /// The negative index saturated: a distinct folded ticket past
+    /// the cap was refused, so both other-caller proofs fail closed
+    /// (sticky; domain retirement still discards that domain's
+    /// entries, but the shortcut stays refused).
+    folded_images_saturated: bool,
     /// One move-only H0 custody reservation per successful physical successor.
     /// An accepted owner receipt consumes it, including a provider/scope refusal.
     successors: HashMap<CallerId, PublishedSemanticSuccessor>,
@@ -1111,6 +1129,8 @@ impl SemanticBindingSet {
             #[cfg(test)]
             refresh_find_visits: 0,
             admission_images: HashMap::new(),
+            folded_images: HashSet::new(),
+            folded_images_saturated: false,
             successors: HashMap::new(),
             refused_successors: HashMap::new(),
             install_lease: None,
@@ -1150,13 +1170,15 @@ impl SemanticBindingSet {
     }
 
     /// Retire one completed domain's entries (DR37 A→B): bindings,
-    /// refusal-only history and successor reservations keyed to the
-    /// domain are removed; every other domain's entries are
-    /// preserved. Returns the removed caller ids so the coordinator
-    /// can clear their transient tail markers too. The index is
-    /// rebuilt (positions shift) and cursors clamped; installed
-    /// storage keeps its lease (the maps stay installed with holes
-    /// until the next install replaces them).
+    /// refusal-only history, folded-image tombstones and successor
+    /// reservations keyed to the domain are removed; every other
+    /// domain's entries are preserved. Returns the removed caller ids
+    /// so the coordinator can clear their transient tail markers too.
+    /// The index is rebuilt (positions shift) and cursors clamped;
+    /// installed storage keeps its lease (the maps stay installed
+    /// with holes until the next install replaces them). A saturated
+    /// negative index stays saturated: retirement discards entries,
+    /// never the fail-closed latch.
     #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): called by retire_joint_domain.
     pub(crate) fn retire_domain(&mut self, domain: NativeDomainId) -> Vec<CallerId> {
         let mut removed = BTreeSet::new();
@@ -1195,6 +1217,10 @@ impl SemanticBindingSet {
                 self.refresh_cursor = None;
             }
         }
+        // Tombstones drop with their domain even when no live entry
+        // names it: a fully folded domain leaves only negatives.
+        self.folded_images
+            .retain(|(folded_domain, _)| *folded_domain != domain);
         removed.into_iter().collect()
     }
 
@@ -1215,12 +1241,17 @@ impl SemanticBindingSet {
     /// Release one folded caller's semantic binding, accepted-scan
     /// history and successor reservations, dropping their pidfd
     /// custody so the semantic budget recycles with the caller slots.
-    /// Call only after [`Self::foldable`] (a retained sealed gap must
-    /// drain first) and after the adapter row is forgotten (late rows
-    /// then fail closed on the gone record).
+    /// A negative-only (domain, ticket) tombstone survives the
+    /// release, so a late row for the forgotten image still barriers
+    /// instead of taking the other-caller disposal. Call only after
+    /// [`Self::foldable`] (a retained sealed gap must drain first)
+    /// and after the adapter row is forgotten (late rows then fail
+    /// closed on the gone record).
     pub(crate) fn release_folded_caller(&mut self, caller: CallerId) {
+        let mut image = None;
         if let Some(at) = self.index.remove(&caller) {
-            self.bindings.swap_remove(at);
+            let binding = self.bindings.swap_remove(at);
+            image = Some((binding.domain(), binding.image().task_cookie));
             if let Some(moved) = self.bindings.get(at) {
                 self.index.insert(moved.caller(), at);
             }
@@ -1229,8 +1260,32 @@ impl SemanticBindingSet {
                 self.refresh_cursor = None;
             }
         }
-        self.admission_images.remove(&caller);
+        if let Some(history) = self.admission_images.remove(&caller) {
+            image.get_or_insert((history.domain, history.image.task_cookie));
+        }
         self.release_successor(caller);
+        if let Some((domain, cookie)) = image {
+            self.remember_folded_image(domain, cookie);
+        }
+    }
+
+    /// Remember one folded caller's ticket as negative-only evidence.
+    /// An unknown image (zero cookie) needs no entry: it never proves
+    /// another caller. A repeat ticket is already remembered. Past
+    /// the cap the index saturates and both other-caller proofs fail
+    /// closed.
+    fn remember_folded_image(&mut self, domain: NativeDomainId, cookie: u64) {
+        if cookie == 0 || self.folded_images_saturated {
+            return;
+        }
+        if self.folded_images.contains(&(domain, cookie)) {
+            return;
+        }
+        if self.folded_images.len() >= MAX_FOLDED_IMAGE_NEGATIVES {
+            self.folded_images_saturated = true;
+            return;
+        }
+        self.folded_images.insert((domain, cookie));
     }
 
     /// Accepted semantic bindings. The disclosure gap reports how many
@@ -1258,12 +1313,14 @@ impl SemanticBindingSet {
     /// Whether an unrouted call's record proves a caller other than every
     /// bound Joint caller of its domain, so its lost position need not
     /// barrier their history. Fails closed: an unknown image (zero
-    /// cookie), no bindings, any binding or admission history of another
-    /// domain (a different ticket space), or a cookie equal to any bound
-    /// or historically admitted image all keep the barrier. Tickets are
-    /// per thread group and never reused within a domain, so a different
-    /// nonzero cookie of the same domain is a different process; an exec
-    /// keeps its cookie and therefore still matches.
+    /// cookie), no bindings, a saturated folded-image index, any
+    /// binding, admission history or folded tombstone of another
+    /// domain (a different ticket space), or a cookie equal to any
+    /// bound, historically admitted or folded image all keep the
+    /// barrier. Tickets are per thread group and never reused within
+    /// a domain, so a different nonzero cookie of the same domain is
+    /// a different process; an exec keeps its cookie and therefore
+    /// still matches.
     pub(crate) fn proves_unbound_caller(
         &self,
         domain: NativeDomainId,
@@ -1272,6 +1329,7 @@ impl SemanticBindingSet {
         let cookie = image.task_cookie;
         cookie != 0
             && !self.bindings.is_empty()
+            && !self.folded_images_saturated
             && self.bindings.iter().all(|binding| {
                 binding.domain() == domain
                     && binding.image().task_cookie != 0
@@ -1281,6 +1339,9 @@ impl SemanticBindingSet {
                 .admission_images
                 .values()
                 .all(|history| history.domain == domain && history.image.task_cookie != cookie)
+            && self.folded_images.iter().all(|(folded_domain, folded_cookie)| {
+                *folded_domain == domain && *folded_cookie != cookie
+            })
     }
 
     /// Whether an unrouted call of a journal-refused image proves a
@@ -1290,10 +1351,13 @@ impl SemanticBindingSet {
     /// Joint; this covers the refused caller that later binds for S1,
     /// whose own binding and admission history then hold its cookie
     /// and defeat [`Self::proves_unbound_caller`]. Fails closed: the
-    /// call's exact image must itself be refused, and every binding
-    /// or admission history sharing its cookie must be refused too —
-    /// an unrefused same-cookie image (an exec keeps the cookie)
-    /// could own the call and keeps the barrier.
+    /// call's exact image must itself be refused, a saturated
+    /// folded-image index refuses, and every binding or admission
+    /// history sharing its cookie must be refused too — an unrefused
+    /// same-cookie image (an exec keeps the cookie) could own the
+    /// call and keeps the barrier. A folded same-cookie tombstone
+    /// also keeps the barrier: the forgotten image might be an
+    /// unrefused exec.
     pub(crate) fn proves_refused_other_caller(
         &self,
         domain: NativeDomainId,
@@ -1303,6 +1367,7 @@ impl SemanticBindingSet {
         let cookie = image.task_cookie;
         cookie != 0
             && !self.bindings.is_empty()
+            && !self.folded_images_saturated
             && image_refused(image)
             && self.bindings.iter().all(|binding| {
                 binding.domain() == domain
@@ -1312,6 +1377,9 @@ impl SemanticBindingSet {
             && self.admission_images.values().all(|history| {
                 history.domain == domain
                     && (history.image.task_cookie != cookie || image_refused(history.image))
+            })
+            && self.folded_images.iter().all(|(folded_domain, folded_cookie)| {
+                *folded_domain == domain && *folded_cookie != cookie
             })
     }
 
@@ -7189,6 +7257,20 @@ mod finalizer_history_tests {
                     .is_some(),
                 "the sibling stays bound"
             );
+            assert!(
+                coordinator
+                    .semantic_bindings
+                    .folded_images
+                    .contains(&(domain, FOLDED)),
+                "the fold leaves a negative-only tombstone for its ticket"
+            );
+            assert!(
+                !coordinator
+                    .semantic_bindings
+                    .folded_images
+                    .contains(&(domain, BOUND)),
+                "the live sibling's ticket stays untombstoned"
+            );
             let evidence = commit_outcomes(
                 &mut coordinator,
                 &mut lane,
@@ -7369,6 +7451,10 @@ mod finalizer_history_tests {
             ),
             "below the cap the unbound shortcut stays alive"
         );
+        assert!(
+            !coordinator.semantic_bindings.folded_images_saturated,
+            "ten folds stay far below the cap"
+        );
         // Past the cap: both proofs fail closed.
         let (mut coordinator, _lane, domain) = drop_test_lanes();
         bind_image(&mut coordinator, domain, 9000, sibling);
@@ -7408,6 +7494,14 @@ mod finalizer_history_tests {
                 |_| true
             ),
             "a saturated negative index refuses the refused shortcut"
+        );
+        assert!(
+            coordinator.semantic_bindings.folded_images_saturated,
+            "4,097 distinct folds saturate the index"
+        );
+        assert!(
+            coordinator.semantic_bindings.get(CallerId(9000)).is_some(),
+            "saturation refuses the shortcut, never the live sibling"
         );
     }
 }

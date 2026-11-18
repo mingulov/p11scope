@@ -184,7 +184,7 @@ GAP_REASONS = ("bootstrap_unproven", "bootstrap_refused", "prefix_contradiction"
                "pending_capacity", "session_capacity", "object_capacity", "instance_capacity",
                "id_exhausted", "device_loss", "unseen_finalize", "inconsistent_mechanism",
                "outcome_lost", "unknown_domain", "domain_pruned", "pruned_object_referenced",
-               "corroboration_mismatch")
+               "corroboration_mismatch", "wrapped_park_refused")
 
 SECTION_KEYS = {"version", "revision", "status", "reason", "sessions", "objects",
                 "key_operations", "unknown_key_operations", "gaps", "budgets"}

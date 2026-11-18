@@ -759,9 +759,10 @@
         "unknown_domain",
         "domain_pruned",
         "pruned_object_referenced",
-        "corroboration_mismatch"
+        "corroboration_mismatch",
+        "wrapped_park_refused"
       ],
-      "description": "Model gap vocabulary (snake_case of the finite model enum) plus pruned_object_referenced: a retained key row references an object the model pruned (history stays; the dangle is explicit, never silent). v7 adds corroboration_mismatch: the corroborating length disagreed with the terminal length (the terminal still classifies; v1-v6 never carry it)."
+      "description": "Model gap vocabulary (snake_case of the finite model enum) plus pruned_object_referenced: a retained key row references an object the model pruned (history stays; the dangle is explicit, never silent). v7 adds corroboration_mismatch: the corroborating length disagreed with the terminal length (the terminal still classifies; v1-v6 never carry it). v7 also adds wrapped_park_refused: a wrapped-material park was refused past the park budget (inference-side; rows intact, coverage populated; v1-v6 never carry it)."
     },
     "object_row": {
       "type": "object",
@@ -1136,7 +1137,7 @@
           "description": "inferred: one size. unknown: no evidence or evidence outside every map (named reason in -v text only). conflicting: two distinct sizes, or a contradicting established size. unsupported: evidence exists but the subset has no map (never overwrites inferred, never flips)."
         },
         "detail": {
-          "type": ["object", "null"],
+          "anyOf": [{"type": "null"}, {"$ref": "#/$defs/size_detail"}],
           "description": "First-seen size detail, or null when unknown/unsupported. Same size means same kind plus size params; the evidence tag does not count."
         },
         "completions": {
@@ -1146,7 +1147,7 @@
           "description": "Completions carrying admitted length evidence (flag on with a trailer, read or unavailable) behind this row."
         },
         "conflict_detail": {
-          "type": "object",
+          "$ref": "#/$defs/size_detail",
           "description": "Second distinct size detail, same shape as detail (omitted unless two inferred sizes observed)."
         },
         "further_conflicts": {

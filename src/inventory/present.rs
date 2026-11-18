@@ -2088,6 +2088,11 @@ fn partition_inferred(
 ) {
     use crate::keymeta::{concise_label, family_display, size_concise};
     use crate::semantics_key_use::InferredStatus;
+    // Zero-completion rows (in flight at capture end) contribute
+    // nothing to any segment — not even a valued zero count.
+    if row.completed == 0 {
+        return;
+    }
     let Some(inferred) = row.inferred.as_ref() else {
         partition.unknown = partition.unknown.saturating_add(row.completed);
         return;
@@ -2187,11 +2192,19 @@ fn inferred_row_detail(row: &crate::key_operation_projection::KeyAggRow) -> Opti
         }
         InferredStatus::Conflicting => {
             if let Some((detail, tag)) = inferred.size.detail.as_ref() {
-                let rest = 1 + inferred.size.further;
-                fragments.push(format!(
-                    "{}, +{rest} more conflicting size",
-                    size_verbose(detail, *tag)
-                ));
+                // An established mismatch pins no second side: the
+                // bare value renders (the established label stands on
+                // the row), like the family side.
+                let rest =
+                    u64::from(inferred.size.conflict_detail.is_some()) + inferred.size.further;
+                if rest == 0 {
+                    fragments.push(size_verbose(detail, *tag));
+                } else {
+                    fragments.push(format!(
+                        "{}, +{rest} more conflicting size",
+                        size_verbose(detail, *tag)
+                    ));
+                }
             }
         }
         InferredStatus::Unknown => {

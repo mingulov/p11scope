@@ -1844,15 +1844,27 @@ impl EdgeSemantics {
             );
             let mechanism =
                 (call.mechanism_capture() == capture::MECHANISM_VALUE).then_some(call.mechanism);
+            // Keymeta §5.4: a NULL-output OK direct is a length
+            // query (wrap/encapsulate shapes): the call completes
+            // but the over-estimate value drops on arrival — never
+            // stored, classified or counted. Only output-bearing
+            // directs ever read OUTPUT_NULL; V-directs always read
+            // OUTPUT_NONE.
+            let length = if call.capture & capture::OUTPUT_MASK == capture::OUTPUT_NULL {
+                None
+            } else {
+                completion.length
+            };
             sink.emit(OperationEffect::DirectCompleted {
                 id: OperationId(generation),
                 category: crate::semantics::direct_name(descriptor.direct).unwrap_or("direct"),
                 mechanism,
                 key_receipts: keys.to_vec(),
                 origin: origin.clone(),
-                // Directs emit only on OK: the terminal length and
-                // the seal's exact-one fresh view ride through.
-                length: completion.length,
+                // Directs emit only on OK: a terminal length (queries
+                // drop above) and the seal's exact-one fresh view
+                // ride through.
+                length,
                 fresh_view: completion.fresh_view,
             });
         }

@@ -2319,7 +2319,9 @@ pub(crate) struct KeyUseEvidence {
     /// `corroboration_mismatch` residual, never a conflict.
     pub corroboration_mismatches: u64,
     /// Wrapped-material parks refused past the park budget (the
-    /// aggregate capacity): counted, never silent, never a row.
+    /// aggregate capacity): counted as the named
+    /// `wrapped_park_refused` gap, never silent, never a row, never
+    /// coverage loss.
     pub parked_refused: u64,
 }
 
@@ -2453,6 +2455,7 @@ impl FamilyState {
                 self.value = Some(KeyFamily::Secret);
                 self.status = InferredStatus::Inferred;
                 self.value_completions = 1;
+                self.reason = None;
             }
             return;
         }
@@ -3190,7 +3193,10 @@ impl KeyUseReducer {
             .associations
             .iter()
             .any(|assoc| matches!(assoc.bucket, AssocBucket::Proved(_)));
-        if attributed
+        // Off-mode counts nothing (§9 stale/replayed rule): without
+        // admitted lengths a terminal pair is not evidence.
+        if self.key_sizes
+            && attributed
             && let (Some(LengthOutcome::Value(terminal)), Some(expected)) = (length, corroboration)
             && terminal != expected
         {
@@ -3375,14 +3381,20 @@ impl KeyUseReducer {
 
     /// Park wrapped-material evidence about a rowless view (§5.4 U1):
     /// first park wins, the map stays within the aggregate bound,
-    /// and overflow counts instead of silently dropping.
+    /// and overflow counts instead of silently dropping. Off-mode
+    /// drops parks on arrival (§9 stale/replayed rule — the flag
+    /// never flips mid-run, so gating the store covers every park
+    /// site); a refused park is inference-side, never row loss (no
+    /// partial — the count publishes as the named gap).
     fn park_wrapped(&mut self, view: u64, parked: ParkedSize) {
+        if !self.key_sizes {
+            return;
+        }
         if self.parked.contains_key(&view) {
             return;
         }
         if self.parked.len() >= self.capacity {
             self.evidence.parked_refused = self.evidence.parked_refused.saturating_add(1);
-            self.evidence.partial = true;
             return;
         }
         self.parked.insert(view, parked);
@@ -3615,13 +3627,16 @@ impl KeyUseReducer {
     /// adapter. No model lookup can replace a frozen metadata-at-use receipt.
     fn apply_invalidation(&mut self, effect: &ObjectEffect, model: &ObjectSemantics) {
         match effect {
-            ObjectEffect::Destroyed { object, .. } | ObjectEffect::Retired { object, .. } => {
-                // Parked evidence expires with its view.
+            ObjectEffect::Destroyed { object, .. }
+            | ObjectEffect::Retired { object, .. }
+            | ObjectEffect::AccessEnded { object, .. } => {
+                // Parked evidence expires with its view (every end
+                // path ends the view exactly once; nothing makes it
+                // live again).
                 self.parked.remove(&object.as_u64());
                 self.retire_object(*object);
             }
-            ObjectEffect::AccessEnded { object, .. }
-            | ObjectEffect::Downgraded { object, .. }
+            ObjectEffect::Downgraded { object, .. }
             | ObjectEffect::MetadataInvalidated { object, .. }
             | ObjectEffect::MetadataConflict { object, .. } => self.retire_object(*object),
             ObjectEffect::SessionEnded { session, .. } => self.retire_session(*session, model),

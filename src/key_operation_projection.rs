@@ -1873,6 +1873,16 @@ pub(crate) mod producer {
                 repeats: mismatches,
             });
         }
+        // Refused wrapped-material parks are inference-side, never
+        // row loss (no partial): the count publishes as a named gap.
+        let parks_refused = keyuse.key_use_evidence().parked_refused;
+        if parks_refused > 0 {
+            observations.gaps.push(GapRow {
+                subject: "key_operation",
+                reason: "wrapped_park_refused",
+                repeats: parks_refused,
+            });
+        }
     }
 
     /// Model gaps plus key-side scope facts, sorted, bounded (the

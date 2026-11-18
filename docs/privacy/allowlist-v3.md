@@ -1973,6 +1973,17 @@ unchanged.**
 | --- | --- | --- | --- |
 | Bank gap object (`evidence.counter_collection.bank_gaps`) | A pure projection of the counter acquisition's per-bank failure flags: how many slots failed to fold, and whether the health or kernel evidence read failed. No target-memory, argument, pointer, map-content or file read happens for this field beyond the already-attempted bank reads; a missing bank map or a global quarantine/routing refusal still voids via the existing failure cause. The key stays absent (never null) when the acquisition was exact. | Public profile/metrics JSON only, inside `counter_collection`: `failed_slots` (saturating u64 count of slots that failed to fold), `health_failed` (whether the health read failed), and `kernel_failed` (whether the kernel evidence read failed). Counts and finite flags only; no per-slot index, offset, timing, RV value, health word or control word reaches output. A gap read publishes the last good values (stale) until the next exact read telescopes, except the first read of a generation, which publishes its current rows with zeros as unknown for the failed slots; either way the report reads PARTIAL with cause `counter_collection`. | No slot index, file offset, ordinal, name, RV value, timing, bucket, health word, control word, address, session, PID, argv, environ, PIN, key or payload value reaches output. A gap object with zero counts and false flags is never emitted. Required evidence: per-bank partition and evidence-degradation twins at the counter acquisition seam, an exact-read omission twin, and the matching shape in `docs/schema/observed-profile-v3.md`. |
 
+## RV lower-bound flag (v0.7.2)
+
+**Status: IMPLEMENTED in v0.7.2: an RV-table exhaustion renders as a
+flag in text and JSON counter evidence instead of staying a set-but-unread
+field. No new capture exists; the flag projects the RV-exhaustion fact the
+observer already holds. Allowlist-v1 bytes are unchanged.**
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| RV lower-bound flag (`evidence.counter_collection.rv_lower_bound`) | A pure projection of the counter acquisition's RV-exhaustion flag: whether at least one RV insert failed in the kernel during the acquisition. No target-memory, argument, pointer, map-content or file read happens for this field beyond the already-attempted RV read. The key stays absent (never null, never false) when the RV table did not exhaust. | Public profile/metrics JSON only, inside `counter_collection`: the flag is present as `true` only. Text evidence names it in the counter summary line (`per-RV counts are a lower bound`). One finite flag only; no RV value, slot index, offset, timing, health word or control word reaches output. Per-RV counts undercount while endpoint counts stay exact whenever this flag is present, and the report reads PARTIAL with cause `counter_collection`. | No slot index, file offset, ordinal, name, RV value, timing, bucket, health word, control word, address, session, PID, argv, environ, PIN, key or payload value reaches output. A clean read never emits the flag. Required evidence: an RV-exhaustion render twin at the counter acquisition seam, an exact-read omission twin, and the matching shape in `docs/schema/observed-profile-v3.md`. |
+
 ## Derived count projections (v0.6.0)
 
 **Status: IMPLEMENTED in v0.6.0: `forwarding_layer`, `layer_totals`,

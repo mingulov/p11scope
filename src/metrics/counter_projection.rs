@@ -41,6 +41,10 @@ pub(super) struct CounterSnapshot {
     attempted_kernel: Option<KernelEvidence>,
     discontinuity: bool,
     bank_gaps: CounterGaps,
+    /// The latest attempt's RV table exhausted: per-RV counts undercount
+    /// (a lower bound) while endpoint counts stay exact. Rendered in
+    /// text and JSON evidence, and a counter gap like the bank gaps.
+    rv_lower_bound: bool,
 }
 
 impl CounterSnapshot {
@@ -94,6 +98,10 @@ impl CounterSnapshot {
 
     pub(super) fn bank_gaps(&self) -> CounterGaps {
         self.bank_gaps
+    }
+
+    pub(super) fn rv_lower_bound(&self) -> bool {
+        self.rv_lower_bound
     }
 
     pub(super) fn deltas(&self) -> Option<&[CounterCellDelta]> {
@@ -272,6 +280,7 @@ impl CaptureSnapshot {
                 attempted_kernel: Some(kernel),
                 discontinuity: false,
                 bank_gaps: CounterGaps::default(),
+                rv_lower_bound: false,
             }),
             new_acquisition: false,
             snapshot_failure: Some(failure),
@@ -332,7 +341,10 @@ impl CaptureSnapshot {
         // cause supersedes this one.
         self.snapshot_failure.is_none()
             && self.counter().is_some_and(|snapshot| {
-                !snapshot.is_fresh() || snapshot.discontinuity() || !snapshot.bank_gaps().is_clean()
+                !snapshot.is_fresh()
+                    || snapshot.discontinuity()
+                    || !snapshot.bank_gaps().is_clean()
+                    || snapshot.rv_lower_bound()
             })
     }
 
@@ -365,6 +377,9 @@ impl CaptureSnapshot {
     /// A failed new attempt never substitutes its mode/generation/window.
     /// Per-bank gaps appear only when the acquisition was partial; exact
     /// reads omit `bank_gaps` so the full-coverage shape is unchanged.
+    /// The `rv_lower_bound` flag likewise appears only when the RV table
+    /// exhausted: per-RV counts are then a lower bound while endpoint
+    /// counts stay exact.
     pub(crate) fn counter_collection(&self) -> Option<serde_json::Value> {
         let snapshot = self.counter()?;
         let mode = snapshot.mode()?;
@@ -396,6 +411,12 @@ impl CaptureSnapshot {
                     }),
                 );
         }
+        if snapshot.rv_lower_bound() {
+            value
+                .as_object_mut()
+                .expect("counter collection is an object")
+                .insert("rv_lower_bound".into(), serde_json::Value::Bool(true));
+        }
         Some(value)
     }
 
@@ -408,12 +429,17 @@ impl CaptureSnapshot {
             |failure| format!("stale ({})", failure.name()),
         );
         Some(format!(
-            "Counter collection: {}; generation {}; last read {}{}\n",
+            "Counter collection: {}; generation {}; last read {}{}{}\n",
             mode.name(),
             generation,
             status,
             if snapshot.discontinuity() {
                 "; generation changed"
+            } else {
+                ""
+            },
+            if snapshot.rv_lower_bound() {
+                "; per-RV counts are a lower bound"
             } else {
                 ""
             },
@@ -643,6 +669,7 @@ impl CaptureCollection {
                         stage_projection(plan, pins, &read, reserve).map_err(|failure| {
                             anyhow::anyhow!("counter collection unavailable ({})", failure.name())
                         })?;
+                    let rv_lower_bound = read.view().rv_lower_bound;
                     let snapshot = CounterSnapshot {
                         data: Some(Arc::new(Projection {
                             source: read,
@@ -654,6 +681,7 @@ impl CaptureCollection {
                         attempted_kernel: Some(kernel),
                         discontinuity,
                         bank_gaps: CounterGaps::default(),
+                        rv_lower_bound,
                     };
                     self.last_counter = Some(snapshot.clone());
                     let snapshot = CaptureSnapshot::from_counter(snapshot);
@@ -753,6 +781,7 @@ impl CounterCapture {
         failure: CounterFailure,
         kernel: Option<KernelEvidence>,
         gaps: CounterGaps,
+        rv_lower_bound: bool,
     ) -> CounterSnapshot {
         CounterSnapshot {
             data: self.last.clone(),
@@ -760,6 +789,7 @@ impl CounterCapture {
             attempted_kernel: kernel,
             discontinuity: self.discontinuity,
             bank_gaps: gaps,
+            rv_lower_bound,
         }
     }
 
@@ -780,12 +810,18 @@ impl CounterCapture {
             Ok(read) => read,
             Err(stage) => {
                 let _ = self.collector.observe(Err(stage));
-                return self.failed(CounterFailure::Read(stage), None, CounterGaps::default());
+                return self.failed(
+                    CounterFailure::Read(stage),
+                    None,
+                    CounterGaps::default(),
+                    false,
+                );
             }
         };
         let kernel = read.view().kernel;
         let health = read.view().health;
         let gaps = read.view().gaps;
+        let rv_lower_bound = read.view().rv_lower_bound;
         // Reserve and copy before observe can advance the baseline. Both the
         // acquisition's owned rows and the old displayed view remain charged.
         let (reports, storage) =
@@ -804,10 +840,20 @@ impl CounterCapture {
                             unreachable!("invalid folded rows cannot establish a baseline")
                         }
                     };
-                    return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
+                    return self.failed(
+                        failure.with_observed_health(health),
+                        Some(kernel),
+                        gaps,
+                        rv_lower_bound,
+                    );
                 }
                 Err(failure) => {
-                    return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
+                    return self.failed(
+                        failure.with_observed_health(health),
+                        Some(kernel),
+                        gaps,
+                        rv_lower_bound,
+                    );
                 }
             };
         let observation = self.collector.observe(Ok(read));
@@ -817,7 +863,12 @@ impl CounterCapture {
             _ => None,
         };
         if let Some(failure) = failure {
-            return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
+            return self.failed(
+                failure.with_observed_health(health),
+                Some(kernel),
+                gaps,
+                rv_lower_bound,
+            );
         }
         self.discontinuity |= matches!(observation, CounterObservation::GenerationChanged { .. });
         let source = self
@@ -838,6 +889,7 @@ impl CounterCapture {
             attempted_kernel: Some(kernel),
             discontinuity: self.discontinuity,
             bank_gaps: gaps,
+            rv_lower_bound,
         }
     }
 }

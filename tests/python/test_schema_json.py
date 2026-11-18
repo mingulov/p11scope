@@ -76,6 +76,21 @@ class SchemaOracleAgreement(unittest.TestCase):
             observation["causes"].append("counter_collection")
         return document
 
+    def counter_lower_bound_document(self, *, failure=None):
+        """A counter document carrying the additive `rv_lower_bound` flag.
+        The flag forces PARTIAL with the `counter_collection` cause, even
+        on a fresh read."""
+        document = self.counter_document(failure=failure)
+        evidence = document["evidence"]
+        evidence["counter_collection"]["rv_lower_bound"] = True
+        evidence["completeness"] = "PARTIAL"
+        evidence["verdict_detail"] = "concrete_gap"
+        observation = evidence["gap_classes"]["observation"]
+        observation["status"] = "lossy"
+        if "counter_collection" not in observation["causes"]:
+            observation["causes"].append("counter_collection")
+        return document
+
     def legacy_gaps_document(self, *, unread_stats=1, rv_failed=False,
                              unknown_evidence=()):
         """A legacy (non-counter) document carrying the additive
@@ -333,7 +348,8 @@ class SchemaOracleAgreement(unittest.TestCase):
         collection = evidence_schema()["properties"]["counter_collection"]
         keys = {"mode", "generation", "read_window", "status", "health", "discontinuity", "failure"}
         self.assertEqual(set(collection["required"]), keys)
-        self.assertEqual(set(collection["properties"]), keys | {"bank_gaps"})
+        self.assertEqual(
+            set(collection["properties"]), keys | {"bank_gaps", "rv_lower_bound"})
         self.assertFalse(collection["additionalProperties"])
         self.assertNotIn("counter_collection", evidence_schema()["required"])
         failure = collection["properties"]["failure"]["enum"]
@@ -346,6 +362,9 @@ class SchemaOracleAgreement(unittest.TestCase):
             set(gaps["properties"]), set(CHECKER["BANK_GAPS_KEYS"]))
         self.assertFalse(gaps["additionalProperties"])
         self.assertNotIn("bank_gaps", collection["required"])
+        lower = collection["properties"]["rv_lower_bound"]
+        self.assertEqual(lower["const"], True)
+        self.assertNotIn("rv_lower_bound", collection["required"])
 
     def test_counter_bank_gaps_fresh_and_stale_shapes_accepted(self):
         """Gap captures pass the gate: fresh reads with slot, health or
@@ -419,6 +438,37 @@ class SchemaOracleAgreement(unittest.TestCase):
         unknown = self.counter_gaps_document(gaps=base, health_unknown=True)
         with self.assertRaisesRegex(AssertionError, "counter collection"):
             CHECKER["exact_metrics_schema"](unknown)
+
+    def test_counter_rv_lower_bound_accepted_and_requires_gap(self):
+        """The `rv_lower_bound` flag passes the gate on fresh and stale
+        reads, always PARTIAL with the `counter_collection` cause."""
+        for document in (self.counter_lower_bound_document(),
+                         self.counter_lower_bound_document(failure="read_rvs")):
+            with self.subTest(document=document["evidence"]["counter_collection"]):
+                CHECKER["exact_metrics_schema"](document)
+        fresh = self.counter_lower_bound_document()
+        for field, value in (("completeness", "COMPLETE"),
+                             ("verdict_detail", "clean_proven")):
+            invalid = copy.deepcopy(fresh)
+            invalid["evidence"][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        unflagged = copy.deepcopy(fresh)
+        unflagged["evidence"]["gap_classes"]["observation"]["causes"].remove(
+            "counter_collection")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](unflagged)
+
+    def test_counter_rv_lower_bound_malformed_rejected(self):
+        """A present-but-unset `rv_lower_bound` flag is refused: the flag
+        is omitted when clean, never false or non-boolean."""
+        for value in (False, None, 1, "true"):
+            with self.subTest(value=value):
+                document = self.counter_lower_bound_document()
+                document["evidence"]["counter_collection"]["rv_lower_bound"] = value
+                with self.assertRaisesRegex(AssertionError, "rv_lower_bound"):
+                    CHECKER["exact_metrics_schema"](document)
 
     def test_legacy_collection_accepted_and_requires_gap(self):
         """Legacy gap captures pass the gate with PARTIAL and the

@@ -1710,7 +1710,7 @@ def exact_exit_mappings_split(split):
 def exact_counter_collection(collection):
     """Derived availability of the accepted cumulative snapshot, not intent."""
     require(isinstance(collection, dict)
-            and COUNTER_COLLECTION_KEYS <= set(collection) <= COUNTER_COLLECTION_KEYS | {"bank_gaps"},
+            and COUNTER_COLLECTION_KEYS <= set(collection) <= COUNTER_COLLECTION_KEYS | {"bank_gaps", "rv_lower_bound"},
             f"counter_collection key set: {collection!r}")
     require(collection["mode"] in ("counts", "timestamps", "latency"),
             f"invalid counter mode: {collection!r}")
@@ -1737,6 +1737,9 @@ def exact_counter_collection(collection):
     gaps = collection.get("bank_gaps")
     if gaps is not None:
         exact_counter_bank_gaps(gaps)
+    if "rv_lower_bound" in collection:
+        require(collection["rv_lower_bound"] is True,
+                f"a clean counter rv_lower_bound flag must be omitted: {collection!r}")
     if collection["status"] == "fresh":
         if gaps is None:
             require(failure is None and health == {"saturated": False, "contended": False},
@@ -2512,7 +2515,7 @@ def expected_gap_classes(evidence):
     if collection is not None:
         gates["observation"].append((
             "counter_collection", collection["status"] == "stale" or collection["discontinuity"]
-            or "bank_gaps" in collection,
+            or "bank_gaps" in collection or "rv_lower_bound" in collection,
         ))
     if evidence.get("legacy_collection") is not None:
         gates["observation"].append(("legacy_collection", True))

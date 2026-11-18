@@ -149,6 +149,10 @@
                   "kernel_failed": {"const": false}
                 }
               }
+            },
+            "rv_lower_bound": {
+              "description": "Optional RV-exhaustion disclosure, present only when per-RV counts are a lower bound.",
+              "const": true
             }
           },
           "allOf": [

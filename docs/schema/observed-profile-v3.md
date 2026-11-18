@@ -52,10 +52,13 @@ contains optional `counter_collection` metadata. Legacy captures omit this
 object. Its exact keys are `mode`, `generation`, `read_window`, `status`,
 `health`, `discontinuity`, and `failure`, plus an optional additive
 `bank_gaps` object (`failed_slots` count with `health_failed`/`kernel_failed`
-flags) that appears only when one bank's cells or evidence reads failed.
-Exact counter reads omit `bank_gaps`. A gap read publishes the last good
-snapshot as stale with the gap counts; only the first read of a generation
-publishes its current rows, with zeros as unknown for the failed slots.
+flags) that appears only when one bank's cells or evidence reads failed,
+and an optional additive `rv_lower_bound` flag that appears only when the
+RV table exhausted: per-RV counts are then a lower bound while endpoint
+counts stay exact. Exact counter reads omit both. A gap read publishes the
+last good snapshot as stale with the gap counts; only the first read of a
+generation publishes its current rows, with zeros as unknown for the failed
+slots.
 This is a v3-additive disclosure
 that introduces no new schema revision. Mode and positive generation identify
 the accepted native read. `read_window` is either the measured monotonic
@@ -70,8 +73,9 @@ retains the previous accepted rows, mode, generation, and window with
 `status: "stale"`, null health, and a finite failure cause; observed
 saturation or contention remains explicit as `saturated` or `contended`.
 A generation change sets sticky `discontinuity`. A failure, discontinuity,
-or `bank_gaps` object adds `counter_collection` to the observation gap
-causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
+`bank_gaps` object, or `rv_lower_bound` flag adds `counter_collection` to
+the observation gap causes and requires `PARTIAL` with
+`verdict_detail: "concrete_gap"`.
 An unavailable initial read cannot produce zero measurements. A failed
 terminal read publishes the last good snapshot as stale with `PARTIAL`;
 a capture that never acquired a snapshot seals a degraded report with

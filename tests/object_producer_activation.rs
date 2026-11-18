@@ -3372,6 +3372,13 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// the ReturnPayload::LENGTH const, plus their comment lines):
 /// 154859 B, measured with this same lexer on the integrated source;
 /// the previous pin matches its parent.
+/// Re-baselined for the Task 2 fix round 1 modeled stamp (the only
+/// BPF source changes: the `descriptor - 1` stamp into
+/// `base.event.target_function` on the object-return 648 path and the
+/// `Record::LENGTH && !emitted` stash abandon, plus their comment
+/// lines):
+/// 155241 B, measured with this same lexer on the integrated source;
+/// the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3381,8 +3388,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            154859,
-            "ebeeca21e2f87c09a662236c43c01fe14ddf42c068674bcc404b07c78a95b02a"
+            155241,
+            "75035fe1cdbde2b674ef3477012573c44c6989f5bd646b599e240ad3f2cf0d9b"
         ),
         "stripped BPF dump must stay byte-identical"
     );

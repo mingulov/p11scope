@@ -1238,6 +1238,16 @@ pub struct Engine {
     /// what the loader phase saw without a real teardown wait.
     #[cfg(test)]
     loader_arm_scan_teardown_remaining_for_test: Option<std::time::Duration>,
+    /// Test-only one-shot: observe the teardown budget a record-path
+    /// loader scan saw. The arm probe above fires only on the catch-up
+    /// path; backlog and finish passes dispatch loader records, so
+    /// their entry twins need their own observation point.
+    #[cfg(test)]
+    loader_record_scan_after_scan: Option<fn(&mut Engine)>,
+    /// Test-only: teardown-deferral budget remaining observed by the last
+    /// record-path `after_scan` probe.
+    #[cfg(test)]
+    loader_record_scan_teardown_remaining_for_test: Option<std::time::Duration>,
     /// Test-only one-shot: force the next record-path loader scan to
     /// report incomplete, pinning the `found_complete` plumbing from
     /// the record-path scan to the loader-timing classifier.
@@ -14105,6 +14115,10 @@ impl Engine {
             #[cfg(test)]
             loader_arm_scan_teardown_remaining_for_test: None,
             #[cfg(test)]
+            loader_record_scan_after_scan: None,
+            #[cfg(test)]
+            loader_record_scan_teardown_remaining_for_test: None,
+            #[cfg(test)]
             loader_force_record_scan_incomplete: false,
             #[cfg(test)]
             fail_next_loader_arm_authority: false,
@@ -21846,6 +21860,12 @@ impl Engine {
         #[cfg(test)]
         if catchup_authority.is_some()
             && let Some(after_scan) = self.loader_arm_scan_after_scan.take()
+        {
+            after_scan(self);
+        }
+        #[cfg(test)]
+        if catchup_authority.is_none()
+            && let Some(after_scan) = self.loader_record_scan_after_scan.take()
         {
             after_scan(self);
         }

@@ -18882,6 +18882,14 @@ impl Engine {
         // precedent) — and the rebind must file no ownership claims under
         // them, or an unrelated later refresh purges the carried pins the
         // remove above deliberately kept resolvable.
+        //
+        // Claimlessness covers newly retired views and previously carried
+        // ones, like the inventory assembly: an already-carried module
+        // that rides through another replay must not regain claims.
+        // Previously carried means a committed module for a
+        // still-attached object whose pins are already claimless, from a
+        // view that is neither retiring now nor still live. Currency
+        // keeps the original newly-retired filter below.
         let carried: BTreeSet<ProcessViewId> = self
             .modules
             .iter()
@@ -18890,8 +18898,22 @@ impl Engine {
             })
             .map(|module| module.scanned.view)
             .collect();
+        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        let already_carried = self.pinned.carried_ids();
+        let claimless: BTreeSet<ProcessViewId> = self
+            .modules
+            .iter()
+            .filter(|module| {
+                carry_objects.contains(&module.object)
+                    && already_carried.contains(&module.object)
+                    && !retirements.contains(&module.scanned.view)
+                    && !live.contains(&module.scanned.view)
+            })
+            .map(|module| module.scanned.view)
+            .chain(carried.iter().copied())
+            .collect();
         let mut candidate =
-            self.live_candidate_with_claimless(pinned, raw_modules, skipped, &carried)?;
+            self.live_candidate_with_claimless(pinned, raw_modules, skipped, &claimless)?;
         candidate.views.retain(|view| !carried.contains(view));
         Ok(candidate)
     }
@@ -31516,6 +31538,16 @@ impl Engine {
         // never required) — and the rebind must file no ownership claims
         // under them, or an unrelated later refresh purges the carried pins
         // the remove above deliberately kept resolvable.
+        //
+        // Claimlessness covers newly retired views and previously carried
+        // ones: a carried module that rides again through an unrelated
+        // refresh would otherwise regain claims under its retired view,
+        // losing the derived carried classification on the very next
+        // rebind. Previously carried means a committed module for a
+        // still-attached object whose pins are already claimless —
+        // exact-target gated like the new retirements, and fresh views
+        // (live, refreshed, or not-yet-admitted) never qualify. Currency
+        // keeps the original newly-retired filter below.
         let carried: BTreeSet<ProcessViewId> = self
             .modules
             .iter()
@@ -31524,12 +31556,30 @@ impl Engine {
             })
             .map(|module| module.scanned.view)
             .collect();
+        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        let admitted: BTreeSet<ProcessViewId> =
+            new_views.iter().map(|(view, _, _)| view.id()).collect();
+        let already_carried = self.pinned.carried_ids();
+        let claimless: BTreeSet<ProcessViewId> = self
+            .modules
+            .iter()
+            .filter(|module| {
+                carry_objects.contains(&module.object)
+                    && already_carried.contains(&module.object)
+                    && !removed.contains(&module.scanned.view)
+                    && !refreshed_ids.contains(&module.scanned.view)
+                    && !admitted.contains(&module.scanned.view)
+                    && !live.contains(&module.scanned.view)
+            })
+            .map(|module| module.scanned.view)
+            .chain(carried.iter().copied())
+            .collect();
         let mut candidate = self.live_candidate_with_declined(
             candidate_pins,
             raw_modules,
             skipped,
             declined,
-            &carried,
+            &claimless,
         )?;
         candidate.views.retain(|view| !carried.contains(view));
         candidate

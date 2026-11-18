@@ -1304,6 +1304,73 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
         slot_active(&next, object_a),
         "the carried slot stays attached across the refresh"
     );
+    // A later rebuild must not re-claim the carried view: the refresh
+    // rebind files claims for every bound module, so the previously
+    // carried module needs the same claimless custody as a newly
+    // retired one — otherwise the next purge drops the pin with no
+    // raw owner and stale retirement stops seeing it as carried.
+    assert!(
+        next.pinned.view_claims(view_a).is_none(),
+        "the refresh files no claims under the previously carried view"
+    );
+    assert!(
+        next.pinned.carried_ids().contains(&object_a),
+        "the previously carried pin still reads as carried coverage"
+    );
+    assert!(
+        next.built_by_full_rebuild,
+        "the refresh rebuilds (no cached-plan shortcut)"
+    );
+    // A second empty-preserve refresh must keep the carry claimless,
+    // and stale retirement must still spare it.
+    engine.plan = next.plan;
+    engine.pinned = next.pinned;
+    engine.modules = next.modules;
+    assert!(
+        engine.newcomer_first_seen.is_empty(),
+        "no newcomers wait, so the second refresh preserves nothing"
+    );
+    let refreshed_again = vec![(view_b, Vec::new(), PinnedObjects::empty())];
+    let third = engine
+        .inventory_candidate(&empty, &refreshed_again, &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        third.pinned.summary(object_a).is_some(),
+        "a second refresh never purges a needed carried pin"
+    );
+    assert!(
+        third.modules.iter().any(|module| module.object == object_a),
+        "the carried module still binds after the second refresh"
+    );
+    assert!(
+        slot_active(&third, object_a),
+        "the carried slot stays attached across the second refresh"
+    );
+    assert!(
+        third.pinned.view_claims(view_a).is_none(),
+        "the second refresh files no claims under the carried view"
+    );
+    assert!(
+        third.pinned.carried_ids().contains(&object_a),
+        "the carried pin still reads as carried after the second refresh"
+    );
+    let stale: BTreeSet<ProcessViewId> = BTreeSet::from([view_a]);
+    let mut session = ScriptedSession::default();
+    let mut outcome = super::ApplyOutcome::default();
+    let mut staled = third;
+    engine.retire_stale_candidate_sources(&mut session, &mut staled, &stale, &mut outcome);
+    assert!(
+        slot_active(&staled, object_a),
+        "stale retirement keeps slots carried across refreshes"
+    );
+    assert!(
+        staled.pinned.summary(object_a).is_some(),
+        "stale retirement keeps pins carried across refreshes"
+    );
+    assert!(
+        staled.modules.iter().any(|module| module.object == object_a),
+        "stale retirement keeps modules carried across refreshes"
+    );
 }
 
 #[test]
@@ -1387,6 +1454,35 @@ fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
     assert!(
         carried.pinned.carried_ids().contains(&object),
         "the replayed pin reads as carried coverage"
+    );
+    // A later replay takes the first replay's carried module as an
+    // already-carried input: with no new retirements the replay rebind
+    // must still file no claims under the carried view.
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    let later = engine
+        .conservative_candidate(&BTreeSet::new(), &keys)
+        .unwrap();
+    assert!(
+        later.pinned.summary(object).is_some(),
+        "a later replay never purges a needed carried pin"
+    );
+    assert!(
+        !later.plan.modules.is_empty(),
+        "the carried module still binds after the later replay"
+    );
+    assert!(
+        later.plan.is_active(0),
+        "the carried slot stays attached across the later replay"
+    );
+    assert!(
+        later.pinned.view_claims(view).is_none(),
+        "the later replay files no claims under the already-carried view"
+    );
+    assert!(
+        later.pinned.carried_ids().contains(&object),
+        "the already-carried pin still reads as carried coverage"
     );
 }
 
@@ -40634,6 +40730,88 @@ fn remapped_legacy_prefix_carries_only_the_fresh_extension_proof() {
         granted.standard_layout_evidence(),
         ["interface linkage"],
         "the recorded basis is the linkage leg — the only leg that can grant here"
+    );
+    // Reverse provenance: the retained mapping links an exact-standard
+    // interface but proves no layout, while the fresh mapping proves
+    // the layout but links no interface. Neither grants alone; the
+    // union must not combine the old linkage with the fresh proof at
+    // the fresh address. The retained association is address-bound and
+    // drops on remap (kept unlinked as history), so the merged row
+    // stays count-only.
+    let retained = module(vec![table(0x1000, false)], vec![interface()]);
+    let fresh = module(vec![table(0x2000, true)], vec![]);
+    let retained_authority = authority_of(&retained);
+    assert_eq!(retained_authority.slots.len(), 68);
+    assert!(
+        retained_authority
+            .slots
+            .iter()
+            .all(|slot| !slot.semantic_authorized),
+        "linkage without layout proof grants nothing"
+    );
+    assert!(
+        retained_authority.standard_layout_evidence().is_empty(),
+        "no leg grants on an unproven prefix"
+    );
+    let fresh_authority = authority_of(&fresh);
+    assert_eq!(fresh_authority.slots.len(), 68);
+    assert!(
+        fresh_authority
+            .slots
+            .iter()
+            .all(|slot| !slot.semantic_authorized),
+        "proof without linkage grants nothing here (sole blocked by getter)"
+    );
+    assert!(
+        fresh_authority.standard_layout_evidence().is_empty(),
+        "no leg grants on an unlinked prefix"
+    );
+    let mut reversed = vec![retained];
+    merge_scanned_module(&mut reversed, fresh);
+    assert_eq!(reversed.len(), 1, "same module unions, not twins");
+    assert_eq!(
+        reversed[0].tables.len(),
+        1,
+        "same table at a new address unions, not rivals"
+    );
+    assert_eq!(reversed[0].tables[0].address, 0x2000);
+    assert!(
+        reversed[0].tables[0].extension_impossible,
+        "a remap union honors the fresh decode's proof"
+    );
+    assert!(
+        reversed[0].tables_scan_finished,
+        "a same-table re-decode preserves the finished scan"
+    );
+    assert!(
+        reversed[0].interfaces.iter().any(|i| i.table.is_none()),
+        "the retained association unlinks on remap but stays reportable"
+    );
+    assert!(
+        !reversed[0].interfaces.iter().any(|i| {
+            i.table == Some(0) && i.name_class == "exact_standard"
+        }),
+        "no exact-standard linkage survives the remap without fresh proof"
+    );
+    let merged_authority = authority_of(&reversed[0]);
+    assert_eq!(merged_authority.slots.len(), 68);
+    assert!(
+        merged_authority
+            .slots
+            .iter()
+            .all(|slot| !slot.semantic_authorized),
+        "retained linkage never authorizes a fresh unlinked mapping"
+    );
+    assert!(
+        merged_authority.standard_layout_evidence().is_empty(),
+        "no leg grants on the reversed union"
+    );
+    assert!(
+        merged_authority
+            .slots
+            .iter()
+            .all(|slot| slot.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY),
+        "the reversed union stays count-only"
     );
 }
 

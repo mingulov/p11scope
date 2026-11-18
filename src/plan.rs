@@ -18840,6 +18840,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn extend_exact_replaces_a_getter_whose_scan_still_contributes() {
+        // Failure twin for the manifest-only getter carry: the rebuild
+        // still carries a scan source for the same owner and name (a
+        // rescan that still contributes, not a retired table), so the scan
+        // is not retired and the merge must take the replace branch — no
+        // authorization is carried. Same owner, same names, both
+        // count-only: only the scan-retired gate refuses the carry.
+        let object = PinnedObjectId(1);
+        let descriptor = crate::kinds::function_id("C_GetFunctionList").unwrap() + 1;
+        let getter_slot = |descriptor_index: u32, authorized: bool| Slot {
+            index: 0,
+            descriptor_index,
+            object,
+            object_path: "/proc/self/fd/1".into(),
+            file_offset: 0x10,
+            names: vec!["C_GetFunctionList".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: authorized,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(0)],
+        };
+        let mut scan_module = exact_module(0, object);
+        scan_module.source = "scan";
+        let mut plan = exact_plan(vec![getter_slot(descriptor, true)], vec![scan_module]);
+        plan.validate_slot_index().unwrap();
+        let mut rescan_module = exact_module(0, object);
+        rescan_module.source = "scan";
+        let rebuilt = exact_plan(vec![getter_slot(0, false)], vec![rescan_module]);
+        rebuilt.validate_slot_index().unwrap();
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(
+            !delta.replace.is_empty(),
+            "a still-contributing scan must replace, never carry: {delta:?}"
+        );
+        assert!(
+            delta.new.is_empty() && delta.retire.is_empty(),
+            "pure replace, no churn elsewhere: {delta:?}"
+        );
+        assert_eq!(plan.slots[0].descriptor_index, 0);
+        assert!(
+            !plan.slots[0].semantic_authorized,
+            "the rescan must not inherit the old authorization: {:?}",
+            plan.slots[0]
+        );
+        plan.validate_slot_index().unwrap();
+    }
+
+    #[test]
     fn extend_exact_refuses_an_over_capacity_snapshot_without_a_prefix_mutation() {
         let object = PinnedObjectId(1);
         let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;

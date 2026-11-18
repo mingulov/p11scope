@@ -5835,12 +5835,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if !self.binder.release_retired_caller(id) {
                 continue;
             }
+            // A sealed semantic gap still awaiting its finalizer pins
+            // the row; the fold defers and the next pass retries.
+            if !self.semantic_bindings.foldable(id) {
+                continue;
+            }
             if folded.is_none() {
                 folded = Some(self.fold_context(subset));
             }
             let folded_caller =
                 self.fold_caller_rendered_state(id, &record, folded.as_ref(), now_ns);
             if self.adapter.forget_caller(id) {
+                self.semantic_bindings.release_folded_caller(id);
                 self.count_ownership.forget_caller(id);
                 if let Some(metadata) = self.caller_metadata.as_mut() {
                     metadata.forget(id);

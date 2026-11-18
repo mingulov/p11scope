@@ -111,6 +111,11 @@ versioned separately and are opaque, exact dispatch keys.
   feed's finite counters and final authority into bounded
   capture-owned evidence, proved rows keep their status on JSON,
   JSONL and text, and the live-feed census decrements.
+- Folded callers release their semantic binding, accepted-scan
+  history and pidfd custody once quiescent, so the semantic budget
+  recycles with the caller slots instead of refusing the 4,097th
+  admission; a retained sealed gap pins its row until the normal
+  finalizer drains it, and late receipts for a folded caller refuse.
 
 ## [0.7.1] - 2026-11-17
 

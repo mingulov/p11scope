@@ -1719,6 +1719,108 @@ fn cbom_folded_pathless_caller_at_two_modules_counts_unknown_once() {
 }
 
 #[test]
+fn cbom_folded_key_instance_stays_named_but_unjoinable() {
+    // Characterization (the Opus-escalated join question): proved
+    // key rows survive the fold, but their instance left
+    // `instances[]`, so CBOM names the key without provider or
+    // application edges. Counts stay exact; only the join degrades.
+    // If the fold ever preserves folded join provenance, this twin
+    // must move with it deliberately.
+    let observations = json!({
+        "version": 1, "revision": 1, "status": "populated", "reason": "none",
+        "sessions": [{"session": 0, "origin": "opened", "status": "live"}],
+        "objects": [
+            {
+                "object": 0, "session": 0, "origin": "created",
+                "creation": "generate", "birth": {"start_ns": 1, "end_ns": 2},
+                "lifetime": "live", "lifetime_reason": null,
+                "attribution": "valid", "attribution_reason": null,
+                "requested": metadata_block(Some(4), Some(31), Some(16)),
+                "established": metadata_block(Some(4), Some(31), Some(16)),
+                "queries": {"class": "established", "key_type": "established",
+                            "token": "established", "value_len": "established",
+                            "modulus_bits": "not_queried", "ec_params": "not_queried"},
+                "label": "aes_128",
+                "successful_references": 3, "successful_key_references": 3,
+                "accessing_sessions": 1
+            },
+        ],
+        "key_operations": [
+            {"instance": "i0", "object": 0, "category": "encrypt", "role": "key",
+             "metadata_at_use": "aes_128", "unit": "operations",
+             "started": 3, "completed": 3, "failed": 0, "cancelled": 0,
+             "unknown": 0, "active": 0, "key_join_lost": 0},
+        ],
+        "unknown_key_operations": [],
+        "gaps": {"rows": [], "suppressed": 0},
+        "budgets": {
+            "key_rows": {"limit": 65536, "occupied": 1, "refused": 0},
+            "object_rows": {"limit": 65536, "occupied": 1, "refused": 0},
+            "unknown_rows": {"occupied": 0},
+            "encoded_bytes": 100, "allocation_refused": false, "refusal_reason": "none"
+        }
+    });
+    // Control: the live instance joins provider and application.
+    let mut live: Value = serde_json::from_slice(&inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"c".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+    ))
+    .unwrap();
+    live["instances"] = json!([
+        {"id": "i0", "caller": "c0", "module": "m0", "state": "observed",
+         "reason": null, "first_seen_ns": 110, "last_seen_ns": 190}
+    ]);
+    live["object_observations"] = observations.clone();
+    let live = parse_input(&serde_json::to_vec(&live).unwrap()).unwrap();
+    assert_eq!(live.object_observations, "populated");
+    assert_eq!(live.keys.len(), 1);
+    assert_eq!(live.unknowns.keys_unjoinable, 0);
+    assert!(live.dependencies.contains(&(
+        "p11scope:key:0".to_string(),
+        "p11scope:module:0".to_string()
+    )));
+    assert!(live.dependencies.contains(&(
+        "p11scope:key:0".to_string(),
+        "p11scope:caller:0".to_string()
+    )));
+    // Folded: the same proved rows with the instance row gone and
+    // the caller folded into `departed_use`.
+    let mut folded: Value = serde_json::from_slice(&inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"c".repeat(64),
+            departed_use(
+                1,
+                1,
+                json!([]),
+                vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+                false,
+                0,
+                departed_overflow(0, 0, 0),
+            ),
+        )],
+        vec![],
+    ))
+    .unwrap();
+    folded["object_observations"] = observations;
+    let folded = parse_input(&serde_json::to_vec(&folded).unwrap()).unwrap();
+    assert_eq!(folded.object_observations, "populated");
+    assert_eq!(folded.keys.len(), 1);
+    assert_eq!(
+        folded.unknowns.keys_unjoinable, 1,
+        "the folded instance cannot rejoin its key"
+    );
+    assert!(
+        !folded.dependencies.iter().any(|(from, _)| from == "p11scope:key:0"),
+        "the named key carries no join edges: {:?}",
+        folded.dependencies
+    );
+}
+
+#[test]
 fn cbom_departed_single_path_incomplete_withholds_and_counts_linkage() {
     // Every incomplete aggregate with rows withholds its
     // app->mechanism pairs and counts the module once, even with a

@@ -1228,6 +1228,22 @@ struct FoldContext {
     subset_modules: Option<BTreeSet<ModuleId>>,
 }
 
+/// Per-publication pair work for the departed-caller fold, indexed
+/// once per retire call: live pair targets and stalled recoveries by
+/// owning caller, plus recovery-order positions for O(1) removals.
+/// The position map stays exact across the call's removals (every
+/// swap updates the moved key), so no fold removal ever scans.
+struct PairFoldWork {
+    targets: HashMap<CallerId, Vec<PairKey>>,
+    recoveries: HashMap<CallerId, Vec<PairKey>>,
+    order_pos: HashMap<PairKey, usize>,
+}
+
+/// Callers folded per retire call: burst retirement drains over
+/// passes instead of delaying one publication, and the remainder
+/// resumes next pass without a re-note.
+const FOLD_CALLERS_PER_PUBLICATION: usize = 1024;
+
 /// What one caller's fold removed: whether it carried attributed
 /// calls plus the folded row keys (the seam drops their stream
 /// digests so the emitters stay bounded by live rows).
@@ -5565,6 +5581,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         key: PairKey,
         mut recovery: PairRecovery,
         held: Option<PairCount>,
+        fold_order: Option<&mut PairFoldWork>,
     ) {
         let live_same_caller = matches!(
             self.pair_targets.get(&key),
@@ -5621,24 +5638,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.pair_counts.remove(&key);
             self.placement_generations.remove(&key);
         }
-        if let Some(pos) = self.recovery_order.iter().position(|keyed| *keyed == key) {
-            #[cfg(test)]
-            {
-                self.recovery_order_search_visits = self
-                    .recovery_order_search_visits
-                    .saturating_add(pos as u64 + 1);
-            }
-            self.recovery_order.swap_remove(pos);
-            if self.recovery_cursor > pos {
-                self.recovery_cursor -= 1;
-            }
-            self.recovery_cursor %= self.recovery_order.len().max(1);
-        } else {
-            #[cfg(test)]
-            {
-                self.recovery_order_search_visits = self
-                    .recovery_order_search_visits
-                    .saturating_add(self.recovery_order.len() as u64);
+        match fold_order {
+            Some(pairs) => self.remove_fold_order_key(pairs, &key),
+            None => {
+                if let Some(pos) = self.recovery_order.iter().position(|keyed| *keyed == key) {
+                    #[cfg(test)]
+                    {
+                        self.recovery_order_search_visits = self
+                            .recovery_order_search_visits
+                            .saturating_add(pos as u64 + 1);
+                    }
+                    self.recovery_order.swap_remove(pos);
+                    if self.recovery_cursor > pos {
+                        self.recovery_cursor -= 1;
+                    }
+                    self.recovery_cursor %= self.recovery_order.len().max(1);
+                } else {
+                    #[cfg(test)]
+                    {
+                        self.recovery_order_search_visits = self
+                            .recovery_order_search_visits
+                            .saturating_add(self.recovery_order.len() as u64);
+                    }
+                }
             }
         }
     }
@@ -5652,24 +5674,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// this a suspended pair pins its exited caller forever: nothing
     /// else resolves a dead caller's placement. Routine churn work,
     /// not a count decision, so no diagnostic record.
-    fn drop_caller_pairs_for_fold(&mut self, id: CallerId) {
-        #[cfg(test)]
-        {
-            self.fold_pair_target_visits = self
-                .fold_pair_target_visits
-                .saturating_add(self.pair_targets.len() as u64);
-        }
-        let keys: Vec<PairKey> = self
-            .pair_targets
-            .iter()
-            .filter(|(_, target)| match target {
-                PairTarget::Bound { caller, .. }
-                | PairTarget::Pending { caller, .. }
-                | PairTarget::Suspended { caller, .. } => *caller == id,
-                PairTarget::Dropped { .. } => false,
-            })
-            .map(|(key, _)| *key)
-            .collect();
+    fn drop_caller_pairs_for_fold(&mut self, id: CallerId, pairs: &mut PairFoldWork) {
+        let keys: Vec<PairKey> = pairs.targets.remove(&id).unwrap_or_default();
         for key in keys {
             let (base, base_since) = self.pair_drop_base(&key);
             let _ = self.take_pruned_pair_base(&key);
@@ -5678,26 +5684,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.pair_counts.remove(&key);
             self.recoveries.remove(&key);
             self.placement_generations.remove(&key);
-            if let Some(pos) = self.recovery_order.iter().position(|keyed| *keyed == key) {
-                #[cfg(test)]
-                {
-                    self.recovery_order_search_visits = self
-                        .recovery_order_search_visits
-                        .saturating_add(pos as u64 + 1);
-                }
-                self.recovery_order.swap_remove(pos);
-                if self.recovery_cursor > pos {
-                    self.recovery_cursor -= 1;
-                }
-                self.recovery_cursor %= self.recovery_order.len().max(1);
-            } else {
-                #[cfg(test)]
-                {
-                    self.recovery_order_search_visits = self
-                        .recovery_order_search_visits
-                        .saturating_add(self.recovery_order.len() as u64);
-                }
-            }
+            self.remove_fold_order_key(pairs, &key);
         }
         // Dropped or pruned pairs keep their exact base for the grace
         // prune and revival, but their recoveries name this caller and
@@ -5706,18 +5693,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // rewriting the staged base to a watermark and clobbering any
         // revived pair. The settle discloses any withheld range and
         // removes the recovery without touching the base.
-        #[cfg(test)]
-        {
-            self.fold_pair_recovery_visits = self
-                .fold_pair_recovery_visits
-                .saturating_add(self.recoveries.len() as u64);
-        }
-        let stranded: Vec<PairKey> = self
-            .recoveries
-            .iter()
-            .filter(|(_, recovery)| recovery.caller == id)
-            .map(|(key, _)| *key)
-            .collect();
+        let stranded: Vec<PairKey> = pairs.recoveries.remove(&id).unwrap_or_default();
         for key in stranded {
             let Some(recovery) = self.recoveries.remove(&key) else {
                 continue;
@@ -5725,7 +5701,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Dropped pairs hold no read (the absorb path skips them);
             // a held read here belongs to a revived live caller for the
             // same key, never to this recovery, so settle does not gap it.
-            self.settle_pair_recovery(key, recovery, None);
+            self.settle_pair_recovery(key, recovery, None, Some(pairs));
         }
     }
 
@@ -5868,8 +5844,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// gaps keep naming the folded caller by label. `subset` is the
     /// seated lane's attested subset, if any: folded callers'
     /// Joint-terminal contributions evaluate under it (it never
-    /// changes afterwards). Returns how many rows retired and what
-    /// folded.
+    /// changes afterwards). Binder and pair tables scan once per call,
+    /// never once per caller; the call folds at most
+    /// [`FOLD_CALLERS_PER_PUBLICATION`] rows, stops promptly on stop,
+    /// and re-queues whatever it did not reach, so the remainder
+    /// resumes next pass without a re-note. Returns how many rows
+    /// retired and what folded.
     pub(crate) fn retire_rendered_callers(
         &mut self,
         now_ns: u64,
@@ -5882,14 +5862,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // One referenced-caller set per call, not one scan per candidate:
         // steady state can render the whole caller budget every pass.
         let referenced = self.referenced_callers();
-        // The fold indexes build lazily on the first foldable caller:
-        // most passes retire nothing.
-        let mut folded: Option<FoldContext> = None;
-        let mut receipt = FoldReceipt::default();
+        // Phase 1: fold candidates through the cheap per-row checks.
+        // Missing, live and referenced rows drop here and re-note from
+        // the view next pass, as before.
+        let mut candidates = Vec::new();
         for id in rendered {
-            let record = match self.adapter.record(id) {
-                Some(record) => record.clone(),
-                None => continue,
+            let Some(record) = self.adapter.record(id) else {
+                continue;
             };
             if !record.retired
                 || !matches!(
@@ -5902,21 +5881,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if referenced.contains(&id) {
                 continue;
             }
-            // A pending binder row still needs its incarnation snapshot;
-            // keep the record until that row decides.
-            if !self.binder.release_retired_caller(id) {
-                continue;
-            }
+            candidates.push((id, record.clone()));
+        }
+        // Phase 2: one binder release plan for every candidate
+        // (skipped when no candidate exists: most passes retire
+        // nothing and must not scan).
+        let mut release = None;
+        if !candidates.is_empty() {
+            release = Some(self.binder.plan_retired_release());
+        }
+        // Phase 3: folds with bounded credits and stop checks. Vetoed
+        // rows drop (the view re-notes them); stop and credit breaks
+        // re-queue the unreached remainder for the next pass.
+        // The fold indexes build lazily on the first foldable caller:
+        // most passes retire nothing.
+        let mut folded: Option<FoldContext> = None;
+        let mut pairs: Option<PairFoldWork> = None;
+        let mut receipt = FoldReceipt::default();
+        let mut credits = FOLD_CALLERS_PER_PUBLICATION;
+        let mut rest = candidates.into_iter();
+        loop {
+            let Some((id, record)) = rest.next() else {
+                break;
+            };
             // A sealed semantic gap still awaiting its finalizer pins
-            // the row; the fold defers and the next pass retries.
+            // the row; the fold defers and the next pass retries. This
+            // pure check runs before any clearing, so a deferred row
+            // keeps all of its evidence.
             if !self.semantic_bindings.foldable(id) {
                 continue;
             }
+            // A pending binder row still needs its incarnation snapshot;
+            // keep the record until that row decides.
+            let plan = release.as_ref().expect("a candidate implies a plan");
+            if !self.binder.apply_retired_release(plan, id) {
+                continue;
+            }
+            if self.stopped || credits == 0 {
+                self.rendered_callers.insert(id);
+                self.rendered_callers.extend(rest.map(|(id, _)| id));
+                break;
+            }
             if folded.is_none() {
                 folded = Some(self.fold_context(subset));
+                pairs = Some(self.pair_fold_work());
             }
-            let folded_caller =
-                self.fold_caller_rendered_state(id, &record, folded.as_ref(), now_ns);
+            let folded_caller = self.fold_caller_rendered_state(
+                id,
+                &record,
+                folded.as_ref(),
+                pairs.as_mut(),
+                now_ns,
+            );
             if self.adapter.forget_caller(id) {
                 self.semantic_bindings.release_folded_caller(id);
                 self.count_ownership.forget_caller(id);
@@ -5933,6 +5949,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 receipt.retired += 1;
                 receipt.folded_edges.extend(folded_caller.edges);
                 receipt.folded_instances.extend(folded_caller.instances);
+                credits = credits.saturating_sub(1);
             }
         }
         // Every forgotten row releases its pid's incarnation counter;
@@ -5967,6 +5984,81 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
             .map(|module| module.id)
             .collect()
+    }
+
+    /// Index one retire call's pair work by owning caller, plus
+    /// recovery-order positions: one scan of each pair table per
+    /// publication, never one full scan per caller.
+    fn pair_fold_work(&mut self) -> PairFoldWork {
+        let mut targets: HashMap<CallerId, Vec<PairKey>> = HashMap::new();
+        for (key, target) in &self.pair_targets {
+            #[cfg(test)]
+            {
+                self.fold_pair_target_visits = self.fold_pair_target_visits.saturating_add(1);
+            }
+            match target {
+                PairTarget::Bound { caller, .. }
+                | PairTarget::Pending { caller, .. }
+                | PairTarget::Suspended { caller, .. } => {
+                    targets.entry(*caller).or_default().push(*key);
+                }
+                PairTarget::Dropped { .. } => {}
+            }
+        }
+        let mut recoveries: HashMap<CallerId, Vec<PairKey>> = HashMap::new();
+        for (key, recovery) in &self.recoveries {
+            #[cfg(test)]
+            {
+                self.fold_pair_recovery_visits = self.fold_pair_recovery_visits.saturating_add(1);
+            }
+            recoveries.entry(recovery.caller).or_default().push(*key);
+        }
+        let mut order_pos: HashMap<PairKey, usize> = HashMap::new();
+        for (pos, key) in self.recovery_order.iter().enumerate() {
+            order_pos.insert(*key, pos);
+        }
+        PairFoldWork {
+            targets,
+            recoveries,
+            order_pos,
+        }
+    }
+
+    /// Remove one key from the recovery service order through the
+    /// fold's position index: the same swap-remove plus cursor fixup
+    /// as the linear search, at O(1).
+    fn remove_fold_order_key(&mut self, pairs: &mut PairFoldWork, key: &PairKey) {
+        let Some(pos) = pairs.order_pos.remove(key) else {
+            return;
+        };
+        if self.recovery_order.get(pos) != Some(key) {
+            // Defensive: the index desynced (it never does — every
+            // swap below updates the moved key); fall back to the
+            // linear search to stay exact.
+            let Some(pos) = self.recovery_order.iter().position(|keyed| keyed == key) else {
+                return;
+            };
+            #[cfg(test)]
+            {
+                self.recovery_order_search_visits = self
+                    .recovery_order_search_visits
+                    .saturating_add(pos as u64 + 1);
+            }
+            self.recovery_order.swap_remove(pos);
+            if self.recovery_cursor > pos {
+                self.recovery_cursor -= 1;
+            }
+            self.recovery_cursor %= self.recovery_order.len().max(1);
+            return;
+        }
+        self.recovery_order.swap_remove(pos);
+        if let Some(moved) = self.recovery_order.get(pos) {
+            pairs.order_pos.insert(*moved, pos);
+        }
+        if self.recovery_cursor > pos {
+            self.recovery_cursor -= 1;
+        }
+        self.recovery_cursor %= self.recovery_order.len().max(1);
     }
 
     /// Per-call fold indexes, built lazily on the first foldable
@@ -6043,15 +6135,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         id: CallerId,
         record: &crate::discovery::caller_registry::CallerRecord,
         folded: Option<&FoldContext>,
+        pairs: Option<&mut PairFoldWork>,
         now_ns: u64,
     ) -> FoldedCaller {
-        let Some(ctx) = folded else {
+        let (Some(ctx), Some(pairs)) = (folded, pairs) else {
             return FoldedCaller::default();
         };
         // The caller's live pair targets drop first: staged absolutes
         // land in the dropped-pair machinery (revival intact), so no
         // suspended pair pins the exited caller afterwards.
-        self.drop_caller_pairs_for_fold(id);
+        self.drop_caller_pairs_for_fold(id, pairs);
         // The layer split reads the frozen exited state: provider
         // activity and refused backends from this caller's own edges,
         // exactly like the live presentation reads them.
@@ -9907,7 +10000,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 )
             );
             if !live || self.adapter.record(recovery.caller).is_none() {
-                self.settle_pair_recovery(key, recovery, held);
+                self.settle_pair_recovery(key, recovery, held, None);
                 continue;
             }
             let mut recovery = recovery;

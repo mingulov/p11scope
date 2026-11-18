@@ -30990,3 +30990,135 @@ fn keymeta_legacy_combined_label_conflicts_family_and_size() {
         "the size gate agrees with the family gate"
     );
 }
+
+/// The shared size-detail specimens run through both actual schema
+/// slots: every valid specimen validates in `detail` and
+/// `conflict_detail`, every refused specimen is refused in both —
+/// through the real `inferred_size` references, not a standalone
+/// fragment. The specimen table is shared with the checker twin, so
+/// both validators pin the same contract.
+#[test]
+fn key_operation_schema_v7_detail_slots_share_specimens_with_checker() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let specimens: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("tests/fixtures/key-operations/size-detail-specimens.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v7.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut slot_schema = serde_json::json!({"$ref": "#/$defs/inferred_size"});
+    slot_schema["$defs"] = schema_file["$defs"].clone();
+    let validator = jsonschema::options()
+        .build(&slot_schema)
+        .expect("v7 inferred-size schema builds");
+    let valid = specimens["valid"].as_object().expect("valid table");
+    let refused = specimens["refused"].as_object().expect("refused table");
+    assert!(
+        valid.len() >= 2 && refused.len() >= 6,
+        "the shared table carries both valid details and all six refusals"
+    );
+    let first_valid = valid.values().next().expect("a valid detail");
+    for (name, detail) in valid {
+        let block = serde_json::json!({
+            "status": "inferred",
+            "detail": detail,
+            "completions": 1,
+        });
+        assert!(
+            validator.is_valid(&block),
+            "valid {name} validates in detail"
+        );
+        let block = serde_json::json!({
+            "status": "conflicting",
+            "detail": first_valid,
+            "completions": 2,
+            "conflict_detail": detail,
+        });
+        assert!(
+            validator.is_valid(&block),
+            "valid {name} validates in conflict_detail"
+        );
+    }
+    for (name, detail) in refused {
+        let block = serde_json::json!({
+            "status": "inferred",
+            "detail": detail,
+            "completions": 1,
+        });
+        assert!(
+            !validator.is_valid(&block),
+            "refused {name} is refused in detail"
+        );
+        let block = serde_json::json!({
+            "status": "conflicting",
+            "detail": first_valid,
+            "completions": 2,
+            "conflict_detail": detail,
+        });
+        assert!(
+            !validator.is_valid(&block),
+            "refused {name} is refused in conflict_detail"
+        );
+    }
+}
+
+/// Deliberate schema/checker divergence on numeric spellings: Draft
+/// 2020-12 treats mathematically-integral floats as integers, so the
+/// schema accepts 257.0/24.0 where the command-line checker demands
+/// integer tokens (pinned checker-side). Producer output uses
+/// integer tokens, so the checker's rule never refuses producer
+/// output.
+#[test]
+fn key_operation_schema_v7_detail_accepts_mathematical_integers() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v7.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut slot_schema = serde_json::json!({"$ref": "#/$defs/inferred_size"});
+    slot_schema["$defs"] = schema_file["$defs"].clone();
+    let validator = jsonschema::options()
+        .build(&slot_schema)
+        .expect("v7 inferred-size schema builds");
+    for (name, detail) in [
+        (
+            "rsa_nonstandard",
+            serde_json::json!({
+                "kind": "rsa_nonstandard",
+                "modulus_bytes": 257.0,
+                "evidence": "sign_output",
+            }),
+        ),
+        (
+            "wrapped",
+            serde_json::json!({
+                "kind": "wrapped_material",
+                "material_octets": 24.0,
+                "octets": 32.0,
+                "evidence": "wrap_output",
+                "about": "wrapped",
+            }),
+        ),
+    ] {
+        let block = serde_json::json!({
+            "status": "inferred",
+            "detail": detail,
+            "completions": 1,
+        });
+        assert!(
+            validator.is_valid(&block),
+            "{name}: the schema accepts integral floats"
+        );
+    }
+}

@@ -612,6 +612,13 @@ def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
 
 
 def _check_size_detail(detail):
+    """One closed size detail (§10.2): per-kind required keys, enums
+    and evidence. Deliberate input-token rule: ranged integer fields
+    (rsa_nonstandard modulus_bytes, wrapped octets) demand integer
+    JSON tokens, while enum-constrained numerics use membership. The
+    Draft 2020-12 schema accepts mathematically-integral floats in
+    both positions; producer output uses integer tokens, so this rule
+    never refuses producer output."""
     _require(type(detail) is dict, "invalid size detail")
     _require("kind" in detail and "evidence" in detail,
              "size detail needs kind and evidence")

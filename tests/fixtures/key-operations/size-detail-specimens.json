@@ -1,0 +1,56 @@
+{
+  "_comment": "Shared size-detail specimens (§10.2): the same accepted and refused details run through `detail` and `conflict_detail` in both validators — the v7 schema's real `inferred_size` references (Rust twin) and the command-line checker (Python twin). Every `refused` specimen is refused by both validators in both slots; every `valid` specimen validates in both slots. Numeric spellings stay integer tokens: float spellings are a separate deliberate checker/schema divergence, pinned beside the twins, never in this table.",
+  "valid": {
+    "rsa": {
+      "kind": "rsa",
+      "size_class": 2048,
+      "modulus_bytes": 256,
+      "evidence": "sign_output"
+    },
+    "wrapped": {
+      "kind": "wrapped_material",
+      "material_octets": 24,
+      "octets": 32,
+      "evidence": "wrap_output",
+      "about": "wrapped"
+    }
+  },
+  "refused": {
+    "foreign field": {
+      "kind": "rsa",
+      "size_class": 2048,
+      "modulus_bytes": 256,
+      "evidence": "sign_output",
+      "curve": "ed25519"
+    },
+    "missing required": {
+      "kind": "rsa",
+      "size_class": 2048,
+      "evidence": "sign_output"
+    },
+    "bad evidence": {
+      "kind": "rsa",
+      "size_class": 2048,
+      "modulus_bytes": 256,
+      "evidence": "decapsulate_input"
+    },
+    "bad class": {
+      "kind": "rsa",
+      "size_class": 9,
+      "modulus_bytes": 256,
+      "evidence": "sign_output"
+    },
+    "bad curve": {
+      "kind": "ec",
+      "curve": "p999",
+      "octets": 64,
+      "evidence": "sign_output"
+    },
+    "cross-kind curve": {
+      "kind": "ec",
+      "curve": "ed25519",
+      "octets": 64,
+      "evidence": "sign_output"
+    }
+  }
+}

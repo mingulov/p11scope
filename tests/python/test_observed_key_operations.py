@@ -1012,10 +1012,13 @@ class ObservedRsaTests(unittest.TestCase):
             self.assertEqual(len(facts["gaps"]["rows"]), 2)
 
     def test_h9_v7_size_detail_closed_variants(self):
-        # Closed per-kind variants (§10.2): valid RSA and wrapped
+        # Closed per-kind variants (§10.2): the shared specimen table
+        # runs through both detail slots — valid RSA and wrapped
         # details qualify; a foreign field, a missing required field,
-        # an inappropriate evidence tag, an arbitrary class and an
-        # unconstrained curve do not — in both detail slots.
+        # an inappropriate evidence tag, an arbitrary class, an
+        # unconstrained curve and a cross-kind curve (which belongs to
+        # the outer vocabulary, so it tests the discriminator) do
+        # not. The same table drives the schema twin.
         section = observed("clean.json")
         section["version"] = 7
         section["unattributed"] = []
@@ -1043,39 +1046,89 @@ class ObservedRsaTests(unittest.TestCase):
                            "modulus_bytes": 256,
                            "evidence": "sign_output"},
                 "completions": 1}
-        good_wrapped = {"kind": "wrapped_material", "material_octets": 24,
-                        "octets": 32, "evidence": "wrap_output",
-                        "about": "wrapped"}
-        refused = {
-            "foreign field": {"kind": "rsa", "size_class": 2048,
-                              "modulus_bytes": 256,
-                              "evidence": "sign_output",
-                              "curve": "ed25519"},
-            "missing required": {"kind": "rsa", "size_class": 2048,
-                                 "evidence": "sign_output"},
-            "bad evidence": {"kind": "rsa", "size_class": 2048,
-                             "modulus_bytes": 256,
-                             "evidence": "decapsulate_input"},
-            "bad class": {"kind": "rsa", "size_class": 9,
-                          "modulus_bytes": 256,
-                          "evidence": "sign_output"},
-            "bad curve": {"kind": "ec", "curve": "p999", "octets": 64,
-                          "evidence": "sign_output"},
-        }
-        with self.subTest("valid wrapped qualifies in both slots"):
-            for slot in ("detail", "conflict_detail"):
-                mutated = copy.deepcopy(section)
-                mutated["key_operations"][0]["inferred_size"][slot] = dict(
-                    good_wrapped)
-                ORACLE.check_section(mutated)
+        with open(ROOT / "tests" / "fixtures" / "key-operations"
+                  / "size-detail-specimens.json",
+                  encoding="utf-8") as stream:
+            specimens = json.load(stream)
+        valid = specimens["valid"]
+        refused = specimens["refused"]
+        self.assertGreaterEqual(len(valid), 2)
+        self.assertGreaterEqual(len(refused), 6)
+        for label, detail in valid.items():
+            with self.subTest(f"valid {label} qualifies in both slots"):
+                for slot in ("detail", "conflict_detail"):
+                    mutated = copy.deepcopy(section)
+                    mutated["key_operations"][0][
+                        "inferred_size"][slot] = dict(detail)
+                    ORACLE.check_section(mutated)
         for label, detail in refused.items():
             for slot in ("detail", "conflict_detail"):
                 with self.subTest(f"{label} refused in {slot}"):
                     mutated = copy.deepcopy(section)
-                    mutated["key_operations"][0]["inferred_size"][slot] = dict(
-                        detail)
+                    mutated["key_operations"][0][
+                        "inferred_size"][slot] = dict(detail)
                     with self.assertRaises(ORACLE.OracleRefusal):
                         ORACLE.check_section(mutated)
+
+    def test_h9_v7_size_detail_checker_requires_integer_tokens(self):
+        # Deliberate input-token rule: the checker demands integer
+        # JSON tokens for ranged integer fields (rsa_nonstandard
+        # modulus_bytes, wrapped octets) while enum-constrained
+        # numerics use membership; the Draft 2020-12 schema accepts
+        # mathematically-integral floats in both positions (pinned
+        # schema-side). Producer output uses integer tokens, so the
+        # checker's rule never refuses producer output.
+        section = observed("clean.json")
+        section["version"] = 7
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for name, block in (("requested", row["requested"]),
+                                ("established", row["established"])):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None, "source": None,
+                                          "reason": None}
+                for cell_name, cell in block.items():
+                    if cell_name == "parameter_set":
+                        continue
+                    if name == "established" and cell["status"] == "value":
+                        cell["source"] = "query"
+                    else:
+                        cell["source"] = None
+                    cell["reason"] = None
+            row["queries"]["parameter_set"] = "not_queried"
+        for row in section["key_operations"]:
+            row["inferred_family"] = {"status": "inferred", "value": "rsa",
+                                      "completions": 1}
+            row["inferred_size"] = {
+                "status": "inferred",
+                "detail": {"kind": "rsa", "size_class": 2048,
+                           "modulus_bytes": 256,
+                           "evidence": "sign_output"},
+                "completions": 1}
+        ranged = {
+            "nonstandard modulus float":
+                {"kind": "rsa_nonstandard", "modulus_bytes": 257.0,
+                 "evidence": "sign_output"},
+            "wrapped octets float":
+                {"kind": "wrapped_material", "material_octets": 24.0,
+                 "octets": 32.0, "evidence": "wrap_output",
+                 "about": "wrapped"},
+        }
+        for label, detail in ranged.items():
+            for slot in ("detail", "conflict_detail"):
+                with self.subTest(f"{label} refused in {slot}"):
+                    mutated = copy.deepcopy(section)
+                    mutated["key_operations"][0][
+                        "inferred_size"][slot] = dict(detail)
+                    with self.assertRaises(ORACLE.OracleRefusal):
+                        ORACLE.check_section(mutated)
+        with self.subTest("enum-constrained integral float qualifies"):
+            for slot in ("detail", "conflict_detail"):
+                mutated = copy.deepcopy(section)
+                mutated["key_operations"][0]["inferred_size"][slot] = {
+                    "kind": "rsa", "size_class": 2048.0,
+                    "modulus_bytes": 256, "evidence": "sign_output"}
+                ORACLE.check_section(mutated)
 
     def test_h9_v1_refuses_v7_gaps(self):
         # Version-aware gap vocabulary: v7-only reasons qualify in v7

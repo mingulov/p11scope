@@ -8867,7 +8867,11 @@ fn retire_rendered_callers<Source: ProcessSource>(
     // streamed (or every caller when no log runs): a
     // folded-never-streamed edge or instance would leave the stream
     // silently incomplete. Unstreamed callers wait for the FIFO to
-    // serve them, then fold next pass.
+    // serve them, then fold next pass. Exit candidates gate on the
+    // exact terminal payload, never on a once-carried digest alone:
+    // a stale carried record with a queued exit revision must keep
+    // its row until the queued revision lands (the post-fold forget
+    // drops the digest and any queued update together).
     let foldable: Vec<crate::discovery::caller_registry::CallerId> = if stream.emits() {
         // One per-caller instance index per call, not one scan per
         // candidate: the registry holds instances in one map.
@@ -8881,17 +8885,68 @@ fn retire_rendered_callers<Source: ProcessSource>(
                 .or_default()
                 .push(record.id);
         }
+        // The emitted view's identity index, built once and only when
+        // an exit candidate exists: only proven-ended callers pay for
+        // exact payload comparisons.
+        let mut identities: Option<IdentityIndex<'_>> = None;
         ids.into_iter()
             .filter(|id| {
-                coordinator
-                    .registry()
-                    .edges_of(*id)
-                    .all(|edge| state.edges.has_record(*id, edge.module))
-                    && instances_by_caller.get(id).is_none_or(|members| {
-                        members
-                            .iter()
-                            .all(|instance| state.instances.has_record(*instance))
+                let candidate = coordinator.adapter().record(*id).is_some_and(|record| {
+                    record.retired
+                        && matches!(
+                            record.lifecycle,
+                            crate::discovery::caller_registry::CallerLifecycle::Exited
+                                | crate::discovery::caller_registry::CallerLifecycle::ExecRetired
+                        )
+                });
+                if !candidate {
+                    // Live rows cannot fold this pass; keep the
+                    // current once-streamed noting so the set still
+                    // reflects the view.
+                    return coordinator
+                        .registry()
+                        .edges_of(*id)
+                        .all(|edge| state.edges.has_record(*id, edge.module))
+                        && instances_by_caller.get(id).is_none_or(|members| {
+                            members
+                                .iter()
+                                .all(|instance| state.instances.has_record(*instance))
+                        });
+                }
+                let index = identities.get_or_insert_with(|| IdentityIndex::new(view));
+                coordinator.registry().edges_of(*id).all(|edge| {
+                    view.edges
+                        .binary_search_by_key(&(edge.caller, edge.module), |row| {
+                            (row.caller, row.module)
+                        })
+                        .ok()
+                        .is_some_and(|at| {
+                            state.edges.terminal_published(
+                                edge.caller,
+                                edge.module,
+                                &view.edges[at],
+                                index,
+                            )
+                        })
+                }) && instances_by_caller.get(id).is_none_or(|members| {
+                    members.iter().all(|instance| {
+                        let (Some(in_at), Some(edge_at)) = (
+                            view.instances
+                                .binary_search_by_key(instance, |row| row.id)
+                                .ok(),
+                            view.semantic_edges
+                                .binary_search_by_key(instance, |row| row.instance)
+                                .ok(),
+                        ) else {
+                            return false;
+                        };
+                        state.instances.terminal_published(
+                            *instance,
+                            &view.instances[in_at],
+                            &view.semantic_edges[edge_at],
+                        )
                     })
+                })
             })
             .collect()
     } else {

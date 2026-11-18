@@ -1470,6 +1470,27 @@ impl EdgeEmitter {
         self.digests.contains_key(&(caller, module))
     }
 
+    /// Whether the stream carries this edge's terminal payload: a
+    /// record exists, no update waits in the FIFO, and the carried
+    /// record's exact payload equals the current row. The departed
+    /// fold gates on this, never on [`Self::has_record`] alone: a
+    /// stale carried digest with a queued exit revision must keep
+    /// its row until the queued revision lands.
+    pub(crate) fn terminal_published(
+        &self,
+        caller: CallerId,
+        module: ModuleId,
+        edge: &EdgeView,
+        identities: &IdentityIndex<'_>,
+    ) -> bool {
+        let key = (caller, module);
+        !self.queued.contains(&key)
+            && self
+                .digests
+                .get(&key)
+                .is_some_and(|digest| digest.exact == self.digest(&edge_payload(edge, identities)))
+    }
+
     /// Drop a folded edge's digest and queued keys: its rows left the
     /// snapshot, so no later emission may reference it and its bytes
     /// leave the retention bound. Queued keys drop silently (their
@@ -1873,6 +1894,28 @@ impl InstanceEmitter {
         self.digests
             .get(&id)
             .is_some_and(|digest| digest.instance.is_some() && digest.edge.is_some())
+    }
+
+    /// Whether the stream carries this instance's terminal payloads:
+    /// neither row waits in the FIFO and both carried slots' exact
+    /// payloads equal the current rows. The departed fold gates on
+    /// this, never on [`Self::has_record`] alone: a stale carried
+    /// row with a queued terminal revision must keep its caller.
+    pub(crate) fn terminal_published(
+        &self,
+        id: RegistryInstanceId,
+        instance: &InstanceView,
+        edge: &InstanceSemanticView,
+    ) -> bool {
+        !self.queued.contains(&(id, InstanceKind::Instance))
+            && !self.queued.contains(&(id, InstanceKind::Edge))
+            && self.digests.get(&id).is_some_and(|digest| {
+                digest.instance.as_ref().is_some_and(|row| {
+                    row.exact == self.digest(&crate::inventory::instance_json(instance))
+                }) && digest.edge.as_ref().is_some_and(|row| {
+                    row.exact == self.digest(&crate::inventory::instance_semantic_json(edge))
+                })
+            })
     }
 
     /// Drop a folded instance's digest and queued keys: its rows left

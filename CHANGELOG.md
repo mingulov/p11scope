@@ -116,6 +116,11 @@ versioned separately and are opaque, exact dispatch keys.
   recycles with the caller slots instead of refusing the 4,097th
   admission; a retained sealed gap pins its row until the normal
   finalizer drains it, and late receipts for a folded caller refuse.
+- The streaming fold waits for each exiting edge and instance row's
+  exact terminal payload instead of folding on a once-carried
+  digest: a queued exit revision keeps its row until the FIFO
+  carries it, so the event stream never ends with a stale count and
+  no loss marker.
 
 ## [0.7.1] - 2026-11-17
 

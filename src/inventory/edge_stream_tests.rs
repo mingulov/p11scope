@@ -6,10 +6,12 @@
 //! per edge bounded by the edge limit, and a replay equal to the snapshot.
 
 use super::*;
-use crate::discovery::caller_registry::{CallerId, CoverageNote, ModuleKey, RegistryLimits};
+use crate::discovery::caller_registry::{
+    CallerId, CoverageNote, ImageAuthority, ModuleKey, RegistryLimits,
+};
 use crate::discovery::engine::inventory_coordinator::PassReport;
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
-use crate::inventory_events::{EDGE_EVENTS_PER_PASS, EdgeEmitter, edge_payload};
+use crate::inventory_events::{EDGE_EVENTS_PER_PASS, EdgeEmitter, InstanceEmitter, edge_payload};
 use crate::inventory_present::EdgeView;
 
 const FIRST_PID: u32 = 91_000;
@@ -1704,4 +1706,287 @@ fn finish_with_fitting_stale_selection_discloses_nothing() {
         ended["key_operations_unretained"], 0,
         "a fitting selection discloses nothing"
     );
+}
+
+// ==================== v0.7.2 F3: fold waits for terminal rows ====================
+
+/// Kill one harness pid through the production reconcile path.
+fn kill_pid(harness: &mut Harness, pid: u32, survivors: &[u32]) {
+    harness.source().kill(pid);
+    let observed: BTreeSet<u32> = survivors.iter().copied().collect();
+    let now = harness.now_ns();
+    let events = harness.coordinator_mut().adapter_mut().reconcile(
+        &observed,
+        &mut |_| ImageAuthority::ScanPinned,
+        now,
+    );
+    harness
+        .coordinator_mut()
+        .apply_reconcile_events(&events, now);
+    harness.advance(10);
+}
+
+/// F3 edge twin: a small-cap FIFO defers an exited edge's terminal
+/// update. The fold must wait for the queued exit revision — folding
+/// on the stale carried digest would drop the terminal update and
+/// leave the stream with a stale count and no loss marker. Entry
+/// counts ride on the captured views (the emitter and the gate both
+/// read views; the registry carries row existence), so the terminal
+/// revision is exact without BPF realism.
+#[test]
+fn fold_waits_for_deferred_exit_update_before_folding_edge() {
+    use crate::inventory_present::Presence;
+    let mut harness = harness(2, 1);
+    let exiting_pid = FIRST_PID + 1;
+    let exiting = caller(&harness, 1);
+    let ahead = caller(&harness, 0);
+    assert!(ahead < exiting, "the live edge queues ahead of the exit");
+
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
+    let mut state = StreamState::new();
+    state.edges = EdgeEmitter::with_cap(1);
+    // Pass 1 carries the initial rows: the exiting edge at 2 entries.
+    let mut pass1 = presentation(&harness);
+    for edge in &mut pass1.edges {
+        if edge.caller == exiting {
+            edge.entry_count = 2;
+        }
+    }
+    emit_pass_events(&mut writer, &mut state, &report(1), &pass1, 1).unwrap();
+    assert_eq!(state.last_deferred.edge_events, 1);
+    emit_pass_events(&mut writer, &mut state, &report(2), &pass1, 2).unwrap();
+    assert_eq!(state.last_deferred.edge_events, 0, "both rows carried");
+
+    // The exit: the caller dies, its edge reaches its terminal
+    // revision (exit presence, 3 entries), and the live edge bumps
+    // across a count bucket so both rows are due with the live row
+    // ahead in FIFO order.
+    kill_pid(&mut harness, exiting_pid, &[FIRST_PID]);
+    assert!(
+        harness
+            .coordinator()
+            .adapter()
+            .record(exiting)
+            .is_some_and(|record| record.retired),
+        "production reconcile retires the dead pid"
+    );
+    let mut pass2 = presentation(&harness);
+    assert_eq!(
+        pass2
+            .edges
+            .iter()
+            .find(|edge| edge.caller == exiting)
+            .expect("exited edge retained")
+            .presence,
+        Presence::ProcessExited,
+        "the exit flips presence"
+    );
+    for edge in &mut pass2.edges {
+        if edge.caller == exiting {
+            edge.entry_count = 3;
+        } else {
+            edge.entry_count = 1;
+        }
+    }
+    emit_pass_events(&mut writer, &mut state, &report(3), &pass2, 3).unwrap();
+    assert_eq!(
+        state.last_deferred.edge_events, 1,
+        "the exit update waits behind the cap"
+    );
+
+    // The fold must wait: the terminal exit revision is still queued.
+    state.last_stream_view = Some(std::sync::Arc::new(pass2));
+    let dummy = dir.path().join("dummy.jsonl");
+    let stream = EventLogState::new(Some(EventWriter::create(&dummy, 1 << 20, 2).unwrap()));
+    assert!(stream.emits(), "the gate runs on the streaming path");
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(exiting).is_some(),
+        "the fold waits for the queued exit revision"
+    );
+
+    // The next pass drains the terminal revision with the same
+    // terminal rows; then the fold runs.
+    let mut pass3 = presentation(&harness);
+    for edge in &mut pass3.edges {
+        if edge.caller == exiting {
+            edge.entry_count = 3;
+        } else {
+            edge.entry_count = 1;
+        }
+    }
+    emit_pass_events(&mut writer, &mut state, &report(4), &pass3, 4).unwrap();
+    assert_eq!(
+        state.last_deferred.edge_events, 0,
+        "the exit revision drains"
+    );
+    state.last_stream_view = Some(std::sync::Arc::new(pass3));
+    let carried_before = state.edges.carried_bytes();
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(exiting).is_none(),
+        "the published terminal revision folds"
+    );
+    drop(writer);
+
+    // The stream alone proves the terminal count and the retention
+    // accounting: FIFO order with the exit revision last, pass
+    // markers naming the deferral, and the folded digest leaving the
+    // retention bound.
+    let all = lines(&path);
+    let counts: Vec<u64> = all
+        .iter()
+        .filter(|line| line["kind"] == "edge_observed")
+        .map(|line| line["event"]["entries"]["count"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        counts,
+        vec![0, 2, 1, 3],
+        "FIFO order with the terminal revision last"
+    );
+    assert_eq!(pass_lines(&all, 3).1["edge_events_deferred"], 1);
+    assert_eq!(pass_lines(&all, 4).1["edge_events_deferred"], 0);
+    assert_eq!(state.edges.tracked_len(), 1, "one live digest retained");
+    assert!(
+        state.edges.carried_bytes() < carried_before,
+        "the folded digest leaves the retention bound"
+    );
+}
+
+/// F3 instance twin: the same small-cap deferral for the two instance
+/// rows. The instance row drains first, its semantic revision waits,
+/// and the fold must wait for it: the stream's last records must be
+/// the terminal revisions of both rows.
+#[test]
+fn fold_waits_for_deferred_instance_rows_before_folding_caller() {
+    use crate::attach::capture::NativeDomainId;
+    use crate::discovery::caller_registry::instance_input::{AdmittedInstance, InstanceKey};
+    use crate::discovery::instances::InstanceId;
+    use p11scope_ebpf_common::ImageIdentity;
+    let mut harness = harness(1, 1);
+    let exiting_pid = FIRST_PID;
+    let exiting = caller(&harness, 0);
+    let domain = NativeDomainId::try_mint().expect("fresh domain");
+    let module = key(99);
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .scripted_module_edge(module.clone(), exiting);
+    let instance_key = InstanceKey::scripted(
+        domain,
+        ImageIdentity {
+            task_cookie: 300,
+            exec_id: 1,
+        },
+        InstanceId::from_raw(7),
+        module,
+    );
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_instance(AdmittedInstance::scripted(instance_key, exiting));
+    harness.coordinator_mut().registry_mut().publish();
+
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
+    let mut state = StreamState::new();
+    state.instances = InstanceEmitter::with_cap(1);
+    let pass1 = presentation(&harness);
+    assert_eq!(pass1.instances.len(), 1, "the instance row renders");
+    assert_eq!(pass1.semantic_edges.len(), 1, "the semantic row renders");
+    emit_pass_events(&mut writer, &mut state, &report(1), &pass1, 1).unwrap();
+    emit_pass_events(&mut writer, &mut state, &report(2), &pass1, 2).unwrap();
+    assert_eq!(state.last_deferred.instance_events, 0);
+    assert_eq!(
+        state.last_deferred.semantic_edge_events, 0,
+        "both rows carried"
+    );
+
+    // The exit with a final semantic revision: both rows change, the
+    // instance row writes first, the semantic revision waits behind
+    // the cap.
+    kill_pid(&mut harness, exiting_pid, &[]);
+    let mut pass2 = presentation(&harness);
+    assert_eq!(pass2.instances.len(), 1, "the instance row survives");
+    let terminal_seen = pass2.instances[0].last_seen_ns + 1;
+    for row in &mut pass2.instances {
+        row.last_seen_ns = terminal_seen;
+    }
+    for row in &mut pass2.semantic_edges {
+        row.api_returns = Some(row.api_returns.unwrap_or(0) + 5);
+    }
+    emit_pass_events(&mut writer, &mut state, &report(3), &pass2, 3).unwrap();
+    assert_eq!(
+        state.last_deferred.instance_events, 0,
+        "the instance row drains"
+    );
+    assert_eq!(
+        state.last_deferred.semantic_edge_events, 1,
+        "the semantic revision waits behind the cap"
+    );
+
+    // The fold must wait for the queued semantic revision.
+    state.last_stream_view = Some(std::sync::Arc::new(pass2));
+    let dummy = dir.path().join("dummy.jsonl");
+    let stream = EventLogState::new(Some(EventWriter::create(&dummy, 1 << 20, 2).unwrap()));
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(exiting).is_some(),
+        "the fold waits for the queued semantic revision"
+    );
+
+    // The next pass drains the terminal semantic revision with the
+    // same terminal rows; then the fold runs.
+    let mut pass3 = presentation(&harness);
+    for row in &mut pass3.instances {
+        row.last_seen_ns = terminal_seen;
+    }
+    for row in &mut pass3.semantic_edges {
+        row.api_returns = Some(5);
+    }
+    emit_pass_events(&mut writer, &mut state, &report(4), &pass3, 4).unwrap();
+    assert_eq!(state.last_deferred.semantic_edge_events, 0);
+    state.last_stream_view = Some(std::sync::Arc::new(pass3));
+    let now = harness.now_ns();
+    retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert!(
+        harness.coordinator().adapter().record(exiting).is_none(),
+        "the published terminal revisions fold"
+    );
+    drop(writer);
+
+    // The stream alone proves both terminal revisions: the last
+    // record of each row kind carries the terminal payload, and the
+    // folded digest leaves the retention bound.
+    let all = lines(&path);
+    let last_instance = all
+        .iter()
+        .filter(|line| line["kind"] == "instance_observed")
+        .last()
+        .expect("instance records streamed");
+    assert_eq!(
+        last_instance["event"]["last_seen_ns"].as_u64().unwrap(),
+        terminal_seen,
+        "the terminal instance revision streams last"
+    );
+    let last_semantic = all
+        .iter()
+        .filter(|line| line["kind"] == "semantic_edge_observed")
+        .last()
+        .expect("semantic records streamed");
+    assert_eq!(
+        last_semantic["event"]["api_returns"]["count"]
+            .as_u64()
+            .unwrap(),
+        5,
+        "the terminal semantic revision streams last"
+    );
+    assert_eq!(pass_lines(&all, 3).1["edge_events_deferred"], 0);
+    assert_eq!(state.instances.tracked_len(), 0, "no digest retained");
 }

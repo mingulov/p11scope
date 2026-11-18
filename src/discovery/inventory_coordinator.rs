@@ -24874,9 +24874,17 @@ exit 0
     #[test]
     fn stopped_retirement_folds_nothing_and_resumes() {
         let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
         let mut ids = Vec::new();
         for caller in 0..8u32 {
-            ids.push(stage_exited_caller(&mut native, 5020 + caller, 100));
+            let id = stage_exited_caller(&mut native, 5020 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
         }
         native.scene.coordinator.note_rendered_callers(&ids);
         native.scene.coordinator.stopped = true;
@@ -24895,6 +24903,20 @@ exit 0
                 "every row waits out the stop"
             );
         }
+        // The stop gate is pure: no re-queued row loses its binder
+        // evidence before its own fold runs.
+        let mut owners = native
+            .scene
+            .coordinator
+            .binder
+            .cookie_bound_owners_for_test();
+        owners.sort();
+        let mut waiting = ids.clone();
+        waiting.sort();
+        assert_eq!(
+            owners, waiting,
+            "every waiting row keeps its cookie binding"
+        );
         native.scene.coordinator.stopped = false;
         assert_eq!(
             native
@@ -24905,6 +24927,15 @@ exit 0
             8,
             "clearing the stop resumes without a re-note"
         );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "the resumed fold clears every cookie exactly once"
+        );
     }
 
     /// F5 credit twin: the fold carries bounded credits per
@@ -24913,9 +24944,17 @@ exit 0
     #[test]
     fn fold_credit_cap_resumes_across_publications() {
         let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
         let mut ids = Vec::new();
         for caller in 0..1100u32 {
-            ids.push(stage_exited_caller(&mut native, 5030 + caller, 100));
+            let id = stage_exited_caller(&mut native, 5030 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
         }
         native.scene.coordinator.note_rendered_callers(&ids);
         assert_eq!(
@@ -24926,6 +24965,26 @@ exit 0
                 .retired,
             1024,
             "the first publication folds its credits"
+        );
+        // The credit gate is pure: the re-queued remainder keeps its
+        // binder evidence until its own fold runs, including the
+        // boundary caller that straddles the cap.
+        let mut remainder: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| native.scene.coordinator.adapter.record(*id).is_some())
+            .collect();
+        remainder.sort();
+        assert_eq!(remainder.len(), 76, "the cap leaves 76 rows waiting");
+        let mut owners = native
+            .scene
+            .coordinator
+            .binder
+            .cookie_bound_owners_for_test();
+        owners.sort();
+        assert_eq!(
+            owners, remainder,
+            "every waiting row keeps its cookie binding"
         );
         assert_eq!(
             native
@@ -24942,6 +25001,15 @@ exit 0
                 "every row eventually folds"
             );
         }
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "the resumed fold clears every cookie exactly once"
+        );
     }
 
     /// Twin: an exec newcomer the next pass enumerates and admits is

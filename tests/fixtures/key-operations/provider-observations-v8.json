@@ -95,6 +95,22 @@
       {
         "reason": "mechanism_info_refused",
         "count": 3
+      },
+      {
+        "reason": "info_token_rows_refused",
+        "count": 1
+      },
+      {
+        "reason": "info_mechanism_rows_refused",
+        "count": 2
+      },
+      {
+        "reason": "info_token_departed_folded",
+        "count": 3
+      },
+      {
+        "reason": "info_mechanism_departed_folded",
+        "count": 4
       }
     ]
   }

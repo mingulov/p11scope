@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://p11scope/inventory/v1-object-observations-v8.schema.json",
   "title": "p11scope/inventory/v1 Task 7 provider/token/mechanism section (version 8)",
-  "description": "Consumer contract for section version 8 (v0.8.0 keymeta Task 7, spec section 17.5; the v8 number comes from the shared section-version allocator, spec section 10.1, and versions 1-7 stay frozen). Covers the per-module provider_info key on modules[] rows (see #/$defs/provider_info) and the top-level provider_observations section: per-(module, caller, slot) token rows, per-(module, caller, slot, mechanism) mechanism rows with raw mechanism-dependent limit numbers, and the four named gap counters. The section is emitted exactly when Task 7 content is present. Every object is closed: additionalProperties is false at every level, and every enum is exact. There are no keys for excluded bytes anywhere: no serial number, token label, session count, memory size or clock reading key exists in this contract. Rows carry module + caller references resolving in modules[]/edges[]; the instance id rides a row only when the semantic lane proved it, never synthesized. Row counters are cumulative within their row: completions counts polls, changes counts value transitions (first observation sets the value with changes 0); repeats are last-wins, never second entries and never merges.",
+  "description": "Consumer contract for section version 8 (v0.8.0 keymeta Task 7, spec section 17.5; the v8 number comes from the shared section-version allocator, spec section 10.1, and versions 1-7 stay frozen). Covers the per-module provider_info key on modules[] rows (see #/$defs/provider_info) and the top-level provider_observations section: per-(module, caller, slot) token rows, per-(module, caller, slot, mechanism) mechanism rows with raw mechanism-dependent limit numbers, and the eight named gap counters. The section is emitted exactly when Task 7 content is present. Every object is closed: additionalProperties is false at every level, and every enum is exact. There are no keys for excluded bytes anywhere: no serial number, token label, session count, memory size or clock reading key exists in this contract. Rows carry module + caller references resolving in modules[]/edges[]; the instance id rides a row only when the semantic lane proved it, never synthesized. Row counters are cumulative within their row: completions counts polls, changes counts value transitions (first observation sets the value with changes 0); repeats are last-wins, never second entries and never merges.",
   "type": "object",
   "required": [
     "version",
@@ -270,7 +270,11 @@
             "info_aliased_endpoint",
             "info_return_deferred",
             "info_caller_unavailable",
-            "mechanism_info_refused"
+            "mechanism_info_refused",
+            "info_token_rows_refused",
+            "info_mechanism_rows_refused",
+            "info_token_departed_folded",
+            "info_mechanism_departed_folded"
           ]
         },
         "count": {

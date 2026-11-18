@@ -585,6 +585,21 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "missing".to_string())
         );
+        // One device per (module, slot, token identity): callers
+        // reporting the same token share it, while a conflicting
+        // identity on the same slot keeps its own device (slot ids
+        // are per-process).
+        let mut seen_tokens: BTreeSet<(
+            String,
+            u64,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            u64,
+            u64,
+            u64,
+        )> = BTreeSet::new();
         for row in arr_of(section, "tokens") {
             let (Some(module), Some(caller)) = (
                 row.get("module").and_then(str_of),
@@ -615,12 +630,27 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             else {
                 continue;
             };
-            let mut parts = Vec::new();
-            if let Some(manufacturer) = row.get("manufacturer").and_then(str_of) {
-                parts.push(manufacturer.to_string());
+            let manufacturer = row.get("manufacturer").and_then(str_of).map(str::to_string);
+            let model = row.get("model").and_then(str_of).map(str::to_string);
+            if !seen_tokens.insert((
+                module.to_string(),
+                slot,
+                manufacturer.clone(),
+                model.clone(),
+                hardware.clone(),
+                firmware.clone(),
+                flags,
+                pin_min,
+                pin_max,
+            )) {
+                continue;
             }
-            if let Some(model) = row.get("model").and_then(str_of) {
-                parts.push(model.to_string());
+            let mut parts = Vec::new();
+            if let Some(manufacturer) = &manufacturer {
+                parts.push(manufacturer.clone());
+            }
+            if let Some(model) = &model {
+                parts.push(model.clone());
             }
             let name = if parts.is_empty() {
                 format!("token slot {slot}")

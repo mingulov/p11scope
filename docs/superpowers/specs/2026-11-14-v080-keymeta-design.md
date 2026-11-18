@@ -2593,7 +2593,15 @@ Repeat rule (apps poll; flags change; tokens swap): last-wins per
 token inserted into the same slot is last-wins plus one `changes`
 bump — never a second entry, never a merge. Per-slot caps: tokens
 are 1 per (module, caller, slot) by construction; mechanisms 128
-per (module, caller, slot) (above).
+per (module, caller, slot) (above). Run-wide caps: 4096 token
+rows and 32768 mechanism rows (mirroring the retained-table
+caller/edge bounds); new rows past either refuse with the named
+counted `info_token_rows_refused` / `info_mechanism_rows_refused`
+gap while re-polls of kept rows still complete. A departed
+caller's rows fold like `departed_use`: they retire with the
+named counted `info_token_departed_folded` /
+`info_mechanism_departed_folded` gaps (row counts only — values
+never merge across callers, since slot ids are per-process).
 
 Join (fix8 C2, identity fixed by fix9 R2): info record →
 (module via endpoint id, caller incarnation via the header's
@@ -2620,8 +2628,11 @@ new field marks it.
 Gaps surfaced in this section, all named and counted:
 `info_aliased_endpoint` (per endpoint, §17.4),
 `info_return_deferred` (per endpoint/group, §17.4),
-`info_caller_unavailable` (per refused row, §17.4) and the
-`mechanism_info_refused: too_many` cap counter above.
+`info_caller_unavailable` (per refused row, §17.4),
+`mechanism_info_refused: too_many` (the 128-per-slot cap),
+`info_token_rows_refused` / `info_mechanism_rows_refused` (the
+run-wide caps) and `info_token_departed_folded` /
+`info_mechanism_departed_folded` (departed-caller folding).
 
 Text: concise gains one provider line only where Task 7 content
 exists (byte-stable otherwise), pinned wording:
@@ -2641,10 +2652,13 @@ section, CycloneDX 1.6 per `src/inventory/cbom/render.rs:22`): the existing
 (`src/inventory/cbom/render.rs:169-170`, still `provider.name`)
 and gains `supplier` as an OBJECT (`{"name": <manufacturerID>}`
 — CycloneDX 1.6 `supplier` is an OrganizationalEntity, never a
-string) plus `version` (`<libraryVersion>`); each token projects
-to a `type: device` component named `<manufacturerID> <model>`
+string) plus `version` (`<libraryVersion>`); tokens dedup to one
+`type: device` component per (module, slot, token identity)
+named `<manufacturerID> <model>`
 with hardware/firmware versions, flags and PIN lens in
-`properties[]`, linked to its library via `dependencies[]`.
+`properties[]`, linked to its library via `dependencies[]`
+(callers reporting the same token share the device; a
+conflicting identity on the same slot keeps its own).
 Per-slot mechanism limits map onto the global-per-id
 `type: cryptographic-asset` algorithm components
 (`src/inventory/cbom/input.rs:94-104`, no slot key) by reporter
@@ -2724,7 +2738,11 @@ re-polled token (same value → `completions` bump only; changed
 flags → `changes` bump; swapped token → last-wins + `changes`
 bump, single entry); cap twin: the 129th mechanism on a
 (module, caller, slot) refuses with the named reason while the
-first 128 stand; units
+first 128 stand; run-wide twins: the 4097th token row and the
+32769th mechanism row refuse with the named run-wide reasons
+while re-polls of kept rows still complete; fold twin: folding
+a departed caller retires only its rows with the named folded
+counts; units
 twin: mechanism limits render as raw numbers with no "bits"
 wording anywhere; escape twin: ESC/C1 bytes in provider strings
 are escaped in text, raw in JSON; CBOM twins: no serial key in

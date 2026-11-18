@@ -856,12 +856,12 @@ fn native_semantic_resource_final_types_pinned() {
     );
     pin!(crate::inventory_semantics::SemanticCaptureSummary, 48);
     // Task 7 provider/token/mechanism projection: two row Vecs
-    // (tokens, mechanisms) plus the four u64 section gaps
-    // (2 x 24 + 4 x 8 = 80 B, niche-filled inline).
-    pin!(crate::inventory_provider_info::ProviderObservations, 80);
+    // (tokens, mechanisms) plus the eight u64 section gaps
+    // (2 x 24 + 8 x 8 = 112 B, niche-filled inline).
+    pin!(crate::inventory_provider_info::ProviderObservations, 112);
     pin!(
         Option<crate::inventory_provider_info::ProviderObservations>,
-        80
+        112
     );
     // +24 (c9e1dd977): one inline Vec of pre-arm interval rows, one row
     // per `--prearm-module` input; the pin was never re-measured for it.
@@ -894,6 +894,9 @@ fn native_semantic_resource_final_types_pinned() {
     // inline (2 x 24 + 4 x 8). The per-module
     // `modules[].provider_info` rides the modules Vec and adds no
     // inline byte here.
+    // +32 (Task 7 run-wide bounds): four more u64 section gaps —
+    // run-wide token/mechanism refusals and departed-caller folds
+    // (2 x 24 + 8 x 8 = 112).
     pin!(
         crate::inventory_present::Presentation,
         1384 + size_of::<crate::inventory_present::PresentationRenderIndex>()

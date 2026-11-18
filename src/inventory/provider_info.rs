@@ -48,6 +48,14 @@ pub(crate) const INFO_STATUS_UNAVAILABLE: u8 = 1;
 pub(crate) const INFO_STRING_NON_UTF8: &str = "non_utf8_bytes";
 /// Mechanism rows kept per (module, caller, slot); extras refuse.
 pub(crate) const INFO_MAX_MECHANISMS_PER_SLOT: usize = 128;
+/// Token rows kept run-wide; new rows past this refuse with the
+/// named `info_token_rows_refused` gap. Mirrors the retained-table
+/// caller/module bound (`DEFAULT_MAX_CALLERS`).
+pub(crate) const INFO_MAX_TOKEN_ROWS: usize = 4096;
+/// Mechanism rows kept run-wide beside the per-slot cap; new rows
+/// past this refuse with the named `info_mechanism_rows_refused`
+/// gap. Mirrors the retained-table edge bound (`DEFAULT_MAX_EDGES`).
+pub(crate) const INFO_MAX_MECHANISM_ROWS: usize = 32768;
 /// Section version of the Task 7 projection (spec §10.1 allocator).
 pub(crate) const PROVIDER_OBSERVATIONS_VERSION: u8 = 8;
 
@@ -397,6 +405,10 @@ pub(crate) struct ProviderGaps {
     pub return_deferred: u64,
     pub caller_unavailable: u64,
     pub mechanism_refused: u64,
+    pub tokens_refused: u64,
+    pub mechanisms_refused: u64,
+    pub tokens_departed: u64,
+    pub mechanisms_departed: u64,
 }
 
 /// The joined Task 7 projection (top-level section content).
@@ -422,7 +434,8 @@ fn split_string(parsed: Result<String, &'static str>) -> (Option<String>, Option
 
 /// The (module, caller, slot[, mechanism]) join (spec §17.5):
 /// last-wins repeats with completions/changes, per-process slot
-/// separation, the 128-mechanism cap and the named gaps.
+/// separation, the 128-mechanism per-slot cap, the run-wide row
+/// caps, departed-caller folding and the named gaps.
 pub(crate) struct InfoJoin {
     providers: BTreeMap<ModuleId, ProviderInfo>,
     tokens: BTreeMap<(ModuleId, CallerId, u64), TokenRow>,
@@ -450,6 +463,29 @@ impl InfoJoin {
     /// (attach-side count).
     pub(crate) fn note_return_deferred(&mut self) {
         self.gaps.return_deferred = self.gaps.return_deferred.saturating_add(1);
+    }
+
+    /// Fold one departed caller's rows, like the caller registry
+    /// folds departed edges into `departed_use`: the rows retire and
+    /// their counts land in the named departed gaps. Rows of live
+    /// callers never merge (slot ids are per-process), so values
+    /// leave with the row and only the folded row counts survive.
+    /// Missing callers fold nothing and count nothing.
+    pub(crate) fn fold_departed_caller(&mut self, caller: CallerId) {
+        let tokens_before = self.tokens.len();
+        self.tokens.retain(|key, _| key.1 != caller);
+        let tokens_folded = tokens_before.saturating_sub(self.tokens.len());
+        self.gaps.tokens_departed = self
+            .gaps
+            .tokens_departed
+            .saturating_add(tokens_folded as u64);
+        let mechanisms_before = self.mechanisms.len();
+        self.mechanisms.retain(|key, _| key.1 != caller);
+        let mechanisms_folded = mechanisms_before.saturating_sub(self.mechanisms.len());
+        self.gaps.mechanisms_departed = self
+            .gaps
+            .mechanisms_departed
+            .saturating_add(mechanisms_folded as u64);
     }
 
     /// Fold one decoded record (with drain-resolved module, caller
@@ -489,30 +525,32 @@ impl InfoJoin {
                     self.gaps.caller_unavailable = self.gaps.caller_unavailable.saturating_add(1);
                     return;
                 }
+                let key = (module, caller, record.slot);
+                if !self.tokens.contains_key(&key) && self.tokens.len() >= INFO_MAX_TOKEN_ROWS {
+                    self.gaps.tokens_refused = self.gaps.tokens_refused.saturating_add(1);
+                    return;
+                }
                 let (manufacturer, manufacturer_reason) = split_string(values.manufacturer);
                 let (model, model_reason) = split_string(values.model);
-                let row = self
-                    .tokens
-                    .entry((module, caller, record.slot))
-                    .or_insert_with(|| TokenRow {
-                        module,
-                        caller,
-                        slot: record.slot,
-                        manufacturer: None,
-                        manufacturer_reason: None,
-                        model: None,
-                        model_reason: None,
-                        hardware_major: 0,
-                        hardware_minor: 0,
-                        firmware_major: 0,
-                        firmware_minor: 0,
-                        flags: 0,
-                        pin_min_len: 0,
-                        pin_max_len: 0,
-                        completions: 0,
-                        changes: 0,
-                        instance: None,
-                    });
+                let row = self.tokens.entry(key).or_insert_with(|| TokenRow {
+                    module,
+                    caller,
+                    slot: record.slot,
+                    manufacturer: None,
+                    manufacturer_reason: None,
+                    model: None,
+                    model_reason: None,
+                    hardware_major: 0,
+                    hardware_minor: 0,
+                    firmware_major: 0,
+                    firmware_minor: 0,
+                    flags: 0,
+                    pin_min_len: 0,
+                    pin_max_len: 0,
+                    completions: 0,
+                    changes: 0,
+                    instance: None,
+                });
                 row.completions = row.completions.saturating_add(1);
                 let changed = row.manufacturer != manufacturer
                     || row.manufacturer_reason != manufacturer_reason
@@ -563,6 +601,11 @@ impl InfoJoin {
                         .count();
                     if slot_reporters >= INFO_MAX_MECHANISMS_PER_SLOT {
                         self.gaps.mechanism_refused = self.gaps.mechanism_refused.saturating_add(1);
+                        return;
+                    }
+                    if self.mechanisms.len() >= INFO_MAX_MECHANISM_ROWS {
+                        self.gaps.mechanisms_refused =
+                            self.gaps.mechanisms_refused.saturating_add(1);
                         return;
                     }
                 }
@@ -773,6 +816,19 @@ pub(crate) fn provider_observations_json(observations: &ProviderObservations) ->
         (
             "mechanism_info_refused",
             observations.gaps.mechanism_refused,
+        ),
+        ("info_token_rows_refused", observations.gaps.tokens_refused),
+        (
+            "info_mechanism_rows_refused",
+            observations.gaps.mechanisms_refused,
+        ),
+        (
+            "info_token_departed_folded",
+            observations.gaps.tokens_departed,
+        ),
+        (
+            "info_mechanism_departed_folded",
+            observations.gaps.mechanisms_departed,
         ),
     ] {
         if count > 0 {

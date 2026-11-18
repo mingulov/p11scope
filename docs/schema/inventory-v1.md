@@ -1446,7 +1446,14 @@ when Task 7 content is present, in default inventory as well as under
   numbers are the raw `CK_MECHANISM_INFO` words (bits or bytes,
   mechanism-dependent), never a unit claim. At most 128 rows per
   (module, caller, slot); extras refuse with the
-  `mechanism_info_refused` gap counter.
+  `mechanism_info_refused` gap counter. Run-wide, at most 4096
+  token rows and 32768 mechanism rows; new rows past either
+  refuse with the `info_token_rows_refused` /
+  `info_mechanism_rows_refused` gap counters while re-polls of
+  kept rows still complete. A departed caller's rows fold with
+  the `info_token_departed_folded` /
+  `info_mechanism_departed_folded` gap counters (row counts only;
+  values never merge across callers).
 - Repeat rule: last-wins per key. `completions` counts polls;
   `changes` counts value transitions (first observation sets the
   value with `changes: 0`). A different token in the same slot is
@@ -1458,8 +1465,11 @@ when Task 7 content is present, in default inventory as well as under
   endpoint whose slot set is not exactly one info function keeps
   its usage entry), `info_return_deferred` (an EMFILE-deferred info
   return link), `info_caller_unavailable` (a refused row whose
-  caller identity the return could not obtain) and
-  `mechanism_info_refused` (the 128-row cap).
+  caller identity the return could not obtain),
+  `mechanism_info_refused` (the 128-row per-slot cap),
+  `info_token_rows_refused` / `info_mechanism_rows_refused`
+  (the run-wide row caps) and `info_token_departed_folded` /
+  `info_mechanism_departed_folded` (departed-caller folding).
 - Padded fixed-width strings publish trimmed (trailing spaces and
   NULs removed, truncated at the first embedded NUL; all-spaces
   publishes as the empty string). A non-UTF8 field reads `null`

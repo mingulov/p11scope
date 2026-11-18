@@ -35,6 +35,7 @@ use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, Prea
 use crate::render::escape_controls;
 use crate::semantics_edge::resources::SemanticResourceSnapshot;
 use crate::semantics_edge::{EdgeEvidence, EdgeSemantics, S1Occupancy};
+use std::collections::BTreeMap;
 
 #[path = "present/render_index.rs"]
 mod render_index;
@@ -4042,23 +4043,38 @@ fn render_concise_caller_scope_lines(out: &mut String, presentation: &Presentati
 fn render_provider_info_lines(out: &mut String, presentation: &Presentation, verbose: bool) {
     use std::fmt::Write as _;
     let observations = presentation.provider_observations.as_ref();
+    // Group rows by module once so every per-module render below is
+    // linear in its own rows.
+    let mut tokens_by_module: BTreeMap<ModuleId, Vec<&crate::inventory_provider_info::TokenRow>> =
+        BTreeMap::new();
+    let mut mechanisms_by_module: BTreeMap<
+        ModuleId,
+        Vec<&crate::inventory_provider_info::MechanismRow>,
+    > = BTreeMap::new();
+    if let Some(observations) = observations {
+        for row in &observations.tokens {
+            tokens_by_module.entry(row.module).or_default().push(row);
+        }
+        for row in &observations.mechanisms {
+            mechanisms_by_module
+                .entry(row.module)
+                .or_default()
+                .push(row);
+        }
+    }
     for module in &presentation.modules {
-        let rows_for_module = observations.is_some_and(|observations| {
-            observations
-                .tokens
-                .iter()
-                .any(|row| row.module == module.id)
-                || observations
-                    .mechanisms
-                    .iter()
-                    .any(|row| row.module == module.id)
-        });
+        let tokens: &[&crate::inventory_provider_info::TokenRow] = tokens_by_module
+            .get(&module.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mechanisms: &[&crate::inventory_provider_info::MechanismRow] = mechanisms_by_module
+            .get(&module.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let rows_for_module = !tokens.is_empty() || !mechanisms.is_empty();
         let Some(info) = &module.provider_info else {
-            if verbose
-                && rows_for_module
-                && let Some(observations) = observations
-            {
-                render_provider_info_rows(out, observations, module.id);
+            if verbose && rows_for_module {
+                render_provider_info_rows(out, tokens, mechanisms);
             }
             continue;
         };
@@ -4078,8 +4094,8 @@ fn render_provider_info_lines(out: &mut String, presentation: &Presentation, ver
                 .map(|text| escape_controls(text).into_owned())
                 .unwrap_or_else(|| "?".to_string()),
         );
-        if verbose && let Some(observations) = observations {
-            render_provider_info_rows(out, observations, module.id);
+        if verbose {
+            render_provider_info_rows(out, tokens, mechanisms);
         }
     }
     if verbose && let Some(observations) = observations {
@@ -4090,6 +4106,10 @@ fn render_provider_info_lines(out: &mut String, presentation: &Presentation, ver
             ("info_return_deferred", gaps.return_deferred),
             ("info_caller_unavailable", gaps.caller_unavailable),
             ("mechanism_info_refused", gaps.mechanism_refused),
+            ("info_token_rows_refused", gaps.tokens_refused),
+            ("info_mechanism_rows_refused", gaps.mechanisms_refused),
+            ("info_token_departed_folded", gaps.tokens_departed),
+            ("info_mechanism_departed_folded", gaps.mechanisms_departed),
         ] {
             if count > 0 {
                 parts.push(format!("{reason}={count}"));
@@ -4102,26 +4122,22 @@ fn render_provider_info_lines(out: &mut String, presentation: &Presentation, ver
 }
 
 /// Verbose-only token/mechanism rows for one module, in (slot,
-/// caller[, mechanism]) order.
+/// caller[, mechanism]) order. Linear: slot sharing is counted in
+/// one pass, never rescanned per row.
 fn render_provider_info_rows(
     out: &mut String,
-    observations: &crate::inventory_provider_info::ProviderObservations,
-    module: ModuleId,
+    tokens: &[&crate::inventory_provider_info::TokenRow],
+    mechanisms: &[&crate::inventory_provider_info::MechanismRow],
 ) {
     use std::fmt::Write as _;
-    let mut tokens: Vec<_> = observations
-        .tokens
-        .iter()
-        .filter(|row| row.module == module)
-        .collect();
+    let mut tokens: Vec<_> = tokens.to_vec();
     tokens.sort_by_key(|row| (row.slot, row.caller));
+    let mut slot_counts: BTreeMap<u64, usize> = BTreeMap::new();
     for row in &tokens {
-        let shared_slot = tokens
-            .iter()
-            .filter(|other| other.slot == row.slot)
-            .take(2)
-            .count()
-            > 1;
+        *slot_counts.entry(row.slot).or_default() += 1;
+    }
+    for row in &tokens {
+        let shared_slot = slot_counts.get(&row.slot).copied().unwrap_or(0) > 1;
         let caller = if shared_slot {
             format!(" (caller {})", row.caller.label())
         } else {
@@ -4147,18 +4163,17 @@ fn render_provider_info_rows(
             row.pin_max_len,
         );
     }
-    let mut mechanisms: Vec<_> = observations
-        .mechanisms
-        .iter()
-        .filter(|row| row.module == module)
-        .collect();
+    let mut mechanisms: Vec<_> = mechanisms.to_vec();
     mechanisms.sort_by_key(|row| (row.slot, row.mechanism, row.caller));
+    let mut limit_counts: BTreeMap<(u64, u64), usize> = BTreeMap::new();
     for row in &mechanisms {
-        let shared = mechanisms
-            .iter()
-            .filter(|other| other.slot == row.slot && other.mechanism == row.mechanism)
-            .take(2)
-            .count()
+        *limit_counts.entry((row.slot, row.mechanism)).or_default() += 1;
+    }
+    for row in &mechanisms {
+        let shared = limit_counts
+            .get(&(row.slot, row.mechanism))
+            .copied()
+            .unwrap_or(0)
             > 1;
         let caller = if shared {
             format!(" (caller {})", row.caller.label())

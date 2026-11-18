@@ -46,13 +46,15 @@ projection re-projects it; profile inputs never carry it.
   (`<library major>.<library minor>`). A refused (non-UTF8)
   manufacturer omits the supplier; malformed provider detail
   degrades to no supplier/version while the component renders.
-- Each token row projects to a `type: device` component named
-  `<manufacturerID> <model>` (available parts only; `token slot
-  <N>` when both strings were refused) with hardware/firmware
-  versions, flags and PIN lengths in `properties[]`, linked to its
-  library via `dependencies[]`. Serial numbers, labels, session
-  counts, memory sizes and clock readings have no key anywhere in
-  this output.
+- Tokens dedup to one `type: device` component per (module,
+  slot, token identity) named `<manufacturerID> <model>`
+  (available parts only; `token slot <N>` when both strings were
+  refused) with hardware/firmware versions, flags and PIN lengths
+  in `properties[]`, linked to its library via `dependencies[]`.
+  Callers reporting the same token share the device; a
+  conflicting identity on the same slot keeps its own device.
+  Serial numbers, labels, session counts, memory sizes and clock
+  readings have no key anywhere in this output.
 - Per-slot mechanism limits map onto the global-per-id `algorithm`
   components by reporter count: exactly one (module, caller, slot)
   reporter reads plain properties (`p11scope:min-key-size`,

@@ -500,7 +500,10 @@ static void hot_iteration(int m, CK_SESSION_HANDLE s, CK_OBJECT_HANDLE aes, CK_O
 /* Absolute-deadline pacing for offered-rate cells: each iteration lands on the
  * next deadline grid point (CLOCK_MONOTONIC). On overrun the grid re-anchors to
  * now instead of sleeping catch-up, so the ledger's t0/t1 always reports the
- * achieved rate honestly. No pacing when pace_us <= 0. */
+ * achieved rate honestly. No pacing when pace_us <= 0. Hybrid wait: short
+ * sleeps overshoot on shared hosts (a 45 us request slept ~129 us on the
+ * Fedora cell host), so only the bulk past a spin window sleeps and the
+ * remainder spins to the deadline for precision. */
 static void pace_next(struct timespec *deadline, long pace_us) {
     if (pace_us <= 0) return;
     deadline->tv_nsec += pace_us * 1000L;
@@ -508,13 +511,19 @@ static void pace_next(struct timespec *deadline, long pace_us) {
         deadline->tv_nsec -= 1000000000L;
         deadline->tv_sec++;
     }
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (deadline->tv_sec > now.tv_sec ||
-        (deadline->tv_sec == now.tv_sec && deadline->tv_nsec > now.tv_nsec)) {
-        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL) && errno == EINTR) {}
-    } else {
-        *deadline = now;
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long remain_ns = (long)(deadline->tv_sec - now.tv_sec) * 1000000000L +
+            (deadline->tv_nsec - now.tv_nsec);
+        if (remain_ns <= 0) {
+            *deadline = now;
+            return;
+        }
+        if (remain_ns > 200000L) {
+            struct timespec req = {0, remain_ns - 120000L};
+            while (nanosleep(&req, &req) && errno == EINTR) {}
+        }
     }
 }
 

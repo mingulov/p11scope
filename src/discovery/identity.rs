@@ -11110,6 +11110,16 @@ fn pin_scanned_object(
         budget,
     ) {
         Err(PinFailure::Refused(reason)) => {
+            // Temporary loss forensics (reverted before landing): the
+            // downgrade decision inputs (the exited verdict decides
+            // Gone vs nuke).
+            if std::env::var_os("P11SCOPE_FIX1_EVLOG").is_some_and(|value| !value.is_empty()) {
+                eprintln!(
+                    "p11scope: fix1downgrade reason={} exited={:?}",
+                    reason,
+                    view.original_exited(),
+                );
+            }
             if view.original_exited() == Ok(true) {
                 // The view died mid-pin (its per-PID paths vanished): loss,
                 // not forgery evidence. Downgrade to Gone so the key's live

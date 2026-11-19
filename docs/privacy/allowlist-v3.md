@@ -100,7 +100,8 @@ curve decoding), the requested-values promotion rule and the
 establishment rule. The keymeta section adds the three
 operation-length rows: up to one approved operation-length value
 per completed call at the eleven §8.1 endpoints — an S-cell
-output-length WORD retained at entry and read at return (`C_Sign`,
+address retained at entry with the output-length WORD read on a
+qualifying return (`C_Sign`,
 `C_SignRecover`, `C_SignFinal`, `C_Encrypt`, `C_WrapKey`,
 `C_EncapsulateKey`) or a V-snapshot input-length scalar snapshotted
 at entry with no dereference (`C_Verify`, `C_VerifyFinal`,
@@ -2403,9 +2404,10 @@ other exclusion stay in force. Allowlist-v1 bytes are unchanged.
 
 What is captured: up to one approved length value per completed
 call at the §8.1 evidence endpoints (signature, ciphertext and
-wrap lengths) — an S-cell output-length WORD retained at entry
-and read at return, or a V-snapshot input-length scalar
-snapshotted at entry with no dereference — admitted only on
+wrap lengths) — an S-cell address retained at entry with the
+output-length WORD read on a qualifying return, or a V-snapshot
+input-length scalar snapshotted at entry with no dereference —
+admitted only on
 `CKR_OK` (`CKR_BUFFER_TOO_SMALL` corroborates S-cells; a refused
 or unreadable shape emits unavailable with zero), plus the
 already-captured mechanism id the family inference reuses (no new

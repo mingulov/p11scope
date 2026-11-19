@@ -2327,6 +2327,46 @@ fn cbom_folded_instance_rows_count_toward_the_row_bound() {
     assert!(parse_input(&bytes).is_ok());
 }
 
+/// Folded-instance drops and saturation stay named unknowns: summed
+/// across modules, rendered only when nonzero.
+#[test]
+fn cbom_folded_instance_bounds_stay_named_unknowns() {
+    let mut departed = departed_use(
+        1,
+        1,
+        json!([]),
+        vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+        false,
+        0,
+        departed_overflow(0, 0, 0),
+    );
+    departed["folded_instances"] = json!([{"id": "i0", "caller": "c0"}]);
+    departed["folded_instances_saturated"] = json!(true);
+    departed["folded_instances_dropped"] = json!(7);
+    let bytes = inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"c".repeat(64),
+            departed,
+        )],
+        vec![],
+    );
+    let projection = parse_input(&bytes).unwrap();
+    assert_eq!(projection.unknowns.departed_folded_instances_dropped, 7);
+    assert_eq!(projection.unknowns.departed_folded_instances_saturated, 1);
+    let document = super::render::render_json(&projection);
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_folded_instances_dropped"),
+        json!(7)
+    );
+    assert_eq!(
+        metadata_value(&document, "p11scope:departed_folded_instances_saturated"),
+        json!(1)
+    );
+}
+
 /// A CBOM `-o` write failure (ENOSPC here) saves the rendered
 /// document to the recovery dir instead of dropping it: the error
 /// names the fallback, the saved bytes are the complete document

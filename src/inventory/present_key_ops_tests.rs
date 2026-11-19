@@ -1912,6 +1912,66 @@ fn key_ops_unresolved_instance_reads_unidentified_provider() {
     );
 }
 
+/// A key row whose instance folded out of `instances[]` still groups
+/// under its provider through the departed aggregate's
+/// folded-instance map: the folded twin renders exactly like the
+/// alive control, never as unidentified.
+#[test]
+fn key_ops_folded_instance_resolves_its_provider() {
+    use crate::discovery::caller_registry::DepartedUse;
+    let mut observations = populated(3);
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.objects.push(object_row(11));
+    observations
+        .key_operations
+        .push(key_row_on("i9", 11, "sign", 2, 1, 0));
+    let mut live = key_ops_presentation(observations.clone());
+    live.key_sizes_requested = true;
+    let module = live.modules[0].id;
+    let caller = live.callers[0].id;
+    live.instances.clear();
+    live.instances.push(InstanceView {
+        id: RegistryInstanceId::from_raw(9),
+        caller,
+        module,
+        state: InstanceLifecycle::Observed,
+        reason: None,
+        first_seen_ns: 100,
+        last_seen_ns: 200,
+    });
+    let mut folded = key_ops_presentation(observations);
+    folded.key_sizes_requested = true;
+    folded.instances.clear();
+    let folded_caller = folded.callers[0].id;
+    folded.modules[0].departed_use = Some(DepartedUse {
+        folded_instances: std::collections::BTreeMap::from([(
+            RegistryInstanceId::from_raw(9),
+            folded_caller,
+        )]),
+        ..DepartedUse::default()
+    });
+    for verbosity in [
+        crate::cli::TextVerbosity::Concise,
+        crate::cli::TextVerbosity::Verbose,
+    ] {
+        let live_block = key_ops_block(&render_snapshot_with_verbosity(&live, verbosity));
+        let folded_block = key_ops_block(&render_snapshot_with_verbosity(&folded, verbosity));
+        assert_eq!(
+            folded_block, live_block,
+            "folded renders exactly like live ({verbosity:?})"
+        );
+        assert!(
+            !folded_block[1].contains("unidentified"),
+            "the folded row keeps its provider ({verbosity:?}):\n{}",
+            folded_block.join("\n")
+        );
+    }
+}
+
 /// Verbose instance labels are projection strings: controls escape
 /// like every other snapshot field, so one row can never forge a
 /// second output line.

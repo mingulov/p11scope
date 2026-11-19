@@ -7967,6 +7967,159 @@ fn demotion_retirement_round5_folded_instances_stay_exact() {
     assert_eq!(departed["operations"]["settled_open"], 0);
 }
 
+/// A folded instance keeps its join keys in its module's departed
+/// aggregate: the instance label still resolves to its caller after
+/// the row leaves `instances[]`, with drops counted.
+#[test]
+fn demotion_retirement_round5_folded_instances_keep_their_join_keys() {
+    use crate::discovery::caller_registry::instance_input::{AdmittedInstance, InstanceKey};
+    use p11scope_ebpf_common::ImageIdentity;
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let coordinator = &mut scene.native.scene.coordinator;
+    let module_key = {
+        let edge = coordinator
+            .registry
+            .edges_of(caller)
+            .next()
+            .expect("the shared scene stages one edge");
+        coordinator
+            .registry
+            .module(edge.module)
+            .expect("the edge module is retained")
+            .key
+            .clone()
+    };
+    let key = InstanceKey::scripted(
+        scene.native.domain,
+        ImageIdentity {
+            task_cookie: 41,
+            exec_id: 1,
+        },
+        crate::discovery::instances::InstanceId::from_raw(3),
+        module_key,
+    );
+    coordinator
+        .registry_mut()
+        .note_instance(AdmittedInstance::scripted(key.clone(), caller));
+    coordinator.commit_batch(false).unwrap();
+    scene.native.scene.source.kill(7);
+    scene.native.scene.coordinator.observe_empty_pass(
+        &mut UnavailableImageGuard,
+        &mut scene.native.cookies,
+        "test instance exit",
+        1000,
+    );
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let coordinator = &scene.native.scene.coordinator;
+    let retired = crate::inventory::render_json(coordinator, "test", 0, 1000, 1);
+    let instance = retired["instances"]
+        .as_array()
+        .expect("instances array")
+        .iter()
+        .find(|row| row["caller"] == caller.label())
+        .expect("the retired instance still renders before the fold")
+        .clone();
+    let label = instance["id"].as_str().expect("instance label").to_string();
+    scene
+        .native
+        .scene
+        .coordinator
+        .note_rendered_callers(&[caller]);
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .retire_rendered_callers(1001, None)
+            .retired,
+        1,
+        "the proven-exited caller with an instance retires"
+    );
+    let coordinator = &scene.native.scene.coordinator;
+    let folded = crate::inventory::render_json(coordinator, "test", 0, 1001, 2);
+    assert!(
+        folded["instances"]
+            .as_array()
+            .expect("instances array")
+            .is_empty(),
+        "no instance row survives the fold"
+    );
+    let module = folded["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .find(|module| {
+            module["paths"].as_array().is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| path.ends_with("a.so")))
+            })
+        })
+        .expect("the provider module renders")
+        .clone();
+    let departed = &module["departed_use"];
+    assert_eq!(
+        departed["folded_instances"],
+        serde_json::json!([{"id": label, "caller": caller.label()}]),
+        "the folded instance keeps its join keys"
+    );
+    assert_eq!(departed["folded_instances_dropped"], 0);
+    assert_eq!(departed["folded_instances_saturated"], false);
+}
+
+/// Past the per-module folded-instance bound the aggregate saturates
+/// honestly: first rows named, the rest counted as dropped.
+#[test]
+fn demotion_retirement_round5_folded_instances_saturate_past_the_bound() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::discovery::caller_registry::{CallerId, MAX_FOLDED_INSTANCES_PER_MODULE};
+    let mut scene = Scene::shared();
+    let caller = scene.caller;
+    let module = {
+        let coordinator = &scene.native.scene.coordinator;
+        coordinator
+            .registry
+            .edges_of(caller)
+            .next()
+            .expect("the shared scene stages one edge")
+            .module
+    };
+    let coordinator = &mut scene.native.scene.coordinator;
+    for raw in 0..=MAX_FOLDED_INSTANCES_PER_MODULE as u32 {
+        coordinator.registry_mut().insert_folded_instance(
+            module,
+            RegistryInstanceId::from_raw(raw),
+            CallerId(raw),
+        );
+    }
+    let coordinator = &scene.native.scene.coordinator;
+    let rendered = crate::inventory::render_json(coordinator, "test", 0, 1000, 1);
+    let module = rendered["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .find(|module| {
+            module["paths"].as_array().is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| path.ends_with("a.so")))
+            })
+        })
+        .expect("the provider module renders")
+        .clone();
+    let departed = &module["departed_use"];
+    assert_eq!(
+        departed["folded_instances"]
+            .as_array()
+            .expect("folded rows")
+            .len(),
+        MAX_FOLDED_INSTANCES_PER_MODULE
+    );
+    assert_eq!(departed["folded_instances_saturated"], true);
+    assert_eq!(departed["folded_instances_dropped"], 1);
+}
+
 /// Item 1: an exec-retired caller with calls folds exactly, and live
 /// operations still open at the fold end unknown with explicit
 /// accounting — never silently completed, never silently dropped.

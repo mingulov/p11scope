@@ -22923,6 +22923,8 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
             Vec::new(),
             None,
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .expect("a live candidate builds over the learned tables");
     assert_eq!(
@@ -23069,6 +23071,8 @@ fn learned_candidate_module_count(engine: &mut Engine) -> usize {
             Vec::new(),
             Vec::new(),
             None,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .expect("a live candidate builds over the learned tables")
@@ -23238,6 +23242,8 @@ fn learned_table_bind_loss_files_the_dedicated_counted_row() {
             Vec::new(),
             None,
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .expect("a live candidate builds over the unbound learned tables");
     assert!(
@@ -23297,6 +23303,8 @@ fn learned_table_abi_mismatch_files_the_dedicated_counted_row() {
             Vec::new(),
             Vec::new(),
             None,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .expect("a live candidate builds over the ABI-mismatched learned tables");
@@ -23513,6 +23521,8 @@ fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_sc
                 Vec::new(),
                 Vec::new(),
                 None,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
                 &BTreeSet::new(),
             )
             .expect("a live candidate builds over the learned tables");
@@ -95364,7 +95374,15 @@ fn live_candidate_refuses_uncorroborated_entries_without_function_proof() {
     assert!(pins.absorb(dependency_pins).is_empty());
     let mut engine = Engine::empty();
     let candidate = engine
-        .live_candidate_with_pending(pins, vec![module], Vec::new(), None, &BTreeSet::new())
+        .live_candidate_with_pending(
+            pins,
+            vec![module],
+            Vec::new(),
+            None,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
         .expect("a live candidate builds over the refused table");
     assert_eq!(candidate.modules.len(), 1);
     let entries = &candidate.modules[0].scanned.tables[0].entries;

@@ -19004,15 +19004,13 @@ fn watchdog_spared_late_terminal_falls_back_below_fence() {
         .iter()
         .find(|(caller, _)| *caller != new_caller)
         .unwrap_or_else(|| panic!("{ROW}: the stuck feed is present pre-terminal"))
-        .1
-        .clone();
+        .1;
     let held_pre = watchdog_feed_states(&fixture, 1);
     let sibling_pre = held_pre
         .iter()
         .find(|(caller, _)| *caller != new_caller)
         .unwrap_or_else(|| panic!("{ROW}: the sibling feed is present pre-terminal"))
-        .1
-        .clone();
+        .1;
     let gaps_pre: Vec<(String, String)> = watchdog_scope_gaps(&fixture);
     // The late non-neutral terminal arrives after the wipe: the spared
     // BEGIN matches against the already-fallen-back seal and defers its
@@ -19033,8 +19031,7 @@ fn watchdog_spared_late_terminal_falls_back_below_fence() {
         .iter()
         .find(|(caller, _)| *caller != new_caller)
         .unwrap_or_else(|| panic!("{ROW}: the stuck feed is present post-terminal"))
-        .1
-        .clone();
+        .1;
     assert_eq!(
         (stuck_post.1, stuck_post.2, stuck_post.3, stuck_post.6),
         (stuck_pre.1, stuck_pre.2, stuck_pre.3, stuck_pre.6),
@@ -19185,6 +19182,10 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
         1,
         "{ROW}: the sibling seals exactly its held call"
     );
+    assert_eq!(
+        held[0].1.6, held_disposed_post_rearm,
+        "{ROW}: the sibling disposes nothing"
+    );
     // Baselines before the late terminal lands.
     let stuck_pre = watchdog_feed_states(&fixture, 0);
     assert_eq!(
@@ -19192,8 +19193,8 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
         1,
         "{ROW}: one stuck incarnation pre-terminal"
     );
-    let stuck_pre = stuck_pre[0].1.clone();
-    let sibling_pre = watchdog_feed_states(&fixture, 1)[0].1.clone();
+    let stuck_pre = stuck_pre[0].1;
+    let sibling_pre = watchdog_feed_states(&fixture, 1)[0].1;
     let gaps_pre: Vec<(String, String)> = watchdog_scope_gaps(&fixture);
     fixture.scene.drain.source_mut().push_record(end_a.to_vec());
     fixture.published_labeled("watchdog-taint2-terminal", None);
@@ -19207,7 +19208,7 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
         1,
         "{ROW}: one stuck incarnation post-terminal"
     );
-    let stuck_post = stuck_post[0].1.clone();
+    let stuck_post = stuck_post[0].1;
     assert_eq!(
         (stuck_post.1, stuck_post.2, stuck_post.3, stuck_post.6),
         (stuck_pre.1, stuck_pre.2, stuck_pre.3, stuck_pre.6),
@@ -19232,7 +19233,7 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
         1,
         "{ROW}: one sibling incarnation post-terminal"
     );
-    let sibling_post = sibling_post[0].1.clone();
+    let sibling_post = sibling_post[0].1;
     assert_eq!(
         (
             sibling_post.1,

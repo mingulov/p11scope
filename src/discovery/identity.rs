@@ -11090,6 +11090,7 @@ fn pin_scanned_object(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ProvedEntry, PinFailure> {
+    let raw_path = raw.path.clone();
     match pin_scanned_object_inner(
         view,
         raw,
@@ -11104,7 +11105,7 @@ fn pin_scanned_object(
             eprintln!(
                 "p11scope: DIAG v072c pin_refused view_dead={:?} path={} mono_ns={:?}",
                 dead,
-                raw.path,
+                raw_path,
                 crate::attach::monotonic_ns(),
             );
             if dead == Ok(true) {

@@ -4023,10 +4023,11 @@ fn publication_reuse_preserves_refusal_and_overflow_history() {
         &exec_record_for(overflow_pid),
         &mut pending,
     );
-    assert_eq!(engine.discovery_truncated, 1);
-    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+    assert_eq!(engine.discovery_truncated, 0);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
     // The next successful provider transaction models recovery, after the
-    // earlier queued work has completed. It must not clear the consumed loss.
+    // earlier queued work has completed. It must not clear the unfinished
+    // row.
     engine.refresh_queue.clear_for_test();
     let mut grown = raw.clone();
     grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 2));
@@ -4050,11 +4051,12 @@ fn publication_reuse_preserves_refusal_and_overflow_history() {
             "{:?}",
             engine.discovery.modules_skipped
         );
-        assert_eq!(engine.capture_facts().discovery_truncated, 1);
-        assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+        assert_eq!(engine.capture_facts().discovery_truncated, 0);
+        assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
         assert!(engine.plan.skipped.iter().any(|skip| {
             skip.subject == "live discovery refresh"
-                && skip.reason.contains("exceeded the bounded pending queue")
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished"
         }));
         let published = publication_operation_counts(&engine);
         let discovery = serde_json::to_value(&engine.discovery).unwrap();
@@ -14853,9 +14855,10 @@ fn fake_pid_floor_exceeds_pid_max_limit() {
 }
 
 /// Task 3.1b: lifecycle/loader refresh requests enqueue bounded work. Past
-/// the cap, excess requests are dropped with explicit truncation evidence —
-/// never an unbounded userspace queue — while a re-request for an already
-/// queued pid stays free.
+/// the cap, excess requests defer with an explicit unfinished row —
+/// never an unbounded userspace queue, never dropped as loss (the
+/// refused member stays unexamined, so the pass cursor retries it) —
+/// while a re-request for an already queued pid stays free.
 #[test]
 fn refresh_request_queue_is_bounded_with_explicit_overflow() {
     let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
@@ -14876,23 +14879,22 @@ fn refresh_request_queue_is_bounded_with_explicit_overflow() {
         );
     }
     assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
-    assert_eq!(engine.discovery_truncated, 44);
+    assert_eq!(engine.discovery_truncated, 0);
     assert!(
         engine
             .counters
             .object_skips
             .iter()
             .any(|skip| skip.subject == "live discovery refresh"
-                && skip
-                    .reason
-                    .contains("refresh requests exceeded the bounded pending queue")),
-        "overflow publishes explicit loss: {:?}",
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished"),
+        "overflow publishes an explicit unfinished row: {:?}",
         engine.counters.object_skips
     );
     // Re-requesting a queued pid is a no-op, not more overflow.
     engine.request_refresh(fill_base, None);
     assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
-    assert_eq!(engine.discovery_truncated, 44);
+    assert_eq!(engine.discovery_truncated, 0);
 }
 
 /// Task 3.1b: the loader half of the bounded-work contract. Deferred loader
@@ -23510,11 +23512,15 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     }
     apply_ordinary_batch(&mut engine, &mut session, overflow_batch).unwrap();
 
-    assert_eq!(
-        engine.discovery_truncated, 1,
+    assert_eq!(engine.discovery_truncated, 0);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip.subject
+            == "live discovery refresh"
+            && skip.reason
+                == "refresh requests exceeded the bounded pending queue; work remains unfinished"),
         "the consumed EXEC overflow stays visible"
     );
-    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
     assert!(
         engine.loader_registry.context(retired).is_none(),
         "the old loader retired"
@@ -23543,10 +23549,10 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
         "inventory must free capacity while the retained refresh waits"
     );
     assert_eq!(
-        engine.discovery_truncated, 1,
-        "a full-queue retry is not a new consumed EXEC"
+        engine.discovery_truncated, 0,
+        "neither a consumed overflow nor a full-queue retry counts loss"
     );
-    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
 
     // Free capacity after the earlier work settles. No fresh lifecycle event
     // rescues the owner: ordinary later batches must service its owed refresh.
@@ -23569,10 +23575,10 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
         "all provider exports rearm"
     );
     assert_eq!(
-        engine.discovery_truncated, 1,
+        engine.discovery_truncated, 0,
         "retrying owed work loses no new record"
     );
-    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
 }
 
 /// H6 slice 1 fixture: a live child mapping a provider that publishes a real
@@ -35120,7 +35126,7 @@ impl LoaderPlanningFixture {
                 .views
                 .push(ProcessView::open(view, std::process::id()).unwrap());
         }
-        // A real consumed-EXEC loss is historical input to both paired engines.
+        // A real consumed-EXEC deferral is historical input to both paired engines.
         let mut pending = PendingViewRetirements::new();
         for offset in 0..=MAX_PENDING_REFRESH as u32 {
             engine.dispatch_lifecycle_record(
@@ -35146,7 +35152,14 @@ impl LoaderPlanningFixture {
         assert_eq!(engine.plan.active_slot_count(), 6);
         assert_eq!(engine.discovery.modules.len(), 2);
         assert_eq!(engine.discovery.modules_skipped.len(), 1);
-        assert_eq!(engine.discovery_truncated, 1);
+        assert_eq!(engine.discovery_truncated, 0);
+        assert!(
+            engine.counters.object_skips.iter().any(|skip| skip.subject
+                == "live discovery refresh"
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished"),
+            "the deferral history rides the unfinished row"
+        );
         engine
     }
 
@@ -35319,7 +35332,7 @@ fn loader_pin_reuse_invalidates_on_standalone_projection_and_failed_publication(
         );
         assert!(engine.loader_plan_cache.is_some());
         assert_eq!(engine.plan.active_slot_count(), 6);
-        assert_eq!(engine.discovery_truncated, 1);
+        assert_eq!(engine.discovery_truncated, 0);
     }
 }
 
@@ -36882,7 +36895,7 @@ fn loader_only_pin_reuses_provider_plan() {
             .count(),
         3
     );
-    assert_eq!(engine.discovery_truncated, 1);
+    assert_eq!(engine.discovery_truncated, 0);
     assert_eq!(loader_planning_operation_counts(&engine), before);
 }
 
@@ -38140,7 +38153,7 @@ fn loader_pin_reuse_falls_back_for_unsettled_or_invalid_inputs() {
         );
         apply_loader_planning_candidate(&mut engine, candidate);
         assert_eq!(engine.plan.active_slot_count(), 6);
-        assert_eq!(engine.discovery_truncated, 1);
+        assert_eq!(engine.discovery_truncated, 0);
         match input {
             "staged" => {
                 assert!(engine.capture_facts.staged.is_some());
@@ -38267,7 +38280,7 @@ fn loader_pin_reuse_keeps_generation_checks_at_apply() {
         assert!(engine.pinned.summary(loader).is_none());
         assert_eq!(engine.plan.slots, old_plan.slots);
         assert_eq!(engine.plan.active_slot_count(), 6);
-        assert_eq!(engine.discovery_truncated, 1);
+        assert_eq!(engine.discovery_truncated, 0);
     }
 }
 
@@ -53928,9 +53941,10 @@ fn optional_polling_resumes_fairly_after_refresh_capacity_reopens() {
 
 /// Optional-poll backpressure must not excuse genuine lifecycle overflow.
 /// An EXEC for an unretained generation still needs discovery work, and a
-/// full queue must retain its explicit dropped-record evidence.
+/// full queue keeps it visible with an explicit unfinished row instead of
+/// dropped-record loss (the refused member retries via the cursor).
 #[test]
-fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
+fn genuine_exec_overflow_defers_without_refresh_queue_loss() {
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
     let mut pending = PendingViewRetirements::new();
@@ -53957,23 +53971,24 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
     );
 
     assert_eq!(engine.refresh_queue.snapshot_map_for_test(), requested);
-    assert_eq!(engine.discovery_truncated, 1);
-    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+    assert_eq!(engine.discovery_truncated, 0);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
     assert!(
         engine
             .counters
             .object_skips
             .iter()
             .any(|skip| skip.subject == "live discovery refresh"
-                && skip.reason.contains("exceeded the bounded pending queue")),
-        "a real EXEC request was dropped and must remain visible"
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished"),
+        "a real EXEC request was deferred and must remain visible"
     );
     engine.dispatch_lifecycle_record(
         &mut ScriptedSession::default(),
         &exec_record_for(FAKE_PID_FLOOR),
         &mut pending,
     );
-    assert_eq!(engine.discovery_truncated, 1, "already-queued EXEC is free");
+    assert_eq!(engine.discovery_truncated, 0, "already-queued EXEC is free");
 }
 
 fn polling_engine_with_full_exec_queue(
@@ -56157,12 +56172,13 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
     assert_eq!(stats.pending, 2);
     assert_eq!(stats.dropped, 0);
 
-    // Past the queue cap the excess request drops with its loss marker
-    // and its dropped age (here clock-unknown: the diff never marked it).
+    // Past the queue cap the excess request defers with its unfinished
+    // row and no dropped age (here clock-unknown: the diff never marked
+    // it); its age samples at admission instead.
     let queued = engine.refresh_queue.len();
     // Hermetic fill: the fill range and the overflow newcomer must be
     // impossible pids (no /proc entry on any host), so the excess request
-    // drops with its loss marker on every host.
+    // defers with its unfinished row on every host.
     let fill_base = FAKE_PID_FLOOR;
     let overflow_pid = FAKE_PID_FLOOR + 10_000;
     assert!(
@@ -56176,10 +56192,13 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
     let truncated_before = engine.discovery_truncated;
     engine.request_refresh_consumed(overflow_pid, Some(4_001_000_000));
     assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
-    assert_eq!(engine.discovery_truncated, truncated_before + 1);
+    assert_eq!(
+        engine.discovery_truncated, truncated_before,
+        "deferral counts no loss"
+    );
     let stats = engine.newcomer_stats(Some(4_002_000_000));
     assert_eq!(stats.dropped, 0);
-    assert_eq!(stats.dropped_unknown, 1);
+    assert_eq!(stats.dropped_unknown, 0);
 }
 
 pub(crate) mod detailed_proof_driver {
@@ -59834,17 +59853,26 @@ fn pressure_all_blocked_fifo_refuses_once_then_advances() {
         records.is_empty(),
         "the suffix dispatched after the refusal"
     );
+    assert_eq!(engine.discovery_truncated, 0);
     assert_eq!(
-        engine.discovery_truncated, 1,
-        "the all-blocked head is refused exactly once"
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "live discovery refresh"
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished")
+            .count(),
+        1,
+        "the all-blocked head refuses into one unfinished row"
     );
     assert!(
         !engine.refresh_queue.contains_key(&head_pid),
         "a refused head leaves no request behind"
     );
     assert_eq!(
-        engine.newcomer_ages.dropped_unknown, 1,
-        "the refused head keeps explicit dropped-age evidence"
+        engine.newcomer_ages.dropped_unknown, 0,
+        "a deferred head drops no age; it samples at admission"
     );
     assert!(
         engine
@@ -59913,7 +59941,7 @@ fn pressure_all_blocked_fifo_refuses_once_then_advances() {
         )
         .expect("an empty follow-up pass is a no-op");
     assert_eq!(
-        engine.discovery_truncated, 1,
+        engine.discovery_truncated, 0,
         "no further refusal without a new head"
     );
     refresh_inventory_once(&mut engine);
@@ -59922,8 +59950,15 @@ fn pressure_all_blocked_fifo_refuses_once_then_advances() {
         "a later tick still services the old requests"
     );
     assert_eq!(
-        engine.discovery_truncated, 1,
-        "later service never erases the historical loss"
+        engine.discovery_truncated, 0,
+        "later service never erases the unfinished row"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip.subject
+            == "live discovery refresh"
+            && skip.reason
+                == "refresh requests exceeded the bounded pending queue; work remains unfinished"),
+        "the unfinished row persists across later service"
     );
 }
 
@@ -61411,9 +61446,18 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
         blocked.pressure_attempts, 0,
         "all-blocked heads attempt nothing"
     );
+    assert_eq!(blocked.discovery_truncated, 0);
     assert_eq!(
-        blocked.discovery_truncated, 2,
-        "each all-blocked head is refused exactly once"
+        blocked
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "live discovery refresh"
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished")
+            .count(),
+        1,
+        "both all-blocked heads refuse into one deduped unfinished row"
     );
 }
 
@@ -62047,9 +62091,19 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
         fixture.engine.deep_scans, scans_before,
         "a zero quantum attempts no scan"
     );
+    assert_eq!(fixture.engine.discovery_truncated, 0);
     assert_eq!(
-        fixture.engine.discovery_truncated, 1,
-        "the unserviceable head is refused exactly once"
+        fixture
+            .engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "live discovery refresh"
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished")
+            .count(),
+        1,
+        "the unserviceable head refuses into one unfinished row"
     );
     assert!(
         !fixture.engine.refresh_queue.contains_key(&head_pid),
@@ -62071,8 +62125,8 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
         .drain_discovery_from(&mut session)
         .expect("a later pass with a working clock services the head");
     assert_eq!(
-        fixture.engine.discovery_truncated, 1,
-        "later service never erases the historical loss"
+        fixture.engine.discovery_truncated, 0,
+        "later service never erases the unfinished row"
     );
     assert!(
         fixture.engine.refresh_queue.is_empty(),
@@ -62114,8 +62168,12 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
         0,
         "pause-owned batches run no service pass"
     );
-    assert_eq!(
-        engine.discovery_truncated, 1,
+    assert_eq!(engine.discovery_truncated, 0);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| skip.subject
+            == "live discovery refresh"
+            && skip.reason
+                == "refresh requests exceeded the bounded pending queue; work remains unfinished"),
         "a pause-owned head keeps honest immediate refusal"
     );
     engine.set_pause_owned_batch(false);
@@ -62151,8 +62209,12 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
         1,
         "a tick runs no nested service pass for its leftovers"
     );
-    assert_eq!(
-        tick_engine.discovery_truncated, 1,
+    assert_eq!(tick_engine.discovery_truncated, 0);
+    assert!(
+        tick_engine.counters.object_skips.iter().any(|skip| skip.subject
+            == "live discovery refresh"
+            && skip.reason
+                == "refresh requests exceeded the bounded pending queue; work remains unfinished"),
         "a tick leftover keeps honest immediate refusal"
     );
     assert!(
@@ -62188,7 +62250,7 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
         engine.pending_discovery_records[1].record.pid_tgid >> 32,
         (FAKE_PID_FLOOR + 1) as u64
     );
-    assert_eq!(engine.discovery_truncated, 1, "deferral refuses nothing");
+    assert_eq!(engine.discovery_truncated, 0, "deferral refuses nothing");
     engine.frame_work_budget_ns = u64::MAX;
     engine
         .drain_discovery_from(&mut session)
@@ -62202,7 +62264,7 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
         "the deferred prefix was serviced, not dropped"
     );
     assert_eq!(
-        engine.discovery_truncated, 1,
+        engine.discovery_truncated, 0,
         "deferral kept the full service opportunity"
     );
 }
@@ -77226,9 +77288,8 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
     );
 
     assert_eq!(
-        engine.discovery_truncated,
-        truncated.saturating_add(2),
-        "the full map refuses each head"
+        engine.discovery_truncated, truncated,
+        "the full map refuses each head without loss"
     );
     let losses: Vec<_> = engine
         .counters
@@ -77236,19 +77297,19 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
         .iter()
         .filter(|skip| skip.subject == "live discovery refresh")
         .collect();
-    // The live loss (mark_live_loss) fires exactly once, first. The
-    // retry partial behind it is ordinary EXEC dispatch behavior: the
-    // head's live view queues ExecRefresh retirement, whose retry meets
-    // the same full map. The viewless suffix dedups against both.
+    // The unfinished row files exactly once, first. The retry partial
+    // behind it is ordinary EXEC dispatch behavior: the head's live
+    // view queues ExecRefresh retirement, whose retry meets the same
+    // full map. The viewless suffix dedups against both.
     assert_eq!(
         losses.len(),
         2,
-        "the head loss plus the ordinary EXEC retry, in order"
+        "the head unfinished row plus the ordinary EXEC retry, in order"
     );
     assert_eq!(
         losses[0].reason,
-        "refresh requests exceeded the bounded pending queue; excess requests were dropped",
-        "live loss once, first"
+        "refresh requests exceeded the bounded pending queue; work remains unfinished",
+        "unfinished row once, first"
     );
     assert_eq!(
         losses[1].reason,

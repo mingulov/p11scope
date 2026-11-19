@@ -234,11 +234,17 @@ pub(crate) fn retire_view_only_if_proven_gone(view: ProcessViewId, proof: Retire
 ### 5.2 Contents
 
 - Refresh queue: `request_refresh` serial semantics fixed once —
-  re-queue always retains (completion takes the deferred set from one
-  place), closing fix4 B2a/B2b/B2c and the lane-2 `renewed_ns` fix
-  (a8f9cc27b) as instances. `refresh_requested` moves into
-  `RefreshQueue`; the fair-queue relief scan is bounded per pass
-  (L1-6: no 4096-syscalls-per-arrival loop; caps stay 256 so #136/#137
+  consumed re-queues renew (fresh serial + renewal stamp, so
+  completion drops exactly the snapshot set) while retry
+  re-queues stay idempotent signals (the exec re-arm protocol
+  pins prepared serials — retries must not churn them); a
+  matched exit reclaims only ownerless entries whose every stamp
+  predates it (lane-2 `renewed_ns` fix a8f9cc27b, adopted in the
+  fixed form); overflow defers with an unfinished row instead of
+  dropping as loss (the pass cursor retries the member).
+  `refresh_requested` moves into `RefreshQueue`; the fair-queue
+  relief scan is bounded per pass (L1-6: one 256-examination
+  sweep per pass, never per arrival; caps stay 256 so #136/#137
   stay green).
 - Loader-slot reuse: slots recycle past 256 with a post-reuse
   stale-record proof at the ordinary hit boundary (lane-2 F5 / codex

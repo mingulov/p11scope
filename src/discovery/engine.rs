@@ -14075,7 +14075,7 @@ impl Engine {
             ring_consumed: crate::ring_accounting::RingConsumed::default(),
             ring_positions: crate::ring_accounting::RingPositions::default(),
             malformed_discovery: 0,
-            refresh_queue: RefreshQueue::default(),
+            refresh_queue: RefreshQueue::new(),
             scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
             loader_benign_hits: 0,
@@ -17272,22 +17272,19 @@ impl Engine {
                 true
             }
             RefreshIntake::QueueFull { consumed } => {
-                if consumed {
-                    self.discovery_truncated = self.discovery_truncated.saturating_add(1);
-                    // Diff-first arrivals retain their known dropped age.
-                    let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
-                    self.newcomer_ages
-                        .note_dropped(newcomer_age_ms(seen, now_ns));
-                    self.mark_live_loss(
-                        "live discovery refresh",
-                        "refresh requests exceeded the bounded pending queue; excess requests were dropped",
-                    );
-                } else {
-                    self.mark_partial(
-                        "live discovery refresh",
-                        "refresh retry exceeded the bounded pending queue; work remains unfinished",
-                    );
-                }
+                // Overflow defers, never drops: the refused member stays
+                // unexamined, so the pass cursor retries it next pass
+                // (admission owner 2). No truncation count, no dropped
+                // age, no loss mark — the work is unfinished, not lost.
+                // Consumed and retry overflows keep their distinct rows.
+                self.mark_partial(
+                    "live discovery refresh",
+                    if consumed {
+                        "refresh requests exceeded the bounded pending queue; work remains unfinished"
+                    } else {
+                        "refresh retry exceeded the bounded pending queue; work remains unfinished"
+                    },
+                );
                 false
             }
             RefreshIntake::SerialsExhausted {
@@ -17392,6 +17389,13 @@ impl Engine {
             && self.newcomer_generation_bound(pid) <= hook_ts
         {
             self.consumed_leader_exit_events.insert((pid, hook_ts));
+            // The exit proves this generation ended: reclaim the dead
+            // entry's bounded slot (a successor's renewal keeps it).
+            // A reclaimed refresh drops its poll with it: no rescan
+            // is owed for a generation that ended.
+            if self.refresh_queue.reclaim_on_exit(pid, hook_ts) {
+                self.polled_pids.remove(&pid);
+            }
             return self
                 .newcomer_counted
                 .insert(pid, NewcomerGapCount::Exit)
@@ -38988,6 +38992,8 @@ impl Engine {
     ) -> Result<DiscoveryBatchOutcome> {
         self.note_graph_inputs_mutated();
         self.continuity_deferred = false;
+        // A new pass restores the refresh relief sweep.
+        self.refresh_queue.begin_pass();
         // Renew the capture work interval at this batch boundary
         // (controller ruling 11:38): the work ceiling is a renewing
         // budget, never a capture-lifetime sticky stop. When the

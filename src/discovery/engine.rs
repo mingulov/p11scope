@@ -1205,6 +1205,15 @@ pub struct Engine {
     /// link mutation, driving the pass-containment path past it.
     #[cfg(test)]
     fail_next_apply_for_test: bool,
+    /// Test-only arm: every `apply_candidate` entry clones its candidate
+    /// into `captured_candidates_for_test` before the currency check or
+    /// any mutation, so tests observe discarded (refused) candidates.
+    #[cfg(test)]
+    capture_candidates_for_test: bool,
+    /// Test-only pre-mutation candidates, oldest first. Populated only
+    /// while `capture_candidates_for_test` is armed.
+    #[cfg(test)]
+    captured_candidates_for_test: Vec<CapturedCandidateForTest>,
     /// Test-only count of `inventory_candidate` calls, for the
     /// pass-containment twins below.
     #[cfg(test)]
@@ -5145,6 +5154,15 @@ impl LiveCandidate {
     fn has_exec_receipts(&self) -> bool {
         !self.exec_preservations.is_empty() || !self.exec_completions.is_empty()
     }
+}
+
+/// Test-only clone of one pre-mutation candidate: the pins and modules an
+/// entry built, as `apply_candidate` received them.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedCandidateForTest {
+    pub(crate) pinned: PinnedObjects,
+    pub(crate) modules: Vec<ReconciledModule>,
 }
 
 struct LoaderPlanCache {
@@ -14285,6 +14303,10 @@ impl Engine {
             #[cfg(test)]
             fail_next_apply_for_test: false,
             #[cfg(test)]
+            capture_candidates_for_test: false,
+            #[cfg(test)]
+            captured_candidates_for_test: Vec::new(),
+            #[cfg(test)]
             inventory_candidate_calls_for_test: 0,
             #[cfg(test)]
             fail_inventory_candidate_call_for_test: None,
@@ -19095,6 +19117,16 @@ impl Engine {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_apply_for_test) {
             bail!("test-forced apply failure");
+        }
+        #[cfg(test)]
+        if self.capture_candidates_for_test {
+            // Pre-mutation apply seam: the exact candidate the entry
+            // built, before the currency check or any mutation.
+            self.captured_candidates_for_test
+                .push(CapturedCandidateForTest {
+                    pinned: candidate.pinned.clone(),
+                    modules: candidate.modules.clone(),
+                });
         }
         #[cfg(feature = "h6-reexec-diagnostic")]
         let diagnostic_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {

@@ -95930,6 +95930,80 @@ fn mo_assert_exact_row_claims(
     );
 }
 
+/// The captured pre-mutation candidate riding the carried view: every
+/// carried-cell driver arms the apply seam, so a missing capture means
+/// the entry never attempted its apply.
+fn mo_captured_carried_candidate(engine: &Engine) -> &CapturedCandidateForTest {
+    assert!(
+        !engine.captured_candidates_for_test.is_empty(),
+        "the refused entry attempted its apply"
+    );
+    engine
+        .captured_candidates_for_test
+        .iter()
+        .find(|captured| {
+            captured
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == ProcessViewId(MO_VIEW_R))
+        })
+        .expect("one captured candidate rides the carried row")
+}
+
+/// One view's candidate scan layer: what the choke's reset leaves for
+/// the view's recorded scan pins, computed from observed pins through
+/// the production reset. Callers snapshot the candidate's input pins
+/// before the entry runs.
+fn mo_scan_layer(pinned: &PinnedObjects, view: ProcessViewId) -> Vec<PinnedObjectId> {
+    let mut snapshot = pinned.clone();
+    snapshot.reset_derived_claims();
+    snapshot.reset_scan_pin_claims();
+    snapshot
+        .view_claims(view)
+        .map(|claims| claims.pins.clone())
+        .unwrap_or_default()
+}
+
+/// The discarded candidate's ownership: the carried view owns nothing,
+/// exactly the expected owners hold entries, and every non-carried
+/// row's grant is exact over its scan layer. `scans` overrides the
+/// default scan layer (the row's own object: one recorded scan pin for
+/// the row's key and path) for views with a richer recorded layer;
+/// rowless owners hold no grant and the driver pins their exact shape
+/// beside this call.
+fn mo_assert_discarded_candidate_ownership(
+    captured: &CapturedCandidateForTest,
+    owners: &BTreeSet<ProcessViewId>,
+    scans: &BTreeMap<ProcessViewId, Vec<PinnedObjectId>>,
+    what: &str,
+) {
+    mo_assert_retired_claimless(&captured.pinned, what);
+    assert_eq!(
+        captured
+            .pinned
+            .ownership_views_for_test()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        *owners,
+        "exactly the expected owners hold discarded-candidate claims ({what})"
+    );
+    for module in &captured.modules {
+        if module.scanned.view == ProcessViewId(MO_VIEW_R) {
+            continue;
+        }
+        assert!(
+            owners.contains(&module.scanned.view),
+            "every discarded live row is expected ({what}): {:?}",
+            module.scanned.view
+        );
+        let scan = scans
+            .get(&module.scanned.view)
+            .cloned()
+            .unwrap_or_else(|| vec![module.object]);
+        mo_assert_exact_row_claims(&captured.pinned, module, &scan, what);
+    }
+}
+
 /// A carried pin stays resolvable. A sole-carried pin reads as carried
 /// coverage; a live-co-owned pin is owned, never carried — the object
 /// predicate and the per-view retirement it must not stand in for.
@@ -97559,6 +97633,7 @@ fn mo_entry_e4_carried() -> MoEntryOutcome {
     let lowered = overlay_module(overlay_key(u64::from(MO_VIEW_FRESH)));
     let slots_before = engine.plan.slots.len();
     assert_eq!(mo_generation_markers(&engine), 0);
+    engine.capture_candidates_for_test = true;
     mo_apply_lowered(&mut engine, &lowered, 1003);
     assert!(
         engine
@@ -97571,6 +97646,13 @@ fn mo_entry_e4_carried() -> MoEntryOutcome {
         engine.plan.slots.len(),
         slots_before,
         "the refused lowering leaves the plan untouched"
+    );
+    let captured = mo_captured_carried_candidate(&engine);
+    mo_assert_discarded_candidate_ownership(
+        captured,
+        &BTreeSet::from([ProcessViewId(MO_VIEW_L), observed]),
+        &BTreeMap::new(),
+        "discarded lowering",
     );
     MoEntryOutcome {
         committed: false,
@@ -97622,6 +97704,7 @@ fn mo_entry_e5_carried() -> MoEntryOutcome {
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
     assert_eq!(mo_generation_markers(&engine), 0);
+    engine.capture_candidates_for_test = true;
     let outcome = e07_rescan(
         &mut engine,
         &mut session,
@@ -97641,6 +97724,34 @@ fn mo_entry_e5_carried() -> MoEntryOutcome {
         engine.modules.len(),
         2,
         "the refused rescan commits no found modules"
+    );
+    let captured = mo_captured_carried_candidate(&engine);
+    mo_assert_discarded_candidate_ownership(
+        captured,
+        &BTreeSet::from([ProcessViewId(0), ProcessViewId(MO_VIEW_B)]),
+        &BTreeMap::new(),
+        "discarded rescan",
+    );
+    // The rowless scanned view keeps its scan pins only: no tables, no
+    // targets, and exactly the context's loader pin.
+    let loader = engine
+        .loader_registry
+        .context(context)
+        .expect("the rescan context survives")
+        .spec
+        .loader;
+    let scan = captured
+        .pinned
+        .view_claims(ProcessViewId(0))
+        .expect("the scanned view keeps its scan pins");
+    assert!(
+        scan.tables.is_empty() && scan.targets.is_empty(),
+        "the rowless scanned view files no grant"
+    );
+    assert_eq!(
+        scan.pins,
+        vec![loader],
+        "the rowless scanned view keeps its loader pin"
     );
     MoEntryOutcome {
         committed: false,
@@ -97693,6 +97804,7 @@ fn mo_entry_e6_carried() -> MoEntryOutcome {
     let modules_before = engine.modules.clone();
     let plan_before = engine.plan.clone();
     assert_eq!(mo_generation_markers(&engine), 0);
+    engine.capture_candidates_for_test = true;
     let mut session = ScriptedSession::with_records([], 0);
     engine.apply_learned_staging(&mut session);
     assert!(
@@ -97706,6 +97818,13 @@ fn mo_entry_e6_carried() -> MoEntryOutcome {
     assert_eq!(
         engine.plan, plan_before,
         "the refused apply leaves the plan untouched"
+    );
+    let captured = mo_captured_carried_candidate(&engine);
+    mo_assert_discarded_candidate_ownership(
+        captured,
+        &BTreeSet::from([ProcessViewId(MO_VIEW_L)]),
+        &BTreeMap::new(),
+        "discarded staging",
     );
     MoEntryOutcome {
         committed: false,
@@ -97741,8 +97860,13 @@ fn mo_entry_e6_no_latch() -> MoEntryOutcome {
     let (mut engine, _object) = mo_shared_engine();
     let modules_before = engine.modules.clone();
     let plan_before = engine.plan.clone();
+    engine.capture_candidates_for_test = true;
     let mut session = ScriptedSession::with_records([], 0);
     engine.apply_learned_staging(&mut session);
+    assert!(
+        engine.captured_candidates_for_test.is_empty(),
+        "no staging work attempts no apply"
+    );
     assert!(
         !engine.learned_unapplied,
         "the latch stays unset without staging work"
@@ -97892,9 +98016,15 @@ fn mo_entry_e7_carried() -> MoEntryOutcome {
         .push(ProcessView::open(ProcessViewId(MO_VIEW_L), std::process::id()).unwrap());
     mo_entry_script_table_read(&engine, &mut session, first_binding);
     let record = mo_entry_selection_record(&engine, first_binding);
+    let selection_view = engine.views[0].id();
+    // The selection row's recorded scan layer, snapshotted from the
+    // committed pins the entry clones: the row itself carries no
+    // tables, so its grant appends only its object pin.
+    let selection_scan = mo_scan_layer(&engine.pinned, selection_view);
     let modules_before = engine.modules.clone();
     let slots_before = engine.plan.slots.clone();
     assert_eq!(mo_generation_markers(&engine), 0);
+    engine.capture_candidates_for_test = true;
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
     // The production selection entry itself (dispatch routes here):
@@ -97936,6 +98066,13 @@ fn mo_entry_e7_carried() -> MoEntryOutcome {
             .view_claims(ProcessViewId(MO_VIEW_L))
             .is_some(),
         "the live co-owner keeps its claims"
+    );
+    let captured = mo_captured_carried_candidate(&engine);
+    mo_assert_discarded_candidate_ownership(
+        captured,
+        &BTreeSet::from([selection_view, ProcessViewId(MO_VIEW_L)]),
+        &BTreeMap::from([(selection_view, selection_scan)]),
+        "discarded selection",
     );
     MoEntryOutcome {
         committed: false,

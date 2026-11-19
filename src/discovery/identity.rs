@@ -2812,6 +2812,13 @@ impl PinnedObjects {
         self.ownership.get(&view)
     }
 
+    /// Test-only read of every view holding an ownership entry, so
+    /// discarded-candidate oracles pin the absence of phantom owners.
+    #[cfg(test)]
+    pub(crate) fn ownership_views_for_test(&self) -> Vec<ProcessViewId> {
+        self.ownership.keys().copied().collect()
+    }
+
     /// Scrubs one possibly-partially-filed raw observation (pin-failure
     /// path): drops its raw filing and any by-id entries left with no
     /// raws at all, plus their ownership claims. Never touches

@@ -400,6 +400,14 @@ pub(crate) struct InventoryAttachSet {
     /// for a whole-system view whose counts estimate a link's cost, and
     /// `Some(false)` for a scope-limited one whose counts never do.
     mappers_system_view: Option<bool>,
+    /// Keymeta Task 7 (spec §17.7): whether absorb recognizes info
+    /// functions (`C_GetInfo`, `C_GetTokenInfo`,
+    /// `C_GetMechanismInfo`) as info endpoints. Off unless the
+    /// operator passes `--provider-info`: unrecognized info
+    /// functions stay plain usage endpoints. Unit harnesses enable
+    /// it where they exercise the info machinery.
+    #[allow(dead_code)] // The enforcement commit reads this.
+    info_capture: bool,
 }
 
 impl InventoryAttachSet {
@@ -423,7 +431,16 @@ impl InventoryAttachSet {
             module_record_refusals: 0,
             mappers: BTreeMap::new(),
             mappers_system_view: None,
+            info_capture: false,
         }
+    }
+
+    /// Keymeta Task 7 (spec §17.7): opt into (or out of) info
+    /// capture for later absorbs. The inventory run sets this from
+    /// `--provider-info` (off by default); already-absorbed
+    /// endpoints keep their kinds.
+    pub(crate) fn set_info_capture(&mut self, capture: bool) {
+        self.info_capture = capture;
     }
 
     /// Record one pass's mapper counts by raw object key (a catalog's
@@ -5021,6 +5038,77 @@ pub(crate) mod tests {
             };
         }
         let mut set = InventoryAttachSet::new(budget(64));
+        let outcome = set.absorb(&plan, &pins);
+        assert_eq!(outcome.delta.endpoints.len(), 3);
+        assert_eq!(outcome.delta.endpoints[0].info_kind, None);
+        assert_eq!(outcome.delta.endpoints[1].info_kind, Some(INFO_KIND_TOKEN));
+        assert_eq!(outcome.delta.endpoints[2].info_kind, None);
+        assert_eq!(outcome.info_aliased, 1);
+    }
+
+    /// Keymeta Task 7 (spec §17.7): info capture is off unless the
+    /// operator opts in — a fresh set recognizes no info functions,
+    /// so info-named slots stay plain usage endpoints and count no
+    /// alias gap.
+    #[test]
+    fn absorb_without_info_capture_keeps_usage_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = AdmissionPolicy::Inventory(budget(64));
+        let a = provider(&dir, "a.so", "provider-a");
+        let pins = pass_pins(&[(&a, "sha-a")]);
+        let modules = [module(&pins, &a, &[0x1000, 0x1010, 0x1020])];
+        let mut plan = lower_named(&modules, &pins, policy);
+        for index in 0..plan.slots.len() {
+            if !plan.is_active(index as u32) {
+                continue;
+            }
+            let offset = plan.slots[index].file_offset;
+            plan.slots[index].names = match offset {
+                0x1000 => vec!["C_GetInfo".to_string(), "C_Sign".to_string()],
+                0x1010 => vec!["C_GetTokenInfo".to_string()],
+                _ => vec!["C_Sign".to_string()],
+            };
+        }
+        let mut set = InventoryAttachSet::new(budget(64));
+        let outcome = set.absorb(&plan, &pins);
+        assert_eq!(outcome.delta.endpoints.len(), 3);
+        assert!(
+            outcome
+                .delta
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.info_kind.is_none()),
+            "off means no info kinds: {:?}",
+            outcome.delta.endpoints,
+        );
+        assert_eq!(outcome.info_aliased, 0);
+    }
+
+    /// Keymeta Task 7 (spec §17.7, control): an opted-in set
+    /// recognizes info functions exactly as before — clean slots
+    /// take kinds, aliased slots stay usage and count the gap.
+    #[test]
+    fn absorb_with_info_capture_recognizes_info_endpoints() {
+        use p11scope_ebpf_common::inventory_info::INFO_KIND_TOKEN;
+        let dir = tempfile::tempdir().unwrap();
+        let policy = AdmissionPolicy::Inventory(budget(64));
+        let a = provider(&dir, "a.so", "provider-a");
+        let pins = pass_pins(&[(&a, "sha-a")]);
+        let modules = [module(&pins, &a, &[0x1000, 0x1010, 0x1020])];
+        let mut plan = lower_named(&modules, &pins, policy);
+        for index in 0..plan.slots.len() {
+            if !plan.is_active(index as u32) {
+                continue;
+            }
+            let offset = plan.slots[index].file_offset;
+            plan.slots[index].names = match offset {
+                0x1000 => vec!["C_GetInfo".to_string(), "C_Sign".to_string()],
+                0x1010 => vec!["C_GetTokenInfo".to_string()],
+                _ => vec!["C_Sign".to_string()],
+            };
+        }
+        let mut set = InventoryAttachSet::new(budget(64));
+        set.set_info_capture(true);
         let outcome = set.absorb(&plan, &pins);
         assert_eq!(outcome.delta.endpoints.len(), 3);
         assert_eq!(outcome.delta.endpoints[0].info_kind, None);

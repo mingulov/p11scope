@@ -6229,6 +6229,42 @@ fn info_retry_bound_has_one_owner() {
     assert!(!contract(&tail), "a charge outside the owner");
 }
 
+/// Keymeta Task 7 hazard gate (spec §17.4): an extend with no info
+/// endpoints and no pendings never consults the verdict — an
+/// info-free capture probes nothing. Control: an info endpoint
+/// consults exactly once, then reuses the retained approval.
+#[test]
+fn info_gate_consults_only_when_info_returns_may_attach() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut fixture = SetFixture::new(64);
+    let plain = absorb_named(&mut fixture, "a.so", &[("C_Sign", 0x2000)]);
+    assert!(plain.endpoints[0].info_kind.is_none());
+    let mut harness = Harness::new(64, None);
+    let probes = std::sync::Arc::new(AtomicUsize::new(0));
+    let counting = probes.clone();
+    harness.book.set_info_return_gate(Box::new(move |_, _| {
+        counting.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::uretprobe_hazard::ReturnProbeAdmission::for_test())
+    }));
+    let receipt = harness.extend(plain, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [0]);
+    assert_eq!(probes.load(Ordering::SeqCst), 0, "no info, no probe");
+    // Control: an info endpoint consults once, then reuses.
+    let info = absorb_named(&mut fixture, "b.so", &[("C_GetInfo", 0x1000)]);
+    assert!(info.endpoints[0].info_kind.is_some());
+    let receipt = harness.extend(info, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [1]);
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe");
+    let more = absorb_named(&mut fixture, "c.so", &[("C_GetTokenInfo", 0x1010)]);
+    let receipt = harness.extend(more, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [2]);
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        1,
+        "the retained approval serves later extends"
+    );
+}
+
 /// Keymeta Task 7 ring gate, drain half (5k zero-loss): five thousand
 /// writer-built records across token and mechanism rows flow through
 /// the bounded INFO service, decode, and join with no loss, no

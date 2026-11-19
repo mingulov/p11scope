@@ -314,6 +314,11 @@ pub struct InventoryArgs {
     /// (v0.8.0 keymeta, spec §10.5). Valid only with
     /// `--key-operations`; refused under P0 builds. Default off.
     pub key_sizes: bool,
+    /// `--provider-info`: also capture provider, token and mechanism
+    /// info (v0.8.0 keymeta Task 7, spec §17). Standalone (needs no
+    /// other flag); refused under `--capture scan` and P0 builds.
+    /// Default off.
+    pub provider_info: bool,
     pub hooks: HookRegistry,
     pub json: bool,
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 1024 default.
@@ -823,19 +828,19 @@ exit codes: 0 every requested lane passed; 1 a requested lane is unavailable (--
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP_HEAD: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--key-sizes] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
+                   [--key-operations] [--key-sizes] [--provider-info] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--key-sizes] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
+                   [--key-operations] [--key-sizes] [--provider-info] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
-                   [--key-operations] [--key-sizes] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
+                   [--key-operations] [--key-sizes] [--provider-info] [--hook-symbol <...>]... [--duration <...>] [--json] [--quiet] [-v] [-o <out.json>] [--output-owner <UID[:GID]>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
                    [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
@@ -859,6 +864,7 @@ Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, 
 --forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
 --key-operations also tracks which key each operation used (needs --capture auto or native; start the observer before the application for best coverage). Without it you still get per-provider function and mechanism counts.
 --key-sizes also infers key sizes from operation lengths (needs --key-operations; off by default - token-reported and creation-template sizes and inferred families are still shown without it).
+--provider-info also captures provider, token and mechanism info (needs --capture auto or native; off by default - without it provider_observations stays absent).
 Per-key results appear under object_observations in --json and in the key operations: line.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 ";
@@ -1983,6 +1989,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut forwarding_modules = Vec::new();
     let mut key_operations = false;
     let mut key_sizes = false;
+    let mut provider_info = false;
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
     let mut max_scan_pids: Option<usize> = None;
@@ -2082,6 +2089,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             }
             "--key-operations" => key_operations = true,
             "--key-sizes" => key_sizes = true,
+            "--provider-info" => provider_info = true,
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
             "--quiet" => quiet = true,
@@ -2314,6 +2322,18 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     if key_sizes && !key_operations {
         return Err(usage_err("--key-sizes requires --key-operations"));
     }
+    // P0 builds omit the info programs, so the flag refuses before
+    // any other provider-info check (a P0 run cannot do info at all).
+    if provider_info && cfg!(feature = "stub-object-attributes") {
+        return Err(usage_err(
+            "--provider-info requires a FULL build (P0 omits info capture)",
+        ));
+    }
+    if provider_info && capture == Some(CaptureMode::Scan) {
+        return Err(usage_err(
+            "--provider-info requires --capture auto or native",
+        ));
+    }
     if diagnostics.is_some() && capture == Some(CaptureMode::Scan) {
         return Err(usage_err("--diagnostics requires --capture auto or native"));
     }
@@ -2341,6 +2361,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         forwarding_modules,
         key_operations,
         key_sizes,
+        provider_info,
         hooks,
         json,
         max_scan_pids,
@@ -7778,6 +7799,135 @@ mod tests {
                  (needs --key-operations; off by default - token-reported and \
                  creation-template sizes and inferred families are still shown \
                  without it)."
+            ),
+            "{help}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // --provider-info opt-in (v0.8.0 keymeta Task 7, spec §17).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn inventory_provider_info_defaults_off() {
+        // Absent means off, on every scope and in every build flavor.
+        for scope in [
+            vec!["--pid", "7"],
+            vec!["--cgroup", "/sys/fs/cgroup/p11scope.slice"],
+            vec!["--system"],
+        ] {
+            let mut argv = vec!["inventory"];
+            argv.extend(scope);
+            let Command::Inventory(parsed) = parse(args(&argv)).unwrap() else {
+                panic!("{argv:?} should parse as inventory");
+            };
+            assert!(!parsed.provider_info, "{argv:?} should default off");
+        }
+        // --key-operations alone never implies --provider-info.
+        let Command::Inventory(parsed) =
+            parse(args(&["inventory", "--pid", "7", "--key-operations"])).unwrap()
+        else {
+            panic!("expected inventory");
+        };
+        assert!(
+            !parsed.provider_info,
+            "key-operations alone leaves info off"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "stub-object-attributes"))]
+    fn inventory_provider_info_parses_standalone_full() {
+        // FULL builds accept the flag alone (it needs no other
+        // flag) and beside --key-operations, on every scope,
+        // whichever order the flags arrive in.
+        for scope in [
+            vec!["--pid", "7"],
+            vec!["--cgroup", "/sys/fs/cgroup/p11scope.slice"],
+            vec!["--system"],
+        ] {
+            for extra in [
+                vec!["--provider-info"],
+                vec!["--key-operations", "--provider-info"],
+                vec!["--provider-info", "--key-operations"],
+            ] {
+                let mut argv = vec!["inventory"];
+                argv.extend(scope.clone());
+                argv.extend(extra);
+                let Command::Inventory(parsed) = parse(args(&argv)).unwrap() else {
+                    panic!("{argv:?} should parse as inventory");
+                };
+                assert!(parsed.provider_info, "{argv:?} should opt into info");
+            }
+        }
+    }
+
+    #[test]
+    fn inventory_provider_info_refused_under_scan() {
+        // Info needs native attach: scan pairings refuse by name,
+        // whichever order the flags arrive in.
+        for argv in [
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--capture",
+                "scan",
+                "--provider-info",
+            ],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--provider-info",
+                "--capture",
+                "scan",
+            ],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
+                    if message.contains("--provider-info requires --capture auto or native")),
+                "{argv:?} should refuse --provider-info under scan"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "stub-object-attributes")]
+    fn inventory_provider_info_refused_under_p0() {
+        // P0 builds omit the info programs, so the flag refuses with
+        // the named FULL-only reason — alone (precedence over the
+        // scan refusal) and beside --key-operations.
+        for argv in [
+            vec!["inventory", "--pid", "7", "--provider-info"],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--key-operations",
+                "--provider-info",
+            ],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
+                    if message.contains("--provider-info requires a FULL build (P0 omits info capture)")),
+                "{argv:?} should refuse --provider-info under P0"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_help_names_provider_info_flag() {
+        // The flag, its usage slot beside --key-sizes, and the §17
+        // sentence are pinned where the inventory flag surface is
+        // pinned. Human output stays ASCII-only (render twin).
+        let help = HelpTopic::Inventory.text();
+        assert!(help.contains("[--provider-info]"), "{help}");
+        assert!(
+            help.contains(
+                "--provider-info also captures provider, token and mechanism info \
+                 (needs --capture auto or native; off by default - without it \
+                 provider_observations stays absent)."
             ),
             "{help}"
         );

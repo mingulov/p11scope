@@ -1821,13 +1821,13 @@ impl InventoryState {
         Some(read_info_produced(&self.prepared.ebpf).map_err(|error| format!("{error:#}")))
     }
 
-    /// Keymeta Task 7 (spec §17.4): the four INFO_EVIDENCE cells
+    /// Keymeta Task 7 (spec §17.4): the five INFO_EVIDENCE cells
     /// now (insert failures, unmatched returns, nested overwrites,
-    /// stash mismatches), or `None` before the reader exists (P0
-    /// reads nothing). No cell lookup starts at or past the quantum
-    /// deadline: a mid-group expiry yields (the caller keeps its
-    /// previous sample), and a failed map read rides `Done(Err)`
-    /// with its cause, distinct from P0 absence.
+    /// stash mismatches, INFO ring losses), or `None` before the
+    /// reader exists (P0 reads nothing). No cell lookup starts at
+    /// or past the quantum deadline: a mid-group expiry yields (the
+    /// caller keeps its previous sample), and a failed map read
+    /// rides `Done(Err)` with its cause, distinct from P0 absence.
     pub(super) fn info_evidence(&self, deadline: Instant) -> Option<InfoEvidenceRead> {
         self.info.as_ref()?;
         Some(read_info_evidence(
@@ -2011,7 +2011,7 @@ impl RetiringInventory {
         self.state.as_ref()?.info_produced()
     }
 
-    /// Keymeta Task 7 (spec §17.4): the four INFO_EVIDENCE cells
+    /// Keymeta Task 7 (spec §17.4): the five INFO_EVIDENCE cells
     /// now, or `None` once the state transfers (P0 reads nothing).
     pub(super) fn info_evidence(&self, deadline: Instant) -> Option<InfoEvidenceRead> {
         self.state.as_ref()?.info_evidence(deadline)

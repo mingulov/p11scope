@@ -186,7 +186,7 @@ fn map_fixture() -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
             MapType::PerCpuArray,
             4,
             8,
-            4,
+            5,
             0,
         ),
     ]);

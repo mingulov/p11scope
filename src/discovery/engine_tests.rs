@@ -77670,6 +77670,260 @@ fn collected_graph_charge_covers_requested_heap() {
 }
 
 #[test]
+fn terminal_rebind_authority_credit_stays_bounded_over_many_live_views() {
+    // 65 live views plus 3 carried rows ride one terminal graph that
+    // retires a single view: every credit visits at most one stride of
+    // authority items, and Install keeps every surviving live view's
+    // exact claims while the carried views own nothing.
+    const VIEWS: u32 = 65;
+    const CARRIED: u32 = 3;
+    const RETIRED: u32 = 64;
+    const CARRIED_BASE: u32 = 1000;
+    let shared_file = tempfile::NamedTempFile::new().expect("a shared pin file");
+    std::io::Write::write_all(&mut &shared_file, &[0x7fu8; 8192]).expect("pin bytes");
+    let shared_path = shared_file.path().to_path_buf();
+    let shared_path_text = shared_path.to_str().expect("a utf-8 pin path").to_string();
+    let keys: Vec<ObjectKey> = (0..VIEWS + CARRIED)
+        .map(|index| ObjectKey {
+            device: Device {
+                major: 8,
+                minor: u64::from(index),
+            },
+            inode: 1000 + u64::from(index),
+        })
+        .collect();
+    let mut pins = PinnedObjects::empty();
+    for (index, key) in keys.iter().enumerate() {
+        let absorbed = pins.absorb(overlay_real_scan_pin(
+            &shared_path,
+            Some(*key),
+            index as u64,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ));
+        assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+        if index < VIEWS as usize {
+            record_scan_ownership(
+                &mut pins,
+                ProcessViewId(index as u32),
+                *key,
+                &shared_path_text,
+            );
+        }
+    }
+    overlay_reback(
+        &mut pins,
+        &std::sync::Arc::new(std::fs::File::open(&shared_path).expect("the shared pin file")),
+    );
+    let scanned: Vec<ScannedModule> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let view = if index < VIEWS as usize {
+                ProcessViewId(index as u32)
+            } else {
+                ProcessViewId(CARRIED_BASE + index as u32 - VIEWS)
+            };
+            let mut module = overlay_module(*key);
+            module.view = view;
+            module.path.clone_from(&shared_path_text);
+            module.exports = (0..16)
+                .map(|slot| format!("export-{index}-{slot}"))
+                .collect();
+            module.tables[0].entries[0]
+                .object_path
+                .clone_from(&shared_path_text);
+            module.tables[0].entries[0].file_offset = 0x1000;
+            let mut second = module.tables[0].clone();
+            second.address += 0x1000;
+            second.entries[0].file_offset = 0x1800;
+            module.tables.push(second);
+            module
+        })
+        .collect();
+    let (reconciled, _collapsed, lost) = reconcile_scanned_modules(&scanned, &mut pins);
+    assert!(lost.is_empty(), "every twin row must reconcile");
+    assert_eq!(reconciled.len(), (VIEWS + CARRIED) as usize);
+    // The pre-existing ownership layer is the scan layer only: the
+    // installed claims below are then exactly one fresh grant over it,
+    // and the carried views hold no entry at all.
+    pins.reset_derived_claims();
+    pins.reset_scan_pin_claims();
+    for carried in 0..CARRIED {
+        pins.drop_view_claims(ProcessViewId(CARRIED_BASE + carried));
+    }
+    for carried in 0..CARRIED {
+        assert!(
+            pins.view_claims(ProcessViewId(CARRIED_BASE + carried))
+                .is_none(),
+            "the fixture starts with carried view {} claimless",
+            CARRIED_BASE + carried
+        );
+    }
+    let mut scan_pins: BTreeMap<ProcessViewId, Vec<PinnedObjectId>> = BTreeMap::new();
+    for index in 0..VIEWS {
+        let view = ProcessViewId(index);
+        scan_pins.insert(
+            view,
+            pins.view_claims(view)
+                .expect("every live view keeps its scan pin")
+                .pins
+                .clone(),
+        );
+    }
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.pinned = pins;
+    engine.modules = reconciled;
+    engine.plan = plan::build_from_sources_for_policy(
+        &engine.modules,
+        &[],
+        &engine.pinned,
+        plan::AdmissionPolicy::Inventory(
+            crate::capacity::inventory_endpoint_budget(Some(2 * u64::from(VIEWS + CARRIED)))
+                .unwrap(),
+        ),
+    );
+    assert_eq!(engine.plan.slots.len(), 2 * (VIEWS + CARRIED) as usize);
+    engine.bind_plan_module_ids_for_test();
+    for index in 0..VIEWS {
+        engine.views.push(
+            ProcessView::open(ProcessViewId(index), std::process::id())
+                .expect("every live view opens"),
+        );
+    }
+    insert_sizing_selection_rows(&mut engine, VIEWS);
+    engine.next_view_id = VIEWS;
+    let mut session = ScriptedSession::default();
+    let (_entered, _returned) = attach_nonblocking_native_carrier(&engine, &mut session);
+    engine
+        .collected_test_pool
+        .reference_set_limit(COLLECTED_GRAPH_POOL_BYTES);
+    engine.pending_retirements.insert(ProcessViewId(RETIRED));
+    // One credit at a time with the authority counter reset between
+    // credits: no single credit may visit more than one stride.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut credits = 0u64;
+    let mut saw_rebind = false;
+    loop {
+        engine.graph_authority_visits = 0;
+        let outcome = engine
+            .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
+            .unwrap();
+        credits += 1;
+        assert!(
+            engine.graph_authority_visits <= GRAPH_STRIDE,
+            "one graph credit visits at most one stride of authority items \
+             (credit {credits}: {} visits)",
+            engine.graph_authority_visits
+        );
+        if engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::Rebind)
+        {
+            saw_rebind = true;
+        }
+        if !outcome.pending {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the graph did not settle within 60 s ({credits} credits)"
+        );
+        let worker_settling = engine
+            .collected_graph
+            .as_ref()
+            .is_some_and(|graph| graph.phase == GraphPhase::NativePoll || graph.native_cancel_owed);
+        if worker_settling {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    assert!(saw_rebind, "the drive ran terminal rebind credits");
+    assert!(engine.pending_retirements.is_empty());
+    assert_eq!(engine.collected_graphs_created, 1);
+    assert!(engine.collected_graph_refused().is_none());
+    for index in 0..VIEWS {
+        if index == RETIRED {
+            continue;
+        }
+        let view = ProcessViewId(index);
+        let module = engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == view)
+            .unwrap_or_else(|| panic!("the live row still binds: {view:?}"));
+        let claims = engine
+            .pinned
+            .view_claims(view)
+            .unwrap_or_else(|| panic!("the live view installed its claims: {view:?}"));
+        assert_eq!(
+            claims.tables,
+            vec![module.object; module.scanned.tables.len()],
+            "the live view's installed tables name its object: {view:?}"
+        );
+        let expected_targets: Vec<(PinnedObjectId, u64)> = module
+            .scanned
+            .tables
+            .iter()
+            .zip(&module.entry_objects)
+            .flat_map(|(table, ids)| {
+                table
+                    .entries
+                    .iter()
+                    .zip(ids)
+                    .map(|(entry, id)| (*id, entry.file_offset))
+            })
+            .collect();
+        assert_eq!(
+            claims.targets, expected_targets,
+            "the live view's installed targets are its bound entries: {view:?}"
+        );
+        let mut expected_pins = scan_pins.get(&view).cloned().unwrap_or_default();
+        expected_pins.push(module.object);
+        expected_pins.extend(module.entry_objects.iter().flatten().copied());
+        assert_eq!(
+            claims.pins, expected_pins,
+            "the live view's installed pins are its scan pin plus its grant: {view:?}"
+        );
+    }
+    for carried in 0..CARRIED {
+        let view = ProcessViewId(CARRIED_BASE + carried);
+        assert!(
+            engine.pinned.view_claims(view).is_none(),
+            "the carried view owns no installed claims: {view:?}"
+        );
+        let module = engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == view)
+            .unwrap_or_else(|| panic!("the carried row still binds: {view:?}"));
+        assert!(
+            engine.pinned.summary(module.object).is_some(),
+            "the carried pin stays resolvable: {view:?}"
+        );
+        assert!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .any(|slot| engine.plan.is_active(slot.index) && slot.object == module.object),
+            "the carried slot stays attached: {view:?}"
+        );
+    }
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != ProcessViewId(RETIRED)),
+        "the retired row leaves the installed modules"
+    );
+    assert!(
+        engine.pinned.view_claims(ProcessViewId(RETIRED)).is_none(),
+        "the retired view owns no installed claims"
+    );
+}
+
+#[test]
 fn collected_graph_installed_facts_stay_charged_while_canonical() {
     // The installed Facts maps stay charged while their backing is
     // canonical: graph 1's live-map leases survive its Done, move to the

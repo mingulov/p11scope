@@ -1289,6 +1289,12 @@ pub struct Engine {
     /// Intents Intake visited (test count, G23).
     #[cfg(test)]
     collected_intake_intents: u32,
+    /// Authority items the terminal rebind path visited since the test
+    /// last reset it: the live-list scans behind one Rebind credit, or
+    /// one strided authority-build credit. The bound twin resets it
+    /// before every credit and asserts it never exceeds one stride.
+    #[cfg(test)]
+    graph_authority_visits: usize,
     /// Test-only semantic pool behind `service_collected_finish_records` (D1.2).
     #[cfg(test)]
     collected_test_pool: SemanticResourcePool,
@@ -14309,6 +14315,8 @@ impl Engine {
             collected_graphs_created: 0,
             #[cfg(test)]
             collected_intake_intents: 0,
+            #[cfg(test)]
+            graph_authority_visits: 0,
             #[cfg(test)]
             collected_test_pool: SemanticResourcePool::with_limit(COLLECTED_GRAPH_POOL_BYTES),
             #[cfg(test)]
@@ -36119,6 +36127,11 @@ impl Engine {
         // constructor as the live choke, with no newcomers and no
         // declined views at Finish.
         let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        #[cfg(test)]
+        {
+            // The live-list scan: one visit per retained view.
+            self.graph_authority_visits = self.graph_authority_visits.saturating_add(live.len());
+        }
         let empty = BTreeSet::new();
         let retired = graph
             .selection
@@ -36126,6 +36139,14 @@ impl Engine {
             .map(ConservativePinSelection::retired)
             .unwrap_or(&empty);
         let authority = ClaimAuthority::candidate(&live, &empty, &empty, retired);
+        #[cfg(test)]
+        {
+            // The union scan plus the retirement removals inside the
+            // constructor: one visit per live view, one per retirement.
+            self.graph_authority_visits = self
+                .graph_authority_visits
+                .saturating_add(live.len().saturating_add(retired.len()));
+        }
         match graph.pins.poll_scanned_rebind(
             &mut graph.raw,
             &mut graph.rebind,

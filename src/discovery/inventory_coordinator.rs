@@ -6824,19 +6824,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) -> Option<FoldContext> {
         let mut instances_by_caller: HashMap<CallerId, Vec<RegistryInstanceId>> = HashMap::new();
         // Distinct touched modules per caller, for the one-unit
-        // departed-identity charge: derived inside these same
-        // stop-paced scans, with no extra pass and no extra stop
-        // polling.
+        // departed-identity charge: the first touch of a caller/module
+        // pair reserves its unit here, inside these same stop-paced
+        // scans, with no extra pass and no extra stop polling.
         let mut touched: HashMap<CallerId, BTreeSet<ModuleId>> = HashMap::new();
+        let mut identity_units: HashMap<CallerId, usize> = HashMap::new();
         for record in self.registry.instances() {
             instances_by_caller
                 .entry(record.caller)
                 .or_default()
                 .push(record.id);
-            touched
+            if touched
                 .entry(record.caller)
                 .or_default()
-                .insert(record.module);
+                .insert(record.module)
+            {
+                identity_units
+                    .entry(record.caller)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+            }
             if unit() {
                 return None;
             }
@@ -6906,8 +6913,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let mut refused_backend = false;
             for (key_caller, module) in keys {
                 // Every indexed edge key counts, exactly like the
-                // admission lengths the commit folds from.
-                touched.entry(*caller).or_default().insert(*module);
+                // admission lengths the commit folds from: the first
+                // touch of a caller/module pair reserves its identity
+                // unit here, inside the paced scan.
+                if touched.entry(*caller).or_default().insert(*module) {
+                    identity_units
+                        .entry(*caller)
+                        .and_modify(|count| *count = count.saturating_add(1))
+                        .or_insert(1);
+                }
                 let Some(edge) = self.registry.edge(*key_caller, *module) else {
                     if unit() {
                         return None;
@@ -6936,17 +6950,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if let Some(subset) = subset {
             subset_modules = Some(self.subset_module_ids(subset, &mut unit)?);
         }
-        let identity_units: HashMap<CallerId, usize> = touched
-            .into_iter()
-            .map(|(caller, modules)| {
-                #[cfg(test)]
-                {
-                    self.fold_identity_unpaced_writes
-                        .set(self.fold_identity_unpaced_writes.get().saturating_add(1));
-                }
-                (caller, modules.len())
-            })
-            .collect();
+        // The distinct-module sets drop here: freeing the temporary
+        // index needs no stride check, and the per-caller counts
+        // above already rode the paced scans.
+        drop(touched);
         Some(FoldContext {
             instances_by_caller,
             claimed_children,

@@ -169,7 +169,7 @@ fn map_fixture(n: u32) -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)>
             MapType::PerCpuArray,
             4,
             8,
-            4,
+            5,
             0,
         ),
     ]);
@@ -817,7 +817,7 @@ fn inventory_full_map_manifest_carries_the_info_ring_and_stash() {
             MapType::PerCpuArray,
             4,
             8,
-            4,
+            5,
             0,
         ),
     ] {

@@ -559,7 +559,7 @@ fn inventory_maps(
         (
             "INFO_EVIDENCE",
             K::PerCpuArray,
-            map_metadata(MapType::PerCpuArray, 4, 8, 4, 0),
+            map_metadata(MapType::PerCpuArray, 4, 8, 5, 0),
         ),
     ]);
     rows.into_iter()

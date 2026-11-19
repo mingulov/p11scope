@@ -13737,28 +13737,6 @@ fn reduce_profile_event(
     #[cfg(test)]
     crate::first_use_probe::call(domain, &ev);
     tracker.check_root_event(domain, ev.root_affiliation)?;
-    // Temporary loss forensics: per-event pid and time series on
-    // stderr under P11SCOPE_FIX1_EVLOG (reverted before landing).
-    // One line per CALL/FORK: exact per-worker arrival proof.
-    if std::env::var_os("P11SCOPE_FIX1_EVLOG").is_some_and(|value| !value.is_empty()) {
-        let kind = match ev.event_type {
-            p11scope_ebpf_common::event_type::CALL => "CALL",
-            p11scope_ebpf_common::event_type::FORK => "FORK",
-            p11scope_ebpf_common::event_type::FORK_INTO_CGROUP => "FORK_CG",
-            _ => "OTHER",
-        };
-        let pid = (ev.pid_tgid >> 32) as u32;
-        let tid = ev.pid_tgid as u32;
-        eprintln!(
-            "p11scope: fix1ev type={} pid={} tid={} slot={} child={} ts={}",
-            kind,
-            pid,
-            tid,
-            ev.slot,
-            ev.session,
-            ev.ts_ns,
-        );
-    }
     if !observe_fork(domain, tracker, state, scope, &ev)
         && let Some(process) = identify_tracked(domain, tracker, state, &ev)
         && state.observe_process(process, &ev)

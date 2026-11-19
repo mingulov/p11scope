@@ -4229,4 +4229,232 @@ mod tests {
             "the pre-handover sync must not `?`-fail and delete the capture"
         );
     }
+
+    /// A failed `-o` document write saves the caller's complete bytes
+    /// to the recovery dir (the temp holds at most a partial write,
+    /// so the fallback never reads it): typed `SavedToRecovery`, the
+    /// message names the fallback path, the saved file is `0600`
+    /// owner-only with the exact bytes, and the partial temp is gone.
+    #[test]
+    fn write_failure_saves_bytes_to_recovered_dir() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut a = AtomicFile::create(&path).unwrap();
+        a.set_fail_write_with(libc::ENOSPC);
+        let error = a.write_document(b"{\"ok\":true}").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        let _override = hold_recovered_override(&recovered_base);
+        let failure = a.fail_write_with_recovery(
+            b"{\"ok\":true}",
+            format!("writing inventory report failed: {error}"),
+        );
+        assert_eq!(failure.kind(), CommitFailureKind::SavedToRecovery);
+        let saved = failure
+            .saved_to_recovery()
+            .expect("a saved fallback names its path")
+            .to_path_buf();
+        assert!(
+            failure.message().contains("capture saved to"),
+            "the message names the fallback, got: {}",
+            failure.message()
+        );
+        assert!(
+            failure.message().contains(&saved.display().to_string()),
+            "the message names the fallback path, got: {}",
+            failure.message()
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"{\"ok\":true}");
+        let metadata = std::fs::metadata(&saved).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A failed `-o` document write with a refused recovery dir (a
+    /// planted symlink here) reports a typed `RecoveryFailed`: no
+    /// saved path, the message carries both errors with `capture
+    /// lost`, and nothing is created through the refused base.
+    #[test]
+    fn write_failure_with_refused_recovery_reports_lost() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let plant = private_tempdir();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        a.set_fail_write_with(libc::ENOSPC);
+        let error = a.write_document(b"{\"ok\":true}").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        let _override = hold_recovered_override(&link);
+        let failure = a.fail_write_with_recovery(
+            b"{\"ok\":true}",
+            format!("writing inventory report failed: {error}"),
+        );
+        assert_eq!(failure.kind(), CommitFailureKind::RecoveryFailed);
+        assert!(
+            failure.saved_to_recovery().is_none(),
+            "a double failure saves nothing"
+        );
+        let message = failure.into_message();
+        assert!(message.contains("capture lost"), "got: {message}");
+        assert!(
+            message.contains("also failed"),
+            "the message names the fallback failure, got: {message}"
+        );
+        assert!(!path.exists(), "the requested -o does not exist");
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused symlink"
+        );
+    }
+
+    /// The production recovery dir carries the caller's uid, so one
+    /// user's fallback never blocks another's: root and unprivileged
+    /// callers recover into different directories.
+    #[test]
+    fn recovered_production_base_carries_the_euid() {
+        assert_eq!(
+            recovered_production_base(0),
+            PathBuf::from("/var/tmp/p11scope-recovered-0")
+        );
+        assert_eq!(
+            recovered_production_base(1000),
+            PathBuf::from("/var/tmp/p11scope-recovered-1000")
+        );
+        assert_eq!(
+            recovered_production_base(65534),
+            PathBuf::from("/var/tmp/p11scope-recovered-65534")
+        );
+    }
+
+    /// Without the test override the recovery base is the production
+    /// per-euid name (under the override lock, so no concurrent twin
+    /// can set the variable mid-check).
+    #[test]
+    fn recovered_base_dir_defaults_to_the_per_euid_production_name() {
+        let _lock = RECOVERED_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR").is_none());
+        let euid = unsafe { libc::geteuid() } as u32;
+        assert_eq!(
+            recovered_base_dir(),
+            recovered_production_base(euid),
+            "the default base names this uid"
+        );
+    }
+
+    /// A recovery base occupied by a foreign object (a file, a
+    /// symlink, a permissive dir here — all refused by the base
+    /// checks) falls back to a fresh unique sibling: the save
+    /// succeeds, the saved path names the sibling, the sibling is
+    /// `0700` owner-only, and the planted base is untouched. A
+    /// truly foreign-owned dir joins the set when root runs this.
+    #[test]
+    fn foreign_recovery_base_falls_back_to_a_fresh_sibling() {
+        use std::os::unix::fs::MetadataExt as _;
+        let plant = private_tempdir();
+        let file_base = plant.path().join("p11scope-recovered-file");
+        std::fs::write(&file_base, b"not a directory").unwrap();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link_base = plant.path().join("p11scope-recovered-link");
+        std::os::unix::fs::symlink(&target, &link_base).unwrap();
+        let loose_base = plant.path().join("p11scope-recovered-loose");
+        std::fs::create_dir(&loose_base).unwrap();
+        std::fs::set_permissions(&loose_base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut bases = vec![file_base, link_base, loose_base];
+        if unsafe { libc::geteuid() } == 0 {
+            let foreign_base = plant.path().join("p11scope-recovered-foreign");
+            std::fs::create_dir(&foreign_base).unwrap();
+            std::fs::set_permissions(&foreign_base, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let foreign_c =
+                CString::new(foreign_base.as_os_str().as_bytes()).expect("no NUL in temp path");
+            assert_eq!(
+                unsafe { libc::chown(foreign_c.as_ptr(), 65534, 65534) },
+                0,
+                "root plants a foreign-owned base"
+            );
+            bases.push(foreign_base);
+        } else {
+            eprintln!(
+                "foreign-owned leg skipped: needs root (file, symlink and permissive legs run)"
+            );
+        }
+        for base in &bases {
+            let saved = save_recovered_bytes(b"{\"ok\":true}", Path::new("observed.json"), base)
+                .expect("a refused base falls back");
+            let sibling = saved.parent().expect("the save names its dir");
+            assert_ne!(sibling, base, "the save leaves the refused base");
+            assert!(
+                sibling.starts_with(plant.path()),
+                "the sibling stays beside the base: {}",
+                sibling.display()
+            );
+            let stem = format!(
+                "{}.",
+                base.file_name()
+                    .expect("the base has a name")
+                    .to_string_lossy()
+            );
+            assert!(
+                sibling
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&stem)),
+                "the sibling keeps the base name stem: {}",
+                saved.display()
+            );
+            assert_eq!(std::fs::read(&saved).unwrap(), b"{\"ok\":true}");
+            let metadata = std::fs::metadata(sibling).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            let file_metadata = std::fs::metadata(&saved).unwrap();
+            assert_eq!(file_metadata.permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(
+            std::fs::read(plant.path().join("p11scope-recovered-file")).unwrap(),
+            b"not a directory",
+            "the planted file base is untouched"
+        );
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused symlink"
+        );
+        std::fs::set_permissions(
+            plant.path().join("p11scope-recovered-loose"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    /// When the base and the fresh-dir fallback both fail (a
+    /// read-only parent here), the error carries both failures with
+    /// the base path, so the operator sees the refused base and the
+    /// failed fallback instead of a bare refusal.
+    #[test]
+    fn recovery_fallback_failure_reports_both_errors() {
+        let plant = private_tempdir();
+        let base = plant.path().join("p11scope-recovered");
+        std::fs::set_permissions(plant.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let error =
+            save_recovered_bytes(b"{\"ok\":true}", Path::new("observed.json"), &base).unwrap_err();
+        std::fs::set_permissions(plant.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            error.contains(&base.display().to_string()),
+            "the error names the base, got: {error}"
+        );
+        assert!(
+            error.contains("fallback"),
+            "the error names the failed fallback, got: {error}"
+        );
+    }
 }

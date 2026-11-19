@@ -714,7 +714,8 @@ impl BinderReleasePlan {
     }
 
     /// The cookie sequences the plan would clear for this caller, if
-    /// any: the staged oversized fold collects them into its lists.
+    /// any: the fold's commit and the staged commit's revalidation read
+    /// them.
     pub(crate) fn owned_keys(&self, id: CallerId) -> Option<&Vec<(usize, DomainCookie, u64)>> {
         self.owned.get(&id)
     }
@@ -1138,10 +1139,21 @@ impl NativeBinder {
         }
     }
 
+    /// Whether one cookie sequence still names `id`: the staged
+    /// oversized fold rehearses its lists read-only and the commit
+    /// revalidates them, so neither trusts a stale key.
+    pub(crate) fn owns_sequence(&self, id: CallerId, key: &(usize, DomainCookie, u64)) -> bool {
+        self.domains
+            .get(key.0)
+            .and_then(|domain| domain.cookies.get(&key.1))
+            .and_then(|execs| execs.get(&key.2))
+            .is_some_and(|seen| seen.bound == Some(id))
+    }
+
     /// Clear cookie-sequence ownership for the given keys: each must
     /// still name `id` (the plan indexed it). The atomic fold clears
     /// all of the caller's sequences at once; the staged oversized
-    /// fold clears them in credited slices across passes.
+    /// fold clears them once at its coherent commit.
     pub(crate) fn clear_owned_sequences(
         &mut self,
         id: CallerId,

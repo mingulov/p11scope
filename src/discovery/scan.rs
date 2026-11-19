@@ -9883,7 +9883,7 @@ mod tests {
         });
         // Data-always (controller R1): an IO-starved bracket over a live
         // view keeps the decoded module with the failure named, never an
-        // empty view — the same keep as the work-starved twin.
+        // empty view — unlike the work-starved twin, which clears.
         let outcome = f.run(&mut budget).unwrap();
         assert_eq!(outcome.modules().len(), 1);
         assert_eq!(outcome.modules()[0].tables.len(), 1);
@@ -10579,9 +10579,9 @@ mod tests {
     /// C1 twin (two providers): the check proves the first provider's
     /// mapping changed (`Ok(false)`), then the second provider's
     /// validation spend starves the work ceiling. The proven-changed
-    /// module must be dropped with its mapping-changed row, and the
-    /// work-starved bracket drops the later, never-validated module
-    /// too — a work-starved bracket never publishes.
+    /// module is dropped without a per-module row; the bracket failure
+    /// names the occurrence. The work-starved bracket drops the later,
+    /// never-validated module too — a work-starved bracket never publishes.
     #[test]
     fn work_starved_bracket_drops_both_modules_with_named_rows() {
         fn changed_first() -> BracketFixture {
@@ -10658,8 +10658,9 @@ mod tests {
     /// C1 twin (generation stop): the check passes — one validation proves
     /// a mapping change — then `final_generation` spends the last work
     /// unit (production proves the filesystem there). The `(Ok, Err)` arm
-    /// must still drop the proven-changed module with its row, and the
-    /// work-starved generation proof drops the unproven module too.
+    /// drops the proven-changed module with no per-module row; the
+    /// generation proof names the occurrence and drops the unproven
+    /// module too.
     #[test]
     fn generation_stop_after_a_passed_check_still_drops_a_proven_changed_module() {
         for changed in [false, true] {

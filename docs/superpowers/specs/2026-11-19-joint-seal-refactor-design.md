@@ -253,6 +253,9 @@ lane liveness past recovery.
 | E6 | Seal cursor park (§3.2) | Watchdog bound with stuck cursor consumer | Cursor advances past degraded consumer; later healthy consumers seal/deliver in the same frame |
 | E7 | Birth funnel past stuck member (§3.6) | Stuck member + healthy births | Healthy births decided/consumed; stuck member parked with named gap; re-offer bounds kept |
 | E8 | Bounded bulk discard (§3.5) | 25-operation stuck quantum (75 heads), transient re-arm | All 75 disposed counted, zero per-head preservation, named gap counts the discard |
+| E9a | Consumer park, no trip (§3.2) | Posed Retry seal failure + backdated clock, natural polls | Parked consumer forced-fallback degrades with park gap; frame completes; no trip, no abandon, no rearm |
+| E9b | Barrier shed in scoped void (§3.4) | Foreign in-flight call + trip + rearm | Barrier shed with loss; held session kept and seals exact; fresh stuck-file call seals |
+| E10 | Unapplied re-arm keeps carried (§3.4) | Transient refusal before anything applied | Touched set empty, nothing disposed; held call stays staged; lane continues |
 
 E4/E5 are no-change guard rows: the refactor must not alter terminal
 behavior while localizing running recovery.

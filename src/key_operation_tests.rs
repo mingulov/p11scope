@@ -22947,6 +22947,83 @@ fn key_operation_partial_publication_counts_unattributed() {
     );
 }
 
+/// A pending key lost to H3 with nothing staged still degrades to a
+/// named per-key gap instead of voiding the whole view. Twin for the
+/// stub-provider live repro (147/147 joined, void_audit=1 H3Loss,
+/// keys_pending=1, r4 zeros, v1 unavailable 0 rows): staged empty
+/// (refused calls never stage), one per-key model gap, no rows.
+#[test]
+fn key_operation_pending_key_h3_loss_degrades_view_per_key() {
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Staged empty: the refused calls never staged, like the live
+    // stub repro where slot refusals shed H3 before any Joint stage.
+    assert_eq!(staging.staged_len(), 0, "nothing staged before the loss");
+    let failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 0 }
+        ),
+        "empty staging degrades with zero disposed, not a retry"
+    );
+    assert!(staging.degraded_loss(), "real loss latches degraded loss");
+    // The seal's per-key gap for the pending key: one registered
+    // domain voided as lost history, no sessions or objects.
+    let mut gapped = crate::semantics_objects::ObjectSemantics::new();
+    let domain = crate::semantics_objects::ObjectDomain::reference(1, 1, 1, 1, 1);
+    gapped.register_domain(domain).expect("domain registers");
+    let mut ledger = crate::semantics_objects::journal::StagingLedger::new();
+    gapped.outcome_lost(
+        crate::semantics_objects::LostOutcome::Voided(
+            domain,
+            crate::semantics_objects::RefCut::reference(6),
+        ),
+        &mut ledger,
+    );
+    let projected = gapped.project();
+    assert!(
+        projected.gap(crate::semantics_objects::ObjectGap::OutcomeLost) >= 1,
+        "the per-key loss lands as a named model gap"
+    );
+    assert!(
+        projected.sessions.is_empty() && projected.objects.is_empty(),
+        "no sessions or objects, like the live r4 zeros"
+    );
+    let degraded = commit(34, &[&staging], &projected, &keyuse);
+    assert_eq!(
+        degraded.status, ObsStatus::Partial,
+        "one pending key's loss degrades the view, never voids it to unavailable"
+    );
+    assert_eq!(degraded.reason, "authority_lost");
+    assert!(
+        degraded.gaps.iter().any(|gap| gap.reason == "outcome_lost"),
+        "the view carries the named per-key gap: {:?}",
+        degraded.gaps
+    );
+}
+
 /// F2 (round 3): staged calls left unsealed when the no-progress
 /// watchdog trips count once as `watchdog_no_progress` at
 /// publication — they are enumerable in the staging at the trip.

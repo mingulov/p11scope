@@ -2127,7 +2127,11 @@ fn async_global_same_module_mixed_retire_discloses_the_dark_endpoint() {
 /// links detached with `selected`, nothing replaced them, and the slot
 /// deactivates. Intent (the planned reattach) excluded the early window,
 /// so the outcome — a deactivated replace slot with no cover — files the
-/// follow-up window + count + row for the stranded key.
+/// follow-up window + count + row for the stranded key. The replacement
+/// is a rival owner (same index and endpoint, a different stable module
+/// id, as `extend_exact_replaces_a_getter_claimed_by_a_rival_manifest_owner`
+/// produces): the window must attribute to the committed owner, not the
+/// proposal.
 #[test]
 fn async_global_precheck_failed_replacement_discloses_the_stranded_endpoint() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
@@ -2140,7 +2144,18 @@ fn async_global_precheck_failed_replacement_discloses_the_stranded_endpoint() {
         candidate.delta.new.is_empty() && candidate.delta.replace.is_empty(),
         "premise: nothing is left to attach"
     );
-    candidate.delta.replace.push(engine.plan.slots[0].clone());
+    let mut replacement = engine.plan.slots[0].clone();
+    replacement.module_ids = vec![crate::plan::ModuleId(1)];
+    assert_ne!(
+        replacement.module_ids, engine.plan.slots[0].module_ids,
+        "premise: the proposal names a rival owner for the same endpoint"
+    );
+    assert_eq!(
+        crate::plan::AttachKey::of(&replacement),
+        crate::plan::AttachKey::of(&engine.plan.slots[0]),
+        "premise: the rival reuses the same endpoint and index"
+    );
+    candidate.delta.replace.push(replacement);
     let retired_index = engine.plan.slots[0].index;
     let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
         engine.plan.slots[0].module_ids.iter().copied().collect();
@@ -2196,12 +2211,30 @@ fn async_global_precheck_failed_replacement_discloses_the_stranded_endpoint() {
         "the paired finite gap row files: {:?}",
         engine.counters.object_skips
     );
+    let facts = engine.capture_facts();
+    let record = facts
+        .discovery
+        .modules
+        .iter()
+        .find(|record| retired_modules.contains(&record.id))
+        .expect("the retired owner projects a record");
+    assert!(
+        record
+            .unobserved_windows
+            .as_ref()
+            .is_some_and(|windows| windows.iter().any(|window| {
+                window.reason == crate::render::UnobservedReason::CoverageRetired
+            })),
+        "the original owner's record carries the window: {record:?}"
+    );
 }
 
 /// A pending global retirement voids its planned reattach: the apply
 /// deactivates the ticket's slots and returns Deferred without ever
 /// attaching the reattach, so judging the exclusion on intent would stay
-/// silent. The pending path files for every attached selected slot.
+/// silent. The pending path files for every attached selected slot. The
+/// planned reattach is a rival owner (same index and endpoint, a different
+/// stable module id): the window must attribute to the committed owner.
 #[test]
 fn async_global_pending_retirement_with_planned_reattach_files_for_every_attached_slot() {
     let mut case = Case::new();
@@ -2217,10 +2250,18 @@ fn async_global_pending_retirement_with_planned_reattach_files_for_every_attache
         candidate.delta.new.is_empty(),
         "premise: nothing is left to attach"
     );
-    candidate
-        .delta
-        .replace
-        .push(case.engine.plan.slots[0].clone());
+    let mut replacement = case.engine.plan.slots[0].clone();
+    replacement.module_ids = vec![crate::plan::ModuleId(1)];
+    assert_ne!(
+        replacement.module_ids, case.engine.plan.slots[0].module_ids,
+        "premise: the proposal names a rival owner for the same endpoint"
+    );
+    assert_eq!(
+        crate::plan::AttachKey::of(&replacement),
+        crate::plan::AttachKey::of(&case.engine.plan.slots[0]),
+        "premise: the rival reuses the same endpoint and index"
+    );
+    candidate.delta.replace.push(replacement);
     let retired_index = case.engine.plan.slots[0].index;
     let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> = case.engine.plan.slots
         [0]
@@ -2264,5 +2305,21 @@ fn async_global_pending_retirement_with_planned_reattach_files_for_every_attache
         }),
         "the paired finite gap row files: {:?}",
         case.engine.counters.object_skips
+    );
+    let facts = case.engine.capture_facts();
+    let record = facts
+        .discovery
+        .modules
+        .iter()
+        .find(|record| retired_modules.contains(&record.id))
+        .expect("the retired owner projects a record");
+    assert!(
+        record
+            .unobserved_windows
+            .as_ref()
+            .is_some_and(|windows| windows.iter().any(|window| {
+                window.reason == crate::render::UnobservedReason::CoverageRetired
+            })),
+        "the original owner's record carries the window: {record:?}"
     );
 }

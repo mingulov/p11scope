@@ -11103,9 +11103,10 @@ fn pin_scanned_object(
         Err(PinFailure::Refused(reason)) => {
             let dead = view.original_exited();
             eprintln!(
-                "p11scope: DIAG v072c pin_refused view_dead={:?} path={} mono_ns={:?}",
+                "p11scope: DIAG v072c pin_refused view_dead={:?} path={} reason={} mono_ns={:?}",
                 dead,
                 raw_path,
+                reason.chars().take(160).collect::<String>(),
                 crate::attach::monotonic_ns(),
             );
             if dead == Ok(true) {

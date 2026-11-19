@@ -706,7 +706,15 @@ every module in the window re-attaches, else it reads open-ended at
 capture end. An owned-run retirement composed with same-apply
 reattach — the paused ExecRefresh/static-to-exact generation turnover
 — files no window; a pure owned retire with no same-apply reattach
-files one like any live retire. Every
+files one like any live retire. Finalize-time stale-generation cleanup
+is outside this witness: when a process generation changes after link
+mutation, its orphaned targets detach with only the generic `live
+discovery generation` row (and, when unpublished additions are left
+for a later tick with nothing undone, no gap row at all). Exited
+generations have no live victim, like the ended path; the remaining
+shape — a stale view that exec'd while keeping the provider mapped,
+stranding a not-yet-admitted caller until reattach — stays undisclosed
+pending lifecycle judgment. Every
 window carries conservative outer bounds, never a missed-call
 estimate; the affected-slot count rides in
 `evidence.coverage_retired_slots`.

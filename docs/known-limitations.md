@@ -815,6 +815,16 @@ wait for the mapping observation) is planned for a later release;
 a gate failure still
 counts.
 
+### Test-only: run_tree does not honor coverage_retired windows yet
+
+`tests/run_tree.rs` (`first_use_window_end`) honors only
+`pre_attach`/`late_discovery` windows: a miss inside a
+`coverage_retired` retire window lands in the "unexplained miss" arm
+and fails the suite — fail-closed, so nothing is masked. Honoring the
+window is deferred pending an owner ruling; until it lands, a run_tree
+"unexplained miss" on a capture carrying `coverage_retired` artifacts
+is a known oracle limitation, not a product regression.
+
 ### System captures past 1024 processes share one deep examination per library set
 
 A `profile`, `metrics` or `trace --system` (or `--cgroup`) capture on

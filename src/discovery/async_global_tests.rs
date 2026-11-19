@@ -2128,3 +2128,146 @@ fn async_global_same_module_mixed_retire_discloses_the_dark_endpoint() {
         engine.counters.object_skips
     );
 }
+
+/// A replacement the precheck skips leaves its endpoint stranded: the old
+/// links detached with `selected`, nothing replaced them, and the slot
+/// deactivates. Intent (the planned reattach) excluded the early window,
+/// so the outcome — a deactivated replace slot with no cover — files the
+/// follow-up window + count + row for the stranded key.
+#[test]
+fn async_global_precheck_failed_replacement_discloses_the_stranded_endpoint() {
+    let (child, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules[..1]));
+    let mut candidate = engine
+        .live_candidate(pins, vec![modules[0].clone()], skipped)
+        .expect("the intact pins offer a candidate");
+    assert!(
+        candidate.delta.new.is_empty() && candidate.delta.replace.is_empty(),
+        "premise: nothing is left to attach"
+    );
+    candidate
+        .delta
+        .replace
+        .push(engine.plan.slots[0].clone());
+    let retired_index = engine.plan.slots[0].index;
+    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    let mut session = ScriptedSession::default();
+    session.scripted_stamps.insert(retired_index, 1);
+    // The child exits inside the apply's second detach — after the
+    // new-target attach, before the replacement precheck — so the
+    // precheck finds its generation gone and skips the replacement.
+    session.lose_generations_at_detach([None, Some(child.id())]);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(
+        !outcome.detach_failed,
+        "premise: the scripted detach commits"
+    );
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .any(|slots| slots.contains(&retired_index)),
+        "premise: the old links detached with selected"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery replacement"
+                && skip.reason
+                    == "a process generation changed before downgraded exact targets were replaced; they were deactivated"
+        }),
+        "premise: the precheck skipped the replacement: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        !engine.plan.is_active(retired_index),
+        "premise: the stranded slot deactivates"
+    );
+    assert_eq!(
+        engine.coverage_retire_windows.len(),
+        1,
+        "the stranded endpoint files its window"
+    );
+    let window = &engine.coverage_retire_windows[0];
+    assert_eq!(window.modules, retired_modules);
+    assert_eq!(window.slots, 1);
+    assert_eq!(window.end_ns, None, "nothing revived it yet");
+    assert_eq!(engine.coverage_retired_slots(), 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == crate::render::COVERAGE_RETIRED_SUBJECT
+                && skip.reason == crate::render::COVERAGE_RETIRED_REASON
+        }),
+        "the paired finite gap row files: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// A pending global retirement voids its planned reattach: the apply
+/// deactivates the ticket's slots and returns Deferred without ever
+/// attaching the reattach, so judging the exclusion on intent would stay
+/// silent. The pending path files for every attached selected slot.
+#[test]
+fn async_global_pending_retirement_with_planned_reattach_files_for_every_attached_slot() {
+    let mut case = Case::new();
+    let mut candidate = case
+        .engine
+        .live_candidate(
+            case.engine.pinned.clone(),
+            vec![case.modules[0].clone()],
+            vec![],
+        )
+        .unwrap();
+    assert!(
+        candidate.delta.new.is_empty(),
+        "premise: nothing is left to attach"
+    );
+    candidate
+        .delta
+        .replace
+        .push(case.engine.plan.slots[0].clone());
+    let retired_index = case.engine.plan.slots[0].index;
+    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
+        case.engine.plan.slots[0].module_ids.iter().copied().collect();
+    case.session.scripted_stamps.insert(retired_index, 1);
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(
+        outcome.disposition,
+        ApplyDisposition::Deferred,
+        "premise: the retire pends on the async worker"
+    );
+    assert!(
+        case.engine.pending_global_retirement.is_some(),
+        "premise: the ticket parks the retirement"
+    );
+    case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        case.session.replaced_slot_indices.is_empty(),
+        "premise: the planned reattach never ran"
+    );
+    assert_eq!(
+        case.engine.coverage_retire_windows.len(),
+        1,
+        "the pending retire files its window"
+    );
+    let window = &case.engine.coverage_retire_windows[0];
+    assert_eq!(window.modules, retired_modules);
+    assert_eq!(window.slots, 1);
+    assert_eq!(window.end_ns, None, "nothing revived it yet");
+    assert_eq!(case.engine.coverage_retired_slots(), 1);
+    assert!(
+        case.engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == crate::render::COVERAGE_RETIRED_SUBJECT
+                && skip.reason == crate::render::COVERAGE_RETIRED_REASON
+        }),
+        "the paired finite gap row files: {:?}",
+        case.engine.counters.object_skips
+    );
+}

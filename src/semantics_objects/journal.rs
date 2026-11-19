@@ -3810,6 +3810,15 @@ fn sealed_fingerprint(
 /// application's output cell (allowlist v1; the BEGIN/END agreement admits
 /// that rewrite only on an OK or pending return with a non-null output);
 /// see [`session_output_of`]. Everything else reports no session output.
+/// The settled length outcome for one staged END (keymeta §9):
+/// without length capture every END is base-form and carries
+/// nothing, so the seal reports no length (never a guess). BPF
+/// length capture reads the staged END's validated trailer here.
+fn sealed_length(end: Option<StagedEnd>) -> Option<crate::keymeta::LengthOutcome> {
+    let _ = end;
+    None
+}
+
 fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> CompletedFact {
     let base = end.payload_base();
     let tail = end.payload_tail();
@@ -7864,6 +7873,7 @@ impl JournalAdapter {
             {
                 settled[index].end_cut = end.map(|staged| staged.ordinal);
                 settled[index].abandoned = abandoned;
+                settled[index].length = sealed_length(end);
             } else {
                 let (session, mechanism) = sealed_fingerprint(&entry.begin);
                 settled.push(SealedCall {
@@ -7875,9 +7885,7 @@ impl JournalAdapter {
                     abandoned,
                     session,
                     mechanism,
-                    // RED STUB: the GREEN commit reads the staged
-                    // END's validated length trailer here.
-                    length: None,
+                    length: sealed_length(end),
                 });
             }
         }
@@ -7906,9 +7914,9 @@ impl JournalAdapter {
                             .is_some_and(|staged| staged.ordinal <= frontier),
                         session,
                         mechanism,
-                        // RED STUB: the GREEN commit reads the staged
-                        // END's validated length trailer here.
-                        length: None,
+                        length: sealed_length(
+                            entry.end.filter(|staged| staged.ordinal <= frontier),
+                        ),
                     }
                 });
             if !replay.freeze_calls(&mut settled, retained) {

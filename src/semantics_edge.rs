@@ -43,7 +43,7 @@
 //! still starts its operation (mechanism unknown) under A1, where the
 //! capture-wide reducer drops the binding.
 
-use crate::keymeta::CompletionEvidence;
+use crate::keymeta::{CompletionEvidence, LengthOutcome};
 use crate::semantics::{cancel_operation_mask, direct_cancel_flag};
 use p11scope_ebpf_common::{
     FUNCTION_NONE, SESSION_NONE, SlotSemantics, USER_TYPE_NONE, capture, direct, lifecycle,
@@ -1798,6 +1798,15 @@ impl EdgeSemantics {
             for (bit, _) in crate::semantics::operation_bits(descriptor.operations) {
                 if let Some(machine) = self.active.get_mut(&(call.session, bit)) {
                     machine.state = OpState::InProgress;
+                    // Keymeta §5.4: a retained BUFFER_TOO_SMALL length
+                    // corroborates (exact per PKCS#11 v2.40 §5.2);
+                    // every other retained value — queries
+                    // included — drops on arrival, never stored.
+                    if call.rv == CkRv::BUFFER_TOO_SMALL.0
+                        && let Some(LengthOutcome::Value(value)) = completion.length
+                    {
+                        machine.corroboration = Some(value);
+                    }
                 }
             }
         }
@@ -1819,9 +1828,6 @@ impl EdgeSemantics {
         completion: &CompletionEvidence,
         sink: &mut S,
     ) {
-        // RED STUB: the GREEN commit carries the terminal length and
-        // the seal's fresh view onto the direct effect.
-        let _ = completion;
         if call.rv != CkRv::OK.0 {
             return;
         }
@@ -1844,16 +1850,17 @@ impl EdgeSemantics {
                 mechanism,
                 key_receipts: keys.to_vec(),
                 origin: origin.clone(),
-                // RED STUB: the GREEN commit carries the terminal
-                // length and the seal's fresh view.
-                length: None,
-                fresh_view: None,
+                // Directs emit only on OK: the terminal length and
+                // the seal's exact-one fresh view ride through.
+                length: completion.length,
+                fresh_view: completion.fresh_view,
             });
         }
     }
 
     /// End one machine with an explicit end state, emitting its
     /// terminal. Returns whether a machine was actually ended.
+    #[allow(clippy::too_many_arguments)]
     fn end_machine<S: OperationSink>(
         &mut self,
         session: u64,
@@ -1864,9 +1871,6 @@ impl EdgeSemantics {
         completion: &CompletionEvidence,
         sink: &mut S,
     ) -> bool {
-        // RED STUB: the GREEN commit carries the terminal length on
-        // Completed ends and the retained corroboration.
-        let _ = completion;
         if let Some(machine) = self.active.remove(&(session, bit)) {
             self.release_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
             match end {
@@ -1876,13 +1880,23 @@ impl EdgeSemantics {
                 EndState::Unknown => self.unknown = self.unknown.saturating_add(1),
             }
             if S::WANTS_EFFECTS {
+                // Keymeta §9: only a terminal Completed completion
+                // classifies (failures prove nothing, cancellations
+                // end by replacement, retirements are not
+                // completions); the retained corroboration rides the
+                // terminal for the reducer's mismatch check.
+                let completed = matches!(end, EndState::Completed);
                 sink.emit(OperationEffect::Ended {
                     id: OperationId(machine.generation),
                     category,
                     outcome: end.outcome(),
                     origin: origin.clone(),
-                    length: None,
-                    corroboration: None,
+                    length: if completed { completion.length } else { None },
+                    corroboration: if completed {
+                        machine.corroboration
+                    } else {
+                        None
+                    },
                 });
             }
             true

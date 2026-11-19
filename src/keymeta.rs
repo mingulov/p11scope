@@ -133,7 +133,17 @@ const ECDH1_FAMILY_IDS: &[u64] = &[
 const ECDH1_QUALIFIED_IDS: &[u64] = &[0x00001050, 0x00001051, 0x00001053, 0x00004038, 0x00004039];
 const RSA_AES_KEY_WRAP_ID: u64 = 0x00001054;
 const AES_XTS_ID: u64 = 0x00001071;
-const AES_KW_ID: u64 = 0x00002109;
+pub(crate) const AES_KW_ID: u64 = 0x00002109;
+
+/// Whether one mechanism id is in the AES-KW family (plain wrap plus
+/// the padded variants): their wrap/unwrap lengths concern the
+/// wrapped key or fresh view, never the operation key.
+pub(crate) fn is_aes_kw_family(mechanism: u64) -> bool {
+    matches!(
+        mechanism,
+        x if x == AES_KW_ID || x == AES_KW_PAD_ID || x == AES_KW_KWP_ID || x == AES_KW_PKCS7_ID
+    )
+}
 const AES_KW_PAD_ID: u64 = 0x0000210a;
 const AES_KW_KWP_ID: u64 = 0x0000210b;
 const AES_KW_PKCS7_ID: u64 = 0x0000210c;

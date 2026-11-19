@@ -1104,18 +1104,141 @@ pub(crate) fn key_row_json(row: &KeyAggRow) -> serde_json::Value {
     rendered
 }
 
-/// Render one inferred family (§10.2 closed shape).
+/// Render one inferred family (§10.2 closed shape): status, the
+/// first value or null, supporting completions, and the pinned
+/// conflict pair plus further count when present.
 pub(crate) fn inferred_family_json(
-    _family: &crate::semantics_key_use::FamilyState,
+    family: &crate::semantics_key_use::FamilyState,
 ) -> serde_json::Value {
-    // RED STUB: the GREEN commit renders the closed shape.
-    serde_json::Value::Null
+    use crate::semantics_key_use::InferredStatus;
+    let mut rendered = serde_json::json!({
+        "status": match family.status {
+            InferredStatus::Inferred => "inferred",
+            InferredStatus::Unknown => "unknown",
+            InferredStatus::Conflicting => "conflicting",
+            InferredStatus::Unsupported => "unsupported",
+        },
+        "value": family.value.map(crate::keymeta::family_value),
+        "completions": family.completions,
+    });
+    let object = rendered.as_object_mut().expect("family object");
+    if let Some(conflict) = family.conflict_value {
+        object.insert(
+            "conflict_value".to_string(),
+            serde_json::Value::String(crate::keymeta::family_value(conflict).to_string()),
+        );
+        object.insert(
+            "conflict_completions".to_string(),
+            serde_json::json!(family.conflict_completions),
+        );
+    }
+    if family.further > 0 {
+        object.insert(
+            "further_conflicts".to_string(),
+            serde_json::json!(family.further),
+        );
+    }
+    rendered
 }
 
 /// Render one inferred size (§10.2 closed shape).
-pub(crate) fn inferred_size_json(_size: &crate::semantics_key_use::SizeState) -> serde_json::Value {
-    // RED STUB: the GREEN commit renders the closed shape.
-    serde_json::Value::Null
+pub(crate) fn inferred_size_json(size: &crate::semantics_key_use::SizeState) -> serde_json::Value {
+    use crate::semantics_key_use::InferredStatus;
+    let mut rendered = serde_json::json!({
+        "status": match size.status {
+            InferredStatus::Inferred => "inferred",
+            InferredStatus::Unknown => "unknown",
+            InferredStatus::Conflicting => "conflicting",
+            InferredStatus::Unsupported => "unsupported",
+        },
+        "detail": size
+            .detail
+            .as_ref()
+            .map(|(detail, tag)| size_detail_json(detail, *tag)),
+        "completions": size.completions,
+    });
+    let object = rendered.as_object_mut().expect("size object");
+    if let Some((detail, tag)) = size.conflict_detail.as_ref() {
+        object.insert(
+            "conflict_detail".to_string(),
+            size_detail_json(detail, *tag),
+        );
+    }
+    if size.further > 0 {
+        object.insert(
+            "further_conflicts".to_string(),
+            serde_json::json!(size.further),
+        );
+    }
+    rendered
+}
+
+/// Render one size detail (§10.2 `detail` shapes): the kind tag, the
+/// size params, and the first evidence tag.
+fn size_detail_json(
+    detail: &crate::keymeta::SizeDetail,
+    tag: crate::keymeta::EvidenceTag,
+) -> serde_json::Value {
+    use crate::keymeta::{SizeDetail, evidence_value};
+    let evidence = evidence_value(tag);
+    match detail {
+        SizeDetail::Rsa {
+            size_class,
+            modulus_bytes,
+        } => {
+            if size_class.is_some() {
+                serde_json::json!({
+                    "kind": "rsa",
+                    "size_class": size_class,
+                    "modulus_bytes": modulus_bytes,
+                    "evidence": evidence,
+                })
+            } else {
+                serde_json::json!({
+                    "kind": "rsa_nonstandard",
+                    "modulus_bytes": modulus_bytes,
+                    "evidence": evidence,
+                })
+            }
+        }
+        SizeDetail::Ec { curve, octets } => serde_json::json!({
+            "kind": "ec",
+            "curve": curve,
+            "octets": octets,
+            "evidence": evidence,
+        }),
+        SizeDetail::Eddsa { curve, octets } => serde_json::json!({
+            "kind": "eddsa",
+            "curve": curve,
+            "octets": octets,
+            "evidence": evidence,
+        }),
+        SizeDetail::DsaClass { label, octets } => serde_json::json!({
+            "kind": "dsa_class",
+            "label": label,
+            "octets": octets,
+            "evidence": evidence,
+        }),
+        SizeDetail::PqcSet {
+            parameter_set,
+            octets,
+        } => serde_json::json!({
+            "kind": "pqc_set",
+            "parameter_set": parameter_set,
+            "octets": octets,
+            "evidence": evidence,
+        }),
+        SizeDetail::WrappedMaterial {
+            material_octets,
+            octets,
+        } => serde_json::json!({
+            "kind": "wrapped_material",
+            "material_octets": material_octets,
+            "octets": octets,
+            "evidence": evidence,
+            "about": "wrapped",
+        }),
+    }
 }
 
 /// Render one unknown-key summary row: the exact frozen keys (no
@@ -1677,9 +1800,13 @@ pub(crate) mod producer {
                 unknown: counters.unknown,
                 active: counters.active,
                 key_join_lost: counters.key_join_lost,
-                // RED STUB: the GREEN commit fills inferred keys on
-                // every row of a v7 section, None below v7.
-                inferred: None,
+                inferred: Some(
+                    keyuse
+                        .inferred_map()
+                        .get(bucket)
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
             });
         }
         key_rows.sort_by(|a, b| {
@@ -1714,6 +1841,18 @@ pub(crate) mod producer {
             });
         }
         unknown_rows.sort_by(|a, b| (a.category, a.reason).cmp(&(b.category, b.reason)));
+        // v7 emits exactly when a row carries non-blank inferred
+        // content; below v7 every row drops its keys (uniform fill
+        // above, frozen 13 below).
+        if !key_rows.iter().any(|row| {
+            row.inferred
+                .as_ref()
+                .is_some_and(|keys| keys.is_v7_content())
+        }) {
+            for row in &mut key_rows {
+                row.inferred = None;
+            }
+        }
         observations.key_operations = key_rows;
         observations.unknown_key_operations = unknown_rows;
         observations.budgets.unknown_occupied = observations.unknown_key_operations.len();
@@ -1722,6 +1861,16 @@ pub(crate) mod producer {
                 subject: "key_operation",
                 reason: "pruned_object_referenced",
                 repeats: dangling,
+            });
+        }
+        // Corroboration mismatches are a counted residual, never a
+        // conflict and never a coverage loss (no partial).
+        let mismatches = keyuse.key_use_evidence().corroboration_mismatches;
+        if mismatches > 0 {
+            observations.gaps.push(GapRow {
+                subject: "key_operation",
+                reason: "corroboration_mismatch",
+                repeats: mismatches,
             });
         }
     }

@@ -2408,9 +2408,17 @@ impl RowInference {
     /// reason other than the off-mode hint (the hint explains the
     /// mode, never triggers a version on its own).
     pub(crate) fn is_v7_content(&self) -> bool {
-        // RED STUB: the GREEN commit implements the trigger.
-        let _ = (&self.family, &self.size);
-        false
+        let family = self.family.status != InferredStatus::Unknown
+            || self
+                .family
+                .reason
+                .is_some_and(|reason| reason != crate::keymeta::REASON_SIZE_INFERENCE_OFF);
+        let size = self.size.status != InferredStatus::Unknown
+            || self
+                .size
+                .reason
+                .is_some_and(|reason| reason != crate::keymeta::REASON_SIZE_INFERENCE_OFF);
+        family || size
     }
 }
 
@@ -2432,10 +2440,81 @@ impl FamilyState {
     /// family without ever flipping.
     pub(crate) fn accumulate_family(
         &mut self,
-        _established: Option<crate::keymeta::EstablishedKind>,
-        _mechanism: u64,
+        established: Option<crate::keymeta::EstablishedKind>,
+        mechanism: u64,
     ) {
-        // RED STUB.
+        use crate::keymeta::KeyFamily;
+        use crate::keymeta::{REASON_UNLISTED_MECHANISM, families_compatible, infer_family};
+        // Every mechanism-present terminal is family evidence.
+        self.completions = self.completions.saturating_add(1);
+        let Some(family) = infer_family(mechanism) else {
+            if self.status == InferredStatus::Unknown && self.reason.is_none() {
+                self.reason = Some(REASON_UNLISTED_MECHANISM);
+            }
+            return;
+        };
+        if family == KeyFamily::Secret {
+            // Alone, secret is the value; beside a specific family
+            // its count joins the block total without ever flipping.
+            if self.value.is_none() && self.status == InferredStatus::Unknown {
+                self.value = Some(KeyFamily::Secret);
+                self.status = InferredStatus::Inferred;
+                self.value_completions = 1;
+            }
+            return;
+        }
+        // A specific family upgrades a secret-only value (secret
+        // never conflicts, in either direction).
+        if self.value == Some(KeyFamily::Secret) {
+            self.value = Some(family);
+            self.value_completions = 1;
+            self.status = InferredStatus::Inferred;
+            self.reason = None;
+            if let Some(kind) = established
+                && !families_compatible(family, mechanism, kind)
+            {
+                self.status = InferredStatus::Conflicting;
+            }
+            return;
+        }
+        match self.value {
+            None => {
+                // First specific value (blank or reasoned unknown):
+                // pin with support, clear any prior unknown reason,
+                // then check the frozen established fact (an
+                // incompatible pair conflicts with the established
+                // side omitted — the label stands on the row).
+                self.value = Some(family);
+                self.value_completions = 1;
+                self.status = InferredStatus::Inferred;
+                self.reason = None;
+                if let Some(kind) = established
+                    && !families_compatible(family, mechanism, kind)
+                {
+                    self.status = InferredStatus::Conflicting;
+                }
+            }
+            Some(current) if current == family => {
+                self.value_completions = self.value_completions.saturating_add(1);
+            }
+            Some(_) => match self.conflict_value {
+                None => {
+                    self.conflict_value = Some(family);
+                    self.conflict_completions = 1;
+                    self.status = InferredStatus::Conflicting;
+                }
+                Some(second) if second == family => {
+                    self.conflict_completions = self.conflict_completions.saturating_add(1);
+                }
+                Some(_) => {
+                    let bit = 1u32 << (family as u32);
+                    if self.further_seen & bit == 0 {
+                        self.further_seen |= bit;
+                        self.further = self.further.saturating_add(1);
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -2446,12 +2525,117 @@ impl SizeState {
     /// `unsupported` never overwrites `inferred` nor flips.
     pub(crate) fn accumulate_size(
         &mut self,
-        _established: Option<crate::keymeta::EstablishedKind>,
-        _mechanism: Option<u64>,
-        _tag: Option<crate::keymeta::EvidenceTag>,
-        _input: SizeInput,
+        established: Option<crate::keymeta::EstablishedKind>,
+        mechanism: Option<u64>,
+        tag: Option<crate::keymeta::EvidenceTag>,
+        input: SizeInput,
     ) {
-        // RED STUB.
+        use crate::keymeta::{
+            REASON_LENGTH_UNAVAILABLE, REASON_NO_LENGTH_EVIDENCE, REASON_SIZE_INFERENCE_OFF,
+            SizeOutcome, classify_size,
+        };
+        // The weakest unknowns (no reason yet, or a mode/absence
+        // reason) lose to everything; only they accept a new reason.
+        let weakest = self.status == InferredStatus::Unknown
+            && matches!(
+                self.reason,
+                None | Some(REASON_SIZE_INFERENCE_OFF) | Some(REASON_NO_LENGTH_EVIDENCE)
+            );
+        match input {
+            SizeInput::Off => {
+                if weakest {
+                    self.reason = Some(REASON_SIZE_INFERENCE_OFF);
+                }
+            }
+            SizeInput::NoEvidence => {
+                if weakest {
+                    self.reason = Some(REASON_NO_LENGTH_EVIDENCE);
+                }
+            }
+            SizeInput::Unavailable => {
+                self.completions = self.completions.saturating_add(1);
+                if weakest {
+                    self.reason = Some(REASON_LENGTH_UNAVAILABLE);
+                }
+            }
+            SizeInput::Value(length) => {
+                self.completions = self.completions.saturating_add(1);
+                let Some(tag) = tag else {
+                    // Unreachable: seals trailer only evidence
+                    // endpoints, whose categories always map. Treat a
+                    // tagless length as absent evidence, never guess.
+                    debug_assert!(false, "a classified length always carries its evidence tag");
+                    if weakest {
+                        self.reason = Some(REASON_NO_LENGTH_EVIDENCE);
+                    }
+                    return;
+                };
+                match classify_size(mechanism, tag, length) {
+                    SizeOutcome::Unknown { reason } => {
+                        if weakest {
+                            self.reason = Some(reason);
+                        }
+                    }
+                    SizeOutcome::Unsupported { reason } => {
+                        if weakest {
+                            self.status = InferredStatus::Unsupported;
+                            self.reason = Some(reason);
+                        }
+                    }
+                    SizeOutcome::Inferred(detail) => {
+                        self.accumulate_detail(established, mechanism, tag, detail);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Accumulate one classified size detail: first value pins (with
+    /// the established-size check), same sizes keep the first tag, a
+    /// second distinct size rides the conflict pair, and further
+    /// distinct sizes count once each (dedup capped).
+    fn accumulate_detail(
+        &mut self,
+        established: Option<crate::keymeta::EstablishedKind>,
+        mechanism: Option<u64>,
+        tag: crate::keymeta::EvidenceTag,
+        detail: crate::keymeta::SizeDetail,
+    ) {
+        use crate::keymeta::{same_size, size_compatible};
+        match self.detail.as_ref() {
+            None => {
+                self.detail = Some((detail.clone(), tag));
+                self.status = InferredStatus::Inferred;
+                self.reason = None;
+                if let (Some(kind), Some(mechanism)) = (established, mechanism)
+                    && !size_compatible(&detail, mechanism, kind)
+                {
+                    self.status = InferredStatus::Conflicting;
+                }
+            }
+            Some((current, _)) if same_size(current, &detail) => {
+                // Same size: the first tag stands.
+            }
+            Some(_) => match self.conflict_detail.as_ref() {
+                None => {
+                    self.conflict_detail = Some((detail, tag));
+                    self.status = InferredStatus::Conflicting;
+                }
+                Some((second, _)) if same_size(second, &detail) => {}
+                Some(_) => {
+                    if !self
+                        .further_seen
+                        .iter()
+                        .any(|seen| same_size(seen, &detail))
+                    {
+                        if self.further_seen.len() < FURTHER_SEEN_CAP {
+                            self.further_seen.push(detail);
+                        }
+                        self.further = self.further.saturating_add(1);
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -2610,7 +2794,9 @@ impl KeyUseReducer {
 
     /// Admit (`true`) or drop (`false`, `size_inference_off`)
     /// `--key-sizes` length evidence. Seams and harnesses pose the
-    /// off mode through this; production on-mode is the default.
+    /// off mode through this; production on-mode is the default
+    /// (off-mode carries no trailers, so no production wiring).
+    #[cfg(test)]
     pub(crate) fn set_key_sizes(&mut self, key_sizes: bool) {
         self.key_sizes = key_sizes;
     }
@@ -2814,7 +3000,7 @@ impl KeyUseReducer {
                     }
                 };
                 self.open_buckets(resolved);
-                let associations = resolved
+                let associations: Vec<OpenAssoc> = resolved
                     .iter()
                     .zip(receipts.iter())
                     .map(|(slot, receipt)| OpenAssoc {
@@ -2830,6 +3016,12 @@ impl KeyUseReducer {
                     // active now, outcome at close.
                     let slot = unknown_index(category, unbound_reason_for(category));
                     self.unknown_activate(slot);
+                }
+                // Touched proved buckets forward-fill their parks.
+                for assoc in associations.iter() {
+                    if let AssocBucket::Proved(bucket) = assoc.bucket {
+                        self.forward_fill(bucket, assoc.established);
+                    }
                 }
                 self.open.insert(
                     key,
@@ -2850,13 +3042,28 @@ impl KeyUseReducer {
                 category: _,
                 outcome,
                 origin: _,
-                // RED STUB: the GREEN commit attributes the terminal
-                // length and corroboration to the closing buckets.
-                ..
+                length,
+                corroboration,
             } => {
                 let key = (instance, *id);
                 if let Some(open) = self.open.remove(&key) {
                     let (ticket, ticket_shared) = (open.ticket, open.ticket_shared);
+                    // Successful consumption attributes family and
+                    // size to the closing buckets (failed/cancelled
+                    // terminals prove nothing).
+                    if *outcome == OperationOutcome::Completed {
+                        self.attribute_completion(&open, *length, *corroboration);
+                    } else {
+                        // Unproved terminals leave no blank entries
+                        // behind (older inference, if any, stands).
+                        for assoc in &open.associations {
+                            if let AssocBucket::Proved(bucket) = assoc.bucket
+                                && self.inferred.get(&bucket) == Some(&RowInference::default())
+                            {
+                                self.inferred.remove(&bucket);
+                            }
+                        }
+                    }
                     self.close_open(open, *outcome);
                     // The ticket returns to its minting ledger; a
                     // shared ticket closed without shared contact
@@ -2894,7 +3101,10 @@ impl KeyUseReducer {
             }
             OperationEffect::DirectCompleted {
                 category,
+                mechanism,
                 key_receipts,
+                length,
+                fresh_view,
                 ..
             } => {
                 let receipts =
@@ -2945,8 +3155,247 @@ impl KeyUseReducer {
                     let slot = unknown_index(category, unbound_reason_for(category));
                     self.unknown_add(slot, OperationOutcome::Completed);
                 }
+                // Atomic completion attributes family and size per
+                // proved association (role-split for wrap/unwrap),
+                // parks wrapped material about rowless views, and
+                // forward-fills parks onto touched buckets.
+                self.attribute_direct(
+                    category,
+                    *mechanism,
+                    receipts,
+                    resolved,
+                    *length,
+                    *fresh_view,
+                );
             }
         }
+    }
+
+    /// Attribute one successful Init-based completion (§4.3/§9):
+    /// the terminal length evidence (when admitted) and the
+    /// Init-bound mechanism join the open's proved associations; a
+    /// terminal disagreeing with the retained corroboration records
+    /// the named residual, never a conflict.
+    fn attribute_completion(
+        &mut self,
+        open: &OpenKeyUse,
+        length: Option<crate::keymeta::LengthOutcome>,
+        corroboration: Option<u64>,
+    ) {
+        use crate::keymeta::{LengthOutcome, evidence_tag_for_category};
+        if let (Some(LengthOutcome::Value(terminal)), Some(expected)) = (length, corroboration)
+            && terminal != expected
+        {
+            self.evidence.corroboration_mismatches =
+                self.evidence.corroboration_mismatches.saturating_add(1);
+        }
+        let tag = evidence_tag_for_category(open.category);
+        let input = match (self.key_sizes, length) {
+            (false, _) => SizeInput::Off,
+            (true, None) => SizeInput::NoEvidence,
+            (true, Some(LengthOutcome::Unavailable)) => SizeInput::Unavailable,
+            (true, Some(LengthOutcome::Value(value))) => SizeInput::Value(value),
+        };
+        for assoc in &open.associations {
+            let AssocBucket::Proved(bucket) = assoc.bucket else {
+                continue;
+            };
+            if let Some(mechanism) = open.mechanism {
+                self.inferred
+                    .entry(bucket)
+                    .or_default()
+                    .family
+                    .accumulate_family(assoc.established, mechanism);
+            }
+            self.inferred
+                .entry(bucket)
+                .or_default()
+                .size
+                .accumulate_size(assoc.established, open.mechanism, tag, input);
+        }
+    }
+
+    /// Attribute one atomic direct completion (§4.3/§9) with the
+    /// wrap/unwrap role split: the mechanism types the operation
+    /// (wrapping/unwrapping/base/encapsulation) key only, while
+    /// AES-KW lengths size the wrapped key (or park on the fresh
+    /// unwrap view). Unclassifiable roles attribute nothing, never
+    /// guess. Touched proved buckets forward-fill their parks.
+    fn attribute_direct(
+        &mut self,
+        category: &str,
+        mechanism: Option<u64>,
+        receipts: &[KeyReceipt],
+        resolved: &[ResolvedAssoc],
+        length: Option<crate::keymeta::LengthOutcome>,
+        fresh_view: Option<u64>,
+    ) {
+        use crate::keymeta::{
+            EvidenceTag, LengthOutcome, REASON_OPERATION_KEY_ONLY, SizeDetail,
+            evidence_tag_for_category, is_aes_kw_family,
+        };
+        let tag = evidence_tag_for_category(category);
+        // Which key this call's length evidence is about (determinable
+        // without the value: AES-KW-family wrap/unwrap lengths concern
+        // the wrapped key or fresh view; every other classified shape
+        // concerns the operation key).
+        let wrapped_about = matches!(mechanism, Some(id) if is_aes_kw_family(id))
+            && matches!(
+                tag,
+                Some(EvidenceTag::WrapOutput) | Some(EvidenceTag::UnwrapInput)
+            );
+        for (slot, receipt) in resolved.iter().zip(receipts.iter()) {
+            let established = receipt.label.map(crate::keymeta::established_kind);
+            match slot.bucket {
+                AssocBucket::Proved(bucket) => {
+                    self.forward_fill(bucket, established);
+                    // Family by role: the mechanism types the
+                    // operation key; the wrapped key gains nothing
+                    // from it; unclassifiable roles stay blank.
+                    match receipt.role {
+                        KeyRole::WrappedKey => {
+                            if mechanism.is_some() {
+                                let state = &mut self.inferred.entry(bucket).or_default().family;
+                                if state.status == InferredStatus::Unknown && state.reason.is_none()
+                                {
+                                    state.reason = Some(REASON_OPERATION_KEY_ONLY);
+                                }
+                            }
+                        }
+                        KeyRole::WrappingKey
+                        | KeyRole::UnwrappingKey
+                        | KeyRole::BaseKey
+                        | KeyRole::EncapsulationKey
+                        | KeyRole::DecapsulationKey => {
+                            if let Some(mechanism) = mechanism {
+                                self.inferred
+                                    .entry(bucket)
+                                    .or_default()
+                                    .family
+                                    .accumulate_family(established, mechanism);
+                            }
+                        }
+                        KeyRole::OperationKey | KeyRole::Other => {}
+                    }
+                    // Size by role: wrapped material (or its padding
+                    // ambiguity) is about the wrapped key; every
+                    // other classified shape is about the operation
+                    // key; anything else is absent evidence for this
+                    // key. The accumulator re-resolves the selected
+                    // input so transitions stay uniform.
+                    let about_this_key = match receipt.role {
+                        KeyRole::WrappedKey => wrapped_about,
+                        KeyRole::WrappingKey | KeyRole::UnwrappingKey => {
+                            tag.is_some() && !wrapped_about
+                        }
+                        KeyRole::BaseKey
+                        | KeyRole::EncapsulationKey
+                        | KeyRole::DecapsulationKey => tag.is_some(),
+                        KeyRole::OperationKey | KeyRole::Other => false,
+                    };
+                    let input = if about_this_key {
+                        self.size_input_for(length)
+                    } else if !self.key_sizes {
+                        SizeInput::Off
+                    } else {
+                        SizeInput::NoEvidence
+                    };
+                    self.inferred
+                        .entry(bucket)
+                        .or_default()
+                        .size
+                        .accumulate_size(established, mechanism, tag, input);
+                }
+                AssocBucket::Unknown(_) => {
+                    // An unusable wrapped association still names its
+                    // view: park AES-KW material about it.
+                    if category == "wrap"
+                        && receipt.role == KeyRole::WrappedKey
+                        && mechanism == Some(crate::keymeta::AES_KW_ID)
+                        && let Some(LengthOutcome::Value(value)) = length
+                        && let Some(material) = value.checked_sub(8)
+                    {
+                        self.park_wrapped(
+                            receipt.key.as_u64(),
+                            ParkedSize {
+                                detail: SizeDetail::WrappedMaterial {
+                                    material_octets: material,
+                                    octets: value,
+                                },
+                                tag: EvidenceTag::WrapOutput,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        // U1: AES-KW unwrap material about the fresh view parks on
+        // the view (exact-one seal proof, valued lengths only).
+        if category == "unwrap"
+            && mechanism == Some(crate::keymeta::AES_KW_ID)
+            && let Some(LengthOutcome::Value(value)) = length
+            && let Some(view) = fresh_view
+            && let Some(material) = value.checked_sub(8)
+        {
+            self.park_wrapped(
+                view,
+                ParkedSize {
+                    detail: SizeDetail::WrappedMaterial {
+                        material_octets: material,
+                        octets: value,
+                    },
+                    tag: EvidenceTag::UnwrapInput,
+                },
+            );
+        }
+    }
+
+    /// Resolve one completion's size input from the flag and trailer.
+    fn size_input_for(&self, length: Option<crate::keymeta::LengthOutcome>) -> SizeInput {
+        use crate::keymeta::LengthOutcome;
+        match (self.key_sizes, length) {
+            (false, _) => SizeInput::Off,
+            (true, None) => SizeInput::NoEvidence,
+            (true, Some(LengthOutcome::Unavailable)) => SizeInput::Unavailable,
+            (true, Some(LengthOutcome::Value(value))) => SizeInput::Value(value),
+        }
+    }
+
+    /// Park wrapped-material evidence about a rowless view (§5.4 U1):
+    /// first park wins, the map stays within the aggregate bound,
+    /// and overflow counts instead of silently dropping.
+    fn park_wrapped(&mut self, view: u64, parked: ParkedSize) {
+        if self.parked.contains_key(&view) {
+            return;
+        }
+        if self.parked.len() >= self.capacity {
+            self.evidence.parked_refused = self.evidence.parked_refused.saturating_add(1);
+            self.evidence.partial = true;
+            return;
+        }
+        self.parked.insert(view, parked);
+    }
+
+    /// Forward-fill a parked fact onto a touched proved bucket: the
+    /// view's first sealed row carries it through the ordinary size
+    /// transitions (same rules, same conflicts — never a
+    /// `metadata_at_use` rewrite).
+    fn forward_fill(
+        &mut self,
+        bucket: AggKey,
+        established: Option<crate::keymeta::EstablishedKind>,
+    ) {
+        let Some(parked) = self.parked.remove(&bucket.object) else {
+            return;
+        };
+        let state = self.inferred.entry(bucket).or_default();
+        // The parked completion carried admitted length evidence, so
+        // it counts; the detail then competes through the shared
+        // path (wrapped shapes imply no mechanism qualifier).
+        state.size.completions = state.size.completions.saturating_add(1);
+        state
+            .size
+            .accumulate_detail(established, None, parked.tag, parked.detail);
     }
 
     /// Whether every new proved bucket in one resolution fits the
@@ -2978,6 +3427,9 @@ impl KeyUseReducer {
                     let counters = self.aggregates.entry(bucket).or_default();
                     counters.started = counters.started.saturating_add(1);
                     counters.active = counters.active.saturating_add(1);
+                    // Reserve the inference entry with its bucket, so
+                    // terminals mutate in place and allocate nothing.
+                    self.inferred.entry(bucket).or_default();
                 }
                 AssocBucket::Unknown(index) => {
                     self.unknown_activate(index);
@@ -3151,9 +3603,12 @@ impl KeyUseReducer {
     /// adapter. No model lookup can replace a frozen metadata-at-use receipt.
     fn apply_invalidation(&mut self, effect: &ObjectEffect, model: &ObjectSemantics) {
         match effect {
-            ObjectEffect::Destroyed { object, .. }
-            | ObjectEffect::Retired { object, .. }
-            | ObjectEffect::AccessEnded { object, .. }
+            ObjectEffect::Destroyed { object, .. } | ObjectEffect::Retired { object, .. } => {
+                // Parked evidence expires with its view.
+                self.parked.remove(&object.as_u64());
+                self.retire_object(*object);
+            }
+            ObjectEffect::AccessEnded { object, .. }
             | ObjectEffect::Downgraded { object, .. }
             | ObjectEffect::MetadataInvalidated { object, .. }
             | ObjectEffect::MetadataConflict { object, .. } => self.retire_object(*object),
@@ -3248,12 +3703,23 @@ impl KeyUseReducer {
     /// directs, the exact-one fresh view. Fail-closed: anything but
     /// an exact-one created view yields no fresh view, never a guess.
     pub(crate) fn completion_evidence_for_effects(
-        _effects: &[ObjectEffect],
-        _settled: &SealedCall,
+        effects: &[ObjectEffect],
+        settled: &SealedCall,
     ) -> crate::keymeta::CompletionEvidence {
-        // RED STUB: the GREEN commit reads the seal's trailer and the
-        // created view.
-        crate::keymeta::CompletionEvidence::NONE
+        let mut fresh_view = None;
+        let mut created = 0u32;
+        for effect in effects {
+            if let ObjectEffect::Created { call, object, .. } = effect
+                && *call == settled.ticket
+            {
+                created = created.saturating_add(1);
+                fresh_view = Some(object.as_u64());
+            }
+        }
+        crate::keymeta::CompletionEvidence {
+            length: settled.length,
+            fresh_view: if created == 1 { fresh_view } else { None },
+        }
     }
 
     /// New H9 reads only its exact original End span. Ticket/input filtering

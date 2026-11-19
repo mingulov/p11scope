@@ -34,7 +34,11 @@ fn note_alloc(size: usize) {
     }
 }
 
-const TRACKED_BLOCK_LIMIT: usize = 8192;
+/// Test-only tracker capacity: raised 8192 to 16384 when keymeta
+/// per-bucket inference entries tipped the nearly-full table (a few
+/// retained nodes over a saturated stale-entry table — the measured
+/// envelopes below are unchanged).
+const TRACKED_BLOCK_LIMIT: usize = 16384;
 
 #[derive(Clone, Copy)]
 struct RequestedBlock {

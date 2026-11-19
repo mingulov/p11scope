@@ -4633,7 +4633,7 @@ fn key_operation_generated_generic_secret_key_rows_with_generic_label() {
                 "the signs are not counted twice"
             );
             let json = crate::key_operation_projection::object_observations_json(&committed);
-            assert_eq!(json["version"], 6, "new-site labels stamp v6");
+            assert_eq!(json["version"], 7, "new-site labels stamp v7");
             assert_eq!(json["key_operations"][0]["metadata_at_use"], "generic_256");
         }
     }
@@ -4789,7 +4789,10 @@ fn key_operation_first_observed_key_rows_with_unknown_metadata() {
     );
     // The JSON section carries the new label under its new version.
     let json = crate::key_operation_projection::object_observations_json(&committed);
-    assert_eq!(json["version"], 4, "unknown metadata rows stamp v4");
+    assert_eq!(
+        json["version"], 7,
+        "unknown metadata rows stamp v7 (inferred families present)"
+    );
     assert!(
         json["key_operations"]
             .as_array()
@@ -5787,12 +5790,13 @@ fn reconstruct(lines: &[serde_json::Value]) -> Reconstructed {
         let revision = event["revision"].as_u64().unwrap_or(u64::MAX);
         // Per-event H9 version authority: absent means v1 (pre-6.07c
         // producers emit v1 rows only); unknown versions refuse,
-        // never guessed from labels or the final section.
+        // never guessed from labels or the final section. v5-v7 add
+        // no roles or creations, so the v2 tables still validate.
         let version = event
             .get("version")
             .map_or(1, |v| v.as_u64().unwrap_or(u64::MAX));
         assert!(
-            (1..=4).contains(&version),
+            (1..=7).contains(&version),
             "H9 row version {version} refused"
         );
         let (roles, creations): (&[&str], &[&str]) = if version >= 2 {
@@ -6200,7 +6204,7 @@ fn key_operation_one_projection_three_consumers() {
     presentation.object_observations = r1.clone();
     let document = render_json_from_presentation(&presentation);
     let section = &document["object_observations"];
-    assert_eq!(section["version"], 1);
+    assert_eq!(section["version"], 7);
     assert_eq!(section["revision"], 1);
     assert_eq!(section["status"], "populated");
 
@@ -9067,10 +9071,10 @@ fn key_operation_schema_contract() {
     let section = object_observations_json(&r1);
     assert_eq!(
         keys_of(&section),
-        table(&SECTION_KEYS),
+        table(&SECTION_KEYS_V3),
         "rendered section keys"
     );
-    assert_eq!(section["version"], 1);
+    assert_eq!(section["version"], 7);
     assert_eq!(section["revision"], 1);
     assert!(STATUS_LABELS.contains(&section["status"].as_str().unwrap()));
     assert_eq!(section["reason"], "none");
@@ -9081,8 +9085,8 @@ fn key_operation_schema_contract() {
     assert!(!section["sessions"].as_array().unwrap().is_empty());
     for row in section["objects"].as_array().unwrap() {
         assert_eq!(keys_of(row), table(&OBJECT_ROW_KEYS));
-        assert_eq!(keys_of(&row["requested"]), table(&METADATA_KEYS));
-        assert_eq!(keys_of(&row["established"]), table(&METADATA_KEYS));
+        assert_eq!(keys_of(&row["requested"]), table(&METADATA_KEYS_V5));
+        assert_eq!(keys_of(&row["established"]), table(&METADATA_KEYS_V5));
         for field in [
             "class",
             "key_type",
@@ -9091,14 +9095,14 @@ fn key_operation_schema_contract() {
             "modulus_bits",
             "ec_params",
         ] {
-            assert_eq!(keys_of(&row["requested"][field]), table(&FIELD_KEYS));
-            assert_eq!(keys_of(&row["established"][field]), table(&FIELD_KEYS));
+            assert_eq!(keys_of(&row["requested"][field]), table(&FIELD_KEYS_V6));
+            assert_eq!(keys_of(&row["established"][field]), table(&FIELD_KEYS_V6));
             assert!(
                 FIELD_STATUSES.contains(&row["established"][field]["status"].as_str().unwrap())
             );
             assert!(QUERY_STATUSES.contains(&row["queries"][field].as_str().unwrap()));
         }
-        assert_eq!(keys_of(&row["queries"]), table(&METADATA_KEYS));
+        assert_eq!(keys_of(&row["queries"]), table(&METADATA_KEYS_V5));
         if !row["birth"].is_null() {
             assert_eq!(keys_of(&row["birth"]), table(&BIRTH_KEYS));
         }
@@ -9111,7 +9115,7 @@ fn key_operation_schema_contract() {
     assert_eq!(section["objects"][0]["lifetime"], "destroyed");
     assert_eq!(section["objects"][0]["label"], "rsa_2048");
     for row in section["key_operations"].as_array().unwrap() {
-        assert_eq!(keys_of(row), table(&KEY_ROW_KEYS));
+        assert_eq!(keys_of(row), table(&KEY_ROW_KEYS_V7));
         assert!(CATEGORY_LABELS.contains(&row["category"].as_str().unwrap()));
         assert!(ROLE_LABELS.contains(&row["role"].as_str().unwrap()));
         assert!(METADATA_LABELS.contains(&row["metadata_at_use"].as_str().unwrap()));
@@ -12491,7 +12495,7 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
     let section = object_observations_json(&committed);
-    assert_eq!(section["version"], 2);
+    assert_eq!(section["version"], 7);
     let rendered = serde_json::to_string(&section).unwrap();
     assert!(rendered.contains("\"decapsulation_key\""), "{rendered}");
     assert!(rendered.contains("\"decapsulate\""), "{rendered}");
@@ -12561,9 +12565,9 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert!(!committed.key_operations.is_empty(), "a proved v1 row");
+    assert!(!committed.key_operations.is_empty(), "a proved row");
     let section = object_observations_json(&committed);
-    assert_eq!(section["version"], 1);
+    assert_eq!(section["version"], 7);
     let rendered = serde_json::to_string(&section).unwrap();
     assert!(!rendered.contains("encapsulat"), "{rendered}");
     assert!(!rendered.contains("decapsulat"), "{rendered}");
@@ -12579,9 +12583,7 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
 fn key_operation_kem_jsonl_version_dispatch() {
     use crate::discovery::engine::inventory_coordinator::PassReport;
     use crate::inventory_events::{KeyOperationEmitter, pass_payload};
-    use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2, object_observations_json,
-    };
+    use crate::key_operation_projection::{OBSERVATIONS_VERSION_V7, object_observations_json};
     fn row_versions(lines: &[serde_json::Value]) -> Vec<u64> {
         lines
             .iter()
@@ -12682,14 +12684,14 @@ fn key_operation_kem_jsonl_version_dispatch() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let r1 = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert!(!r1.key_operations.is_empty(), "a proved v1 row");
+    assert!(!r1.key_operations.is_empty(), "a proved row");
     let section = object_observations_json(&r1);
-    assert_eq!(section["version"], OBSERVATIONS_VERSION);
-    assert_eq!(marker_version(&r1), 1);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V7);
+    assert_eq!(marker_version(&r1), 7);
     let dir = private_tempdir();
     let mut emitter = KeyOperationEmitter::new();
-    let v1path = dir.path().join("v1.jsonl");
-    let mut writer = EventWriter::create(&v1path, 1 << 20, 5).unwrap();
+    let v7path = dir.path().join("v7.jsonl");
+    let mut writer = EventWriter::create(&v7path, 1 << 20, 5).unwrap();
     loop {
         let out = emitter.emit(&mut writer, &r1, 1_000).unwrap();
         if out.emitted == 0 {
@@ -12697,13 +12699,13 @@ fn key_operation_kem_jsonl_version_dispatch() {
         }
     }
     drop(writer);
-    let v1lines = read_stream(dir.path(), "v1.jsonl");
-    assert!(!v1lines.is_empty());
+    let v7lines = read_stream(dir.path(), "v7.jsonl");
+    assert!(!v7lines.is_empty());
     assert!(
-        row_versions(&v1lines).iter().all(|v| *v == 1),
-        "v1 rows bind v1"
+        row_versions(&v7lines).iter().all(|v| *v == 7),
+        "rows bind v7"
     );
-    assert_reconstructed_eq_json(&reconstruct(&v1lines), &section, true);
+    assert_reconstructed_eq_json(&reconstruct(&v7lines), &section, true);
     // Revision 2: creation-only KEM on a fresh input whose metadata
     // conflicts (the r1 input carries AES, which would prove a row;
     // an unconflicted label-less input would row under `unknown`).
@@ -12757,9 +12759,9 @@ fn key_operation_kem_jsonl_version_dispatch() {
         "creation-only: no KEM role row"
     );
     let section = object_observations_json(&r2);
-    assert_eq!(section["version"], OBSERVATIONS_VERSION_V2);
-    assert_eq!(marker_version(&r2), 2);
-    let v2path = dir.path().join("v2delta.jsonl");
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V7);
+    assert_eq!(marker_version(&r2), 7);
+    let v2path = dir.path().join("v7delta.jsonl");
     let mut writer = EventWriter::create(&v2path, 1 << 20, 5).unwrap();
     loop {
         let out = emitter.emit(&mut writer, &r2, 2_000).unwrap();
@@ -12768,18 +12770,18 @@ fn key_operation_kem_jsonl_version_dispatch() {
         }
     }
     drop(writer);
-    let r2delta = read_stream(dir.path(), "v2delta.jsonl");
+    let r2delta = read_stream(dir.path(), "v7delta.jsonl");
     assert!(!r2delta.is_empty(), "the transition emits new rows");
     assert!(
-        row_versions(&r2delta).iter().all(|v| *v == 2),
-        "new rows bind v2"
+        row_versions(&r2delta).iter().all(|v| *v == 7),
+        "new rows bind v7"
     );
     assert!(
-        row_keys(&v1lines).is_disjoint(&row_keys(&r2delta)),
+        row_keys(&v7lines).is_disjoint(&row_keys(&r2delta)),
         "old rows persist below, never re-emitted"
     );
     assert_reconstructed_eq_json(
-        &reconstruct(&[v1lines.clone(), r2delta.clone()].concat()),
+        &reconstruct(&[v7lines.clone(), r2delta.clone()].concat()),
         &section,
         false,
     );
@@ -12799,7 +12801,7 @@ fn key_operation_kem_jsonl_version_dispatch() {
     );
     let r3 = commit(3, &[&staging], &scene.model.project(), &keyuse);
     let section = object_observations_json(&r3);
-    assert_eq!(section["version"], OBSERVATIONS_VERSION_V2);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V7);
     let v3path = dir.path().join("v3delta.jsonl");
     let mut writer = EventWriter::create(&v3path, 1 << 20, 5).unwrap();
     loop {
@@ -12811,13 +12813,13 @@ fn key_operation_kem_jsonl_version_dispatch() {
     drop(writer);
     let r3delta = read_stream(dir.path(), "v3delta.jsonl");
     assert!(
-        row_versions(&r3delta).iter().all(|v| *v == 2),
-        "later rows bind v2"
+        row_versions(&r3delta).iter().all(|v| *v == 7),
+        "later rows bind v7"
     );
-    let before = &row_keys(&v1lines) | &row_keys(&r2delta);
+    let before = &row_keys(&v7lines) | &row_keys(&r2delta);
     let r3keys = row_keys(&r3delta);
     let reemitted: std::collections::BTreeSet<_> = before.intersection(&r3keys).cloned().collect();
-    let v1objects: std::collections::BTreeSet<_> = row_keys(&v1lines)
+    let v1objects: std::collections::BTreeSet<_> = row_keys(&v7lines)
         .into_iter()
         .filter(|key| key.starts_with("o:"))
         .collect();
@@ -12829,14 +12831,14 @@ fn key_operation_kem_jsonl_version_dispatch() {
         if line["kind"] == "object_observed"
             && reemitted.contains(&format!("o:{}", line["event"]["row"]["object"]))
         {
-            assert_eq!(line["event"]["version"], 2, "re-emits bind current v2");
+            assert_eq!(line["event"]["version"], 7, "re-emits bind current v7");
             assert_eq!(
                 line["event"]["row"]["creation"], "create",
-                "v1 vocabulary stays valid under v2"
+                "creation vocabulary stays valid under v7"
             );
         }
     }
-    let r3lines = [v1lines.clone(), r2delta.clone(), r3delta.clone()].concat();
+    let r3lines = [v7lines.clone(), r2delta.clone(), r3delta.clone()].concat();
     let rebuilt = reconstruct(&r3lines);
     assert_reconstructed_eq_json(&rebuilt, &section, false);
     assert!(
@@ -12854,7 +12856,7 @@ fn key_operation_kem_jsonl_version_dispatch() {
         .expect("decapsulate tally");
     assert_eq!((decap.completed, decap.failed, decap.active), (1, 0, 0));
     // Role-only KEM: a proved KEM role with no KEM creation
-    // anywhere still renders and streams v2.
+    // anywhere still renders and streams v7.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -12906,8 +12908,8 @@ fn key_operation_kem_jsonl_version_dispatch() {
         "the proved KEM role"
     );
     let section = object_observations_json(&rr);
-    assert_eq!(section["version"], OBSERVATIONS_VERSION_V2);
-    assert_eq!(marker_version(&rr), 2);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V7);
+    assert_eq!(marker_version(&rr), 7);
     let role_path = dir.path().join("role.jsonl");
     let mut writer = EventWriter::create(&role_path, 1 << 20, 5).unwrap();
     let mut emitter = KeyOperationEmitter::new();
@@ -12920,8 +12922,8 @@ fn key_operation_kem_jsonl_version_dispatch() {
     drop(writer);
     let role_lines = read_stream(dir.path(), "role.jsonl");
     assert!(
-        row_versions(&role_lines).iter().all(|v| *v == 2),
-        "role-only rows bind v2"
+        row_versions(&role_lines).iter().all(|v| *v == 7),
+        "role-only rows bind v7"
     );
     assert_reconstructed_eq_json(&reconstruct(&role_lines), &section, true);
     // Unknown versions refuse without guessing.
@@ -12968,7 +12970,7 @@ fn key_operation_kem_jsonl_version_dispatch() {
     for line in &spun {
         if line["kind"] == "object_observed" || line["kind"] == "key_operations_observed" {
             let version = line["event"]["version"].as_u64().unwrap_or(u64::MAX);
-            assert!(version == 1 || version == 2, "known version survives");
+            assert!(version == 7, "known version survives");
         }
     }
     assert!(
@@ -21833,8 +21835,8 @@ fn key_operation_partial_publication_counts_unattributed() {
     );
     let healthy_json = object_observations_json(&healthy);
     // The label-less proved key rows under `unknown` metadata, which
-    // stamps v4; v4 always carries `unattributed`, empty here.
-    assert_eq!(healthy_json["version"], 4, "unknown metadata rows stamp v4");
+    // stamps v7; v7 always carries `unattributed`, empty here.
+    assert_eq!(healthy_json["version"], 7, "unknown metadata rows stamp v7");
     assert_eq!(
         healthy_json["unattributed"],
         serde_json::json!([]),
@@ -24958,8 +24960,7 @@ fn key_operation_schema_v5_pins_pqc_metadata_contract() {
 fn key_operation_pqc_version_follows_content() {
     use crate::key_operation_projection::producer::commit;
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6, object_observations_json,
-        observations_version,
+        OBSERVATIONS_VERSION_V7, object_observations_json, observations_version,
     };
     use crate::semantics_key_use::KeyUseReducer;
     // Both scenes sign with the ML-DSA mechanism id (0x1d): labels
@@ -25012,9 +25013,9 @@ fn key_operation_pqc_version_follows_content() {
         commit(1, &[&staging], &scene.model.project(), &keyuse)
     }
     let pqc = commit_scene(vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x4a), (7u8, 1u8, 2u16)]);
-    assert_eq!(observations_version(&pqc), OBSERVATIONS_VERSION_V5);
+    assert_eq!(observations_version(&pqc), OBSERVATIONS_VERSION_V7);
     let section = object_observations_json(&pqc);
-    assert_eq!(section["version"], 5);
+    assert_eq!(section["version"], 7);
     assert_eq!(
         section["key_operations"][0]["metadata_at_use"], "ml_dsa_65",
         "the key row carries the PQC label"
@@ -25036,10 +25037,10 @@ fn key_operation_pqc_version_follows_content() {
     ]);
     assert_eq!(
         observations_version(&rsa),
-        crate::key_operation_projection::OBSERVATIONS_VERSION
+        crate::key_operation_projection::OBSERVATIONS_VERSION_V7
     );
     let legacy = object_observations_json(&rsa);
-    assert_eq!(legacy["version"], 1);
+    assert_eq!(legacy["version"], 7);
     assert_eq!(
         legacy["key_operations"][0]["metadata_at_use"], "rsa_2048",
         "the control row proves the scene is live"
@@ -25060,17 +25061,14 @@ fn key_operation_pqc_version_follows_content() {
             "value_len",
             "modulus_bits",
             "ec_params",
+            "parameter_set",
         ];
         expected.sort_unstable();
-        assert_eq!(keys, expected, "{block} keeps six keys");
+        assert_eq!(keys, expected, "{block} keeps seven keys");
     }
-    assert!(
-        legacy["objects"][0]["queries"]
-            .as_object()
-            .unwrap()
-            .get("parameter_set")
-            .is_none(),
-        "no parameter_set query outcome at v1"
+    assert_eq!(
+        legacy["objects"][0]["queries"]["parameter_set"], "not_queried",
+        "no parameter_set query outcome on the legacy row"
     );
     fn assert_seven_key_blocks(section: &serde_json::Value) {
         for block in ["requested", "established"] {
@@ -25110,11 +25108,11 @@ fn key_operation_pqc_version_follows_content() {
         let bare = commit_scene(vec![(1u8, 1u8, 2u16), (2u8, 1u8, key_type)]);
         assert_eq!(
             observations_version(&bare),
-            OBSERVATIONS_VERSION_V5,
-            "key type {key_type:#x} alone versions v5"
+            OBSERVATIONS_VERSION_V7,
+            "key type {key_type:#x} alone versions v7"
         );
         let section = object_observations_json(&bare);
-        assert_eq!(section["version"], 5);
+        assert_eq!(section["version"], 7);
         assert_seven_key_blocks(&section);
         assert_eq!(
             section["objects"][0]["established"]["key_type"]["value"],
@@ -25142,11 +25140,11 @@ fn key_operation_pqc_version_follows_content() {
     ]);
     assert_eq!(
         observations_version(&queried),
-        OBSERVATIONS_VERSION_V5,
-        "a parameter-set query alone versions v5"
+        OBSERVATIONS_VERSION_V7,
+        "a parameter-set query alone versions v7"
     );
     let section = object_observations_json(&queried);
-    assert_eq!(section["version"], 5);
+    assert_eq!(section["version"], 7);
     assert_seven_key_blocks(&section);
     assert_eq!(
         section["key_operations"][0]["metadata_at_use"], "rsa_2048",
@@ -25200,11 +25198,11 @@ fn key_operation_pqc_version_follows_content() {
     let requested_only = commit(1, &[&staging], &scene.model.project(), &keyuse);
     assert_eq!(
         observations_version(&requested_only),
-        OBSERVATIONS_VERSION_V6,
-        "a promoted PQC keygen template versions v6"
+        OBSERVATIONS_VERSION_V7,
+        "a promoted PQC keygen template versions v7"
     );
     let section = object_observations_json(&requested_only);
-    assert_eq!(section["version"], 6);
+    assert_eq!(section["version"], 7);
     assert_seven_key_blocks(&section);
     assert_eq!(
         section["objects"][0]["requested"]["key_type"]["value"],
@@ -25285,7 +25283,7 @@ fn key_operation_pqc_label_constructor_refuses_invalid_pairs() {
 #[test]
 fn key_operation_pqc_wrong_family_pair_publishes_scalar_without_label() {
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V5, object_observations_json, observations_version,
+        OBSERVATIONS_VERSION_V7, object_observations_json, observations_version,
     };
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
@@ -25331,11 +25329,11 @@ fn key_operation_pqc_wrong_family_pair_publishes_scalar_without_label() {
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
     assert_eq!(
         observations_version(&committed),
-        OBSERVATIONS_VERSION_V5,
-        "the classified word versions v5 beside any key type"
+        OBSERVATIONS_VERSION_V7,
+        "the classified word versions v7 beside any key type"
     );
     let section = object_observations_json(&committed);
-    assert_eq!(section["version"], 5);
+    assert_eq!(section["version"], 7);
     let established = &section["objects"][0]["established"];
     assert_eq!(established["key_type"]["value"], 0);
     assert_eq!(established["parameter_set"]["status"], "value");
@@ -25361,7 +25359,7 @@ fn key_operation_pqc_wrong_family_pair_publishes_scalar_without_label() {
 /// (`decapsulate`, `decapsulation_key`, `ml_kem_768`).
 #[test]
 fn key_operation_kem_labelled_input_rows_proved() {
-    use crate::key_operation_projection::{OBSERVATIONS_VERSION_V5, observations_version};
+    use crate::key_operation_projection::{OBSERVATIONS_VERSION_V7, observations_version};
     for (name, category, role, class, capture) in [
         (
             "C_EncapsulateKey",
@@ -25414,8 +25412,8 @@ fn key_operation_kem_labelled_input_rows_proved() {
         let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
         assert_eq!(
             observations_version(&committed),
-            OBSERVATIONS_VERSION_V5,
-            "{name}: the labelled use versions v5"
+            OBSERVATIONS_VERSION_V7,
+            "{name}: the labelled use versions v7"
         );
         assert_eq!(committed.key_operations.len(), 1, "{name}: one proved row");
         let row = &committed.key_operations[0];
@@ -25829,8 +25827,7 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
 fn key_operation_newsite_version_follows_content() {
     use crate::key_operation_projection::producer::commit;
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V6, object_observations_json,
-        observations_version,
+        OBSERVATIONS_VERSION_V7, object_observations_json, observations_version,
     };
     use crate::semantics_key_use::KeyUseReducer;
     fn commit_scene(
@@ -25872,9 +25869,9 @@ fn key_operation_newsite_version_follows_content() {
         commit(1, &[&staging], &scene.model.project(), &keyuse)
     }
     let hkdf = commit_scene(vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x42), (4u8, 1u8, 48u16)]);
-    assert_eq!(observations_version(&hkdf), OBSERVATIONS_VERSION_V6);
+    assert_eq!(observations_version(&hkdf), OBSERVATIONS_VERSION_V7);
     let section = object_observations_json(&hkdf);
-    assert_eq!(section["version"], 6);
+    assert_eq!(section["version"], 7);
     assert_eq!(
         section["key_operations"][0]["metadata_at_use"], "hkdf_384",
         "the key row carries the promoted HKDF label"
@@ -25894,9 +25891,9 @@ fn key_operation_newsite_version_follows_content() {
     // Old-vocabulary creation still renders v6: the established
     // block carries non-`query` sources.
     let aes = commit_scene(vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1f), (4u8, 1u8, 32u16)]);
-    assert_eq!(observations_version(&aes), OBSERVATIONS_VERSION_V6);
+    assert_eq!(observations_version(&aes), OBSERVATIONS_VERSION_V7);
     let promoted = object_observations_json(&aes);
-    assert_eq!(promoted["version"], 6);
+    assert_eq!(promoted["version"], 7);
     assert_eq!(
         promoted["key_operations"][0]["metadata_at_use"], "aes_256",
         "the key row carries the promoted AES label"
@@ -25949,9 +25946,9 @@ fn key_operation_newsite_version_follows_content() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let legacy = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(observations_version(&legacy), OBSERVATIONS_VERSION);
+    assert_eq!(observations_version(&legacy), OBSERVATIONS_VERSION_V7);
     let section = object_observations_json(&legacy);
-    assert_eq!(section["version"], 1);
+    assert_eq!(section["version"], 7);
     assert_eq!(
         section["key_operations"][0]["metadata_at_use"], "aes_256",
         "the control row proves the scene is live"
@@ -25973,8 +25970,13 @@ fn key_operation_newsite_version_follows_content() {
                 .collect();
             assert_eq!(
                 keys,
-                vec!["status".to_string(), "value".to_string()],
-                "v1 {block}.{field} stays byte-stable without source"
+                vec![
+                    "reason".to_string(),
+                    "source".to_string(),
+                    "status".to_string(),
+                    "value".to_string()
+                ],
+                "v7 {block}.{field} carries v6 source keys"
             );
         }
     }
@@ -25988,7 +25990,7 @@ fn key_operation_newsite_version_follows_content() {
 fn key_operation_newsite_montgomery_labels_end_to_end() {
     use crate::key_operation_projection::producer::commit;
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+        OBSERVATIONS_VERSION_V7, object_observations_json, observations_version,
     };
     use crate::semantics_key_use::KeyUseReducer;
     let mut scene = JointScene::new();
@@ -26025,9 +26027,9 @@ fn key_operation_newsite_montgomery_labels_end_to_end() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V7);
     let section = object_observations_json(&committed);
-    assert_eq!(section["version"], 6);
+    assert_eq!(section["version"], 7);
     assert_eq!(
         section["objects"][0]["label"], "x25519",
         "the created Montgomery view labels without a query"
@@ -26844,8 +26846,8 @@ fn key_operation_newsite_unwrap_carries_no_unestablished_curve_reason() {
     );
     let section = object_observations_json(&committed);
     assert_eq!(
-        section["version"], 6,
-        "the promoted creation_success source trips v6"
+        section["version"], 7,
+        "the promoted creation_success source trips v7"
     );
 }
 
@@ -29104,8 +29106,9 @@ fn observations_version_v7_triggers_on_inferred_content() {
         }))]),
         7
     );
-    // Blank rows and the off-mode hint alone stay below v7.
-    assert_eq!(version_of(vec![row(None)]), 1);
+    // Blank rows and the off-mode hint alone stay below v7 (the
+    // unknown metadata label pins v4, frozen and unrelated).
+    assert_eq!(version_of(vec![row(None)]), 4);
     assert_eq!(
         version_of(vec![row(Some(RowInference {
             family: FamilyState::default(),
@@ -29119,7 +29122,7 @@ fn observations_version_v7_triggers_on_inferred_content() {
                 further_seen: Vec::new(),
             },
         }))]),
-        1
+        4
     );
 }
 
@@ -29145,6 +29148,115 @@ fn keymeta_family_further_counts_distinct_once() {
     assert_eq!(state.conflict_completions, 1);
     assert_eq!(state.further, 1);
     assert_eq!(state.completions, 5);
+}
+
+/// Same-value repeats never conflict: the value stands with full
+/// support, and same sizes keep the first tag.
+#[test]
+fn keymeta_same_value_repeats_never_conflict() {
+    use crate::semantics_key_use::{FamilyState, SizeInput, SizeState};
+    let mut family = FamilyState::default();
+    for _ in 0..2 {
+        family.accumulate_family(None, 0x0001);
+    }
+    assert_eq!(family.status, InferredStatus::Inferred);
+    assert_eq!(family.value, Some(KeyFamily::Rsa));
+    assert_eq!(family.completions, 2);
+    assert_eq!(family.value_completions, 2);
+    assert_eq!(family.conflict_value, None);
+    let mut size = SizeState::default();
+    for _ in 0..2 {
+        size.accumulate_size(
+            None,
+            Some(0x0001),
+            Some(EvidenceTag::SignOutput),
+            SizeInput::Value(256),
+        );
+    }
+    assert_eq!(size.status, InferredStatus::Inferred);
+    assert_eq!(size.completions, 2);
+    assert_eq!(
+        size.detail.as_ref().map(|(_, tag)| *tag),
+        Some(EvidenceTag::SignOutput)
+    );
+    assert_eq!(size.conflict_detail, None);
+}
+
+/// Weaker evidence never disturbs valued states: unlisted mechanisms
+/// and unknown lengths after a value keep the value (counted).
+#[test]
+fn keymeta_weaker_evidence_never_disturbs_valued() {
+    use crate::semantics_key_use::{FamilyState, SizeInput, SizeState};
+    let mut family = FamilyState::default();
+    family.accumulate_family(None, 0x0001);
+    family.accumulate_family(None, 0x0500);
+    assert_eq!(family.status, InferredStatus::Inferred);
+    assert_eq!(family.value, Some(KeyFamily::Rsa));
+    assert_eq!(family.completions, 2);
+    assert_eq!(family.reason, None);
+    let mut size = SizeState::default();
+    size.accumulate_size(
+        None,
+        Some(0x0001),
+        Some(EvidenceTag::SignOutput),
+        SizeInput::Value(256),
+    );
+    size.accumulate_size(
+        None,
+        Some(0x1087),
+        Some(EvidenceTag::EncryptOutput),
+        SizeInput::Value(100),
+    );
+    assert_eq!(size.status, InferredStatus::Inferred);
+    assert_eq!(size.completions, 2);
+}
+
+/// Valued evidence upgrades unsupported and unknown states; unknown
+/// evidence never downgrades unsupported ones.
+#[test]
+fn keymeta_valued_upgrades_unsupported_and_unknown() {
+    use crate::semantics_key_use::{FamilyState, SizeInput, SizeState};
+    let mut size = SizeState::default();
+    size.accumulate_size(
+        None,
+        Some(0x0121),
+        Some(EvidenceTag::EncryptOutput),
+        SizeInput::Value(64),
+    );
+    assert_eq!(size.status, InferredStatus::Unsupported);
+    size.accumulate_size(
+        None,
+        Some(0x0001),
+        Some(EvidenceTag::SignOutput),
+        SizeInput::Value(256),
+    );
+    assert_eq!(size.status, InferredStatus::Inferred);
+    assert_eq!(size.completions, 2);
+    let mut size = SizeState::default();
+    size.accumulate_size(
+        None,
+        Some(0x0121),
+        Some(EvidenceTag::EncryptOutput),
+        SizeInput::Value(64),
+    );
+    size.accumulate_size(
+        None,
+        Some(0x1087),
+        Some(EvidenceTag::EncryptOutput),
+        SizeInput::Value(100),
+    );
+    assert_eq!(size.status, InferredStatus::Unsupported);
+    assert_eq!(size.reason, Some(crate::keymeta::REASON_NO_LENGTH_MAP));
+    assert_eq!(size.completions, 2);
+    let mut family = FamilyState::default();
+    family.accumulate_family(None, 0x0001);
+    family.accumulate_family(None, 0x1044);
+    family.accumulate_family(None, 0x0360);
+    assert_eq!(family.status, InferredStatus::Conflicting);
+    assert_eq!(family.value, Some(KeyFamily::Rsa));
+    assert_eq!(family.conflict_value, Some(KeyFamily::Ec));
+    assert_eq!(family.further, 0);
+    assert_eq!(family.completions, 3);
 }
 
 /// Size further-details count distinct sizes, never completions:

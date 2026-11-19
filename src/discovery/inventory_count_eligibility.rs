@@ -653,6 +653,13 @@ impl CountOwnership {
             self.summaries.remove(&key);
         }
     }
+    /// Test-only: count-ownership summaries retained for one caller.
+    #[cfg(test)]
+    pub(super) fn summary_count_for_test(&self, caller: CallerId) -> usize {
+        self.summaries
+            .range((Included((caller, 0)), Included((caller, u32::MAX))))
+            .count()
+    }
     pub(super) fn deferred(&self, caller: CallerId, object: u32) -> bool {
         self.callers.get(&caller).is_some_and(|slot| {
             slot.live

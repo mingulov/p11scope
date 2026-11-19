@@ -76,11 +76,12 @@
 //! syscall plus two pidfd polls.
 #![cfg_attr(not(test), allow(dead_code))]
 
+pub(crate) use super::activation::InfoTeardown;
 use super::activation::{
     ActiveInventory, InventoryEndpoint, InventoryGroupRequest, InventoryHealthSnapshot,
     InventoryLinkIdentity, InventoryLinkIo, InventoryLinked, InventoryState, InventoryTargets,
-    RetiredInventory, RetiringInventory, attach_published_entry_with, require_live_pid_custody,
-    service_inventory_discovery_with, validate_entry,
+    RetiredInventory, RetiringInventory, attach_published_entry_with, attach_published_return_with,
+    require_live_pid_custody, service_inventory_discovery_with, validate_entry,
 };
 use super::callers::{CallerRowFault, CallerUseCursor, CallerUseIo};
 use super::{AttachBackend, PreparedInventory, Scope};
@@ -102,7 +103,7 @@ use p11scope_ebpf_common::inventory_callers::{CallerObjectKey, CallerObjectUse};
 use p11scope_ebpf_common::{
     DISCOVERY_KIND_EXEC, DiscoveryRecord, ImageIdentity, ImageIdentityControl, ThreadOwnerControl,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::os::fd::AsFd as _;
 use std::sync::Arc;
@@ -230,8 +231,10 @@ pub(crate) fn entry_link_bound(backend: AttachBackend, endpoint_limit: u64) -> u
 }
 
 /// The descriptor preflight: the backend's entry-link bound + 2 roots +
-/// the DISCOVERY ring + `FD_RESERVE` must fit what the soft limit leaves
-/// free.
+/// the DISCOVERY ring + the INFO ring + `FD_RESERVE` must fit what the
+/// soft limit leaves free. Info returns stay excluded from the hard
+/// preflight (keymeta Task 7, spec §17.4 N4): they attach
+/// opportunistically and defer on EMFILE, never stopping the capture.
 fn fd_preflight(
     backend: AttachBackend,
     endpoint_limit: u64,
@@ -239,15 +242,15 @@ fn fd_preflight(
     in_use: u64,
 ) -> std::result::Result<(), CaptureCapacityLimited> {
     let links = entry_link_bound(backend, endpoint_limit);
-    let needed = links.saturating_add(3).saturating_add(FD_RESERVE);
+    let needed = links.saturating_add(4).saturating_add(FD_RESERVE);
     let free = soft_limit.saturating_sub(in_use);
     if needed > free {
         let what = match backend {
             AttachBackend::Singles => format!(
-                "N={endpoint_limit} entries need {needed} descriptors (N + 3 + {FD_RESERVE} reserve)"
+                "N={endpoint_limit} entries need {needed} descriptors (N + 4 + {FD_RESERVE} reserve)"
             ),
             AttachBackend::Multi => format!(
-                "N={endpoint_limit} entries in up to {links} attach-group links need {needed} descriptors ({links} + 3 + {FD_RESERVE} reserve)"
+                "N={endpoint_limit} entries in up to {links} attach-group links need {needed} descriptors ({links} + 4 + {FD_RESERVE} reserve)"
             ),
         };
         return Err(CaptureCapacityLimited {
@@ -703,6 +706,99 @@ pub(crate) struct AttachGroup {
     pub links: usize,
 }
 
+/// Keymeta Task 7 (spec §17.4, N4): one deferred info return — an
+/// endpoint (Singles) or a return group (Multi) whose link met
+/// EMFILE. The endpoint stays attached and `known`; the retry
+/// re-attaches the return and publishes `INFO_KIND` once.
+#[derive(Debug, Clone)]
+pub(crate) enum InfoReturnPending {
+    Singles(AttachEndpoint),
+    Multi {
+        object: AttachObjectId,
+        sites: Vec<PendingReturnSite>,
+        /// The entry group's serial: the retried return group
+        /// carries it (the `ReturnGroup` variant distinguishes
+        /// custody), so retried groups never share a serial.
+        entry_serial: u32,
+        /// Next site index to filter in `sites`: the filter resumes
+        /// here, so an interrupted group never rescans its visited
+        /// prefix nor copies its unvisited suffix. The storage stays
+        /// across yields; only this cursor and `excluded` advance.
+        validated: usize,
+        /// The revocation epoch the prefix before `validated` was
+        /// checked against: a newer epoch revalidates from the first
+        /// site before publication, under the same visit allowance.
+        validated_epoch: u64,
+        /// Revoked site indexes (bit `i` = `sites[i]` revoked):
+        /// irreversible, so a resumed filter never rechecks them.
+        /// Covers the [`MULTI_LINK_MAX_SITES`] maximum (96 sites in
+        /// two words); bits past `sites.len()` stay clear.
+        excluded: [u64; 2],
+        /// Survivors accumulated during credited filter visits, in
+        /// site order: one push per visited surviving site, already
+        /// charged. Cleared on an epoch change and rebuilt under
+        /// the same allowance. Lets every yield and EMFILE requeue
+        /// the original `sites` vector, cursor and mask with no
+        /// post-filter scan or copy.
+        staged: Vec<PendingReturnSite>,
+        /// Attach points for `staged`, built alongside each push as
+        /// (`file_offset`, `cookie`). Passed directly to the return
+        /// group attach; never derived by a second scan.
+        staged_points: Vec<(u64, u64)>,
+    },
+}
+
+/// Whether Multi site `index` is excluded as revoked.
+fn multi_site_excluded(excluded: &[u64; 2], index: usize) -> bool {
+    let (word, bit) = (index / 64, index % 64);
+    word < excluded.len() && (excluded[word] & (1u64 << bit)) != 0
+}
+
+/// Mark Multi site `index` excluded as revoked.
+fn multi_site_exclude(excluded: &mut [u64; 2], index: usize) {
+    let (word, bit) = (index / 64, index % 64);
+    if let Some(slot) = excluded.get_mut(word) {
+        *slot |= 1u64 << bit;
+    }
+}
+
+/// One Multi return-group member awaiting its return link.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingReturnSite {
+    pub endpoint: u32,
+    pub file_offset: u64,
+    pub cookie: u64,
+    pub kind: u8,
+}
+
+/// Keymeta Task 7 ring cross-check (spec §17.4): the INFO drain
+/// compares produced vs consumed per quantum, never a silent drop.
+/// The difference is derived backlog (produced minus consumed):
+/// provisional mid-run — submitted-but-undrained records read as
+/// backlog until the next quantum drains them — and reported, never
+/// certified, at the terminal cut (exact loss needs producer
+/// quiescence, unproven under D3). A regressing read retains the
+/// whole prior triple. Reserve failures (a full ring) never reach
+/// this counter — no submit, no produced bump — and land in the
+/// session's shared ring-loss counter instead, beside DISCOVERY losses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct InfoRingAccounting {
+    pub produced: u64,
+    pub consumed: u64,
+    pub loss: u64,
+}
+
+impl InfoRingAccounting {
+    pub(crate) fn note_info_quantum(&mut self, produced_now: u64, consumed_now: u64) {
+        if produced_now < self.produced || consumed_now < self.consumed {
+            return;
+        }
+        self.produced = produced_now;
+        self.consumed = consumed_now;
+        self.loss = produced_now.saturating_sub(consumed_now);
+    }
+}
+
 /// What one `extend` did. Every endpoint of the delta lands in exactly one
 /// of `attached`, `failed`, `known`, or `deferred`.
 #[derive(Debug, Default)]
@@ -722,6 +818,20 @@ pub(crate) struct ExtendReceipt {
     /// An attach hit EMFILE: the window stopped there and the rest was
     /// deferred, nothing failed.
     pub fd_exhausted: bool,
+    /// Keymeta Task 7 (spec §17.4, N4): info returns (Singles) or
+    /// info return groups (Multi) that met EMFILE this extend. The
+    /// endpoints stay attached (their usage entries still record);
+    /// the returns retry from the private pending list.
+    pub info_return_deferred: u64,
+    /// Keymeta Task 7 (spec §17.4): endpoints whose INFO kind this
+    /// extend revoked (a later pass proved their names aliased).
+    /// Fresh copies downgraded to usage-only, pendings purged and
+    /// (FULL only) the INFO_KIND cell cleared.
+    pub info_revoked: u64,
+    /// Keymeta Task 7 (spec §17.4): revoked endpoints whose INFO_KIND
+    /// write failed this extend. Each retries on the next extend;
+    /// usage attaches proceed regardless.
+    pub info_revoke_failed: u64,
     /// Multi: leaf links a halted group attach (EMFILE, or a kernel
     /// refusing uprobe-multi) had already created and then closed before
     /// they reached custody. Their members are deferred or failed with
@@ -1047,6 +1157,80 @@ pub(crate) enum CookieQuery {
     Unavailable(String),
 }
 
+/// Keymeta Task 7 (spec §17.4): one bounded INFO quantum, in
+/// dequeue order — raw 176-byte records (decoded at staging) plus
+/// the produced-vs-consumed cross-check snapshot.
+#[derive(Debug, Clone)]
+pub(crate) struct InfoBatch {
+    /// The BPF domain these records came from, tagged by the facade
+    /// that drained them (never by a caller).
+    pub domain: NativeDomainId,
+    pub records: Vec<[u8; 176]>,
+    /// Malformed frames that ended this quantum (exact evidence).
+    pub malformed: u64,
+    /// Submitted INFO records over the capture so far (kernel half).
+    pub produced: u64,
+    /// Consumed INFO records over the capture so far (userspace half).
+    pub consumed: u64,
+    /// Derived backlog (produced minus consumed): provisional
+    /// mid-run, reported at the terminal cut — never certified loss
+    /// (exact loss needs producer quiescence, unproven under D3).
+    pub loss: u64,
+    /// True only for the session's terminal cut: the last quantum
+    /// before the domain finishes, carrying the retirement outcome.
+    /// Only a terminal batch reports its backlog cut; provisional
+    /// mid-run readings stay in the batch (submitted-but-undrained
+    /// backlog reads as loss until the next quantum drains it).
+    pub terminal: bool,
+    /// A dequeue failure stopped the quantum (a ring-read error, a
+    /// refused bound): the cause, distinct from the malformed count.
+    pub failure: Option<String>,
+    /// Keymeta Task 7 evidence deltas (spec §17.4): INFO_EVIDENCE
+    /// cells observed since the last quantum — insert failures,
+    /// unmatched returns, nested overwrites, stash mismatches —
+    /// indexed by the INFO_EVIDENCE_* consts. Zeros for P0.
+    pub evidence_delta: [u64; 4],
+    /// The INFO_EVIDENCE read failed this quantum (FULL only): the
+    /// cause. Counts are not updated on a failed read, so a later
+    /// success reports the full delta since the last success.
+    pub evidence_error: Option<String>,
+    /// True when this quantum drained the ring to empty: no record
+    /// bound, no deadline and no dequeue failure stopped it. Only a
+    /// complete terminal quantum reports its backlog cut; anything
+    /// else reports incomplete.
+    pub complete: bool,
+    /// The produced counter read succeeded this quantum. False for
+    /// P0 (no reader) and for failed map reads.
+    pub produced_fresh: bool,
+    /// The produced counter read failed this quantum (FULL only):
+    /// the cause. The triple retains its prior values.
+    pub produced_error: Option<String>,
+    /// Retirement had settled when the session cut this terminal
+    /// batch. Only the session sets this, only on terminal batches.
+    pub retired: bool,
+}
+
+impl InfoBatch {
+    pub(crate) fn empty(domain: NativeDomainId) -> Self {
+        Self {
+            domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: false,
+            produced_error: None,
+            retired: false,
+        }
+    }
+}
+
 /// One bounded quantum of lifecycle records, in dequeue order.
 pub(crate) struct DiscoveryBatch {
     /// The BPF domain these records came from, tagged by the facade that
@@ -1135,6 +1319,13 @@ pub(crate) struct CleanupSummary {
     pub failures: Vec<String>,
     /// Links that stay owned (quarantined or failed to close).
     pub retained_links: usize,
+    /// Keymeta Task 7 (spec §17.4): the INFO_START scrub did not
+    /// prove an empty stash (retained links refused it). Explicitly
+    /// unproven, never silently dirty.
+    pub info_teardown_unproven: bool,
+    /// Keymeta Task 7 (spec §17.4): the scrub phase's last concrete
+    /// failure, if it transferred unproven.
+    pub info_scrub_error: Option<String>,
 }
 
 /// Facade bookkeeping that travels through every state.
@@ -1161,6 +1352,47 @@ struct CaptureBook {
     attached: BTreeSet<u32>,
     /// Endpoints that failed: never retried. Bounded by N.
     failed: BTreeMap<u32, String>,
+    /// Keymeta Task 7 (spec §17.4, N4): the private info-return
+    /// pending list. An attached endpoint counts as already handled
+    /// (`knows`) and is never resubmitted through the `deferred`
+    /// backlog, so deferred info returns wait here instead. Every
+    /// extend retries this list first, within the same window; the
+    /// endpoints stay `known`.
+    info_return_pending: VecDeque<InfoReturnPending>,
+    /// Keymeta Task 7 (spec §17.4): the INFO produced-vs-consumed
+    /// cross-check, noted per quantum.
+    info_accounting: InfoRingAccounting,
+    /// Keymeta Task 7 (spec §17.4): INFO records consumed over the
+    /// capture so far (the userspace half of the cross-check).
+    info_consumed: u64,
+    /// Keymeta Task 7 (spec §17.4): malformed INFO frames over the
+    /// capture so far (each ends its quantum with exact evidence).
+    malformed_info: u64,
+    /// Keymeta Task 7 (spec §17.4): last observed INFO_EVIDENCE
+    /// cells, for per-quantum deltas.
+    last_info_evidence: [u64; 4],
+    /// Keymeta Task 7 (spec §17.4): revoked endpoints whose INFO_KIND
+    /// cell writes still pend, oldest first. The queue persists
+    /// across extends: each extend pops from the front up to its
+    /// allowance, paced-out cells keep their place (never rebuilt),
+    /// and failed or yielded cells cycle to the back, so unattempted
+    /// cells always get a turn.
+    pending_info_revoke: VecDeque<EndpointId>,
+    /// Keymeta Task 7 (spec §17.4, INV-2): the pending queue's
+    /// indexed membership plus each cell's resume substep, so
+    /// enqueue dedups directly and a mid-cell yield resumes without
+    /// redoing finished map operations.
+    pending_info_revoke_step: BTreeMap<EndpointId, super::RevokeSubstep>,
+    /// Keymeta Task 7 (spec §17.4): every endpoint ever revoked this
+    /// capture, persistent and irreversible. Fresh copies downgrade
+    /// and pending info returns drop against this set from their
+    /// staging extend on, without rescanning the write queue.
+    info_revoked: BTreeSet<u32>,
+    /// Keymeta Task 7 (spec §17.4): the revoked set's epoch,
+    /// bumped whenever the set grows, so a resumed Multi return
+    /// filter revalidates survivors staged under an older set
+    /// before publication.
+    info_revoked_epoch: u64,
     custody_lost: Option<(u64, String)>,
     original_exit: Option<OriginalPidExit>,
     /// First reason PID-scope coverage became unproven (sticky).
@@ -1287,6 +1519,15 @@ impl CaptureBook {
             published: BTreeMap::new(),
             attached: BTreeSet::new(),
             failed: BTreeMap::new(),
+            info_return_pending: VecDeque::new(),
+            info_accounting: InfoRingAccounting::default(),
+            info_consumed: 0,
+            malformed_info: 0,
+            last_info_evidence: [0; 4],
+            pending_info_revoke: VecDeque::new(),
+            pending_info_revoke_step: BTreeMap::new(),
+            info_revoked: BTreeSet::new(),
+            info_revoked_epoch: 0,
             custody_lost: None,
             original_exit: None,
             unproven: None,
@@ -1482,6 +1723,71 @@ impl CaptureBook {
             link_retained,
         });
     }
+
+    /// Keymeta Task 7 (spec §17.4): close one INFO quantum — count
+    /// the consumed records and malformed frames, note the
+    /// produced-vs-consumed cross-check, difference the evidence
+    /// cells, and assemble the batch. A missing produced reading
+    /// (P0) or a failed one retains the prior triple instead of
+    /// regressing it; the failure rides the batch so the terminal
+    /// cut never publishes a stale difference as loss. A missing
+    /// evidence reading (P0) reports zero deltas; a failed one
+    /// reports the cause and keeps the last cells, so a later
+    /// success reports the full delta. The batch leaves as
+    /// non-terminal and unretired; the session's terminal drain
+    /// marks its own batch, whichever capture state serves it.
+    fn finish_info_quantum(
+        &mut self,
+        records: Vec<[u8; 176]>,
+        malformed: u64,
+        failure: Option<String>,
+        complete: bool,
+        produced: Option<Result<u64, String>>,
+        evidence: Option<Result<[u64; 4], String>>,
+    ) -> InfoBatch {
+        self.info_consumed = self.info_consumed.saturating_add(records.len() as u64);
+        self.malformed_info = self.malformed_info.saturating_add(malformed);
+        let (produced_fresh, produced_error) = match produced {
+            Some(Ok(now)) => {
+                self.info_accounting
+                    .note_info_quantum(now, self.info_consumed);
+                (true, None)
+            }
+            Some(Err(error)) => (false, Some(error)),
+            None => (false, None),
+        };
+        let (evidence_delta, evidence_error) = match evidence {
+            None => ([0; 4], None),
+            Some(Ok(cells)) => {
+                let mut delta = [0u64; 4];
+                for (slot, (now, was)) in delta
+                    .iter_mut()
+                    .zip(cells.iter().zip(self.last_info_evidence.iter()))
+                {
+                    *slot = now.saturating_sub(*was);
+                }
+                self.last_info_evidence = cells;
+                (delta, None)
+            }
+            Some(Err(error)) => ([0; 4], Some(error)),
+        };
+        InfoBatch {
+            domain: self.domain,
+            records,
+            malformed,
+            produced: self.info_accounting.produced,
+            consumed: self.info_consumed,
+            loss: self.info_accounting.loss,
+            terminal: false,
+            failure,
+            evidence_delta,
+            evidence_error,
+            complete,
+            produced_fresh,
+            produced_error,
+            retired: false,
+        }
+    }
 }
 
 /// A clock reading usable as a drain floor: `u64::MAX` marks a failed
@@ -1626,19 +1932,456 @@ fn monotonic_ns() -> u64 {
 /// The incremental entry transaction over any link IO (the fake one in
 /// unit tests), under the book's backend. `custody` is the PID-scope
 /// check; `now` stamps attaches.
+/// Keymeta Task 7 (spec §17.4, INV-2): pending-return visits per
+/// extend for the INFO revocation filter. Each visited Single and
+/// each visited Multi site spends one credit; the unvisited suffix
+/// requeues for later extends instead of consuming the whole
+/// service window ahead of every attach.
+const INFO_RETURN_RETRY_PER_EXTEND: usize = 64;
+
+#[allow(clippy::too_many_arguments)]
+/// Keymeta Task 7 (spec §17.4, N4): retry the private info-return
+/// pending list first on every extend, within the same window and
+/// visit allowance. An attached endpoint stays `known`; the retry
+/// links its return and publishes `INFO_KIND` once. EMFILE re-parks
+/// the rest with the named counted gap and stops (descriptors are
+/// still exhausted); deterministic refusals fail disclosed with
+/// links retained.
+fn retry_info_returns<I: InventoryLinkIo>(
+    io: &mut I,
+    targets: &InventoryTargets,
+    links: &mut Vec<InventoryLinked<I::Link>>,
+    book: &mut CaptureBook,
+    receipt: &mut ExtendReceipt,
+    deadline: Instant,
+    now: &mut dyn FnMut() -> Instant,
+) {
+    // In-place queue: the deque moves out once and moves back once,
+    // and every yield pushes the front item back into the SAME deque
+    // before moving it back — never `append` across deques, which
+    // copies both backing slices scaled to the whole queue. An
+    // expired call before any work touches nothing at all.
+    if book.info_return_pending.is_empty() {
+        return;
+    }
+    if now() >= deadline {
+        return;
+    }
+    let mut queue: VecDeque<InfoReturnPending> = std::mem::take(&mut book.info_return_pending);
+    let mut remaining = INFO_RETURN_RETRY_PER_EXTEND;
+    while !queue.is_empty() {
+        // The window and allowance gate every visit before popping:
+        // nothing — not even a revoked Single's drop — is visited
+        // at or past the deadline or past the visit allowance, and
+        // an expired or spent extend moves no queue storage.
+        if now() >= deadline || remaining == 0 {
+            book.info_return_pending = queue;
+            return;
+        }
+        let Some(next) = queue.pop_front() else {
+            break;
+        };
+        match next {
+            InfoReturnPending::Singles(endpoint) => {
+                remaining -= 1;
+                // Revoked endpoints (spec §17.4) drop here, at
+                // their retry: the staging extend already recorded
+                // the revocation, so no return link is ever
+                // attempted for them again.
+                if book.info_revoked.contains(&endpoint.id.0) {
+                    continue;
+                }
+                let Some(kind) = endpoint.info_kind else {
+                    continue;
+                };
+                let entry = InventoryEndpoint {
+                    id: endpoint.id.0,
+                    object: PinnedObjectId(endpoint.object.index()),
+                    file_offset: endpoint.file_offset,
+                    abi: endpoint.abi,
+                    info_kind: Some(kind),
+                };
+                let before = links.len();
+                let attached = attach_published_return_with(io, targets, &entry, links);
+                let retained = links.len() > before;
+                match attached {
+                    Err(error) if !retained && crate::attach::is_fd_exhaustion(&error) => {
+                        receipt.info_return_deferred += 1;
+                        queue.push_front(InfoReturnPending::Singles(endpoint));
+                        book.info_return_pending = queue;
+                        return;
+                    }
+                    Err(error) => {
+                        book.fail(receipt, &endpoint, format!("{error:#}"), retained);
+                    }
+                    Ok(()) => {
+                        if let Err(error) =
+                            io.publish_info_kind(entry.id, kind).with_context(|| {
+                                format!("publishing info kind for endpoint {}", entry.id)
+                            })
+                        {
+                            book.fail(receipt, &endpoint, format!("{error:#}"), true);
+                        }
+                    }
+                }
+            }
+            InfoReturnPending::Multi {
+                object,
+                sites,
+                entry_serial,
+                mut validated,
+                mut validated_epoch,
+                mut excluded,
+                mut staged,
+                mut staged_points,
+            } => {
+                let epoch = book.info_revoked_epoch;
+                validated = validated.min(sites.len());
+                // A newer revocation epoch revalidates from the first
+                // site under the same visit allowance: survivors the
+                // filter kept under an older set drop here when the
+                // set has since revoked them, before any publication.
+                // Excluded bits stay (revocation is irreversible), so
+                // a resumed filter never rechecks them; the staged
+                // survivors clear and rebuild under the allowance.
+                if validated_epoch != epoch {
+                    validated = 0;
+                    validated_epoch = epoch;
+                    staged.clear();
+                    staged_points.clear();
+                }
+                // In-place cursor: the storage stays across yields and
+                // only the cursor, the exclusion mask and the staged
+                // survivors advance — no `to_vec` of the visited
+                // prefix and no `extend_from_slice` of the unvisited
+                // suffix. Each visited site spends one visit credit,
+                // excluded indexes included (site-index work under
+                // INV-2); each surviving visit pushes its site and
+                // its attach point, already charged, so completion
+                // needs no post-filter scan or copy.
+                let mut yielded = false;
+                while validated < sites.len() {
+                    if multi_site_excluded(&excluded, validated) {
+                        if remaining == 0 || now() >= deadline {
+                            yielded = true;
+                            break;
+                        }
+                        remaining -= 1;
+                        validated += 1;
+                        continue;
+                    }
+                    if remaining == 0 || now() >= deadline {
+                        yielded = true;
+                        break;
+                    }
+                    remaining -= 1;
+                    let site = sites[validated];
+                    if book.info_revoked.contains(&site.endpoint) {
+                        multi_site_exclude(&mut excluded, validated);
+                    } else {
+                        staged.push(site);
+                        staged_points.push((site.file_offset, site.cookie));
+                    }
+                    validated += 1;
+                }
+                if yielded {
+                    queue.push_front(InfoReturnPending::Multi {
+                        object,
+                        sites,
+                        entry_serial,
+                        validated,
+                        validated_epoch,
+                        excluded,
+                        staged,
+                        staged_points,
+                    });
+                    book.info_return_pending = queue;
+                    return;
+                }
+                // Filter complete: the staged survivors were built
+                // during credited visits, so no scan or copy runs
+                // here. An empty stage drops the fully revoked group.
+                if staged.is_empty() {
+                    continue;
+                }
+                // The filter spent time: recheck the window before
+                // native work. The original vector, cursor, mask and
+                // staged survivors requeue unchanged — never a
+                // rebuilt survivors-only copy.
+                if now() >= deadline {
+                    queue.push_front(InfoReturnPending::Multi {
+                        object,
+                        sites,
+                        entry_serial,
+                        validated,
+                        validated_epoch,
+                        excluded,
+                        staged,
+                        staged_points,
+                    });
+                    book.info_return_pending = queue;
+                    return;
+                }
+                let local = PinnedObjectId(object.index());
+                let retry = |book: &mut CaptureBook,
+                             receipt: &mut ExtendReceipt,
+                             sites: &[PendingReturnSite],
+                             reason: String| {
+                    for site in sites {
+                        book.failed.insert(site.endpoint, reason.clone());
+                        receipt.failed.push(EndpointFailure {
+                            id: EndpointId(site.endpoint),
+                            object,
+                            reason: reason.clone(),
+                            link_retained: true,
+                        });
+                    }
+                };
+                if let Err(error) = targets.check_object(local) {
+                    retry(book, receipt, &staged, format!("{error:#}"));
+                    continue;
+                }
+                let Some(path) = targets.attach_path(local) else {
+                    retry(
+                        book,
+                        receipt,
+                        &staged,
+                        "missing Inventory target pin".into(),
+                    );
+                    continue;
+                };
+                let attached = io.attach_return_group(InventoryGroupRequest {
+                    program: "p11_info_return",
+                    path: &path,
+                    sites: &staged_points,
+                });
+                match attached {
+                    Err(p11scope_bpf_multi::BisectHalt {
+                        halt: p11scope_bpf_multi::GroupHalt::Exhausted(_),
+                        closed_leaves,
+                    }) => {
+                        receipt.halt_closed_links += closed_leaves;
+                        receipt.info_return_deferred += 1;
+                        queue.push_front(InfoReturnPending::Multi {
+                            object,
+                            sites,
+                            entry_serial,
+                            validated,
+                            validated_epoch,
+                            excluded,
+                            staged,
+                            staged_points,
+                        });
+                        book.info_return_pending = queue;
+                        return;
+                    }
+                    Err(p11scope_bpf_multi::BisectHalt {
+                        halt: p11scope_bpf_multi::GroupHalt::Unsupported(error),
+                        closed_leaves,
+                    }) => {
+                        receipt.halt_closed_links += closed_leaves;
+                        retry(
+                            book,
+                            receipt,
+                            &staged,
+                            format!("uretprobe-multi refused by the running kernel: {error}"),
+                        );
+                        continue;
+                    }
+                    Ok(attach) => {
+                        // The return group carries its entry group's
+                        // serial (the `ReturnGroup` variant
+                        // distinguishes custody): entry serials are
+                        // unique, so retried groups never share one.
+                        let serial = entry_serial;
+                        for handle in attach.links {
+                            links.push(InventoryLinked {
+                                target: InventoryLinkIdentity::ReturnGroup(serial),
+                                handle,
+                            });
+                        }
+                        let refused: BTreeMap<usize, std::io::Error> =
+                            attach.refused.into_iter().collect();
+                        let mut survivors = Vec::with_capacity(staged.len());
+                        for (index, site) in staged.iter().enumerate() {
+                            if let Some(error) = refused.get(&index) {
+                                book.failed.insert(site.endpoint, format!("{error}"));
+                                receipt.failed.push(EndpointFailure {
+                                    id: EndpointId(site.endpoint),
+                                    object,
+                                    reason: format!(
+                                        "attaching Inventory return {} in group {serial}: {error}",
+                                        site.endpoint
+                                    ),
+                                    link_retained: true,
+                                });
+                                continue;
+                            }
+                            if let Err(error) = io
+                                .publish_info_kind(site.endpoint, site.kind)
+                                .with_context(|| {
+                                    format!("publishing info kind for endpoint {}", site.endpoint)
+                                })
+                            {
+                                book.failed.insert(site.endpoint, format!("{error:#}"));
+                                receipt.failed.push(EndpointFailure {
+                                    id: EndpointId(site.endpoint),
+                                    object,
+                                    reason: format!("{error:#}"),
+                                    link_retained: true,
+                                });
+                                continue;
+                            }
+                            survivors.push(site.endpoint);
+                        }
+                        if return_group_links(links, serial) > 0 {
+                            receipt.groups.push(AttachGroup {
+                                serial,
+                                object,
+                                program: "p11_info_return",
+                                members: survivors
+                                    .iter()
+                                    .map(|endpoint| EndpointId(*endpoint))
+                                    .collect(),
+                                links: return_group_links(links, serial),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Keymeta Task 7 (spec §17.4, INV-2): cell writes per extend for
+/// INFO revocations. Revocation authority (fresh downgrade, pending
+/// purge, row rejection) applies to every staged endpoint at once;
+/// only the map writes pace out — at most this many per extend and
+/// none at or past the extend deadline, the rest requeuing.
+const INFO_REVOKE_PER_EXTEND: usize = 64;
+
+/// Keymeta Task 7 (spec §17.4): apply this extend's INFO
+/// revocations before any attach or pending retry. Fresh endpoints
+/// whose ids revoked downgrade to usage-only (never publish new
+/// info state for them); pending info returns for revoked ids are
+/// purged; each revoked INFO_KIND cell writes back to zero (FULL
+/// only — P0 carries no map). Failed writes requeue for the next
+/// extend and count; successes count. Usage attaches proceed
+/// regardless.
+fn revoke_info_kinds<I: InventoryLinkIo>(
+    io: &mut I,
+    book: &mut CaptureBook,
+    delta: &mut TargetDelta,
+    receipt: &mut ExtendReceipt,
+    deadline: Instant,
+) {
+    let fresh = std::mem::take(&mut delta.info_revoked);
+    if fresh.is_empty() && book.pending_info_revoke.is_empty() {
+        return;
+    }
+    // P0 counts staged revocations without attempting any write, so
+    // it keeps the carried-plus-fresh total even for duplicates.
+    let carried = book.pending_info_revoke.len();
+    // Revocation authority applies to every staged endpoint at once
+    // (spec §17.4): fresh copies downgrade, pending info returns
+    // drop at their retry, and the coordinator already rejects their
+    // rows — before any map write, paced or not. Staging touches
+    // only the fresh delta plus indexed queue membership, never a
+    // scan over the whole write backlog.
+    let mut revoked_grew = false;
+    for id in &fresh {
+        revoked_grew |= book.info_revoked.insert(id.0);
+        if !book.pending_info_revoke_step.contains_key(id) {
+            book.pending_info_revoke.push_back(*id);
+            book.pending_info_revoke_step
+                .insert(*id, super::RevokeSubstep::ReadInitial);
+        }
+    }
+    if revoked_grew {
+        book.info_revoked_epoch = book.info_revoked_epoch.saturating_add(1);
+    }
+    for endpoint in &mut delta.endpoints {
+        if book.info_revoked.contains(&endpoint.id.0) {
+            endpoint.info_kind = None;
+        }
+    }
+    // Only the cell writes pace out: at most one extend's allowance,
+    // oldest cells first, and none at or past the extend deadline.
+    // Paced-out endpoints keep their queue place silently (pacing is
+    // not failure); failed writes cycle to the back counted, so
+    // unattempted cells always get a turn. Each queued cell attempts
+    // at most once per extend, and each attempt spends one credit of
+    // the extend's allowance. P0 carries no map, so its revokes cost
+    // no native work and pace nothing.
+    if cfg!(feature = "stub-object-attributes") {
+        let staged = carried.saturating_add(fresh.len()) as u64;
+        receipt.info_revoked = receipt.info_revoked.saturating_add(staged);
+        book.pending_info_revoke.clear();
+        book.pending_info_revoke_step.clear();
+        return;
+    }
+    let mut remaining = book.pending_info_revoke.len().min(INFO_REVOKE_PER_EXTEND);
+    while remaining > 0 {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Some(id) = book.pending_info_revoke.pop_front() else {
+            break;
+        };
+        let resume = book
+            .pending_info_revoke_step
+            .get(&id)
+            .copied()
+            .unwrap_or(super::RevokeSubstep::ReadInitial);
+        remaining -= 1;
+        match io.revoke_info_kind(id.0, resume, deadline, &mut Instant::now) {
+            Ok(super::RevokeStepOutcome::Done) => {
+                book.pending_info_revoke_step.remove(&id);
+                receipt.info_revoked = receipt.info_revoked.saturating_add(1);
+            }
+            Ok(super::RevokeStepOutcome::Yielded { next }) => {
+                book.pending_info_revoke_step.insert(id, next);
+                book.pending_info_revoke.push_back(id);
+            }
+            Err(_) => {
+                receipt.info_revoke_failed = receipt.info_revoke_failed.saturating_add(1);
+                book.pending_info_revoke_step
+                    .insert(id, super::RevokeSubstep::ReadInitial);
+                book.pending_info_revoke.push_back(id);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extend_entries_with<I: InventoryLinkIo>(
     io: &mut I,
     targets: &mut InventoryTargets,
     links: &mut Vec<InventoryLinked<I::Link>>,
     book: &mut CaptureBook,
-    delta: TargetDelta,
+    mut delta: TargetDelta,
     source: &dyn CaptureTargets,
     window: ExtendWindow,
     custody: &mut dyn FnMut() -> std::result::Result<(), String>,
     now: &mut dyn FnMut() -> u64,
     receipt: &mut ExtendReceipt,
 ) {
+    // Keymeta Task 7 (spec §17.4): revocations first — a revoked
+    // endpoint must not attach info state or retry a pending info
+    // return in this same extend.
+    revoke_info_kinds(io, book, &mut delta, receipt, window.deadline);
+    // Keymeta Task 7 (spec §17.4, N4): every extend retries the
+    // private info-return pending list first, within the same
+    // window; the endpoints stay `known`.
+    retry_info_returns(
+        io,
+        targets,
+        links,
+        book,
+        receipt,
+        window.deadline,
+        &mut Instant::now,
+    );
     match book.backend {
         AttachBackend::Singles => extend_singles_with(
             io, targets, links, book, delta, source, window, custody, now, receipt,
@@ -1678,6 +2421,14 @@ fn admit_entry<I: InventoryLinkIo>(
         object: local,
         file_offset: endpoint.file_offset,
         abi: endpoint.abi,
+        // Keymeta Task 7 (spec §17.4): the attach set's kind rides
+        // into the entry; P0 forces usage-only (the P0 object
+        // carries no info programs).
+        info_kind: if cfg!(feature = "stub-object-attributes") {
+            None
+        } else {
+            endpoint.info_kind
+        },
     };
     // Published but unattached (an earlier attach hit EMFILE): the
     // binding and the entry record stand; only the attach is retried.
@@ -1735,6 +2486,56 @@ fn admit_entry<I: InventoryLinkIo>(
         return None;
     }
     Some(entry)
+}
+
+/// Keymeta Task 7 Singles info return (spec §17.4, N4): attach the
+/// return after its entry linked, then publish `INFO_KIND` once.
+/// EMFILE (or an expired window) parks the endpoint on the private
+/// pending list — counted only on EMFILE — and reports
+/// attached-anyway (`None`); a deterministic refusal or a
+/// publication failure reports its reason for a disclosed fail with
+/// links retained.
+#[allow(clippy::too_many_arguments)]
+fn attempt_info_return_singles<I: InventoryLinkIo>(
+    io: &mut I,
+    targets: &InventoryTargets,
+    links: &mut Vec<InventoryLinked<I::Link>>,
+    book: &mut CaptureBook,
+    endpoint: &AttachEndpoint,
+    entry: &InventoryEndpoint,
+    kind: u8,
+    receipt: &mut ExtendReceipt,
+    deadline: Instant,
+) -> Option<String> {
+    if Instant::now() >= deadline {
+        book.info_return_pending
+            .push_back(InfoReturnPending::Singles(*endpoint));
+        return None;
+    }
+    let before = links.len();
+    let attached = attach_published_return_with(io, targets, entry, links);
+    let retained = links.len() > before;
+    match attached {
+        Err(error) if !retained && crate::attach::is_fd_exhaustion(&error) => {
+            // Descriptors ran out: nothing about this endpoint is
+            // wrong. It stays attached (its usage entry still
+            // records); the return retries from the pending list.
+            receipt.info_return_deferred += 1;
+            book.info_return_pending
+                .push_back(InfoReturnPending::Singles(*endpoint));
+            None
+        }
+        Err(error) => Some(format!("{error:#}")),
+        Ok(()) => {
+            if let Err(error) = io
+                .publish_info_kind(entry.id, kind)
+                .with_context(|| format!("publishing info kind for endpoint {}", entry.id))
+            {
+                return Some(format!("{error:#}"));
+            }
+            None
+        }
+    }
 }
 
 /// Singles: one perf link per entry, each published, attached and checked
@@ -1803,6 +2604,24 @@ fn extend_singles_with<I: InventoryLinkIo>(
             defer_unknown(book, receipt, &delta.endpoints[index + 1..]);
             return;
         }
+        // Keymeta Task 7 (spec §17.4): info endpoints attempt one
+        // return link after their entry linked.
+        if let Some(kind) = entry.info_kind
+            && let Some(reason) = attempt_info_return_singles(
+                io,
+                targets,
+                links,
+                book,
+                endpoint,
+                &entry,
+                kind,
+                receipt,
+                window.deadline,
+            )
+        {
+            book.fail(receipt, endpoint, reason, true);
+            continue;
+        }
         book.attached.insert(entry.id);
         receipt.attached.push(AttachedEndpoint {
             id: endpoint.id,
@@ -1820,10 +2639,226 @@ fn entry_program(abi: p11scope_manifest::elf::ElfAbi) -> &'static str {
     }
 }
 
+/// Keymeta Task 7 (spec §17.4): the info entry program of `abi`.
+fn info_entry_program(abi: p11scope_manifest::elf::ElfAbi) -> &'static str {
+    match abi {
+        p11scope_manifest::elf::ElfAbi::Lp64 => "p11_info_entry_lp64",
+        p11scope_manifest::elf::ElfAbi::Ilp32 => "p11_info_entry_ia32",
+    }
+}
+
+/// Keymeta Task 7 (spec §17.4): info endpoints link the inventory
+/// info entry pair (per ABI); every other endpoint keeps its usage
+/// entry. Cold-only proof at selection time: no journal program
+/// links at an info endpoint in any mode.
+fn entry_program_for(abi: p11scope_manifest::elf::ElfAbi, info_kind: Option<u8>) -> &'static str {
+    if info_kind.is_some() {
+        info_entry_program(abi)
+    } else {
+        entry_program(abi)
+    }
+}
+
 /// A group's key: the local object id and the entry program.
 type GroupKey = (u32, &'static str);
 /// One admitted group member: its endpoint and published entry.
 type GroupMember = (AttachEndpoint, InventoryEndpoint);
+
+/// Keymeta Task 7 Multi info returns (spec §17.4, fix8 I1, N4): an
+/// info entry group attempts its return group (+G return-group
+/// links) inline, before its members mark attached, so every member
+/// still lands in exactly one receipt bucket. The return group
+/// carries its entry group's serial (the `ReturnGroup` variant
+/// distinguishes custody). EMFILE defers the group to the private
+/// pending list with the named counted gap (per group) while the
+/// members attach; deterministic refusals and publication failures
+/// fail disclosed with links retained. Usage groups pass through
+/// untouched. Returns the members to mark attached.
+#[allow(clippy::too_many_arguments)]
+fn attach_info_return_group<I: InventoryLinkIo>(
+    io: &mut I,
+    targets: &InventoryTargets,
+    links: &mut Vec<InventoryLinked<I::Link>>,
+    book: &mut CaptureBook,
+    receipt: &mut ExtendReceipt,
+    object: u32,
+    members: Vec<(AttachEndpoint, InventoryEndpoint)>,
+    entry_serial: u32,
+    deadline: Instant,
+) -> Vec<(AttachEndpoint, InventoryEndpoint)> {
+    let info: Vec<(AttachEndpoint, InventoryEndpoint)> = members
+        .iter()
+        .filter(|(_, entry)| entry.info_kind.is_some())
+        .copied()
+        .collect();
+    if info.is_empty() {
+        return members;
+    }
+    let fail_all = |book: &mut CaptureBook,
+                    receipt: &mut ExtendReceipt,
+                    members: &[(AttachEndpoint, InventoryEndpoint)],
+                    reason: &str| {
+        for (endpoint, _) in members {
+            book.fail(receipt, endpoint, reason.to_string(), true);
+        }
+    };
+    let pending_sites: Vec<PendingReturnSite> = info
+        .iter()
+        .map(|(endpoint, entry)| PendingReturnSite {
+            endpoint: endpoint.id.0,
+            file_offset: entry.file_offset,
+            cookie: (u64::from(p11scope_ebpf_common::INVENTORY_COOKIE_TAG) << 32)
+                | u64::from(entry.id),
+            kind: entry.info_kind.unwrap_or(0),
+        })
+        .collect();
+    if Instant::now() >= deadline {
+        let epoch = book.info_revoked_epoch;
+        book.info_return_pending
+            .push_back(InfoReturnPending::Multi {
+                object: info[0].0.object,
+                sites: pending_sites,
+                entry_serial,
+                validated: 0,
+                validated_epoch: epoch,
+                excluded: [0; 2],
+                staged: Vec::new(),
+                staged_points: Vec::new(),
+            });
+        return members;
+    }
+    // Every failure path below fails the info members and returns
+    // the rest (groups are homogeneous, so that is empty today):
+    // one convention, so no member lands in no receipt bucket.
+    let failures_out = |members: Vec<(AttachEndpoint, InventoryEndpoint)>| {
+        members
+            .into_iter()
+            .filter(|(endpoint, _)| !info.iter().any(|(failed, _)| failed.id == endpoint.id))
+            .collect()
+    };
+    let local = PinnedObjectId(object);
+    if let Err(error) = targets.check_object(local) {
+        fail_all(book, receipt, &info, &format!("{error:#}"));
+        return failures_out(members);
+    }
+    let Some(path) = targets.attach_path(local) else {
+        fail_all(book, receipt, &info, "missing Inventory target pin");
+        return failures_out(members);
+    };
+    let sites: Vec<(u64, u64)> = pending_sites
+        .iter()
+        .map(|site| (site.file_offset, site.cookie))
+        .collect();
+    let started = Instant::now();
+    let attached = io.attach_return_group(InventoryGroupRequest {
+        program: "p11_info_return",
+        path: &path,
+        sites: &sites,
+    });
+    let spent = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    receipt.attach_ns_total = receipt.attach_ns_total.saturating_add(spent);
+    receipt.attach_ns_max = receipt.attach_ns_max.max(spent);
+    let attach = match attached {
+        Ok(attach) => attach,
+        Err(p11scope_bpf_multi::BisectHalt {
+            halt: p11scope_bpf_multi::GroupHalt::Exhausted(_),
+            closed_leaves,
+        }) => {
+            // No return link reached custody; the members stay
+            // attached (their usage entries still record) and the
+            // group retries from the pending list. The capture never
+            // stops: entry groups continue after this one.
+            receipt.halt_closed_links += closed_leaves;
+            receipt.info_return_deferred += 1;
+            let epoch = book.info_revoked_epoch;
+            book.info_return_pending
+                .push_back(InfoReturnPending::Multi {
+                    object: info[0].0.object,
+                    sites: pending_sites,
+                    entry_serial,
+                    validated: 0,
+                    validated_epoch: epoch,
+                    excluded: [0; 2],
+                    staged: Vec::new(),
+                    staged_points: Vec::new(),
+                });
+            return members;
+        }
+        Err(p11scope_bpf_multi::BisectHalt {
+            halt: p11scope_bpf_multi::GroupHalt::Unsupported(error),
+            closed_leaves,
+        }) => {
+            receipt.halt_closed_links += closed_leaves;
+            fail_all(
+                book,
+                receipt,
+                &info,
+                &format!("uretprobe-multi refused by the running kernel: {error}"),
+            );
+            return failures_out(members);
+        }
+    };
+    // The return group carries its entry group's serial (the
+    // `ReturnGroup` variant distinguishes custody): entry serials
+    // are unique, so return groups never share one.
+    let serial = entry_serial;
+    for handle in attach.links {
+        links.push(InventoryLinked {
+            target: InventoryLinkIdentity::ReturnGroup(serial),
+            handle,
+        });
+    }
+    let refused: BTreeMap<usize, std::io::Error> = attach.refused.into_iter().collect();
+    let mut survivors = Vec::with_capacity(info.len());
+    for (index, (endpoint, entry)) in info.iter().enumerate() {
+        if let Some(error) = refused.get(&index) {
+            book.fail(
+                receipt,
+                endpoint,
+                format!(
+                    "attaching Inventory return {} in group {serial}: {error}",
+                    entry.id
+                ),
+                true,
+            );
+            continue;
+        }
+        let kind = entry.info_kind.unwrap_or(0);
+        if let Err(error) = io
+            .publish_info_kind(entry.id, kind)
+            .with_context(|| format!("publishing info kind for endpoint {}", entry.id))
+        {
+            book.fail(receipt, endpoint, format!("{error:#}"), true);
+            continue;
+        }
+        survivors.push((*endpoint, *entry));
+    }
+    if return_group_links(links, serial) > 0 {
+        receipt.groups.push(AttachGroup {
+            serial,
+            object: info[0].0.object,
+            program: "p11_info_return",
+            members: survivors.iter().map(|(endpoint, _)| endpoint.id).collect(),
+            links: return_group_links(links, serial),
+        });
+    }
+    // Usage members (none: groups are homogeneous by program) plus
+    // the info survivors mark attached.
+    let mut out: Vec<(AttachEndpoint, InventoryEndpoint)> = members
+        .into_iter()
+        .filter(|(_, entry)| entry.info_kind.is_none())
+        .collect();
+    out.extend(survivors);
+    out
+}
+
+/// Links held under one return-group serial.
+fn return_group_links<L>(links: &[InventoryLinked<L>], serial: u32) -> usize {
+    links
+        .iter()
+        .filter(|link| link.target == InventoryLinkIdentity::ReturnGroup(serial))
+        .count()
+}
 
 /// Multi: the window's new entries are admitted (published) first, then
 /// attached as one immutable uprobe-multi group per (object, entry
@@ -1881,8 +2916,14 @@ fn extend_groups_with<I: InventoryLinkIo>(
     // member's binding is already published.
     let mut groups: BTreeMap<GroupKey, Vec<GroupMember>> = BTreeMap::new();
     for (endpoint, entry) in admitted {
+        // Keymeta Task 7 (spec §17.4, fix8 I1): the info endpoints
+        // split out of their usage groups into their own groups per
+        // (object, info entry program).
         groups
-            .entry((entry.object.0, entry_program(entry.abi)))
+            .entry((
+                entry.object.0,
+                entry_program_for(entry.abi, entry.info_kind),
+            ))
             .or_default()
             .push((endpoint, entry));
     }
@@ -2075,6 +3116,22 @@ fn extend_groups_with<I: InventoryLinkIo>(
             fail_all(book, receipt, &accepted, &reason, retained);
             defer_members(receipt, &[], &pending);
             return;
+        }
+        // Keymeta Task 7 (spec §17.4): info entry groups attempt
+        // their return group inline, before members mark attached.
+        let accepted = attach_info_return_group(
+            io,
+            targets,
+            links,
+            book,
+            receipt,
+            object,
+            accepted,
+            serial,
+            window.deadline,
+        );
+        if accepted.is_empty() {
+            continue;
         }
         let at_ns = now();
         for (endpoint, entry) in accepted {
@@ -2351,6 +3408,10 @@ impl InventoryCapture {
                     .refused
                     .get_or_insert_with(|| format!("Inventory capture failed: {error}"));
                 defer(&mut receipt, &delta.endpoints);
+                receipt
+                    .deferred
+                    .info_revoked
+                    .extend(delta.info_revoked.iter().copied());
                 receipt.custody = Some(book.custody());
                 return receipt;
             }
@@ -2366,6 +3427,10 @@ impl InventoryCapture {
             if let Some((_, reason)) = &book.custody_lost {
                 receipt.refused = Some(format!("PID custody was lost: {reason}"));
                 defer(&mut receipt, &delta.endpoints);
+                receipt
+                    .deferred
+                    .info_revoked
+                    .extend(delta.info_revoked.iter().copied());
                 return true;
             }
             if let Err(reason) = custody() {
@@ -2373,6 +3438,10 @@ impl InventoryCapture {
                 book.mark_lost(reason.clone());
                 receipt.refused = Some(reason);
                 defer(&mut receipt, &delta.endpoints);
+                receipt
+                    .deferred
+                    .info_revoked
+                    .extend(delta.info_revoked.iter().copied());
                 return true;
             }
             extend_entries_with(
@@ -2557,6 +3626,25 @@ impl InventoryCapture {
         }
     }
 
+    /// Keymeta Task 7 (spec §17.4): up to `window` INFO records.
+    /// Raw 176-byte frames (decoded at staging) plus the
+    /// produced-vs-consumed cross-check snapshot. A malformed frame
+    /// ends its quantum with exact evidence; the derived cross-check
+    /// loss never marks lifecycle loss (provider facts are advisory,
+    /// never custody) — only a full ring's reserve failures ride the
+    /// shared ring-loss counter beside `DISCOVERY` losses.
+    pub(crate) fn service_info(&mut self, window: ReadWindow) -> InfoBatch {
+        match &mut self.state {
+            CaptureState::Active(active) => {
+                service_info_quantum(&mut self.book, window, active.state_mut())
+            }
+            CaptureState::Failed { retiring, .. } => {
+                service_info_quantum(&mut self.book, window, retiring.as_mut())
+            }
+            CaptureState::Prepared(_) | CaptureState::Moving => InfoBatch::empty(self.book.domain),
+        }
+    }
+
     /// Starts owned retirement. Reads stay available and are unsettled.
     /// The count-refresh traversal restarts (baselines kept): the
     /// terminal refresh is then a generation begun after this boundary,
@@ -2630,6 +3718,15 @@ impl RetiringCapture {
         }
     }
 
+    /// True once every link had its close attempt, even while the
+    /// INFO scrub still blocks the ownership transfer.
+    pub(crate) fn detach_completed(&self) -> bool {
+        match &self.inner {
+            RetiringInner::Unactivated(_) => true,
+            RetiringInner::Retiring(retiring) => retiring.detach_completed(),
+        }
+    }
+
     pub(crate) fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
         match &mut self.inner {
             RetiringInner::Unactivated(_) => DiscoveryBatch::empty(self.book.domain),
@@ -2638,6 +3735,18 @@ impl RetiringCapture {
                     let (result, high_water) = retiring.service_discovery(max, deadline, dispatch);
                     (result, retiring.discovery_head_pending(), high_water)
                 })
+            }
+        }
+    }
+
+    /// Keymeta Task 7 (spec §17.4): drain remaining INFO records
+    /// after stop began (the session marks the last quantum of its
+    /// terminal cut, which reports the observed backlog).
+    pub(crate) fn service_info(&mut self, window: ReadWindow) -> InfoBatch {
+        match &mut self.inner {
+            RetiringInner::Unactivated(_) => InfoBatch::empty(self.book.domain),
+            RetiringInner::Retiring(retiring) => {
+                service_info_quantum(&mut self.book, window, retiring.as_mut())
             }
         }
     }
@@ -2668,7 +3777,12 @@ impl RetiringCapture {
     }
 
     /// Transfers the completed retirement, or returns this capture intact.
-    pub(crate) fn try_finish(self) -> std::result::Result<RetiredCapture, Box<Self>> {
+    /// The stop `deadline` bounds the INFO stash scrub's native work:
+    /// nothing starts at or past it.
+    pub(crate) fn try_finish(
+        self,
+        deadline: Instant,
+    ) -> std::result::Result<RetiredCapture, Box<Self>> {
         let Self {
             inner,
             book,
@@ -2682,7 +3796,7 @@ impl RetiringCapture {
                 cleanup: CleanupSummary::default(),
                 failure,
             }),
-            RetiringInner::Retiring(retiring) => match retiring.try_finish() {
+            RetiringInner::Retiring(retiring) => match retiring.try_finish(deadline) {
                 Ok(retired) => {
                     let cleanup = CleanupSummary {
                         attempted: retired.cleanup.attempted,
@@ -2694,6 +3808,8 @@ impl RetiringCapture {
                             .map(|failure| format!("{:?}: {:#}", failure.target, failure.error))
                             .collect(),
                         retained_links: 0,
+                        info_teardown_unproven: retired.cleanup.info_teardown_unproven,
+                        info_scrub_error: retired.cleanup.info_scrub_error.clone(),
                     };
                     let mut retired = RetiredCapture {
                         inner: Some(Box::new(retired)),
@@ -2714,6 +3830,14 @@ impl RetiringCapture {
                     failure,
                 })),
             },
+        }
+    }
+
+    /// The INFO stash teardown outcome for the operator (spec §17.4).
+    pub(crate) fn info_teardown(&self) -> InfoTeardown {
+        match &self.inner {
+            RetiringInner::Unactivated(_) => InfoTeardown::Proven,
+            RetiringInner::Retiring(retiring) => retiring.info_teardown(),
         }
     }
 
@@ -2780,6 +3904,16 @@ impl RetiredCapture {
         }
     }
 
+    /// Keymeta Task 7 (spec §17.4): one INFO quantum for the
+    /// session's terminal cut, which reports the observed backlog
+    /// (never certified loss).
+    pub(crate) fn service_info(&mut self, window: ReadWindow) -> InfoBatch {
+        match self.inner.as_mut() {
+            None => InfoBatch::empty(self.book.domain),
+            Some(inner) => service_info_quantum(&mut self.book, window, inner.state_mut()),
+        }
+    }
+
     pub(crate) fn query_cookie(&self, pin: &PidPin) -> CookieQuery {
         let ebpf = self.inner.as_ref().map(|inner| inner.state().ebpf());
         query_cookie_in(ebpf, self.book.domain, pin)
@@ -2800,6 +3934,139 @@ fn service_with(
     service: impl FnOnce(usize, Instant, Dispatch<'_>) -> ServiceOutcome,
 ) -> DiscoveryBatch {
     service_with_clock(book, window, &mut monotonic_ns, service)
+}
+
+/// Keymeta Task 7 (spec §17.4): one INFO quantum's native
+/// source — the ring dequeue plus the produced counter and the four
+/// evidence cells. Every capture state serves its quanta through
+/// this one trait so the ring+counter window binds them all alike.
+trait InfoQuantumSource {
+    fn dequeue_info(&mut self) -> Result<Option<super::activation::InfoItem>>;
+    fn info_produced(&self) -> Option<Result<u64, String>>;
+    fn info_evidence(&self, deadline: Instant) -> Option<super::activation::InfoEvidenceRead>;
+}
+
+impl InfoQuantumSource for InventoryState {
+    fn dequeue_info(&mut self) -> Result<Option<super::activation::InfoItem>> {
+        InventoryState::dequeue_info(self)
+    }
+    fn info_produced(&self) -> Option<Result<u64, String>> {
+        InventoryState::info_produced(self)
+    }
+    fn info_evidence(&self, deadline: Instant) -> Option<super::activation::InfoEvidenceRead> {
+        InventoryState::info_evidence(self, deadline)
+    }
+}
+
+impl InfoQuantumSource for RetiringInventory {
+    fn dequeue_info(&mut self) -> Result<Option<super::activation::InfoItem>> {
+        RetiringInventory::dequeue_info(self)
+    }
+    fn info_produced(&self) -> Option<Result<u64, String>> {
+        RetiringInventory::info_produced(self)
+    }
+    fn info_evidence(&self, deadline: Instant) -> Option<super::activation::InfoEvidenceRead> {
+        RetiringInventory::info_evidence(self, deadline)
+    }
+}
+
+/// Keymeta Task 7 (spec §17.4): one bounded INFO quantum for every
+/// capture state — the ring drain plus the produced-vs-consumed
+/// cross-check snapshot — through a single ring+counter window.
+/// The window binds the counters as well as the ring: no produced
+/// or evidence lookup starts at or past it, each of the four
+/// evidence cells gating on the window in turn. A skipped counter
+/// or a mid-group yield stages the quantum incomplete (the yielded
+/// group keeps the previous full sample), so the terminal cut
+/// reports the expired window instead of a clean cut over unread
+/// or partially read counters.
+fn service_info_quantum(
+    book: &mut CaptureBook,
+    window: ReadWindow,
+    source: &mut impl InfoQuantumSource,
+) -> InfoBatch {
+    let (records, malformed, failure, ring_complete) =
+        drain_info_quantum(window, || source.dequeue_info());
+    let mut complete = ring_complete;
+    let produced = if Instant::now() >= window.deadline() {
+        complete = false;
+        None
+    } else {
+        source.info_produced()
+    };
+    let evidence = if Instant::now() >= window.deadline() {
+        complete = false;
+        None
+    } else {
+        match source.info_evidence(window.deadline()) {
+            Some(super::activation::InfoEvidenceRead::Done(result)) => Some(result),
+            Some(super::activation::InfoEvidenceRead::Yielded) => {
+                complete = false;
+                None
+            }
+            None => None,
+        }
+    };
+    book.finish_info_quantum(records, malformed, failure, complete, produced, evidence)
+}
+
+/// Keymeta Task 7 (spec §17.4): drain one bounded INFO quantum:
+/// collected records, the malformed frames counted at dequeue, and
+/// a dequeue failure's text. A malformed frame ends the quantum
+/// with exact evidence, like DISCOVERY; any other error — a
+/// ring-read failure, a refused bound — surfaces distinctly with
+/// its cause instead of hiding behind the malformed count.
+fn drain_info_quantum(
+    window: ReadWindow,
+    mut dequeue: impl FnMut() -> Result<Option<super::activation::InfoItem>>,
+) -> (Vec<[u8; 176]>, u64, Option<String>, bool) {
+    let mut records = Vec::new();
+    let mut malformed = 0u64;
+    let result = super::activation::service_inventory_info_with(
+        window.max_rows(),
+        window.deadline(),
+        || match dequeue() {
+            Ok(Some(super::activation::InfoItem::Malformed)) => {
+                malformed = malformed.saturating_add(1);
+                Ok(Some(super::activation::InfoItem::Malformed))
+            }
+            dequeued => dequeued,
+        },
+        |record| {
+            records.push(record);
+            Ok(())
+        },
+    );
+    match result {
+        // Complete only when the service drained to empty: a record
+        // bound or deadline means the ring may still hold records.
+        Ok(service) => (
+            records,
+            malformed,
+            None,
+            !service.record_bound_reached && !service.deadline_reached,
+        ),
+        Err(failure) => {
+            // Dispatch never fails here, so a held-back record is
+            // unexpected: keep it with the failure, like DISCOVERY.
+            // Any error stops the drain early: never complete, even
+            // when malformed frames carry the evidence instead.
+            let held_back = failure.record.is_some();
+            if let Some(record) = failure.record {
+                records.push(*record);
+            }
+            if held_back || malformed == 0 {
+                (
+                    records,
+                    malformed,
+                    Some(format!("{:#}", failure.error)),
+                    false,
+                )
+            } else {
+                (records, malformed, None, false)
+            }
+        }
+    }
 }
 
 /// What one serviced drain reports: its outcome, whether the head was

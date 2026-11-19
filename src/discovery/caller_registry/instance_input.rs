@@ -1727,6 +1727,12 @@ pub(super) struct InstanceState {
     records: BTreeMap<RegistryInstanceId, InstanceRecord>,
     semantics: BTreeMap<RegistryInstanceId, InstanceSemanticRecord>,
     by_key: HashMap<InstanceKey, RegistryInstanceId>,
+    /// Keymeta Task 7 (spec §17.5, INV-2): live instance members
+    /// per (caller, module) pair, maintained with `records` on
+    /// every insert and remove. Attribution probes this map
+    /// directly — one lookup per record — instead of scanning the
+    /// registry per batch. Each instance sits in exactly one set.
+    pairs: BTreeMap<(CallerId, ModuleId), BTreeSet<RegistryInstanceId>>,
     next_id: u32,
     limit: usize,
     occupied: usize,
@@ -1790,6 +1796,7 @@ impl Default for InstanceState {
             records: BTreeMap::new(),
             semantics: BTreeMap::new(),
             by_key: HashMap::new(),
+            pairs: BTreeMap::new(),
             next_id: 0,
             limit: MAX_REGISTRY_INSTANCES,
             occupied: 0,
@@ -1856,6 +1863,22 @@ impl CallerRegistry {
 
     pub(crate) fn instances(&self) -> impl Iterator<Item = &InstanceRecord> {
         self.instance_state.records.values()
+    }
+
+    /// Keymeta Task 7 instance attribution (spec §17.5): the proved
+    /// instance id for one (caller, module) pair — `Some` exactly
+    /// when one live instance for the pair exists. One map probe,
+    /// never a registry scan; duplicates and absences attach
+    /// nothing, never synthesized.
+    pub(crate) fn instance_pair_unique(
+        &self,
+        caller: CallerId,
+        module: ModuleId,
+    ) -> Option<RegistryInstanceId> {
+        match self.instance_state.pairs.get(&(caller, module)) {
+            Some(members) if members.len() == 1 => members.first().copied(),
+            _ => None,
+        }
     }
 
     /// B17 leg-2 inventory projection: every registered instance for one
@@ -3224,6 +3247,18 @@ impl CallerRegistry {
         }
         let record = self.instance_state.records.remove(&id)?;
         self.instance_state.by_key.remove(&record.key);
+        if let Some(members) = self
+            .instance_state
+            .pairs
+            .get_mut(&(record.caller, record.module))
+        {
+            members.remove(&id);
+            if members.is_empty() {
+                self.instance_state
+                    .pairs
+                    .remove(&(record.caller, record.module));
+            }
+        }
         let semantic = self.instance_state.semantics.remove(&id);
         if semantic.as_ref().is_some_and(|row| row.semantics.is_some()) {
             debug_assert!(self.instance_state.occupied > 0);
@@ -3560,6 +3595,11 @@ impl CallerRegistry {
                 last_seen_ns: input.observed_ns,
             },
         );
+        self.instance_state
+            .pairs
+            .entry((input.caller, module))
+            .or_default()
+            .insert(id);
         self.instance_state.semantics.insert(
             id,
             InstanceSemanticRecord {
@@ -7287,5 +7327,166 @@ mod joint_ending_reason_tests {
                 "{label} is snake_case"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pair_uniqueness_tests {
+    use super::super::{CallerId, CallerRegistry, ModuleKey, RegistryLimits};
+    use super::{AdmittedInstance, InstanceKey, RegistryInstanceId};
+    use crate::attach::capture::NativeDomainId;
+    use crate::discovery::instances::InstanceId;
+    use p11scope_ebpf_common::ImageIdentity;
+
+    struct PairScene {
+        registry: CallerRegistry,
+        domain: NativeDomainId,
+        caller: CallerId,
+        module: super::ModuleId,
+        module_key: ModuleKey,
+        next_router: u64,
+        next_id: u32,
+    }
+
+    impl PairScene {
+        fn new() -> Self {
+            let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+            let domain = NativeDomainId::try_mint().expect("fresh domain");
+            let caller = CallerId(7);
+            let module_key = ModuleKey::Physical {
+                dev_major: 1,
+                dev_minor: 2,
+                ino: 3,
+                sha256: None,
+            };
+            let module = registry.scripted_module_edge(module_key.clone(), caller);
+            Self {
+                registry,
+                domain,
+                caller,
+                module,
+                module_key,
+                next_router: 0,
+                next_id: 0,
+            }
+        }
+
+        fn register(&mut self, caller: CallerId) -> RegistryInstanceId {
+            let router = self.next_router;
+            self.next_router += 1;
+            let key = InstanceKey::scripted(
+                self.domain,
+                ImageIdentity {
+                    task_cookie: 100 + router,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(router),
+                self.module_key.clone(),
+            );
+            let id = RegistryInstanceId::from_raw(self.next_id);
+            self.next_id += 1;
+            self.registry
+                .note_instance(AdmittedInstance::scripted(key, caller));
+            self.registry.publish();
+            assert!(
+                self.registry.feed_mode_for_test(id).is_some(),
+                "registration retains instance {id:?}"
+            );
+            id
+        }
+    }
+
+    /// Keymeta Task 7 pair uniqueness (spec §17.5): the
+    /// mutation-maintained pair map attaches exactly the proved
+    /// instance — one member, never zero, never duplicates — and
+    /// tracks registrations and departed folds exactly.
+    #[test]
+    fn instance_pair_unique_tracks_registrations_and_folds() {
+        let mut scene = PairScene::new();
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(scene.caller, scene.module),
+            None,
+            "no instances attach nothing"
+        );
+        let first = scene.register(scene.caller);
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(scene.caller, scene.module),
+            Some(first),
+            "one instance attaches"
+        );
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(CallerId(12), scene.module),
+            None,
+            "other callers do not match"
+        );
+        let second = scene.register(scene.caller);
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(scene.caller, scene.module),
+            None,
+            "two instances synthesize nothing"
+        );
+        scene.registry.take_instance_for_fold(first).unwrap();
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(scene.caller, scene.module),
+            Some(second),
+            "the surviving member reattaches after a fold"
+        );
+        scene.registry.take_instance_for_fold(second).unwrap();
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(scene.caller, scene.module),
+            None,
+            "a folded pair attaches nothing"
+        );
+    }
+
+    /// Keymeta Task 7 pair uniqueness at scale (spec §17.5): a full
+    /// 4096-instance table keeps every pair exact — the crowded
+    /// pair attaches nothing, the lone unique pair attaches its own
+    /// instance, and absent pairs attach nothing. Each query probes
+    /// the pair map once; no query scans the table.
+    #[test]
+    fn instance_pair_unique_stays_exact_at_full_table() {
+        let mut scene = PairScene::new();
+        let other_caller = CallerId(9);
+        scene
+            .registry
+            .scripted_module_edge(scene.module_key.clone(), other_caller);
+        let lone = scene.register(other_caller);
+        for _ in 0..4095 {
+            scene.register(scene.caller);
+        }
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(scene.caller, scene.module),
+            None,
+            "a 4095-member pair attaches nothing"
+        );
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(other_caller, scene.module),
+            Some(lone),
+            "the lone unique pair attaches its instance"
+        );
+        assert_eq!(
+            scene
+                .registry
+                .instance_pair_unique(CallerId(100_000), scene.module),
+            None,
+            "absent pairs attach nothing"
+        );
     }
 }

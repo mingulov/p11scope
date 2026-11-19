@@ -58,7 +58,8 @@ fn inventory_freeze_owner_metadata_matches_both_embedded_flavors() {
 
 fn map_fixture(n: u32) -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
     use InventoryMapKind as K;
-    [
+    #[cfg_attr(feature = "stub-object-attributes", allow(unused_mut))]
+    let mut rows = vec![
         ("CONFIG", K::Array, MapType::Array, 4, 8, 2, 128),
         ("PID_FILTER", K::Hash, MapType::Hash, 4, 8, 1024, 128),
         (
@@ -138,26 +139,59 @@ fn map_fixture(n: u32) -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)>
             3,
             0,
         ),
-    ]
-    .into_iter()
-    .map(
-        |(name, kind, map_type, key_size, value_size, max_entries, flags)| {
-            (
-                name.to_string(),
+    ];
+    // Keymeta Task 7 (spec §17.4): the FULL manifest gains the INFO
+    // rows; the P0 manifest keeps the pre-info set.
+    #[cfg(not(feature = "stub-object-attributes"))]
+    rows.extend([
+        ("INFO_START", K::Hash, MapType::Hash, 16, 32, 1024, 0),
+        (
+            "INFO",
+            K::RingBuf,
+            MapType::RingBuf,
+            0,
+            0,
+            EXPECTED_INVENTORY_INFO_BYTES,
+            0,
+        ),
+        (
+            "INFO_KIND",
+            K::Array,
+            MapType::Array,
+            4,
+            8,
+            n,
+            BPF_F_RDONLY_PROG,
+        ),
+        (
+            "INFO_EVIDENCE",
+            K::PerCpuArray,
+            MapType::PerCpuArray,
+            4,
+            8,
+            4,
+            0,
+        ),
+    ]);
+    rows.into_iter()
+        .map(
+            |(name, kind, map_type, key_size, value_size, max_entries, flags)| {
                 (
-                    kind,
-                    ExactMapMetadata {
-                        map_type,
-                        key_size,
-                        value_size,
-                        max_entries,
-                        flags,
-                    },
-                ),
-            )
-        },
-    )
-    .collect()
+                    name.to_string(),
+                    (
+                        kind,
+                        ExactMapMetadata {
+                            map_type,
+                            key_size,
+                            value_size,
+                            max_entries,
+                            flags,
+                        },
+                    ),
+                )
+            },
+        )
+        .collect()
 }
 
 #[test]
@@ -270,7 +304,9 @@ fn inventory_objects_carry_exactly_the_loader_manifest_maps() {
         ("TASK_COOKIE", MapType::TaskStorage, 4, 8, 0, 1),
         ("COOKIE_CTL", MapType::Array, 4, 40, 1, 0),
     ];
-    let resized = ["USAGE", "ENDPOINT_OBJECT", "CALLER_USE"];
+    // Keymeta Task 7 (spec §17.4): `INFO_KIND` rides the loader's
+    // capacity patch beside `USAGE` (placeholder 1 in the object).
+    let resized = ["USAGE", "ENDPOINT_OBJECT", "CALLER_USE", "INFO_KIND"];
     let manifest = inventory_maps(capacity(576));
     for (flavor, bytes, extra) in [
         ("inventory", crate::EBPF_INVENTORY_OBJECT, &[][..]),
@@ -325,7 +361,9 @@ fn inventory_objects_carry_exactly_the_loader_manifest_maps() {
 
 fn program_fixture() -> BTreeMap<String, InventoryProgramKind> {
     use InventoryProgramKind::*;
-    [
+    // Keymeta Task 7 (spec §17.4): the FULL flavors carry the
+    // inventory info pair (12 → 15); the P0 flavor omits it.
+    let mut programs = vec![
         ("p11_usage_entry_lp64", Entry),
         ("p11_usage_entry_ia32", Entry),
         ("dl_debug_state", Entry),
@@ -338,10 +376,21 @@ fn program_fixture() -> BTreeMap<String, InventoryProgramKind> {
         ("interface_return", Return),
         ("sched_process_exec", RawTracePoint),
         ("sched_process_exit", RawTracePoint),
-    ]
-    .into_iter()
-    .map(|(name, kind)| (name.to_string(), kind))
-    .collect()
+    ];
+    if cfg!(feature = "stub-object-attributes") {
+        assert_eq!(programs.len(), 12);
+    } else {
+        programs.extend([
+            ("p11_info_entry_lp64", Entry),
+            ("p11_info_entry_ia32", Entry),
+            ("p11_info_return", Return),
+        ]);
+        assert_eq!(programs.len(), 15);
+    }
+    programs
+        .into_iter()
+        .map(|(name, kind)| (name.to_string(), kind))
+        .collect()
 }
 
 #[test]
@@ -442,8 +491,11 @@ fn inventory_embedded_program_sections_preserve_entry_return_and_raw_tracepoint_
     assert_eq!(actual, program_fixture());
 }
 
+/// Keymeta Task 7 (spec §17.4): Multi load extends to the info
+/// entries and the info return beside the two ordinary usage
+/// entries; the lifecycle roots stay plain.
 #[test]
-fn inventory_multi_load_is_confined_to_the_two_ordinary_usage_entries() {
+fn inventory_multi_load_is_confined_to_the_usage_entries_and_the_info_pair() {
     use InventoryProgramLoad::*;
     for name in program_fixture().keys() {
         let expected_single = if name.starts_with("sched_process_") {
@@ -452,7 +504,11 @@ fn inventory_multi_load_is_confined_to_the_two_ordinary_usage_entries() {
             UProbe
         };
         let expected_multi = match name.as_str() {
-            "p11_usage_entry_lp64" | "p11_usage_entry_ia32" => UProbeMulti,
+            "p11_usage_entry_lp64"
+            | "p11_usage_entry_ia32"
+            | "p11_info_entry_lp64"
+            | "p11_info_entry_ia32"
+            | "p11_info_return" => UProbeMulti,
             "sched_process_exec" | "sched_process_exit" => RawTracePoint,
             _ => UProbe,
         };
@@ -537,7 +593,10 @@ fn preparation_steps(backend: AttachBackend) -> Vec<InventoryPreparation> {
     } else {
         UProbe
     };
-    vec![
+    // Keymeta Task 7 (spec §17.4): the FULL flavors load the info
+    // pair beside the usage entries; the freeze sequence gains
+    // nothing (admission-published maps are never frozen).
+    let mut steps = vec![
         LoadObject,
         ValidateMaps,
         ValidatePrograms,
@@ -561,6 +620,17 @@ fn preparation_steps(backend: AttachBackend) -> Vec<InventoryPreparation> {
         LoadProgram("interface_list_return", UProbe),
         LoadProgram("interface_list_worker", UProbe),
         LoadProgram("interface_return", UProbe),
+    ];
+    if cfg!(feature = "stub-object-attributes") {
+        assert_eq!(program_fixture().len(), 12);
+    } else {
+        steps.extend([
+            LoadProgram("p11_info_entry_ia32", usage),
+            LoadProgram("p11_info_entry_lp64", usage),
+            LoadProgram("p11_info_return", usage),
+        ]);
+    }
+    steps.extend([
         LoadProgram("p11_usage_entry_ia32", usage),
         LoadProgram("p11_usage_entry_lp64", usage),
         LoadProgram("sched_process_exec", RawTracePoint),
@@ -569,7 +639,8 @@ fn preparation_steps(backend: AttachBackend) -> Vec<InventoryPreparation> {
         PublishTailCalls,
         RetainDiscovery,
         RecheckCustody,
-    ]
+    ]);
+    steps
 }
 
 #[derive(Debug)]
@@ -688,4 +759,199 @@ fn object_checker_multi_loaded_programs_match_the_loaders() {
         );
     }
     assert_eq!(pinned, loaders);
+}
+
+/// Keymeta Task 7 (spec §17.4): the FULL inventory flavors carry the
+/// inventory info pair beside the usage entries (12 → 15); the P0
+/// flavor omits the info programs (exact 12-program list). RED-a: the
+/// FULL object still lists 12.
+#[test]
+fn inventory_full_program_shape_carries_the_info_pair() {
+    use InventoryProgramKind::*;
+    let mut expected = program_fixture();
+    if cfg!(feature = "stub-object-attributes") {
+        assert_eq!(expected.len(), 12, "the P0 flavor omits the info pair");
+    } else {
+        expected.insert("p11_info_entry_lp64".to_string(), Entry);
+        expected.insert("p11_info_entry_ia32".to_string(), Entry);
+        expected.insert("p11_info_return".to_string(), Return);
+        assert_eq!(expected.len(), 15);
+    }
+    validate_inventory_programs(&expected).unwrap();
+}
+
+/// Keymeta Task 7 (spec §17.4): the FULL inventory manifest gains the
+/// `INFO_START` stash, the `INFO` ring, the `INFO_KIND` publication
+/// and the `INFO_EVIDENCE` cells, and `PRODUCED` grows 2 → 3. RED-a:
+/// the manifest still lists the pre-info set.
+#[test]
+fn inventory_full_map_manifest_carries_the_info_ring_and_stash() {
+    use InventoryMapKind as K;
+    let manifest = inventory_maps(capacity(576));
+    if cfg!(feature = "stub-object-attributes") {
+        for absent in ["INFO_START", "INFO", "INFO_KIND", "INFO_EVIDENCE"] {
+            assert!(
+                !manifest.contains_key(absent),
+                "the P0 flavor omits {absent}"
+            );
+        }
+        return;
+    }
+    let produced = manifest.get("PRODUCED").expect("PRODUCED row");
+    assert_eq!(produced.1.max_entries, 3, "PRODUCED counts the INFO ring");
+    for (name, kind, map_type, key_size, value_size, max_entries, flags) in [
+        ("INFO_START", K::Hash, MapType::Hash, 16, 32, 1024, 0),
+        ("INFO", K::RingBuf, MapType::RingBuf, 0, 0, 64 * 1024, 0),
+        (
+            "INFO_KIND",
+            K::Array,
+            MapType::Array,
+            4,
+            8,
+            576,
+            BPF_F_RDONLY_PROG,
+        ),
+        (
+            "INFO_EVIDENCE",
+            K::PerCpuArray,
+            MapType::PerCpuArray,
+            4,
+            8,
+            4,
+            0,
+        ),
+    ] {
+        let (actual_kind, actual) = manifest.get(name).unwrap_or_else(|| panic!("{name} row"));
+        assert_eq!(*actual_kind, kind, "{name} kind");
+        assert_eq!(actual.map_type, map_type, "{name} type");
+        assert_eq!(actual.key_size, key_size, "{name} key");
+        assert_eq!(actual.value_size, value_size, "{name} value");
+        assert_eq!(actual.max_entries, max_entries, "{name} entries");
+        assert_eq!(actual.flags, flags, "{name} flags");
+    }
+}
+
+/// Keymeta Task 7 `INFO_KIND` publication (spec §17.4, fix9 R1): the
+/// endpoint→kind cell is written once with the kind in the low byte
+/// and read back; re-publication, a nonzero cell, kind zero and a
+/// readback mismatch all refuse. Follows the `ENDPOINT_OBJECT`
+/// precedent; the map is never frozen.
+#[test]
+fn info_kind_publication_writes_once_and_reads_back() {
+    use p11scope_ebpf_common::inventory_info::INFO_KIND_PROVIDER;
+    struct Cells {
+        cells: BTreeMap<u32, u64>,
+        corrupt_readback: bool,
+    }
+    impl super::InfoKindIo for Cells {
+        fn read_kind(&mut self, endpoint: u32) -> Result<u64> {
+            let value = self.cells.get(&endpoint).copied().unwrap_or(0);
+            Ok(if self.corrupt_readback {
+                value ^ 0xFF
+            } else {
+                value
+            })
+        }
+        fn write_kind(&mut self, endpoint: u32, value: u64) -> Result<()> {
+            self.cells.insert(endpoint, value);
+            Ok(())
+        }
+    }
+    let mut io = Cells {
+        cells: BTreeMap::new(),
+        corrupt_readback: false,
+    };
+    super::publish_info_kind_with(&mut io, 7, INFO_KIND_PROVIDER).unwrap();
+    assert_eq!(io.cells.get(&7), Some(&1));
+    assert!(super::publish_info_kind_with(&mut io, 7, INFO_KIND_PROVIDER).is_err());
+    assert!(super::publish_info_kind_with(&mut io, 9, 0).is_err());
+    io.cells.insert(11, 2);
+    assert!(super::publish_info_kind_with(&mut io, 11, INFO_KIND_PROVIDER).is_err());
+    io.corrupt_readback = true;
+    assert!(super::publish_info_kind_with(&mut io, 13, INFO_KIND_PROVIDER).is_err());
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): the
+/// deadline gates every map operation, not just the cell
+/// transaction — when the initial lookup itself reaches the
+/// deadline, the zero-write must not start, and the next extend
+/// resumes at the write without redoing the read.
+#[test]
+fn revoke_step_yields_when_the_initial_lookup_reaches_the_deadline() {
+    use std::time::{Duration, Instant};
+    struct Cells {
+        cells: BTreeMap<u32, u64>,
+        clock: Rc<Cell<Instant>>,
+        past: Instant,
+        reads: usize,
+        writes: usize,
+    }
+    impl super::InfoKindIo for Cells {
+        fn read_kind(&mut self, endpoint: u32) -> Result<u64> {
+            self.reads += 1;
+            // The lookup itself consumes the window: the clock reads
+            // past the deadline from here on.
+            self.clock.set(self.past);
+            Ok(self.cells.get(&endpoint).copied().unwrap_or(0))
+        }
+        fn write_kind(&mut self, endpoint: u32, value: u64) -> Result<()> {
+            self.writes += 1;
+            self.cells.insert(endpoint, value);
+            Ok(())
+        }
+    }
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(30);
+    let past = deadline + Duration::from_secs(1);
+    let clock = Rc::new(Cell::new(start));
+    let mut io = Cells {
+        cells: BTreeMap::from([(7u32, 1u64)]),
+        clock: Rc::clone(&clock),
+        past,
+        reads: 0,
+        writes: 0,
+    };
+    let mut now = || clock.get();
+    let outcome = super::revoke_info_kind_step(
+        &mut io,
+        7,
+        super::RevokeSubstep::ReadInitial,
+        deadline,
+        &mut now,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        super::RevokeStepOutcome::Yielded {
+            next: super::RevokeSubstep::WriteZero
+        },
+        "the crossed deadline yields at the pending write"
+    );
+    assert_eq!(io.reads, 1, "the initial lookup ran");
+    assert_eq!(io.writes, 0, "no zero-write starts past the deadline");
+    assert_eq!(io.cells.get(&7), Some(&1), "the cell keeps its kind");
+    // The next extend resumes at the write: one write plus its
+    // read-back, and no second initial read.
+    clock.set(start);
+    let (reads_before, writes_before) = (io.reads, io.writes);
+    let outcome = super::revoke_info_kind_step(
+        &mut io,
+        7,
+        super::RevokeSubstep::WriteZero,
+        deadline,
+        &mut now,
+    )
+    .unwrap();
+    assert_eq!(outcome, super::RevokeStepOutcome::Done);
+    assert_eq!(
+        io.reads - reads_before,
+        1,
+        "the resume reads back once and redoes no finished read"
+    );
+    assert_eq!(
+        io.writes - writes_before,
+        1,
+        "the resume writes the cell once"
+    );
+    assert_eq!(io.cells.get(&7), Some(&0), "the cell clears");
 }

@@ -137,7 +137,7 @@ fn stop(capture: InventoryCapture) -> Result<RetiredCapture> {
         std::thread::sleep(Duration::from_millis(1));
     }
     retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("completed retirement did not transfer"))
 }
 
@@ -957,7 +957,7 @@ fn privileged_inventory_capture_stop_with_held_call_reports_unsettled_lp64() -> 
         std::thread::sleep(Duration::from_millis(1));
     }
     let mut retired = retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("completed retirement did not transfer"))?;
     ensure!(
         retired.cleanup().attempted == 6
@@ -1291,7 +1291,7 @@ fn privileged_inventory_capture_stop_before_activation_repolls_custody_lp64() ->
         second.custody_proven_ns
     );
     let mut retired = retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("an unactivated capture retires at once"))?;
     target.kill()?;
     target.wait()?;

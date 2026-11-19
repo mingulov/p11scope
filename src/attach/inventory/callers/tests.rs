@@ -60,7 +60,8 @@ fn caller_budget_rejects_missing_or_surplus_additional_payload() {
 
 fn map_fixture() -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
     use InventoryMapKind as K;
-    [
+    #[cfg_attr(feature = "stub-object-attributes", allow(unused_mut))]
+    let mut rows = vec![
         ("CONFIG", K::Array, MapType::Array, 4, 8, 2, 128),
         ("PID_FILTER", K::Hash, MapType::Hash, 4, 8, 1024, 128),
         (
@@ -163,26 +164,51 @@ fn map_fixture() -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
         ("COOKIE_CTL", K::Array, MapType::Array, 4, 40, 1, 0),
         ("INV_BASELINE_RQ", K::Hash, MapType::Hash, 4, 16, 1024, 129),
         ("INV_BASELINE_CT", K::Array, MapType::Array, 4, 56, 1, 0),
-    ]
-    .into_iter()
-    .map(
-        |(name, kind, map_type, key_size, value_size, max_entries, flags)| {
-            (
-                name.to_owned(),
+    ];
+    // Keymeta Task 7 (spec §17.4): the FULL manifest gains the INFO
+    // rows; the P0 manifest keeps the pre-info set.
+    #[cfg(not(feature = "stub-object-attributes"))]
+    rows.extend([
+        ("INFO_START", K::Hash, MapType::Hash, 16, 32, 1024, 0),
+        (
+            "INFO",
+            K::RingBuf,
+            MapType::RingBuf,
+            0,
+            0,
+            super::super::EXPECTED_INVENTORY_INFO_BYTES,
+            0,
+        ),
+        ("INFO_KIND", K::Array, MapType::Array, 4, 8, 3, 128),
+        (
+            "INFO_EVIDENCE",
+            K::PerCpuArray,
+            MapType::PerCpuArray,
+            4,
+            8,
+            4,
+            0,
+        ),
+    ]);
+    rows.into_iter()
+        .map(
+            |(name, kind, map_type, key_size, value_size, max_entries, flags)| {
                 (
-                    kind,
-                    ExactMapMetadata {
-                        map_type,
-                        key_size,
-                        value_size,
-                        max_entries,
-                        flags,
-                    },
-                ),
-            )
-        },
-    )
-    .collect()
+                    name.to_owned(),
+                    (
+                        kind,
+                        ExactMapMetadata {
+                            map_type,
+                            key_size,
+                            value_size,
+                            max_entries,
+                            flags,
+                        },
+                    ),
+                )
+            },
+        )
+        .collect()
 }
 
 #[test]
@@ -315,12 +341,19 @@ fn caller_preparation_initializes_and_freezes_native_maps_before_loading_any_pro
         !observed.contains(&Freeze("ENDPOINT_OBJECT")),
         "endpoint bindings do not exist during preparation"
     );
+    // Keymeta Task 7 (spec §17.4): the FULL flavors load the info
+    // pair (12 → 15); the P0 flavor omits it.
+    let expected_programs = if cfg!(feature = "stub-object-attributes") {
+        12
+    } else {
+        15
+    };
     assert_eq!(
         observed
             .iter()
             .filter(|step| matches!(step, LoadProgram(_, _)))
             .count(),
-        12
+        expected_programs
     );
     assert!(position(RetainDiscovery) < position(RecheckCustody));
 }

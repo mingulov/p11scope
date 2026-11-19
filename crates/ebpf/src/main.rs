@@ -54,6 +54,11 @@ mod journal_roots;
 mod inventory;
 #[cfg(feature = "inventory-callers")]
 mod inventory_callers;
+// Keymeta Task 7 (spec §17.4): the inventory info pair rides the
+// FULL inventory flavors; the P0 inventory flavor omits it (exact
+// 12-program list), so P0 acquires no info bytes.
+#[cfg(all(feature = "inventory-only", not(feature = "stub-object-attributes")))]
+mod inventory_info;
 
 use aya_ebpf::bindings::{BPF_F_MMAPABLE, BPF_F_RDONLY_PROG};
 use aya_ebpf::macros::{map, raw_tracepoint, uprobe, uretprobe};

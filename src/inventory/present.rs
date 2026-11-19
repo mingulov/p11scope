@@ -843,6 +843,10 @@ impl Presentation {
         }
         let mut module_ids: Vec<ModuleId> = registry.modules().map(|module| module.id).collect();
         module_ids.sort();
+        // Keymeta Task 7 (spec §17.5): the INFO drain's join
+        // projection — per-module provider facts plus the run-wide
+        // token/mechanism rows and gaps.
+        let (provider_infos, provider_observations) = coordinator.provider_info_snapshot();
         let mut modules = Vec::with_capacity(module_ids.len());
         for id in &module_ids {
             let record = registry
@@ -879,9 +883,7 @@ impl Presentation {
                 departed_use: record.departed_use.clone(),
                 init: ModuleInitView::capture(registry, *id),
                 operator_forwarding: false,
-                // TODO(Task 7 BPF half): fill from the INFO drain's
-                // join once the inventory session drains INFO records.
-                provider_info: None,
+                provider_info: provider_infos.get(id).cloned(),
             });
         }
         let mut edge_keys: Vec<(CallerId, ModuleId)> = registry
@@ -1159,9 +1161,8 @@ impl Presentation {
                 let diagnosis = coordinator.joint_audit_subject_diagnosis();
                 (!diagnosis.is_empty()).then_some(diagnosis)
             },
-            // TODO(Task 7 BPF half): fill from the INFO drain's join
-            // once the inventory session drains INFO records.
-            provider_observations: None,
+            provider_observations: (!provider_observations.is_empty())
+                .then_some(provider_observations),
         })
     }
 

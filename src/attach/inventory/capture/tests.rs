@@ -87,12 +87,24 @@ enum Op {
     Attach(u32),
     /// One uprobe-multi link over these endpoint IDs (Multi).
     Group(&'static str, Vec<u32>),
+    /// One info return link over this endpoint (Singles).
+    Return(u32),
+    /// One info kind publication (endpoint, kind).
+    PublishInfoKind(u32, u8),
+    /// One info kind revocation attempt (endpoint).
+    RevokeInfoKind(u32),
+    /// One INFO_KIND cell read inside a revocation attempt.
+    ReadInfoKindCell(u32),
+    /// One INFO_KIND cell write inside a revocation attempt.
+    WriteInfoKindCell(u32, u64),
 }
 
 #[derive(Default)]
 struct Log {
     ops: Vec<Op>,
     live: usize,
+    /// The entry program each endpoint ID attached (Singles).
+    programs: BTreeMap<u32, &'static str>,
 }
 
 struct FakeLink {
@@ -114,6 +126,21 @@ struct FakeIo {
     poison: BTreeSet<u32>,
     /// attach() fails with EMFILE (no link) for these endpoint IDs.
     emfile: BTreeSet<u32>,
+    /// Info return attaches fail with EMFILE (no link) for these
+    /// endpoint IDs; entries are unaffected.
+    emfile_returns: BTreeSet<u32>,
+    /// Info return attaches fail deterministically (no link, no
+    /// EMFILE) for these endpoint IDs; entries are unaffected.
+    refuse_returns: BTreeSet<u32>,
+    /// Info kind revocations fail for these endpoint IDs (the cell
+    /// keeps its kind and the write retries on the next extend).
+    fail_revokes: BTreeSet<u32>,
+    /// Info kind revocation reads sleep past a tight window for
+    /// these endpoint IDs (the lookup crosses the extend deadline).
+    slow_revoke_reads: BTreeSet<u32>,
+    /// The scripted INFO_KIND cells publications write and
+    /// revocations clear (absent reads zero, like the map).
+    revoke_cells: BTreeMap<u32, u64>,
     /// attach_entry_group() halts as an unsupported kernel would.
     unsupported: bool,
     /// Leaf links an EMFILE halt creates (as a bisect would, after a
@@ -144,9 +171,12 @@ impl InventoryLinkIo for FakeIo {
     }
 
     fn attach(&mut self, request: InventoryAttachRequest<'_>) -> Result<Self::Link> {
-        let id = match request {
-            InventoryAttachRequest::Entry { cookie, .. } => entry_id(cookie),
-            InventoryAttachRequest::Lifecycle { .. } => u32::MAX,
+        let (id, program, is_return) = match request {
+            InventoryAttachRequest::Entry {
+                cookie, program, ..
+            } => (entry_id(cookie), Some(program), false),
+            InventoryAttachRequest::Return { cookie, .. } => (entry_id(cookie), None, true),
+            InventoryAttachRequest::Lifecycle { .. } => (u32::MAX, None, false),
         };
         if self.refuse.contains(&id) {
             bail!("kernel refused entry {id}");
@@ -157,8 +187,24 @@ impl InventoryLinkIo for FakeIo {
                     .context(format!("perf_event_open for entry {id}")),
             );
         }
+        if is_return && self.emfile_returns.contains(&id) {
+            return Err(
+                anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EMFILE))
+                    .context(format!("perf_event_open for return {id}")),
+            );
+        }
+        if is_return && self.refuse_returns.contains(&id) {
+            bail!("kernel refused return {id}");
+        }
         let mut log = self.log.lock().unwrap();
-        log.ops.push(Op::Attach(id));
+        if is_return {
+            log.ops.push(Op::Return(id));
+        } else {
+            log.ops.push(Op::Attach(id));
+        }
+        if let Some(program) = program {
+            log.programs.insert(id, program);
+        }
         log.live += 1;
         Ok((
             FakeLink {
@@ -166,6 +212,71 @@ impl InventoryLinkIo for FakeIo {
             },
             id,
         ))
+    }
+
+    fn publish_info_kind(&mut self, endpoint: u32, kind: u8) -> Result<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .ops
+            .push(Op::PublishInfoKind(endpoint, kind));
+        self.revoke_cells.insert(endpoint, u64::from(kind));
+        Ok(())
+    }
+
+    fn revoke_info_kind(
+        &mut self,
+        endpoint: u32,
+        resume: super::super::RevokeSubstep,
+        deadline: Instant,
+        now: &mut dyn FnMut() -> Instant,
+    ) -> Result<super::super::RevokeStepOutcome> {
+        self.log
+            .lock()
+            .unwrap()
+            .ops
+            .push(Op::RevokeInfoKind(endpoint));
+        struct Cells<'a> {
+            cells: &'a mut BTreeMap<u32, u64>,
+            log: std::sync::Arc<std::sync::Mutex<Log>>,
+            fail: &'a BTreeSet<u32>,
+            slow: &'a BTreeSet<u32>,
+        }
+        impl super::super::InfoKindIo for Cells<'_> {
+            fn read_kind(&mut self, endpoint: u32) -> Result<u64> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .ops
+                    .push(Op::ReadInfoKindCell(endpoint));
+                if self.slow.contains(&endpoint) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                if self.fail.contains(&endpoint) {
+                    bail!("injected info kind revoke fault on {endpoint}");
+                }
+                Ok(self.cells.get(&endpoint).copied().unwrap_or(0))
+            }
+            fn write_kind(&mut self, endpoint: u32, value: u64) -> Result<()> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .ops
+                    .push(Op::WriteInfoKindCell(endpoint, value));
+                if self.fail.contains(&endpoint) {
+                    bail!("injected info kind revoke fault on {endpoint}");
+                }
+                self.cells.insert(endpoint, value);
+                Ok(())
+            }
+        }
+        let mut cells = Cells {
+            cells: &mut self.revoke_cells,
+            log: std::sync::Arc::clone(&self.log),
+            fail: &self.fail_revokes,
+            slow: &self.slow_revoke_reads,
+        };
+        super::super::revoke_info_kind_step(&mut cells, endpoint, resume, deadline, now)
     }
 
     fn detach(&mut self, _link: &mut Self::Link) -> Result<()> {
@@ -242,6 +353,61 @@ impl InventoryLinkIo for FakeIo {
             .copied()
             .filter(|id| !self.refuse.contains(id))
             .collect();
+        let mut links = Vec::new();
+        if let Some(first) = accepted.first().copied() {
+            let mut log = self.log.lock().unwrap();
+            log.ops.push(Op::Group(request.program, accepted));
+            log.live += 1;
+            links.push((
+                FakeLink {
+                    log: self.log.clone(),
+                },
+                first,
+            ));
+        }
+        Ok(super::super::activation::InventoryGroupAttach { links, refused })
+    }
+
+    /// Info return groups mirror entry groups; EMFILE is driven by
+    /// `emfile_returns`, and deterministic per-site refusals by
+    /// `refuse` or `refuse_returns`, so entries and returns fail
+    /// independently.
+    fn attach_return_group(
+        &mut self,
+        request: InventoryGroupRequest<'_>,
+    ) -> std::result::Result<
+        super::super::activation::InventoryGroupAttach<Self::Link>,
+        p11scope_bpf_multi::BisectHalt,
+    > {
+        let ids: Vec<u32> = request
+            .sites
+            .iter()
+            .map(|(_, cookie)| entry_id(*cookie))
+            .collect();
+        if self.unsupported {
+            return Err(p11scope_bpf_multi::BisectHalt {
+                halt: p11scope_bpf_multi::GroupHalt::Unsupported(
+                    std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+                ),
+                closed_leaves: 0,
+            });
+        }
+        if ids.iter().any(|id| self.emfile_returns.contains(id)) {
+            return Err(p11scope_bpf_multi::BisectHalt {
+                halt: p11scope_bpf_multi::GroupHalt::Exhausted(std::io::Error::from_raw_os_error(
+                    libc::EMFILE,
+                )),
+                closed_leaves: 0,
+            });
+        }
+        let refused_site = |id: &u32| self.refuse.contains(id) || self.refuse_returns.contains(id);
+        let refused: Vec<(usize, std::io::Error)> = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| refused_site(id))
+            .map(|(index, _)| (index, std::io::Error::from_raw_os_error(libc::EINVAL)))
+            .collect();
+        let accepted: Vec<u32> = ids.iter().copied().filter(|id| !refused_site(id)).collect();
         let mut links = Vec::new();
         if let Some(first) = accepted.first().copied() {
             let mut log = self.log.lock().unwrap();
@@ -374,7 +540,13 @@ impl Harness {
             .into_iter()
             .filter_map(|op| match op {
                 Op::Attach(id) => Some(id),
-                Op::Publish(..) | Op::Group(..) => None,
+                Op::Publish(..)
+                | Op::Group(..)
+                | Op::Return(_)
+                | Op::PublishInfoKind(..)
+                | Op::RevokeInfoKind(_)
+                | Op::ReadInfoKindCell(_)
+                | Op::WriteInfoKindCell(..) => None,
             })
             .collect()
     }
@@ -481,6 +653,7 @@ fn a_mid_extend_failure_keeps_link_custody_and_other_endpoints_active() {
         TargetDelta {
             endpoints: fixture.set.endpoints().copied().collect(),
             objects: vec![],
+            info_revoked: vec![],
         },
         &fixture.set,
     );
@@ -1381,6 +1554,7 @@ fn an_older_deferred_backlog_attaches_after_a_newer_delta() {
         object: PinnedObjectId(0),
         file_offset: 0,
         abi: p11scope_manifest::elf::ElfAbi::Lp64,
+        info_kind: None,
     };
     let error = harness.targets.record_entry(again).unwrap_err();
     assert!(
@@ -1465,8 +1639,9 @@ fn an_emfile_attach_stops_the_window_defers_and_retries_without_republishing() {
 
 #[test]
 fn the_fd_preflight_refuses_a_named_fds_capacity() {
-    // N + 2 roots + DISCOVERY + reserve must fit the free soft limit.
-    let need = 128 + 3 + FD_RESERVE;
+    // N + 2 roots + DISCOVERY + INFO + reserve must fit the free
+    // soft limit (keymeta Task 7, spec §17.4 N4).
+    let need = 128 + 4 + FD_RESERVE;
     assert!(fd_preflight(AttachBackend::Singles, 128, need + 10, 10).is_ok());
     let refused = fd_preflight(AttachBackend::Singles, 128, need + 10, 11).unwrap_err();
     assert_eq!(refused.resource, FD_RESOURCE);
@@ -2361,6 +2536,7 @@ fn a_multi_extend_attaches_one_group_per_object_after_publishing_every_member() 
     let mut both = TargetDelta {
         endpoints: fixture.set.endpoints().copied().collect(),
         objects: vec![],
+        info_revoked: vec![],
     };
     assert_eq!(delta_ids(&both), [0, 1, 2, 3, 4]);
     let mut harness = Harness::multi(64, None);
@@ -2446,6 +2622,7 @@ fn a_later_multi_extend_adds_a_new_group_and_never_touches_an_existing_one() {
     let all = TargetDelta {
         endpoints: fixture.set.endpoints().copied().collect(),
         objects: vec![],
+        info_revoked: vec![],
     };
     let receipt = harness.extend(all, &fixture.set);
     assert!(receipt.attached.is_empty() && receipt.groups.is_empty());
@@ -2996,8 +3173,10 @@ fn a_multi_extend_honours_the_window_and_defers_the_rest_unpublished() {
 #[test]
 fn the_multi_fd_preflight_needs_the_group_bound_not_n() {
     for n in [4096, 8192] {
-        let singles = n + 3 + FD_RESERVE;
-        let multi = MULTI_LINK_BOUND + 3 + FD_RESERVE;
+        // Keymeta Task 7 (spec §17.4 N4): entry links + 4 (2 roots +
+        // DISCOVERY + INFO) + reserve; info returns stay excluded.
+        let singles = n + 4 + FD_RESERVE;
+        let multi = MULTI_LINK_BOUND + 4 + FD_RESERVE;
         assert!(fd_preflight(AttachBackend::Singles, n, singles, 0).is_ok());
         assert!(fd_preflight(AttachBackend::Singles, n, singles - 1, 0).is_err());
         assert!(fd_preflight(AttachBackend::Multi, n, singles - 1, 0).is_ok());
@@ -3016,7 +3195,7 @@ fn the_multi_fd_preflight_needs_the_group_bound_not_n() {
             assert!(fd_preflight(backend, n, needed + 10, 11).is_err());
         }
         if n == 8192 {
-            assert_eq!((singles, multi), (8259, 1091));
+            assert_eq!((singles, multi), (8260, 1092));
         }
     }
     // A small N bounds Multi too.
@@ -3827,5 +4006,1724 @@ fn a_refresh_value_naming_an_unpublished_or_rebound_endpoint_is_integrity() {
     assert!(
         reread.integrity.iter().all(|row| row.value.is_some()),
         "the corrupt values stay as evidence"
+    );
+}
+
+/// Keymeta Task 7 (spec §17.4, N4): the descriptor preflight grows
+/// from entry links + 3 + 64 to entry links + 4 + 64 (2 roots,
+/// DISCOVERY and INFO rings); info returns stay excluded from the
+/// hard preflight. RED-a: the preflight still counts 3.
+#[test]
+fn fd_preflight_counts_two_roots_plus_two_rings() {
+    // Singles N=4096: 4096 + 4 + 64 = 4164.
+    assert!(
+        fd_preflight(AttachBackend::Singles, 4096, 4164 + 100, 100).is_ok(),
+        "4096 entries fit in 4164 free descriptors"
+    );
+    assert!(
+        fd_preflight(AttachBackend::Singles, 4096, 4163 + 100, 100).is_err(),
+        "4096 entries refuse 4163 free descriptors"
+    );
+}
+
+/// One named-entries pass over a fresh provider: entries are
+/// (function name, file offset) pairs, so info endpoints absorb
+/// with their kinds. Scan-only entries lower as `unknown` names (a
+/// positional guess, never presented); the names below stand in for
+/// the operator-authorized claim a manifest-backed lowering would
+/// produce, which is exactly the input `absorb` reads.
+fn absorb_named(
+    fixture: &mut SetFixture,
+    name: &str,
+    entries: &[(&'static str, u64)],
+) -> TargetDelta {
+    let path = fx::provider(&fixture.dir, name, &format!("provider-{name}"));
+    fixture.paths.push(path);
+    let files: Vec<(&std::path::Path, String)> = fixture
+        .paths
+        .iter()
+        .map(|path| (path.as_path(), format!("sha-{}", path.display())))
+        .collect();
+    let borrowed: Vec<(&std::path::Path, &str)> = files
+        .iter()
+        .map(|(path, sha)| (*path, sha.as_str()))
+        .collect();
+    let pins = fx::pass_pins(&borrowed);
+    let offsets: Vec<u64> = entries.iter().map(|(_, offset)| *offset).collect();
+    let scanned = fx::module(&pins, fixture.paths.last().unwrap(), &offsets);
+    let mut plan = fx::lower_named(
+        &[scanned],
+        &pins,
+        AdmissionPolicy::Inventory(fixture.set.budget()),
+    );
+    for index in 0..plan.slots.len() {
+        if !plan.is_active(index as u32) {
+            continue;
+        }
+        let offset = plan.slots[index].file_offset;
+        if let Some((entry_name, _)) = entries.iter().find(|(_, want)| *want == offset) {
+            plan.slots[index].names = vec![entry_name.to_string()];
+        }
+    }
+    fixture.set.absorb(&plan, &pins).delta
+}
+
+/// Keymeta Task 7 (spec §17.4): info endpoints link the inventory
+/// info entry pair (per ABI); every other endpoint keeps its usage
+/// entry. Cold-only proof at selection time.
+#[test]
+fn info_entry_selection_pins_the_cold_pair() {
+    use p11scope_manifest::elf::ElfAbi;
+    assert_eq!(
+        entry_program_for(ElfAbi::Lp64, None),
+        "p11_usage_entry_lp64"
+    );
+    assert_eq!(
+        entry_program_for(ElfAbi::Ilp32, None),
+        "p11_usage_entry_ia32"
+    );
+    for kind in [1, 2, 3] {
+        assert_eq!(
+            entry_program_for(ElfAbi::Lp64, Some(kind)),
+            "p11_info_entry_lp64",
+            "kind {kind}"
+        );
+        assert_eq!(
+            entry_program_for(ElfAbi::Ilp32, Some(kind)),
+            "p11_info_entry_ia32",
+            "kind {kind}"
+        );
+    }
+}
+
+/// Keymeta Task 7 Singles routing (spec §17.4, fix8 I1): the info
+/// entries substitute usage entries (+0 entry links) and each info
+/// endpoint attempts one return link (+1 per info endpoint). The
+/// kind publishes once per endpoint, after its return link.
+#[test]
+fn singles_info_endpoints_substitute_entries_and_attempt_one_return_each() {
+    use p11scope_ebpf_common::inventory_info::{INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(
+        &mut fixture,
+        "a.so",
+        &[
+            ("C_GetInfo", 0x1000),
+            ("C_GetTokenInfo", 0x1010),
+            ("C_Sign", 0x1020),
+        ],
+    );
+    assert_eq!(delta_ids(&delta), [0, 1, 2]);
+    assert_eq!(delta.endpoints[0].info_kind, Some(INFO_KIND_PROVIDER));
+    assert_eq!(delta.endpoints[1].info_kind, Some(INFO_KIND_TOKEN));
+    assert_eq!(delta.endpoints[2].info_kind, None);
+    let mut harness = Harness::new(64, None);
+    let receipt = harness.extend(delta, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [0, 1, 2]);
+    assert_eq!(receipt.info_return_deferred, 0);
+    let log = harness.io.log.lock().unwrap();
+    assert_eq!(log.programs.get(&0), Some(&"p11_info_entry_lp64"));
+    assert_eq!(log.programs.get(&1), Some(&"p11_info_entry_lp64"));
+    assert_eq!(log.programs.get(&2), Some(&"p11_usage_entry_lp64"));
+    let returns: Vec<u32> = log
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Return(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(returns, [0, 1], "one attempted return per info endpoint");
+    let published: Vec<(u32, u8)> = log
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::PublishInfoKind(endpoint, kind) => Some((*endpoint, *kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        published,
+        [(0, INFO_KIND_PROVIDER), (1, INFO_KIND_TOKEN)],
+        "each kind publishes once, after its return link"
+    );
+}
+
+/// Keymeta Task 7 Multi routing (spec §17.4, fix8 I1): the info
+/// endpoints split out of their usage groups into their own groups
+/// per (object, info entry program): +G entry-group links and +G
+/// return-group links, where G is the number of distinct (object,
+/// ABI) info pairs (one provider object × one ABI here). Each info
+/// entry group attempts its return group inline, before its members
+/// mark attached, so every member still lands in exactly one receipt
+/// bucket.
+#[test]
+fn multi_info_endpoints_split_into_their_own_entry_and_return_groups() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(
+        &mut fixture,
+        "a.so",
+        &[
+            ("C_GetInfo", 0x1000),
+            ("C_GetTokenInfo", 0x1010),
+            ("C_Sign", 0x1020),
+        ],
+    );
+    let mut harness = Harness::multi(64, None);
+    let receipt = harness.extend(delta, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [0, 1, 2]);
+    assert_eq!(receipt.info_return_deferred, 0);
+    assert_eq!(
+        harness.group_ops(),
+        [
+            ("p11_info_entry_lp64", vec![0, 1]),
+            ("p11_info_return", vec![0, 1]),
+            ("p11_usage_entry_lp64", vec![2]),
+        ],
+        "info entry group (+G) with its return group (+G), then the usage group"
+    );
+    harness.assert_group_invariants();
+}
+
+/// Keymeta Task 7 EMFILE deferral (spec §17.4, N4): a return link
+/// that meets EMFILE leaves the endpoint attached (the usage entry
+/// still records), reports the named counted `info_return_deferred`
+/// gap, keeps kind 0 (no stash, zero `INFO_START` rows), and retries
+/// from the private pending list on a later extend: the retry links
+/// the return, publishes `INFO_KIND` once, and info records flow.
+#[test]
+fn info_return_emfile_defers_with_the_named_gap_and_retries() {
+    use p11scope_ebpf_common::inventory_info::INFO_KIND_TOKEN;
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(
+        &mut fixture,
+        "a.so",
+        &[("C_GetInfo", 0x1000), ("C_GetTokenInfo", 0x1010)],
+    );
+    let mut harness = Harness::new(64, None);
+    harness.io.emfile_returns.insert(1);
+    let receipt = harness.extend(delta, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [0, 1], "entries still link");
+    assert_eq!(receipt.info_return_deferred, 1);
+    assert!(!receipt.fd_exhausted, "the capture never stops");
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    let published: Vec<(u32, u8)> = harness
+        .ops()
+        .into_iter()
+        .filter_map(|op| match op {
+            Op::PublishInfoKind(endpoint, kind) => Some((endpoint, kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(published.len(), 1, "kind 0 keeps endpoint 1 unpublished");
+    assert_eq!(published[0].0, 0);
+    // The retry links the return and publishes the kind once.
+    harness.io.emfile_returns.clear();
+    let receipt = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(receipt.info_return_deferred, 0);
+    assert!(harness.book.info_return_pending.is_empty());
+    let published: Vec<(u32, u8)> = harness
+        .ops()
+        .into_iter()
+        .filter_map(|op| match op {
+            Op::PublishInfoKind(endpoint, kind) => Some((endpoint, kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(published.len(), 2);
+    assert!(published.contains(&(1, INFO_KIND_TOKEN)));
+    let returns = harness
+        .ops()
+        .into_iter()
+        .filter(|op| matches!(op, Op::Return(_)))
+        .count();
+    assert_eq!(returns, 2, "both info returns end linked");
+}
+
+/// Keymeta Task 7 revocation (spec §17.4): a later pass that proves
+/// an attached endpoint's names aliased clears its INFO_KIND cell
+/// (barring new stashes), purges its pending info return (never
+/// retried, never published) and leaves usage coverage intact —
+/// the endpoint stays attached with its entry link held.
+#[test]
+fn extend_revokes_info_kinds_purges_pendings_and_keeps_usage() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(
+        &mut fixture,
+        "a.so",
+        &[("C_GetInfo", 0x1000), ("C_GetTokenInfo", 0x1010)],
+    );
+    let mut harness = Harness::new(64, None);
+    harness.io.emfile_returns.insert(1);
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(ids(&first.attached), [0, 1], "entries still link");
+    assert_eq!(first.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: vec![EndpointId(0), EndpointId(1)],
+    };
+    let receipt = harness.extend(revoke, &fixture.set);
+    assert_eq!(receipt.info_revoked, 2);
+    assert_eq!(receipt.info_revoke_failed, 0);
+    assert!(
+        harness.book.info_return_pending.is_empty(),
+        "revocation purges pending info returns"
+    );
+    let revoked: Vec<u32> = harness
+        .ops()
+        .into_iter()
+        .filter_map(|op| match op {
+            Op::RevokeInfoKind(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(revoked, [0, 1], "both cells clear");
+    assert!(harness.book.attached.contains(&0));
+    assert!(harness.book.attached.contains(&1));
+    assert!(!harness.book.failed.contains_key(&0));
+    assert!(!harness.book.failed.contains_key(&1));
+    // No retry after the purge: clearing EMFILE and extending links
+    // nothing new and publishes nothing for the revoked endpoint.
+    harness.io.emfile_returns.clear();
+    let ops_before = harness.ops().len();
+    let _ = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(
+        harness.ops().len(),
+        ops_before,
+        "purged pendings never retry"
+    );
+    let published: Vec<(u32, u8)> = harness
+        .ops()
+        .into_iter()
+        .filter_map(|op| match op {
+            Op::PublishInfoKind(endpoint, kind) => Some((endpoint, kind)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        published.iter().all(|(endpoint, _)| *endpoint == 0),
+        "only the pre-revocation publish stands: {published:?}"
+    );
+}
+
+/// Keymeta Task 7 revocation (spec §17.4): an endpoint revoked
+/// before its first extend attaches as usage-only — the info entry
+/// never links, no return links, no kind publishes — while the
+/// revocation still counts.
+#[test]
+fn extend_downgrades_revoked_fresh_endpoints_to_usage_only() {
+    let mut fixture = SetFixture::new(64);
+    let mut delta = absorb_named(&mut fixture, "a.so", &[("C_GetTokenInfo", 0x1010)]);
+    assert!(delta.endpoints[0].info_kind.is_some());
+    delta.info_revoked.push(delta.endpoints[0].id);
+    let mut harness = Harness::new(64, None);
+    let receipt = harness.extend(delta, &fixture.set);
+    assert_eq!(receipt.info_revoked, 1);
+    assert_eq!(receipt.info_revoke_failed, 0);
+    assert_eq!(ids(&receipt.attached), [0], "the usage entry still links");
+    let log = harness.io.log.lock().unwrap();
+    assert_eq!(
+        log.programs.get(&0),
+        Some(&"p11_usage_entry_lp64"),
+        "a revoked fresh endpoint links the usage entry"
+    );
+    assert!(
+        !log.ops.iter().any(|op| matches!(op, Op::Return(_))),
+        "no info return links: {:?}",
+        log.ops
+    );
+    assert!(
+        !log.ops
+            .iter()
+            .any(|op| matches!(op, Op::PublishInfoKind(..))),
+        "no kind publishes: {:?}",
+        log.ops
+    );
+    assert!(
+        log.ops.iter().any(|op| matches!(op, Op::RevokeInfoKind(0))),
+        "the cell clears: {:?}",
+        log.ops
+    );
+}
+
+/// Keymeta Task 7 revocation authority (spec §17.4): a failed
+/// revoke write keeps the endpoint revoked userspace-side — the
+/// failure counts, the write requeues, usage stays intact, no kind
+/// re-publishes — and the next extend retries the cell write to
+/// success. A stable endpoint beside it keeps its kind throughout:
+/// no revoke op, no purge, no downgrade.
+#[test]
+fn revoke_write_failure_keeps_endpoint_revoked_and_retries() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(
+        &mut fixture,
+        "a.so",
+        &[("C_GetInfo", 0x1000), ("C_GetTokenInfo", 0x1010)],
+    );
+    let mut harness = Harness::new(64, None);
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(ids(&first.attached), [0, 1], "entries still link");
+    // Revoke endpoint 0 only; its cell write fails this extend.
+    harness.io.fail_revokes.insert(0);
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: vec![EndpointId(0)],
+    };
+    let receipt = harness.extend(revoke, &fixture.set);
+    assert_eq!(receipt.info_revoked, 0, "no cell cleared");
+    assert_eq!(receipt.info_revoke_failed, 1, "the failure counts");
+    assert_eq!(
+        harness.book.pending_info_revoke,
+        std::collections::VecDeque::from([EndpointId(0)]),
+        "the write requeues"
+    );
+    // Usage stays intact on the revoked endpoint, and nothing
+    // re-publishes a kind for it.
+    assert!(harness.book.attached.contains(&0));
+    assert!(!harness.book.failed.contains_key(&0));
+    // The stable endpoint keeps its kind: revoked nowhere.
+    let revoked: Vec<u32> = harness
+        .ops()
+        .into_iter()
+        .filter_map(|op| match op {
+            Op::RevokeInfoKind(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(revoked, [0], "only the revoked endpoint writes");
+    // The fault clears: the next extend retries the queued write to
+    // success and publishes nothing new for the revoked endpoint.
+    harness.io.fail_revokes.clear();
+    let ops_before = harness.ops().len();
+    let receipt = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(receipt.info_revoked, 1, "the retry clears the cell");
+    assert_eq!(receipt.info_revoke_failed, 0);
+    assert!(
+        harness.book.pending_info_revoke.is_empty(),
+        "nothing requeues after success"
+    );
+    let fresh: Vec<Op> = harness.ops().into_iter().skip(ops_before).collect();
+    assert!(
+        fresh
+            .iter()
+            .all(|op| !matches!(op, Op::PublishInfoKind(0, _))),
+        "no kind re-publishes for the revoked endpoint: {fresh:?}"
+    );
+    assert!(
+        fresh.contains(&Op::RevokeInfoKind(0)),
+        "the retry writes the cell: {fresh:?}"
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): a large
+/// revoke delta writes at most one extend's allowance of cells —
+/// the rest requeue for later extends instead of consuming the
+/// whole service window ahead of every attach.
+#[test]
+fn revoke_paces_large_deltas_within_one_extend() {
+    let fixture = SetFixture::new(4096);
+    let mut harness = Harness::new(4096, None);
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: (0..200u32).map(EndpointId).collect(),
+    };
+    let receipt = harness.extend(revoke, &fixture.set);
+    assert!(
+        receipt.info_revoked <= 64,
+        "one extend writes a bounded slice: {}",
+        receipt.info_revoked
+    );
+    assert_eq!(
+        receipt.info_revoked as usize + harness.book.pending_info_revoke.len(),
+        200,
+        "every staged endpoint writes or requeues"
+    );
+    assert!(
+        !harness.book.pending_info_revoke.is_empty(),
+        "the remainder waits for the next extend"
+    );
+    // The next extends drain the queue to completion.
+    for _ in 0..4 {
+        let _ = harness.extend(TargetDelta::default(), &fixture.set);
+    }
+    assert!(
+        harness.book.pending_info_revoke.is_empty(),
+        "pacing finishes, never strands: {:?}",
+        harness.book.pending_info_revoke.len()
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): no cell
+/// write starts at or past the extend deadline — an expired window
+/// requeues every staged endpoint with zero map writes.
+#[test]
+fn revoke_writes_nothing_past_the_extend_deadline() {
+    let mut harness = Harness::new(4096, None);
+    let mut delta = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: (0..200u32).map(EndpointId).collect(),
+    };
+    let mut receipt = ExtendReceipt::default();
+    let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    revoke_info_kinds(
+        &mut harness.io,
+        &mut harness.book,
+        &mut delta,
+        &mut receipt,
+        expired,
+    );
+    assert_eq!(receipt.info_revoked, 0, "an expired window writes nothing");
+    assert_eq!(receipt.info_revoke_failed, 0, "pacing is not failure");
+    assert_eq!(
+        harness.book.pending_info_revoke.len(),
+        200,
+        "every staged endpoint requeues"
+    );
+    assert!(
+        harness.ops().is_empty(),
+        "zero map writes past the deadline: {:?}",
+        harness.ops()
+    );
+}
+
+/// Keymeta Task 7 revocation fairness (spec §17.4, INV-2): 64
+/// persistently failing cells must not starve a healthy endpoint —
+/// an unattempted cell gets its turn instead of waiting behind the
+/// same failures on every extend.
+#[test]
+fn revoke_fairness_healthy_cell_behind_persistent_failures() {
+    let fixture = SetFixture::new(4096);
+    let mut harness = Harness::new(4096, None);
+    for failing in 0..64u32 {
+        harness.io.fail_revokes.insert(failing);
+    }
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: (0..65u32).map(EndpointId).collect(),
+    };
+    let _ = harness.extend(revoke, &fixture.set);
+    for _ in 0..2 {
+        let _ = harness.extend(TargetDelta::default(), &fixture.set);
+    }
+    let healthy_attempts = harness
+        .ops()
+        .into_iter()
+        .filter(|op| matches!(op, Op::RevokeInfoKind(64)))
+        .count();
+    assert!(
+        healthy_attempts >= 1,
+        "the healthy cell gets a turn within three extends: {healthy_attempts} attempts, {:?}",
+        harness.ops().len()
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): a cell
+/// whose initial lookup crosses the extend deadline writes nothing
+/// past it — the cell requeues at its pending substep (pacing, not
+/// failure) and the next extend resumes to clear it.
+#[test]
+fn revoke_deadline_crossed_mid_cell_yields_and_resumes() {
+    let fixture = SetFixture::new(64);
+    let mut harness = Harness::new(64, None);
+    harness.io.slow_revoke_reads.insert(0);
+    // A published cell, so the revoke needs the write the deadline
+    // gates (a zero cell would complete on the lookup alone).
+    harness.io.revoke_cells.insert(0, 1);
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: vec![EndpointId(0)],
+    };
+    // A generous window (no plausible scheduling stall trips the
+    // attempt gate) with a far longer lookup, so the crossing is
+    // established by construction.
+    let tight = ExtendWindow::new(1024, Instant::now() + Duration::from_millis(50)).unwrap();
+    let receipt = harness.extend_with_custody(revoke, &fixture.set, tight, &mut || Ok(()));
+    assert_eq!(receipt.info_revoked, 0, "no cell clears past the deadline");
+    assert_eq!(
+        receipt.info_revoke_failed, 0,
+        "a yield is pacing, not failure"
+    );
+    assert_eq!(
+        harness.book.pending_info_revoke,
+        std::collections::VecDeque::from([EndpointId(0)]),
+        "the cell requeues at its pending substep"
+    );
+    assert!(
+        !harness
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::WriteInfoKindCell(..))),
+        "no zero-write starts past the crossed deadline: {:?}",
+        harness.ops()
+    );
+    // The next extend resumes at the write: one more attempt clears.
+    let receipt = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(receipt.info_revoked, 1, "the resume clears the cell");
+    let attempts = harness
+        .ops()
+        .into_iter()
+        .filter(|op| matches!(op, Op::RevokeInfoKind(0)))
+        .count();
+    assert_eq!(attempts, 2, "one yield plus one resume");
+    let subops: Vec<Op> = harness
+        .ops()
+        .into_iter()
+        .filter(|op| matches!(op, Op::ReadInfoKindCell(_) | Op::WriteInfoKindCell(..)))
+        .collect();
+    assert_eq!(
+        subops,
+        [
+            Op::ReadInfoKindCell(0),
+            Op::WriteInfoKindCell(0, 0),
+            Op::ReadInfoKindCell(0),
+        ],
+        "the resume writes and reads back without redoing the lookup"
+    );
+}
+
+/// Keymeta Task 7 info-return failure (spec §17.4, N4): a
+/// deterministic (non-EMFILE) return refusal fails the endpoint
+/// disclosed with its entry link retained. The usage entry keeps
+/// recording in BPF, but every row naming the failed endpoint is
+/// integrity evidence, never a witness
+/// (`a_row_naming_a_failed_endpoint_is_integrity_not_a_witness`
+/// pins the witness half).
+#[test]
+fn deterministic_info_return_refusal_fails_the_endpoint_with_links_retained() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(&mut fixture, "a.so", &[("C_GetTokenInfo", 0x1010)]);
+    assert_eq!(delta_ids(&delta), [0]);
+    let mut harness = Harness::new(64, None);
+    harness.io.refuse_returns.insert(0);
+    let receipt = harness.extend(delta, &fixture.set);
+    assert!(receipt.attached.is_empty(), "nothing marks attached");
+    assert_eq!(receipt.failed.len(), 1);
+    assert_eq!(receipt.failed[0].id, EndpointId(0));
+    assert!(
+        receipt.failed[0].reason.contains("refused return"),
+        "disclosed refusal: {:?}",
+        receipt.failed[0]
+    );
+    assert!(
+        receipt.failed[0].link_retained,
+        "the entry link stays held: {:?}",
+        receipt.failed[0]
+    );
+    assert!(
+        harness.book.failed.contains_key(&0),
+        "a failed endpoint's rows are integrity evidence"
+    );
+    assert_eq!(
+        harness.io.log.lock().unwrap().live,
+        1,
+        "the entry link is retained"
+    );
+}
+
+/// Keymeta Task 7 Multi retry (spec §17.4, N4): two deferred info
+/// return groups retried in one extend keep distinct serials with
+/// exact per-group link counts. Each return group carries its entry
+/// group's serial (the `ReturnGroup` variant distinguishes custody),
+/// so the second group's row never recounts the first group's links.
+#[test]
+fn multi_info_return_retry_keeps_distinct_serials_and_exact_links() {
+    let mut fixture = SetFixture::new(64);
+    let first = absorb_named(&mut fixture, "a.so", &[("C_GetInfo", 0x1000)]);
+    let second = absorb_named(&mut fixture, "b.so", &[("C_GetTokenInfo", 0x1010)]);
+    let mut both = first;
+    both.append(second);
+    assert_eq!(delta_ids(&both), [0, 1]);
+    let mut harness = Harness::multi(64, None);
+    harness.io.emfile_returns.insert(0);
+    harness.io.emfile_returns.insert(1);
+    let entry_receipt = harness.extend(both, &fixture.set);
+    assert_eq!(entry_receipt.info_return_deferred, 2);
+    assert_eq!(harness.book.info_return_pending.len(), 2);
+    // Entry serials, keyed by object.
+    let mut entry_serial = BTreeMap::new();
+    for row in &entry_receipt.groups {
+        entry_serial.insert(row.object, row.serial);
+    }
+    assert_eq!(entry_serial.len(), 2);
+    // One retry extend links both return groups.
+    harness.io.emfile_returns.clear();
+    let receipt = harness.extend(TargetDelta::default(), &fixture.set);
+    let returns: Vec<&AttachGroup> = receipt
+        .groups
+        .iter()
+        .filter(|row| row.program == "p11_info_return")
+        .collect();
+    assert_eq!(
+        returns.len(),
+        2,
+        "both return groups link: {:?}",
+        receipt.groups
+    );
+    let serials: BTreeSet<u32> = returns.iter().map(|row| row.serial).collect();
+    assert_eq!(
+        serials.len(),
+        2,
+        "distinct return serials: {:?}",
+        receipt.groups
+    );
+    for row in returns {
+        assert_eq!(row.links, 1, "exact per-group links: {row:?}");
+        assert_eq!(
+            entry_serial.get(&row.object),
+            Some(&row.serial),
+            "return group pairs with its entry group: {row:?}"
+        );
+    }
+    harness.assert_group_invariants();
+}
+
+/// Keymeta Task 7 Multi retry (spec §17.4, N4): a retried return
+/// group reports its surviving sites only — refused sites land in
+/// `receipt.failed`, never in the group's members.
+#[test]
+fn multi_info_return_retry_reports_surviving_sites_only() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(
+        &mut fixture,
+        "a.so",
+        &[("C_GetInfo", 0x1000), ("C_GetTokenInfo", 0x1010)],
+    );
+    assert_eq!(delta_ids(&delta), [0, 1]);
+    let mut harness = Harness::multi(64, None);
+    harness.io.emfile_returns.insert(0);
+    harness.io.emfile_returns.insert(1);
+    let receipt = harness.extend(delta, &fixture.set);
+    assert_eq!(receipt.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    // The retry refuses endpoint 1's site: only endpoint 0 survives.
+    harness.io.emfile_returns.clear();
+    harness.io.refuse.insert(1);
+    let receipt = harness.extend(TargetDelta::default(), &fixture.set);
+    let returns: Vec<&AttachGroup> = receipt
+        .groups
+        .iter()
+        .filter(|row| row.program == "p11_info_return")
+        .collect();
+    assert_eq!(
+        returns.len(),
+        1,
+        "the surviving site keeps its row: {:?}",
+        receipt.groups
+    );
+    assert_eq!(
+        returns[0].members,
+        vec![EndpointId(0)],
+        "refused sites leave the members: {:?}",
+        returns[0]
+    );
+    assert!(
+        receipt
+            .failed
+            .iter()
+            .any(|failed| failed.id == EndpointId(1)),
+        "the refused site fails disclosed: {:?}",
+        receipt.failed
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): an expired
+/// extend visits no pending info return — 4096 revoked Singles stay
+/// queued with zero attach attempts instead of filtering the whole
+/// revoked prefix past the deadline.
+#[test]
+fn expired_extend_visits_no_pending_info_return() {
+    let mut fixture = SetFixture::new(4096);
+    let entries: Vec<(&'static str, u64)> = (0..4096u32)
+        .map(|n| ("C_GetTokenInfo", 0x1000 + u64::from(n) * 0x10))
+        .collect();
+    let delta = absorb_named(&mut fixture, "a.so", &entries);
+    assert_eq!(delta.endpoints.len(), 4096);
+    let mut harness = Harness::new(4096, None);
+    for endpoint in &delta.endpoints {
+        harness.io.emfile_returns.insert(endpoint.id.0);
+    }
+    // One extend admits 1024 entries: resubmit the deferred rest
+    // until every return parks (re-parks re-count, so the queued
+    // length — not the receipt sum — proves the setup).
+    let mut unsubmitted = delta;
+    for _ in 0..8 {
+        if unsubmitted.endpoints.is_empty() {
+            break;
+        }
+        let receipt = harness.extend(std::mem::take(&mut unsubmitted), &fixture.set);
+        unsubmitted = receipt.deferred;
+    }
+    assert!(unsubmitted.endpoints.is_empty());
+    assert_eq!(harness.book.info_return_pending.len(), 4096);
+    // Revoke every endpoint, then retry under an expired window.
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: (0..4096u32).map(EndpointId).collect(),
+    };
+    let expired = ExtendWindow::new(
+        1024,
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+    )
+    .unwrap();
+    let ops_before = harness.ops().len();
+    let _ = harness.extend_with_custody(revoke, &fixture.set, expired, &mut || Ok(()));
+    assert_eq!(
+        harness.book.info_return_pending.len(),
+        4096,
+        "an expired extend consumes no revoked prefix"
+    );
+    assert_eq!(
+        harness.ops().len(),
+        ops_before,
+        "zero attach attempts past the deadline: {:?}",
+        harness.ops().len()
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): a Multi
+/// return group larger than one extend's visit allowance filters a
+/// bounded prefix and requeues with its progress — no whole-group
+/// scan — and a revocation staged before the resume drops its site
+/// at publication instead of linking it.
+#[test]
+fn multi_info_return_filter_yields_and_revalidates_across_extends() {
+    // Eighty sites ride one return link (past one extend's visit
+    // allowance, inside one link's 96-site cap).
+    let mut fixture = SetFixture::new(128);
+    let entries: Vec<(&'static str, u64)> = (0..80u32)
+        .map(|n| ("C_GetInfo", 0x1000 + u64::from(n) * 0x10))
+        .collect();
+    let delta = absorb_named(&mut fixture, "a.so", &entries);
+    assert_eq!(delta.endpoints.len(), 80);
+    let mut harness = Harness::multi(128, None);
+    for endpoint in &delta.endpoints {
+        harness.io.emfile_returns.insert(endpoint.id.0);
+    }
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(first.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    // One retry extend filters a bounded prefix and requeues the
+    // group: nothing links yet and no site is lost.
+    harness.io.emfile_returns.clear();
+    let _ = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(
+        harness.book.info_return_pending.len(),
+        1,
+        "the interrupted group requeues instead of scanning whole"
+    );
+    let (sites, validated) = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi {
+            sites, validated, ..
+        } => (sites.len(), *validated),
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    assert_eq!(sites, 80, "every site survives the interruption");
+    assert_eq!(validated, 64, "the filter resumes after its bounded prefix");
+    assert!(
+        !harness
+            .group_ops()
+            .iter()
+            .any(|(program, _)| *program == "p11_info_return"),
+        "no return group links before its filter completes: {:?}",
+        harness.group_ops()
+    );
+    // A revocation staged before the resume drops its site: the
+    // resumed filter revalidates against the staged set.
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: vec![EndpointId(0)],
+    };
+    let _ = harness.extend(revoke, &fixture.set);
+    for _ in 0..4 {
+        if harness.book.info_return_pending.is_empty() {
+            break;
+        }
+        let _ = harness.extend(TargetDelta::default(), &fixture.set);
+    }
+    assert!(
+        harness.book.info_return_pending.is_empty(),
+        "the resumed filter completes instead of stranding the group"
+    );
+    let returns: Vec<Vec<u32>> = harness
+        .group_ops()
+        .into_iter()
+        .filter_map(|(program, ids)| (program == "p11_info_return").then_some(ids))
+        .collect();
+    assert_eq!(
+        returns.len(),
+        1,
+        "one return group links after the resume: {returns:?}"
+    );
+    assert_eq!(
+        returns[0].len(),
+        79,
+        "the revoked site never links: {:?}",
+        returns[0].len()
+    );
+    assert!(
+        !returns[0].contains(&0),
+        "the revoked site drops at publication: {:?}",
+        returns[0]
+    );
+    assert!(
+        !harness
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::PublishInfoKind(0, _))),
+        "no kind publishes for the revoked site"
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): an expired
+/// retry moves no pending queue storage — 4096 queued Singles keep
+/// their backing buffers with zero attach attempts, not a whole-queue
+/// copy to different storage preserving order.
+#[test]
+fn expired_retry_moves_no_pending_queue_storage() {
+    let mut fixture = SetFixture::new(4096);
+    let entries: Vec<(&'static str, u64)> = (0..4096u32)
+        .map(|n| ("C_GetTokenInfo", 0x1000 + u64::from(n) * 0x10))
+        .collect();
+    let delta = absorb_named(&mut fixture, "a.so", &entries);
+    assert_eq!(delta.endpoints.len(), 4096);
+    let mut harness = Harness::new(4096, None);
+    for endpoint in &delta.endpoints {
+        harness.io.emfile_returns.insert(endpoint.id.0);
+    }
+    let mut unsubmitted = delta;
+    for _ in 0..8 {
+        if unsubmitted.endpoints.is_empty() {
+            break;
+        }
+        let receipt = harness.extend(std::mem::take(&mut unsubmitted), &fixture.set);
+        unsubmitted = receipt.deferred;
+    }
+    assert!(unsubmitted.endpoints.is_empty());
+    assert_eq!(harness.book.info_return_pending.len(), 4096);
+    let first_before = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Singles(endpoint) => endpoint.id.0,
+        InfoReturnPending::Multi { .. } => panic!("Singles stay Singles"),
+    };
+    let last_before = match &harness.book.info_return_pending[4095] {
+        InfoReturnPending::Singles(endpoint) => endpoint.id.0,
+        InfoReturnPending::Multi { .. } => panic!("Singles stay Singles"),
+    };
+    let (front_before, back_before) = harness.book.info_return_pending.as_slices();
+    let front_ptr_before = front_before.as_ptr() as usize;
+    let back_ptr_before = back_before.as_ptr() as usize;
+    let front_len_before = front_before.len();
+    let back_len_before = back_before.len();
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: (0..4096u32).map(EndpointId).collect(),
+    };
+    let expired = ExtendWindow::new(
+        1024,
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+    )
+    .unwrap();
+    let ops_before = harness.ops().len();
+    let _ = harness.extend_with_custody(revoke, &fixture.set, expired, &mut || Ok(()));
+    assert_eq!(
+        harness.book.info_return_pending.len(),
+        4096,
+        "an expired retry consumes no revoked prefix"
+    );
+    assert_eq!(
+        harness.ops().len(),
+        ops_before,
+        "zero attach attempts past the deadline"
+    );
+    let (front_after, back_after) = harness.book.info_return_pending.as_slices();
+    assert_eq!(
+        front_after.as_ptr() as usize,
+        front_ptr_before,
+        "the expired retry moves no front backing storage"
+    );
+    assert_eq!(
+        back_after.as_ptr() as usize,
+        back_ptr_before,
+        "the expired retry moves no back backing storage"
+    );
+    assert_eq!(
+        (front_after.len(), back_after.len()),
+        (front_len_before, back_len_before),
+        "the expired retry keeps both backing slices"
+    );
+    let first_after = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Singles(endpoint) => endpoint.id.0,
+        InfoReturnPending::Multi { .. } => panic!("Singles stay Singles"),
+    };
+    let last_after = match &harness.book.info_return_pending[4095] {
+        InfoReturnPending::Singles(endpoint) => endpoint.id.0,
+        InfoReturnPending::Multi { .. } => panic!("Singles stay Singles"),
+    };
+    assert_eq!(
+        (first_after, last_after),
+        (first_before, last_before),
+        "the expired retry preserves queue order without moving storage"
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): a Multi
+/// yield keeps its site storage across extends — an 80-site group
+/// past one extend's visit allowance resumes in place with its
+/// unvisited suffix uncopied, not rebuilt into a new vector.
+#[test]
+fn multi_yield_keeps_site_storage_without_copying_unvisited() {
+    let mut fixture = SetFixture::new(128);
+    let entries: Vec<(&'static str, u64)> = (0..80u32)
+        .map(|n| ("C_GetInfo", 0x1000 + u64::from(n) * 0x10))
+        .collect();
+    let delta = absorb_named(&mut fixture, "a.so", &entries);
+    assert_eq!(delta.endpoints.len(), 80);
+    let mut harness = Harness::multi(128, None);
+    for endpoint in &delta.endpoints {
+        harness.io.emfile_returns.insert(endpoint.id.0);
+    }
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(first.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    let sites_ptr_before = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi { sites, .. } => sites.as_ptr() as usize,
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    harness.io.emfile_returns.clear();
+    let _ = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(
+        harness.book.info_return_pending.len(),
+        1,
+        "the interrupted group requeues instead of scanning whole"
+    );
+    let (sites_len, validated, sites_ptr_after) = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi {
+            sites, validated, ..
+        } => (sites.len(), *validated, sites.as_ptr() as usize),
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    assert_eq!(sites_len, 80, "every site survives the interruption");
+    assert_eq!(validated, 64, "the filter resumes after its bounded prefix");
+    assert_eq!(
+        sites_ptr_after, sites_ptr_before,
+        "the yield keeps the same site storage instead of copying unvisited sites"
+    );
+    assert!(
+        !harness
+            .group_ops()
+            .iter()
+            .any(|(program, _)| *program == "p11_info_return"),
+        "no return group links before its filter completes: {:?}",
+        harness.group_ops()
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): an EMFILE
+/// after a completed Multi filter keeps the original site storage —
+/// a 32-site group (within one extend's visit allowance) that
+/// filters fully and then meets exhausted descriptors requeues its
+/// original vector, cursor and mask, not a rebuilt survivors-only
+/// copy — and links once descriptors free.
+#[test]
+fn multi_emfile_after_full_validation_keeps_original_site_storage() {
+    let mut fixture = SetFixture::new(128);
+    let entries: Vec<(&'static str, u64)> = (0..32u32)
+        .map(|n| ("C_GetInfo", 0x1000 + u64::from(n) * 0x10))
+        .collect();
+    let delta = absorb_named(&mut fixture, "a.so", &entries);
+    assert_eq!(delta.endpoints.len(), 32);
+    let mut harness = Harness::multi(128, None);
+    for endpoint in &delta.endpoints {
+        harness.io.emfile_returns.insert(endpoint.id.0);
+    }
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(first.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    let sites_ptr_before = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi { sites, .. } => sites.as_ptr() as usize,
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    // The filter completes (32 visits, within the 64 allowance) and
+    // the attach meets EMFILE: the group requeues instead of linking.
+    let second = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(second.info_return_deferred, 1);
+    assert_eq!(
+        harness.book.info_return_pending.len(),
+        1,
+        "the EMFILE group requeues instead of dropping"
+    );
+    let (sites_len, validated, sites_ptr_after) = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi {
+            sites, validated, ..
+        } => (sites.len(), *validated, sites.as_ptr() as usize),
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    assert_eq!(sites_len, 32, "every site survives the EMFILE");
+    assert_eq!(validated, 32, "the completed filter stays complete");
+    assert_eq!(
+        sites_ptr_after, sites_ptr_before,
+        "the EMFILE keeps the original site storage instead of a survivors-only copy"
+    );
+    assert!(
+        !harness
+            .group_ops()
+            .iter()
+            .any(|(program, _)| *program == "p11_info_return"),
+        "no return group links on EMFILE: {:?}",
+        harness.group_ops()
+    );
+    // Descriptors free: the requeued original links once.
+    harness.io.emfile_returns.clear();
+    let _ = harness.extend(TargetDelta::default(), &fixture.set);
+    assert!(
+        harness.book.info_return_pending.is_empty(),
+        "the requeued group completes instead of stranding"
+    );
+    let returns: Vec<Vec<u32>> = harness
+        .group_ops()
+        .into_iter()
+        .filter_map(|(program, ids)| (program == "p11_info_return").then_some(ids))
+        .collect();
+    assert_eq!(returns.len(), 1, "one return group links: {returns:?}");
+    assert_eq!(
+        returns[0].len(),
+        32,
+        "every site links: {:?}",
+        returns[0].len()
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): a new
+/// epoch with many excluded sites charges each excluded index —
+/// a 96-site group with 64 revoked sites that meets one more
+/// revocation revalidates a bounded prefix (the 64 excluded) and
+/// requeues, instead of walking all 96 indexes on 32 set lookups.
+#[test]
+fn multi_epoch_change_with_many_excluded_charges_each_site() {
+    let mut fixture = SetFixture::new(128);
+    let entries: Vec<(&'static str, u64)> = (0..96u32)
+        .map(|n| ("C_GetInfo", 0x1000 + u64::from(n) * 0x10))
+        .collect();
+    let delta = absorb_named(&mut fixture, "a.so", &entries);
+    assert_eq!(delta.endpoints.len(), 96);
+    let mut harness = Harness::multi(128, None);
+    for endpoint in &delta.endpoints {
+        harness.io.emfile_returns.insert(endpoint.id.0);
+    }
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(first.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    harness.io.emfile_returns.clear();
+    // Sixty-four revocations: the next filter visits and excludes
+    // them, spending its whole allowance and requeueing.
+    let revoke = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: (0..64u32).map(EndpointId).collect(),
+    };
+    let _ = harness.extend(revoke, &fixture.set);
+    assert_eq!(
+        harness.book.info_return_pending.len(),
+        1,
+        "the interrupted filter requeues"
+    );
+    let validated = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi { validated, .. } => *validated,
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    assert_eq!(validated, 64, "the filter resumes after its bounded prefix");
+    // One more revocation bumps the epoch: the 64 excluded indexes
+    // still cost visits, so the rebuild yields again instead of
+    // completing on 32 set lookups.
+    let bump = TargetDelta {
+        endpoints: vec![],
+        objects: vec![],
+        info_revoked: vec![EndpointId(64)],
+    };
+    let _ = harness.extend(bump, &fixture.set);
+    assert_eq!(
+        harness.book.info_return_pending.len(),
+        1,
+        "the epoch rebuild yields on its excluded prefix instead of scanning whole"
+    );
+    let validated = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi { validated, .. } => *validated,
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    assert_eq!(validated, 64, "each excluded index spends one visit credit");
+    assert!(
+        !harness
+            .group_ops()
+            .iter()
+            .any(|(program, _)| *program == "p11_info_return"),
+        "no return group links before the rebuild completes: {:?}",
+        harness.group_ops()
+    );
+    // The rebuild finishes over the next extends and links only the
+    // survivors (65..95).
+    for _ in 0..4 {
+        if harness.book.info_return_pending.is_empty() {
+            break;
+        }
+        let _ = harness.extend(TargetDelta::default(), &fixture.set);
+    }
+    assert!(
+        harness.book.info_return_pending.is_empty(),
+        "the rebuild completes instead of stranding the group"
+    );
+    let returns: Vec<Vec<u32>> = harness
+        .group_ops()
+        .into_iter()
+        .filter_map(|(program, ids)| (program == "p11_info_return").then_some(ids))
+        .collect();
+    assert_eq!(returns.len(), 1, "one return group links: {returns:?}");
+    assert_eq!(
+        returns[0].len(),
+        31,
+        "only survivors link: {:?}",
+        returns[0].len()
+    );
+    assert!(
+        returns[0].iter().all(|id| *id >= 65),
+        "no revoked site links: {:?}",
+        returns[0]
+    );
+}
+
+/// Keymeta Task 7 revocation pacing (spec §17.4, INV-2): an expiry
+/// just after the final Multi validation keeps the original site
+/// storage — the 33rd lookup completes a 32-site filter and the
+/// clock crosses the deadline before native work, so the group
+/// requeues its original vector, cursor and mask with no
+/// whole-group scan or copy.
+#[test]
+fn multi_expiry_after_final_validation_keeps_original_site_storage() {
+    let mut fixture = SetFixture::new(128);
+    let entries: Vec<(&'static str, u64)> = (0..32u32)
+        .map(|n| ("C_GetInfo", 0x1000 + u64::from(n) * 0x10))
+        .collect();
+    let delta = absorb_named(&mut fixture, "a.so", &entries);
+    assert_eq!(delta.endpoints.len(), 32);
+    let mut harness = Harness::multi(128, None);
+    for endpoint in &delta.endpoints {
+        harness.io.emfile_returns.insert(endpoint.id.0);
+    }
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(first.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    let sites_ptr_before = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi { sites, .. } => sites.as_ptr() as usize,
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    harness.io.emfile_returns.clear();
+    // A scripted clock: wide through the entry gate, the queue gate
+    // and all 32 site visits (34 reads), expired at the post-filter
+    // recheck before native work.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let wide = deadline.checked_sub(Duration::from_secs(1)).unwrap();
+    let expired = deadline.checked_add(Duration::from_secs(1)).unwrap();
+    let mut calls = 0usize;
+    let mut scripted = || {
+        calls += 1;
+        if calls <= 34 { wide } else { expired }
+    };
+    let mut receipt = ExtendReceipt::default();
+    retry_info_returns(
+        &mut harness.io,
+        &harness.targets,
+        &mut harness.links,
+        &mut harness.book,
+        &mut receipt,
+        deadline,
+        &mut scripted,
+    );
+    assert_eq!(
+        harness.book.info_return_pending.len(),
+        1,
+        "the expired post-filter requeues instead of dropping"
+    );
+    let (sites_len, validated, sites_ptr_after) = match &harness.book.info_return_pending[0] {
+        InfoReturnPending::Multi {
+            sites, validated, ..
+        } => (sites.len(), *validated, sites.as_ptr() as usize),
+        InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+    };
+    assert_eq!(sites_len, 32, "every site survives the expiry");
+    assert_eq!(validated, 32, "the completed filter stays complete");
+    assert_eq!(
+        sites_ptr_after, sites_ptr_before,
+        "the expiry keeps the original site storage instead of scanning and copying survivors"
+    );
+    assert!(
+        !harness
+            .group_ops()
+            .iter()
+            .any(|(program, _)| *program == "p11_info_return"),
+        "no return group links past the deadline: {:?}",
+        harness.group_ops()
+    );
+}
+
+/// Keymeta Task 7 INFO service (spec §17.4): the inventory session
+/// drains the INFO ring alongside DISCOVERY with the same bounded
+/// quantum shape (positive record bound, deadline, no read-ahead,
+/// exact consumed-but-undelivered evidence on dispatch failure).
+#[test]
+fn info_drain_service_dispatches_bounded_quantums() {
+    use super::super::activation::{
+        InfoItem, InventoryInfoDispatchFailure, service_inventory_info_with,
+    };
+    use std::collections::VecDeque;
+    let one = [1u8; 176];
+    let two = [2u8; 176];
+    let mut feeder = VecDeque::from([InfoItem::Record(one), InfoItem::Record(two)]);
+    let mut seen = Vec::new();
+    let service = service_inventory_info_with(
+        16,
+        Instant::now() + Duration::from_secs(30),
+        || Ok(feeder.pop_front()),
+        |record: [u8; 176]| {
+            seen.push(record);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(service.dispatched, 2);
+    assert!(!service.record_bound_reached && !service.deadline_reached);
+    assert_eq!(seen, [one, two]);
+    // A malformed record bails with exact evidence, like DISCOVERY.
+    let mut feeder = VecDeque::from([InfoItem::Record(one), InfoItem::Malformed]);
+    let failure = service_inventory_info_with(
+        16,
+        Instant::now() + Duration::from_secs(30),
+        || Ok(feeder.pop_front()),
+        |_record: [u8; 176]| Ok(()),
+    )
+    .unwrap_err();
+    let InventoryInfoDispatchFailure {
+        record, dispatched, ..
+    } = failure;
+    assert_eq!(dispatched, 1);
+    assert!(record.is_none(), "malformed carries no record");
+    // A zero record bound refuses without dequeuing.
+    let mut feeder = VecDeque::from([InfoItem::Record(one)]);
+    assert!(
+        service_inventory_info_with(
+            0,
+            Instant::now() + Duration::from_secs(30),
+            || { Ok(feeder.pop_front()) },
+            |_record: [u8; 176]| Ok(())
+        )
+        .is_err()
+    );
+    assert_eq!(feeder.len(), 1, "nothing dequeued");
+}
+
+/// Keymeta Task 7 drain errors (spec §17.4): a malformed frame
+/// counts as malformed with no failure, while a dequeue (ring-read)
+/// error surfaces as a batch failure with the error text — a
+/// failing INFO ring never hides behind the malformed count.
+#[test]
+fn info_drain_distinguishes_malformed_frames_from_dequeue_errors() {
+    use super::super::activation::InfoItem;
+    use std::collections::VecDeque;
+    let window = || ReadWindow::new(16, Instant::now() + Duration::from_secs(30)).unwrap();
+    let mut feeder = VecDeque::from([InfoItem::Record([7u8; 176]), InfoItem::Malformed]);
+    let (records, malformed, failure, complete) =
+        drain_info_quantum(window(), || Ok(feeder.pop_front()));
+    assert_eq!(records, [[7u8; 176]]);
+    assert_eq!(malformed, 1, "the malformed frame counts once");
+    assert_eq!(failure, None, "no failure on a malformed frame");
+    assert!(!complete, "a malformed stop never completes the drain");
+    let (records, malformed, failure, complete) = drain_info_quantum(window(), || {
+        Err::<Option<InfoItem>, _>(anyhow::anyhow!("ring read broke"))
+    });
+    assert!(records.is_empty());
+    assert_eq!(malformed, 0, "a dequeue error is not malformed");
+    assert!(
+        failure
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ring read broke"),
+        "the error text survives: {failure:?}"
+    );
+    assert!(!complete, "a dequeue error never completes the drain");
+    // A drain to empty completes.
+    let mut feeder = VecDeque::from([InfoItem::Record([7u8; 176])]);
+    let (records, malformed, failure, complete) =
+        drain_info_quantum(window(), || Ok(feeder.pop_front()));
+    assert_eq!(records, [[7u8; 176]]);
+    assert_eq!((malformed, failure, complete), (0, None, true));
+    // A record bound stops the drain early: incomplete, with records
+    // still pending.
+    let mut feeder = VecDeque::from([InfoItem::Record([7u8; 176]), InfoItem::Record([8u8; 176])]);
+    let bound = ReadWindow::new(1, Instant::now() + Duration::from_secs(30)).unwrap();
+    let (records, _, _, complete) = drain_info_quantum(bound, || Ok(feeder.pop_front()));
+    assert_eq!(records, [[7u8; 176]]);
+    assert!(!complete, "a bound stop never completes the drain");
+    assert_eq!(feeder.len(), 1, "one record still pends");
+}
+
+/// One INFO quantum's scripted native source: counts dequeues and
+/// counter reads, and optionally sleeps through the window on its
+/// first dequeue (the cooperative slice expiring mid-drain).
+struct CountingInfoSource {
+    dequeues: usize,
+    produced_calls: std::cell::Cell<usize>,
+    evidence_calls: std::cell::Cell<usize>,
+    sleep_on_first_dequeue: Duration,
+}
+
+impl CountingInfoSource {
+    fn idle() -> Self {
+        Self {
+            dequeues: 0,
+            produced_calls: std::cell::Cell::new(0),
+            evidence_calls: std::cell::Cell::new(0),
+            sleep_on_first_dequeue: Duration::ZERO,
+        }
+    }
+}
+
+impl super::InfoQuantumSource for CountingInfoSource {
+    fn dequeue_info(&mut self) -> Result<Option<super::super::activation::InfoItem>> {
+        self.dequeues += 1;
+        if self.dequeues == 1 && !self.sleep_on_first_dequeue.is_zero() {
+            std::thread::sleep(self.sleep_on_first_dequeue);
+        }
+        Ok(None)
+    }
+    fn info_produced(&self) -> Option<Result<u64, String>> {
+        self.produced_calls.set(self.produced_calls.get() + 1);
+        Some(Ok(9))
+    }
+    fn info_evidence(
+        &self,
+        _deadline: Instant,
+    ) -> Option<super::super::activation::InfoEvidenceRead> {
+        self.evidence_calls.set(self.evidence_calls.get() + 1);
+        Some(super::super::activation::InfoEvidenceRead::Done(Ok([
+            1, 0, 0, 0,
+        ])))
+    }
+}
+
+/// Keymeta Task 7 stop window (spec §17.4): a quantum whose window
+/// already expired reads nothing — no dequeue, no produced
+/// counter, no evidence cells — and stages incomplete, so the
+/// terminal cut reports the expired window instead of a clean cut
+/// over unread counters.
+#[test]
+fn info_quantum_with_an_expired_window_reads_no_counters() {
+    let mut book = test_book(8, 16, None);
+    let expired = ReadWindow::new(
+        16,
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+    )
+    .unwrap();
+    let mut source = CountingInfoSource::idle();
+    let batch = service_info_quantum(&mut book, expired, &mut source);
+    assert_eq!(source.dequeues, 0, "no dequeue starts past the window");
+    assert_eq!(
+        source.produced_calls.get(),
+        0,
+        "no produced read starts past the window"
+    );
+    assert_eq!(
+        source.evidence_calls.get(),
+        0,
+        "no evidence read starts past the window"
+    );
+    assert!(!batch.complete, "the expired window stages incomplete");
+}
+
+/// Keymeta Task 7 stop window (spec §17.4): a cooperative quantum
+/// whose slice deadline passes during the dequeue still reads no
+/// counters past it — the last observation stages incomplete with
+/// the records it already drained.
+#[test]
+fn info_quantum_with_a_deadline_crossed_during_dequeue_reads_no_counters() {
+    let mut book = test_book(8, 16, None);
+    // A generous window (no plausible scheduling stall trips the
+    // pre-drain check) with a far longer first dequeue, so the
+    // deadline crossing is established by construction.
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_millis(100)).unwrap();
+    let mut source = CountingInfoSource {
+        sleep_on_first_dequeue: Duration::from_millis(300),
+        ..CountingInfoSource::idle()
+    };
+    let batch = service_info_quantum(&mut book, window, &mut source);
+    assert_eq!(source.dequeues, 1, "the drain started inside the window");
+    assert_eq!(
+        source.produced_calls.get(),
+        0,
+        "no produced read starts past the crossed deadline"
+    );
+    assert_eq!(
+        source.evidence_calls.get(),
+        0,
+        "no evidence read starts past the crossed deadline"
+    );
+    assert!(
+        !batch.complete,
+        "the crossed window stages incomplete, never a clean cut"
+    );
+}
+
+/// A source whose evidence read mimics the production four-lookup
+/// loop: it records each cell start and crosses the window deadline
+/// inside the first cell, so a conforming quantum starts no further
+/// cell past it.
+struct CellCrossingInfoSource {
+    cell_starts: std::cell::RefCell<Vec<usize>>,
+    sleep_in_first_cell: Duration,
+}
+
+impl super::InfoQuantumSource for CellCrossingInfoSource {
+    fn dequeue_info(&mut self) -> Result<Option<super::super::activation::InfoItem>> {
+        Ok(None)
+    }
+    fn info_produced(&self) -> Option<Result<u64, String>> {
+        Some(Ok(9))
+    }
+    fn info_evidence(
+        &self,
+        deadline: Instant,
+    ) -> Option<super::super::activation::InfoEvidenceRead> {
+        // The production loop issues four native lookups, each gated
+        // on the window; this mimic records the same shape so the
+        // twin pins the per-cell gating.
+        for cell in 0..4 {
+            if Instant::now() >= deadline {
+                return Some(super::super::activation::InfoEvidenceRead::Yielded);
+            }
+            self.cell_starts.borrow_mut().push(cell);
+            if cell == 0 {
+                std::thread::sleep(self.sleep_in_first_cell);
+            }
+        }
+        Some(super::super::activation::InfoEvidenceRead::Done(Ok([
+            1, 0, 0, 0,
+        ])))
+    }
+}
+
+/// Keymeta Task 7 stop window (spec §17.4): a quantum whose window
+/// deadline passes inside the first evidence lookup starts no
+/// further evidence cell — each of the four native lookups gates on
+/// the window — and stages incomplete instead of a clean cut over a
+/// partially read group.
+#[test]
+fn info_evidence_deadline_crossed_mid_first_cell_starts_no_further_cell() {
+    let mut book = test_book(8, 16, None);
+    // A generous window (no plausible scheduling stall trips the
+    // pre-evidence check) with a far longer first cell, so the
+    // crossing is established by construction.
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_millis(100)).unwrap();
+    let mut source = CellCrossingInfoSource {
+        cell_starts: std::cell::RefCell::new(Vec::new()),
+        sleep_in_first_cell: Duration::from_millis(300),
+    };
+    let batch = service_info_quantum(&mut book, window, &mut source);
+    assert_eq!(
+        *source.cell_starts.borrow(),
+        [0],
+        "no evidence cell starts at or past the crossed deadline"
+    );
+    assert!(
+        !batch.complete,
+        "the mid-evidence crossing stages incomplete, never a clean cut"
+    );
+}
+
+/// Keymeta Task 7 ring cross-check (spec §17.4): the drain compares
+/// produced vs consumed per quantum, never a silent drop. Loss is
+/// derived, so submitted-but-undrained records read as provisional
+/// loss until the next quantum drains them; regressing counters
+/// retain the prior triple.
+#[test]
+fn info_ring_accounting_counts_produced_minus_consumed_per_quantum() {
+    let mut accounting = InfoRingAccounting::default();
+    accounting.note_info_quantum(5, 5);
+    assert_eq!(
+        (accounting.produced, accounting.consumed, accounting.loss),
+        (5, 5, 0)
+    );
+    accounting.note_info_quantum(9, 7);
+    assert_eq!(
+        (accounting.produced, accounting.consumed, accounting.loss),
+        (9, 7, 2)
+    );
+    // The next quantum drains the backlog: derived loss recovers to
+    // zero instead of sticking at the provisional count.
+    accounting.note_info_quantum(12, 12);
+    assert_eq!(
+        (accounting.produced, accounting.consumed, accounting.loss),
+        (12, 12, 0)
+    );
+    // A regressing produced read retains the whole prior triple.
+    accounting.note_info_quantum(11, 12);
+    assert_eq!(
+        (accounting.produced, accounting.consumed, accounting.loss),
+        (12, 12, 0)
+    );
+}
+
+/// Keymeta Task 7 evidence (spec §17.4, never silent): each quantum
+/// reports the INFO_EVIDENCE deltas since the last one. A failed
+/// cell read reports its cause and keeps the last cells, so the
+/// next success reports the full delta; P0 (no reading) reports
+/// zero deltas with no error.
+#[test]
+fn info_evidence_deltas_span_failures_and_p0() {
+    let mut book = test_book(8, 16, None);
+    let quantum = |book: &mut CaptureBook, evidence: Option<Result<[u64; 4], String>>| {
+        book.finish_info_quantum(Vec::new(), 0, None, true, None, evidence)
+    };
+    let first = quantum(&mut book, Some(Ok([2, 1, 0, 3])));
+    assert_eq!(first.evidence_delta, [2, 1, 0, 3]);
+    assert!(first.evidence_error.is_none());
+    let second = quantum(&mut book, Some(Ok([2, 4, 1, 3])));
+    assert_eq!(second.evidence_delta, [0, 3, 1, 0]);
+    assert!(second.evidence_error.is_none());
+    let failed = quantum(&mut book, Some(Err("cells broke".into())));
+    assert_eq!(failed.evidence_delta, [0; 4]);
+    assert_eq!(failed.evidence_error.as_deref(), Some("cells broke"));
+    // The failed read kept the last cells: the next success reports
+    // everything since the second quantum.
+    let third = quantum(&mut book, Some(Ok([5, 4, 1, 4])));
+    assert_eq!(third.evidence_delta, [3, 0, 0, 1]);
+    assert!(third.evidence_error.is_none());
+    // P0: no reading, zero deltas, no error.
+    let mut p0 = test_book(8, 16, None);
+    let idle = quantum(&mut p0, None);
+    assert_eq!(idle.evidence_delta, [0; 4]);
+    assert!(idle.evidence_error.is_none());
+}
+
+/// Keymeta Task 7 ring gate, drain half (5k zero-loss): five thousand
+/// writer-built records across token and mechanism rows flow through
+/// the bounded INFO service, decode, and join with no loss, no
+/// malformed record and no refusal.
+#[test]
+fn info_drain_absorbs_five_thousand_records_without_loss() {
+    use super::super::activation::service_inventory_info_with;
+    use crate::discovery::caller_registry::{CallerId, ModuleId};
+    use crate::inventory_provider_info::{InfoJoin, decode_info_record};
+    use p11scope_ebpf_common::inventory_info::{
+        INFO_KIND_MECHANISM, INFO_KIND_TOKEN, INFO_LAYOUT_LP64, INFO_RECORD_LEN, INFO_STATUS_OK,
+        InfoHeader, encode_info_record,
+    };
+    use p11scope_ebpf_common::object_flow::{InfoStart, adapter_info_return};
+    use p11scope_ebpf_common::{FnByteReader, LinuxLayout};
+    use std::collections::VecDeque;
+    // 3000 token rows (distinct slots, one caller) stay under the
+    // 4096 run-wide cap; 2000 mechanism rows (25 slots × 80
+    // mechanisms) stay under both the per-slot 128 and the run-wide
+    // 32768 cap.
+    let mut records = Vec::with_capacity(5000);
+    for slot in 0..3000u64 {
+        let mut struct_bytes = vec![0xAAu8; 208];
+        struct_bytes[32..64].copy_from_slice(&[b'M'; 32]);
+        struct_bytes[64..80].copy_from_slice(&[b'X'; 16]);
+        struct_bytes[96..104].copy_from_slice(&0x06u64.to_le_bytes());
+        struct_bytes[136..144].copy_from_slice(&255u64.to_le_bytes());
+        struct_bytes[144..152].copy_from_slice(&4u64.to_le_bytes());
+        struct_bytes[184..186].copy_from_slice(&[2, 6]);
+        struct_bytes[186..188].copy_from_slice(&[2, 7]);
+        records.push((INFO_KIND_TOKEN, struct_bytes, slot, 0u64));
+    }
+    for slot in 0..25u64 {
+        for mechanism in 0..80u64 {
+            let mut struct_bytes = vec![0u8; 24];
+            struct_bytes[0..8].copy_from_slice(&1024u64.to_le_bytes());
+            struct_bytes[8..16].copy_from_slice(&4096u64.to_le_bytes());
+            struct_bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+            records.push((INFO_KIND_MECHANISM, struct_bytes, slot, 0x1000 + mechanism));
+        }
+    }
+    assert_eq!(records.len(), 5000);
+    let mut feeder = VecDeque::with_capacity(5000);
+    for (kind, struct_bytes, slot, mechanism) in &records {
+        let base = 0x4000u64;
+        let stash = InfoStart {
+            info_ptr: base,
+            slot: *slot,
+            mechanism: *mechanism,
+            kind: *kind,
+            layout: INFO_LAYOUT_LP64,
+            reserved: [0; 6],
+        };
+        let mut reader = FnByteReader(|address: u64, _layout: LinuxLayout, out: &mut [u8]| {
+            let start = usize::try_from(address.wrapping_sub(base)).map_err(|_| ())?;
+            out.copy_from_slice(struct_bytes.get(start..start + out.len()).ok_or(())?);
+            Ok(())
+        });
+        let mut payload = [0u8; 120];
+        let verdict = adapter_info_return(&stash, 0, LinuxLayout::Lp64, &mut payload, &mut reader);
+        assert!(matches!(
+            verdict,
+            p11scope_ebpf_common::object_flow::InfoReturnVerdict::Emit(_)
+        ));
+        let header = InfoHeader {
+            endpoint: 7,
+            kind: *kind,
+            layout: INFO_LAYOUT_LP64,
+            reserved0: 0,
+            host_tgid: 4242,
+            reserved1: 0,
+            task_cookie: 11,
+            exec_id: 9,
+            slot: *slot,
+            mechanism: *mechanism,
+        };
+        let mut out = [0u8; INFO_RECORD_LEN];
+        assert!(encode_info_record(
+            &mut out,
+            &header,
+            INFO_STATUS_OK,
+            &payload
+        ));
+        feeder.push_back(super::super::activation::InfoItem::Record(out));
+    }
+    let mut join = InfoJoin::new();
+    let mut malformed = 0u64;
+    let service = service_inventory_info_with(
+        8192,
+        Instant::now() + Duration::from_secs(30),
+        || Ok(feeder.pop_front()),
+        |record: [u8; 176]| match decode_info_record(&record) {
+            Ok(decoded) => {
+                join.ingest(&decoded, ModuleId(1), Some(CallerId(11)), None);
+                Ok(())
+            }
+            Err(_) => {
+                malformed += 1;
+                Ok(())
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(service.dispatched, 5000);
+    assert_eq!(malformed, 0);
+    let mut accounting = InfoRingAccounting::default();
+    accounting.note_info_quantum(5000, service.dispatched as u64);
+    assert_eq!(accounting.loss, 0, "zero-loss across the 5k quantum");
+    let (providers, observations) = join.finish();
+    assert!(providers.is_empty(), "no provider records in this gate");
+    assert_eq!(observations.tokens.len(), 3000);
+    assert_eq!(observations.mechanisms.len(), 2000);
+    assert_eq!(
+        observations.gaps,
+        crate::inventory_provider_info::ProviderGaps::default()
     );
 }

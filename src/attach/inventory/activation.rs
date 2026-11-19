@@ -45,6 +45,9 @@ pub(super) struct InventoryEndpoint {
     pub(super) object: PinnedObjectId,
     pub(super) file_offset: u64,
     pub(super) abi: ElfAbi,
+    /// Keymeta Task 7 (spec §17.4): the endpoint's info kind (`None`
+    /// = usage-only), carried from the attach set.
+    pub(super) info_kind: Option<u8>,
 }
 
 impl InventoryTargets {
@@ -82,6 +85,10 @@ impl InventoryTargets {
                 object: slot.object,
                 file_offset: slot.file_offset,
                 abi: pin.abi(),
+                // The plan path predates the attach set's kind rule;
+                // the capture facade (which carries kinds) is the
+                // only producer of info endpoints.
+                info_kind: None,
             });
         }
         targets.check_unchanged()?;
@@ -256,6 +263,14 @@ pub(super) enum InventoryAttachRequest<'a> {
         file_offset: u64,
         cookie: u64,
     },
+    /// Keymeta Task 7 (spec §17.4): one info return (uretprobe) at
+    /// an info endpoint's site, attempted after its entry links.
+    Return {
+        program: &'static str,
+        path: &'a Path,
+        file_offset: u64,
+        cookie: u64,
+    },
 }
 
 /// One attach group's request: every site of one (object, entry program)
@@ -299,6 +314,41 @@ pub(super) trait InventoryLinkIo {
             closed_leaves: 0,
         })
     }
+    /// Keymeta Task 7 (spec §17.4): one uretprobe-multi group per
+    /// (object, info return program), mirroring `attach_entry_group`.
+    /// An IO without multi support refuses.
+    fn attach_return_group(
+        &mut self,
+        _request: InventoryGroupRequest<'_>,
+    ) -> std::result::Result<InventoryGroupAttach<Self::Link>, p11scope_bpf_multi::BisectHalt> {
+        Err(p11scope_bpf_multi::BisectHalt {
+            halt: p11scope_bpf_multi::GroupHalt::Unsupported(std::io::Error::from_raw_os_error(
+                libc::EOPNOTSUPP,
+            )),
+            closed_leaves: 0,
+        })
+    }
+    /// Keymeta Task 7 (spec §17.4, fix9 R1): publish one endpoint's
+    /// info kind after its return link exists (write-once,
+    /// read-back, refused re-publication).
+    fn publish_info_kind(&mut self, _endpoint: u32, _kind: u8) -> Result<()> {
+        bail!("info kind publication needs an INFO_KIND map")
+    }
+
+    /// Keymeta Task 7 (spec §17.4, INV-2): revoke one endpoint's
+    /// info kind after a later pass proved its names aliased (read,
+    /// zero-write, read-back, idempotent), resuming at `resume`
+    /// after an earlier yield and starting no map operation at or
+    /// past `deadline`.
+    fn revoke_info_kind(
+        &mut self,
+        _endpoint: u32,
+        _resume: super::RevokeSubstep,
+        _deadline: Instant,
+        _now: &mut dyn FnMut() -> Instant,
+    ) -> Result<super::RevokeStepOutcome> {
+        bail!("info kind revocation needs an INFO_KIND map")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -307,6 +357,13 @@ pub(super) struct InventoryCleanupReceipt {
     pub(super) closed: usize,
     pub(super) failures: Vec<InventoryDetachFailure>,
     callback_quiescence_proven: bool,
+    /// Keymeta Task 7 (spec §17.4): the INFO_START scrub did not
+    /// prove an empty stash (retained links refused it). Explicitly
+    /// unproven, never silently dirty.
+    pub(super) info_teardown_unproven: bool,
+    /// Keymeta Task 7 (spec §17.4): the scrub phase's last concrete
+    /// failure, if it transferred unproven.
+    pub(super) info_scrub_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -321,6 +378,11 @@ pub(super) enum InventoryLinkIdentity {
     Entry(u32),
     /// One link of the capture's attach group with this serial (Multi).
     EntryGroup(u32),
+    /// Keymeta Task 7 (spec §17.4): one info return link (Singles).
+    Return(u32),
+    /// Keymeta Task 7 (spec §17.4): one info return-group link with
+    /// this serial (Multi).
+    ReturnGroup(u32),
 }
 
 pub(super) struct InventoryLinked<L> {
@@ -432,9 +494,14 @@ pub(super) fn attach_published_entry_with<I: InventoryLinkIo>(
     targets
         .check_pin(entry.object)
         .with_context(|| format!("before Inventory entry {}", entry.id))?;
-    let program = match entry.abi {
-        ElfAbi::Lp64 => "p11_usage_entry_lp64",
-        ElfAbi::Ilp32 => "p11_usage_entry_ia32",
+    // Keymeta Task 7 (spec §17.4): info endpoints link the
+    // inventory info entry pair; every other endpoint keeps its
+    // usage entry.
+    let program = match (entry.abi, entry.info_kind) {
+        (ElfAbi::Lp64, Some(_)) => "p11_info_entry_lp64",
+        (ElfAbi::Ilp32, Some(_)) => "p11_info_entry_ia32",
+        (ElfAbi::Lp64, None) => "p11_usage_entry_lp64",
+        (ElfAbi::Ilp32, None) => "p11_usage_entry_ia32",
     };
     let path = pin.attach_path();
     let cookie =
@@ -458,6 +525,49 @@ pub(super) fn attach_published_entry_with<I: InventoryLinkIo>(
     targets
         .check_pin(entry.object)
         .with_context(|| format!("during Inventory entry {} attachment", entry.id))
+}
+
+/// Keymeta Task 7 (spec §17.4): attaches one info return whose entry
+/// already linked: pin unchanged before, the link registered
+/// immediately, then the post-acquisition custody check and the pin
+/// unchanged after. A failure leaves any acquired link in `links`.
+/// Callers handle EMFILE (defer + named gap, the endpoint still
+/// attaches) apart from deterministic refusals (fail disclosed).
+pub(super) fn attach_published_return_with<I: InventoryLinkIo>(
+    io: &mut I,
+    targets: &InventoryTargets,
+    entry: &InventoryEndpoint,
+    links: &mut Vec<InventoryLinked<I::Link>>,
+) -> Result<()> {
+    let pin = targets
+        .pins
+        .get(&entry.object)
+        .context("missing Inventory target pin")?;
+    targets
+        .check_pin(entry.object)
+        .with_context(|| format!("before Inventory return {}", entry.id))?;
+    let path = pin.attach_path();
+    let cookie =
+        (u64::from(p11scope_ebpf_common::INVENTORY_COOKIE_TAG) << 32) | u64::from(entry.id);
+    let handle = io
+        .attach(InventoryAttachRequest::Return {
+            program: "p11_info_return",
+            path: &path,
+            file_offset: entry.file_offset,
+            cookie,
+        })
+        .with_context(|| format!("attaching Inventory return {}", entry.id))?;
+    // Register immediately, before any post-attach check can fail.
+    links.push(InventoryLinked {
+        target: InventoryLinkIdentity::Return(entry.id),
+        handle,
+    });
+    if let Some(error) = io.attachment_error(&links.last().unwrap().handle) {
+        bail!(error);
+    }
+    targets
+        .check_pin(entry.object)
+        .with_context(|| format!("during Inventory return {} attachment", entry.id))
 }
 
 fn stop_inventory_links_with<I: InventoryLinkIo>(
@@ -486,6 +596,468 @@ fn stop_inventory_links_with<I: InventoryLinkIo>(
     *links = uncertain;
     // FD closure is not an Inventory callback-quiescence protocol.
     receipt
+}
+
+/// Rows cleared per INFO_START scrub step (spec §17.4): each
+/// retirement poll does at most this many zero-verify-remove rows,
+/// then yields. The poll loop owns the stop deadline; steps resume
+/// from carried progress.
+#[cfg(not(feature = "stub-object-attributes"))]
+const INFO_SCRUB_BATCH: usize = 64;
+
+/// Native map operations per INFO_START scrub poll (spec §17.4,
+/// INV-2): one map-shape validation plus the 64-row table batch —
+/// one enumeration plus zero, read-back and remove per row
+/// (1 + 64×4). A full batch spends the allowance and defers its
+/// terminal emptiness observation to the next poll. No native call
+/// starts once the allowance is spent or the stop deadline passes.
+#[cfg(not(feature = "stub-object-attributes"))]
+const INFO_SCRUB_OPS_PER_POLL: u64 = 257;
+
+/// One retirement poll's native-operation allowance for the
+/// INFO_START scrub (spec §17.4, INV-2): at most
+/// `INFO_SCRUB_OPS_PER_POLL` map operations, and none at or past
+/// the stop `deadline`. The clock injects so tests script expiry
+/// without racing the wall clock.
+#[cfg(not(feature = "stub-object-attributes"))]
+struct ScrubBudget<F: FnMut() -> Instant> {
+    ops_remaining: u64,
+    deadline: Instant,
+    now: F,
+}
+
+#[cfg(not(feature = "stub-object-attributes"))]
+impl<F: FnMut() -> Instant> ScrubBudget<F> {
+    fn per_poll(deadline: Instant, now: F) -> Self {
+        Self {
+            ops_remaining: INFO_SCRUB_OPS_PER_POLL,
+            deadline,
+            now,
+        }
+    }
+
+    fn expired(&mut self) -> bool {
+        (self.now)() >= self.deadline
+    }
+}
+
+/// One INFO_START row source for the stop scrub (spec §17.4). The
+/// real impl drives the kernel map; tests drive an in-memory fake.
+/// The row lifecycle splits into its three native substeps so a
+/// step that yields mid-row resumes at the pending substep instead
+/// of redoing finished work.
+#[cfg(not(feature = "stub-object-attributes"))]
+trait InfoScrubTable {
+    /// The map's capacity: clearing this many rows without emptying
+    /// saturates (concurrent inserts or an unremovable row).
+    fn capacity(&self) -> u32;
+    /// Any remaining row's key, or `None` when empty.
+    fn first_key(&mut self) -> Result<Option<[u8; 16]>>;
+    /// Zero one row's value (BPF_EXIST forbids manufacturing an
+    /// owner: a failed delete leaves no private pointer bytes).
+    fn zero_row(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError>;
+    /// Verify one row reads back zero.
+    fn verify_row_zero(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError>;
+    /// Remove one zeroed row.
+    fn remove_row(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError>;
+}
+
+/// What one scrub row operation found: the row gone (an in-flight
+/// return removed it between polls — the stale cursor clears and
+/// the step re-enumerates) or a concrete failure (retryable and
+/// reportable, the cursor kept).
+#[cfg(not(feature = "stub-object-attributes"))]
+#[derive(Debug)]
+enum ScrubRowError {
+    Missing,
+    Failed(anyhow::Error),
+}
+
+/// A scrub row interrupted between native substeps: its key plus
+/// the next substep to run. Carried in the scrub phase across
+/// polls, so a resume never redoes finished work.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingScrubRow {
+    key: [u8; 16],
+    next: ScrubSubstep,
+}
+
+/// The next native substep for a [`PendingScrubRow`].
+#[cfg(not(feature = "stub-object-attributes"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrubSubstep {
+    Zero,
+    Verify,
+    Remove,
+}
+
+/// What one bounded scrub step found.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[derive(Debug, PartialEq, Eq)]
+enum InfoScrubOutcome {
+    /// The table observed empty: teardown proven for the rows.
+    Complete,
+    /// The batch spent with rows remaining: re-poll and resume.
+    Pending,
+    /// A full capacity cleared without emptying: concurrent inserts
+    /// or an unremovable row. The caller resets progress and retries,
+    /// bounded by the poll loop's stop budget.
+    Saturated,
+}
+
+/// One bounded INFO_START scrub step (spec §17.4, INV-2):
+/// zero-verify-remove up to `INFO_SCRUB_BATCH` rows, carrying the
+/// cleared count in `progress` and the interrupted row in `pending`,
+/// and charging every native call to the poll's `budget`. No native
+/// call starts without allowance left or at or past the stop
+/// deadline — an expired budget yields `Pending` with zero
+/// operations, and a short allowance yields mid-row with the
+/// pending key and substep kept, so the resume never redoes
+/// finished work. Observes emptiness after a full batch before
+/// yielding, so a complete table reports `Complete` without a
+/// spurious extra poll.
+#[cfg(not(feature = "stub-object-attributes"))]
+fn scrub_info_start_step<F: FnMut() -> Instant>(
+    table: &mut impl InfoScrubTable,
+    progress: &mut u64,
+    pending: &mut Option<PendingScrubRow>,
+    budget: &mut ScrubBudget<F>,
+) -> Result<InfoScrubOutcome> {
+    if budget.expired() {
+        return Ok(InfoScrubOutcome::Pending);
+    }
+    // Finish a row the last step interrupted, one charged substep
+    // at a time. Concrete failures return with the pending row
+    // untouched, so the retry resumes at the failed substep; a
+    // disappeared row clears the stale cursor and counts resolved,
+    // and the step re-enumerates. A resumed removal consumes its row
+    // slot in this step's batch.
+    let mut rows_this_step = 0usize;
+    while let Some(PendingScrubRow { key, next }) = *pending {
+        if budget.ops_remaining == 0 || budget.expired() {
+            return Ok(InfoScrubOutcome::Pending);
+        }
+        let outcome = match next {
+            ScrubSubstep::Zero => table.zero_row(&key),
+            ScrubSubstep::Verify => table.verify_row_zero(&key),
+            ScrubSubstep::Remove => table.remove_row(&key),
+        };
+        match outcome {
+            Err(ScrubRowError::Missing) => {
+                budget.ops_remaining -= 1;
+                *pending = None;
+                *progress = progress.saturating_add(1);
+                rows_this_step += 1;
+            }
+            Err(ScrubRowError::Failed(error)) => return Err(error),
+            Ok(()) => {
+                budget.ops_remaining -= 1;
+                match next {
+                    ScrubSubstep::Zero => {
+                        *pending = Some(PendingScrubRow {
+                            key,
+                            next: ScrubSubstep::Verify,
+                        });
+                    }
+                    ScrubSubstep::Verify => {
+                        *pending = Some(PendingScrubRow {
+                            key,
+                            next: ScrubSubstep::Remove,
+                        });
+                    }
+                    ScrubSubstep::Remove => {
+                        *pending = None;
+                        *progress = progress.saturating_add(1);
+                        rows_this_step += 1;
+                    }
+                }
+            }
+        }
+    }
+    'rows: for _ in rows_this_step..INFO_SCRUB_BATCH {
+        if budget.ops_remaining == 0 || budget.expired() {
+            return Ok(InfoScrubOutcome::Pending);
+        }
+        let Some(key) = table
+            .first_key()
+            .context("enumerating stopped INFO_START")?
+        else {
+            return Ok(InfoScrubOutcome::Complete);
+        };
+        budget.ops_remaining -= 1;
+        if *progress >= u64::from(table.capacity()) {
+            return Ok(InfoScrubOutcome::Saturated);
+        }
+        // The pending row records each substep before it runs: a
+        // yield or an error resumes (or retries) exactly there. A
+        // row disappearing mid-step resolves like a cleared row and
+        // the step takes a fresh enumeration.
+        for next in [
+            ScrubSubstep::Zero,
+            ScrubSubstep::Verify,
+            ScrubSubstep::Remove,
+        ] {
+            if budget.ops_remaining == 0 || budget.expired() {
+                *pending = Some(PendingScrubRow { key, next });
+                return Ok(InfoScrubOutcome::Pending);
+            }
+            *pending = Some(PendingScrubRow { key, next });
+            let outcome = match next {
+                ScrubSubstep::Zero => table.zero_row(&key),
+                ScrubSubstep::Verify => table.verify_row_zero(&key),
+                ScrubSubstep::Remove => table.remove_row(&key),
+            };
+            match outcome {
+                Err(ScrubRowError::Missing) => {
+                    budget.ops_remaining -= 1;
+                    *pending = None;
+                    *progress = progress.saturating_add(1);
+                    continue 'rows;
+                }
+                Err(ScrubRowError::Failed(error)) => return Err(error),
+                Ok(()) => {
+                    budget.ops_remaining -= 1;
+                }
+            }
+        }
+        *pending = None;
+        *progress = progress.saturating_add(1);
+    }
+    if budget.ops_remaining == 0 || budget.expired() {
+        return Ok(InfoScrubOutcome::Pending);
+    }
+    budget.ops_remaining -= 1;
+    match table.first_key().context("checking stopped INFO_START")? {
+        None => Ok(InfoScrubOutcome::Complete),
+        Some(_) => Ok(InfoScrubOutcome::Pending),
+    }
+}
+
+/// The real scrub table: the kernel INFO_START map, validated like
+/// every other inventory map (exact type, key/value sizes and the
+/// map's own capacity).
+#[cfg(not(feature = "stub-object-attributes"))]
+struct KernelScrubTable<'m> {
+    table: aya::maps::HashMap<&'m mut aya::maps::MapData, [u8; 16], [u8; 32]>,
+    capacity: u32,
+}
+
+/// True when a kernel map error means the row is gone: a lookup
+/// miss, or an update/delete refused with ENOENT (BPF_EXIST never
+/// manufactures the row, deletes never resurrect it).
+#[cfg(not(feature = "stub-object-attributes"))]
+fn scrub_row_is_missing(error: &aya::maps::MapError) -> bool {
+    matches!(error, aya::maps::MapError::KeyNotFound)
+        || matches!(
+            error,
+            aya::maps::MapError::SyscallError(error)
+                if error.io_error.raw_os_error() == Some(libc::ENOENT)
+        )
+}
+
+#[cfg(not(feature = "stub-object-attributes"))]
+impl InfoScrubTable for KernelScrubTable<'_> {
+    fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    fn first_key(&mut self) -> Result<Option<[u8; 16]>> {
+        Ok(self.table.keys().next().transpose()?)
+    }
+
+    fn zero_row(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError> {
+        self.table.insert(*key, [0; 32], 2).map_err(|error| {
+            if scrub_row_is_missing(&error) {
+                ScrubRowError::Missing
+            } else {
+                ScrubRowError::Failed(
+                    anyhow::Error::from(error).context("zeroing stopped INFO_START"),
+                )
+            }
+        })
+    }
+
+    fn verify_row_zero(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError> {
+        let value = self.table.get(key, 0).map_err(|error| {
+            if scrub_row_is_missing(&error) {
+                ScrubRowError::Missing
+            } else {
+                ScrubRowError::Failed(
+                    anyhow::Error::from(error).context("reading stopped INFO_START zero"),
+                )
+            }
+        })?;
+        if value != [0; 32] {
+            return Err(ScrubRowError::Failed(anyhow::anyhow!(
+                "stopped INFO_START zero readback differs"
+            )));
+        }
+        Ok(())
+    }
+
+    fn remove_row(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError> {
+        self.table.remove(key).map_err(|error| {
+            if scrub_row_is_missing(&error) {
+                ScrubRowError::Missing
+            } else {
+                ScrubRowError::Failed(
+                    anyhow::Error::from(error).context("removing stopped INFO_START"),
+                )
+            }
+        })
+    }
+}
+
+/// Fetch and validate the INFO_START shape once per scrub poll
+/// (spec §17.4, INV-2): the map's own capacity plus the exact
+/// type/key/value/flags contract. The fetch is injectable so the
+/// allowance twin drives production validation without a kernel
+/// map. The single metadata read charges one operation to the same
+/// poll allowance as the table calls, with the deadline checked at
+/// that call. `None`: no allowance was left or the budget expired
+/// before the fetch, so the poll runs zero native calls.
+#[cfg(not(feature = "stub-object-attributes"))]
+fn scrub_table_capacity_with<F: FnMut() -> Instant>(
+    fetch: &mut dyn FnMut() -> Result<crate::attach::ExactMapMetadata>,
+    budget: &mut ScrubBudget<F>,
+) -> Result<Option<u32>> {
+    use super::map_metadata;
+    use crate::attach::compare_map_metadata;
+    use aya::maps::MapType;
+    if budget.ops_remaining == 0 || budget.expired() {
+        return Ok(None);
+    }
+    let meta = fetch()?;
+    budget.ops_remaining -= 1;
+    compare_map_metadata(
+        "INFO_START",
+        meta,
+        map_metadata(MapType::Hash, 16, 32, meta.max_entries, 0),
+    )?;
+    Ok(Some(meta.max_entries))
+}
+
+/// Validate the kernel INFO_START map and run one bounded scrub
+/// step against it. An expired budget yields before the map
+/// validation, so an expired poll runs zero native calls.
+#[cfg(not(feature = "stub-object-attributes"))]
+fn scrub_info_start_step_on<F: FnMut() -> Instant>(
+    ebpf: &mut Ebpf,
+    progress: &mut u64,
+    pending: &mut Option<PendingScrubRow>,
+    budget: &mut ScrubBudget<F>,
+) -> Result<InfoScrubOutcome> {
+    use super::read_map_metadata;
+    use aya::maps::{HashMap, Map};
+    let Some(max_entries) = scrub_table_capacity_with(
+        &mut || {
+            let map = ebpf
+                .map_mut("INFO_START")
+                .context("INFO_START map for info scrub")?;
+            match &*map {
+                Map::HashMap(data) => read_map_metadata("INFO_START", data),
+                _ => anyhow::bail!("unexpected INFO_START map variant for info scrub"),
+            }
+        },
+        budget,
+    )?
+    else {
+        return Ok(InfoScrubOutcome::Pending);
+    };
+    let map = ebpf
+        .map_mut("INFO_START")
+        .context("INFO_START map for info scrub")?;
+    let mut table = KernelScrubTable {
+        table: HashMap::try_from(map)?,
+        capacity: max_entries,
+    };
+    scrub_info_start_step(&mut table, progress, pending, budget)
+}
+
+/// Bounded INFO_START scrub phase (spec §17.4): explicit retirement
+/// work with progress and concrete failures. Refuses while links are
+/// retained (probes still mutating); otherwise runs one bounded step
+/// per poll.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[derive(Debug, Default)]
+struct InfoScrubPhase {
+    cleared: u64,
+    pending: Option<PendingScrubRow>,
+    error: Option<String>,
+}
+
+/// What the scrub phase tells try_finish after one poll.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[derive(Debug, PartialEq, Eq)]
+enum InfoScrubDirective {
+    /// Transfer the state: teardown proven (`unproven` false) or
+    /// explicitly unproven (retained links refused the scrub).
+    Transfer { unproven: bool },
+    /// Scrub more on the next poll.
+    Retry,
+}
+
+#[cfg(not(feature = "stub-object-attributes"))]
+impl InfoScrubPhase {
+    /// One poll: refuse when links are retained (transfer with
+    /// teardown explicitly unproven), else run one bounded step. A
+    /// complete table transfers clean (clearing transient errors);
+    /// pending work and concrete failures retry with progress and
+    /// the failure carried; saturation resets progress and retries,
+    /// bounded by the poll loop's stop budget.
+    fn poll(
+        &mut self,
+        retained_links: bool,
+        step: impl FnOnce(&mut u64, &mut Option<PendingScrubRow>) -> Result<InfoScrubOutcome, String>,
+    ) -> InfoScrubDirective {
+        if retained_links {
+            self.error = Some("scrub refused: links retained".into());
+            return InfoScrubDirective::Transfer { unproven: true };
+        }
+        match step(&mut self.cleared, &mut self.pending) {
+            Ok(InfoScrubOutcome::Complete) => {
+                self.error = None;
+                InfoScrubDirective::Transfer { unproven: false }
+            }
+            Ok(InfoScrubOutcome::Pending) => InfoScrubDirective::Retry,
+            Ok(InfoScrubOutcome::Saturated) => {
+                self.cleared = 0;
+                InfoScrubDirective::Retry
+            }
+            Err(error) => {
+                self.error = Some(error);
+                InfoScrubDirective::Retry
+            }
+        }
+    }
+
+    /// The teardown outcome for the operator right now: a carried
+    /// concrete failure (even while retries continue), else the
+    /// running progress.
+    fn status(&self) -> InfoTeardown {
+        match &self.error {
+            Some(error) => InfoTeardown::Failed {
+                error: error.clone(),
+            },
+            None => InfoTeardown::Pending {
+                cleared: self.cleared,
+            },
+        }
+    }
+}
+
+/// The INFO stash teardown outcome for the operator (spec §17.4):
+/// proven (P0 carries no map; FULL proved an empty stash), still
+/// running with progress, or failing with its concrete carried
+/// error. A transferred-but-unproven teardown (retained links
+/// refused the scrub) rides the typed [`InventoryCleanupReceipt`]
+/// fields instead — the stop line reads both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InfoTeardown {
+    Proven,
+    Pending { cleared: u64 },
+    Failed { error: String },
 }
 
 pub(super) struct InventoryReadWindow {
@@ -618,6 +1190,39 @@ pub(super) struct AyaInventoryLinkIo<'a> {
 #[cfg(test)]
 type BeforeAttach<'a> = dyn FnMut(&InventoryAttachRequest<'_>) -> Result<()> + 'a;
 
+impl AyaInventoryLinkIo<'_> {
+    /// One entry or info-return uprobe at a site (the program's ELF
+    /// section decides entry vs return): attach, transfer link
+    /// custody, and quarantine anything unexpected.
+    fn attach_uprobe(
+        ebpf: &mut Ebpf,
+        program: &'static str,
+        path: &Path,
+        file_offset: u64,
+        cookie: u64,
+        entry_scope: UProbeScope,
+    ) -> Result<KernelInventoryLink> {
+        let probe: &mut UProbe = ebpf.program_mut(program).context(program)?.try_into()?;
+        let point = UProbeAttachPoint {
+            location: UProbeAttachLocation::AbsoluteOffset(file_offset),
+            cookie: Some(cookie),
+        };
+        let id = probe.attach([point], path, entry_scope)?;
+        Ok(match probe.take_link(id) {
+            Ok(link) => match link.into_fd_links() {
+                Ok(links) => {
+                    KernelInventoryLink::Fds(links.into_iter().map(InventoryFd::Aya).collect())
+                }
+                Err(link) => KernelInventoryLink::UnexpectedUProbe(link),
+            },
+            Err(error) => KernelInventoryLink::RegistryUncertain {
+                program,
+                error: error.to_string(),
+            },
+        })
+    }
+}
+
 impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
     type Link = KernelInventoryLink;
 
@@ -658,30 +1263,30 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
                 path,
                 file_offset,
                 cookie,
-            } => {
-                let probe: &mut UProbe = self
-                    .ebpf
-                    .program_mut(program)
-                    .context(program)?
-                    .try_into()?;
-                let point = UProbeAttachPoint {
-                    location: UProbeAttachLocation::AbsoluteOffset(file_offset),
-                    cookie: Some(cookie),
-                };
-                let id = probe.attach([point], path, self.entry_scope)?;
-                Ok(match probe.take_link(id) {
-                    Ok(link) => match link.into_fd_links() {
-                        Ok(links) => KernelInventoryLink::Fds(
-                            links.into_iter().map(InventoryFd::Aya).collect(),
-                        ),
-                        Err(link) => KernelInventoryLink::UnexpectedUProbe(link),
-                    },
-                    Err(error) => KernelInventoryLink::RegistryUncertain {
-                        program,
-                        error: error.to_string(),
-                    },
-                })
-            }
+            } => Self::attach_uprobe(
+                self.ebpf,
+                program,
+                path,
+                file_offset,
+                cookie,
+                self.entry_scope,
+            ),
+            // Keymeta Task 7 (spec §17.4): the info return attaches
+            // exactly like an entry (the ELF section makes it a
+            // uretprobe), at the same site and cookie.
+            InventoryAttachRequest::Return {
+                program,
+                path,
+                file_offset,
+                cookie,
+            } => Self::attach_uprobe(
+                self.ebpf,
+                program,
+                path,
+                file_offset,
+                cookie,
+                self.entry_scope,
+            ),
         }
     }
 
@@ -774,6 +1379,112 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
                 .collect(),
         })
     }
+
+    fn attach_return_group(
+        &mut self,
+        request: InventoryGroupRequest<'_>,
+    ) -> std::result::Result<InventoryGroupAttach<Self::Link>, p11scope_bpf_multi::BisectHalt> {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let InventoryGroupRequest {
+            program,
+            path,
+            sites,
+        } = request;
+        // The return program was loaded plainly; a missing or
+        // unloaded program refuses every site, never the backend.
+        let prog_fd = (|| -> Result<std::os::fd::RawFd> {
+            let probe: &mut UProbe = self
+                .ebpf
+                .program_mut(program)
+                .context(program)?
+                .try_into()?;
+            Ok(probe.fd()?.as_fd().as_raw_fd())
+        })();
+        let prog_fd = match prog_fd {
+            Ok(fd) => fd,
+            Err(error) => {
+                return Ok(InventoryGroupAttach {
+                    links: Vec::new(),
+                    refused: (0..sites.len())
+                        .map(|index| {
+                            (
+                                index,
+                                std::io::Error::other(format!("Inventory {program}: {error:#}")),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        };
+        let pid = crate::attach::multi_link_pid(self.entry_scope);
+        let (links, refused) = p11scope_bpf_multi::bisect_attach_counted(
+            &mut |slice| {
+                let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                p11scope_bpf_multi::attach_group(prog_fd, pid, path, &offsets, &cookies, true)
+            },
+            sites,
+        )?;
+        Ok(InventoryGroupAttach {
+            links: links
+                .into_iter()
+                .map(|fd| KernelInventoryLink::Fds(vec![InventoryFd::Multi(fd)]))
+                .collect(),
+            refused: refused
+                .into_iter()
+                .map(|site| (site.index, site.error))
+                .collect(),
+        })
+    }
+
+    fn publish_info_kind(&mut self, endpoint: u32, kind: u8) -> Result<()> {
+        struct MapIo<'b> {
+            ebpf: &'b mut Ebpf,
+        }
+        impl super::InfoKindIo for MapIo<'_> {
+            fn read_kind(&mut self, endpoint: u32) -> Result<u64> {
+                let map: Array<_, u64> =
+                    Array::try_from(self.ebpf.map("INFO_KIND").context("INFO_KIND map")?)?;
+                Ok(map.get(&endpoint, 0)?)
+            }
+            fn write_kind(&mut self, endpoint: u32, value: u64) -> Result<()> {
+                let mut map: Array<_, u64> =
+                    Array::try_from(self.ebpf.map_mut("INFO_KIND").context("INFO_KIND map")?)?;
+                Ok(map.set(endpoint, value, 0)?)
+            }
+        }
+        super::publish_info_kind_with(&mut MapIo { ebpf: self.ebpf }, endpoint, kind)
+    }
+
+    fn revoke_info_kind(
+        &mut self,
+        endpoint: u32,
+        resume: super::RevokeSubstep,
+        deadline: Instant,
+        now: &mut dyn FnMut() -> Instant,
+    ) -> Result<super::RevokeStepOutcome> {
+        struct MapIo<'b> {
+            ebpf: &'b mut Ebpf,
+        }
+        impl super::InfoKindIo for MapIo<'_> {
+            fn read_kind(&mut self, endpoint: u32) -> Result<u64> {
+                let map: Array<_, u64> =
+                    Array::try_from(self.ebpf.map("INFO_KIND").context("INFO_KIND map")?)?;
+                Ok(map.get(&endpoint, 0)?)
+            }
+            fn write_kind(&mut self, endpoint: u32, value: u64) -> Result<()> {
+                let mut map: Array<_, u64> =
+                    Array::try_from(self.ebpf.map_mut("INFO_KIND").context("INFO_KIND map")?)?;
+                Ok(map.set(endpoint, value, 0)?)
+            }
+        }
+        super::revoke_info_kind_step(
+            &mut MapIo { ebpf: self.ebpf },
+            endpoint,
+            resume,
+            deadline,
+            now,
+        )
+    }
 }
 
 fn close_inventory_fds(links: &mut Vec<InventoryFd>) -> Result<()> {
@@ -787,6 +1498,9 @@ fn close_inventory_fds(links: &mut Vec<InventoryFd>) -> Result<()> {
 pub(super) struct InventoryState {
     links: Vec<InventoryLinked<KernelInventoryLink>>,
     discovery: Option<OwnedDiscoveryDrain>,
+    /// Keymeta Task 7 (spec §17.4): the session's retained INFO
+    /// consumer (`None` in P0, whose object carries no INFO ring).
+    info: Option<OwnedInfoDrain>,
     prepared: PreparedInventory,
     history: InventoryUsageHistory,
     malformed_discovery: u64,
@@ -855,6 +1569,10 @@ impl InventoryState {
             InventoryLinkIdentity::Lifecycle(_) => (0, 1),
             InventoryLinkIdentity::Entry(id) => (1, id),
             InventoryLinkIdentity::EntryGroup(serial) => (2, serial),
+            // Keymeta Task 7 (spec §17.4): info returns retire with
+            // their entries and entry groups.
+            InventoryLinkIdentity::Return(id) => (1, id),
+            InventoryLinkIdentity::ReturnGroup(serial) => (2, serial),
         });
         receipt
     }
@@ -1085,6 +1803,40 @@ impl InventoryState {
         self.discovery_dequeue()
     }
 
+    /// Keymeta Task 7 (spec §17.4): one INFO dequeue (`None` before
+    /// the reader exists, including P0).
+    pub(super) fn dequeue_info(&mut self) -> Result<Option<InfoItem>> {
+        match self.info.as_mut() {
+            Some(drain) => drain.dequeue(),
+            None => Ok(None),
+        }
+    }
+
+    /// Keymeta Task 7 (spec §17.4): submitted INFO records now, or
+    /// `None` before the reader exists (P0 reads nothing). A failed
+    /// map read rides `Some(Err)` with its cause — the terminal cut
+    /// must not publish a stale provisional difference as loss.
+    pub(super) fn info_produced(&self) -> Option<Result<u64, String>> {
+        self.info.as_ref()?;
+        Some(read_info_produced(&self.prepared.ebpf).map_err(|error| format!("{error:#}")))
+    }
+
+    /// Keymeta Task 7 (spec §17.4): the four INFO_EVIDENCE cells
+    /// now (insert failures, unmatched returns, nested overwrites,
+    /// stash mismatches), or `None` before the reader exists (P0
+    /// reads nothing). No cell lookup starts at or past the quantum
+    /// deadline: a mid-group expiry yields (the caller keeps its
+    /// previous sample), and a failed map read rides `Done(Err)`
+    /// with its cause, distinct from P0 absence.
+    pub(super) fn info_evidence(&self, deadline: Instant) -> Option<InfoEvidenceRead> {
+        self.info.as_ref()?;
+        Some(read_info_evidence(
+            &self.prepared.ebpf,
+            deadline,
+            &mut Instant::now,
+        ))
+    }
+
     /// See [`crate::events::discovery_head_pending`].
     pub(super) fn discovery_head_pending(&self) -> bool {
         self.discovery
@@ -1140,6 +1892,10 @@ pub(super) struct RetiringInventory {
     empty_worker: Option<std::thread::JoinHandle<Option<RetirementWork<Vec<InventoryFd>>>>>,
     cleanup: Option<InventoryCleanupReceipt>,
     control_error: Option<String>,
+    /// Keymeta Task 7 (spec §17.4): the bounded INFO_START scrub
+    /// phase, carrying progress and concrete failures across polls.
+    #[cfg(not(feature = "stub-object-attributes"))]
+    scrub: InfoScrubPhase,
 }
 
 impl RetiringInventory {
@@ -1159,6 +1915,8 @@ impl RetiringInventory {
             empty_worker: None,
             cleanup: None,
             control_error: None,
+            #[cfg(not(feature = "stub-object-attributes"))]
+            scrub: InfoScrubPhase::default(),
         };
         if work.links.is_empty() {
             retiring.cleanup = Some(InventoryCleanupReceipt::default());
@@ -1237,6 +1995,28 @@ impl RetiringInventory {
         (result, high_water)
     }
 
+    /// Keymeta Task 7 (spec §17.4): one retiring INFO dequeue
+    /// (`None` once the state transfers).
+    pub(super) fn dequeue_info(&mut self) -> Result<Option<InfoItem>> {
+        match self.state.as_mut() {
+            Some(state) => state.dequeue_info(),
+            None => Ok(None),
+        }
+    }
+
+    /// Keymeta Task 7 (spec §17.4): submitted INFO records now, or
+    /// `None` once the state transfers (P0 reads nothing). A failed
+    /// map read rides `Some(Err)` with its cause.
+    pub(super) fn info_produced(&self) -> Option<Result<u64, String>> {
+        self.state.as_ref()?.info_produced()
+    }
+
+    /// Keymeta Task 7 (spec §17.4): the four INFO_EVIDENCE cells
+    /// now, or `None` once the state transfers (P0 reads nothing).
+    pub(super) fn info_evidence(&self, deadline: Instant) -> Option<InfoEvidenceRead> {
+        self.state.as_ref()?.info_evidence(deadline)
+    }
+
     fn usage_snapshot(&mut self, window: InventoryReadWindow) -> InventoryUsageSnapshot {
         self.state.as_mut().unwrap().usage_snapshot(window, true)
     }
@@ -1264,9 +2044,64 @@ impl RetiringInventory {
         self.control_error.as_deref()
     }
 
-    pub(super) fn try_finish(mut self) -> std::result::Result<RetiredInventory, Box<Self>> {
+    /// True once every link had its close attempt (the detach half
+    /// of retirement), even while the INFO scrub still blocks the
+    /// ownership transfer.
+    pub(super) fn detach_completed(&self) -> bool {
+        self.cleanup.is_some()
+    }
+
+    /// The INFO stash teardown outcome for the operator (spec §17.4):
+    /// the scrub phase's live status on FULL, proven on P0 (no map).
+    pub(super) fn info_teardown(&self) -> InfoTeardown {
+        #[cfg(feature = "stub-object-attributes")]
+        {
+            InfoTeardown::Proven
+        }
+        #[cfg(not(feature = "stub-object-attributes"))]
+        {
+            self.scrub.status()
+        }
+    }
+
+    pub(super) fn try_finish(
+        mut self,
+        deadline: Instant,
+    ) -> std::result::Result<RetiredInventory, Box<Self>> {
+        // P0 objects carry no INFO_START map: no scrub runs there.
+        #[cfg(feature = "stub-object-attributes")]
+        let _ = deadline;
         let Some(cleanup) = self.cleanup.take() else {
             return Err(Box::new(self));
+        };
+        // Keymeta Task 7 (spec §17.4): the links are detached; scrub
+        // the info stash in bounded steps before transferring the
+        // state, refusing while links are retained (probes still
+        // mutating) with teardown explicitly unproven. Each poll
+        // spends at most one native-operation allowance and starts
+        // nothing at or past the stop deadline. Fresh maps per
+        // preparation mean no row survives the session either way. P0
+        // objects carry no INFO_START map.
+        #[cfg(not(feature = "stub-object-attributes"))]
+        let cleanup = if let Some(state) = self.state.as_mut() {
+            let retained = !cleanup.failures.is_empty();
+            let mut budget = ScrubBudget::per_poll(deadline, Instant::now);
+            match self.scrub.poll(retained, |cleared, pending| {
+                scrub_info_start_step_on(&mut state.prepared.ebpf, cleared, pending, &mut budget)
+                    .map_err(|error| format!("{error:#}"))
+            }) {
+                InfoScrubDirective::Transfer { unproven } => InventoryCleanupReceipt {
+                    info_teardown_unproven: unproven,
+                    info_scrub_error: self.scrub.error.clone(),
+                    ..cleanup
+                },
+                InfoScrubDirective::Retry => {
+                    self.cleanup = Some(cleanup);
+                    return Err(Box::new(self));
+                }
+            }
+        } else {
+            cleanup
         };
         Ok(RetiredInventory {
             state: self.state.take().unwrap(),
@@ -1296,6 +2131,142 @@ impl Drop for RetiringInventory {
         }
         state.drain_abandoned_quantum();
     }
+}
+
+/// Keymeta Task 7 (spec §17.4): one INFO ring dequeue — a raw
+/// 176-byte record, or a malformed frame.
+pub(super) enum InfoItem {
+    Record([u8; 176]),
+    Malformed,
+}
+
+/// Keymeta Task 7 (spec §17.4): the session's single retained
+/// consumer for the private INFO ring. It owns a duplicate
+/// descriptor and its mappings (no self-borrow of the prepared
+/// object); every dequeued frame counts as consumed, malformed ones
+/// included.
+pub(super) struct OwnedInfoDrain {
+    ring: aya::maps::RingBuf<aya::maps::MapData>,
+    consumed: u64,
+}
+
+impl OwnedInfoDrain {
+    pub(super) fn for_session(ebpf: &Ebpf) -> Result<Self> {
+        let aya::maps::Map::RingBuf(data) = ebpf.map("INFO").context("INFO map")? else {
+            anyhow::bail!("INFO is not a ring buffer");
+        };
+        let id = u64::from(data.info()?.id());
+        use std::os::fd::AsFd as _;
+        let owned = data
+            .fd()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("duplicating INFO descriptor")?;
+        let data = aya::maps::MapData::from_fd(owned).context("reopening INFO map")?;
+        anyhow::ensure!(
+            u64::from(data.info()?.id()) == id,
+            "INFO map does not match retained allocation"
+        );
+        let ring = aya::maps::RingBuf::try_from(aya::maps::Map::from_map_data(data)?)?;
+        Ok(Self { ring, consumed: 0 })
+    }
+
+    pub(super) fn dequeue(&mut self) -> Result<Option<InfoItem>> {
+        let Some(record) = self.ring.next() else {
+            return Ok(None);
+        };
+        self.consumed = self.consumed.saturating_add(1);
+        let bytes: &[u8] = &record[..];
+        if bytes.len() != 176 {
+            return Ok(Some(InfoItem::Malformed));
+        }
+        let mut fixed = [0u8; 176];
+        fixed.copy_from_slice(bytes);
+        Ok(Some(InfoItem::Record(fixed)))
+    }
+
+    pub(super) fn consumed(&self) -> u64 {
+        self.consumed
+    }
+}
+
+/// Keymeta Task 7 (spec §17.4): submitted INFO records from the
+/// `PRODUCED` map — the kernel half of the INFO cross-check.
+pub(super) fn read_info_produced(ebpf: &Ebpf) -> Result<u64> {
+    let map: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(ebpf.map("PRODUCED").context("PRODUCED map")?)?;
+    Ok(map
+        .get(&p11scope_ebpf_common::PRODUCED_INFO, 0)?
+        .iter()
+        .sum())
+}
+
+/// Keymeta Task 7 (spec §17.4): one bounded `INFO_EVIDENCE`
+/// group read — all four cells, or the yield when the window
+/// expired mid-group (the caller keeps its previous full sample
+/// and stages incomplete, never a partial group).
+pub(super) enum InfoEvidenceRead {
+    Done(Result<[u64; 4], String>),
+    Yielded,
+}
+
+/// Keymeta Task 7 (spec §17.4): the four `INFO_EVIDENCE` cells —
+/// insert failures, unmatched returns, nested overwrites and stash
+/// mismatches — summed over CPUs. No cell lookup starts at or past
+/// the quantum deadline: a mid-group expiry yields with no partial
+/// sample. FULL objects only; P0 carries no such map and never
+/// calls this (the caller gates on the INFO reader).
+pub(super) fn read_info_evidence(
+    ebpf: &Ebpf,
+    deadline: Instant,
+    now: &mut dyn FnMut() -> Instant,
+) -> InfoEvidenceRead {
+    if now() >= deadline {
+        return InfoEvidenceRead::Yielded;
+    }
+    let named = match ebpf.map("INFO_EVIDENCE").context("INFO_EVIDENCE map") {
+        Ok(map) => map,
+        Err(error) => return InfoEvidenceRead::Done(Err(format!("{error:#}"))),
+    };
+    let map: PerCpuArray<_, u64> = match PerCpuArray::try_from(named) {
+        Ok(map) => map,
+        Err(error) => return InfoEvidenceRead::Done(Err(format!("{error:#}"))),
+    };
+    read_evidence_cells(deadline, now, |index| {
+        map.get(&index, 0)
+            .map(|values| values.iter().sum())
+            .map_err(|error| format!("{error:#}"))
+    })
+}
+
+/// The four-cell evidence loop over one cell reader: no cell starts
+/// at or past the deadline, and a failed cell ends the group with
+/// its cause (later cells never start, like the `?` before it).
+fn read_evidence_cells(
+    deadline: Instant,
+    now: &mut dyn FnMut() -> Instant,
+    mut read_cell: impl FnMut(u32) -> Result<u64, String>,
+) -> InfoEvidenceRead {
+    use p11scope_ebpf_common::{
+        INFO_EVIDENCE_INSERT_FAILURES, INFO_EVIDENCE_NESTED_OVERWRITES,
+        INFO_EVIDENCE_STASH_MISMATCHES, INFO_EVIDENCE_UNMATCHED_RETURNS,
+    };
+    let mut cells = [0u64; 4];
+    for (cell, index) in cells.iter_mut().zip([
+        INFO_EVIDENCE_INSERT_FAILURES,
+        INFO_EVIDENCE_UNMATCHED_RETURNS,
+        INFO_EVIDENCE_NESTED_OVERWRITES,
+        INFO_EVIDENCE_STASH_MISMATCHES,
+    ]) {
+        if now() >= deadline {
+            return InfoEvidenceRead::Yielded;
+        }
+        match read_cell(index) {
+            Ok(value) => *cell = value,
+            Err(error) => return InfoEvidenceRead::Done(Err(error)),
+        }
+    }
+    InfoEvidenceRead::Done(Ok(cells))
 }
 
 #[derive(Default, Debug)]
@@ -1366,6 +2337,86 @@ pub(super) fn service_inventory_discovery_with(
     Ok(service)
 }
 
+#[derive(Default, Debug)]
+pub(super) struct InventoryInfoService {
+    pub(super) dispatched: usize,
+    pub(super) record_bound_reached: bool,
+    pub(super) deadline_reached: bool,
+}
+
+pub(super) struct InventoryInfoDispatchFailure {
+    pub(super) record: Option<Box<[u8; 176]>>,
+    pub(super) error: anyhow::Error,
+    pub(super) dispatched: usize,
+}
+
+impl fmt::Debug for InventoryInfoDispatchFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InventoryInfoDispatchFailure")
+            .field("has_record", &self.record.is_some())
+            .field("error", &self.error)
+            .field("dispatched", &self.dispatched)
+            .finish()
+    }
+}
+
+/// Keymeta Task 7 (spec §17.4): drain the INFO ring alongside
+/// DISCOVERY with the same bounded quantum shape — a positive
+/// record bound, a deadline, no read-ahead, and exact
+/// consumed-but-undelivered evidence on dispatch failure. A
+/// malformed frame bails with no record, like DISCOVERY.
+pub(super) fn service_inventory_info_with(
+    max_records: usize,
+    deadline: Instant,
+    mut dequeue: impl FnMut() -> Result<Option<InfoItem>>,
+    mut dispatch: impl FnMut([u8; 176]) -> Result<()>,
+) -> std::result::Result<InventoryInfoService, InventoryInfoDispatchFailure> {
+    if max_records == 0 {
+        return Err(InventoryInfoDispatchFailure {
+            record: None,
+            error: anyhow::anyhow!("Inventory INFO service requires a positive record bound"),
+            dispatched: 0,
+        });
+    }
+    let mut service = InventoryInfoService::default();
+    while service.dispatched < max_records {
+        if Instant::now() >= deadline {
+            service.deadline_reached = true;
+            return Ok(service);
+        }
+        let record = match dequeue() {
+            Ok(Some(InfoItem::Record(record))) => record,
+            Ok(Some(InfoItem::Malformed)) => {
+                return Err(InventoryInfoDispatchFailure {
+                    record: None,
+                    error: anyhow::anyhow!("malformed Inventory INFO record"),
+                    dispatched: service.dispatched,
+                });
+            }
+            Ok(None) => return Ok(service),
+            Err(error) => {
+                return Err(InventoryInfoDispatchFailure {
+                    record: None,
+                    error,
+                    dispatched: service.dispatched,
+                });
+            }
+        };
+        if let Err(error) = dispatch(record) {
+            // Return exact consumed-but-undelivered evidence to the caller.
+            // Never read ahead, silently discard, or queue records internally.
+            return Err(InventoryInfoDispatchFailure {
+                record: Some(Box::new(record)),
+                error,
+                dispatched: service.dispatched,
+            });
+        }
+        service.dispatched += 1;
+    }
+    service.record_bound_reached = true;
+    Ok(service)
+}
+
 pub(super) struct InventoryActivationFailure {
     pub(super) error: anyhow::Error,
     pub(super) retiring: Box<RetiringInventory>,
@@ -1412,6 +2463,7 @@ impl PreparedInventory {
             history: InventoryUsageHistory::new(targets.allocated.clone()),
             links: vec![],
             discovery: None,
+            info: None,
             prepared: self,
             targets,
             malformed_discovery: 0,
@@ -1431,6 +2483,13 @@ impl PreparedInventory {
                 &state.prepared.ebpf,
                 &state.prepared.discovery_domain,
             )?);
+            // Keymeta Task 7 (spec §17.4): the retained INFO
+            // consumer beside DISCOVERY. P0 objects carry no INFO
+            // ring, so the reader stays absent there.
+            #[cfg(not(feature = "stub-object-attributes"))]
+            {
+                state.info = Some(OwnedInfoDrain::for_session(&state.prepared.ebpf)?);
+            }
             Ok(())
         })();
         if let Err(error) = ready {
@@ -1476,6 +2535,7 @@ impl PreparedInventory {
             history: InventoryUsageHistory::new(Vec::new()),
             links: vec![],
             discovery: None,
+            info: None,
             prepared: self,
             targets,
             malformed_discovery: 0,
@@ -1495,6 +2555,13 @@ impl PreparedInventory {
                 &state.prepared.ebpf,
                 &state.prepared.discovery_domain,
             )?);
+            // Keymeta Task 7 (spec §17.4): the retained INFO
+            // consumer beside DISCOVERY. P0 objects carry no INFO
+            // ring, so the reader stays absent there.
+            #[cfg(not(feature = "stub-object-attributes"))]
+            {
+                state.info = Some(OwnedInfoDrain::for_session(&state.prepared.ebpf)?);
+            }
             Ok(())
         })();
         if let Err(error) = ready {

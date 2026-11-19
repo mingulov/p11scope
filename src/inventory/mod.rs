@@ -8087,17 +8087,37 @@ fn lifecycle_high_water_suffix(high_water_bytes: u64) -> String {
 /// The stderr line a native run ends with: what it attached, how its
 /// retirement ended, and its settlement (plus, under stage timings, the
 /// run's lifecycle-ring high-water).
+/// The INFO teardown clause for a closed retirement: nothing when
+/// the scrub proved an empty stash, else the unproven flag and the
+/// concrete cause beside the detach counts (spec §17.4).
+fn info_teardown_suffix(cleanup: &crate::attach::capture::CleanupSummary) -> String {
+    let mut suffix = String::new();
+    if cleanup.info_teardown_unproven {
+        suffix.push_str("; info teardown unproven");
+    }
+    if let Some(error) = &cleanup.info_scrub_error {
+        suffix.push_str(if cleanup.info_teardown_unproven {
+            ": "
+        } else {
+            "; info scrub error: "
+        });
+        suffix.push_str(&crate::render::escape_controls(error));
+    }
+    suffix
+}
+
 fn stop_line(summary: &LaneSummary) -> String {
     let retirement = match &summary.retirement {
         crate::inventory_capture::Retirement::Closed(cleanup) => format!(
-            "retirement closed ({} of {} links closed{})",
+            "retirement closed ({} of {} links closed{}{})",
             cleanup.closed,
             cleanup.attempted,
             if cleanup.failures.is_empty() {
                 String::new()
             } else {
                 format!(", {} close failures", cleanup.failures.len())
-            }
+            },
+            info_teardown_suffix(cleanup),
         ),
         crate::inventory_capture::Retirement::Unsettled(reason) => format!(
             "retirement unsettled: {}",
@@ -15699,6 +15719,29 @@ mod tests {
                  (per-offset links), 0 failed; retirement unsettled: budget passed; settlement {}",
                 crate::inventory_capture::SETTLEMENT
             )
+        );
+        assert!(!line.contains("  "), "{line}");
+    }
+
+    #[test]
+    fn the_stop_line_names_an_unproven_info_teardown() {
+        let cleanup = crate::attach::capture::CleanupSummary {
+            attempted: 4,
+            closed: 4,
+            info_teardown_unproven: true,
+            info_scrub_error: Some("scrub refused: links retained".into()),
+            ..Default::default()
+        };
+        let line = stop_line(&lane_summary(crate::inventory_capture::Retirement::Closed(
+            cleanup,
+        )));
+        assert!(
+            line.contains("info teardown unproven"),
+            "the stop line names the unproven teardown: {line}"
+        );
+        assert!(
+            line.contains("scrub refused: links retained"),
+            "the stop line carries the concrete refusal: {line}"
         );
         assert!(!line.contains("  "), "{line}");
     }

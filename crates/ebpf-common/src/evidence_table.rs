@@ -258,6 +258,24 @@ pub const EVIDENCE_BUFFER_BASES: [(&str, u8); 6] = [
     ("C_EncapsulateKey", 5),
 ];
 
+/// Resolve one function ordinal to its Task 7 info kind
+/// (`INFO_KIND_*`), or `None` for length endpoints and every other
+/// ordinal. An ordinal match like [`evidence_position`]: no
+/// `function_name()` call, no static table, no rodata. The attach
+/// set resolves by function name instead
+/// ([`crate::inventory_info::info_kind_for_function`]); the
+/// cross-check test pins the two spellings together.
+#[inline(always)]
+pub fn info_kind_for_ordinal(ordinal: u32) -> Option<u8> {
+    use crate::inventory_info::{INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+    match ordinal {
+        2 => Some(INFO_KIND_PROVIDER),
+        6 => Some(INFO_KIND_TOKEN),
+        8 => Some(INFO_KIND_MECHANISM),
+        _ => None,
+    }
+}
+
 /// Resolve one canonical descriptor to its length kind
 /// (`LENGTH_KIND_SCELL` / `LENGTH_KIND_VSCALAR`), or `None` when the
 /// endpoint takes the base pair (count-only, out-of-range, unlisted,
@@ -470,6 +488,56 @@ mod tests {
                 evidence_position(ordinal),
                 None,
                 "ordinal {ordinal} fails closed"
+            );
+        }
+    }
+
+    /// Keymeta Task 7 (spec §17.4): the three info endpoints resolve
+    /// to their info kinds by frozen catalog ordinal; the length
+    /// endpoints and every other ordinal resolve to none.
+    #[test]
+    fn info_kind_for_ordinal_resolves_the_three_endpoints() {
+        use crate::inventory_info::{INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+        for (name, ordinal, kind) in [
+            ("C_GetInfo", 2, INFO_KIND_PROVIDER),
+            ("C_GetTokenInfo", 6, INFO_KIND_TOKEN),
+            ("C_GetMechanismInfo", 8, INFO_KIND_MECHANISM),
+        ] {
+            assert_eq!(function_ordinal(name), ordinal, "{name} ordinal");
+            assert_eq!(info_kind_for_ordinal(ordinal), Some(kind), "{name} kind");
+        }
+        for name in [
+            "C_Sign",
+            "C_Encrypt",
+            "C_Initialize",
+            "C_GetSlotInfo",
+            "C_SignInit",
+        ] {
+            assert_eq!(
+                info_kind_for_ordinal(function_ordinal(name)),
+                None,
+                "{name} carries no info kind"
+            );
+        }
+        for ordinal in [1, 105, MAX_DESCRIPTORS, u32::MAX] {
+            assert_eq!(info_kind_for_ordinal(ordinal), None, "ordinal {ordinal}");
+        }
+    }
+
+    /// The two Task 7 kind spellings agree: every info marker row
+    /// resolves to the same kind by ordinal and by function name, and
+    /// every length row resolves to none by both.
+    #[test]
+    fn info_kind_spellings_agree_on_every_row() {
+        for row in EVIDENCE_POSITIONS {
+            let by_ordinal = info_kind_for_ordinal(function_ordinal(row.function));
+            let by_name = crate::inventory_info::info_kind_for_function(row.function);
+            assert_eq!(by_ordinal, by_name, "{}: spellings agree", row.function);
+            assert_eq!(
+                by_ordinal.is_some(),
+                row.info,
+                "{}: kind exactly on info rows",
+                row.function
             );
         }
     }

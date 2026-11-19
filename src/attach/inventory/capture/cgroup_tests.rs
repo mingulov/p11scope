@@ -90,7 +90,7 @@ fn unactivated_stop_keeps_root_through_terminal_reads_until_drop() {
         .read_witnesses(ReadWindow::new(1, Instant::now() + Duration::from_secs(1)).unwrap());
     assert_eq!(read.custody, ScopeCustody::CgroupHeld);
     let mut retired = retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .ok()
         .expect("no producers need detaching");
     assert!(weak.upgrade().is_some());
@@ -121,7 +121,7 @@ fn active_and_failed_branches_share_the_root_preserving_retirement_transfer() {
         ScopeCustody::CgroupHeld
     );
     let mut retired = retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .ok()
         .expect("no kernel IO in this control");
     assert!(weak.upgrade().is_some());
@@ -351,7 +351,7 @@ fn inventory_exit_retention_retired_capture_keeps_the_original_book_root() {
         || {
             let (_directory, book, root) = cgroup_book();
             let retired = retiring_capture(RetiringInner::Unactivated(None), book, None)
-                .try_finish()
+                .try_finish(Instant::now() + Duration::from_secs(60))
                 .ok()
                 .unwrap();
             retired.abandon_for_process_exit();

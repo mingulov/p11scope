@@ -125,6 +125,12 @@ enum Request {
         offset: u64,
         cookie: u64,
     },
+    Return {
+        program: String,
+        path: PathBuf,
+        offset: u64,
+        cookie: u64,
+    },
 }
 
 #[derive(Default)]
@@ -179,6 +185,17 @@ impl InventoryLinkIo for LinkIo {
                 file_offset,
                 cookie,
             } => Request::Entry {
+                program: program.into(),
+                path: path.into(),
+                offset: file_offset,
+                cookie,
+            },
+            InventoryAttachRequest::Return {
+                program,
+                path,
+                file_offset,
+                cookie,
+            } => Request::Return {
                 program: program.into(),
                 path: path.into(),
                 offset: file_offset,
@@ -609,6 +626,36 @@ fn inventory_private_target_abi_or_id_drift_is_refused_before_any_root_link() {
         assert!(io.state.lock().unwrap().requests.is_empty());
         assert_eq!(failure.cleanup.attempted, 0);
     }
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): the retirement poll
+/// drives the INFO_START scrub as explicit bounded steps with
+/// progress carried across polls — never an unbounded sweep in one
+/// poll — and refuses to scrub while links are retained (probes
+/// still mutating), transferring with teardown explicitly unproven
+/// instead.
+#[test]
+fn stop_scrub_is_bounded_resumable_and_refuses_retained_links() {
+    let source = std::fs::read_to_string("src/attach/inventory/activation.rs")
+        .expect("read activation source");
+    assert!(
+        source.contains("scrub: InfoScrubPhase"),
+        "RetiringInventory carries scrub progress across polls"
+    );
+    assert!(
+        source.contains("scrub_info_start_step"),
+        "the scrub runs as bounded steps"
+    );
+    let lines: Vec<&str> = source.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.contains("pub(super) fn try_finish"))
+        .expect("try_finish exists");
+    let body = lines[start..(start + 80).min(lines.len())].join("\n");
+    assert!(
+        body.contains("failures.is_empty()"),
+        "try_finish refuses to scrub while links are retained"
+    );
 }
 
 #[test]
@@ -1378,4 +1425,885 @@ fn inventory_discovery_service_preserves_consumer_failure_and_enforces_both_boun
         )
         .is_err()
     );
+}
+
+/// In-memory INFO_START stand-in for the scrub stepper: counts map
+/// operations (budget pin), mirrors the zero-verify-remove sequence
+/// and injects a fault on one operation.
+#[cfg(not(feature = "stub-object-attributes"))]
+struct FakeScrubTable {
+    rows: BTreeMap<[u8; 16], [u8; 32]>,
+    capacity: u32,
+    ops: u64,
+    fail_on_op: Option<u64>,
+    fail_on_substep: Option<&'static str>,
+    /// Keys an in-flight return removes between the fake's zero and
+    /// verify: the verify observes the disappearance.
+    remove_on_verify: BTreeSet<[u8; 16]>,
+}
+
+#[cfg(not(feature = "stub-object-attributes"))]
+impl FakeScrubTable {
+    fn full(rows: u16, capacity: u32) -> Self {
+        let mut table = Self {
+            rows: BTreeMap::new(),
+            capacity,
+            ops: 0,
+            fail_on_op: None,
+            fail_on_substep: None,
+            remove_on_verify: BTreeSet::new(),
+        };
+        for row in 0..rows {
+            let mut key = [0u8; 16];
+            key[..2].copy_from_slice(&row.to_le_bytes());
+            table.rows.insert(key, [0xa5; 32]);
+        }
+        table
+    }
+
+    fn tick(&mut self, what: &str) -> Result<()> {
+        self.ops = self.ops.saturating_add(1);
+        if self.fail_on_op == Some(self.ops) {
+            anyhow::bail!("injected scrub fault at {what} op {}", self.ops);
+        }
+        if self.fail_on_substep == Some(what) {
+            anyhow::bail!("injected persistent scrub fault at {what}");
+        }
+        Ok(())
+    }
+
+    fn tick_row(&mut self, what: &str) -> Result<(), ScrubRowError> {
+        self.tick(what).map_err(ScrubRowError::Failed)
+    }
+}
+
+#[cfg(not(feature = "stub-object-attributes"))]
+impl InfoScrubTable for FakeScrubTable {
+    fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    fn first_key(&mut self) -> Result<Option<[u8; 16]>> {
+        self.tick("enumerate")?;
+        Ok(self.rows.keys().next().copied())
+    }
+
+    fn zero_row(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError> {
+        self.tick_row("zero")?;
+        // BPF_EXIST, like the kernel: a missing row refuses instead
+        // of manufacturing an owner.
+        if !self.rows.contains_key(key) {
+            return Err(ScrubRowError::Missing);
+        }
+        self.rows.insert(*key, [0; 32]);
+        Ok(())
+    }
+
+    fn verify_row_zero(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError> {
+        self.tick_row("verify")?;
+        if self.remove_on_verify.remove(key) {
+            self.rows.remove(key);
+        }
+        if !self.rows.contains_key(key) {
+            return Err(ScrubRowError::Missing);
+        }
+        if self.rows.get(key) != Some(&[0; 32]) {
+            return Err(ScrubRowError::Failed(anyhow::anyhow!(
+                "stopped INFO_START zero readback differs"
+            )));
+        }
+        Ok(())
+    }
+
+    fn remove_row(&mut self, key: &[u8; 16]) -> Result<(), ScrubRowError> {
+        self.tick_row("remove")?;
+        if self.rows.remove(key).is_none() {
+            return Err(ScrubRowError::Missing);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "stub-object-attributes"))]
+fn generous_budget() -> ScrubBudget<fn() -> Instant> {
+    ScrubBudget::per_poll(Instant::now() + Duration::from_secs(60), Instant::now)
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): a full 1024-row stash
+/// clears in bounded 64-row steps within the map-I/O budget, and
+/// the table observes empty exactly once at the end.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_clears_a_full_map_within_budget() {
+    let mut table = FakeScrubTable::full(1024, 1024);
+    let mut progress = 0u64;
+    let mut steps = 0u32;
+    loop {
+        steps += 1;
+        match scrub_info_start_step(&mut table, &mut progress, &mut None, &mut generous_budget())
+            .expect("a healthy scrub never errors")
+        {
+            InfoScrubOutcome::Complete => break,
+            InfoScrubOutcome::Pending => {}
+            InfoScrubOutcome::Saturated => panic!("a quiet table never saturates"),
+        }
+        assert!(steps <= 17, "bounded steps");
+    }
+    assert_eq!(steps, 16, "1024 rows clear in sixteen 64-row steps");
+    assert_eq!(progress, 1024);
+    assert!(table.rows.is_empty());
+    // Four map operations per row (enumerate, zero, verify, remove)
+    // plus one emptiness observation per step: 1024×4 + 16.
+    assert_eq!(table.ops, 4112);
+    assert!(table.ops <= 5000, "full-map budget holds");
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): a batch spent with rows
+/// remaining yields `Pending` with progress carried; the next step
+/// resumes where it left off and completes.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_yields_and_resumes_with_progress() {
+    let mut table = FakeScrubTable::full(100, 1024);
+    let mut progress = 0u64;
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut None, &mut generous_budget())
+            .unwrap(),
+        InfoScrubOutcome::Pending
+    );
+    assert_eq!(progress, 64);
+    assert_eq!(table.rows.len(), 36);
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut None, &mut generous_budget())
+            .unwrap(),
+        InfoScrubOutcome::Complete
+    );
+    assert_eq!(progress, 100);
+    assert!(table.rows.is_empty());
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): a failed map operation
+/// surfaces its concrete cause with progress preserved; clearing
+/// the fault resumes to completion without redoing cleared rows.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_carries_concrete_failures_and_resumes() {
+    let mut table = FakeScrubTable::full(10, 1024);
+    table.fail_on_op = Some(7);
+    let mut progress = 0u64;
+    let error = scrub_info_start_step(&mut table, &mut progress, &mut None, &mut generous_budget())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected scrub fault"),
+        "concrete cause survives: {error:#}"
+    );
+    // Ops 1–4 clear row one (enumerate, zero, verify, remove); ops
+    // 5–6 enumerate and zero row two; op 7 fails the verify.
+    assert_eq!(progress, 1, "cleared rows stay cleared");
+    assert_eq!(table.rows.len(), 9);
+    table.fail_on_op = None;
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut None, &mut generous_budget())
+            .unwrap(),
+        InfoScrubOutcome::Complete
+    );
+    assert_eq!(progress, 10);
+    assert!(table.rows.is_empty());
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): clearing a full capacity
+/// without emptying saturates instead of spinning — concurrent
+/// inserts or an unremovable row retry from reset progress.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_saturates_past_capacity() {
+    let mut table = FakeScrubTable::full(6, 4);
+    let mut progress = 0u64;
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut None, &mut generous_budget())
+            .unwrap(),
+        InfoScrubOutcome::Saturated
+    );
+    assert_eq!(progress, 4);
+    assert_eq!(table.rows.len(), 2);
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4, INV-2): the step spends
+/// its native-operation allowance operation by operation — a short
+/// allowance yields mid-row with the pending key and substep kept,
+/// and the resume completes the row without redoing finished
+/// substeps.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_yields_mid_row_on_a_short_allowance_and_resumes() {
+    let mut table = FakeScrubTable::full(4, 1024);
+    let mut progress = 0u64;
+    let mut pending = None;
+    // Six operations: row one (enumerate, zero, verify, remove) plus
+    // the row-two enumeration and zero. The step yields with the
+    // row-two verify pending instead of starting work it cannot pay.
+    let mut budget = ScrubBudget {
+        ops_remaining: 6,
+        deadline: Instant::now() + Duration::from_secs(60),
+        now: Instant::now,
+    };
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut pending, &mut budget).unwrap(),
+        InfoScrubOutcome::Pending
+    );
+    assert_eq!(progress, 1, "one row cleared");
+    assert_eq!(table.ops, 6, "no operation starts without allowance");
+    let mut key = [0u8; 16];
+    key[..2].copy_from_slice(&1u16.to_le_bytes());
+    assert_eq!(
+        table.rows.get(&key),
+        Some(&[0; 32]),
+        "row two stays zeroed-but-present across the yield"
+    );
+    // The resume finishes row two (verify, remove), clears rows
+    // three and four, and observes empty: 11 more operations, 17 in
+    // all — exactly one pass with no redone zero.
+    assert_eq!(
+        scrub_info_start_step(
+            &mut table,
+            &mut progress,
+            &mut pending,
+            &mut generous_budget()
+        )
+        .unwrap(),
+        InfoScrubOutcome::Complete
+    );
+    assert_eq!(progress, 4);
+    assert!(table.rows.is_empty());
+    assert_eq!(table.ops, 17, "the resume redoes no finished substep");
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4, INV-2): an expired budget
+/// starts zero native calls — the step yields before its first map
+/// operation.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_spends_nothing_once_expired() {
+    let mut table = FakeScrubTable::full(4, 1024);
+    let mut progress = 0u64;
+    let mut budget = ScrubBudget {
+        ops_remaining: INFO_SCRUB_OPS_PER_POLL,
+        deadline: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        now: Instant::now,
+    };
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut None, &mut budget).unwrap(),
+        InfoScrubOutcome::Pending
+    );
+    assert_eq!(table.ops, 0, "an expired step runs zero native calls");
+    assert_eq!(progress, 0);
+    assert_eq!(table.rows.len(), 4);
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4, INV-2): a deadline that
+/// passes mid-step stops new operations at once — the step yields
+/// with the pending substep kept and resumes to completion.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_stops_starting_operations_when_the_deadline_passes() {
+    let mut table = FakeScrubTable::full(4, 1024);
+    let mut progress = 0u64;
+    let mut pending = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let before = deadline.checked_sub(Duration::from_secs(30)).unwrap();
+    let after = deadline.checked_add(Duration::from_secs(1)).unwrap();
+    // The clock reads healthy for the entry check plus three
+    // operations, then passes the deadline for good.
+    let calls = std::cell::Cell::new(0u32);
+    let mut budget = ScrubBudget {
+        ops_remaining: INFO_SCRUB_OPS_PER_POLL,
+        deadline,
+        now: || {
+            calls.set(calls.get() + 1);
+            if calls.get() <= 4 { before } else { after }
+        },
+    };
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut pending, &mut budget).unwrap(),
+        InfoScrubOutcome::Pending
+    );
+    assert_eq!(table.ops, 3, "enumerate, zero, verify — then nothing new");
+    assert_eq!(progress, 0, "the interrupted row clears on resume");
+    assert_eq!(
+        scrub_info_start_step(
+            &mut table,
+            &mut progress,
+            &mut pending,
+            &mut generous_budget()
+        )
+        .unwrap(),
+        InfoScrubOutcome::Complete
+    );
+    assert_eq!(progress, 4);
+    assert!(table.rows.is_empty());
+    assert_eq!(table.ops, 17, "one pass with no redone substep");
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4, INV-2): the per-poll map
+/// validation reads the map shape once and charges that read to the
+/// same native-operation allowance as the table calls — the shape
+/// is owned and unchanged, so one metadata read proves it.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_poll_validates_the_map_once_against_the_allowance() {
+    use std::cell::Cell;
+    let fetches = Cell::new(0u64);
+    let mut fetch = || {
+        fetches.set(fetches.get() + 1);
+        Ok(crate::attach::map_metadata(
+            aya::maps::MapType::Hash,
+            16,
+            32,
+            1024,
+            0,
+        ))
+    };
+    let mut budget = generous_budget();
+    let capacity = scrub_table_capacity_with(&mut fetch, &mut budget)
+        .expect("a healthy shape validates")
+        .expect("a generous budget fetches");
+    assert_eq!(capacity, 1024, "the map's own capacity carries");
+    assert_eq!(fetches.get(), 1, "one metadata read per poll");
+    assert_eq!(
+        budget.ops_remaining,
+        INFO_SCRUB_OPS_PER_POLL - 1,
+        "the metadata read charges to the poll allowance"
+    );
+    // An expired budget fetches nothing: zero native calls.
+    let mut expired = ScrubBudget {
+        ops_remaining: INFO_SCRUB_OPS_PER_POLL,
+        deadline: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        now: Instant::now,
+    };
+    let before = fetches.get();
+    assert_eq!(
+        scrub_table_capacity_with(&mut fetch, &mut expired).unwrap(),
+        None,
+        "an expired poll skips validation"
+    );
+    assert_eq!(
+        fetches.get(),
+        before,
+        "zero metadata reads past the deadline"
+    );
+    // A wrong shape refuses without spending table work.
+    let mut wrong = || {
+        Ok(crate::attach::map_metadata(
+            aya::maps::MapType::Array,
+            16,
+            32,
+            1024,
+            0,
+        ))
+    };
+    assert!(
+        scrub_table_capacity_with(&mut wrong, &mut generous_budget()).is_err(),
+        "a mistyped map refuses"
+    );
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4, INV-2): a poll that
+/// resumes at Remove still clears at most a 64-row batch — the
+/// resumed removal consumes its row slot instead of clearing 65.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_poll_resumed_at_remove_counts_against_the_row_batch() {
+    let mut table = FakeScrubTable::full(70, 1024);
+    let mut progress = 0u64;
+    let mut pending = None;
+    // Three operations: row one enumerated, zeroed and verified,
+    // with its removal pending.
+    let mut short = ScrubBudget {
+        ops_remaining: 3,
+        deadline: Instant::now() + Duration::from_secs(60),
+        now: Instant::now,
+    };
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut pending, &mut short).unwrap(),
+        InfoScrubOutcome::Pending
+    );
+    assert_eq!(progress, 0, "the interrupted row clears on resume");
+    assert_eq!(
+        pending,
+        Some(PendingScrubRow {
+            key: {
+                let mut key = [0u8; 16];
+                key[..2].copy_from_slice(&0u16.to_le_bytes());
+                key
+            },
+            next: ScrubSubstep::Remove,
+        }),
+        "the removal pends"
+    );
+    // The resume removes row one plus at most 63 fresh rows: 64
+    // rows for the poll, with rows remaining afterwards.
+    assert_eq!(
+        scrub_info_start_step(
+            &mut table,
+            &mut progress,
+            &mut pending,
+            &mut generous_budget()
+        )
+        .unwrap(),
+        InfoScrubOutcome::Pending
+    );
+    assert_eq!(progress, 64, "one poll clears one 64-row batch");
+    assert_eq!(table.rows.len(), 6, "six rows wait for the next poll");
+}
+
+/// Keymeta Task 7 stop window (spec §17.4): the evidence group
+/// read gates each of its four cell lookups on the quantum
+/// deadline — a clock already past the window yields before the
+/// first cell, and a deadline crossed inside the first cell starts
+/// no further cell. A failed cell ends the group with its cause
+/// and starts no later cell; a healthy group reads all four cells
+/// in index order.
+#[test]
+fn evidence_group_read_gates_each_cell_on_the_quantum_deadline() {
+    use p11scope_ebpf_common::{
+        INFO_EVIDENCE_INSERT_FAILURES, INFO_EVIDENCE_NESTED_OVERWRITES,
+        INFO_EVIDENCE_STASH_MISMATCHES, INFO_EVIDENCE_UNMATCHED_RETURNS,
+    };
+    use std::cell::RefCell;
+    let order = [
+        INFO_EVIDENCE_INSERT_FAILURES,
+        INFO_EVIDENCE_UNMATCHED_RETURNS,
+        INFO_EVIDENCE_NESTED_OVERWRITES,
+        INFO_EVIDENCE_STASH_MISMATCHES,
+    ];
+    // An already-expired window yields with zero cell starts.
+    let starts = RefCell::new(Vec::new());
+    let mut now = || Instant::now() + Duration::from_secs(60);
+    let expired = Instant::now();
+    assert!(
+        matches!(
+            read_evidence_cells(expired, &mut now, |index| {
+                starts.borrow_mut().push(index);
+                Ok(1u64)
+            }),
+            InfoEvidenceRead::Yielded
+        ),
+        "an expired window yields before the first cell"
+    );
+    assert!(
+        starts.borrow().is_empty(),
+        "no cell starts at or past the deadline: {:?}",
+        starts.borrow()
+    );
+    // A deadline crossed inside the first cell starts no further
+    // cell: the clock reads inside the window once, then past it.
+    let starts = RefCell::new(Vec::new());
+    let reads = std::cell::Cell::new(0u32);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(60);
+    let mut now = || {
+        reads.set(reads.get() + 1);
+        if reads.get() == 1 { start } else { deadline }
+    };
+    assert!(
+        matches!(
+            read_evidence_cells(deadline, &mut now, |index| {
+                starts.borrow_mut().push(index);
+                Ok(7u64)
+            }),
+            InfoEvidenceRead::Yielded
+        ),
+        "the mid-group crossing yields with no partial sample"
+    );
+    assert_eq!(
+        *starts.borrow(),
+        [INFO_EVIDENCE_INSERT_FAILURES],
+        "only the first cell starts: {:?}",
+        starts.borrow()
+    );
+    // A healthy group reads all four cells in index order.
+    let starts = RefCell::new(Vec::new());
+    let mut now = || start;
+    let read = read_evidence_cells(deadline, &mut now, |index| {
+        starts.borrow_mut().push(index);
+        Ok(u64::from(index) + 1)
+    });
+    let InfoEvidenceRead::Done(Ok(cells)) = read else {
+        panic!("a healthy group reads all four cells");
+    };
+    assert_eq!(
+        *starts.borrow(),
+        order,
+        "cells read in index order: {:?}",
+        starts.borrow()
+    );
+    assert_eq!(cells, [1, 2, 3, 4]);
+    // A failed cell ends the group with its cause: later cells
+    // never start.
+    let starts = RefCell::new(Vec::new());
+    let mut now = || start;
+    let read = read_evidence_cells(deadline, &mut now, |index| {
+        starts.borrow_mut().push(index);
+        if index == INFO_EVIDENCE_UNMATCHED_RETURNS {
+            return Err("cells broke".to_string());
+        }
+        Ok(0u64)
+    });
+    let InfoEvidenceRead::Done(Err(error)) = read else {
+        panic!("a failed cell ends the group with its cause");
+    };
+    assert_eq!(error, "cells broke");
+    assert_eq!(
+        *starts.borrow(),
+        [
+            INFO_EVIDENCE_INSERT_FAILURES,
+            INFO_EVIDENCE_UNMATCHED_RETURNS
+        ],
+        "no cell starts past the failure: {:?}",
+        starts.borrow()
+    );
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4, INV-2): one poll spends
+/// at most 257 native operations all-in — one metadata read plus
+/// the 64-row table batch — and the terminal emptiness observation
+/// waits for the next poll when the allowance is spent.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_poll_spends_at_most_257_native_operations_all_in() {
+    use std::cell::Cell;
+    let fetches = Cell::new(0u64);
+    let mut fetch = || {
+        fetches.set(fetches.get() + 1);
+        Ok(crate::attach::map_metadata(
+            aya::maps::MapType::Hash,
+            16,
+            32,
+            1024,
+            0,
+        ))
+    };
+    let mut table = FakeScrubTable::full(64, 1024);
+    let mut progress = 0u64;
+    let mut pending = None;
+    let mut budget = generous_budget();
+    let capacity = scrub_table_capacity_with(&mut fetch, &mut budget)
+        .expect("a healthy shape validates")
+        .expect("a generous budget fetches");
+    assert_eq!(capacity, 1024);
+    let outcome =
+        scrub_info_start_step(&mut table, &mut progress, &mut pending, &mut budget).unwrap();
+    assert_eq!(
+        fetches.get() + table.ops,
+        INFO_SCRUB_OPS_PER_POLL,
+        "one metadata read plus the 64-row table batch, nothing more"
+    );
+    assert_eq!(progress, 64, "the full batch cleared");
+    assert_eq!(
+        outcome,
+        InfoScrubOutcome::Pending,
+        "the spent allowance defers the emptiness observation"
+    );
+    // The next poll validates again and observes the empty table.
+    let ops_before = table.ops;
+    let mut budget = generous_budget();
+    let capacity = scrub_table_capacity_with(&mut fetch, &mut budget)
+        .expect("a healthy shape validates")
+        .expect("a generous budget fetches");
+    assert_eq!(capacity, 1024);
+    let outcome =
+        scrub_info_start_step(&mut table, &mut progress, &mut pending, &mut budget).unwrap();
+    assert_eq!(outcome, InfoScrubOutcome::Complete);
+    assert_eq!(
+        table.ops - ops_before,
+        1,
+        "one terminal emptiness observation"
+    );
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): a row an in-flight
+/// return removed between polls never strands the scrub at its
+/// stale key — the absence clears the cursor, counts the resolved
+/// row, and the step re-enumerates (charged) to a fresh empty-map
+/// observation before completing.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_disappeared_row_clears_the_cursor_and_reenumerates() {
+    let mut table = FakeScrubTable::full(1, 1024);
+    let mut key = [0u8; 16];
+    key[..2].copy_from_slice(&0u16.to_le_bytes());
+    // The return removes the row after the enumeration pinned it:
+    // the resumed removal observes the absence.
+    let mut progress = 0u64;
+    let mut pending = Some(PendingScrubRow {
+        key,
+        next: ScrubSubstep::Remove,
+    });
+    table.rows.remove(&key);
+    assert_eq!(
+        scrub_info_start_step(
+            &mut table,
+            &mut progress,
+            &mut pending,
+            &mut generous_budget()
+        )
+        .unwrap(),
+        InfoScrubOutcome::Complete,
+        "a disappeared row completes on a fresh empty observation"
+    );
+    assert_eq!(progress, 1, "the resolved row counts");
+    assert_eq!(pending, None, "the stale cursor clears");
+    assert_eq!(
+        table.ops, 2,
+        "the failed removal plus the charged re-enumeration"
+    );
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): a row disappearing
+/// mid-step — between its zero and its verify — resolves the same
+/// way, while a concrete non-absence failure still retries with
+/// the cursor kept.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_step_row_disappearing_mid_step_resolves_and_non_absence_retries() {
+    let mut table = FakeScrubTable::full(1, 1024);
+    let mut key = [0u8; 16];
+    key[..2].copy_from_slice(&0u16.to_le_bytes());
+    table.remove_on_verify.insert(key);
+    let mut progress = 0u64;
+    assert_eq!(
+        scrub_info_start_step(&mut table, &mut progress, &mut None, &mut generous_budget())
+            .unwrap(),
+        InfoScrubOutcome::Complete,
+        "a mid-step disappearance completes on re-enumeration"
+    );
+    assert_eq!(progress, 1, "the resolved row counts");
+    assert_eq!(
+        table.ops, 4,
+        "enumerate, zero, the observing verify, re-enumeration"
+    );
+    // A concrete failure is not an absence: it retries with the
+    // pending substep kept.
+    let mut table = FakeScrubTable::full(1, 1024);
+    table.fail_on_substep = Some("verify");
+    let mut progress = 0u64;
+    let mut pending = None;
+    let error = scrub_info_start_step(
+        &mut table,
+        &mut progress,
+        &mut pending,
+        &mut generous_budget(),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("persistent scrub fault"),
+        "concrete failures stay reportable: {error:#}"
+    );
+    assert_eq!(
+        pending,
+        Some(PendingScrubRow {
+            key,
+            next: ScrubSubstep::Verify,
+        }),
+        "concrete failures keep the cursor for retry"
+    );
+    assert_eq!(progress, 0, "nothing resolves on failure");
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): retained links refuse the
+/// scrub outright — the step never runs — and transfer with teardown
+/// explicitly unproven.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_phase_refuses_retained_links() {
+    let mut phase = InfoScrubPhase::default();
+    let mut stepped = false;
+    assert_eq!(
+        phase.poll(true, |_, _| {
+            stepped = true;
+            Ok(InfoScrubOutcome::Complete)
+        }),
+        InfoScrubDirective::Transfer { unproven: true }
+    );
+    assert!(!stepped, "refused scrubs run no map operations");
+    assert_eq!(
+        phase.error.as_deref(),
+        Some("scrub refused: links retained")
+    );
+}
+
+/// Keymeta Task 7 stop scrub (spec §17.4): the phase lifecycle —
+/// pending work retries with progress kept, concrete failures retry
+/// with the failure carried, saturation resets progress and retries,
+/// and completion transfers clean, clearing transient errors.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn scrub_phase_drives_pending_errors_and_saturation() {
+    let mut phase = InfoScrubPhase::default();
+    assert_eq!(
+        phase.poll(false, |cleared, _| {
+            *cleared = 64;
+            Ok(InfoScrubOutcome::Pending)
+        }),
+        InfoScrubDirective::Retry
+    );
+    assert_eq!(phase.cleared, 64, "pending keeps progress");
+    assert_eq!(
+        phase.poll(false, |_, _| Err("cells broke".into())),
+        InfoScrubDirective::Retry
+    );
+    assert_eq!(phase.error.as_deref(), Some("cells broke"));
+    assert_eq!(phase.cleared, 64, "errors keep progress");
+    assert_eq!(
+        phase.poll(false, |_, _| Ok(InfoScrubOutcome::Saturated)),
+        InfoScrubDirective::Retry
+    );
+    assert_eq!(phase.cleared, 0, "saturation resets progress");
+    assert_eq!(
+        phase.poll(false, |_, _| Ok(InfoScrubOutcome::Complete)),
+        InfoScrubDirective::Transfer { unproven: false }
+    );
+    assert!(phase.error.is_none(), "completion clears transient errors");
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4): a persistent
+/// zero-substep failure retries with its concrete error carried,
+/// and the timeout classifies it beside the detach outcome —
+/// never a bare "probes did not detach".
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn persistent_zero_failure_reports_its_concrete_error_on_timeout() {
+    use crate::inventory_capture::{Retirement, classify_retirement};
+    let mut table = FakeScrubTable::full(2, 1024);
+    table.fail_on_substep = Some("zero");
+    let mut phase = InfoScrubPhase::default();
+    for poll in 1..=2u32 {
+        assert_eq!(
+            phase.poll(false, |cleared, pending| {
+                scrub_info_start_step(&mut table, cleared, pending, &mut generous_budget())
+                    .map_err(|error| format!("{error:#}"))
+            }),
+            InfoScrubDirective::Retry,
+            "poll {poll}: a failing zero retries"
+        );
+        let InfoTeardown::Failed { error } = phase.status() else {
+            panic!("poll {poll}: the status carries the failure");
+        };
+        assert!(
+            error.contains("zero"),
+            "poll {poll}: the concrete zero error survives: {error}"
+        );
+        let Retirement::Unsettled(reason) = classify_retirement(
+            true,
+            false,
+            None,
+            None,
+            &InfoTeardown::Failed {
+                error: error.clone(),
+            },
+            Duration::from_millis(300),
+        ) else {
+            panic!("poll {poll}: a timed-out retirement reads unsettled");
+        };
+        assert!(
+            reason.contains("probes detached"),
+            "poll {poll}: completed detach reads as completed: {reason}"
+        );
+        assert!(
+            !reason.contains("did not detach"),
+            "poll {poll}: no detach timeout past completed detach: {reason}"
+        );
+        assert!(
+            reason.contains(&error),
+            "poll {poll}: the concrete error crosses the timeout: {reason}"
+        );
+    }
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4): a persistent
+/// read-back failure reports end to end like the zero twin.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn persistent_readback_failure_reports_its_concrete_error_on_timeout() {
+    use crate::inventory_capture::{Retirement, classify_retirement};
+    let mut table = FakeScrubTable::full(2, 1024);
+    table.fail_on_substep = Some("verify");
+    let mut phase = InfoScrubPhase::default();
+    for poll in 1..=2u32 {
+        assert_eq!(
+            phase.poll(false, |cleared, pending| {
+                scrub_info_start_step(&mut table, cleared, pending, &mut generous_budget())
+                    .map_err(|error| format!("{error:#}"))
+            }),
+            InfoScrubDirective::Retry,
+            "poll {poll}: a failing read-back retries"
+        );
+        let InfoTeardown::Failed { error } = phase.status() else {
+            panic!("poll {poll}: the status carries the failure");
+        };
+        assert!(
+            error.contains("verify"),
+            "poll {poll}: the concrete read-back error survives: {error}"
+        );
+        let Retirement::Unsettled(reason) = classify_retirement(
+            true,
+            false,
+            None,
+            None,
+            &InfoTeardown::Failed {
+                error: error.clone(),
+            },
+            Duration::from_millis(300),
+        ) else {
+            panic!("poll {poll}: a timed-out retirement reads unsettled");
+        };
+        assert!(
+            reason.contains(&error),
+            "poll {poll}: the concrete error crosses the timeout: {reason}"
+        );
+    }
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4): a persistent
+/// remove-substep failure reports end to end like the zero twin.
+#[cfg(not(feature = "stub-object-attributes"))]
+#[test]
+fn persistent_remove_failure_reports_its_concrete_error_on_timeout() {
+    use crate::inventory_capture::{Retirement, classify_retirement};
+    let mut table = FakeScrubTable::full(2, 1024);
+    table.fail_on_substep = Some("remove");
+    let mut phase = InfoScrubPhase::default();
+    for poll in 1..=2u32 {
+        assert_eq!(
+            phase.poll(false, |cleared, pending| {
+                scrub_info_start_step(&mut table, cleared, pending, &mut generous_budget())
+                    .map_err(|error| format!("{error:#}"))
+            }),
+            InfoScrubDirective::Retry,
+            "poll {poll}: a failing remove retries"
+        );
+        let InfoTeardown::Failed { error } = phase.status() else {
+            panic!("poll {poll}: the status carries the failure");
+        };
+        assert!(
+            error.contains("remove"),
+            "poll {poll}: the concrete remove error survives: {error}"
+        );
+        let Retirement::Unsettled(reason) = classify_retirement(
+            true,
+            false,
+            None,
+            None,
+            &InfoTeardown::Failed {
+                error: error.clone(),
+            },
+            Duration::from_millis(300),
+        ) else {
+            panic!("poll {poll}: a timed-out retirement reads unsettled");
+        };
+        assert!(
+            reason.contains(&error),
+            "poll {poll}: the concrete error crosses the timeout: {reason}"
+        );
+    }
 }

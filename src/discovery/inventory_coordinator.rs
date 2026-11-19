@@ -45,7 +45,8 @@ use crate::discovery::caller_registry::{
     CallerLifecycle, CallerRegistry, CountPublication, CoverageNote, DepartedIdentity,
     EdgeFoldFacts, EdgeRecord, ExeIdentity, ExeResolution, ImageAuthority, MappingState, ModuleId,
     ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection, ProcessSource, RegistryGap,
-    RegistryLimits, ScopedOwnerProof, UnboundExe, UnboundImage, UnknownReason, UseCoverage,
+    RegistryLimits, ScopedOwnerProof, TERMINAL_GAP_RESERVE, UnboundExe, UnboundImage,
+    UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, DecisionLog, ENDPOINT_RESOURCE,
@@ -579,6 +580,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
+    /// Keymeta Task 7 (spec §17.5): the INFO join, fed by the
+    /// session drain (decoded records with resolved module, caller
+    /// and instance) and the attach-side gaps.
+    info_join: crate::inventory_provider_info::InfoJoin,
     /// This pass's attach-decision notes for the verbose per-pass
     /// lines: replaced by every absorb, read by the progress
     /// renderer. Empty passes (and old runs) render no lines.
@@ -587,6 +592,50 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// last took them. Bounded by the endpoint budget: every endpoint
     /// enters exactly once.
     pending_targets: TargetDelta,
+    /// Keymeta Task 7 (spec §17.4): retained endpoints whose INFO
+    /// kind a later pass revoked. Their rows are rejected at ingest
+    /// (the alias gap was already counted at revocation). Bounded by
+    /// the endpoint budget; entries never leave.
+    info_revoked: BTreeSet<u32>,
+    /// Keymeta Task 7 (spec §17.5): pair-uniqueness probes for INFO
+    /// attribution (work pin: at most one per decoded row that needs
+    /// a lookup — token/mechanism rows with a bound caller;
+    /// provider and unavailable rows probe nothing).
+    info_attribution_probes: u64,
+    /// Keymeta Task 7 (spec §17.4): saturating run totals of the
+    /// four INFO evidence cells, reported once per nonzero category
+    /// at the terminal cut — through the terminal gap headroom, so
+    /// a saturated generic log never loses them.
+    info_evidence_totals: [u64; 4],
+    /// Keymeta Task 7 (spec §17.5): the stop already disclosed its
+    /// queued-but-unfolded departed INFO folds, once per run.
+    info_fold_deferred_disclosed: bool,
+    /// Keymeta Task 7 (spec §17.4): the last INFO quantum's cut
+    /// outcome, carried independently of terminal eligibility so
+    /// an unsettled stop still discloses its cut and run totals.
+    info_last_cut: Option<InfoCutOutcome>,
+    /// Keymeta Task 7 (spec §17.4): whether any INFO quantum this
+    /// run observed anything — sticky, so an expired final quantum
+    /// with no fresh readings never erases an earlier observation
+    /// from the terminal cut. Quiet runs (P0 included) stay false.
+    info_observed_any: bool,
+    /// Keymeta Task 7 (spec §17.4): the terminal INFO cut and run
+    /// totals already staged, once per run.
+    info_cut_disclosed: bool,
+    /// Keymeta Task 7 (spec §17.4): the last INFO quantum arrived as
+    /// a terminal batch, so its classification is handled even when
+    /// it stages no rows (a healthy settled cut stays quiet through
+    /// Finish instead of relabelling as unsettled). Finish falls back
+    /// only when the last cut was provisional.
+    info_last_cut_terminal: bool,
+    /// Whether the terminal/stop-time gap phase has flipped (mirrors
+    /// the registry's phase for INFO's own headroom budget).
+    terminal_phase_entered: bool,
+    /// Stop-time per-quantum INFO evidence rows staged since the
+    /// phase flipped: capped so the terminal aggregates keep their
+    /// reserved headroom slots (the deltas still accumulate into
+    /// the run totals, which the cut reports).
+    info_stop_evidence_rows: usize,
     /// What the capture facade's receipts say per endpoint, once native
     /// capture runs (Task 6 C3); `None` in the scan lane.
     capture: Option<CaptureCoverage>,
@@ -1440,6 +1489,30 @@ pub(crate) struct FoldReceipt {
     pub folded_instances: Vec<RegistryInstanceId>,
 }
 
+/// Shared-headroom rows held back from INFO detail for other
+/// stop-time diagnostics (spec §17.4): stop-time per-quantum
+/// evidence rows yield past this many shared slots, so a failure
+/// diagnostic staged beside them still retains. The terminal INFO
+/// aggregates themselves (cut, run totals, deferred fold) ride the
+/// dedicated aggregate headroom above the shared reserve.
+const INFO_TERMINAL_DETAIL_HOLDBACK: usize = 5;
+
+/// One INFO quantum's terminal-cut outcome, carried independently
+/// of terminal eligibility so an unsettled stop still discloses
+/// its cut and totals at Finish. Run-wide: the INFO ring has a
+/// single producer per run.
+#[derive(Debug, Clone)]
+struct InfoCutOutcome {
+    observed: bool,
+    retired: bool,
+    complete: bool,
+    produced_fresh: bool,
+    failure: Option<String>,
+    produced_error: Option<String>,
+    loss: u64,
+    consumed: u64,
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     // Retain the default constructor for existing internal harness callers;
     // the public runtime always supplies its already-resolved budget.
@@ -1521,8 +1594,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             adapter,
             registry,
             attach_set: InventoryAttachSet::new(endpoint_budget),
+            info_join: crate::inventory_provider_info::InfoJoin::new(),
             last_pass_decisions: DecisionLog::default(),
             pending_targets: TargetDelta::default(),
+            info_revoked: BTreeSet::new(),
+            info_attribution_probes: 0,
+            info_evidence_totals: [0; 4],
+            info_fold_deferred_disclosed: false,
+            info_last_cut: None,
+            info_observed_any: false,
+            info_cut_disclosed: false,
+            info_last_cut_terminal: false,
+            terminal_phase_entered: false,
+            info_stop_evidence_rows: 0,
             capture: None,
             deferral_folds: BTreeMap::new(),
             stop_reprojection: BTreeMap::new(),
@@ -3855,6 +3939,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The lane enters it when stopping (stop request, plus the lane stop
     /// for bare stops), before staging any terminal disclosure.
     pub(crate) fn enter_terminal_phase(&mut self) {
+        self.terminal_phase_entered = true;
         self.registry.enter_terminal_phase();
     }
 
@@ -3962,7 +4047,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// passes): the lane's activation extend carries it instead of waiting
     /// for the first pass.
     pub(crate) fn has_pending_targets(&self) -> bool {
-        !self.pending_targets.endpoints.is_empty() || !self.pending_targets.objects.is_empty()
+        !self.pending_targets.endpoints.is_empty()
+            || !self.pending_targets.objects.is_empty()
+            || !self.pending_targets.info_revoked.is_empty()
     }
 
     /// Native capture starts: from now on each scan projection stages a
@@ -4010,6 +4097,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Exec coverage is the binder's, whatever capture coverage holds.
         if let Some(coverage) = receipt.exec_coverage {
             self.binder.note_exec_coverage(coverage);
+        }
+        // Keymeta Task 7 (spec §17.4): the attach-side counted
+        // `info_return_deferred` gap rides every receipt into the
+        // join, before the capture-gated sections below.
+        for _ in 0..receipt.info_return_deferred {
+            self.info_join.note_return_deferred();
+        }
+        // Failed INFO_KIND revocation writes retry on the next
+        // extend; each failure still reaches the operator (the stale
+        // cell keeps authorizing probe reads until the retry lands).
+        if receipt.info_revoke_failed > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "provider info".into(),
+                reason: format!(
+                    "info revocation failed for {} endpoint(s); stale reads possible until the retry",
+                    receipt.info_revoke_failed
+                ),
+                budget: None,
+            });
         }
         let Some(capture) = self.capture.as_mut() else {
             return;
@@ -6384,6 +6493,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if stop() {
             return FoldReceipt::default();
         }
+        // Keymeta Task 7 (spec §17.5, INV-2): retire one bounded
+        // slice of queued departed-INFO rows per call — even when
+        // nothing new rendered — so a single caller can never stall
+        // a pass. Folds complete over subsequent calls. Past the
+        // stop gate above: a stopped retirement folds nothing.
+        self.info_join
+            .fold_step(crate::inventory_provider_info::INFO_FOLD_ROWS_PER_CALL);
         if self.rendered_callers.is_empty() {
             // No rows wait, but a stopped drain may have left closes
             // queued: service them while quiet.
@@ -6986,6 +7102,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         sizes: Option<&MemberSizes>,
         now_ns: u64,
     ) -> FoldedCaller {
+        // Keymeta Task 7 (spec §17.5): a proven-ended caller queues
+        // its info rows for the run-wide departed counts. Missing
+        // callers fold nothing and count nothing, so this runs
+        // unconditionally, ahead of the context-gated edge fold;
+        // the bounded fold steps run in `retire_rendered_callers`.
+        self.info_join.enqueue_fold(id);
         let (Some(ctx), Some(pairs), Some(sizes)) = (folded, pairs, sizes) else {
             return FoldedCaller::default();
         };
@@ -8486,6 +8608,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         absorbed: AbsorbOutcome,
     ) -> BTreeMap<AttachModuleKey, AttachVerdict> {
+        // Keymeta Task 7 (spec §17.4): the attach-side counted
+        // `info_aliased_endpoint` gap rides the absorb outcome into
+        // the join.
+        for _ in 0..absorbed.info_aliased {
+            self.info_join.note_aliased_endpoint();
+        }
+        // Revoked endpoints: their rows reject at ingest from now
+        // on, and the capture clears their cells on the next extend.
+        for id in &absorbed.info_revoked {
+            self.info_revoked.insert(id.0);
+        }
+        self.pending_targets
+            .info_revoked
+            .extend(absorbed.info_revoked);
         self.pending_targets.append(absorbed.delta);
         self.last_pass_decisions = absorbed.decisions;
         for gap in absorbed.gaps {
@@ -8996,8 +9132,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ));
                 }
             }
-            NativeBatch::Finish { domain } => self.binder.finish(domain),
+            NativeBatch::Finish { domain } => {
+                self.binder.finish(domain);
+                self.disclose_info_deferred_fold();
+                self.disclose_info_cut_at_finish();
+            }
             NativeBatch::Semantic(batch) => self.stage_semantic_batch(batch),
+            // Keymeta Task 7 (spec §17.5): decode, resolve and join
+            // one INFO quantum; degradation notes registry gaps.
+            NativeBatch::Info(batch) => self.ingest_info_batch(&batch),
         }
         let mut receipt = self.stage_binder_output(identity, now_ns);
         receipt.events.extend(hook_events);
@@ -9368,8 +9511,365 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.stage_binder_output(identity, pass_start_ns).events
     }
 
+    /// Keymeta Task 7 evidence cell name (spec §17.4): the stable
+    /// per-category identity shared by per-quantum deltas and the
+    /// terminal run totals, so oracles parse one vocabulary.
+    fn info_evidence_cell_name(index: usize) -> Option<&'static str> {
+        match u32::try_from(index).ok() {
+            Some(p11scope_ebpf_common::INFO_EVIDENCE_INSERT_FAILURES) => {
+                Some("stash insert failure")
+            }
+            Some(p11scope_ebpf_common::INFO_EVIDENCE_UNMATCHED_RETURNS) => Some("unmatched return"),
+            Some(p11scope_ebpf_common::INFO_EVIDENCE_NESTED_OVERWRITES) => Some("nested overwrite"),
+            Some(p11scope_ebpf_common::INFO_EVIDENCE_STASH_MISMATCHES) => Some("stash mismatch"),
+            _ => None,
+        }
+    }
+
     /// Stages what the binder decided since the last call: decided rows,
     /// then proven exec transitions, then the census.
+    /// Keymeta Task 7 (spec §17.4, §17.5): decode one INFO quantum,
+    /// resolve endpoint → module and the header identity → caller
+    /// incarnation, and fold each row into the join with the proved
+    /// instance where exactly one exists. Bound rows join; unbound
+    /// and zero identities refuse with the named counted
+    /// `info_caller_unavailable` gap; records naming no admitted
+    /// module, undecodable records, unreadable-ring failures and
+    /// terminal backlog cuts note registry gaps and drop.
+    /// Multi-module endpoints ingest under each admitted module
+    /// (identical library facts, both true).
+    fn ingest_info_batch(&mut self, batch: &crate::attach::capture::InfoBatch) {
+        use crate::inventory_provider_info::decode_info_record;
+        use p11scope_ebpf_common::inventory_info::{INFO_KIND_PROVIDER, INFO_STATUS_UNAVAILABLE};
+        let mut unresolvable = 0u64;
+        let mut malformed = batch.malformed;
+        for raw in &batch.records {
+            let Ok(record) = decode_info_record(raw) else {
+                malformed = malformed.saturating_add(1);
+                continue;
+            };
+            // Revoked endpoints (a later pass proved their names
+            // aliased): reject outstanding rows. The alias gap was
+            // already counted once at revocation.
+            if self.info_revoked.contains(&record.endpoint) {
+                continue;
+            }
+            let modules = match self.resolve_info_modules(record.endpoint) {
+                Ok(modules) => modules,
+                Err(()) => {
+                    unresolvable = unresolvable.saturating_add(1);
+                    continue;
+                }
+            };
+            let caller = (record.task_cookie != 0 && record.exec_id != 0).then(|| {
+                self.binder.bound_caller_for_image(
+                    batch.domain,
+                    DomainCookie::new(batch.domain, record.task_cookie),
+                    record.exec_id,
+                )
+            });
+            let caller = caller.flatten();
+            for module in modules {
+                // Provider rows publish regardless of caller and
+                // unavailable rows join to nothing, so neither
+                // needs instance attribution; every other row
+                // probes the registry's mutation-maintained pair
+                // map directly (one lookup per row, never a
+                // registry scan).
+                let instance = if record.status == INFO_STATUS_UNAVAILABLE
+                    || record.kind == INFO_KIND_PROVIDER
+                {
+                    None
+                } else {
+                    caller.and_then(|caller| {
+                        let unique = self.registry.instance_pair_unique(caller, module);
+                        self.info_attribution_probes =
+                            self.info_attribution_probes.saturating_add(1);
+                        unique
+                    })
+                };
+                self.info_join.ingest(&record, module, caller, instance);
+            }
+        }
+        if unresolvable > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "provider info".into(),
+                reason: format!("{unresolvable} info record(s) named no admitted module; dropped"),
+                budget: None,
+            });
+        }
+        if malformed > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "provider info".into(),
+                reason: format!("{malformed} info record(s) failed validation; dropped"),
+                budget: None,
+            });
+        }
+        if let Some(failure) = batch.failure.as_deref() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "provider info".into(),
+                reason: format!("info ring unreadable: {failure}"),
+                budget: None,
+            });
+        }
+        // Keymeta Task 7 evidence (spec §17.4, never silent): the
+        // stash-level counts since the last quantum reach the
+        // operator as counted diagnostics; a failed cell read
+        // reports its cause instead of hiding behind zeros. Every
+        // delta also lands in the saturating run totals, which the
+        // terminal cut reports once per nonzero category.
+        for (index, delta) in batch.evidence_delta.iter().enumerate() {
+            self.info_evidence_totals[index] =
+                self.info_evidence_totals[index].saturating_add(*delta);
+            if *delta == 0 {
+                continue;
+            }
+            let Some(what) = Self::info_evidence_cell_name(index) else {
+                continue;
+            };
+            // Stop-time per-quantum evidence detail yields its rows
+            // past the headroom budget: the deltas already landed in
+            // the run totals above, which the terminal cut reports.
+            // Failure diagnostics below never yield.
+            if self.terminal_phase_entered {
+                if self.info_stop_evidence_rows
+                    >= TERMINAL_GAP_RESERVE - INFO_TERMINAL_DETAIL_HOLDBACK
+                {
+                    continue;
+                }
+                self.info_stop_evidence_rows += 1;
+            }
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "provider info".into(),
+                reason: format!("info evidence: {delta} {what}(s)"),
+                budget: None,
+            });
+        }
+        if let Some(error) = batch.evidence_error.as_deref() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "provider info".into(),
+                reason: format!("info evidence unreadable: {error}"),
+                budget: None,
+            });
+        }
+        // Every quantum's cut outcome carries to the stop,
+        // independently of terminal eligibility, so an unsettled
+        // cut still discloses at Finish. Mid-run batches stay
+        // provisional (registry gaps never retract). Observation
+        // presence is run-wide: an expired final quantum keeps the
+        // run's earlier observation while the counts stay the last
+        // batch's stale readings.
+        let batch_observed = batch.produced_fresh
+            || batch.produced_error.is_some()
+            || !batch.records.is_empty()
+            || batch.produced > 0
+            || batch.consumed > 0
+            || batch.malformed > 0
+            || batch.failure.is_some()
+            || batch.evidence_delta.iter().any(|delta| *delta > 0)
+            || batch.evidence_error.is_some();
+        self.info_observed_any |= batch_observed;
+        let cut = InfoCutOutcome {
+            observed: self.info_observed_any,
+            retired: batch.retired,
+            complete: batch.complete,
+            produced_fresh: batch.produced_fresh,
+            failure: batch.failure.clone(),
+            produced_error: batch.produced_error.clone(),
+            loss: batch.loss,
+            consumed: batch.consumed,
+        };
+        // Terminal cut (spec §17.4): the session's last INFO quantum
+        // over settled retirement discloses here; an unsettled stop
+        // discloses its provisional cut at Finish instead. A terminal
+        // arrival marks its classification handled even when it stages
+        // no rows, so a healthy settled cut never relabels.
+        if batch.terminal && self.stage_info_cut(&cut) {
+            self.info_cut_disclosed = true;
+        }
+        self.info_last_cut_terminal = batch.terminal;
+        self.info_last_cut = Some(cut);
+    }
+
+    /// The terminal-cut reason for one INFO cut outcome (spec §17.4):
+    /// the last quantum reports its observed backlog, never certified
+    /// loss — exact loss is unproven without producer quiescence
+    /// (D3), which Inventory FD retirement does not supply. Cuts
+    /// without any INFO observation (P0, or a quiet run) stay quiet,
+    /// as does a retired, complete, fresh cut with zero backlog.
+    fn info_cut_reason(cut: &InfoCutOutcome) -> Option<String> {
+        if !cut.observed {
+            return None;
+        }
+        if !cut.retired {
+            return Some(format!(
+                "info terminal incomplete: retirement unsettled; backlog {} observed \
+                 (loss unproven)",
+                cut.loss
+            ));
+        }
+        if !cut.complete {
+            let cause = cut
+                .failure
+                .as_deref()
+                .unwrap_or("drain bound or deadline reached");
+            return Some(format!(
+                "info terminal incomplete: {cause}; backlog {} observed (loss unproven)",
+                cut.loss
+            ));
+        }
+        if !cut.produced_fresh {
+            let cause = cut.produced_error.as_deref().unwrap_or("unreadable");
+            return Some(format!(
+                "info terminal unavailable: produced counter {cause}; consumed {} observed \
+                 (loss unproven)",
+                cut.consumed
+            ));
+        }
+        if cut.loss > 0 {
+            return Some(format!(
+                "info terminal backlog: {} record(s) observed at cut (loss unproven)",
+                cut.loss
+            ));
+        }
+        None
+    }
+
+    /// One INFO terminal cut: the backlog row plus the run totals,
+    /// one stable row per nonzero category. The cut stages as
+    /// terminal aggregates, so these retain from the dedicated
+    /// aggregate headroom even when per-quantum rows and other
+    /// stop-time gaps filled the shared reserve. True when any row
+    /// staged.
+    fn stage_info_cut(&mut self, cut: &InfoCutOutcome) -> bool {
+        let mut staged = false;
+        if let Some(reason) = Self::info_cut_reason(cut) {
+            staged = true;
+            self.registry.record_terminal_aggregate(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "provider info".into(),
+                reason,
+                budget: None,
+            });
+        }
+        for (index, total) in self.info_evidence_totals.iter().enumerate() {
+            if *total == 0 {
+                continue;
+            }
+            let Some(what) = Self::info_evidence_cell_name(index) else {
+                continue;
+            };
+            staged = true;
+            self.registry.record_terminal_aggregate(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "provider info".into(),
+                reason: format!("info evidence run total: {total} {what}(s)"),
+                budget: None,
+            });
+        }
+        staged
+    }
+
+    /// Keymeta Task 7 (spec §17.4): the stop discloses an unsettled
+    /// INFO cut once — the last provisional quantum's outcome over the
+    /// run totals — only when the last cut was provisional. A terminal
+    /// batch already classified its cut (quiet stays quiet); a Finish
+    /// without any terminal batch means retirement never settled it.
+    /// Silent without any INFO observation.
+    fn disclose_info_cut_at_finish(&mut self) {
+        if self.info_cut_disclosed || self.info_last_cut_terminal {
+            return;
+        }
+        let Some(last) = self.info_last_cut.clone() else {
+            return;
+        };
+        let cut = InfoCutOutcome {
+            retired: false,
+            ..last
+        };
+        if self.stage_info_cut(&cut) {
+            self.info_cut_disclosed = true;
+        }
+    }
+
+    /// Keymeta Task 7 (spec §17.5): the stop names queued-but-
+    /// unfolded departed INFO folds — once per run, beside the
+    /// terminal cut — instead of silently understating the departed
+    /// counts. The deferred rows stay out of the live projection
+    /// (snapshots omit queued callers); only the folded counts are
+    /// final. Silent when no unfolded rows pend.
+    fn disclose_info_deferred_fold(&mut self) {
+        if self.info_fold_deferred_disclosed {
+            return;
+        }
+        let (callers, rows) = self.info_join.fold_deferred();
+        if rows == 0 {
+            return;
+        }
+        self.info_fold_deferred_disclosed = true;
+        self.registry.record_terminal_aggregate(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "provider info".into(),
+            reason: format!(
+                "info departed fold deferred: {callers} caller(s), {rows} row(s) unfolded at stop \
+                 (excluded from live rows; folded counts partial)"
+            ),
+            budget: None,
+        });
+    }
+
+    /// Endpoint → admitted registry modules for one INFO record, via
+    /// the attach set's membership and the registry's projection.
+    fn resolve_info_modules(&self, endpoint: u32) -> Result<Vec<ModuleId>, ()> {
+        let keys = self
+            .admitted_modules_for_endpoint(crate::discovery::inventory_attach_set::EndpointId(
+                endpoint,
+            ))
+            .map_err(|_| ())?;
+        let modules: Vec<ModuleId> = keys
+            .iter()
+            .filter_map(|key| self.registry.module_by_key(key))
+            .collect();
+        if modules.is_empty() {
+            Err(())
+        } else {
+            Ok(modules)
+        }
+    }
+
+    /// The join's current projection for rendering: per-module
+    /// provider facts plus the run-wide token/mechanism rows and
+    /// gaps. Streaming views snapshot while the capture still runs.
+    pub(crate) fn provider_info_snapshot(
+        &self,
+    ) -> (
+        BTreeMap<ModuleId, crate::inventory_provider_info::ProviderInfo>,
+        crate::inventory_provider_info::ProviderObservations,
+    ) {
+        self.info_join.snapshot()
+    }
+
     fn stage_binder_output(
         &mut self,
         identity: &mut dyn NativeIdentity<Source::Pin>,
@@ -13531,7 +14031,12 @@ pub(crate) enum NativeBatch {
     Finish { domain: NativeDomainId },
     /// One owned lane batch (H0 outcomes, current-partition receipts and
     /// lane negatives) queued for finalization after the commit tail.
+    /// Test-only constructed until the H0 lane stages in production.
+    #[cfg_attr(not(test), allow(dead_code))]
     Semantic(SemanticBatch),
+    /// Keymeta Task 7 (spec §17.5): one INFO quantum drained from a
+    /// capture domain, decoded and resolved into the join here.
+    Info(crate::attach::capture::InfoBatch),
 }
 
 /// What one `stage_native` call did.
@@ -18226,6 +18731,7 @@ pub(crate) mod tests {
         let deferred = |id: u32| crate::discovery::inventory_attach_set::TargetDelta {
             endpoints: vec![endpoint(id)],
             objects: vec![endpoint(id).object],
+            info_revoked: vec![],
         };
         // One attached, one deferred: partial attach.
         coordinator.note_extend_receipt(&ExtendReceipt {
@@ -18331,6 +18837,7 @@ pub(crate) mod tests {
             deferred: crate::discovery::inventory_attach_set::TargetDelta {
                 endpoints: vec![b_endpoint],
                 objects: vec![b_endpoint.object],
+                info_revoked: vec![],
             },
             ..ExtendReceipt::default()
         });
@@ -18459,6 +18966,7 @@ pub(crate) mod tests {
                 deferred: crate::discovery::inventory_attach_set::TargetDelta {
                     endpoints: rest,
                     objects,
+                    info_revoked: vec![],
                 },
                 ..ExtendReceipt::default()
             });
@@ -18601,6 +19109,7 @@ pub(crate) mod tests {
             deferred: crate::discovery::inventory_attach_set::TargetDelta {
                 endpoints: vec![endpoint(1), endpoint(2)],
                 objects: vec![endpoint(1).object, endpoint(2).object],
+                info_revoked: vec![],
             },
             ..ExtendReceipt::default()
         });
@@ -18748,6 +19257,7 @@ pub(crate) mod tests {
             deferred: crate::discovery::inventory_attach_set::TargetDelta {
                 endpoints: deferred.to_vec(),
                 objects: deferred.iter().map(|target| target.object).collect(),
+                info_revoked: vec![],
             },
             ..ExtendReceipt::default()
         }
@@ -18908,6 +19418,7 @@ pub(crate) mod tests {
             deferred: crate::discovery::inventory_attach_set::TargetDelta {
                 endpoints: rest,
                 objects,
+                info_revoked: vec![],
             },
             ..ExtendReceipt::default()
         });
@@ -19005,6 +19516,7 @@ pub(crate) mod tests {
                 deferred: crate::discovery::inventory_attach_set::TargetDelta {
                     endpoints: rest,
                     objects,
+                    info_revoked: vec![],
                 },
                 ..ExtendReceipt::default()
             });
@@ -19102,6 +19614,7 @@ pub(crate) mod tests {
                 deferred: crate::discovery::inventory_attach_set::TargetDelta {
                     endpoints: rest,
                     objects,
+                    info_revoked: vec![],
                 },
                 ..ExtendReceipt::default()
             });
@@ -19199,6 +19712,7 @@ pub(crate) mod tests {
             deferred: crate::discovery::inventory_attach_set::TargetDelta {
                 endpoints: vec![evicted],
                 objects: vec![evicted.object],
+                info_revoked: vec![],
             },
             ..ExtendReceipt::default()
         });
@@ -19330,6 +19844,7 @@ pub(crate) mod tests {
             deferred: crate::discovery::inventory_attach_set::TargetDelta {
                 endpoints: vec![shared],
                 objects: vec![shared.object],
+                info_revoked: vec![],
             },
             ..ExtendReceipt::default()
         });
@@ -19427,7 +19942,11 @@ pub(crate) mod tests {
         let defer = |ids: &[u32]| -> crate::discovery::inventory_attach_set::TargetDelta {
             let endpoints: Vec<_> = ids.iter().map(|id| endpoint(*id)).collect();
             let objects: Vec<_> = endpoints.iter().map(|target| target.object).collect();
-            crate::discovery::inventory_attach_set::TargetDelta { endpoints, objects }
+            crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints,
+                objects,
+                info_revoked: vec![],
+            }
         };
         // Pass one defers two, pass two defers one; both stream
         // mid-run exactly as the pass loop emits them.
@@ -19531,7 +20050,11 @@ pub(crate) mod tests {
         let defer = |ids: &[u32]| -> crate::discovery::inventory_attach_set::TargetDelta {
             let endpoints: Vec<_> = ids.iter().map(|id| endpoint(*id)).collect();
             let objects: Vec<_> = endpoints.iter().map(|target| target.object).collect();
-            crate::discovery::inventory_attach_set::TargetDelta { endpoints, objects }
+            crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints,
+                objects,
+                info_revoked: vec![],
+            }
         };
         coordinator.note_extend_receipt(&ExtendReceipt {
             deferred: defer(&[0, 1]),
@@ -19637,6 +20160,7 @@ pub(crate) mod tests {
             deferred: crate::discovery::inventory_attach_set::TargetDelta {
                 endpoints: rest,
                 objects,
+                info_revoked: vec![],
             },
             ..ExtendReceipt::default()
         });
@@ -40419,6 +40943,1867 @@ int main(void) {
             "use row could bind"
         ));
     }
+
+    /// One writer-built INFO record for coordinator ingest tests: the
+    /// production return adapter packs the struct bytes and the shared
+    /// encoder emits the 176-byte record (spec §17.4).
+    fn info_record_bytes(
+        kind: u8,
+        struct_bytes: &[u8],
+        endpoint: u32,
+        cookie: u64,
+        exec: u64,
+        slot: u64,
+        mechanism: u64,
+    ) -> [u8; 176] {
+        use p11scope_ebpf_common::inventory_info::{
+            INFO_LAYOUT_LP64, INFO_RECORD_LEN, INFO_STATUS_OK, InfoHeader, encode_info_record,
+        };
+        use p11scope_ebpf_common::object_flow::{
+            InfoReturnVerdict, InfoStart, adapter_info_return,
+        };
+        use p11scope_ebpf_common::{FnByteReader, LinuxLayout};
+        let base = 0x4000u64;
+        let stash = InfoStart {
+            info_ptr: base,
+            slot,
+            mechanism,
+            kind,
+            layout: INFO_LAYOUT_LP64,
+            reserved: [0; 6],
+        };
+        let mut reader = FnByteReader(|address: u64, _: LinuxLayout, out: &mut [u8]| {
+            let start = usize::try_from(address.wrapping_sub(base)).map_err(|_| ())?;
+            out.copy_from_slice(struct_bytes.get(start..start + out.len()).ok_or(())?);
+            Ok(())
+        });
+        let mut payload = [0u8; 120];
+        assert!(matches!(
+            adapter_info_return(&stash, 0, LinuxLayout::Lp64, &mut payload, &mut reader),
+            InfoReturnVerdict::Emit(_)
+        ));
+        let header = InfoHeader {
+            endpoint,
+            kind,
+            layout: INFO_LAYOUT_LP64,
+            reserved0: 0,
+            host_tgid: 7,
+            reserved1: 0,
+            task_cookie: cookie,
+            exec_id: exec,
+            slot,
+            mechanism,
+        };
+        let mut out = [0u8; INFO_RECORD_LEN];
+        assert!(encode_info_record(
+            &mut out,
+            &header,
+            INFO_STATUS_OK,
+            &payload
+        ));
+        out
+    }
+
+    fn scripted_token_struct() -> Vec<u8> {
+        let mut bytes = vec![0u8; 208];
+        bytes[32..64].copy_from_slice(&[b'M'; 32]);
+        bytes[64..80].copy_from_slice(&[b'X'; 16]);
+        bytes[96..104].copy_from_slice(&0x06u64.to_le_bytes());
+        bytes[136..144].copy_from_slice(&255u64.to_le_bytes());
+        bytes[144..152].copy_from_slice(&4u64.to_le_bytes());
+        bytes[184..186].copy_from_slice(&[2, 6]);
+        bytes[186..188].copy_from_slice(&[2, 7]);
+        bytes
+    }
+
+    fn scripted_mechanism_struct() -> Vec<u8> {
+        let mut bytes = vec![0u8; 24];
+        bytes[0..8].copy_from_slice(&1024u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        bytes
+    }
+
+    fn scripted_provider_struct() -> Vec<u8> {
+        let mut bytes = vec![0u8; 88];
+        bytes[0..2].copy_from_slice(&[3, 1]);
+        bytes[2..9].copy_from_slice(b"SoftHSM");
+        bytes[9..34].fill(b' ');
+        bytes[40..48].copy_from_slice(&0u64.to_le_bytes());
+        bytes[48..58].copy_from_slice(b"SoftHSM v2");
+        bytes[58..80].fill(b' ');
+        bytes[80..82].copy_from_slice(&[2, 6]);
+        bytes
+    }
+
+    /// Keymeta Task 7 session drain (spec §17.4, §17.5): INFO batches
+    /// stage through the coordinator, which decodes each record,
+    /// resolves endpoint → module and the header identity → caller
+    /// incarnation, and ingests into the join. Bound rows join;
+    /// unbound and zero identities refuse with the named counted
+    /// `info_caller_unavailable` gap; records naming no admitted
+    /// module and undecodable records note registry gaps and drop;
+    /// a terminal backlog cut rides a gap too, while provisional
+    /// mid-run backlog records none.
+    #[test]
+    fn ingest_info_batch_resolves_joins_and_gaps() {
+        use p11scope_ebpf_common::inventory_info::{
+            INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN,
+        };
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        let module = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .map(|edge| edge.module)
+            .expect("bound witness stages its edge");
+        let mut records = vec![
+            info_record_bytes(
+                INFO_KIND_PROVIDER,
+                &scripted_provider_struct(),
+                endpoint,
+                41,
+                1,
+                0,
+                0,
+            ),
+            info_record_bytes(
+                INFO_KIND_TOKEN,
+                &scripted_token_struct(),
+                endpoint,
+                41,
+                1,
+                3,
+                0,
+            ),
+            info_record_bytes(
+                INFO_KIND_MECHANISM,
+                &scripted_mechanism_struct(),
+                endpoint,
+                41,
+                1,
+                3,
+                0x1082,
+            ),
+            // Unbound image: refused with the caller gap.
+            info_record_bytes(
+                INFO_KIND_TOKEN,
+                &scripted_token_struct(),
+                endpoint,
+                99,
+                1,
+                4,
+                0,
+            ),
+            // Zero identity: refused with the caller gap.
+            info_record_bytes(
+                INFO_KIND_TOKEN,
+                &scripted_token_struct(),
+                endpoint,
+                0,
+                0,
+                5,
+                0,
+            ),
+        ];
+        // Unknown endpoint: no admitted module.
+        records.push(info_record_bytes(
+            INFO_KIND_TOKEN,
+            &scripted_token_struct(),
+            999,
+            41,
+            1,
+            6,
+            0,
+        ));
+        // Undecodable record: bad version.
+        let mut malformed = info_record_bytes(
+            INFO_KIND_TOKEN,
+            &scripted_token_struct(),
+            endpoint,
+            41,
+            1,
+            7,
+            0,
+        );
+        malformed[48..50].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        records.push(malformed);
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records,
+            malformed: 0,
+            produced: 7,
+            consumed: 7,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        // Registry gaps stage until the batch commits.
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let (providers, observations) = native.scene.coordinator.info_join.snapshot();
+        assert_eq!(providers.len(), 1, "one provider row joins");
+        assert!(providers.contains_key(&module));
+        assert_eq!(observations.tokens.len(), 1, "one token row joins");
+        assert_eq!(observations.tokens[0].slot, 3);
+        assert_eq!(observations.tokens[0].module, module);
+        assert_eq!(observations.tokens[0].caller, caller);
+        assert_eq!(observations.tokens[0].pin_min_len, 4);
+        assert!(observations.tokens[0].instance.is_none());
+        assert_eq!(observations.mechanisms.len(), 1, "one mechanism row joins");
+        assert_eq!(observations.mechanisms[0].mechanism, 0x1082);
+        assert_eq!(
+            observations.gaps.caller_unavailable, 2,
+            "unbound and zero identities refuse"
+        );
+        let gaps: Vec<(&str, &str)> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.as_str(), gap.reason.as_str()))
+            .collect();
+        assert!(
+            gaps.iter()
+                .any(|(subject, reason)| subject.contains("provider info")
+                    && reason.contains("no admitted module")),
+            "module-miss notes a gap: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|(subject, reason)| subject.contains("provider info")
+                    && reason.contains("failed validation")),
+            "malformed notes a gap: {gaps:?}"
+        );
+        // Provisional mid-run backlog (submitted-but-undrained)
+        // records no gap: only the terminal cut reports.
+        let backlog = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 9,
+            consumed: 7,
+            loss: 2,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(backlog));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().all(|gap| {
+                !(gap.subject.contains("provider info") && gap.reason.contains("lost"))
+            }),
+            "provisional mid-run loss records no gap: {gaps:?}"
+        );
+        // A terminal cut with observed backlog rides a backlog gap,
+        // never certified loss.
+        let lossy = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 9,
+            consumed: 7,
+            loss: 2,
+            terminal: true,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: true,
+        };
+        native.stage(NativeBatch::Info(lossy));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject.contains("provider info")
+                && gap.reason.contains("backlog: 2 record(s) observed at cut")),
+            "a terminal cut with backlog notes a backlog gap: {gaps:?}"
+        );
+        assert!(
+            gaps.iter().all(|gap| {
+                !(gap.subject.contains("provider info") && gap.reason.contains("lost"))
+            }),
+            "a terminal cut never certifies loss: {gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 terminal cut (spec §17.4): a terminal reading
+    /// reports its observed backlog, never certified loss — exact
+    /// loss is unproven without producer quiescence (D3), which
+    /// Inventory FD retirement does not supply.
+    #[test]
+    fn ingest_info_batch_reports_terminal_backlog_never_certified_loss() {
+        let (mut native, _caller) = NativeScene::new();
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 9,
+            consumed: 7,
+            loss: 2,
+            terminal: true,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: true,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().all(|gap| {
+                !(gap.subject.contains("provider info") && gap.reason.contains("lost"))
+            }),
+            "a terminal cut never certifies loss: {gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|gap| gap.subject.contains("provider info")
+                && gap.reason.contains("backlog: 2 record(s) observed at cut")),
+            "a terminal cut reports its observed backlog: {gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 terminal cuts (spec §17.4): an incomplete
+    /// drain (bound, deadline or error), an unreadable final counter
+    /// and an unsettled retirement each report their own cut with
+    /// the observed backlog or counts — never certified loss. A P0
+    /// cut and a healthy retired cut stay quiet.
+    #[test]
+    fn ingest_info_batch_reports_terminal_cuts_honestly() {
+        let cut = |complete: bool,
+                   fresh: bool,
+                   retired: bool,
+                   produced: u64,
+                   consumed: u64,
+                   failure: Option<String>,
+                   produced_error: Option<String>| {
+            let (mut native, _caller) = NativeScene::new();
+            let batch = crate::attach::capture::InfoBatch {
+                domain: native.domain,
+                records: Vec::new(),
+                malformed: 0,
+                produced,
+                consumed,
+                loss: produced.saturating_sub(consumed),
+                terminal: true,
+                failure,
+                evidence_delta: [0; 4],
+                evidence_error: None,
+                complete,
+                produced_fresh: fresh,
+                produced_error,
+                retired,
+            };
+            native.stage(NativeBatch::Info(batch));
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject.contains("provider info"))
+                .map(|gap| gap.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        // Incomplete drain (bound reached, backlog pending).
+        let gaps = cut(false, true, true, 356, 256, None, None);
+        assert!(
+            gaps.iter().any(|reason| reason.contains("incomplete")
+                && reason.contains("drain bound or deadline")
+                && reason.contains("backlog 100 observed")),
+            "an incomplete cut reports its backlog: {gaps:?}"
+        );
+        // Incomplete drain with a dequeue error: the cause carries.
+        let gaps = cut(
+            false,
+            true,
+            true,
+            10,
+            8,
+            Some("ring read broke".into()),
+            None,
+        );
+        assert!(
+            gaps.iter().any(|reason| reason.contains("ring read broke")),
+            "a failed cut reports its cause: {gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(
+                |reason| reason.contains("incomplete") && reason.contains("backlog 2 observed")
+            ),
+            "a failed cut reports incomplete with backlog: {gaps:?}"
+        );
+        // Unreadable final counter after earlier provisional backlog:
+        // the stale retained difference never publishes as loss.
+        let gaps = cut(true, false, true, 9, 7, None, Some("map read broke".into()));
+        assert!(
+            gaps.iter().any(|reason| reason.contains("unavailable")
+                && reason.contains("map read broke")
+                && reason.contains("consumed 7 observed")),
+            "an unreadable counter reports unavailable with counts: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .all(|reason| !reason.contains("lost") && !reason.contains("backlog")),
+            "no stale backlog or loss publishes: {gaps:?}"
+        );
+        // Unsettled retirement: producers may still submit.
+        let gaps = cut(true, true, false, 12, 7, None, None);
+        assert!(
+            gaps.iter().any(|reason| reason.contains("incomplete")
+                && reason.contains("retirement unsettled")
+                && reason.contains("backlog 5 observed")),
+            "an unsettled cut reports incomplete: {gaps:?}"
+        );
+        // P0 (no reader, no records, no counts) stays quiet.
+        let gaps = cut(true, false, true, 0, 0, None, None);
+        assert!(gaps.is_empty(), "a P0 cut stays quiet: {gaps:?}");
+        // A healthy retired cut (complete, fresh, zero backlog) stays quiet.
+        let gaps = cut(true, true, true, 0, 0, None, None);
+        assert!(gaps.is_empty(), "a healthy cut stays quiet: {gaps:?}");
+        // Mid-run batches stay provisional whatever they carry.
+        let (mut native, _caller) = NativeScene::new();
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 9,
+            consumed: 7,
+            loss: 2,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: false,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject.contains("provider info"))
+            .collect();
+        assert!(gaps.is_empty(), "mid-run cuts stay provisional: {gaps:?}");
+    }
+
+    /// Keymeta Task 7 drain errors (spec §17.4): a batch carrying
+    /// a dequeue failure notes an unreadable-ring gap with the
+    /// error text — a failing INFO ring stays diagnosable.
+    #[test]
+    fn ingest_info_batch_reports_unreadable_ring() {
+        let (mut native, _caller) = NativeScene::new();
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal: false,
+            failure: Some("ring read broke".into()),
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: false,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject.contains("provider info")
+                && gap.reason.contains("unreadable")
+                && gap.reason.contains("ring read broke")),
+            "an unreadable ring notes a gap with its cause: {gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 evidence (spec §17.4, never silent): every
+    /// nonzero evidence delta reaches the operator as a counted
+    /// diagnostic, a failed cell read reports its cause, and a
+    /// healthy quantum (zero deltas, no error) records nothing.
+    #[test]
+    fn ingest_info_batch_reports_evidence_deltas_and_errors() {
+        let (mut native, _caller) = NativeScene::new();
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [2, 1, 0, 3],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        for expected in [
+            "info evidence: 2 stash insert failure(s)",
+            "info evidence: 1 unmatched return(s)",
+            "info evidence: 3 stash mismatch(s)",
+        ] {
+            assert!(
+                gaps.iter()
+                    .any(|gap| gap.subject.contains("provider info")
+                        && gap.reason.contains(expected)),
+                "evidence delta notes a gap ({expected}): {gaps:?}"
+            );
+        }
+        assert!(
+            gaps.iter()
+                .all(|gap| !gap.reason.contains("nested overwrite")),
+            "zero deltas record nothing: {gaps:?}"
+        );
+        let failed = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: Some("cells broke".into()),
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(failed));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject.contains("provider info")
+                && gap.reason.contains("info evidence unreadable")
+                && gap.reason.contains("cells broke")),
+            "an unreadable evidence read notes a gap with its cause: {gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 evidence totals (spec §17.4): the four stash
+    /// cells accumulate saturating run totals, and the terminal cut
+    /// reports each nonzero category once — through the terminal
+    /// headroom, so a saturated generic gap log loses per-quantum
+    /// rows but never the totals. Mixed and repeated deltas sum
+    /// exactly, and a failed read followed by a success still lands
+    /// the full delta.
+    #[test]
+    fn info_evidence_run_totals_survive_a_saturated_gap_log() {
+        use crate::discovery::caller_registry::{DEFAULT_MAX_GAPS, RegistryGap};
+        let (mut native, _caller) = NativeScene::new();
+        for n in 0..DEFAULT_MAX_GAPS + 10 {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native.scene.coordinator.registry.gaps_suppressed() > 0,
+            "the flood saturates the generic log"
+        );
+        let domain = native.domain;
+        let quantum = |delta: [u64; 4], error: Option<String>, terminal: bool| {
+            crate::attach::capture::InfoBatch {
+                domain,
+                records: Vec::new(),
+                malformed: 0,
+                produced: 0,
+                consumed: 0,
+                loss: 0,
+                terminal,
+                failure: None,
+                evidence_delta: delta,
+                evidence_error: error,
+                complete: true,
+                produced_fresh: true,
+                produced_error: None,
+                retired: terminal,
+            }
+        };
+        native.stage(NativeBatch::Info(quantum([2, 1, 0, 3], None, false)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Info(quantum(
+            [0; 4],
+            Some("cells broke".into()),
+            false,
+        )));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Info(quantum([5, 0, 1, 0], None, false)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.enter_terminal_phase();
+        native.stage(NativeBatch::Info(quantum([1, 1, 1, 1], None, true)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let info_gaps: Vec<(&str, &str)> = gaps
+            .iter()
+            .filter(|gap| gap.subject.contains("provider info"))
+            .map(|gap| (gap.subject.as_str(), gap.reason.as_str()))
+            .collect();
+        for (total, cell) in [
+            (8u64, "stash insert failure"),
+            (2, "unmatched return"),
+            (2, "nested overwrite"),
+            (4, "stash mismatch"),
+        ] {
+            let expected = format!("info evidence run total: {total} {cell}(s)");
+            assert!(
+                info_gaps
+                    .iter()
+                    .any(|(_, reason)| reason.contains(&expected)),
+                "the terminal cut reports the run total ({expected}): {info_gaps:?}"
+            );
+        }
+    }
+
+    /// Keymeta Task 7 fallback (spec §17.4, fix8 C3): a refused
+    /// journal start leaves Task 7 running on the ordinary retry's
+    /// broad inventory — info positives on a journal-refused run
+    /// equal the unrefused run's. The journal-unavailable disclosure
+    /// rides the registry; the INFO join never consults it.
+    #[test]
+    fn info_positives_match_between_journal_refused_and_plain_runs() {
+        use p11scope_ebpf_common::inventory_info::{
+            INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN,
+        };
+        let positives = |journal_refused: bool| {
+            let (mut native, _caller) = NativeScene::new();
+            native.answer(7, 500, 41);
+            let row = native.row(41, 1, 7, 100, 0);
+            native.witness(vec![row]);
+            if journal_refused {
+                native
+                    .scene
+                    .coordinator
+                    .disclose_joint_journal_unavailable_once();
+            }
+            let endpoint = native.scene.delta.endpoints[0].id.0;
+            let records = vec![
+                info_record_bytes(
+                    INFO_KIND_PROVIDER,
+                    &scripted_provider_struct(),
+                    endpoint,
+                    41,
+                    1,
+                    0,
+                    0,
+                ),
+                info_record_bytes(
+                    INFO_KIND_TOKEN,
+                    &scripted_token_struct(),
+                    endpoint,
+                    41,
+                    1,
+                    3,
+                    0,
+                ),
+                info_record_bytes(
+                    INFO_KIND_MECHANISM,
+                    &scripted_mechanism_struct(),
+                    endpoint,
+                    41,
+                    1,
+                    3,
+                    0x1082,
+                ),
+            ];
+            native.stage(NativeBatch::Info(crate::attach::capture::InfoBatch {
+                domain: native.domain,
+                records,
+                malformed: 0,
+                produced: 3,
+                consumed: 3,
+                loss: 0,
+                terminal: true,
+                failure: None,
+                evidence_delta: [0; 4],
+                evidence_error: None,
+                complete: true,
+                produced_fresh: true,
+                produced_error: None,
+                retired: true,
+            }));
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let (providers, observations) = native.scene.coordinator.info_join.snapshot();
+            (
+                providers.len(),
+                observations
+                    .tokens
+                    .iter()
+                    .map(|token| (token.slot, token.pin_min_len))
+                    .collect::<Vec<_>>(),
+                observations
+                    .mechanisms
+                    .iter()
+                    .map(|mechanism| mechanism.mechanism)
+                    .collect::<Vec<_>>(),
+                observations.gaps.caller_unavailable,
+            )
+        };
+        let plain = positives(false);
+        assert_eq!(plain.0, 1, "the provider row joins");
+        assert_eq!(plain.1.len(), 1, "the token row joins");
+        assert_eq!(plain.2, [0x1082], "the mechanism row joins");
+        assert_eq!(
+            positives(true),
+            plain,
+            "journal refusal changes no info positive"
+        );
+    }
+
+    /// Keymeta Task 7 attach-side gaps (spec §17.4): extend receipts
+    /// forward the named counted `info_return_deferred` gap into the
+    /// join.
+    #[test]
+    fn note_extend_receipt_forwards_info_return_deferred() {
+        let mut scene = CaptureScene::new(2);
+        scene.coordinator.note_extend_receipt(&ExtendReceipt {
+            info_return_deferred: 2,
+            ..ExtendReceipt::default()
+        });
+        let (_, observations) = scene.coordinator.info_join.snapshot();
+        assert_eq!(observations.gaps.return_deferred, 2);
+    }
+
+    /// Keymeta Task 7 attach-side gaps (spec §17.4): absorb outcomes
+    /// forward the named counted `info_aliased_endpoint` gap into
+    /// the join.
+    #[test]
+    fn record_absorbed_forwards_info_aliased_endpoints() {
+        let mut scene = CaptureScene::new(2);
+        scene.coordinator.record_absorbed(AbsorbOutcome {
+            info_aliased: 3,
+            ..AbsorbOutcome::default()
+        });
+        let (_, observations) = scene.coordinator.info_join.snapshot();
+        assert_eq!(observations.gaps.aliased, 3);
+    }
+
+    /// Keymeta Task 7 revocation (spec §17.4): absorb outcomes carry
+    /// revoked endpoints into the ingest drop set and the pending
+    /// capture delta (which `has_pending_targets` reports even with
+    /// no fresh endpoints), while the alias gap counts once.
+    #[test]
+    fn record_absorbed_forwards_info_revoked_endpoints() {
+        let mut scene = CaptureScene::new(2);
+        scene.coordinator.record_absorbed(AbsorbOutcome {
+            info_aliased: 1,
+            info_revoked: vec![EndpointId(3)],
+            ..AbsorbOutcome::default()
+        });
+        assert!(scene.coordinator.info_revoked.contains(&3));
+        assert_eq!(
+            scene.coordinator.pending_targets.info_revoked,
+            vec![EndpointId(3)]
+        );
+        assert!(scene.coordinator.has_pending_targets());
+        let (_, observations) = scene.coordinator.info_join.snapshot();
+        assert_eq!(observations.gaps.aliased, 1);
+    }
+
+    /// Keymeta Task 7 revocation (spec §17.4): rows from revoked
+    /// endpoints reject at ingest — provider, token and mechanism
+    /// rows alike publish nothing — without counting a second alias
+    /// gap per row.
+    #[test]
+    fn ingest_info_batch_rejects_rows_from_revoked_endpoints() {
+        use p11scope_ebpf_common::inventory_info::{INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+        let (mut native, _caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        native.scene.coordinator.info_revoked.insert(endpoint);
+        let records = vec![
+            info_record_bytes(
+                INFO_KIND_PROVIDER,
+                &scripted_provider_struct(),
+                endpoint,
+                41,
+                1,
+                0,
+                0,
+            ),
+            info_record_bytes(
+                INFO_KIND_TOKEN,
+                &scripted_token_struct(),
+                endpoint,
+                41,
+                1,
+                3,
+                0,
+            ),
+        ];
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records,
+            malformed: 0,
+            produced: 2,
+            consumed: 2,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let (providers, observations) = native.scene.coordinator.info_join.snapshot();
+        assert!(providers.is_empty(), "revoked provider rows reject");
+        assert!(observations.tokens.is_empty(), "revoked token rows reject");
+        assert_eq!(
+            observations.gaps.aliased, 0,
+            "rejected rows count no second alias gap"
+        );
+    }
+
+    /// Keymeta Task 7 revocation boundary (spec §17.4):
+    /// fixed-frame validation runs before the revoked-endpoint
+    /// rejection — a malformed frame from a revoked endpoint counts
+    /// malformed exactly like any other, while no revoked row ever
+    /// reaches semantic parsing, the join or publication.
+    #[test]
+    fn malformed_frame_from_a_revoked_endpoint_counts_malformed() {
+        use p11scope_ebpf_common::inventory_info::INFO_KIND_TOKEN;
+        let (mut native, _caller) = NativeScene::new();
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        native.scene.coordinator.info_revoked.insert(endpoint);
+        let mut frame = info_record_bytes(
+            INFO_KIND_TOKEN,
+            &scripted_token_struct(),
+            endpoint,
+            41,
+            1,
+            3,
+            0,
+        );
+        frame[4] = 0xFF;
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records: vec![frame],
+            malformed: 0,
+            produced: 1,
+            consumed: 1,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject.contains("provider info")
+                && gap.reason.contains("failed validation")),
+            "a malformed revoked frame counts malformed: {gaps:?}"
+        );
+        let (_, observations) = native.scene.coordinator.info_join.snapshot();
+        assert!(
+            observations.tokens.is_empty(),
+            "no revoked row reaches the join"
+        );
+    }
+
+    /// Keymeta Task 7 revocation (spec §17.4): failed INFO_KIND
+    /// revocation writes reach the operator with their count — the
+    /// stale cell keeps authorizing probe reads until the retry
+    /// lands.
+    #[test]
+    fn note_extend_receipt_reports_info_revoke_failures() {
+        let mut scene = CaptureScene::new(2);
+        scene.coordinator.note_extend_receipt(&ExtendReceipt {
+            info_revoke_failed: 2,
+            ..ExtendReceipt::default()
+        });
+        scene.coordinator.commit_batch(false).unwrap();
+        let gaps = scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject.contains("provider info")
+                && gap
+                    .reason
+                    .contains("info revocation failed for 2 endpoint(s)")),
+            "revocation failures note a gap: {gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 fold call sites (spec §17.5): retiring a caller
+    /// folds its info rows into the run-wide departed counts.
+    #[test]
+    fn fold_caller_retires_its_info_rows() {
+        use crate::inventory_provider_info::InfoRecord;
+        use p11scope_ebpf_common::inventory_info::{INFO_KIND_TOKEN, INFO_LAYOUT_ILP32};
+        let (mut native, caller) = NativeScene::new();
+        let record = InfoRecord {
+            endpoint: 0,
+            kind: INFO_KIND_TOKEN,
+            layout: INFO_LAYOUT_ILP32,
+            host_tgid: 7,
+            task_cookie: 41,
+            exec_id: 1,
+            slot: 3,
+            mechanism: 0,
+            status: 0,
+            payload_len: 64,
+            payload: [0u8; 120],
+        };
+        // No witness staged: resolve the module straight from the
+        // attach set for this fold-only scene.
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        let keys = native
+            .scene
+            .coordinator
+            .admitted_modules_for_endpoint(crate::discovery::inventory_attach_set::EndpointId(
+                endpoint,
+            ))
+            .expect("endpoint resolves");
+        assert_eq!(keys.len(), 1);
+        let module = native
+            .scene
+            .coordinator
+            .registry
+            .modules()
+            .find(|record| record.key == keys[0])
+            .map(|record| record.id)
+            .expect("projected module");
+        native
+            .scene
+            .coordinator
+            .info_join
+            .ingest(&record, module, Some(caller), None);
+        let caller_record = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .unwrap()
+            .clone();
+        native
+            .scene
+            .coordinator
+            .fold_caller_rendered_state(caller, &caller_record, None, 200);
+        // The retire queues the fold; one bounded step retires the
+        // single row (as `retire_rendered_callers` drives per call).
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .info_join
+                .fold_step(crate::inventory_provider_info::INFO_FOLD_ROWS_PER_CALL),
+            "one row folds in one step"
+        );
+        let (_, observations) = native.scene.coordinator.info_join.snapshot();
+        assert!(observations.tokens.is_empty(), "folded rows retire");
+        assert_eq!(observations.gaps.tokens_departed, 1);
+    }
+
+    /// Keymeta Task 7 departed fold (spec §17.5): a caller queued by
+    /// the final pass reads departed in the very next snapshot — a
+    /// stop right after retirement cannot publish its rows as live,
+    /// even though no fold slice ran for them yet.
+    #[test]
+    fn caller_queued_by_the_final_pass_reads_departed_before_any_fold_slice() {
+        use crate::inventory_provider_info::InfoRecord;
+        use p11scope_ebpf_common::inventory_info::{INFO_KIND_TOKEN, INFO_LAYOUT_ILP32};
+        let (mut native, _live) = NativeScene::new();
+        native.scene.source.spawn(8, 800);
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(
+                8,
+                crate::discovery::caller_registry::ImageAuthority::ScanPinned,
+                100,
+            )
+            .unwrap();
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        let keys = native
+            .scene
+            .coordinator
+            .admitted_modules_for_endpoint(crate::discovery::inventory_attach_set::EndpointId(
+                endpoint,
+            ))
+            .expect("endpoint resolves");
+        let module = native
+            .scene
+            .coordinator
+            .registry
+            .modules()
+            .find(|record| record.key == keys[0])
+            .map(|record| record.id)
+            .expect("projected module");
+        native.scene.coordinator.info_join.ingest(
+            &InfoRecord {
+                endpoint,
+                kind: INFO_KIND_TOKEN,
+                layout: INFO_LAYOUT_ILP32,
+                host_tgid: 7,
+                task_cookie: 41,
+                exec_id: 1,
+                slot: 3,
+                mechanism: 0,
+                status: 0,
+                payload_len: 64,
+                payload: [0u8; 120],
+            },
+            module,
+            Some(caller),
+            None,
+        );
+        native
+            .scene
+            .coordinator
+            .adapter
+            .exec_transition_scoped(caller, 200);
+        native.scene.coordinator.note_rendered_callers(&[caller]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            1,
+            "the final pass retires the proven-exited row"
+        );
+        let (_, observations) = native.scene.coordinator.provider_info_snapshot();
+        assert!(
+            observations.tokens.is_empty(),
+            "a queued caller's rows read departed before any fold slice: {:?}",
+            observations
+                .tokens
+                .iter()
+                .map(|row| (row.caller, row.slot))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Keymeta Task 7 departed fold (spec §17.5): a stop with folds
+    /// still queued reports them instead of silently understating
+    /// the departed counts — the deferred rows stay out of the live
+    /// projection and the cut names them.
+    #[test]
+    fn stop_with_queued_folds_reports_the_deferred_fold() {
+        use crate::inventory_provider_info::InfoRecord;
+        use p11scope_ebpf_common::inventory_info::{INFO_KIND_TOKEN, INFO_LAYOUT_ILP32};
+        let (mut native, _live) = NativeScene::new();
+        native.scene.source.spawn(8, 800);
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(
+                8,
+                crate::discovery::caller_registry::ImageAuthority::ScanPinned,
+                100,
+            )
+            .unwrap();
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        let keys = native
+            .scene
+            .coordinator
+            .admitted_modules_for_endpoint(crate::discovery::inventory_attach_set::EndpointId(
+                endpoint,
+            ))
+            .expect("endpoint resolves");
+        let module = native
+            .scene
+            .coordinator
+            .registry
+            .modules()
+            .find(|record| record.key == keys[0])
+            .map(|record| record.id)
+            .expect("projected module");
+        native.scene.coordinator.info_join.ingest(
+            &InfoRecord {
+                endpoint,
+                kind: INFO_KIND_TOKEN,
+                layout: INFO_LAYOUT_ILP32,
+                host_tgid: 7,
+                task_cookie: 41,
+                exec_id: 1,
+                slot: 3,
+                mechanism: 0,
+                status: 0,
+                payload_len: 64,
+                payload: [0u8; 120],
+            },
+            module,
+            Some(caller),
+            None,
+        );
+        native
+            .scene
+            .coordinator
+            .adapter
+            .exec_transition_scoped(caller, 200);
+        native.scene.coordinator.note_rendered_callers(&[caller]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            1,
+            "the final pass retires the proven-exited row"
+        );
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject == "provider info"
+                && gap.reason.contains("info departed fold deferred")),
+            "the stop reports the queued fold instead of an understated count: {:?}",
+            gaps.iter()
+                .filter(|gap| gap.subject == "provider info")
+                .map(|gap| gap.reason.as_str())
+                .collect::<Vec<_>>()
+        );
+        let (_, observations) = native.scene.coordinator.provider_info_snapshot();
+        assert!(
+            observations.tokens.is_empty(),
+            "deferred rows stay out of the live projection"
+        );
+    }
+
+    /// Keymeta Task 7 terminal cut (spec §17.4): an unsettled stop
+    /// still discloses its INFO outcome — the run totals over
+    /// earlier and late evidence plus the INFO-specific unsettled
+    /// cut — instead of dropping both with the terminal mark.
+    #[test]
+    fn unsettled_finish_reports_evidence_totals_and_the_unsettled_cut() {
+        let (mut native, _caller) = NativeScene::new();
+        let domain = native.domain;
+        let quantum = |delta: [u64; 4], loss: u64| crate::attach::capture::InfoBatch {
+            domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss,
+            terminal: false,
+            failure: None,
+            evidence_delta: delta,
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(quantum([2, 1, 0, 3], 0)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Info(quantum([5, 0, 1, 0], 7)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let info_gaps: Vec<&str> = gaps
+            .iter()
+            .filter(|gap| gap.subject.contains("provider info"))
+            .map(|gap| gap.reason.as_str())
+            .collect();
+        for (total, cell) in [
+            (7u64, "stash insert failure"),
+            (1, "unmatched return"),
+            (1, "nested overwrite"),
+            (3, "stash mismatch"),
+        ] {
+            let expected = format!("info evidence run total: {total} {cell}(s)");
+            assert!(
+                info_gaps.iter().any(|reason| reason.contains(&expected)),
+                "the unsettled cut reports the run total ({expected}): {info_gaps:?}"
+            );
+        }
+        assert!(
+            info_gaps
+                .iter()
+                .any(|reason| reason.contains("retirement unsettled; backlog 7 observed")),
+            "the unsettled cut carries its INFO-specific disclosure: {info_gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 terminal cut (spec §17.4): an expired final
+    /// quantum never erases the run's INFO observation — an
+    /// evidence-only FULL run whose last quantum expired with no
+    /// fresh readings still reports its cut status, never silence.
+    #[test]
+    fn expired_final_quantum_keeps_the_evidence_only_cut_status() {
+        let (mut native, _caller) = NativeScene::new();
+        let domain = native.domain;
+        // An earlier quantum observes one stash insert failure with
+        // zero records produced or consumed.
+        let observed = crate::attach::capture::InfoBatch {
+            domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [1, 0, 0, 0],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(observed));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // The expired final quantum: no new evidence, no fresh
+        // produced read, no records — but the run was observed.
+        let expired = crate::attach::capture::InfoBatch {
+            domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal: true,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: false,
+            produced_fresh: false,
+            produced_error: None,
+            retired: true,
+        };
+        native.stage(NativeBatch::Info(expired));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let info_gaps: Vec<&str> = gaps
+            .iter()
+            .filter(|gap| gap.subject.contains("provider info"))
+            .map(|gap| gap.reason.as_str())
+            .collect();
+        assert!(
+            info_gaps.iter().any(|reason| reason
+                .contains("info terminal incomplete: drain bound or deadline reached")),
+            "the expired cut keeps its status past the empty final quantum: {info_gaps:?}"
+        );
+        assert!(
+            info_gaps.iter().any(|reason| reason
+                .contains("info evidence run total: 1 stash insert failure(s)")),
+            "the run total survives the expired final quantum: {info_gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 terminal cut (spec §17.4): a healthy settled
+    /// FULL cut — fresh produced reading, zero backlog, zero evidence
+    /// totals — stays quiet through Finish: the terminal batch already
+    /// classified it, so Finish never relabels it as unsettled.
+    #[test]
+    fn settled_full_zero_backlog_cut_stays_quiet_through_finish() {
+        let (mut native, _caller) = NativeScene::new();
+        let domain = native.domain;
+        let settled = crate::attach::capture::InfoBatch {
+            domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 5,
+            consumed: 5,
+            loss: 0,
+            terminal: true,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: true,
+        };
+        native.stage(NativeBatch::Info(settled));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let info_gaps: Vec<&str> = gaps
+            .iter()
+            .filter(|gap| gap.subject.contains("provider info"))
+            .map(|gap| gap.reason.as_str())
+            .collect();
+        assert!(
+            info_gaps.is_empty(),
+            "a healthy settled cut reports no INFO cut at all: {info_gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 terminal cut (spec §17.4): a quiet P0 run —
+    /// no INFO observation in any quantum — stays quiet through
+    /// the terminal cut: no cut row, no run totals.
+    #[test]
+    fn quiet_p0_run_stays_quiet_through_the_terminal_cut() {
+        let (mut native, _caller) = NativeScene::new();
+        let domain = native.domain;
+        let quantum = |terminal: bool| crate::attach::capture::InfoBatch {
+            domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: false,
+            produced_error: None,
+            retired: terminal,
+        };
+        native.stage(NativeBatch::Info(quantum(false)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Info(quantum(true)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let info_gaps: Vec<&str> = gaps
+            .iter()
+            .filter(|gap| gap.subject.contains("provider info"))
+            .map(|gap| gap.reason.as_str())
+            .collect();
+        assert!(
+            info_gaps.is_empty(),
+            "a quiet run reports no INFO cut at all: {info_gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 terminal cut (spec §17.4): stop-time
+    /// per-quantum evidence rows never crowd the terminal
+    /// aggregates out of the stop-time headroom — the backlog cut
+    /// and the run totals keep their reserved slots under a
+    /// saturated stop-time gap phase.
+    #[test]
+    fn saturated_stop_time_gap_phase_keeps_the_info_aggregates() {
+        use crate::discovery::caller_registry::{DEFAULT_MAX_GAPS, RegistryGap};
+        let (mut native, _caller) = NativeScene::new();
+        for n in 0..DEFAULT_MAX_GAPS + 10 {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native.scene.coordinator.registry.gaps_suppressed() > 0,
+            "the flood saturates the generic log"
+        );
+        let domain = native.domain;
+        let quantum =
+            |delta: [u64; 4], loss: u64, terminal: bool| crate::attach::capture::InfoBatch {
+                domain,
+                records: Vec::new(),
+                malformed: 0,
+                produced: 0,
+                consumed: 0,
+                loss,
+                terminal,
+                failure: None,
+                evidence_delta: delta,
+                evidence_error: None,
+                complete: true,
+                produced_fresh: true,
+                produced_error: None,
+                retired: terminal,
+            };
+        native.scene.coordinator.enter_terminal_phase();
+        // Twenty stop-time quanta with distinct per-cell deltas: 80
+        // distinct per-quantum rows, past the 64-slot headroom.
+        for n in 0..20u64 {
+            let base = n * 4;
+            native.stage(NativeBatch::Info(quantum(
+                [base + 1, base + 2, base + 3, base + 4],
+                0,
+                false,
+            )));
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        native.stage(NativeBatch::Info(quantum([0; 4], 5, true)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let info_gaps: Vec<&str> = gaps
+            .iter()
+            .filter(|gap| gap.subject.contains("provider info"))
+            .map(|gap| gap.reason.as_str())
+            .collect();
+        assert!(
+            info_gaps.iter().any(|reason| reason
+                .contains("info terminal backlog: 5 record(s) observed at cut")),
+            "the saturated cut still reports its backlog: {info_gaps:?}"
+        );
+        for (total, cell) in [
+            (780u64, "stash insert failure"),
+            (800, "unmatched return"),
+            (820, "nested overwrite"),
+            (840, "stash mismatch"),
+        ] {
+            let expected = format!("info evidence run total: {total} {cell}(s)");
+            assert!(
+                info_gaps.iter().any(|reason| reason.contains(&expected)),
+                "the saturated cut reports the run total ({expected}): {info_gaps:?}"
+            );
+        }
+    }
+
+    /// Keymeta Task 7 terminal cut (spec §17.4): stop-time gaps that
+    /// share the terminal headroom — a failure diagnostic beside
+    /// the capped per-quantum evidence detail — never crowd the
+    /// terminal INFO aggregates out: the backlog cut, every run
+    /// total and the deferred-fold row all retain.
+    #[test]
+    fn stop_time_failure_beside_saturated_detail_keeps_every_info_aggregate() {
+        use crate::discovery::caller_registry::{DEFAULT_MAX_GAPS, RegistryGap};
+        use crate::inventory_provider_info::InfoRecord;
+        use p11scope_ebpf_common::inventory_info::{INFO_KIND_TOKEN, INFO_LAYOUT_ILP32};
+        let (mut native, caller) = NativeScene::new();
+        for n in 0..DEFAULT_MAX_GAPS + 10 {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native.scene.coordinator.registry.gaps_suppressed() > 0,
+            "the flood saturates the generic log"
+        );
+        // One queued departed fold with a live row, for the deferred
+        // disclosure at Finish.
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        let keys = native
+            .scene
+            .coordinator
+            .admitted_modules_for_endpoint(crate::discovery::inventory_attach_set::EndpointId(
+                endpoint,
+            ))
+            .expect("endpoint resolves");
+        let module = native
+            .scene
+            .coordinator
+            .registry
+            .modules()
+            .find(|record| record.key == keys[0])
+            .map(|record| record.id)
+            .expect("projected module");
+        native.scene.coordinator.info_join.ingest(
+            &InfoRecord {
+                endpoint,
+                kind: INFO_KIND_TOKEN,
+                layout: INFO_LAYOUT_ILP32,
+                host_tgid: 7,
+                task_cookie: 41,
+                exec_id: 1,
+                slot: 3,
+                mechanism: 0,
+                status: 0,
+                payload_len: 64,
+                payload: [0u8; 120],
+            },
+            module,
+            Some(caller),
+            None,
+        );
+        native.scene.coordinator.info_join.enqueue_fold(caller);
+        let domain = native.domain;
+        let quantum =
+            |delta: [u64; 4], loss: u64, terminal: bool| crate::attach::capture::InfoBatch {
+                domain,
+                records: Vec::new(),
+                malformed: 0,
+                produced: 0,
+                consumed: 0,
+                loss,
+                terminal,
+                failure: None,
+                evidence_delta: delta,
+                evidence_error: None,
+                complete: true,
+                produced_fresh: true,
+                produced_error: None,
+                retired: terminal,
+            };
+        native.scene.coordinator.enter_terminal_phase();
+        for n in 0..20u64 {
+            let base = n * 4;
+            native.stage(NativeBatch::Info(quantum(
+                [base + 1, base + 2, base + 3, base + 4],
+                0,
+                false,
+            )));
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        // One stop-time failure diagnostic beside the capped detail.
+        let mut failed = quantum([0; 4], 0, false);
+        failed.evidence_error = Some("cells broke".into());
+        native.stage(NativeBatch::Info(failed));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Info(quantum([0; 4], 5, true)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let info_gaps: Vec<&str> = gaps
+            .iter()
+            .filter(|gap| gap.subject.contains("provider info"))
+            .map(|gap| gap.reason.as_str())
+            .collect();
+        assert!(
+            info_gaps.iter().any(|reason| reason
+                .contains("info terminal backlog: 5 record(s) observed at cut")),
+            "the cut still reports its backlog beside the failure: {info_gaps:?}"
+        );
+        for (total, cell) in [
+            (780u64, "stash insert failure"),
+            (800, "unmatched return"),
+            (820, "nested overwrite"),
+            (840, "stash mismatch"),
+        ] {
+            let expected = format!("info evidence run total: {total} {cell}(s)");
+            assert!(
+                info_gaps.iter().any(|reason| reason.contains(&expected)),
+                "the cut reports the run total ({expected}) beside the failure: {info_gaps:?}"
+            );
+        }
+        assert!(
+            info_gaps
+                .iter()
+                .any(|reason| reason.contains("info departed fold deferred")),
+            "the Finish discloses the queued fold beside the failure: {info_gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 presentation (spec §17.5): the rendered view
+    /// carries the join's module rows and the run-wide observations
+    /// section.
+    #[test]
+    fn present_fills_provider_observations_from_the_join() {
+        use crate::inventory_provider_info::InfoRecord;
+        use p11scope_ebpf_common::inventory_info::{
+            INFO_KIND_PROVIDER, INFO_KIND_TOKEN, INFO_LAYOUT_LP64,
+        };
+        let (mut native, caller) = NativeScene::new();
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        let keys = native
+            .scene
+            .coordinator
+            .admitted_modules_for_endpoint(crate::discovery::inventory_attach_set::EndpointId(
+                endpoint,
+            ))
+            .expect("endpoint resolves");
+        assert_eq!(keys.len(), 1);
+        let module = native
+            .scene
+            .coordinator
+            .registry
+            .modules()
+            .find(|record| record.key == keys[0])
+            .map(|record| record.id)
+            .expect("projected module");
+        let mut provider_payload = [0u8; 120];
+        provider_payload[0..2].copy_from_slice(&[3, 1]);
+        provider_payload[2..9].copy_from_slice(b"SoftHSM");
+        provider_payload[9..34].fill(b' ');
+        provider_payload[42..52].copy_from_slice(b"SoftHSM v2");
+        provider_payload[52..74].fill(b' ');
+        provider_payload[74..76].copy_from_slice(&[2, 6]);
+        native.scene.coordinator.info_join.ingest(
+            &InfoRecord {
+                endpoint,
+                kind: INFO_KIND_PROVIDER,
+                layout: INFO_LAYOUT_LP64,
+                host_tgid: 7,
+                task_cookie: 41,
+                exec_id: 1,
+                slot: 0,
+                mechanism: 0,
+                status: 0,
+                payload_len: 76,
+                payload: provider_payload,
+            },
+            module,
+            Some(caller),
+            None,
+        );
+        native.scene.coordinator.info_join.ingest(
+            &InfoRecord {
+                endpoint,
+                kind: INFO_KIND_TOKEN,
+                layout: INFO_LAYOUT_LP64,
+                host_tgid: 7,
+                task_cookie: 41,
+                exec_id: 1,
+                slot: 3,
+                mechanism: 0,
+                status: 0,
+                payload_len: 76,
+                payload: [0u8; 120],
+            },
+            module,
+            Some(caller),
+            None,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let view = crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "system",
+            1,
+            2,
+            1,
+        );
+        let observations = view
+            .provider_observations
+            .as_ref()
+            .expect("observations section renders");
+        assert_eq!(observations.tokens.len(), 1);
+        assert_eq!(observations.tokens[0].module, module);
+        assert!(
+            view.modules
+                .iter()
+                .any(|record| record.id == module && record.provider_info.is_some()),
+            "module rows carry provider_info"
+        );
+    }
+
+    /// Keymeta Task 7 attribution work (spec §17.5, INV-2): 256
+    /// no-match rows over a full 4096-instance registry probe once
+    /// each — attribution scales with the batch, never with the
+    /// instance population, and the distractors join nothing.
+    #[test]
+    fn info_attribution_scales_with_batch_not_registry() {
+        use crate::discovery::caller_registry::instance_input::{AdmittedInstance, InstanceKey};
+        use crate::discovery::caller_registry::{CallerId, ModuleKey};
+        use crate::discovery::instances::InstanceId;
+        use p11scope_ebpf_common::ImageIdentity;
+        use p11scope_ebpf_common::inventory_info::INFO_KIND_TOKEN;
+        let (mut native, _caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        // A full table of distractor instances on one unrelated
+        // pair: no-match rows must not pay for them.
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("fresh domain");
+        let module_key = ModuleKey::Physical {
+            dev_major: 9,
+            dev_minor: 9,
+            ino: 9,
+            sha256: None,
+        };
+        native
+            .scene
+            .coordinator
+            .registry
+            .scripted_module_edge(module_key.clone(), CallerId(7));
+        for router in 0..4096u64 {
+            let key = InstanceKey::scripted(
+                domain,
+                ImageIdentity {
+                    task_cookie: 200 + router,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(router),
+                module_key.clone(),
+            );
+            native
+                .scene
+                .coordinator
+                .registry
+                .note_instance(AdmittedInstance::scripted(key, CallerId(7)));
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        let records: Vec<[u8; 176]> = (0..256u64)
+            .map(|slot| {
+                info_record_bytes(
+                    INFO_KIND_TOKEN,
+                    &scripted_token_struct(),
+                    endpoint,
+                    41,
+                    1,
+                    slot,
+                    0,
+                )
+            })
+            .collect();
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records,
+            malformed: 0,
+            produced: 256,
+            consumed: 256,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.info_attribution_probes, 256,
+            "256 rows probe once each over 4096 distractors"
+        );
+        let (_, observations) = native.scene.coordinator.provider_info_snapshot();
+        assert_eq!(
+            observations.tokens.len(),
+            256,
+            "every row still joins unattributed"
+        );
+    }
+
+    /// Keymeta Task 7 pair probes (spec §17.5): each INFO row that
+    /// needs a lookup probes the pair map exactly once —
+    /// provider-only batches probe nothing.
+    #[test]
+    fn ingest_info_batch_probes_pairs_without_registry_scans() {
+        use p11scope_ebpf_common::inventory_info::{INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+        let (mut native, _caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        let endpoint = native.scene.delta.endpoints[0].id.0;
+        // Provider-only batch: no row needs a lookup, no build.
+        let records = vec![info_record_bytes(
+            INFO_KIND_PROVIDER,
+            &scripted_provider_struct(),
+            endpoint,
+            41,
+            1,
+            0,
+            0,
+        )];
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records,
+            malformed: 0,
+            produced: 1,
+            consumed: 1,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.info_attribution_probes, 0,
+            "provider-only batches probe nothing"
+        );
+        // Each token row probes the pair map exactly once.
+        let records = vec![
+            info_record_bytes(
+                INFO_KIND_TOKEN,
+                &scripted_token_struct(),
+                endpoint,
+                41,
+                1,
+                3,
+                0,
+            ),
+            info_record_bytes(
+                INFO_KIND_TOKEN,
+                &scripted_token_struct(),
+                endpoint,
+                41,
+                1,
+                4,
+                0,
+            ),
+        ];
+        let batch = crate::attach::capture::InfoBatch {
+            domain: native.domain,
+            records,
+            malformed: 0,
+            produced: 3,
+            consumed: 3,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0; 4],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.info_attribution_probes, 2,
+            "two token rows probe twice"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -41189,7 +43574,6 @@ mod maps_skip_memory_tests {
         );
     }
 }
-
 #[cfg(test)]
 mod stop_diff_tests {
     use super::*;

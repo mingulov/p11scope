@@ -23,16 +23,23 @@ MAPS = {name: checker.map_def(*shape) for name, shape in {
     "CGROUP_FILTER": (8, 4, 4, 1), "TAIL_CALLS": (3, 4, 4, 2),
     "STACK_GUARD": (3, 4, 4, 1),
     "EVIDENCE": (6, 4, 8, 11), "COUNTERS": (6, 4, 8, 5),
-    "PRODUCED": (6, 4, 8, 2),
+    "PRODUCED": (6, 4, 8, 3),
     "DISCOVERY": (27, 0, 0, 8388608), "DISCOVERY_STATE": (1, 24, 24, 64),
     "THREAD_OWNER": (29, 4, 544, 0, 1), "OWNER_CTL": (2, 4, 56, 1),
     "USAGE": (2, 4, 8, 1), "USAGE_CONFIG": (2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": (6, 4, 8, 3),
+    # Keymeta Task 7 (spec 17.4): the info stash, ring, kind
+    # publication and evidence cells.
+    "INFO_START": (1, 16, 32, 1024),
+    "INFO": (27, 0, 0, 64 * 1024),
+    "INFO_KIND": (2, 4, 8, 1, 128),
+    "INFO_EVIDENCE": (6, 4, 8, 4),
 }.items()}
 PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "function_list_entry", "function_list_return", "interface_list_entry",
             "interface_list_return", "interface_list_worker", "interface_entry",
-            "interface_return", "sched_process_exec", "sched_process_exit"}
+            "interface_return", "sched_process_exec", "sched_process_exit",
+            "p11_info_entry_lp64", "p11_info_entry_ia32", "p11_info_return"}
 SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg",
            "p11_exec_dumpability", "p11_exe_identity"}
 

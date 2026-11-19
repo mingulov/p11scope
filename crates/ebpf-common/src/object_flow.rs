@@ -1002,6 +1002,191 @@ pub fn adapter_length_return(
     }
 }
 
+/// The `INFO_START` stash row: one retained info pointer plus the
+/// snapshotted slot/mechanism scalars per in-flight call at an info
+/// endpoint (spec §17.4). Exactly 32 bytes; the BPF map and the stop
+/// scrub share this shape. Holds raw target words: deliberately no
+/// `Debug` (like the other stash rows, it must never be logged
+/// verbatim).
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct InfoStart {
+    /// Retained info-struct pointer.
+    pub info_ptr: u64,
+    /// Snapshotted slot id (0 for `C_GetInfo`).
+    pub slot: u64,
+    /// Snapshotted mechanism id (0 except `C_GetMechanismInfo`).
+    pub mechanism: u64,
+    /// `INFO_KIND_*`.
+    pub kind: u8,
+    /// `INFO_LAYOUT_*`.
+    pub layout: u8,
+    /// Reserved, always zero.
+    pub reserved: [u8; 6],
+}
+
+/// Info-evidence return verdicts: packed payload ranges with the
+/// exact length, an unreadable struct (status-1 record, joins to
+/// nothing), a silent non-OK return (no record), or a stash mismatch
+/// (deleted and counted, never a guessed byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoReturnVerdict {
+    Emit(u8),
+    Unavailable,
+    Silent,
+    StashMismatch,
+}
+
+/// Production info-evidence entry adapter body (spec §17.1, §17.4):
+/// retain the info-struct pointer with the full-span guard and
+/// snapshot the per-kind slot/mechanism scalars. Returns true with
+/// `out` filled on retention, false with `out` zeroed on every
+/// unavailable shape (fail closed, never a guessed bound). The BPF
+/// wrapper inserts on true (overwrite) and deletes on false (a stale
+/// row is never trusted); full-map insert failures land in their own
+/// evidence counter, never silent.
+///
+/// `kind` is the endpoint's `INFO_KIND` cell (0, unknown and
+/// out-of-range kinds retain nothing with zero reads). The entry
+/// reads nothing from the target: no dereference, only retention.
+#[inline(always)]
+pub fn adapter_info_entry(
+    out: &mut InfoStart,
+    kind: u8,
+    layout: LinuxLayout,
+    fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
+) -> bool {
+    use crate::inventory_info::{
+        info_mechanism_arg, info_pointer_arg, info_slot_arg, info_span_size, INFO_LAYOUT_ILP32,
+        INFO_LAYOUT_LP64,
+    };
+    *out = InfoStart::default();
+    let Some(pointer_arg) = info_pointer_arg(kind) else {
+        return false;
+    };
+    let Some(span) = info_span_size(kind, layout) else {
+        return false;
+    };
+    let Some(ptr) = fetch_arg(pointer_arg) else {
+        return false;
+    };
+    if ptr == 0 {
+        return false;
+    }
+    if validate_target_span(ptr, u64::from(span), layout).is_none() {
+        return false;
+    }
+    let mut slot = 0u64;
+    if let Some(arg) = info_slot_arg(kind) {
+        let Some(value) = fetch_arg(arg) else {
+            return false;
+        };
+        if layout == LinuxLayout::Ilp32 && value > u64::from(u32::MAX) {
+            return false;
+        }
+        slot = value;
+    }
+    let mut mechanism = 0u64;
+    if let Some(arg) = info_mechanism_arg(kind) {
+        let Some(value) = fetch_arg(arg) else {
+            return false;
+        };
+        if layout == LinuxLayout::Ilp32 && value > u64::from(u32::MAX) {
+            return false;
+        }
+        mechanism = value;
+    }
+    *out = InfoStart {
+        info_ptr: ptr,
+        slot,
+        mechanism,
+        kind,
+        layout: match layout {
+            LinuxLayout::Lp64 => INFO_LAYOUT_LP64,
+            LinuxLayout::Ilp32 => INFO_LAYOUT_ILP32,
+        },
+        reserved: [0; 6],
+    };
+    true
+}
+
+/// Production info-evidence return adapter body (spec §17.1, §17.4):
+/// resolve the retained pointer against the return RV and the owned
+/// layout. `stash` is the stash row (the caller holds a copy; the
+/// BPF wrapper deletes the row on every path). Layout skew and
+/// unknown kinds mismatch; non-OK returns (including an explicit
+/// `BUFFER_TOO_SMALL`: info structs have no query shape) resolve
+/// silent with zero reads; `CKR_OK` packs the §17.1 ranges in struct
+/// address order into `payload` with zero slack, or resolves
+/// unavailable with a zeroed payload when any range is unreadable.
+/// No retry after return.
+#[inline(always)]
+pub fn adapter_info_return(
+    stash: &InfoStart,
+    rv: u64,
+    layout: LinuxLayout,
+    payload: &mut [u8; crate::inventory_info::INFO_PAYLOAD_MAX],
+    reader: &mut impl crate::InfoByteReader,
+) -> InfoReturnVerdict {
+    use crate::inventory_info::{
+        info_read_ranges, zero_info_payload, INFO_LAYOUT_ILP32, INFO_LAYOUT_LP64,
+    };
+    use InfoReturnVerdict::{Emit, Silent, StashMismatch, Unavailable};
+    let layout_code = match layout {
+        LinuxLayout::Lp64 => INFO_LAYOUT_LP64,
+        LinuxLayout::Ilp32 => INFO_LAYOUT_ILP32,
+    };
+    if stash.layout != layout_code {
+        return StashMismatch;
+    }
+    let Some(list) = info_read_ranges(stash.kind, layout) else {
+        return StashMismatch;
+    };
+    if rv != CKR_OK {
+        return Silent;
+    }
+    zero_info_payload(payload);
+    let mut dst = 0usize;
+    let mut index = 0u8;
+    while index < list.count {
+        // Explicit guards before every runtime index (the length
+        // stash precedent): the verifier sees bounded accesses, and
+        // a corrupt table fails closed instead of panicking.
+        if index as usize >= list.ranges.len() {
+            zero_info_payload(payload);
+            return Unavailable;
+        }
+        let (off, len) = list.ranges[index as usize];
+        let len = len as usize;
+        let Some(end) = dst.checked_add(len) else {
+            zero_info_payload(payload);
+            return Unavailable;
+        };
+        if end > payload.len() {
+            zero_info_payload(payload);
+            return Unavailable;
+        }
+        let Some(addr) = stash.info_ptr.checked_add(u64::from(off)) else {
+            zero_info_payload(payload);
+            return Unavailable;
+        };
+        if reader
+            .read_bytes(addr, layout, &mut payload[dst..end])
+            .is_err()
+        {
+            zero_info_payload(payload);
+            return Unavailable;
+        }
+        dst = end;
+        index += 1;
+    }
+    let Ok(len) = u8::try_from(dst) else {
+        zero_info_payload(payload);
+        return Unavailable;
+    };
+    Emit(len)
+}
+
 #[inline(always)]
 fn slot_span(ptr: u64, layout: LinuxLayout) -> (bool, u8) {
     if ptr == 0 {
@@ -4971,5 +5156,591 @@ mod tests {
         assert_eq!(zeroed.ev_layout, 0);
         assert_eq!(zeroed.ev_flags, 0);
         assert_eq!(zeroed.reserved, [0; 12]);
+    }
+
+    /// The `INFO_START` stash row: one retained info pointer plus the
+    /// snapshotted slot/mechanism scalars per in-flight call at an
+    /// info endpoint (spec §17.4). Exactly 32 bytes; the BPF map and
+    /// the stop scrub share this shape. Holds raw target words:
+    /// deliberately no `Debug` (like the other stash rows, it must
+    /// never be logged verbatim).
+    #[test]
+    fn info_start_is_32_bytes_with_named_offsets() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<InfoStart>(), 32);
+        assert_eq!(align_of::<InfoStart>(), 8);
+        assert_eq!(offset_of!(InfoStart, info_ptr), 0);
+        assert_eq!(offset_of!(InfoStart, slot), 8);
+        assert_eq!(offset_of!(InfoStart, mechanism), 16);
+        assert_eq!(offset_of!(InfoStart, kind), 24);
+        assert_eq!(offset_of!(InfoStart, layout), 25);
+        assert_eq!(offset_of!(InfoStart, reserved), 26);
+        let zeroed = InfoStart::default();
+        assert_eq!(zeroed.info_ptr, 0);
+        assert_eq!(zeroed.slot, 0);
+        assert_eq!(zeroed.mechanism, 0);
+        assert_eq!(zeroed.kind, 0);
+        assert_eq!(zeroed.layout, 0);
+        assert_eq!(zeroed.reserved, [0; 6]);
+    }
+
+    /// Scripted entry-argument table plus a fake target memory window
+    /// for the info adapters. Register fetches resolve from `args`;
+    /// byte reads resolve from `memory` at `base` (anything outside
+    /// the window, or with `fail` set, faults); `reads` logs every
+    /// (address, length) pair in order.
+    struct InfoSpy {
+        args: [(u8, Option<u64>); 7],
+        fetches: Vec<u8>,
+        reads: Vec<(u64, usize)>,
+        base: u64,
+        memory: Vec<u8>,
+        fail: bool,
+    }
+
+    impl InfoSpy {
+        fn new(args: [(u8, Option<u64>); 7], base: u64, memory: Vec<u8>) -> Self {
+            Self {
+                args,
+                fetches: Vec::new(),
+                reads: Vec::new(),
+                base,
+                memory,
+                fail: false,
+            }
+        }
+
+        fn run_entry(&mut self, out: &mut InfoStart, kind: u8, layout: LinuxLayout) -> bool {
+            let args = &self.args;
+            let fetches = &mut self.fetches;
+            let mut fetch = |index: u8| {
+                fetches.push(index);
+                args.iter()
+                    .find(|(slot, _)| *slot == index)
+                    .and_then(|(_, value)| *value)
+            };
+            adapter_info_entry(out, kind, layout, &mut fetch)
+        }
+
+        fn run_return(
+            &mut self,
+            stash: &InfoStart,
+            rv: u64,
+            layout: LinuxLayout,
+            payload: &mut [u8; 120],
+        ) -> InfoReturnVerdict {
+            let reads = &mut self.reads;
+            let base = self.base;
+            let memory = &self.memory;
+            let fail = self.fail;
+            let mut reader =
+                crate::FnByteReader(|address: u64, _layout: LinuxLayout, out: &mut [u8]| {
+                    reads.push((address, out.len()));
+                    if fail {
+                        return Err(());
+                    }
+                    let start = address.checked_sub(base).ok_or(())? as usize;
+                    let end = start.checked_add(out.len()).ok_or(())?;
+                    let window = memory.get(start..end).ok_or(())?;
+                    out.copy_from_slice(window);
+                    Ok(())
+                });
+            adapter_info_return(stash, rv, layout, payload, &mut reader)
+        }
+    }
+
+    fn info_args(pairs: &[(u8, Option<u64>)]) -> [(u8, Option<u64>); 7] {
+        let mut args = [
+            (0, None),
+            (1, None),
+            (2, None),
+            (3, None),
+            (4, None),
+            (5, None),
+            (6, None),
+        ];
+        for (index, value) in pairs {
+            args[*index as usize] = (*index, *value);
+        }
+        args
+    }
+
+    fn info_layout_code(layout: LinuxLayout) -> u8 {
+        match layout {
+            LinuxLayout::Lp64 => crate::inventory_info::INFO_LAYOUT_LP64,
+            LinuxLayout::Ilp32 => crate::inventory_info::INFO_LAYOUT_ILP32,
+        }
+    }
+
+    fn assert_info_zeroed(out: &InfoStart, context: &str) {
+        assert_eq!(out.info_ptr, 0, "{context}: pointer");
+        assert_eq!(out.slot, 0, "{context}: slot");
+        assert_eq!(out.mechanism, 0, "{context}: mechanism");
+        assert_eq!(out.kind, 0, "{context}: kind");
+        assert_eq!(out.layout, 0, "{context}: layout");
+        assert_eq!(out.reserved, [0; 6], "{context}: reserved");
+    }
+
+    /// Every kind (LP64 + ia32): a non-NULL pointer with a readable
+    /// full span retains, stamping the pointer, the per-kind
+    /// slot/mechanism snapshots, the kind and the layout. The entry
+    /// reads nothing from the target.
+    #[test]
+    fn adapter_info_entry_retains_pointer_and_scalars() {
+        use crate::inventory_info::{INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+        use crate::LinuxLayout::{Ilp32, Lp64};
+        for (kind, layout, args, slot, mechanism) in [
+            (
+                INFO_KIND_PROVIDER,
+                Lp64,
+                info_args(&[(0, Some(0x1000))]),
+                0,
+                0,
+            ),
+            (
+                INFO_KIND_PROVIDER,
+                Ilp32,
+                info_args(&[(0, Some(0x1000))]),
+                0,
+                0,
+            ),
+            (
+                INFO_KIND_TOKEN,
+                Lp64,
+                info_args(&[(0, Some(5)), (1, Some(0x2000))]),
+                5,
+                0,
+            ),
+            (
+                INFO_KIND_TOKEN,
+                Ilp32,
+                info_args(&[(0, Some(5)), (1, Some(0x2000))]),
+                5,
+                0,
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                Lp64,
+                info_args(&[(0, Some(7)), (1, Some(0x1082)), (2, Some(0x3000))]),
+                7,
+                0x1082,
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                Ilp32,
+                info_args(&[(0, Some(7)), (1, Some(0x1082)), (2, Some(0x3000))]),
+                7,
+                0x1082,
+            ),
+        ] {
+            let mut spy = InfoSpy::new(args, 0x1000, vec![0u8; 512]);
+            let mut out = InfoStart::default();
+            assert!(spy.run_entry(&mut out, kind, layout), "kind {kind} retains");
+            assert_eq!(
+                out.info_ptr,
+                spy.args
+                    .iter()
+                    .find_map(|(slot, value)| {
+                        if *slot == crate::inventory_info::info_pointer_arg(kind).unwrap() {
+                            *value
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap()
+            );
+            assert_eq!(out.slot, slot, "kind {kind}: slot snapshot");
+            assert_eq!(out.mechanism, mechanism, "kind {kind}: mechanism snapshot");
+            assert_eq!(out.kind, kind, "kind {kind}: kind stamp");
+            assert_eq!(
+                out.layout,
+                info_layout_code(layout),
+                "kind {kind}: layout stamp"
+            );
+            assert_eq!(out.reserved, [0; 6], "kind {kind}: reserved");
+            assert!(spy.reads.is_empty(), "kind {kind}: the entry reads nothing");
+        }
+    }
+
+    /// Kind zero (usage-only or return-deferred endpoint) and unknown
+    /// kinds retain nothing with zero reads.
+    #[test]
+    fn adapter_info_entry_refuses_zero_and_unknown_kind() {
+        use crate::LinuxLayout::Lp64;
+        for kind in [0, 4, 9, 255] {
+            let mut spy = InfoSpy::new(info_args(&[(0, Some(0x1000))]), 0x1000, vec![0u8; 512]);
+            let mut out = InfoStart::default();
+            assert!(!spy.run_entry(&mut out, kind, Lp64), "kind {kind} refuses");
+            assert_info_zeroed(&out, "kind {kind}");
+            assert!(spy.reads.is_empty(), "kind {kind}: zero reads");
+        }
+    }
+
+    /// Entry argument allowlist (spec §17.1, allowlist-v3 named
+    /// positions): the BPF wrapper loads exactly provider {0}, token
+    /// {0,1} and mechanism {0,1,2}, and nothing for kind 0 or
+    /// unknown kinds. The adapter's fetch spy requests only those
+    /// positions on every signature, so no caller word outside the
+    /// authorized signature is ever acquired.
+    #[test]
+    fn info_entry_loads_only_its_kinds_named_positions() {
+        use crate::inventory_info::{
+            info_uses_arg, INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN,
+        };
+        use crate::LinuxLayout::{Ilp32, Lp64};
+        for (kind, allowed) in [
+            (INFO_KIND_PROVIDER, vec![0u8]),
+            (INFO_KIND_TOKEN, vec![0u8, 1]),
+            (INFO_KIND_MECHANISM, vec![0u8, 1, 2]),
+        ] {
+            for index in 0..6u8 {
+                assert_eq!(
+                    info_uses_arg(kind, index),
+                    allowed.contains(&index),
+                    "kind {kind} index {index}"
+                );
+            }
+        }
+        for kind in [0u8, 4, 9, 255] {
+            for index in 0..6u8 {
+                assert!(
+                    !info_uses_arg(kind, index),
+                    "refused kind {kind} loads nothing (index {index})"
+                );
+            }
+            let mut spy = InfoSpy::new(info_args(&[(0, Some(0x1000))]), 0x1000, vec![0u8; 512]);
+            let mut out = InfoStart::default();
+            assert!(!spy.run_entry(&mut out, kind, Lp64));
+            assert!(
+                spy.fetches.is_empty(),
+                "refused kind {kind} fetches nothing"
+            );
+        }
+        // All three signatures on both ABIs: every adapter fetch
+        // lands inside the kind's allowed set.
+        for (kind, layout, args, allowed) in [
+            (
+                INFO_KIND_PROVIDER,
+                Lp64,
+                info_args(&[(0, Some(0x1000))]),
+                vec![0u8],
+            ),
+            (
+                INFO_KIND_PROVIDER,
+                Ilp32,
+                info_args(&[(0, Some(0x1000))]),
+                vec![0u8],
+            ),
+            (
+                INFO_KIND_TOKEN,
+                Lp64,
+                info_args(&[(0, Some(5)), (1, Some(0x2000))]),
+                vec![0u8, 1],
+            ),
+            (
+                INFO_KIND_TOKEN,
+                Ilp32,
+                info_args(&[(0, Some(5)), (1, Some(0x2000))]),
+                vec![0u8, 1],
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                Lp64,
+                info_args(&[(0, Some(7)), (1, Some(0x1082)), (2, Some(0x3000))]),
+                vec![0u8, 1, 2],
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                Ilp32,
+                info_args(&[(0, Some(7)), (1, Some(0x1082)), (2, Some(0x3000))]),
+                vec![0u8, 1, 2],
+            ),
+        ] {
+            let mut spy = InfoSpy::new(args, 0x1000, vec![0u8; 512]);
+            let mut out = InfoStart::default();
+            assert!(spy.run_entry(&mut out, kind, layout), "kind {kind} retains");
+            for fetch in &spy.fetches {
+                assert!(
+                    allowed.contains(fetch),
+                    "kind {kind}: fetch {fetch} outside {allowed:?}"
+                );
+            }
+            let mut fetched = spy.fetches.clone();
+            fetched.sort();
+            assert_eq!(fetched, allowed, "kind {kind}: exact fetch set");
+        }
+    }
+
+    /// NULL info pointers retain nothing (the return then finds no
+    /// row and counts the named unmatched return, never a record).
+    #[test]
+    fn adapter_info_entry_refuses_null_pointer() {
+        use crate::inventory_info::{INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+        use crate::LinuxLayout::{Ilp32, Lp64};
+        for (kind, layout, args) in [
+            (INFO_KIND_PROVIDER, Lp64, info_args(&[(0, Some(0))])),
+            (
+                INFO_KIND_TOKEN,
+                Ilp32,
+                info_args(&[(0, Some(5)), (1, Some(0))]),
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                Lp64,
+                info_args(&[(0, Some(7)), (1, Some(1)), (2, Some(0))]),
+            ),
+        ] {
+            let mut spy = InfoSpy::new(args, 0x1000, vec![0u8; 512]);
+            let mut out = InfoStart::default();
+            assert!(
+                !spy.run_entry(&mut out, kind, layout),
+                "kind {kind} refuses NULL"
+            );
+            assert_info_zeroed(&out, "kind {kind}");
+        }
+    }
+
+    /// The full-span guard: a pointer whose per-ABI struct span
+    /// overflows the address space (or the ia32 4 GiB window)
+    /// retains nothing.
+    #[test]
+    fn adapter_info_entry_refuses_unreadable_span() {
+        use crate::inventory_info::{INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+        use crate::LinuxLayout::{Ilp32, Lp64};
+        for (kind, layout, args) in [
+            (INFO_KIND_PROVIDER, Lp64, info_args(&[(0, Some(u64::MAX))])),
+            (
+                INFO_KIND_TOKEN,
+                Lp64,
+                info_args(&[(0, Some(1)), (1, Some(u64::MAX - 100))]),
+            ),
+            (
+                INFO_KIND_TOKEN,
+                Ilp32,
+                info_args(&[(0, Some(1)), (1, Some(0x1_0000_0000))]),
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                Ilp32,
+                info_args(&[(0, Some(1)), (1, Some(2)), (2, Some(0xFFFF_FFF5))]),
+            ),
+        ] {
+            let mut spy = InfoSpy::new(args, 0x1000, vec![0u8; 512]);
+            let mut out = InfoStart::default();
+            assert!(
+                !spy.run_entry(&mut out, kind, layout),
+                "kind {kind} refuses the unreadable span"
+            );
+            assert_info_zeroed(&out, "kind {kind}");
+        }
+    }
+
+    /// Missing slot/mechanism scalars retain nothing: without the
+    /// snapshot the return has no header words.
+    #[test]
+    fn adapter_info_entry_refuses_missing_scalars() {
+        use crate::inventory_info::{INFO_KIND_MECHANISM, INFO_KIND_TOKEN};
+        use crate::LinuxLayout::{Ilp32, Lp64};
+        for (kind, layout, args) in [
+            (INFO_KIND_TOKEN, Lp64, info_args(&[(1, Some(0x2000))])),
+            (
+                INFO_KIND_MECHANISM,
+                Ilp32,
+                info_args(&[(1, Some(2)), (2, Some(0x3000))]),
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                Lp64,
+                info_args(&[(0, Some(7)), (2, Some(0x3000))]),
+            ),
+        ] {
+            let mut spy = InfoSpy::new(args, 0x1000, vec![0u8; 512]);
+            let mut out = InfoStart::default();
+            assert!(
+                !spy.run_entry(&mut out, kind, layout),
+                "kind {kind} refuses the missing scalar"
+            );
+            assert_info_zeroed(&out, "kind {kind}");
+        }
+    }
+
+    /// Hostile widths: an ia32 scalar above `u32::MAX` is never a
+    /// slot or mechanism id and retains nothing.
+    #[test]
+    fn adapter_info_entry_refuses_hostile_widths() {
+        use crate::inventory_info::{INFO_KIND_MECHANISM, INFO_KIND_TOKEN};
+        use crate::LinuxLayout::Ilp32;
+        for (kind, args) in [
+            (
+                INFO_KIND_TOKEN,
+                info_args(&[(0, Some(0x1_0000_0005)), (1, Some(0x2000))]),
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                info_args(&[(0, Some(7)), (1, Some(u64::MAX)), (2, Some(0x3000))]),
+            ),
+        ] {
+            let mut spy = InfoSpy::new(args, 0x1000, vec![0u8; 512]);
+            let mut out = InfoStart::default();
+            assert!(
+                !spy.run_entry(&mut out, kind, Ilp32),
+                "kind {kind} refuses the hostile width"
+            );
+            assert_info_zeroed(&out, "kind {kind}");
+        }
+    }
+
+    /// Every (kind, layout): `CKR_OK` packs the §17.1 ranges in
+    /// struct address order into the payload window with zero slack,
+    /// and reports the exact payload length. Struct bytes below are
+    /// built at the transcribed §17.1 offsets with sentinel excluded
+    /// bytes between the ranges.
+    #[test]
+    fn adapter_info_return_packs_ranges_on_ok() {
+        use crate::inventory_info::{INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+        use crate::object_capture::CKR_OK;
+        use crate::LinuxLayout::{Ilp32, Lp64};
+        // (kind, layout, span, ranges, payload length).
+        type PackCase<'a> = (u8, LinuxLayout, usize, &'a [(usize, usize)], u8);
+        let cases: [PackCase<'_>; 6] = [
+            (INFO_KIND_PROVIDER, Lp64, 88, &[(0, 34), (40, 42)], 76),
+            (INFO_KIND_PROVIDER, Ilp32, 76, &[(0, 34), (36, 38)], 72),
+            (
+                INFO_KIND_TOKEN,
+                Lp64,
+                208,
+                &[(32, 48), (96, 8), (136, 16), (184, 4)],
+                76,
+            ),
+            (
+                INFO_KIND_TOKEN,
+                Ilp32,
+                160,
+                &[(32, 48), (96, 4), (116, 8), (140, 4)],
+                64,
+            ),
+            (INFO_KIND_MECHANISM, Lp64, 24, &[(0, 24)], 24),
+            (INFO_KIND_MECHANISM, Ilp32, 12, &[(0, 12)], 12),
+        ];
+        for (kind, layout, span, ranges, len) in cases {
+            let base = 0x4000u64;
+            let mut memory = vec![0xAAu8; span];
+            for (index, byte) in memory.iter_mut().enumerate() {
+                *byte = (index % 251) as u8;
+            }
+            let stash = InfoStart {
+                info_ptr: base,
+                slot: 3,
+                mechanism: if kind == INFO_KIND_MECHANISM {
+                    0x1050
+                } else {
+                    0
+                },
+                kind,
+                layout: info_layout_code(layout),
+                reserved: [0; 6],
+            };
+            let mut spy = InfoSpy::new(info_args(&[]), base, memory.clone());
+            let mut payload = [0xCCu8; 120];
+            let verdict = spy.run_return(&stash, CKR_OK, layout, &mut payload);
+            assert_eq!(verdict, InfoReturnVerdict::Emit(len), "kind {kind}");
+            let mut expected = [0u8; 120];
+            let mut dst = 0usize;
+            for (off, range_len) in ranges {
+                expected[dst..dst + range_len].copy_from_slice(&memory[*off..off + range_len]);
+                dst += range_len;
+            }
+            assert_eq!(dst, usize::from(len), "kind {kind}: packed length");
+            assert_eq!(
+                payload, expected,
+                "kind {kind}: packed ranges with zero slack"
+            );
+            assert_eq!(
+                spy.reads.len(),
+                ranges.len(),
+                "kind {kind}: one read per range"
+            );
+        }
+    }
+
+    /// Any non-OK return (a failed call such as `CKR_TOKEN_NOT_PRESENT`
+    /// on a polled empty slot, and explicitly `BUFFER_TOO_SMALL`: info
+    /// structs have no query shape) resolves silent with zero reads:
+    /// the caller deletes the row and emits no record.
+    #[test]
+    fn adapter_info_return_silent_on_failure_rv() {
+        use crate::inventory_info::INFO_KIND_TOKEN;
+        use crate::object_capture::{CKR_BUFFER_TOO_SMALL, CKR_OK};
+        use crate::LinuxLayout::Lp64;
+        let _ = CKR_OK;
+        for rv in [1, 3, 0xE0, CKR_BUFFER_TOO_SMALL, 336, u64::MAX] {
+            let stash = InfoStart {
+                info_ptr: 0x4000,
+                slot: 3,
+                mechanism: 0,
+                kind: INFO_KIND_TOKEN,
+                layout: info_layout_code(Lp64),
+                reserved: [0; 6],
+            };
+            let mut spy = InfoSpy::new(info_args(&[]), 0x4000, vec![7u8; 208]);
+            let mut payload = [0xCCu8; 120];
+            let verdict = spy.run_return(&stash, rv, Lp64, &mut payload);
+            assert_eq!(verdict, InfoReturnVerdict::Silent, "rv {rv:#x}");
+            assert!(spy.reads.is_empty(), "rv {rv:#x}: zero reads");
+        }
+    }
+
+    /// `CKR_OK` with unreadable bytes (the page left between entry
+    /// and return) resolves unavailable with a zeroed payload: the
+    /// caller emits the status-1 record, which joins to nothing.
+    #[test]
+    fn adapter_info_return_unavailable_when_bytes_unreadable() {
+        use crate::inventory_info::INFO_KIND_PROVIDER;
+        use crate::object_capture::CKR_OK;
+        use crate::LinuxLayout::Lp64;
+        let stash = InfoStart {
+            info_ptr: 0x4000,
+            slot: 0,
+            mechanism: 0,
+            kind: INFO_KIND_PROVIDER,
+            layout: info_layout_code(Lp64),
+            reserved: [0; 6],
+        };
+        let mut spy = InfoSpy::new(info_args(&[]), 0x4000, vec![7u8; 88]);
+        spy.fail = true;
+        let mut payload = [0xCCu8; 120];
+        let verdict = spy.run_return(&stash, CKR_OK, Lp64, &mut payload);
+        assert_eq!(verdict, InfoReturnVerdict::Unavailable);
+        assert_eq!(payload, [0u8; 120]);
+    }
+
+    /// A return whose layout disagrees with the retained row, or
+    /// whose kind is unknown, mismatches: the caller deletes the row,
+    /// counts the named mismatch and emits no record.
+    #[test]
+    fn adapter_info_return_mismatch_on_skewed_row() {
+        use crate::inventory_info::INFO_KIND_TOKEN;
+        use crate::object_capture::CKR_OK;
+        use crate::LinuxLayout::{Ilp32, Lp64};
+        let skewed = InfoStart {
+            info_ptr: 0x4000,
+            slot: 3,
+            mechanism: 0,
+            kind: INFO_KIND_TOKEN,
+            layout: info_layout_code(Lp64),
+            reserved: [0; 6],
+        };
+        let mut spy = InfoSpy::new(info_args(&[]), 0x4000, vec![7u8; 208]);
+        let mut payload = [0xCCu8; 120];
+        assert_eq!(
+            spy.run_return(&skewed, CKR_OK, Ilp32, &mut payload),
+            InfoReturnVerdict::StashMismatch
+        );
+        let unknown = InfoStart { kind: 9, ..skewed };
+        assert_eq!(
+            spy.run_return(&unknown, CKR_OK, Lp64, &mut payload),
+            InfoReturnVerdict::StashMismatch
+        );
+        assert!(spy.reads.is_empty(), "mismatches read nothing");
     }
 }

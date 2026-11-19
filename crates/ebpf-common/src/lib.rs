@@ -60,6 +60,44 @@ where
     }
 }
 
+/// Target byte-range reader for the shared info adapter (spec
+/// §17.1): one bounded userspace copy per struct range. Like
+/// [`WordReader`], BPF passes a zero-sized reader whose always-inlined
+/// method dissolves into the adapter, and host tests wrap closures in
+/// [`FnByteReader`].
+pub trait InfoByteReader {
+    // `()` error is the established reader protocol: failure distinct
+    // from any value including zero.
+    #[allow(clippy::result_unit_err)]
+    fn read_bytes(&mut self, addr: u64, layout: LinuxLayout, out: &mut [u8]) -> Result<(), ()>;
+}
+
+/// Closure-backed byte reader for host tests (a concrete type, so it
+/// never overlaps the `&mut R` impl below).
+pub struct FnByteReader<F>(pub F);
+
+impl<F> InfoByteReader for FnByteReader<F>
+where
+    F: FnMut(u64, LinuxLayout, &mut [u8]) -> Result<(), ()>,
+{
+    #[inline(always)]
+    #[allow(clippy::result_unit_err)]
+    fn read_bytes(&mut self, addr: u64, layout: LinuxLayout, out: &mut [u8]) -> Result<(), ()> {
+        (self.0)(addr, layout, out)
+    }
+}
+
+impl<R> InfoByteReader for &mut R
+where
+    R: InfoByteReader,
+{
+    #[inline(always)]
+    #[allow(clippy::result_unit_err)]
+    fn read_bytes(&mut self, addr: u64, layout: LinuxLayout, out: &mut [u8]) -> Result<(), ()> {
+        (**self).read_bytes(addr, layout, out)
+    }
+}
+
 /// Conventional x86 userspace code selectors accepted by the observer.
 /// Exact equality is intentional: masking or narrowing would authorize an
 /// ABI-dependent read for an unqualified selector.
@@ -610,7 +648,9 @@ pub const DISCOVERY_COUNTER_CELLS: u32 = 5;
 /// counter there would break every one of them.
 pub const PRODUCED_DISCOVERY: u32 = 0;
 pub const PRODUCED_EVENTS: u32 = 1;
-pub const PRODUCED_CELLS: u32 = 2;
+/// Keymeta Task 7 (spec §17.4): submitted INFO records.
+pub const PRODUCED_INFO: u32 = 2;
+pub const PRODUCED_CELLS: u32 = 3;
 
 pub const PAUSE_ARMED: u64 = 1;
 pub const PAUSE_REQUESTED: u64 = 2;
@@ -672,6 +712,12 @@ pub const DISCOVERY_BYTES: u32 = 4_096;
 pub const INVENTORY_DISCOVERY_BYTES: u32 = 8 * 1024 * 1024;
 #[cfg(feature = "small-discovery-ring")]
 pub const INVENTORY_DISCOVERY_BYTES: u32 = 4_096;
+/// Keymeta Task 7 (spec §17.4): the Inventory flavors' INFO ring —
+/// 64 KiB holds about 370 records of 176 B, ample for cold info
+/// calls at application poll rates. Locked kernel memory: 64 KiB per
+/// Inventory capture. The `small-discovery-ring` feature leaves this
+/// ring alone (the induced-loss leg targets DISCOVERY).
+pub const INVENTORY_INFO_BYTES: u32 = 64 * 1024;
 
 pub const LOADER_CONTEXT_ID_MASK: u64 = 0xff;
 pub const LOADER_STATE_PRESENT: u64 = 1 << 8;
@@ -1298,6 +1344,15 @@ pub const EVIDENCE_LENGTH_INSERT_FAILURES: u32 = 9;
 /// a guessed length.
 pub const EVIDENCE_LENGTH_STASH_MISMATCHES: u32 = 10;
 pub const EVIDENCE_CELLS: u32 = 11;
+
+/// Keymeta Task 7 (spec §17.4): the `INFO_EVIDENCE` cells — insert
+/// failures, unmatched returns, nested overwrites and stash
+/// mismatches. Never silent, never folded into `EVIDENCE`.
+pub const INFO_EVIDENCE_INSERT_FAILURES: u32 = 0;
+pub const INFO_EVIDENCE_UNMATCHED_RETURNS: u32 = 1;
+pub const INFO_EVIDENCE_NESTED_OVERWRITES: u32 = 2;
+pub const INFO_EVIDENCE_STASH_MISMATCHES: u32 = 3;
+pub const INFO_EVIDENCE_CELLS: u32 = 4;
 
 /// Hash-map capacities. The opt-in induced-gap build shrinks both maps so
 /// their independent failure counters can be exercised deterministically.
@@ -3309,7 +3364,28 @@ mod tests {
         assert_eq!(DISCOVERY_COUNTER_CELLS, 5);
         assert_eq!(PRODUCED_DISCOVERY, 0);
         assert_eq!(PRODUCED_EVENTS, 1);
-        assert_eq!(PRODUCED_CELLS, 2);
+        assert_eq!(PRODUCED_INFO, 2);
+        assert_eq!(PRODUCED_CELLS, 3);
+    }
+
+    /// Keymeta Task 7 (spec §17.4): the INFO ring joins the produced
+    /// cross-check as cell 2. RED-a: the cell does not exist yet.
+    #[test]
+    fn produced_cells_count_discovery_events_and_info() {
+        assert_eq!(PRODUCED_INFO, 2);
+        assert_eq!(PRODUCED_CELLS, 3);
+    }
+
+    /// Keymeta Task 7 (spec §17.4): the `INFO_EVIDENCE` cells —
+    /// insert failures, unmatched returns, nested overwrites and
+    /// stash mismatches — never silent, never folded into EVIDENCE.
+    #[test]
+    fn info_evidence_cells_pin_the_four_counters() {
+        assert_eq!(INFO_EVIDENCE_INSERT_FAILURES, 0);
+        assert_eq!(INFO_EVIDENCE_UNMATCHED_RETURNS, 1);
+        assert_eq!(INFO_EVIDENCE_NESTED_OVERWRITES, 2);
+        assert_eq!(INFO_EVIDENCE_STASH_MISMATCHES, 3);
+        assert_eq!(INFO_EVIDENCE_CELLS, 4);
     }
 
     fn discovery_record(kind: u8) -> DiscoveryRecord {

@@ -872,6 +872,29 @@ impl NativeBinder {
         }
     }
 
+    /// Keymeta Task 7 (spec §17.5): read the settled image→caller
+    /// binding for one (domain, task cookie, exec sequence) triple —
+    /// proven through the witness path, never synthesized here. The
+    /// INFO join keys rows by caller incarnation through this query;
+    /// unknown domains, tickets and exec sequences refuse (`None`),
+    /// and the row is refused with the named counted
+    /// `info_caller_unavailable` gap. Read-only: an unknown domain
+    /// refuses without creating state.
+    pub(crate) fn bound_caller_for_image(
+        &self,
+        domain: NativeDomainId,
+        cookie: DomainCookie,
+        exec_id: u64,
+    ) -> Option<CallerId> {
+        let index = *self.domain_indices.get(&domain)?;
+        self.domains
+            .get(index)?
+            .cookies
+            .get(&cookie)?
+            .get(&exec_id)?
+            .bound
+    }
+
     /// Where `coverage`'s domain began recording execs (the facade's
     /// activation stamp). The first report wins: coverage never restarts
     /// later within one domain.

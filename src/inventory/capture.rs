@@ -49,9 +49,9 @@
 
 use crate::attach::capture::{
     AttachedEndpoint, CaptureScope, CaptureScopeCoverage, CaptureTargets, CleanupSummary,
-    CookieQuery, DiscoveryBatch, EndpointFailure, ExtendReceipt, ExtendWindow, InventoryCapture,
-    MapperEstimate, NativeDomainId, ReadWindow, RetiredCapture, RetiringCapture, ScopeCustody,
-    WitnessBatch, default_caller_budget,
+    CookieQuery, DiscoveryBatch, EndpointFailure, ExtendReceipt, ExtendWindow, InfoBatch,
+    InfoTeardown, InventoryCapture, MapperEstimate, NativeDomainId, ReadWindow, RetiredCapture,
+    RetiringCapture, ScopeCustody, WitnessBatch, default_caller_budget,
 };
 use crate::attach::{AttachBackend, BackendSelection};
 use crate::discovery::caller_registry::{CallerEvent, ProcessSource, UnknownReason, now_ns};
@@ -253,6 +253,18 @@ impl LaneWindows {
 
     fn discovery(&self) -> ReadWindow {
         self.discovery_at_most(self.discovery_records)
+    }
+
+    /// Keymeta Task 7 (spec §17.4): an INFO window for the stop's
+    /// terminal cut — the normal discovery shape clamped to the
+    /// retirement deadline, so the cut never starts a fresh window
+    /// past the stop budget.
+    fn info_stop(&self, stop_deadline: Instant) -> ReadWindow {
+        ReadWindow::new(
+            self.discovery_records,
+            (Instant::now() + self.discovery_budget).min(stop_deadline),
+        )
+        .expect("the provisional discovery window is positive")
     }
 
     /// A discovery window of at most `records` (at least one) records.
@@ -505,6 +517,13 @@ pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
         window: ExtendWindow,
     ) -> ExtendReceipt;
     fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch;
+    /// Keymeta Task 7 (spec §17.4): one INFO quantum. The default
+    /// drains nothing (lanes without the info pair); the inventory
+    /// lane serves its INFO ring.
+    fn service_info(&mut self, window: ReadWindow) -> InfoBatch {
+        let _ = window;
+        InfoBatch::empty(self.domain())
+    }
     fn read_witnesses(&mut self, window: ReadWindow) -> WitnessBatch;
     /// Starts owned retirement; a second call does nothing.
     fn begin_stop(&mut self);
@@ -513,6 +532,19 @@ pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
     fn poll_retirement(&mut self, deadline: Instant) -> Result<bool>;
     /// What retirement closed, once it completed.
     fn cleanup(&self) -> Option<CleanupSummary>;
+    /// True once every link had its close attempt, even while INFO
+    /// teardown still blocks the ownership transfer. Lanes without
+    /// the detach/scrub split answer false until they complete.
+    fn detach_completed(&self) -> bool {
+        false
+    }
+    /// Keymeta Task 7 (spec §17.4): the INFO stash teardown outcome
+    /// for the operator. The default proves nothing pending (lanes
+    /// without the info pair); the inventory lane reports its scrub
+    /// phase's live status.
+    fn info_teardown(&self) -> InfoTeardown {
+        InfoTeardown::Proven
+    }
 }
 
 /// The coordinator calls the lane makes (the C3/C4 staging API). A test
@@ -571,6 +603,12 @@ pub(crate) trait LaneHost<Pin> {
     /// silently. Read-only over admission; records at most one scope gap,
     /// only for provider newcomers. Default: ignore.
     fn note_discarded_collection(&mut self, _collected: &CollectedPass) {}
+    /// Enter the terminal gap phase (state only, no terminal I/O): gaps
+    /// staged from now on carry the terminal flag and may use the
+    /// stop-time headroom. The retained cooperative stop calls this
+    /// before its lane can stage the INFO cut and Finish, matching the
+    /// classic stop's `on_stop_requested` order. Default: ignore.
+    fn enter_terminal_phase(&mut self) {}
 }
 
 impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
@@ -638,6 +676,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
     fn note_discarded_collection(&mut self, collected: &CollectedPass) {
         InventoryCoordinator::note_discarded_collection(self, collected);
     }
+
+    fn enter_terminal_phase(&mut self) {
+        InventoryCoordinator::enter_terminal_phase(self);
+    }
 }
 
 /// How the native capture's retirement ended.
@@ -656,6 +698,91 @@ impl Retirement {
             Retirement::Closed(_) => "closed",
             Retirement::Unsettled(_) => "unsettled",
         }
+    }
+}
+
+/// Whether an INFO cut may mark terminal (spec §17.4): retirement
+/// transferred, no poll error, and a clean cleanup — no failed
+/// closes, no retained links. The ownership transfer alone never
+/// qualifies: a cleanup that retained links leaves the cut
+/// provisional like any unsettled retirement.
+fn info_cut_settled(
+    retired: bool,
+    poll_error: &Option<String>,
+    cleanup: Option<&CleanupSummary>,
+) -> bool {
+    retired
+        && poll_error.is_none()
+        && cleanup.is_some_and(|cleanup| cleanup.failures.is_empty() && cleanup.retained_links == 0)
+}
+
+/// One retirement outcome for both stop drivers: the blocking and
+/// cooperative paths classify the same inputs the same way. A
+/// completed transfer closes (carrying its cleanup, INFO teardown
+/// fields included). Anything else reads unsettled with detach
+/// completion carried separately from the ownership transfer: a
+/// completed detach with teardown still pending names both, a
+/// scrub still waiting for detach leaves the detach outcome bare,
+/// and a failing scrub carries its concrete error across the
+/// timeout instead of hiding behind a bare detach stall.
+pub(crate) fn classify_retirement(
+    detach_done: bool,
+    retired: bool,
+    poll_error: Option<String>,
+    cleanup: Option<CleanupSummary>,
+    scrub: &InfoTeardown,
+    budget: Duration,
+) -> Retirement {
+    match (retired, poll_error, cleanup) {
+        (true, _, Some(cleanup)) => Retirement::Closed(cleanup),
+        (true, _, None) => Retirement::Closed(CleanupSummary::default()),
+        (false, Some(error), _) => {
+            Retirement::Unsettled(with_scrub_outcome(error, scrub, detach_done))
+        }
+        (false, None, _) if detach_done => Retirement::Unsettled(with_scrub_outcome(
+            format!(
+                "the probes detached but INFO teardown did not complete within {} ms",
+                budget.as_millis()
+            ),
+            scrub,
+            detach_done,
+        )),
+        (false, None, _) => Retirement::Unsettled(with_scrub_outcome(
+            format!("the probes did not detach within {} ms", budget.as_millis()),
+            scrub,
+            detach_done,
+        )),
+    }
+}
+
+/// The retirement scope-gap suffix follows the detach outcome: a
+/// completed detach never warns that probes may still be attached —
+/// the detached probes are only reclaimed after the document — while
+/// an unconfirmed detach keeps the existing attachment warning.
+fn retirement_gap_suffix(detach_done: bool) -> &'static str {
+    if detach_done {
+        "; the detached Inventory probes are reclaimed (blocking) after it"
+    } else {
+        "; the document was written while the Inventory probes may still be attached, and they \
+         are reclaimed (blocking) after it"
+    }
+}
+
+/// An unsettled detach outcome with the live INFO scrub outcome
+/// beside it: a proven scrub leaves the detach message alone, a
+/// failing scrub carries its concrete error, a scrub in progress
+/// reports its rows cleared, and a scrub still waiting for detach
+/// adds nothing — it never started.
+fn with_scrub_outcome(base: String, scrub: &InfoTeardown, detach_done: bool) -> String {
+    match scrub {
+        InfoTeardown::Proven => base,
+        InfoTeardown::Failed { error } => {
+            format!("{base}; info stash scrub failed: {error}")
+        }
+        InfoTeardown::Pending { cleared } if detach_done => {
+            format!("{base}; info stash scrub pending ({cleared} rows cleared)")
+        }
+        InfoTeardown::Pending { .. } => base,
     }
 }
 
@@ -1185,7 +1312,11 @@ impl<L> NativeLane<L> {
                 objects.push(endpoint.object);
             }
         }
-        let prefix = TargetDelta { endpoints, objects };
+        let prefix = TargetDelta {
+            endpoints,
+            objects,
+            info_revoked: Vec::new(),
+        };
         let receipt = capture.extend(prefix, targets, window);
         *pending_attach_ns_max = (*pending_attach_ns_max).max(receipt.attach_ns_max);
         if receipt.fd_exhausted {
@@ -1229,7 +1360,25 @@ impl<L> NativeLane<L> {
             )
             .events,
         );
+        // Keymeta Task 7 (spec §17.4): one INFO quantum per pass,
+        // staged after the witnesses whose bindings the join
+        // resolves against, so same-pass images already bind. Cold
+        // traffic needs no mid-run multi-quantum loop; the terminal
+        // cut reports the observed backlog.
+        let info = self.drain_info();
+        events.extend(
+            host.stage_native(NativeBatch::Info(info), &mut self.capture, now_ns())
+                .events,
+        );
         events
+    }
+
+    /// Keymeta Task 7 (spec §17.4): one INFO quantum from the lane.
+    fn drain_info<Pin>(&mut self) -> InfoBatch
+    where
+        L: CaptureLane<Pin>,
+    {
+        self.capture.service_info(self.windows.discovery())
     }
 
     /// One service tick between passes (invariant 3): first one
@@ -1608,27 +1757,51 @@ impl<L> NativeLane<L> {
                 refresh_budget.as_millis()
             ));
         }
+        // Keymeta Task 7 (spec §17.4): the terminal INFO cut, before
+        // the domain finishes. Bounded quanta drain while the stop
+        // budget allows, each inside the retirement window; only the
+        // last quantum over settled retirement marks terminal, and
+        // it carries the settlement. Unsettled retirement, poll
+        // errors and retained-link cleanups keep the cut provisional
+        // — the retirement gap carries that outcome instead. The cut
+        // reports its observed backlog, never certified loss: without
+        // producer quiescence (D3 — FD retirement proves no callback
+        // quiescence), exact loss is unproven. Every mid-run batch
+        // stays provisional.
+        let cleanup = self.capture.cleanup();
+        let settled = info_cut_settled(retired, &poll_error, cleanup.as_ref());
+        loop {
+            let mut info = self.capture.service_info(self.windows.info_stop(deadline));
+            let progress = !info.records.is_empty();
+            let last = info.complete || Instant::now() >= deadline;
+            if last {
+                info.terminal = settled;
+                info.retired = settled;
+            }
+            events.extend(
+                host.stage_native(NativeBatch::Info(info), &mut self.capture, now_ns())
+                    .events,
+            );
+            if last {
+                break;
+            }
+            if !progress {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         let domain = self.capture.domain();
         events.extend(
             host.stage_native(NativeBatch::Finish { domain }, &mut self.capture, now_ns())
                 .events,
         );
-        let retirement = match (retired, poll_error, self.capture.cleanup()) {
-            (true, _, Some(cleanup)) => Retirement::Closed(cleanup),
-            (true, _, None) => Retirement::Closed(CleanupSummary::default()),
-            (false, Some(error), _) => Retirement::Unsettled(error),
-            (false, None, _) => Retirement::Unsettled(format!(
-                "the probes did not detach within {} ms",
-                budget.as_millis()
-            )),
-        };
+        let scrub = self.capture.info_teardown();
+        let detach_done = self.capture.detach_completed();
+        let retirement =
+            classify_retirement(detach_done, retired, poll_error, cleanup, &scrub, budget);
         if let Retirement::Unsettled(reason) = &retirement {
             host.note_scope_gap(
                 "native capture retirement unsettled".into(),
-                format!(
-                    "{reason}; the document was written while the Inventory probes may still \
-                     be attached, and they are reclaimed (blocking) after it"
-                ),
+                format!("{reason}{}", retirement_gap_suffix(detach_done)),
             );
         }
         Stopped {
@@ -1685,6 +1858,7 @@ enum NativeStopPhase {
     RetirementDrain,
     PostWitness,
     RefreshLoss,
+    InfoDrain,
     Finish,
     RetirementGap,
     Summarize,
@@ -1697,6 +1871,7 @@ enum NativeAfterStage {
     PreWitness { complete: bool },
     RetirementDrain { drained: bool },
     PostWitness { exact: bool },
+    InfoDrain { done: bool, idle: bool },
     Finish,
 }
 
@@ -1711,6 +1886,7 @@ pub(crate) struct NativeStop<L> {
     pre_witness_deadline: Option<Instant>,
     retirement_deadline: Option<Instant>,
     refresh_deadline: Option<Instant>,
+    info_deadline: Option<Instant>,
     drain_attempted: bool,
     witness_attempted: bool,
     refresh_attempted: bool,
@@ -1745,6 +1921,7 @@ impl<L> NativeStop<L> {
             pre_witness_deadline: None,
             retirement_deadline: None,
             refresh_deadline: None,
+            info_deadline: None,
             drain_attempted: false,
             witness_attempted: false,
             refresh_attempted: false,
@@ -1767,6 +1944,9 @@ impl<L> NativeStop<L> {
             }
             NativeStopPhase::PostWitness => {
                 self.refresh_deadline.get_or_insert(sweep_end);
+            }
+            NativeStopPhase::InfoDrain => {
+                self.info_deadline.get_or_insert(sweep_end);
             }
             _ => {}
         }
@@ -1870,13 +2050,23 @@ impl<L> NativeStop<L> {
                         }
                     }
                     NativeAfterStage::PostWitness { exact } => {
-                        self.phase = if exact {
-                            NativeStopPhase::Finish
+                        if exact {
+                            self.enter(NativeStopPhase::InfoDrain, now);
                         } else if now >= self.refresh_deadline.unwrap() {
-                            NativeStopPhase::RefreshLoss
+                            self.phase = NativeStopPhase::RefreshLoss;
                         } else {
-                            NativeStopPhase::PostWitness
-                        };
+                            self.phase = NativeStopPhase::PostWitness;
+                        }
+                    }
+                    NativeAfterStage::InfoDrain { done, idle } => {
+                        if done {
+                            self.phase = NativeStopPhase::Finish;
+                        } else {
+                            self.phase = NativeStopPhase::InfoDrain;
+                            if idle {
+                                self.not_before = Some(now + Duration::from_millis(1));
+                            }
+                        }
                     }
                     NativeAfterStage::Finish => self.phase = NativeStopPhase::RetirementGap,
                 }
@@ -1976,13 +2166,47 @@ impl<L> NativeStop<L> {
                 }
             }
             NativeStopPhase::RefreshLoss => {
-                self.phase = NativeStopPhase::Finish;
+                self.enter(NativeStopPhase::InfoDrain, now);
                 host.note_refresh_loss(format!(
                     "terminal count refresh incomplete: no gap-free count-refresh sweep completed \
                      within {} ms after stop began; witnessed counts keep their last read as a \
                      lower bound",
                     self.lane.windows.terminal_sweep_budget.as_millis()
                 ));
+            }
+            NativeStopPhase::InfoDrain => {
+                // Keymeta Task 7 (spec §17.4): the cooperative
+                // terminal INFO cut — the shared classification with
+                // the blocking stop, one quantum per step. Read
+                // windows clamp to the stop slice and the phase
+                // deadline, and the shared quantum gates its counter
+                // reads on the same window, so an expired phase runs
+                // zero native work; only the last quantum over settled
+                // retirement marks terminal. The final quantum always
+                // stages, even expired and incomplete, so the cut is
+                // never skipped — unlike the provisional drains, its
+                // batch carries the terminal outcome.
+                let end = self.info_deadline.unwrap();
+                let mut batch = self
+                    .lane
+                    .capture
+                    .service_info(self.discovery_window(now, slice_end, end));
+                let settled = info_cut_settled(
+                    self.retired,
+                    &self.poll_error,
+                    self.lane.capture.cleanup().as_ref(),
+                );
+                let last = batch.complete || now >= end;
+                if last {
+                    batch.terminal = settled;
+                    batch.retired = settled;
+                }
+                self.after_stage = NativeAfterStage::InfoDrain {
+                    done: last,
+                    idle: batch.records.is_empty(),
+                };
+                self.pending = Some(NativeBatch::Info(batch));
+                self.phase = NativeStopPhase::Stage;
             }
             NativeStopPhase::Finish => {
                 self.pending = Some(NativeBatch::Finish {
@@ -1993,23 +2217,21 @@ impl<L> NativeStop<L> {
             }
             NativeStopPhase::RetirementGap => {
                 self.phase = NativeStopPhase::Summarize;
-                let retirement = match (
+                let scrub = self.lane.capture.info_teardown();
+                let detach_done = self.lane.capture.detach_completed();
+                let retirement = classify_retirement(
+                    detach_done,
                     self.retired,
                     self.poll_error.take(),
                     self.lane.capture.cleanup(),
-                ) {
-                    (true, _, Some(cleanup)) => Retirement::Closed(cleanup),
-                    (true, _, None) => Retirement::Closed(CleanupSummary::default()),
-                    (false, Some(error), _) => Retirement::Unsettled(error),
-                    (false, None, _) => Retirement::Unsettled(format!(
-                        "the probes did not detach within {} ms",
-                        self.retirement_budget.as_millis()
-                    )),
-                };
+                    &scrub,
+                    self.retirement_budget,
+                );
                 if let Retirement::Unsettled(reason) = &retirement {
-                    host.note_scope_gap("native capture retirement unsettled".into(), format!(
-                        "{reason}; the document was written while the Inventory probes may still \
-                         be attached, and they are reclaimed (blocking) after it"));
+                    host.note_scope_gap(
+                        "native capture retirement unsettled".into(),
+                        format!("{reason}{}", retirement_gap_suffix(detach_done)),
+                    );
                 }
                 self.retirement = Some(retirement);
             }
@@ -3326,43 +3548,53 @@ where
                         *phase = RetainedTerminalPhase::Complete;
                     }
                 }
-                RetainedTerminalPhase::NativeStop => match run.native.take() {
-                    Some(RetainedNative::Live(lane)) => {
-                        let Some(disposition) = select_native_stop_disposition(
-                            &lane,
-                            error.is_some(),
-                            run.stop_cause,
-                            run.host_stopped,
-                        ) else {
-                            run.native = Some(RetainedNative::Live(lane));
-                            run.block = Some(RetainedBlock::Native);
-                            continue;
-                        };
-                        match lane.into_finite_stop::<Pin>(disposition, run.control.as_ref()) {
-                            Ok(stop) => run.native = Some(RetainedNative::Stopping(stop)),
-                            Err(lane) => {
+                RetainedTerminalPhase::NativeStop => {
+                    // Terminal phase before the lane can stage its INFO
+                    // cut and Finish (state only, no terminal I/O): the
+                    // retained path skipped `on_stop_requested`, so
+                    // without this the cut, Finish and retirement gap
+                    // stage with the ordinary cap and suppress under a
+                    // filled log. Idempotent; `on_lane_stopped`
+                    // re-enters after the stop.
+                    driver.host().enter_terminal_phase();
+                    match run.native.take() {
+                        Some(RetainedNative::Live(lane)) => {
+                            let Some(disposition) = select_native_stop_disposition(
+                                &lane,
+                                error.is_some(),
+                                run.stop_cause,
+                                run.host_stopped,
+                            ) else {
                                 run.native = Some(RetainedNative::Live(lane));
                                 run.block = Some(RetainedBlock::Native);
+                                continue;
+                            };
+                            match lane.into_finite_stop::<Pin>(disposition, run.control.as_ref()) {
+                                Ok(stop) => run.native = Some(RetainedNative::Stopping(stop)),
+                                Err(lane) => {
+                                    run.native = Some(RetainedNative::Live(lane));
+                                    run.block = Some(RetainedBlock::Native);
+                                }
                             }
                         }
-                    }
-                    Some(RetainedNative::Stopping(stop)) => {
-                        match stop.step::<Pin, _>(driver.host(), now, budget.deadline, clock) {
-                            NativeStopProgress::Pending(stop) => {
-                                run.native = Some(RetainedNative::Stopping(stop))
-                            }
-                            NativeStopProgress::Stopped(stopped) => {
-                                run.native = Some(RetainedNative::Stopped(stopped));
-                                *phase = RetainedTerminalPhase::LaneStopped;
+                        Some(RetainedNative::Stopping(stop)) => {
+                            match stop.step::<Pin, _>(driver.host(), now, budget.deadline, clock) {
+                                NativeStopProgress::Pending(stop) => {
+                                    run.native = Some(RetainedNative::Stopping(stop))
+                                }
+                                NativeStopProgress::Stopped(stopped) => {
+                                    run.native = Some(RetainedNative::Stopped(stopped));
+                                    *phase = RetainedTerminalPhase::LaneStopped;
+                                }
                             }
                         }
+                        Some(RetainedNative::Stopped(stopped)) => {
+                            run.native = Some(RetainedNative::Stopped(stopped));
+                            *phase = RetainedTerminalPhase::LaneStopped;
+                        }
+                        None => *phase = RetainedTerminalPhase::FinalCommit,
                     }
-                    Some(RetainedNative::Stopped(stopped)) => {
-                        run.native = Some(RetainedNative::Stopped(stopped));
-                        *phase = RetainedTerminalPhase::LaneStopped;
-                    }
-                    None => *phase = RetainedTerminalPhase::FinalCommit,
-                },
+                }
                 RetainedTerminalPhase::LaneStopped => {
                     *phase = RetainedTerminalPhase::FinalCommit;
                     driver.on_lane_stopped();
@@ -4536,6 +4768,15 @@ impl CaptureLane<PidPin> for FacadeLane {
         }
     }
 
+    fn service_info(&mut self, window: ReadWindow) -> InfoBatch {
+        match &mut self.state {
+            FacadeState::Active(capture) => capture.service_info(window),
+            FacadeState::Retiring(capture) => capture.service_info(window),
+            FacadeState::Retired(capture) => capture.service_info(window),
+            FacadeState::Moving => unreachable!("no read while the capture moves"),
+        }
+    }
+
     fn read_witnesses(&mut self, window: ReadWindow) -> WitnessBatch {
         match &mut self.state {
             FacadeState::Active(capture) => capture.read_witnesses(window),
@@ -4572,7 +4813,7 @@ impl CaptureLane<PidPin> for FacadeLane {
         else {
             unreachable!()
         };
-        match capture.try_finish() {
+        match capture.try_finish(deadline) {
             Ok(retired) => {
                 self.state = FacadeState::Retired(Box::new(retired));
                 Ok(true)
@@ -4588,6 +4829,21 @@ impl CaptureLane<PidPin> for FacadeLane {
         match &self.state {
             FacadeState::Retired(capture) => Some(capture.cleanup().clone()),
             _ => None,
+        }
+    }
+
+    fn detach_completed(&self) -> bool {
+        match &self.state {
+            FacadeState::Retired(_) => true,
+            FacadeState::Retiring(capture) => capture.detach_completed(),
+            _ => false,
+        }
+    }
+
+    fn info_teardown(&self) -> InfoTeardown {
+        match &self.state {
+            FacadeState::Retiring(capture) => capture.info_teardown(),
+            _ => InfoTeardown::Proven,
         }
     }
 }
@@ -5046,9 +5302,11 @@ mod stop_latch_tests {
                     object: AttachObjectId::scripted(0),
                     file_offset: 0x1000 + u64::from(id) * 16,
                     abi: p11scope_manifest::elf::ElfAbi::Lp64,
+                    info_kind: None,
                 })
                 .collect(),
             objects: vec![AttachObjectId::scripted(0)],
+            info_revoked: vec![],
         }
     }
 

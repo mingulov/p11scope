@@ -13,11 +13,12 @@ use p11scope_ebpf_common::{
 #[map]
 static USAGE: Array<u64> = Array::with_max_entries(1, 0);
 #[map]
-static USAGE_CONFIG: Array<InventoryUsageConfig> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
+pub(super) static USAGE_CONFIG: Array<InventoryUsageConfig> =
+    Array::with_max_entries(1, BPF_F_RDONLY_PROG);
 #[map]
 static USAGE_EVIDENCE: PerCpuArray<u64> = PerCpuArray::with_max_entries(USAGE_EVIDENCE_CELLS, 0);
 
-fn bump_usage_evidence(index: u32) {
+pub(super) fn bump_usage_evidence(index: u32) {
     if let Some(value) = USAGE_EVIDENCE.get_ptr_mut(index) {
         unsafe { *value = (*value).saturating_add(1) };
     }
@@ -36,7 +37,7 @@ pub fn p11_usage_entry_ia32(ctx: ProbeContext) -> u32 {
 }
 
 #[inline(always)]
-fn usage_entry(ctx: ProbeContext, declared_layout: LinuxLayout) -> u32 {
+pub(super) fn usage_entry(ctx: ProbeContext, declared_layout: LinuxLayout) -> u32 {
     // Even malformed config/cookie evidence must not become an unscoped signal.
     #[cfg(not(feature = "inventory-callers"))]
     if scope_auth().is_none() {

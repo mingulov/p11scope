@@ -2175,6 +2175,14 @@ as `CKR_TOKEN_NOT_PRESENT` on a polled empty slot must not leave
 its row behind to fill the map). NULL
 pointer → unavailable; any other return → never (no
 BUFFER_TOO_SMALL/query-shape rule: these are not length cells).
+Concretely: a NULL pointer at entry deletes any stale row and
+stashes nothing (never a NULL marker), so the return finds no row,
+counts the named `info_unmatched_return` and emits no record —
+like the S-protocol cell, a stale row is never trusted.
+`INFO_STATUS_UNAVAILABLE` records (status 1, zero payload, joining
+to nothing) arise only when the bytes are unreadable at return on
+`CKR_OK` — the page left between entry and return — preserving the
+completed call's slot/mechanism/identity evidence.
 Every terminal/loss path clears the retained row, exactly like
 the S-protocol cell. FULL builds only: the P0 flavors omit the
 info programs (explicit unavailability, §17.4), so P0 acquires no
@@ -2353,15 +2361,37 @@ overwrites, the inner return consumes the inner row, the outer
 return finds no row and yields unavailable — exactly one good
 record plus one named unavailable, never a crossed pointer).
 Stop
-scrub: after callback quiescence the inventory teardown
-zero-verify-removes every `INFO_START` row (the
-`object_stop.rs` pattern) and asserts the map empty — plus
-fresh maps per preparation, so no row survives the session.
+scrub: after the links detach, the inventory teardown clears
+the `INFO_START` stash in bounded steps (at most 64 rows per
+retirement poll, zero-verify-remove per row following the
+`object_stop.rs` pattern), carrying progress, the pending
+key/substep and concrete failures across polls and observing
+emptiness before reporting complete. Every native call charges
+to the poll's operation allowance (INV-2, 257 per poll: one
+enumeration plus zero, read-back and remove per row, and one
+terminal emptiness observation), and no call starts at or past
+the stop deadline — a short allowance or a passed deadline
+yields mid-row and resumes at the pending substep without
+redoing finished work. The scrub
+refuses while links are retained (failed detaches keep probes
+attached and mutating) and transfers with teardown explicitly
+unproven instead of blocking retirement. The outcome always
+reaches the operator: the stop line names an unproven teardown
+with its concrete cause beside the detach counts, and an
+unsettled retirement names the live scrub outcome — running
+progress or concrete failure — beside the detach outcome, on
+both stop drivers. Callback quiescence
+itself is unproven under D3, so even a complete scrub is
+best-effort hygiene, not a proof — plus fresh maps per
+preparation, so no row survives the session either way.
 Full-map insert failures, unmatched returns and nested
 overwrites each land in their own `INFO_EVIDENCE` PerCpuArray
 cell (new map, 4 cells: insert failures, unmatched returns,
 nested overwrites, stash mismatches — never silent, never
-folded into `EVIDENCE`).
+folded into `EVIDENCE`). The coordinator keeps a saturating run
+total per cell and reports each nonzero total once at the
+terminal cut, through the terminal gap headroom, so a saturated
+generic log loses per-quantum rows but never the totals.
 
 Function kind (fix8 I3, publication fixed by fix9 R1): the BPF
 side learns the function from an endpoint→kind map, `INFO_KIND`
@@ -2404,7 +2434,35 @@ physical (object, offset) (`Slot.names`/`aliased`,
 `src/plan.rs:182-210`): the set is exactly one of the 3 info
 functions → that kind; anything else (alias of two info
 functions, info aliased with a non-info function, no info
-function) → `None`. Link rule: the info pair links ONLY where
+function) → `None`. A later pass that adds names at a retained
+endpoint re-checks the rule there: when the new set no longer
+resolves to the retained kind, the attach set revokes INFO at
+that endpoint (kind clears to `None`, irreversible — a
+usage-only endpoint never upgrades), reports the endpoint for
+capture revocation and counts `info_aliased_endpoint` once. The
+capture downgrades any fresh copy to usage-only, purges its
+pending info returns and writes its `INFO_KIND` cell back to zero
+(idempotent, retried on failure; at most 64 cells per extend and
+none past the extend deadline, the rest requeuing); the
+coordinator rejects that endpoint's outstanding rows. Usage
+coverage stays intact throughout. Authority boundary: consumption authority (row
+rejection, pending purge, fresh downgrade) lapses at absorb
+staging, while entry authority (BPF acquisition under the
+previously published kind) lapses at the zero-write read-back.
+Between the two, bytes may still be acquired but are never
+semantically parsed, joined or published: fixed-frame validation
+still runs first (length, kind/layout, trailer and payload rules),
+so a malformed frame from a revoked endpoint counts malformed
+exactly like any other, while no revoked row ever reaches
+semantic parsing, the join or publication. Past the boundary the
+return
+enforces the live cell: a zero or unknown live kind deletes any
+stash row silently — an in-flight call that entered before the
+revocation and returns after loses INFO authority there, its
+saved pointer never read — and counts no unmatched return; a
+stash/live kind skew mismatches without reading. A failed
+zero-write retries every extend with a counted gap; rows stay
+rejected throughout. Link rule: the info pair links ONLY where
 the kind is `Some`; otherwise the usage entry stays and the
 endpoint reports the named gap `info_aliased_endpoint`
 (counted per endpoint, surfaced in the Task 7 section — never
@@ -2468,7 +2526,36 @@ drains in the inventory session alongside `DISCOVERY`; loss
 accounting rides a new `PRODUCED_INFO = 2` cell with
 `PRODUCED_CELLS` 2→3 (`lib.rs:609-611`) — the drain
 cross-checks produced vs consumed per quantum and counts the
-difference, never a silent drop.
+difference, never a silent drop. The difference is derived
+backlog (produced minus consumed): provisional mid-run, since
+submitted-but-undrained records read as backlog until the next
+quantum drains them. The terminal cut — bounded quanta while
+the stop budget allows, drained and staged before the domain
+finishes on BOTH stop drivers (the blocking stop and the
+cooperative retained stop share one classifier and one resumable
+INFO phase) — reports its observed backlog, never certified
+loss: exact loss needs producer quiescence, and Inventory FD
+retirement proves no callback quiescence (D3). Only the last
+quantum over SETTLED retirement marks terminal: retirement
+transferred, no poll error, and a clean cleanup with no failed
+closes and no retained links. Unsettled retirement, poll errors
+and retained-link cleanups keep the cut provisional — the
+retirement gap carries that outcome instead, never a terminal
+flag. A retired, complete, fresh cut with nonzero backlog
+reports that backlog; an incomplete drain (bound/deadline/error)
+or an unreadable final counter each report their own
+incomplete/unavailable cut with the observed backlog or counts;
+a healthy or P0 cut stays quiet. Running readings stay provisional
+in the batch; the terminal batch reports its cut once, and Finish
+discloses the last provisional cut with the run totals once, only when
+retirement never settled (a terminal classification already handled its
+cut, quiet included). Observation presence is run-wide: an expired
+final quantum never erases an earlier observation from the cut. Reserve
+failures (a full ring submits nothing, so no produced bump)
+land in the session's shared ring-loss counter beside
+`DISCOVERY` losses: a full INFO ring means the session's drains
+stalled, which the lifecycle-loss machinery already treats as
+unproven custody.
 
 Feasibility inside the inventory-only build: the info pair needs
 none of the compiled-out items. It brings its own stash/kind
@@ -2617,6 +2704,10 @@ caller's rows fold like `departed_use`: they retire with the
 named counted `info_token_departed_folded` /
 `info_mechanism_departed_folded` gaps (row counts only — values
 never merge across callers, since slot ids are per-process).
+Retires queue; each retire call folds one bounded slice (64
+rows) through the resumable per-caller range cursor, so one
+caller can never stall a pass, and folds complete over
+subsequent calls.
 
 Join (fix8 C2, identity fixed by fix9 R2): info record →
 (module via endpoint id, caller incarnation via the header's
@@ -2633,7 +2724,11 @@ never mentions instances: rows carry module + caller references
 resolving in `modules[]`/`edges[]`. Where the semantic lane
 proves an instance (manifest runs), the same rows additionally
 carry the instance id — attached, never synthesized, and never
-required. No `AggKey` contact (these are not key rows) and no
+required. Attribution probes the registry's mutation-maintained
+(caller, module) pair map directly (one lookup per row that
+needs it; provider and unavailable rows probe nothing), so joins
+scale with the batch, never with the instance population. No
+`AggKey` contact (these are not key rows) and no
 `metadata_at_use` contact.
 A provider with no completed Task 7 calls has no `provider_info`
 block: "provider never watched" is derivable from the JSON

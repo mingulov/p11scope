@@ -13584,9 +13584,16 @@ mod tests {
         }
         let inventory = include_str!("attach/inventory/activation.rs");
         assert!(!inventory.contains("require_return_probe_admission"));
-        assert!(inventory.contains("let program = match entry.abi {"));
-        assert!(inventory.contains("ElfAbi::Lp64 => \"p11_usage_entry_lp64\""));
-        assert!(inventory.contains("ElfAbi::Ilp32 => \"p11_usage_entry_ia32\""));
+        // Keymeta Task 7 (spec §17.4): info endpoints substitute the
+        // inventory info entries; the inventory link set stays
+        // entry-only plus the single info return (no journal
+        // programs link here in any mode).
+        assert!(inventory.contains("let program = match (entry.abi, entry.info_kind) {"));
+        assert!(inventory.contains("(ElfAbi::Lp64, Some(_)) => \"p11_info_entry_lp64\""));
+        assert!(inventory.contains("(ElfAbi::Ilp32, Some(_)) => \"p11_info_entry_ia32\""));
+        assert!(inventory.contains("(ElfAbi::Lp64, None) => \"p11_usage_entry_lp64\""));
+        assert!(inventory.contains("(ElfAbi::Ilp32, None) => \"p11_usage_entry_ia32\""));
+        assert!(inventory.contains("program: \"p11_info_return\""));
     }
 
     /// Pause thread-birth dating trusts the attach clock: every provider

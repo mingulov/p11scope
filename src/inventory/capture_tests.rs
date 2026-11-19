@@ -7,7 +7,7 @@
 use super::*;
 use crate::attach::capture::{
     AttachedEndpoint, CallerCountUpdate, CaptureHealth, CapturePhase, DomainCookie, ExecCoverage,
-    WitnessRow,
+    InfoBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::tests::ScriptedSource;
@@ -140,6 +140,8 @@ fn exit_finalizer_control(completed: bool) {
                         closed: 1,
                         failures: Vec::new(),
                         retained_links: 0,
+                        info_teardown_unproven: false,
+                        info_scrub_error: None,
                     })
                 } else {
                     Retirement::Unsettled("actual host retirement close is still gated".into())
@@ -480,6 +482,21 @@ struct ScriptedLane {
     service_stamps: Rc<RefCell<Vec<u64>>>,
     /// Records each discovery quantum returns (non-exec, binder-neutral).
     records_per_service: usize,
+    /// The first this many INFO services return incomplete quanta
+    /// (the ring still holds records); later ones complete.
+    info_incomplete_services: usize,
+    /// Scripted INFO quanta, popped per INFO service in order
+    /// (empty: the default empty quantum, honoring
+    /// `info_incomplete_services`).
+    staged_info: VecDeque<InfoBatch>,
+    /// The stop-time cleanup reports retained links (failed closes):
+    /// retirement transferred but never settled clean.
+    dirty_cleanup: bool,
+    /// Every link had its close attempt, even though the transfer
+    /// never completed (the INFO scrub blocks it).
+    detach_done: bool,
+    /// The INFO stash teardown outcome the stop reports.
+    teardown: InfoTeardown,
     /// EXEC pids each discovery service returns, in service order (the
     /// post-last-pass coverage fixture): popped per service call, so the
     /// first service drains the head entry. Empty: no EXEC records.
@@ -502,6 +519,9 @@ struct ScriptedLane {
     services: usize,
     /// The actual deadlines passed through the native I/O boundary.
     io_deadlines: Rc<RefCell<Vec<(&'static str, Instant)>>>,
+    /// Every INFO service window's deadline, in call order (mid-run
+    /// quanta first, then the stop's terminal cut).
+    info_windows: Rc<RefCell<Vec<Instant>>>,
     /// Scripted image acquisition handed to the driver while
     /// `acquisition_active` (the production facade's Active state).
     acquisition: Option<ScriptedAcquisition>,
@@ -563,6 +583,11 @@ impl ScriptedLane {
             serviced: None,
             service_stamps: Rc::default(),
             records_per_service: 0,
+            info_incomplete_services: 0,
+            staged_info: VecDeque::new(),
+            dirty_cleanup: false,
+            detach_done: false,
+            teardown: InfoTeardown::Proven,
             staged_execs: VecDeque::new(),
             staged_ticketed_execs: VecDeque::new(),
             ring_loss: VecDeque::new(),
@@ -571,6 +596,7 @@ impl ScriptedLane {
             drain_high_water_bytes: Vec::new(),
             services: 0,
             io_deadlines: Rc::default(),
+            info_windows: Rc::default(),
             acquisition: None,
             acquisition_active: false,
             backend: LaneBackend::singles(),
@@ -775,6 +801,19 @@ impl CaptureLane<Pin> for ScriptedLane {
         batch
     }
 
+    fn service_info(&mut self, window: ReadWindow) -> InfoBatch {
+        self.info_windows.borrow_mut().push(window.deadline());
+        if let Some(batch) = self.staged_info.pop_front() {
+            return batch;
+        }
+        let mut batch = InfoBatch::empty(self.domain);
+        if self.info_incomplete_services > 0 {
+            self.info_incomplete_services -= 1;
+            batch.complete = false;
+        }
+        batch
+    }
+
     fn read_witnesses(&mut self, window: ReadWindow) -> WitnessBatch {
         self.io_deadlines.borrow_mut().push((
             if self.stopping {
@@ -900,12 +939,35 @@ impl CaptureLane<Pin> for ScriptedLane {
     }
 
     fn cleanup(&self) -> Option<CleanupSummary> {
-        self.retired.then(|| CleanupSummary {
-            attempted: self.attached.len() + 2,
-            closed: self.attached.len() + 2,
-            failures: Vec::new(),
-            retained_links: 0,
+        self.retired.then(|| {
+            if self.dirty_cleanup {
+                CleanupSummary {
+                    attempted: self.attached.len() + 2,
+                    closed: self.attached.len() + 1,
+                    failures: vec!["scripted close failure".into()],
+                    retained_links: 1,
+                    info_teardown_unproven: false,
+                    info_scrub_error: None,
+                }
+            } else {
+                CleanupSummary {
+                    attempted: self.attached.len() + 2,
+                    closed: self.attached.len() + 2,
+                    failures: Vec::new(),
+                    retained_links: 0,
+                    info_teardown_unproven: false,
+                    info_scrub_error: None,
+                }
+            }
         })
+    }
+
+    fn detach_completed(&self) -> bool {
+        self.detach_done
+    }
+
+    fn info_teardown(&self) -> InfoTeardown {
+        self.teardown.clone()
     }
 }
 
@@ -954,6 +1016,14 @@ struct Scene {
     staged_lifecycle: Vec<u64>,
     /// Every staged witness batch's refreshed-count size, in staging order.
     staged_counts: Vec<usize>,
+    /// Every staged INFO batch's terminal mark, in staging order.
+    staged_info_terminal: Vec<bool>,
+    /// Every staged INFO batch's retired mark, in staging order.
+    staged_info_retired: Vec<bool>,
+    /// Every staged INFO batch's record count, in staging order.
+    staged_info_records: Vec<usize>,
+    /// Every staged INFO batch's evidence delta, in staging order.
+    staged_info_evidence: Vec<[u64; 4]>,
     /// Acquisition domains the loop forwarded to commit polls, in order.
     poll_acquisitions: Vec<Option<NativeDomainId>>,
     /// Acquisition domains the loop forwarded to ticks, in order.
@@ -993,6 +1063,10 @@ impl Scene {
             collect_gate: None,
             staged_lifecycle: Vec::new(),
             staged_counts: Vec::new(),
+            staged_info_terminal: Vec::new(),
+            staged_info_retired: Vec::new(),
+            staged_info_records: Vec::new(),
+            staged_info_evidence: Vec::new(),
             poll_acquisitions: Vec::new(),
             tick_acquisitions: Vec::new(),
         }
@@ -1257,12 +1331,19 @@ impl LaneHost<Pin> for Scene {
             NativeBatch::Lifecycle(_) => "stage:lifecycle",
             NativeBatch::Finish { .. } => "stage:finish",
             NativeBatch::Semantic(_) => "stage:semantic",
+            NativeBatch::Info(_) => "stage:info",
         });
         if let NativeBatch::Lifecycle(lifecycle) = &batch {
             self.staged_lifecycle.push(lifecycle.started_ns);
         }
         if let NativeBatch::Witness(witness) = &batch {
             self.staged_counts.push(witness.counts.len());
+        }
+        if let NativeBatch::Info(info) = &batch {
+            self.staged_info_terminal.push(info.terminal);
+            self.staged_info_retired.push(info.retired);
+            self.staged_info_records.push(info.records.len());
+            self.staged_info_evidence.push(info.evidence_delta);
         }
         self.coordinator.stage_native(batch, identity, now_ns)
     }
@@ -1467,6 +1548,9 @@ fn pass(extend: &str) -> Vec<String> {
         "stage:lifecycle",
         "read",
         "stage:witness",
+        // Keymeta Task 7 (spec §17.4): one INFO quantum per pass,
+        // staged after the witnesses its join resolves against.
+        "stage:info",
         "commit",
         "publish:pass",
     ]
@@ -1474,7 +1558,7 @@ fn pass(extend: &str) -> Vec<String> {
     .to_vec()
 }
 
-const STOP: [&str; 15] = [
+const STOP: [&str; 16] = [
     // Two endpoints: the 200 ms base and 50 ms for each.
     "publish:retiring 2 300",
     // A complete lifecycle drain right before the terminal read.
@@ -1489,6 +1573,9 @@ const STOP: [&str; 15] = [
     "stage:lifecycle",
     "read",
     "stage:witness",
+    // Keymeta Task 7 (spec §17.4): the terminal INFO drain over the
+    // quiescent ring, certifying the cross-check.
+    "stage:info",
     "stage:finish",
     "commit",
     "publish:stop",
@@ -1662,6 +1749,7 @@ fn mid_run_arrivals_merge_with_the_deferred_backlog_in_host_order() {
         delta: TargetDelta {
             endpoints: first,
             objects: Vec::new(),
+            info_revoked: Vec::new(),
         },
         start_pending: false,
     };
@@ -1679,6 +1767,7 @@ fn mid_run_arrivals_merge_with_the_deferred_backlog_in_host_order() {
     host.delta = TargetDelta {
         endpoints: fresh,
         objects: Vec::new(),
+        info_revoked: Vec::new(),
     };
     lane.after_pass(&mut host);
     let log_entries = entries(&log);
@@ -1787,9 +1876,11 @@ fn fabricated_delta(count: u32) -> TargetDelta {
                 object: AttachObjectId::scripted(0),
                 file_offset: 0x1000 + u64::from(id) * 16,
                 abi: p11scope_manifest::elf::ElfAbi::Lp64,
+                info_kind: None,
             })
             .collect(),
         objects: Vec::new(),
+        info_revoked: Vec::new(),
     }
 }
 
@@ -1805,9 +1896,11 @@ fn two_object_delta(per_object: u32) -> TargetDelta {
                 object: AttachObjectId::scripted(id / per_object),
                 file_offset: 0x1000 + u64::from(id) * 16,
                 abi: p11scope_manifest::elf::ElfAbi::Lp64,
+                info_kind: None,
             })
             .collect(),
         objects: vec![AttachObjectId::scripted(0), AttachObjectId::scripted(1)],
+        info_revoked: vec![],
     }
 }
 
@@ -2579,6 +2672,683 @@ fn the_lane_follows_the_contract_order_from_startup_through_stop() {
     assert_eq!(stopped.summary.passes, 2);
     assert_eq!(stopped.summary.attached, 2);
     assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
+    // Keymeta Task 7 (spec §17.4): per-pass INFO quanta stay
+    // provisional; only the terminal cut marks its batch, reporting
+    // the observed backlog.
+    assert_eq!(
+        scene.staged_info_terminal,
+        [false, false, true],
+        "only the terminal INFO batch is marked"
+    );
+}
+
+/// Keymeta Task 7 terminal cut (spec §17.4): while the stop budget
+/// allows, the terminal drain services bounded quanta until one
+/// completes — each non-terminal until the last, which marks
+/// terminal over settled retirement. Only that last batch carries
+/// the cut outcome.
+#[test]
+fn terminal_info_cut_drains_bounded_quanta_until_complete() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // Two passes drain incomplete mid-run quanta; the terminal loop
+    // then drains one more incomplete quantum before completing.
+    lane.info_incomplete_services = 3;
+    let (stopped, _) = run(&mut scene, lane, 2);
+    assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
+    assert_eq!(
+        scene.staged_info_terminal,
+        [false, false, false, true],
+        "only the last terminal-loop quantum is marked"
+    );
+    assert_eq!(
+        scene.staged_info_retired,
+        [false, false, false, true],
+        "only the terminal cut carries settled retirement"
+    );
+}
+
+/// Keymeta Task 7 terminal cut (spec §17.4): the cooperative stop
+/// drains INFO before the domain finishes, like the classic stop.
+/// A record and a nonzero evidence cell arriving after the final
+/// normal pass reach the host on the stop path, ahead of Finish.
+#[test]
+fn cooperative_stop_drains_pending_info_before_finish() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    let mut stop_quantum = InfoBatch::empty(lane.domain);
+    stop_quantum.records = vec![[0xAB; 176]];
+    stop_quantum.evidence_delta = [0, 0, 0, 1];
+    stop_quantum.complete = true;
+    stop_quantum.produced_fresh = true;
+    lane.staged_info.push_back(stop_quantum);
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let stop = started
+        .into_finite_stop(NativeStopDisposition::Error, None)
+        .ok()
+        .expect("the error disposition is always admissible");
+    let keep_running = || false;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(60)),
+        stop: &keep_running,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut stop = stop;
+    let mut steps = 0u32;
+    let _stopped = loop {
+        steps += 1;
+        assert!(steps <= 10_000, "the cooperative stop finishes its phases");
+        let now = Instant::now();
+        match stop.step(&mut scene, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => stop = next,
+            NativeStopProgress::Stopped(stopped) => break stopped,
+        }
+    };
+    assert_eq!(
+        scene.staged_info_records,
+        [1],
+        "the cooperative stop stages the pending INFO record: {:?}",
+        scene.staged_info_records
+    );
+    assert_eq!(
+        scene.staged_info_evidence.last(),
+        Some(&[0, 0, 0, 1]),
+        "the stop-time evidence cell stages: {:?}",
+        scene.staged_info_evidence
+    );
+    let log = entries(&log);
+    let info_at = log.iter().position(|entry| entry == "stage:info");
+    let finish_at = log.iter().position(|entry| entry == "stage:finish");
+    assert!(
+        info_at.is_some_and(|info| finish_at.is_some_and(|finish| info < finish)),
+        "INFO stages before Finish: {log:?}"
+    );
+}
+
+/// Keymeta Task 7 terminal cut (spec §17.4): the classic stop
+/// stages stop-time INFO content — a record and a nonzero evidence
+/// cell arriving after the final normal pass land on the terminal
+/// cut ahead of Finish.
+#[test]
+fn classic_stop_stages_late_info_content_on_the_terminal_cut() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    let domain = lane.domain;
+    lane.staged_info.push_back(InfoBatch::empty(domain));
+    let mut stop_quantum = InfoBatch::empty(domain);
+    stop_quantum.records = vec![[0xAB; 176]];
+    stop_quantum.evidence_delta = [1, 0, 0, 0];
+    stop_quantum.complete = true;
+    stop_quantum.produced_fresh = true;
+    lane.staged_info.push_back(stop_quantum);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
+    assert_eq!(
+        scene.staged_info_records,
+        [0, 1],
+        "the terminal cut carries the late record: {:?}",
+        scene.staged_info_records
+    );
+    assert_eq!(
+        scene.staged_info_evidence.last(),
+        Some(&[1, 0, 0, 0]),
+        "the terminal cut carries the late evidence: {:?}",
+        scene.staged_info_evidence
+    );
+    assert_eq!(
+        scene.staged_info_terminal.last(),
+        Some(&true),
+        "settled retirement still marks terminal"
+    );
+    let log = entries(&log);
+    let info_at = log.iter().rposition(|entry| entry == "stage:info");
+    let finish_at = log.iter().position(|entry| entry == "stage:finish");
+    assert!(
+        info_at.is_some_and(|info| finish_at.is_some_and(|finish| info < finish)),
+        "INFO stages before Finish: {log:?}"
+    );
+}
+
+/// Keymeta Task 7 terminal cut (spec §17.4): an unsettled
+/// retirement never marks its INFO cut terminal — the last
+/// quantum stays provisional and the retirement gap carries the
+/// outcome, on timeout...
+#[test]
+fn unsettled_retirement_cuts_info_without_terminal_mark() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert!(matches!(
+        stopped.summary.retirement,
+        Retirement::Unsettled(_)
+    ));
+    assert_eq!(
+        scene.staged_info_terminal.last(),
+        Some(&false),
+        "a cut over unsettled retirement never marks terminal: {:?}",
+        scene.staged_info_terminal
+    );
+    assert_eq!(
+        scene.staged_info_retired.last(),
+        Some(&false),
+        "an unsettled terminal cut never claims retirement"
+    );
+}
+
+/// Keymeta Task 7 terminal cut (spec §17.4): the classic stop's
+/// INFO quanta run inside the retirement window — never a fresh
+/// normal discovery window past it. With retirement unsettled past
+/// its budget, every stop-time INFO window reads at or before the
+/// retirement deadline the polls already passed.
+#[test]
+fn classic_stop_infos_run_inside_the_retirement_window() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    let info_windows = Rc::clone(&lane.info_windows);
+    let io_deadlines = Rc::clone(&lane.io_deadlines);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert!(matches!(
+        stopped.summary.retirement,
+        Retirement::Unsettled(_)
+    ));
+    let retirement_deadline = io_deadlines
+        .borrow()
+        .iter()
+        .find_map(|(kind, deadline)| (*kind == "retirement").then_some(*deadline))
+        .expect("the stop polled retirement");
+    let windows = info_windows.borrow();
+    // One mid-run quantum per pass runs on a fresh window; every
+    // later quantum belongs to the stop's terminal cut.
+    assert!(
+        windows.len() >= 2,
+        "the stop serviced INFO after the pass: {}",
+        windows.len()
+    );
+    for (index, window) in windows.iter().enumerate().skip(1) {
+        assert!(
+            window <= &retirement_deadline,
+            "stop-time INFO quantum {index} stays inside the retirement window: \
+             {window:?} vs {retirement_deadline:?}"
+        );
+    }
+}
+
+/// ...on poll error...
+#[test]
+fn poll_error_cuts_info_without_terminal_mark() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retirement_error = true;
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert!(matches!(
+        stopped.summary.retirement,
+        Retirement::Unsettled(_)
+    ));
+    assert_eq!(
+        scene.staged_info_terminal.last(),
+        Some(&false),
+        "a cut over a poll error never marks terminal: {:?}",
+        scene.staged_info_terminal
+    );
+    assert_eq!(
+        scene.staged_info_retired.last(),
+        Some(&false),
+        "a poll-error cut never claims retirement"
+    );
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4): an unsettled
+/// retirement names the live INFO scrub outcome beside the detach
+/// outcome — a concrete scrub failure survives the timeout, and a
+/// running scrub reports its progress instead of reading as a pure
+/// detach stall.
+#[test]
+fn unsettled_retirement_names_the_live_scrub_outcome() {
+    let failed = InfoTeardown::Failed {
+        error: "cells broke".into(),
+    };
+    let Retirement::Unsettled(reason) = classify_retirement(
+        false,
+        false,
+        None,
+        None,
+        &failed,
+        Duration::from_millis(300),
+    ) else {
+        panic!("a timed-out retirement reads unsettled");
+    };
+    assert!(
+        reason.contains("did not detach within 300 ms"),
+        "the detach outcome stays: {reason}"
+    );
+    assert!(
+        reason.contains("cells broke"),
+        "the concrete scrub error survives the timeout: {reason}"
+    );
+    let Retirement::Unsettled(reason) = classify_retirement(
+        false,
+        false,
+        Some("controlled retirement poll failure".into()),
+        None,
+        &failed,
+        Duration::from_millis(300),
+    ) else {
+        panic!("a poll error reads unsettled");
+    };
+    assert!(
+        reason.contains("controlled retirement poll failure"),
+        "the poll error stays: {reason}"
+    );
+    assert!(
+        reason.contains("cells broke"),
+        "the scrub failure rides the poll error too: {reason}"
+    );
+    let pending = InfoTeardown::Pending { cleared: 41 };
+    let Retirement::Unsettled(reason) = classify_retirement(
+        true,
+        false,
+        None,
+        None,
+        &pending,
+        Duration::from_millis(300),
+    ) else {
+        panic!("a timed-out retirement reads unsettled");
+    };
+    assert!(
+        reason.contains("probes detached"),
+        "completed detach reads as completed: {reason}"
+    );
+    assert!(
+        reason.contains("41"),
+        "the running scrub reports its progress: {reason}"
+    );
+    let Retirement::Unsettled(reason) = classify_retirement(
+        false,
+        false,
+        None,
+        None,
+        &InfoTeardown::Proven,
+        Duration::from_millis(300),
+    ) else {
+        panic!("a timed-out retirement reads unsettled");
+    };
+    assert_eq!(
+        reason, "the probes did not detach within 300 ms",
+        "a proven scrub leaves the detach message alone: {reason}"
+    );
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4): when cleanup
+/// proves the probes detached and only INFO teardown blocks the
+/// transfer, the unsettled report names the completed detach and
+/// the live scrub outcome — never a detach timeout.
+#[test]
+fn detached_but_untransferred_retirement_names_completed_detach() {
+    let failed = InfoTeardown::Failed {
+        error: "cells broke".into(),
+    };
+    let Retirement::Unsettled(reason) =
+        classify_retirement(true, false, None, None, &failed, Duration::from_millis(300))
+    else {
+        panic!("an untransferred retirement reads unsettled");
+    };
+    assert!(
+        reason.contains("probes detached"),
+        "completed detach reads as completed: {reason}"
+    );
+    assert!(
+        !reason.contains("did not detach"),
+        "no detach timeout past completed detach: {reason}"
+    );
+    assert!(
+        reason.contains("cells broke"),
+        "the concrete scrub error survives: {reason}"
+    );
+    let pending = InfoTeardown::Pending { cleared: 41 };
+    let Retirement::Unsettled(reason) = classify_retirement(
+        true,
+        false,
+        None,
+        None,
+        &pending,
+        Duration::from_millis(300),
+    ) else {
+        panic!("an untransferred retirement reads unsettled");
+    };
+    assert!(
+        reason.contains("probes detached"),
+        "completed detach reads as completed: {reason}"
+    );
+    assert!(
+        reason.contains("41"),
+        "the running scrub reports its progress: {reason}"
+    );
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4): a scrub still
+/// waiting for detach leaves the detach timeout bare instead of
+/// reporting progress it never made.
+#[test]
+fn waiting_scrub_leaves_the_detach_timeout_bare() {
+    let Retirement::Unsettled(reason) = classify_retirement(
+        false,
+        false,
+        None,
+        None,
+        &InfoTeardown::Pending { cleared: 0 },
+        Duration::from_millis(300),
+    ) else {
+        panic!("a timed-out retirement reads unsettled");
+    };
+    assert_eq!(
+        reason, "the probes did not detach within 300 ms",
+        "a waiting scrub adds no progress clause: {reason}"
+    );
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4), end to end: a
+/// stop whose links detached but whose scrub fails reports the
+/// completed detach with the concrete scrub cause.
+#[test]
+fn unsettled_stop_with_completed_detach_names_the_scrub_failure() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    lane.detach_done = true;
+    lane.teardown = InfoTeardown::Failed {
+        error: "cells broke".into(),
+    };
+    let (stopped, _) = run(&mut scene, lane, 1);
+    let Retirement::Unsettled(reason) = &stopped.summary.retirement else {
+        panic!("an untransferred stop reads unsettled");
+    };
+    assert!(
+        reason.contains("probes detached"),
+        "completed detach reads as completed: {reason}"
+    );
+    assert!(
+        reason.contains("cells broke"),
+        "the concrete scrub cause survives the stop: {reason}"
+    );
+}
+
+/// The committed operator gap reasons for unsettled native-capture
+/// retirement, in stage order.
+fn retirement_gap_reasons(scene: &Scene) -> Vec<String> {
+    scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "native capture retirement unsettled")
+        .map(|gap| gap.reason.clone())
+        .collect()
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4), end to end: a
+/// classic stop whose links detached but whose scrub is still
+/// pending reports the completed detach in the operator gap — never
+/// the still-attached warning — beside the pending scrub.
+#[test]
+fn classic_stop_with_completed_detach_and_pending_scrub_names_detach_in_the_gap() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    lane.detach_done = true;
+    lane.teardown = InfoTeardown::Pending { cleared: 41 };
+    let (stopped, _) = run(&mut scene, lane, 1);
+    let Retirement::Unsettled(reason) = &stopped.summary.retirement else {
+        panic!("an untransferred stop reads unsettled");
+    };
+    assert!(
+        reason.contains("probes detached"),
+        "completed detach reads as completed: {reason}"
+    );
+    assert!(
+        reason.contains("41"),
+        "the running scrub reports its progress: {reason}"
+    );
+    let gaps = retirement_gap_reasons(&scene);
+    assert_eq!(gaps.len(), 1, "one retirement gap stages: {gaps:?}");
+    assert!(
+        gaps[0].contains("probes detached"),
+        "the gap names the completed detach: {}",
+        gaps[0]
+    );
+    assert!(
+        !gaps[0].contains("may still be attached"),
+        "no still-attached warning past completed detach: {}",
+        gaps[0]
+    );
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4), end to end: a
+/// classic stop whose links detached but whose scrub failed reports
+/// the completed detach with the concrete scrub cause in the
+/// operator gap — never the still-attached warning.
+#[test]
+fn classic_stop_with_completed_detach_and_failed_scrub_names_detach_in_the_gap() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    lane.detach_done = true;
+    lane.teardown = InfoTeardown::Failed {
+        error: "cells broke".into(),
+    };
+    let (stopped, _) = run(&mut scene, lane, 1);
+    let Retirement::Unsettled(reason) = &stopped.summary.retirement else {
+        panic!("an untransferred stop reads unsettled");
+    };
+    assert!(
+        reason.contains("probes detached"),
+        "completed detach reads as completed: {reason}"
+    );
+    assert!(
+        reason.contains("cells broke"),
+        "the concrete scrub cause survives the stop: {reason}"
+    );
+    let gaps = retirement_gap_reasons(&scene);
+    assert_eq!(gaps.len(), 1, "one retirement gap stages: {gaps:?}");
+    assert!(
+        gaps[0].contains("probes detached"),
+        "the gap names the completed detach: {}",
+        gaps[0]
+    );
+    assert!(
+        gaps[0].contains("cells broke"),
+        "the gap carries the concrete scrub cause: {}",
+        gaps[0]
+    );
+    assert!(
+        !gaps[0].contains("may still be attached"),
+        "no still-attached warning past completed detach: {}",
+        gaps[0]
+    );
+}
+
+/// Drives one cooperative stop to its `Stopped`, then commits the
+/// staged terminal disclosures like the classic stop does.
+fn drive_cooperative_stop(scene: &mut Scene, lane: ScriptedLane) -> Stopped<ScriptedLane> {
+    let started = NativeLane::start(lane, &mut *scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let stop = started
+        .into_finite_stop(NativeStopDisposition::Error, None)
+        .ok()
+        .expect("the error disposition is always admissible");
+    let keep_running = || false;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(60)),
+        stop: &keep_running,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut stop = stop;
+    let mut steps = 0u32;
+    let stopped = loop {
+        steps += 1;
+        assert!(steps <= 100_000, "the cooperative stop finishes its phases");
+        let now = Instant::now();
+        match stop.step(&mut *scene, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => {
+                stop = next;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            NativeStopProgress::Stopped(stopped) => break stopped,
+        }
+    };
+    scene.commit(false).unwrap();
+    stopped
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4), end to end: a
+/// cooperative stop whose links detached but whose scrub is still
+/// pending reports the completed detach in the operator gap — never
+/// the still-attached warning — beside the pending scrub.
+#[test]
+fn cooperative_stop_with_completed_detach_and_pending_scrub_names_detach_in_the_gap() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    lane.detach_done = true;
+    lane.teardown = InfoTeardown::Pending { cleared: 41 };
+    let stopped = drive_cooperative_stop(&mut scene, lane);
+    let Retirement::Unsettled(reason) = &stopped.summary.retirement else {
+        panic!("an untransferred stop reads unsettled");
+    };
+    assert!(
+        reason.contains("probes detached"),
+        "completed detach reads as completed: {reason}"
+    );
+    assert!(
+        reason.contains("41"),
+        "the running scrub reports its progress: {reason}"
+    );
+    let gaps = retirement_gap_reasons(&scene);
+    assert_eq!(gaps.len(), 1, "one retirement gap stages: {gaps:?}");
+    assert!(
+        gaps[0].contains("probes detached"),
+        "the gap names the completed detach: {}",
+        gaps[0]
+    );
+    assert!(
+        !gaps[0].contains("may still be attached"),
+        "no still-attached warning past completed detach: {}",
+        gaps[0]
+    );
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4), end to end: a
+/// cooperative stop whose links detached but whose scrub failed
+/// reports the completed detach with the concrete scrub cause in
+/// the operator gap — never the still-attached warning.
+#[test]
+fn cooperative_stop_with_completed_detach_and_failed_scrub_names_detach_in_the_gap() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    lane.detach_done = true;
+    lane.teardown = InfoTeardown::Failed {
+        error: "cells broke".into(),
+    };
+    let stopped = drive_cooperative_stop(&mut scene, lane);
+    let Retirement::Unsettled(reason) = &stopped.summary.retirement else {
+        panic!("an untransferred stop reads unsettled");
+    };
+    assert!(
+        reason.contains("probes detached"),
+        "completed detach reads as completed: {reason}"
+    );
+    assert!(
+        reason.contains("cells broke"),
+        "the concrete scrub cause survives the stop: {reason}"
+    );
+    let gaps = retirement_gap_reasons(&scene);
+    assert_eq!(gaps.len(), 1, "one retirement gap stages: {gaps:?}");
+    assert!(
+        gaps[0].contains("probes detached"),
+        "the gap names the completed detach: {}",
+        gaps[0]
+    );
+    assert!(
+        gaps[0].contains("cells broke"),
+        "the gap carries the concrete scrub cause: {}",
+        gaps[0]
+    );
+    assert!(
+        !gaps[0].contains("may still be attached"),
+        "no still-attached warning past completed detach: {}",
+        gaps[0]
+    );
+}
+
+/// Keymeta Task 7 teardown reporting (spec §17.4): an unsettled
+/// stop whose detach never completed keeps the existing
+/// still-attached warning in the operator gap.
+#[test]
+fn unconfirmed_detach_keeps_the_still_attached_warning_in_the_gap() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    let (stopped, _) = run(&mut scene, lane, 1);
+    let Retirement::Unsettled(reason) = &stopped.summary.retirement else {
+        panic!("an untransferred stop reads unsettled");
+    };
+    assert!(
+        reason.contains("did not detach"),
+        "unconfirmed detach reads as a detach timeout: {reason}"
+    );
+    let gaps = retirement_gap_reasons(&scene);
+    assert_eq!(gaps.len(), 1, "one retirement gap stages: {gaps:?}");
+    assert!(
+        gaps[0].contains("may still be attached"),
+        "the unconfirmed-detach warning stays: {}",
+        gaps[0]
+    );
+}
+
+/// ...and over a cleanup that retained links: the ownership
+/// transfer alone does not make a terminal cut.
+#[test]
+fn retained_link_cleanup_cuts_info_without_terminal_mark() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.dirty_cleanup = true;
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
+    assert_eq!(
+        scene.staged_info_terminal.last(),
+        Some(&false),
+        "a cut over retained links never marks terminal: {:?}",
+        scene.staged_info_terminal
+    );
+    assert_eq!(
+        scene.staged_info_retired.last(),
+        Some(&false),
+        "a retained-link cut never claims retirement"
+    );
 }
 
 /// F9 mid-apply cancellation: a stop landing during apply latches
@@ -3082,12 +3852,23 @@ fn a_missed_retirement_budget_reads_unsettled_with_a_gap() {
     assert_eq!(
         tail,
         [
-            "stage:witness",
+            // Keymeta Task 7 (spec §17.4): the terminal INFO drain
+            // stages before the domain finishes.
+            "stage:info",
             "stage:finish",
             "gap:native capture retirement unsettled",
             "commit",
             "publish:stop"
         ]
+    );
+    // The cut over unsettled retirement stays provisional (never
+    // terminal) and carries retired=false; the retirement gap above
+    // carries the outcome instead.
+    assert_eq!(scene.staged_info_terminal.last(), Some(&false));
+    assert_eq!(
+        scene.staged_info_retired.last(),
+        Some(&false),
+        "an unsettled terminal cut never claims retirement"
     );
     assert!(!stopped.capture.retired);
 }
@@ -10022,6 +10803,8 @@ impl CaptureLane<Pin> for DrainLane {
             closed: 2,
             failures: Vec::new(),
             retained_links: 0,
+            info_teardown_unproven: false,
+            info_scrub_error: None,
         })
     }
 }

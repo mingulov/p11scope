@@ -3590,6 +3590,12 @@ pub(crate) const DEFAULT_MAX_GAPS: usize = 8192;
 /// 4x with headroom for future terminal disclosures. A bounded raise of
 /// the stop-time retention ceiling (LIM-1 allows raises, never lowerings).
 pub(crate) const TERMINAL_GAP_RESERVE: usize = 64;
+/// Terminal INFO aggregate headroom above the shared stop-time
+/// reserve (spec §17.4): the cut row, one run-total row per nonzero
+/// evidence cell, and the deferred-fold row ride these dedicated
+/// slots, so other stop-time gaps sharing the 64-slot headroom can
+/// never suppress them. At most six aggregates stage per run.
+pub(crate) const TERMINAL_AGGREGATE_HEADROOM: usize = 6;
 /// Hard ceiling for the `--max-gaps` CLI knob (CLI input guard only;
 /// [`RegistryLimits::new`] still accepts any non-zero bound). This caps
 /// the retained RECORD COUNT, not bytes: subjects keep full /proc paths
@@ -3834,6 +3840,10 @@ enum Mutation {
         /// after the phase flips, so a staged per-drain flood can never
         /// consume the stop-time headroom.
         terminal: bool,
+        /// A terminal INFO aggregate (cut, run total, deferred fold):
+        /// retained from the dedicated aggregate headroom above the
+        /// shared stop-time reserve, never crowded out by it.
+        aggregate: bool,
     },
     RecordKeyedGap {
         /// The module key, resolved to an ID at apply time — after the
@@ -4099,6 +4109,12 @@ pub(crate) struct CallerRegistry {
     /// Aggregated subjects already counted as suppressed: a
     /// suppressed aggregate counts once, not once per merged drain.
     suppressed_aggregates: HashSet<(String, usize)>,
+    /// Terminal INFO aggregates retained: counted separately from
+    /// ordinary gaps, so either stage order preserves both budgets —
+    /// early aggregates never consume the shared stop-time reserve a
+    /// late ordinary diagnostic needs, and ordinary rows never consume
+    /// the dedicated aggregate headroom.
+    terminal_aggregate_retained: usize,
     /// Terminal/stop-time phase: set once the lane stops. Gaps staged
     /// from now on carry the terminal flag and may use the headroom
     /// above the bound; gaps staged before it keep the plain bound
@@ -4423,6 +4439,7 @@ impl CallerRegistry {
             gaps_suppressed: 0,
             unrouted_aggregates: HashMap::new(),
             suppressed_aggregates: HashSet::new(),
+            terminal_aggregate_retained: 0,
             terminal_phase: false,
             staged: Vec::new(),
             joint_publication: None,
@@ -4549,6 +4566,14 @@ impl CallerRegistry {
     /// reducer, so off-mode lengths drop with `size_inference_off`.
     pub(crate) fn set_joint_key_sizes(&mut self, requested: bool) {
         self.joint_keyuse.set_key_sizes(requested);
+    }
+
+    /// Keymeta Task 7 (spec §17.5): read the admitted module for
+    /// one module key, if the registry projected it. The INFO drain
+    /// resolves endpoint → module keys through the attach set and
+    /// looks each key up here; unprojected keys refuse (`None`).
+    pub(crate) fn module_by_key(&self, key: &ModuleKey) -> Option<ModuleId> {
+        self.modules_by_key.get(key).copied()
     }
 
     /// Tests-only reference wiring (N1): bind one module key to one
@@ -5870,7 +5895,27 @@ impl CallerRegistry {
 
     pub(crate) fn record_gap(&mut self, gap: RegistryGap) {
         let terminal = self.terminal_phase;
-        self.staged.push(Mutation::RecordGap { gap, terminal });
+        self.staged.push(Mutation::RecordGap {
+            gap,
+            terminal,
+            aggregate: false,
+        });
+    }
+
+    /// Stage one terminal INFO aggregate (spec §17.4): the cut, a run
+    /// total, or the deferred-fold disclosure. Aggregates carry
+    /// explicit terminal retention — they retain from the dedicated
+    /// [`TERMINAL_AGGREGATE_HEADROOM`] above the shared stop-time
+    /// reserve even when staged before the phase flips (the retained
+    /// cooperative lane stages its cut and Finish before
+    /// `on_lane_stopped`), so other stop-time gaps can never suppress
+    /// them; at most six stage per run.
+    pub(crate) fn record_terminal_aggregate(&mut self, gap: RegistryGap) {
+        self.staged.push(Mutation::RecordGap {
+            gap,
+            terminal: true,
+            aggregate: true,
+        });
     }
 
     /// Stage one drain's shed calls for an aggregated per-drain
@@ -6324,7 +6369,7 @@ impl CallerRegistry {
     /// phase (staged gaps carry their flag captured at stage time).
     fn push_gap(&mut self, gap: RegistryGap) {
         let terminal = self.terminal_phase;
-        self.push_gap_as(gap, terminal);
+        self.push_gap_as(gap, terminal, false);
     }
 
     /// Publish one gap once per run. Identity is every published field
@@ -6341,18 +6386,31 @@ impl CallerRegistry {
     /// the full `max_gaps` bound; terminal gaps (staged after
     /// `enter_terminal_phase`) may use [`TERMINAL_GAP_RESERVE`] headroom
     /// rows above it, so a per-drain flood can never crowd out the
-    /// stop-time disclosures.
-    fn push_gap_as(&mut self, gap: RegistryGap, terminal: bool) {
+    /// stop-time disclosures. Terminal INFO aggregates use a separate
+    /// [`TERMINAL_AGGREGATE_HEADROOM`] count above the shared reserve,
+    /// so either stage order preserves both budgets.
+    fn push_gap_as(&mut self, gap: RegistryGap, terminal: bool, aggregate: bool) {
         if let Some(&index) = self.gap_index.get(&gap) {
             self.gap_repeats[index] = self.gap_repeats[index].saturating_add(1);
             return;
         }
-        let cap = if terminal {
-            self.limits.max_gaps.saturating_add(TERMINAL_GAP_RESERVE)
+        // Separate budgets: aggregates use only the dedicated
+        // headroom count, ordinary rows use only the ordinary count
+        // (total rows minus aggregates). Either stage order preserves
+        // both: early aggregates never shrink the shared reserve, and
+        // a filled shared reserve never shrinks the aggregate slots.
+        let ordinary_retained = self
+            .gaps
+            .len()
+            .saturating_sub(self.terminal_aggregate_retained);
+        let retain = if aggregate && terminal {
+            self.terminal_aggregate_retained < TERMINAL_AGGREGATE_HEADROOM
+        } else if terminal {
+            ordinary_retained < self.limits.max_gaps.saturating_add(TERMINAL_GAP_RESERVE)
         } else {
-            self.limits.max_gaps
+            ordinary_retained < self.limits.max_gaps
         };
-        if self.gaps.len() >= cap {
+        if !retain {
             let fingerprint = self.suppressed_hasher.hash_one(&gap);
             if self.suppressed_seen.contains(&fingerprint) {
                 return;
@@ -6366,6 +6424,9 @@ impl CallerRegistry {
         self.gap_index.insert(gap.clone(), self.gaps.len());
         self.gaps.push(gap);
         self.gap_repeats.push(1);
+        if aggregate && terminal {
+            self.terminal_aggregate_retained = self.terminal_aggregate_retained.saturating_add(1);
+        }
     }
 
     /// Merge one drain's shed calls into the (subject, bindings)
@@ -6445,7 +6506,7 @@ impl CallerRegistry {
             budget: None,
         };
         let before = self.gaps.len();
-        self.push_gap_as(gap.clone(), terminal);
+        self.push_gap_as(gap.clone(), terminal, false);
         if let Some(&index) = self.gap_index.get(&gap) {
             if let Some(aggregate) = self.unrouted_aggregates.get_mut(&key) {
                 aggregate.gap_index = Some(index);
@@ -6823,7 +6884,11 @@ impl CallerRegistry {
                     self.recompute_module(module);
                 }
             }
-            Mutation::RecordGap { gap, terminal } => self.push_gap_as(gap, terminal),
+            Mutation::RecordGap {
+                gap,
+                terminal,
+                aggregate,
+            } => self.push_gap_as(gap, terminal, aggregate),
             Mutation::RecordAggregatedUnrouted {
                 subject,
                 total,
@@ -6851,6 +6916,7 @@ impl CallerRegistry {
                         budget,
                     },
                     terminal,
+                    false,
                 );
             }
         }
@@ -8906,6 +8972,7 @@ pub(crate) mod tests {
                 budget: None,
             },
             false,
+            false,
         );
         let lens = registry.memory_lens();
         assert_eq!(lens.callers.len, 1);
@@ -10852,6 +10919,184 @@ pub(crate) mod tests {
                 "terminal gap {n} survives the staged flood"
             );
         }
+    }
+
+    #[test]
+    fn terminal_info_aggregates_keep_dedicated_headroom_above_the_shared_reserve() {
+        // The six terminal INFO aggregates (cut, four run totals, the
+        // deferred fold) retain above a filled shared reserve, while
+        // a 65th ordinary terminal gap still suppresses.
+        let mut registry = registry();
+        for n in 0..DEFAULT_MAX_GAPS {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        registry.enter_terminal_phase();
+        for n in 0..TERMINAL_GAP_RESERVE {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("terminal-{n}"),
+                reason: "y".into(),
+                budget: None,
+            });
+        }
+        for n in 0..TERMINAL_AGGREGATE_HEADROOM {
+            registry.record_terminal_aggregate(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("aggregate-{n}"),
+                reason: "z".into(),
+                budget: None,
+            });
+        }
+        registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "terminal-overflow".into(),
+            reason: "y".into(),
+            budget: None,
+        });
+        registry.publish();
+        assert_eq!(
+            registry.gaps().len(),
+            DEFAULT_MAX_GAPS + TERMINAL_GAP_RESERVE + TERMINAL_AGGREGATE_HEADROOM
+        );
+        for n in 0..TERMINAL_AGGREGATE_HEADROOM {
+            assert!(
+                registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == format!("aggregate-{n}")),
+                "aggregate {n} retains above the filled shared reserve"
+            );
+        }
+        assert_eq!(
+            registry.gaps_suppressed(),
+            1,
+            "only the ordinary overflow past the shared reserve suppresses"
+        );
+    }
+
+    #[test]
+    fn terminal_aggregates_staged_before_the_phase_flip_still_retain() {
+        // The retained cooperative lane stages its final INFO cut and
+        // Finish before `on_lane_stopped` flips the retention phase;
+        // aggregates carry explicit terminal retention, so they retain
+        // even when staged before the flip and applied after it.
+        let mut registry = registry();
+        for n in 0..DEFAULT_MAX_GAPS {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        for n in 0..TERMINAL_AGGREGATE_HEADROOM {
+            registry.record_terminal_aggregate(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("aggregate-{n}"),
+                reason: "z".into(),
+                budget: None,
+            });
+        }
+        registry.enter_terminal_phase();
+        registry.publish();
+        assert_eq!(
+            registry.gaps().len(),
+            DEFAULT_MAX_GAPS + TERMINAL_AGGREGATE_HEADROOM,
+            "staged-before-phase aggregates retain through the flip"
+        );
+        for n in 0..TERMINAL_AGGREGATE_HEADROOM {
+            assert!(
+                registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == format!("aggregate-{n}")),
+                "aggregate {n} retains despite staging before the phase"
+            );
+        }
+        assert_eq!(
+            registry.gaps_suppressed(),
+            0,
+            "no suppression when only aggregates ride the headroom"
+        );
+    }
+
+    #[test]
+    fn early_aggregates_leave_the_shared_reserve_for_late_diagnostics() {
+        // Either stage order preserves both budgets: six aggregates
+        // staged first must not consume the shared 64-slot reserve a
+        // late ordinary stop diagnostic needs.
+        let mut registry = registry();
+        for n in 0..DEFAULT_MAX_GAPS {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        registry.enter_terminal_phase();
+        for n in 0..TERMINAL_AGGREGATE_HEADROOM {
+            registry.record_terminal_aggregate(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("aggregate-{n}"),
+                reason: "z".into(),
+                budget: None,
+            });
+        }
+        for n in 0..TERMINAL_GAP_RESERVE {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("terminal-{n}"),
+                reason: "y".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        assert_eq!(
+            registry.gaps().len(),
+            DEFAULT_MAX_GAPS + TERMINAL_GAP_RESERVE + TERMINAL_AGGREGATE_HEADROOM,
+            "early aggregates plus a full shared reserve all retain"
+        );
+        for n in 0..TERMINAL_GAP_RESERVE {
+            assert!(
+                registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == format!("terminal-{n}")),
+                "ordinary terminal gap {n} retains beside early aggregates"
+            );
+        }
+        assert_eq!(
+            registry.gaps_suppressed(),
+            0,
+            "a full shared reserve beside aggregates suppresses nothing"
+        );
     }
 
     #[test]

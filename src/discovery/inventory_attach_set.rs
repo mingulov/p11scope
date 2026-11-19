@@ -154,6 +154,31 @@ pub(crate) struct AttachEndpoint {
     pub object: AttachObjectId,
     pub file_offset: u64,
     pub abi: ElfAbi,
+    /// Keymeta Task 7 (spec §17.4): the endpoint's info kind (`None`
+    /// = usage-only). Computed from the plan slots' names at absorb
+    /// time by the single-info-function rule.
+    pub info_kind: Option<u8>,
+}
+
+/// Keymeta Task 7 single-info-function rule (spec §17.4): the
+/// slot's name set is exactly one of the three info functions →
+/// that kind; anything else (alias of two info functions, info
+/// aliased with a non-info function, no info function) → `None`
+/// (usage-only).
+pub(crate) fn info_kind_for_slot_names(names: &[String]) -> Option<u8> {
+    use p11scope_ebpf_common::inventory_info::info_kind_for_function;
+    let mut kinds = [false; 256];
+    let mut distinct = 0u8;
+    let mut kind = 0u8;
+    for name in names {
+        let this = info_kind_for_function(name)?;
+        if !kinds[usize::from(this)] {
+            kinds[usize::from(this)] = true;
+            distinct += 1;
+            kind = this;
+        }
+    }
+    (distinct == 1).then_some(kind)
 }
 
 /// A module's physical identity, as the catalog and the caller registry key
@@ -196,12 +221,18 @@ pub(crate) struct AttachGap {
 pub(crate) struct TargetDelta {
     pub endpoints: Vec<AttachEndpoint>,
     pub objects: Vec<AttachObjectId>,
+    /// Keymeta Task 7 (spec §17.4): retained endpoints whose INFO
+    /// kind a later pass revoked (conflicting names at a kept
+    /// target). The capture downgrades any fresh copy to
+    /// usage-only, purges its pending info returns and clears its
+    /// INFO_KIND cell; the coordinator drops its rows.
+    pub info_revoked: Vec<EndpointId>,
 }
 
 impl TargetDelta {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.endpoints.is_empty() && self.objects.is_empty()
+        self.endpoints.is_empty() && self.objects.is_empty() && self.info_revoked.is_empty()
     }
 
     /// Appends a later pass's delta. IDs only grow; the merged window's
@@ -210,6 +241,7 @@ impl TargetDelta {
     pub(crate) fn append(&mut self, mut later: TargetDelta) {
         self.endpoints.append(&mut later.endpoints);
         self.objects.append(&mut later.objects);
+        self.info_revoked.append(&mut later.info_revoked);
     }
 }
 
@@ -222,6 +254,14 @@ pub(crate) struct AbsorbOutcome {
     pub verdicts: BTreeMap<AttachModuleKey, AttachVerdict>,
     pub gaps: Vec<AttachGap>,
     pub decisions: DecisionLog,
+    /// Keymeta Task 7 (spec §17.4): endpoints admitted this pass
+    /// whose names involve an info function without resolving to
+    /// exactly one (the named counted `info_aliased_endpoint` gap).
+    pub info_aliased: u64,
+    /// Keymeta Task 7 (spec §17.4): retained endpoints this pass
+    /// revoked (a later conflicting claim at a kept target). Each
+    /// is also counted once in `info_aliased` above.
+    pub info_revoked: Vec<EndpointId>,
 }
 
 /// Which side of a copy-up pair proof carried the witness-proven
@@ -1040,6 +1080,10 @@ impl InventoryAttachSet {
             .map(|module| (module.id, module.object))
             .collect();
         let mut demand: BTreeMap<PinnedObjectId, BTreeSet<(PinnedObjectId, u64)>> = BTreeMap::new();
+        // Keymeta Task 7 (spec §17.4): the union of names resolving
+        // at each target, for the single-info-function rule. Slots
+        // sharing a target union their names.
+        let mut slot_names: BTreeMap<(PinnedObjectId, u64), Vec<String>> = BTreeMap::new();
         for slot in plan.slots.iter().filter(|slot| plan.is_active(slot.index)) {
             for module in &slot.module_ids {
                 if let Some(object) = owners.get(module) {
@@ -1047,6 +1091,14 @@ impl InventoryAttachSet {
                         .entry(*object)
                         .or_default()
                         .insert((slot.object, slot.file_offset));
+                }
+            }
+            let entry = slot_names
+                .entry((slot.object, slot.file_offset))
+                .or_default();
+            for name in &slot.names {
+                if !entry.contains(name) {
+                    entry.push(name.clone());
                 }
             }
         }
@@ -1108,6 +1160,7 @@ impl InventoryAttachSet {
                 &key,
                 &module.path,
                 wanted,
+                &slot_names,
                 &mut resolved,
                 pins,
                 &mut outcome,
@@ -1565,6 +1618,7 @@ impl InventoryAttachSet {
         key: &AttachModuleKey,
         path: &str,
         wanted: &BTreeSet<(PinnedObjectId, u64)>,
+        slot_names: &BTreeMap<(PinnedObjectId, u64), Vec<String>>,
         resolved: &mut BTreeMap<PinnedObjectId, Resolution>,
         pins: &PinnedObjects,
         outcome: &mut AbsorbOutcome,
@@ -1581,6 +1635,24 @@ impl InventoryAttachSet {
                     if self.by_endpoint.contains_key(&(*retained, offset)) =>
                 {
                     kept += 1;
+                    // Keymeta Task 7 (spec §17.4): a later pass can add
+                    // names at a retained endpoint. When this pass
+                    // explicitly names the target with a set that no
+                    // longer resolves to the retained kind, revoke INFO
+                    // there: clear to usage-only (irreversible, usage
+                    // intact), report the endpoint for capture
+                    // revocation and count the alias gap once. A
+                    // usage-only endpoint never upgrades.
+                    if let Some(names) = slot_names.get(&(object, offset)) {
+                        let current = info_kind_for_slot_names(names);
+                        let id = self.by_endpoint[&(*retained, offset)];
+                        let kept_endpoint = &mut self.endpoints[id.0 as usize];
+                        if kept_endpoint.info_kind.is_some() && current != kept_endpoint.info_kind {
+                            kept_endpoint.info_kind = None;
+                            outcome.info_revoked.push(id);
+                            outcome.info_aliased = outcome.info_aliased.saturating_add(1);
+                        }
+                    }
                 }
                 Some(Resolution::Known(_) | Resolution::Fresh) => fresh.push((object, offset)),
                 Some(Resolution::Blocked { reason, recorded }) => {
@@ -1632,14 +1704,25 @@ impl InventoryAttachSet {
                 budget: Some((ENDPOINT_RESOURCE, limit, self.endpoints.len() + fresh.len())),
             })
         } else {
-            self.add(&fresh, resolved, pins, &mut outcome.delta, prepared)
-                .err()
-                .map(|cause| Refusal {
+            match self.add(
+                &fresh,
+                slot_names,
+                resolved,
+                pins,
+                &mut outcome.delta,
+                prepared,
+            ) {
+                Ok(aliased) => {
+                    outcome.info_aliased = outcome.info_aliased.saturating_add(aliased);
+                    None
+                }
+                Err(cause) => Some(Refusal {
                     cause,
                     recorded: false,
                     kind: RefusalKind::Retention,
                     budget: None,
-                })
+                }),
+            }
         };
         match refusal.as_ref().map(|refusal| refusal.kind) {
             Some(RefusalKind::Endpoints) => {
@@ -1771,11 +1854,13 @@ impl InventoryAttachSet {
     fn add(
         &mut self,
         fresh: &[(PinnedObjectId, u64)],
+        slot_names: &BTreeMap<(PinnedObjectId, u64), Vec<String>>,
         resolved: &mut BTreeMap<PinnedObjectId, Resolution>,
         pins: &PinnedObjects,
         delta: &mut TargetDelta,
         mut prepared: Option<&mut PreparedProviderFacts>,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
+        let mut aliased = 0u64;
         let mut retained: Vec<(PinnedObjectId, RetainedInventoryTarget)> = Vec::new();
         for &(object, _) in fresh {
             if matches!(resolved.get(&object), Some(Resolution::Fresh))
@@ -1820,11 +1905,26 @@ impl InventoryAttachSet {
             if self.by_endpoint.contains_key(&(retained, file_offset)) {
                 continue;
             }
+            let names = slot_names.get(&(object, file_offset));
+            let info_kind = names.and_then(|names| info_kind_for_slot_names(names));
+            // Keymeta Task 7 (spec §17.4): names involving an info
+            // function without resolving to exactly one keep the
+            // usage entry and count the aliased gap.
+            if info_kind.is_none()
+                && names.is_some_and(|names| {
+                    names.iter().any(|name| {
+                        p11scope_ebpf_common::inventory_info::info_kind_for_function(name).is_some()
+                    })
+                })
+            {
+                aliased = aliased.saturating_add(1);
+            }
             let endpoint = AttachEndpoint {
                 id: EndpointId(self.endpoints.len() as u32),
                 object: retained,
                 file_offset,
                 abi: self.objects[retained.0 as usize].target.abi(),
+                info_kind,
             };
             self.by_endpoint
                 .insert((retained, file_offset), endpoint.id);
@@ -1833,7 +1933,7 @@ impl InventoryAttachSet {
             self.drain_hint.push(usize::MAX);
             delta.endpoints.push(endpoint);
         }
-        Ok(())
+        Ok(aliased)
     }
 
     fn limit(&self) -> usize {
@@ -4857,6 +4957,140 @@ pub(crate) mod tests {
         assert!(
             set.count_revision.0.is_none(),
             "actual mutation exhaustion cannot wrap or recover"
+        );
+    }
+
+    /// Keymeta Task 7 single-info-function rule (spec §17.4): the
+    /// slot's name set is exactly one of the three info functions →
+    /// that kind; an info/info alias, an info/non-info alias, a
+    /// non-info set, or an empty set → usage-only (`None`, with the
+    /// aliased-info cases reported through the attach-side gap).
+    #[test]
+    fn info_kind_for_slot_names_pins_the_single_info_function_rule() {
+        use p11scope_ebpf_common::inventory_info::{
+            INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN,
+        };
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        for (list, expected) in [
+            (names(&["C_GetInfo"]), Some(INFO_KIND_PROVIDER)),
+            (names(&["C_GetTokenInfo"]), Some(INFO_KIND_TOKEN)),
+            (names(&["C_GetMechanismInfo"]), Some(INFO_KIND_MECHANISM)),
+            // Duplicates collapse: the set is still exactly one.
+            (names(&["C_GetInfo", "C_GetInfo"]), Some(INFO_KIND_PROVIDER)),
+        ] {
+            assert_eq!(info_kind_for_slot_names(&list), expected, "{list:?}");
+        }
+        for list in [
+            names(&[]),
+            names(&["C_Sign"]),
+            names(&["C_GetInfo", "C_GetTokenInfo"]),
+            names(&["C_GetInfo", "C_GetMechanismInfo", "C_GetTokenInfo"]),
+            names(&["C_GetInfo", "C_Sign"]),
+            names(&["C_GetTokenInfo", "unknown"]),
+            names(&["c_getinfo"]),
+        ] {
+            assert_eq!(info_kind_for_slot_names(&list), None, "{list:?}");
+        }
+    }
+
+    /// Keymeta Task 7 (spec §17.4): absorb carries endpoint kinds and
+    /// counts aliased info endpoints — slots whose names involve an
+    /// info function without resolving to exactly one keep the usage
+    /// entry and report the named `info_aliased_endpoint` gap. (Slot
+    /// names stand in for the operator-authorized claim a
+    /// manifest-backed lowering would produce, which is exactly the
+    /// input `absorb` reads.)
+    #[test]
+    fn absorb_counts_aliased_info_endpoints() {
+        use p11scope_ebpf_common::inventory_info::INFO_KIND_TOKEN;
+        let dir = tempfile::tempdir().unwrap();
+        let policy = AdmissionPolicy::Inventory(budget(64));
+        let a = provider(&dir, "a.so", "provider-a");
+        let pins = pass_pins(&[(&a, "sha-a")]);
+        let modules = [module(&pins, &a, &[0x1000, 0x1010, 0x1020])];
+        let mut plan = lower_named(&modules, &pins, policy);
+        for index in 0..plan.slots.len() {
+            if !plan.is_active(index as u32) {
+                continue;
+            }
+            let offset = plan.slots[index].file_offset;
+            plan.slots[index].names = match offset {
+                0x1000 => vec!["C_GetInfo".to_string(), "C_Sign".to_string()],
+                0x1010 => vec!["C_GetTokenInfo".to_string()],
+                _ => vec!["C_Sign".to_string()],
+            };
+        }
+        let mut set = InventoryAttachSet::new(budget(64));
+        let outcome = set.absorb(&plan, &pins);
+        assert_eq!(outcome.delta.endpoints.len(), 3);
+        assert_eq!(outcome.delta.endpoints[0].info_kind, None);
+        assert_eq!(outcome.delta.endpoints[1].info_kind, Some(INFO_KIND_TOKEN));
+        assert_eq!(outcome.delta.endpoints[2].info_kind, None);
+        assert_eq!(outcome.info_aliased, 1);
+    }
+
+    /// Keymeta Task 7 revocation (spec §17.4): a later pass that adds
+    /// a conflicting name at a retained endpoint revokes INFO there —
+    /// the retained kind clears to usage-only and the alias gap
+    /// counts once. A stable uncontested endpoint in the same pass
+    /// keeps its kind and counts nothing.
+    #[test]
+    fn absorb_revokes_info_when_a_later_pass_adds_an_alias() {
+        use p11scope_ebpf_common::inventory_info::{INFO_KIND_PROVIDER, INFO_KIND_TOKEN};
+        let dir = tempfile::tempdir().unwrap();
+        let policy = AdmissionPolicy::Inventory(budget(64));
+        let a = provider(&dir, "a.so", "provider-a");
+        // Pass 1: two clean single-info-function slots.
+        let pins = pass_pins(&[(&a, "sha-a")]);
+        let modules = [module(&pins, &a, &[0x1000, 0x1010])];
+        let mut plan = lower_named(&modules, &pins, policy);
+        for index in 0..plan.slots.len() {
+            if !plan.is_active(index as u32) {
+                continue;
+            }
+            let offset = plan.slots[index].file_offset;
+            plan.slots[index].names = match offset {
+                0x1000 => vec!["C_GetTokenInfo".to_string()],
+                _ => vec!["C_GetInfo".to_string()],
+            };
+        }
+        let mut set = InventoryAttachSet::new(budget(64));
+        let first = set.absorb(&plan, &pins);
+        assert_eq!(first.delta.endpoints.len(), 2);
+        assert_eq!(first.delta.endpoints[0].info_kind, Some(INFO_KIND_TOKEN));
+        assert_eq!(first.delta.endpoints[1].info_kind, Some(INFO_KIND_PROVIDER));
+        assert_eq!(first.info_aliased, 0);
+        // Pass 2: a conflicting name lands at 0x1000; 0x1010 stays clean.
+        let pins = pass_pins(&[(&a, "sha-a")]);
+        let modules = [module(&pins, &a, &[0x1000, 0x1010])];
+        let mut plan = lower_named(&modules, &pins, policy);
+        for index in 0..plan.slots.len() {
+            if !plan.is_active(index as u32) {
+                continue;
+            }
+            let offset = plan.slots[index].file_offset;
+            plan.slots[index].names = match offset {
+                0x1000 => vec!["C_GetTokenInfo".to_string(), "C_GetInfo".to_string()],
+                _ => vec!["C_GetInfo".to_string()],
+            };
+        }
+        let second = set.absorb(&plan, &pins);
+        assert!(
+            second.delta.endpoints.is_empty(),
+            "a conflict adds no endpoints"
+        );
+        assert_eq!(
+            second.info_aliased, 1,
+            "a later conflict counts the alias gap once"
+        );
+        assert_eq!(
+            set.endpoints[0].info_kind, None,
+            "the conflicted endpoint revokes to usage-only"
+        );
+        assert_eq!(
+            set.endpoints[1].info_kind,
+            Some(INFO_KIND_PROVIDER),
+            "the stable uncontested endpoint keeps its kind"
         );
     }
 }

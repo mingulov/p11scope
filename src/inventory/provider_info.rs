@@ -6,46 +6,36 @@
 //! (`modules[].provider_info` plus the top-level
 //! `provider_observations` section).
 //!
-//! TODO(Task 7 BPF half): the kernel adapters (`adapter_info_entry` /
-//! `adapter_info_return`), the `INFO_START` / `INFO` / `INFO_KIND` /
-//! `INFO_EVIDENCE` maps, the inventory program list 12→15, the
-//! per-group info returns with EMFILE deferral, and the INFO drain in
-//! the inventory session land after the Task 2 merge. The drain feeds
-//! [`decode_info_record`] + [`InfoJoin::ingest`] (resolving endpoint
-//! → module and the header identity → caller incarnation itself) and
-//! calls [`InfoJoin::note_aliased_endpoint`] /
-//! [`InfoJoin::note_return_deferred`] for the attach-side gaps; the
-//! BPF half fills the shared `InfoTrailer` layout and mirrors the
-//! §17.1 read lists into `ebpf-common` consts (adopting the
-//! kind/layout/status/version codes below), and extends the
-//! root-crate LP64 cross-check there. Until then this module's
-//! decode/join surface is test-driven only.
+//! TODO(Task 7 BPF half, attach + session): the `INFO_START` / `INFO` /
+//! `INFO_KIND` / `INFO_EVIDENCE` maps, the inventory program list
+//! 12→15, the per-group info returns with EMFILE deferral, and the
+//! INFO drain in the inventory session land after the Task 2 merge.
+//! The drain feeds [`decode_info_record`] + [`InfoJoin::ingest`]
+//! (resolving endpoint → module and the header identity → caller
+//! incarnation itself) and calls [`InfoJoin::note_aliased_endpoint`] /
+//! [`InfoJoin::note_return_deferred`] for the attach-side gaps. The
+//! shared adapters, read lists and wire codes live in
+//! `p11scope_ebpf_common::inventory_info` / `object_flow`; the
+//! root-crate LP64 cross-check pins them against cryptoki-sys. Until
+//! the drain lands, this module's decode/join surface is test-driven
+//! only.
 
 #![allow(dead_code)] // TODO(Task 7 BPF half): remove once the INFO drain feeds the join.
 
 use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 use crate::discovery::caller_registry::{CallerId, ModuleId};
 use p11scope_ebpf_common::inventory_info::{
-    INFO_HEADER_LEN, INFO_PAYLOAD_MAX, INFO_RECORD_LEN, InfoTrailer,
+    INFO_HEADER_LEN, INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN, INFO_LAYOUT_ILP32,
+    INFO_LAYOUT_LP64, INFO_PAYLOAD_MAX, INFO_RECORD_LEN, INFO_STATUS_OK, INFO_STATUS_UNAVAILABLE,
+    INFO_VERSION, InfoTrailer,
 };
-use std::collections::BTreeMap;
-
-/// Info trailer version carried in every record.
-pub(crate) const INFO_VERSION: u16 = 1;
-/// Info kinds: `C_GetInfo` / `C_GetTokenInfo` / `C_GetMechanismInfo`.
-/// Kind 0 is usage-only (never stashes, never records).
-pub(crate) const INFO_KIND_PROVIDER: u8 = 1;
-pub(crate) const INFO_KIND_TOKEN: u8 = 2;
-pub(crate) const INFO_KIND_MECHANISM: u8 = 3;
-/// Layout codes, mirroring the journal wire (`OBJECT_LAYOUT_*`).
-pub(crate) const INFO_LAYOUT_LP64: u8 = 1;
-pub(crate) const INFO_LAYOUT_ILP32: u8 = 2;
-/// Trailer status: values present (`CKR_OK` + non-NULL pointer) or
-/// unavailable (NULL pointer — joins to nothing).
-pub(crate) const INFO_STATUS_OK: u8 = 0;
-pub(crate) const INFO_STATUS_UNAVAILABLE: u8 = 1;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 /// Named reason on a padded string refused for non-UTF8 bytes.
 pub(crate) const INFO_STRING_NON_UTF8: &str = "non_utf8_bytes";
+/// Departed-INFO rows retired per fold call (spec §17.5, INV-2):
+/// one bounded slice per call, resumable across calls, so a single
+/// caller can never stall a pass no matter how many rows it owns.
+pub(crate) const INFO_FOLD_ROWS_PER_CALL: usize = 64;
 /// Mechanism rows kept per (module, caller, slot); extras refuse.
 pub(crate) const INFO_MAX_MECHANISMS_PER_SLOT: usize = 128;
 /// Token rows kept run-wide; new rows past this refuse with the
@@ -183,6 +173,16 @@ pub(crate) fn decode_info_record(bytes: &[u8]) -> Result<InfoRecord, &'static st
         .any(|byte| *byte != 0)
     {
         return Err("nonzero_trailer_slack");
+    }
+    // Status 1 (unavailable) carries a zero payload over the whole
+    // window: the return adapter zeroes it before emitting, so any
+    // nonzero byte inside the declared prefix refuses (spec §17.1).
+    if status == INFO_STATUS_UNAVAILABLE
+        && bytes[payload_at..payload_at + usize::from(payload_len)]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err("nonzero_unavailable_payload");
     }
     let mut payload = [0u8; INFO_PAYLOAD_MAX];
     payload.copy_from_slice(&bytes[payload_at..payload_end]);
@@ -438,9 +438,53 @@ fn split_string(parsed: Result<String, &'static str>) -> (Option<String>, Option
 /// caps, departed-caller folding and the named gaps.
 pub(crate) struct InfoJoin {
     providers: BTreeMap<ModuleId, ProviderInfo>,
-    tokens: BTreeMap<(ModuleId, CallerId, u64), TokenRow>,
-    mechanisms: BTreeMap<(ModuleId, CallerId, u64, u64), MechanismRow>,
+    /// Caller-leading keys: a departed caller's rows retire as one
+    /// bounded range instead of scanning the whole table. Snapshots
+    /// sort back to module-leading order.
+    tokens: BTreeMap<(CallerId, ModuleId, u64), TokenRow>,
+    mechanisms: BTreeMap<(CallerId, ModuleId, u64, u64), MechanismRow>,
     gaps: ProviderGaps,
+    /// Rows examined by departed-caller folds (work pin: each fold
+    /// touches only its caller's slice, never the whole table).
+    fold_visits: u64,
+    /// Departed callers awaiting fold, in retire order.
+    fold_queue: VecDeque<CallerId>,
+    /// The in-progress departed fold and its resume position.
+    fold_cursor: Option<InfoFoldCursor>,
+    /// Queued plus in-progress departed callers: indexed enqueue
+    /// membership, and the departed set the snapshots omit — a
+    /// queued caller's rows read departed from enqueue time, before
+    /// any fold slice reclaims them.
+    fold_pending: BTreeSet<CallerId>,
+    /// Live (token + mechanism) rows per caller, maintained at
+    /// every insert and fold: the stop discloses deferred folds
+    /// from these, never a pending scan.
+    caller_rows: BTreeMap<CallerId, u64>,
+    /// Rows still queued-but-unfolded over `fold_pending`,
+    /// maintained with it: enqueue adds the caller's rows, folds
+    /// subtract what they retire, and rows that land for a queued
+    /// caller add on ingest.
+    pending_rows: u64,
+}
+
+/// One departed caller's in-progress fold (spec §17.5): token rows
+/// first, then mechanism rows, each as a resumable caller-bounded
+/// range. `after` is the last retired key (exclusive resume
+/// point), or `None` before the phase's first key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InfoFoldCursor {
+    caller: CallerId,
+    phase: InfoFoldPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfoFoldPhase {
+    Tokens {
+        after: Option<(CallerId, ModuleId, u64)>,
+    },
+    Mechanisms {
+        after: Option<(CallerId, ModuleId, u64, u64)>,
+    },
 }
 
 impl InfoJoin {
@@ -450,6 +494,12 @@ impl InfoJoin {
             tokens: BTreeMap::new(),
             mechanisms: BTreeMap::new(),
             gaps: ProviderGaps::default(),
+            fold_visits: 0,
+            fold_queue: VecDeque::new(),
+            fold_cursor: None,
+            fold_pending: BTreeSet::new(),
+            caller_rows: BTreeMap::new(),
+            pending_rows: 0,
         }
     }
 
@@ -465,37 +515,178 @@ impl InfoJoin {
         self.gaps.return_deferred = self.gaps.return_deferred.saturating_add(1);
     }
 
-    /// Fold one departed caller's rows, like the caller registry
-    /// folds departed edges into `departed_use`: the rows retire and
-    /// their counts land in the named departed gaps. Rows of live
-    /// callers never merge (slot ids are per-process), so values
-    /// leave with the row and only the folded row counts survive.
-    /// Missing callers fold nothing and count nothing.
-    pub(crate) fn fold_departed_caller(&mut self, caller: CallerId) {
-        let tokens_before = self.tokens.len();
-        self.tokens.retain(|key, _| key.1 != caller);
-        let tokens_folded = tokens_before.saturating_sub(self.tokens.len());
-        self.gaps.tokens_departed = self
-            .gaps
-            .tokens_departed
-            .saturating_add(tokens_folded as u64);
-        let mechanisms_before = self.mechanisms.len();
-        self.mechanisms.retain(|key, _| key.1 != caller);
-        let mechanisms_folded = mechanisms_before.saturating_sub(self.mechanisms.len());
-        self.gaps.mechanisms_departed = self
-            .gaps
-            .mechanisms_departed
-            .saturating_add(mechanisms_folded as u64);
+    /// Queue one departed caller's rows for folding, like the
+    /// caller registry folds departed edges into `departed_use`.
+    /// Idempotent: a caller already queued or folding queues once
+    /// (indexed membership, never a queue scan). The caller's rows
+    /// read departed from here on, before any fold slice runs.
+    pub(crate) fn enqueue_fold(&mut self, caller: CallerId) {
+        if !self.fold_pending.insert(caller) {
+            return;
+        }
+        self.pending_rows = self
+            .pending_rows
+            .saturating_add(self.caller_rows.get(&caller).copied().unwrap_or(0));
+        self.fold_queue.push_back(caller);
     }
 
-    /// Fold one decoded record (with drain-resolved module, caller
-    /// and optional proved instance) into the join. Unavailable
-    /// (NULL-pointer) records publish nothing.
+    /// One fresh token/mechanism row for `caller`: the per-caller
+    /// count and, for a queued departure, the pending total grow by
+    /// one. Repeats of an existing row never reach here.
+    fn note_row_added(&mut self, caller: CallerId) {
+        self.caller_rows
+            .entry(caller)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        if self.fold_pending.contains(&caller) {
+            self.pending_rows = self.pending_rows.saturating_add(1);
+        }
+    }
+
+    /// `retired` rows of `caller` folded away: the per-caller count
+    /// and the pending total shrink by as much.
+    fn note_rows_folded(&mut self, caller: CallerId, retired: u64) {
+        if let Some(count) = self.caller_rows.get_mut(&caller) {
+            *count = count.saturating_sub(retired);
+        }
+        self.pending_rows = self.pending_rows.saturating_sub(retired);
+    }
+
+    /// Retire up to `bound` queued departed rows through the
+    /// resumable per-caller range cursor, oldest caller first.
+    /// Returns whether more rows remain queued. Rows retire with
+    /// their counts landing in the named departed gaps; rows of
+    /// live callers never merge (slot ids are per-process), so
+    /// values leave with the row and only the folded row counts
+    /// survive. Missing callers fold nothing and count nothing, but
+    /// every phase probe still charges one credit even when it finds
+    /// no rows, so an empty-caller queue drains bounded prefixes,
+    /// never the whole queue in one step. Snapshots omit queued
+    /// callers' rows throughout; folds complete over subsequent
+    /// calls.
+    pub(crate) fn fold_step(&mut self, bound: usize) -> bool {
+        use std::ops::Bound::{Excluded, Included};
+        let mut remaining = bound;
+        while remaining > 0 {
+            if self.fold_cursor.is_none() {
+                let Some(caller) = self.fold_queue.pop_front() else {
+                    return false;
+                };
+                self.fold_cursor = Some(InfoFoldCursor {
+                    caller,
+                    phase: InfoFoldPhase::Tokens { after: None },
+                });
+            }
+            let Some(cursor) = self.fold_cursor else {
+                return !self.fold_queue.is_empty();
+            };
+            // A phase that yields fewer keys than the remaining
+            // allowance is exhausted (an empty take included) and
+            // the cursor advances; a full take spends the allowance
+            // and keeps the resume point after the last key taken.
+            // An empty probe still charges one credit for the range
+            // scan itself.
+            let quota = remaining;
+            match cursor.phase {
+                InfoFoldPhase::Tokens { after } => {
+                    let start = match after {
+                        None => Included((cursor.caller, ModuleId(u32::MIN), u64::MIN)),
+                        Some(key) => Excluded(key),
+                    };
+                    let end = Included((cursor.caller, ModuleId(u32::MAX), u64::MAX));
+                    let keys: Vec<(CallerId, ModuleId, u64)> = self
+                        .tokens
+                        .range((start, end))
+                        .take(quota)
+                        .map(|(key, _)| *key)
+                        .collect();
+                    let took = keys.len();
+                    self.fold_visits = self.fold_visits.saturating_add(took as u64);
+                    for key in &keys {
+                        self.tokens.remove(key);
+                    }
+                    self.gaps.tokens_departed =
+                        self.gaps.tokens_departed.saturating_add(took as u64);
+                    self.note_rows_folded(cursor.caller, took as u64);
+                    remaining -= took.max(1);
+                    if took < quota {
+                        self.fold_cursor = Some(InfoFoldCursor {
+                            caller: cursor.caller,
+                            phase: InfoFoldPhase::Mechanisms { after: None },
+                        });
+                    } else if let Some(last) = keys.last() {
+                        self.fold_cursor = Some(InfoFoldCursor {
+                            caller: cursor.caller,
+                            phase: InfoFoldPhase::Tokens { after: Some(*last) },
+                        });
+                    }
+                }
+                InfoFoldPhase::Mechanisms { after } => {
+                    let start = match after {
+                        None => Included((cursor.caller, ModuleId(u32::MIN), u64::MIN, u64::MIN)),
+                        Some(key) => Excluded(key),
+                    };
+                    let end = Included((cursor.caller, ModuleId(u32::MAX), u64::MAX, u64::MAX));
+                    let keys: Vec<(CallerId, ModuleId, u64, u64)> = self
+                        .mechanisms
+                        .range((start, end))
+                        .take(quota)
+                        .map(|(key, _)| *key)
+                        .collect();
+                    let took = keys.len();
+                    self.fold_visits = self.fold_visits.saturating_add(took as u64);
+                    for key in &keys {
+                        self.mechanisms.remove(key);
+                    }
+                    self.gaps.mechanisms_departed =
+                        self.gaps.mechanisms_departed.saturating_add(took as u64);
+                    self.note_rows_folded(cursor.caller, took as u64);
+                    remaining -= took.max(1);
+                    if took < quota {
+                        self.fold_pending.remove(&cursor.caller);
+                        self.fold_cursor = None;
+                        // Rows that landed for this caller after its
+                        // ranges passed stay live and keep their
+                        // per-caller count; only the pending total
+                        // drops them with the caller.
+                        let live = self.caller_rows.get(&cursor.caller).copied().unwrap_or(0);
+                        self.pending_rows = self.pending_rows.saturating_sub(live);
+                        if live == 0 {
+                            self.caller_rows.remove(&cursor.caller);
+                        }
+                    } else if let Some(last) = keys.last() {
+                        self.fold_cursor = Some(InfoFoldCursor {
+                            caller: cursor.caller,
+                            phase: InfoFoldPhase::Mechanisms { after: Some(*last) },
+                        });
+                    }
+                }
+            }
+        }
+        self.fold_cursor.is_some() || !self.fold_queue.is_empty()
+    }
+
+    /// Queued-but-unfolded departed folds: how many callers still
+    /// pend and how many of their rows the stop has not reclaimed.
+    /// The stop discloses this once instead of silently understating
+    /// the departed counts — from the maintained per-caller counts,
+    /// with no range probe even over thousands of empty callers.
+    pub(crate) fn fold_deferred(&self) -> (u64, u64) {
+        (self.fold_pending.len() as u64, self.pending_rows)
+    }
+
+    /// Fold one decoded record (with drain-resolved module,
+    /// optionally resolved caller incarnation, and optional proved
+    /// instance) into the join. Unavailable records publish nothing.
+    /// Provider facts publish regardless of caller resolution;
+    /// token and mechanism rows require a bound caller and refuse
+    /// with the named counted `info_caller_unavailable` gap without
+    /// one (unresolved or zero identity alike).
     pub(crate) fn ingest(
         &mut self,
         record: &InfoRecord,
         module: ModuleId,
-        caller: CallerId,
+        caller: Option<CallerId>,
         instance: Option<RegistryInstanceId>,
     ) {
         if record.status == INFO_STATUS_UNAVAILABLE {
@@ -521,17 +712,25 @@ impl InfoJoin {
                 );
             }
             InfoValues::Token(values) => {
+                let Some(caller) = caller else {
+                    self.gaps.caller_unavailable = self.gaps.caller_unavailable.saturating_add(1);
+                    return;
+                };
                 if record.task_cookie == 0 || record.exec_id == 0 {
                     self.gaps.caller_unavailable = self.gaps.caller_unavailable.saturating_add(1);
                     return;
                 }
-                let key = (module, caller, record.slot);
-                if !self.tokens.contains_key(&key) && self.tokens.len() >= INFO_MAX_TOKEN_ROWS {
+                let key = (caller, module, record.slot);
+                let fresh = !self.tokens.contains_key(&key);
+                if fresh && self.tokens.len() >= INFO_MAX_TOKEN_ROWS {
                     self.gaps.tokens_refused = self.gaps.tokens_refused.saturating_add(1);
                     return;
                 }
                 let (manufacturer, manufacturer_reason) = split_string(values.manufacturer);
                 let (model, model_reason) = split_string(values.model);
+                if fresh {
+                    self.note_row_added(caller);
+                }
                 let row = self.tokens.entry(key).or_insert_with(|| TokenRow {
                     module,
                     caller,
@@ -586,17 +785,22 @@ impl InfoJoin {
                 }
             }
             InfoValues::Mechanism(values) => {
+                let Some(caller) = caller else {
+                    self.gaps.caller_unavailable = self.gaps.caller_unavailable.saturating_add(1);
+                    return;
+                };
                 if record.task_cookie == 0 || record.exec_id == 0 {
                     self.gaps.caller_unavailable = self.gaps.caller_unavailable.saturating_add(1);
                     return;
                 }
-                let key = (module, caller, record.slot, record.mechanism);
-                if !self.mechanisms.contains_key(&key) {
+                let key = (caller, module, record.slot, record.mechanism);
+                let fresh = !self.mechanisms.contains_key(&key);
+                if fresh {
                     let slot_reporters = self
                         .mechanisms
                         .range(
-                            (module, caller, record.slot, u64::MIN)
-                                ..=(module, caller, record.slot, u64::MAX),
+                            (caller, module, record.slot, u64::MIN)
+                                ..=(caller, module, record.slot, u64::MAX),
                         )
                         .count();
                     if slot_reporters >= INFO_MAX_MECHANISMS_PER_SLOT {
@@ -608,6 +812,9 @@ impl InfoJoin {
                             self.gaps.mechanisms_refused.saturating_add(1);
                         return;
                     }
+                }
+                if fresh {
+                    self.note_row_added(caller);
                 }
                 let row = self.mechanisms.entry(key).or_insert_with(|| MechanismRow {
                     module,
@@ -639,14 +846,39 @@ impl InfoJoin {
     }
 
     pub(crate) fn finish(self) -> (BTreeMap<ModuleId, ProviderInfo>, ProviderObservations) {
-        let tokens: Vec<TokenRow> = self.tokens.into_values().collect();
-        let mechanisms: Vec<MechanismRow> = self.mechanisms.into_values().collect();
+        self.snapshot()
+    }
+
+    /// A non-destructive projection: the per-module provider facts
+    /// plus the run-wide token/mechanism rows and gaps. The session
+    /// renders streaming views from snapshots while the capture
+    /// still runs; the terminal view finishes the join. Rows of
+    /// queued-but-unfolded departed callers read departed, never
+    /// live, from enqueue time — a stop right after retirement
+    /// cannot publish them.
+    pub(crate) fn snapshot(&self) -> (BTreeMap<ModuleId, ProviderInfo>, ProviderObservations) {
+        // Caller-leading storage, module-leading output: restore the
+        // deterministic (module, caller, slot[, mechanism]) order.
+        let mut tokens: Vec<TokenRow> = self
+            .tokens
+            .values()
+            .filter(|row| !self.fold_pending.contains(&row.caller))
+            .cloned()
+            .collect();
+        tokens.sort_by_key(|row| (row.module, row.caller, row.slot));
+        let mut mechanisms: Vec<MechanismRow> = self
+            .mechanisms
+            .values()
+            .filter(|row| !self.fold_pending.contains(&row.caller))
+            .cloned()
+            .collect();
+        mechanisms.sort_by_key(|row| (row.module, row.caller, row.slot, row.mechanism));
         (
-            self.providers,
+            self.providers.clone(),
             ProviderObservations {
                 tokens,
                 mechanisms,
-                gaps: self.gaps,
+                gaps: self.gaps.clone(),
             },
         )
     }
@@ -1393,7 +1625,7 @@ mod tests {
             100 + u64::from(caller),
         ))
         .expect("token record decodes");
-        join.ingest(&record, ModuleId(0), CallerId(caller), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(caller)), None);
     }
 
     #[test]
@@ -1421,7 +1653,7 @@ mod tests {
             100,
         ))
         .expect("token record decodes");
-        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         let (_, observations) = join.finish();
         assert_eq!(observations.tokens.len(), 1);
         assert_eq!(observations.tokens[0].completions, 2);
@@ -1443,7 +1675,7 @@ mod tests {
         .expect("token record decodes");
         let mut join = InfoJoin::new();
         ingest_token(&mut join, 0, 0);
-        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         let (_, observations) = join.finish();
         assert_eq!(observations.tokens.len(), 1);
         assert_eq!(observations.tokens[0].model.as_deref(), Some("Model-Y"));
@@ -1465,7 +1697,7 @@ mod tests {
                 100,
             ))
             .expect("mechanism record decodes");
-            join.ingest(&record, ModuleId(0), CallerId(0), None);
+            join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         }
         let (_, observations) = join.finish();
         assert_eq!(observations.mechanisms.len(), 128);
@@ -1492,7 +1724,7 @@ mod tests {
                 100,
             ))
             .expect("mechanism record decodes");
-            join.ingest(&record, ModuleId(0), CallerId(0), None);
+            join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         }
         let full = full_mech_lp64();
         let record = decode_info_record(&record_bytes(
@@ -1504,7 +1736,7 @@ mod tests {
             100,
         ))
         .expect("mechanism record decodes");
-        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         let (_, observations) = join.finish();
         assert_eq!(observations.mechanisms.len(), 128);
         assert_eq!(observations.gaps.mechanism_refused, 0);
@@ -1549,7 +1781,7 @@ mod tests {
         join.ingest(
             &record,
             ModuleId(0),
-            CallerId(0),
+            Some(CallerId(0)),
             Some(RegistryInstanceId::from_raw(7)),
         );
         ingest_token(&mut join, 1, 0);
@@ -1580,10 +1812,10 @@ mod tests {
         join.ingest(
             &record,
             ModuleId(0),
-            CallerId(0),
+            Some(CallerId(0)),
             Some(RegistryInstanceId::from_raw(7)),
         );
-        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         let mech = full_mech_lp64();
         let record = decode_info_record(&record_bytes(
             INFO_KIND_MECHANISM,
@@ -1597,10 +1829,10 @@ mod tests {
         join.ingest(
             &record,
             ModuleId(0),
-            CallerId(0),
+            Some(CallerId(0)),
             Some(RegistryInstanceId::from_raw(9)),
         );
-        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         let (_, observations) = join.finish();
         assert_eq!(observations.tokens.len(), 1);
         assert_eq!(observations.tokens[0].completions, 2);
@@ -1623,18 +1855,18 @@ mod tests {
         // shared zero caller).
         let mut join = InfoJoin::new();
         let provider = decode_info_record(&provider_record()).expect("provider record decodes");
-        join.ingest(&provider, ModuleId(0), CallerId(0), None);
+        join.ingest(&provider, ModuleId(0), Some(CallerId(0)), None);
         let full = full_token_lp64();
         let payload = payload_of(&full, &TOKEN_RANGES_LP64);
         let mut zero = record_bytes(INFO_KIND_TOKEN, INFO_LAYOUT_LP64, &payload, 0, 0, 0);
         zero[24..32].copy_from_slice(&0u64.to_le_bytes());
         let token = decode_info_record(&zero).expect("zero-identity record decodes");
-        join.ingest(&token, ModuleId(0), CallerId(0), None);
+        join.ingest(&token, ModuleId(0), Some(CallerId(0)), None);
         let mech = full_mech_lp64();
         let mut zero_mech = record_bytes(INFO_KIND_MECHANISM, INFO_LAYOUT_LP64, &mech, 0, 1082, 0);
         zero_mech[24..32].copy_from_slice(&0u64.to_le_bytes());
         let mechanism = decode_info_record(&zero_mech).expect("zero-identity record decodes");
-        join.ingest(&mechanism, ModuleId(0), CallerId(0), None);
+        join.ingest(&mechanism, ModuleId(0), Some(CallerId(0)), None);
         let (providers, observations) = join.finish();
         assert_eq!(providers.len(), 1);
         assert!(observations.tokens.is_empty());
@@ -1646,20 +1878,57 @@ mod tests {
     fn info_join_unavailable_records_publish_nothing() {
         let mut bytes = provider_record();
         bytes[51] = INFO_STATUS_UNAVAILABLE;
+        // Wire-valid unavailable bytes: the whole payload window is
+        // zero (a populated prefix refuses at decode).
+        let len = usize::from(bytes[53]);
+        bytes[56..56 + len].fill(0);
         let record = decode_info_record(&bytes).expect("unavailable record decodes");
         assert_eq!(record.status, INFO_STATUS_UNAVAILABLE);
         let mut join = InfoJoin::new();
-        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         let (providers, observations) = join.finish();
         assert!(providers.is_empty());
         assert!(observations.is_empty());
     }
 
     #[test]
+    fn info_status_unavailable_refuses_nonzero_payload_prefix() {
+        // Status 1 carries a zero payload over the whole 120-byte
+        // window (the writer zeroes it): any nonzero byte inside the
+        // declared prefix refuses, not just slack past it.
+        let mut bytes = provider_record();
+        bytes[51] = INFO_STATUS_UNAVAILABLE;
+        assert_eq!(
+            decode_info_record(&bytes),
+            Err("nonzero_unavailable_payload"),
+            "populated payload with status 1 refuses"
+        );
+        // Single-byte mutants inside the declared prefix of an
+        // otherwise wire-valid unavailable record (first and last
+        // prefix bytes).
+        let mut valid = record_bytes(INFO_KIND_PROVIDER, INFO_LAYOUT_LP64, &[0u8; 76], 0, 0, 11);
+        valid[51] = INFO_STATUS_UNAVAILABLE;
+        decode_info_record(&valid).expect("zero-payload unavailable decodes");
+        valid[56] = 1;
+        assert_eq!(
+            decode_info_record(&valid),
+            Err("nonzero_unavailable_payload"),
+            "nonzero first prefix byte refuses"
+        );
+        valid[56] = 0;
+        valid[56 + 75] = 0xFF;
+        assert_eq!(
+            decode_info_record(&valid),
+            Err("nonzero_unavailable_payload"),
+            "nonzero last prefix byte refuses"
+        );
+    }
+
+    #[test]
     fn info_join_provider_last_wins_without_counters() {
         let mut join = InfoJoin::new();
         let first = decode_info_record(&provider_record()).expect("provider record decodes");
-        join.ingest(&first, ModuleId(0), CallerId(0), None);
+        join.ingest(&first, ModuleId(0), Some(CallerId(0)), None);
         let mut info = full_ck_info_lp64();
         info[48..80].copy_from_slice(&padded(b"SoftHSM v3", 32));
         let payload = payload_of(&info, &CK_INFO_RANGES_LP64);
@@ -1672,7 +1941,7 @@ mod tests {
             100,
         ))
         .expect("provider record decodes");
-        join.ingest(&second, ModuleId(0), CallerId(0), None);
+        join.ingest(&second, ModuleId(0), Some(CallerId(0)), None);
         let (providers, observations) = join.finish();
         assert_eq!(providers.len(), 1);
         let rendered = provider_info_json(&providers[&ModuleId(0)]);
@@ -1700,12 +1969,12 @@ mod tests {
                     100,
                 ))
                 .expect("mechanism record decodes");
-                join.ingest(&record, ModuleId(0), CallerId(0), None);
+                join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
             }
             let (providers, observations) = join.finish();
             let provider = decode_info_record(&provider_record()).expect("provider record decodes");
             let mut join = InfoJoin::new();
-            join.ingest(&provider, ModuleId(0), CallerId(0), None);
+            join.ingest(&provider, ModuleId(0), Some(CallerId(0)), None);
             let (providers2, _) = join.finish();
             let _ = providers;
             (
@@ -1742,13 +2011,13 @@ mod tests {
         join.ingest(
             &record,
             ModuleId(0),
-            CallerId(0),
+            Some(CallerId(0)),
             Some(RegistryInstanceId::from_raw(9)),
         );
         join.note_aliased_endpoint();
         join.note_return_deferred();
         let provider = decode_info_record(&provider_record()).expect("provider record decodes");
-        join.ingest(&provider, ModuleId(0), CallerId(0), None);
+        join.ingest(&provider, ModuleId(0), Some(CallerId(0)), None);
         let (providers, observations) = join.finish();
         let section = provider_observations_json(&observations);
         assert_eq!(section["version"], 8);
@@ -1937,7 +2206,7 @@ mod tests {
                     100,
                 ))
                 .expect("mechanism record decodes");
-                join.ingest(&record, ModuleId(0), CallerId(0), None);
+                join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
                 rows += 1;
             }
         }
@@ -1951,7 +2220,7 @@ mod tests {
             100,
         ))
         .expect("mechanism record decodes");
-        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         let record = decode_info_record(&record_bytes(
             INFO_KIND_MECHANISM,
             INFO_LAYOUT_LP64,
@@ -1961,7 +2230,7 @@ mod tests {
             100,
         ))
         .expect("mechanism record decodes");
-        join.ingest(&record, ModuleId(0), CallerId(0), None);
+        join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
         let (_, observations) = join.finish();
         assert_eq!(observations.mechanisms.len(), INFO_MAX_MECHANISM_ROWS);
         assert_eq!(observations.gaps.mechanisms_refused, 1);
@@ -1993,10 +2262,11 @@ mod tests {
                 100 + u64::from(caller),
             ))
             .expect("mechanism record decodes");
-            join.ingest(&record, ModuleId(0), CallerId(caller), None);
+            join.ingest(&record, ModuleId(0), Some(CallerId(caller)), None);
         }
-        join.fold_departed_caller(CallerId(9));
-        join.fold_departed_caller(CallerId(1));
+        join.enqueue_fold(CallerId(9));
+        join.enqueue_fold(CallerId(1));
+        while join.fold_step(INFO_FOLD_ROWS_PER_CALL) {}
         let (_, observations) = join.finish();
         assert_eq!(observations.tokens.len(), 1);
         assert_eq!(observations.tokens[0].caller, CallerId(0));
@@ -2004,6 +2274,267 @@ mod tests {
         assert_eq!(observations.mechanisms[0].caller, CallerId(0));
         assert_eq!(observations.gaps.tokens_departed, 2);
         assert_eq!(observations.gaps.mechanisms_departed, 2);
+    }
+
+    #[test]
+    fn fold_departed_caller_touches_only_its_own_rows() {
+        // Scale fixture: a large unrelated live population (1000
+        // token + 1000 mechanism rows) plus 2+2 rows for the
+        // departing caller. The fold must touch the departing
+        // slice, never scan the whole table.
+        let mut join = InfoJoin::new();
+        let full = full_mech_lp64();
+        for slot in 0..1000u64 {
+            ingest_token(&mut join, slot, 0);
+            let record = decode_info_record(&record_bytes(
+                INFO_KIND_MECHANISM,
+                INFO_LAYOUT_LP64,
+                &full,
+                slot,
+                0x1082,
+                100,
+            ))
+            .expect("mechanism record decodes");
+            join.ingest(&record, ModuleId(0), Some(CallerId(0)), None);
+        }
+        ingest_token(&mut join, 0, 9);
+        ingest_token(&mut join, 1, 9);
+        for mechanism in [0x1082u64, 0x1083] {
+            let record = decode_info_record(&record_bytes(
+                INFO_KIND_MECHANISM,
+                INFO_LAYOUT_LP64,
+                &full,
+                0,
+                mechanism,
+                109,
+            ))
+            .expect("mechanism record decodes");
+            join.ingest(&record, ModuleId(0), Some(CallerId(9)), None);
+        }
+        assert_eq!(join.tokens.len(), 1002);
+        assert_eq!(join.mechanisms.len(), 1002);
+        let visits_before = join.fold_visits;
+        join.enqueue_fold(CallerId(9));
+        assert!(
+            !join.fold_step(INFO_FOLD_ROWS_PER_CALL),
+            "four rows fold in one bounded step"
+        );
+        let visits = join.fold_visits - visits_before;
+        assert!(
+            visits <= 16,
+            "fold touches the departing slice, not the table: {visits}"
+        );
+        assert_eq!(join.tokens.len(), 1000);
+        assert_eq!(join.mechanisms.len(), 1000);
+        let (_, observations) = join.finish();
+        assert_eq!(observations.gaps.tokens_departed, 2);
+        assert_eq!(observations.gaps.mechanisms_departed, 2);
+    }
+
+    /// Keymeta Task 7 departed fold (spec §17.5, INV-2): one caller
+    /// can own hundreds of rows, and each fold call retires only a
+    /// bounded slice of them through the resumable cursor — never
+    /// the caller's whole table in one synchronous pass. Steps
+    /// complete over subsequent calls with exact departed counts.
+    #[test]
+    fn fold_many_row_caller_retires_a_bounded_slice_per_call() {
+        let mut join = InfoJoin::new();
+        let full = full_mech_lp64();
+        for slot in 0..500u64 {
+            ingest_token(&mut join, slot, 9);
+            let record = decode_info_record(&record_bytes(
+                INFO_KIND_MECHANISM,
+                INFO_LAYOUT_LP64,
+                &full,
+                slot,
+                0x1082,
+                100 + slot,
+            ))
+            .expect("mechanism record decodes");
+            join.ingest(&record, ModuleId(0), Some(CallerId(9)), None);
+        }
+        assert_eq!(join.tokens.len(), 500);
+        assert_eq!(join.mechanisms.len(), 500);
+        join.enqueue_fold(CallerId(9));
+        join.enqueue_fold(CallerId(9));
+        let mut steps = 0u32;
+        let mut visits_before = join.fold_visits;
+        while join.fold_step(INFO_FOLD_ROWS_PER_CALL) {
+            steps += 1;
+            let visits = join.fold_visits - visits_before;
+            assert!(
+                visits <= INFO_FOLD_ROWS_PER_CALL as u64,
+                "step {steps} retires a bounded slice: {visits}"
+            );
+            visits_before = join.fold_visits;
+            assert!(steps <= 20, "1000 rows fold in bounded steps");
+        }
+        let visits = join.fold_visits - visits_before;
+        assert!(
+            visits <= INFO_FOLD_ROWS_PER_CALL as u64,
+            "the final step stays bounded: {visits}"
+        );
+        assert_eq!(
+            join.fold_visits, 1000,
+            "every row retires exactly once across the steps"
+        );
+        assert_eq!(join.tokens.len(), 0);
+        assert_eq!(join.mechanisms.len(), 0);
+        let (_, observations) = join.finish();
+        assert_eq!(observations.gaps.tokens_departed, 500);
+        assert_eq!(observations.gaps.mechanisms_departed, 500);
+    }
+
+    /// Keymeta Task 7 departed fold (spec §17.5): a 65-row caller
+    /// retires 64 rows in one bounded slice, and the unfolded
+    /// remainder must not read as live — the queued departure is
+    /// visible to the snapshot before the fold completes, so a stop
+    /// right after the slice cannot publish a departed row.
+    #[test]
+    fn fold_step_over_65_rows_hides_the_unfolded_remainder_from_snapshots() {
+        let mut join = InfoJoin::new();
+        for slot in 0..65u64 {
+            ingest_token(&mut join, slot, 9);
+        }
+        join.enqueue_fold(CallerId(9));
+        assert!(
+            join.fold_step(INFO_FOLD_ROWS_PER_CALL),
+            "one row still pends after the first 64-row slice"
+        );
+        let (_, observations) = join.snapshot();
+        assert_eq!(
+            observations.gaps.tokens_departed, 64,
+            "the first slice retires 64 rows"
+        );
+        assert!(
+            observations.tokens.is_empty(),
+            "the unfolded remainder of a queued caller reads departed, never live: {:?}",
+            observations
+                .tokens
+                .iter()
+                .map(|row| (row.caller, row.slot))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Keymeta Task 7 departed fold (spec §17.5, INV-2): empty
+    /// callers still cost probe work — one fold step over 4096
+    /// queued callers with no rows must retire a bounded prefix,
+    /// never drain the whole queue for zero visits.
+    #[test]
+    fn fold_step_charges_empty_caller_probes() {
+        let mut join = InfoJoin::new();
+        for caller in 0..4096u32 {
+            join.enqueue_fold(CallerId(caller));
+        }
+        let visits_before = join.fold_visits;
+        assert!(
+            join.fold_step(INFO_FOLD_ROWS_PER_CALL),
+            "one step retires a bounded prefix of the empty-caller queue"
+        );
+        assert_eq!(
+            join.fold_visits - visits_before,
+            0,
+            "no rows retire from empty callers"
+        );
+        assert_eq!(
+            join.fold_queue.len(),
+            4096 - 32,
+            "each empty caller costs its two phase probes against the 64-credit slice"
+        );
+    }
+
+    /// Keymeta Task 7 departed fold (spec §17.5, INV-2): the Finish
+    /// disclosure over queued-but-unfolded callers reads maintained
+    /// counts, never table scans — 4096 empty pending callers disclose
+    /// with zero unfolded rows, and live rows keep their counts even
+    /// when the tables disagree (a pending scan would read zero).
+    #[test]
+    fn finish_disclosure_spends_no_probes_over_empty_callers() {
+        let mut join = InfoJoin::new();
+        for caller in 0..4096u32 {
+            join.enqueue_fold(CallerId(caller));
+        }
+        assert_eq!(
+            join.fold_deferred(),
+            (4096, 0),
+            "the pending count discloses with zero unfolded rows"
+        );
+        let mut join = InfoJoin::new();
+        for slot in 0..3u64 {
+            ingest_token(&mut join, slot, 7);
+        }
+        ingest_token(&mut join, 0, 9);
+        join.enqueue_fold(CallerId(7));
+        join.enqueue_fold(CallerId(9));
+        assert_eq!(
+            join.fold_deferred(),
+            (2, 4),
+            "three plus one rows pend before the tables disagree"
+        );
+        join.tokens.clear();
+        join.mechanisms.clear();
+        assert_eq!(
+            join.fold_deferred(),
+            (2, 4),
+            "the disclosure reads maintained counts, never table scans"
+        );
+    }
+
+    /// Keymeta Task 7 departed fold (spec §17.5): the maintained
+    /// disclosure counts stay exact across ingest, repeats,
+    /// queueing and partial folds — repeats add no rows, a bounded
+    /// slice decrements the pending total, rows that land for a
+    /// queued caller count while queued, and draining the queue
+    /// clears both counts with no per-caller residue.
+    #[test]
+    fn finish_disclosure_counts_stay_exact_across_folds() {
+        let mut join = InfoJoin::new();
+        // Caller 7: three token rows; a repeat adds no row.
+        for slot in 0..3u64 {
+            ingest_token(&mut join, slot, 7);
+        }
+        ingest_token(&mut join, 0, 7);
+        // Caller 9: one token row and two mechanism rows.
+        ingest_token(&mut join, 0, 9);
+        let full = full_mech_lp64();
+        for mechanism in [0x1082u64, 0x1083] {
+            let record = decode_info_record(&record_bytes(
+                INFO_KIND_MECHANISM,
+                INFO_LAYOUT_LP64,
+                &full,
+                0,
+                mechanism,
+                109,
+            ))
+            .expect("mechanism record decodes");
+            join.ingest(&record, ModuleId(0), Some(CallerId(9)), None);
+        }
+        assert_eq!(join.fold_deferred(), (0, 0), "nothing pends yet");
+        join.enqueue_fold(CallerId(7));
+        join.enqueue_fold(CallerId(9));
+        assert_eq!(
+            join.fold_deferred(),
+            (2, 6),
+            "three token rows plus one token and two mechanism rows"
+        );
+        // A bounded slice retires two of caller 7's token rows.
+        assert!(
+            join.fold_step(2),
+            "four rows still pend after the first slice"
+        );
+        assert_eq!(join.fold_deferred(), (2, 4));
+        // Rows that land for a queued caller count while queued.
+        ingest_token(&mut join, 9, 7);
+        assert_eq!(join.fold_deferred(), (2, 5));
+        // Draining the queue clears both counts.
+        while join.fold_step(INFO_FOLD_ROWS_PER_CALL) {}
+        assert_eq!(join.fold_deferred(), (0, 0));
+        assert!(
+            join.caller_rows.is_empty(),
+            "no per-caller count survives its fold: {:?}",
+            join.caller_rows
+        );
     }
 
     #[test]
@@ -2046,5 +2577,427 @@ mod tests {
             .map(|gap| gap["count"].as_u64().expect("gap count"))
             .collect();
         assert_eq!(counts, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// Root-crate LP64 cross-check (spec §17.1 layer 3): the shared
+    /// read lists cover exactly the read fields of the cryptoki-sys
+    /// 0.5.0 bindgen types — every read field's
+    /// `size_of`/`offset_of` sits inside the ranges, and every
+    /// excluded §17.2 byte (label, serial, session counts, memory
+    /// sizes, utcTime) plus every struct pad sits outside them. A pin
+    /// bump that moves any field fails here. The ia32 literals are
+    /// pinned by the byte-exact round-trip buffers below.
+    #[test]
+    fn info_read_lists_match_cryptoki_sys_lp64() {
+        use core::mem::{offset_of, size_of};
+        use cryptoki_sys::{CK_INFO, CK_MECHANISM_INFO, CK_TOKEN_INFO, CK_ULONG, CK_VERSION};
+        use p11scope_ebpf_common::LinuxLayout::Lp64;
+        use p11scope_ebpf_common::inventory_info::{
+            info_payload_len, info_read_ranges, info_span_size,
+        };
+        // This host is LP64: the bindgen word is 8 bytes.
+        assert_eq!(size_of::<CK_ULONG>(), 8);
+        assert_eq!(size_of::<CK_VERSION>(), 2);
+        // (kind, bindgen span, read fields as (offset, width),
+        // excluded fields as (offset, width)).
+        type FieldCase<'a> = (u8, usize, &'a [(usize, usize)], &'a [(usize, usize)]);
+        let cases: [FieldCase<'_>; 3] = [
+            (
+                INFO_KIND_PROVIDER,
+                size_of::<CK_INFO>(),
+                &[
+                    (
+                        offset_of!(CK_INFO, cryptokiVersion),
+                        size_of::<CK_VERSION>(),
+                    ),
+                    (offset_of!(CK_INFO, manufacturerID), 32),
+                    (offset_of!(CK_INFO, flags), size_of::<CK_ULONG>()),
+                    (offset_of!(CK_INFO, libraryDescription), 32),
+                    (offset_of!(CK_INFO, libraryVersion), size_of::<CK_VERSION>()),
+                ],
+                &[],
+            ),
+            (
+                INFO_KIND_TOKEN,
+                size_of::<CK_TOKEN_INFO>(),
+                &[
+                    (offset_of!(CK_TOKEN_INFO, manufacturerID), 32),
+                    (offset_of!(CK_TOKEN_INFO, model), 16),
+                    (offset_of!(CK_TOKEN_INFO, flags), size_of::<CK_ULONG>()),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulMaxPinLen),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulMinPinLen),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, hardwareVersion),
+                        size_of::<CK_VERSION>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, firmwareVersion),
+                        size_of::<CK_VERSION>(),
+                    ),
+                ],
+                &[
+                    (offset_of!(CK_TOKEN_INFO, label), 32),
+                    (offset_of!(CK_TOKEN_INFO, serialNumber), 16),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulMaxSessionCount),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulSessionCount),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulMaxRwSessionCount),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulRwSessionCount),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulTotalPublicMemory),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulFreePublicMemory),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulTotalPrivateMemory),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_TOKEN_INFO, ulFreePrivateMemory),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (offset_of!(CK_TOKEN_INFO, utcTime), 16),
+                ],
+            ),
+            (
+                INFO_KIND_MECHANISM,
+                size_of::<CK_MECHANISM_INFO>(),
+                &[
+                    (
+                        offset_of!(CK_MECHANISM_INFO, ulMinKeySize),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (
+                        offset_of!(CK_MECHANISM_INFO, ulMaxKeySize),
+                        size_of::<CK_ULONG>(),
+                    ),
+                    (offset_of!(CK_MECHANISM_INFO, flags), size_of::<CK_ULONG>()),
+                ],
+                &[],
+            ),
+        ];
+        for (kind, bindgen_span, read_fields, excluded) in cases {
+            let span = usize::from(info_span_size(kind, Lp64).expect("span"));
+            assert_eq!(span, bindgen_span, "kind {kind}: span is the bindgen size");
+            let list = info_read_ranges(kind, Lp64).expect("ranges");
+            let live = &list.ranges[..usize::from(list.count)];
+            let mut covered = vec![false; span];
+            let mut sum = 0usize;
+            for (off, len) in live {
+                let (off, len) = (usize::from(*off), usize::from(*len));
+                for byte in &mut covered[off..off + len] {
+                    assert!(!*byte, "kind {kind}: ranges are disjoint");
+                    *byte = true;
+                }
+                sum += len;
+            }
+            assert_eq!(
+                sum,
+                usize::from(info_payload_len(kind, Lp64).expect("payload len")),
+                "kind {kind}: bytes sum"
+            );
+            for (off, len) in read_fields {
+                assert!(
+                    covered[*off..off + len].iter().all(|byte| *byte),
+                    "kind {kind}: read field [{off}..{}) covered",
+                    off + len
+                );
+            }
+            for (off, len) in excluded {
+                assert!(
+                    covered[*off..off + len].iter().all(|byte| !*byte),
+                    "kind {kind}: excluded field [{off}..{}) never read",
+                    off + len
+                );
+            }
+            // No read byte is unaccounted: every covered byte belongs
+            // to a read field.
+            for (index, byte) in covered.iter().enumerate() {
+                if *byte {
+                    assert!(
+                        read_fields
+                            .iter()
+                            .any(|(off, len)| index >= *off && index < *off + *len),
+                        "kind {kind}: byte {index} belongs to a read field"
+                    );
+                }
+            }
+        }
+    }
+
+    fn full_mech_ilp32() -> [u8; 12] {
+        let mut mech = [0u8; 12];
+        mech[0..4].copy_from_slice(&128u32.to_le_bytes());
+        mech[4..8].copy_from_slice(&256u32.to_le_bytes());
+        mech[8..12].copy_from_slice(&3u32.to_le_bytes());
+        mech
+    }
+
+    /// One writer→decoder round trip through the production path:
+    /// the return adapter packs the struct bytes, the shared encoder
+    /// emits the 176-byte record, and the decoder accepts exactly
+    /// those bytes. Struct buffers are built at the transcribed
+    /// §17.1 offsets (the ia32 oracle, cited to the i686 bindgen
+    /// asserts); LP64 additionally cross-checks against bindgen
+    /// above.
+    fn round_trip_via_writer(
+        kind: u8,
+        layout_code: u8,
+        struct_bytes: &[u8],
+        slot: u64,
+        mechanism: u64,
+    ) -> Vec<u8> {
+        use p11scope_ebpf_common::LinuxLayout;
+        use p11scope_ebpf_common::inventory_info::{InfoHeader, encode_info_record};
+        use p11scope_ebpf_common::object_flow::{
+            InfoReturnVerdict, InfoStart, adapter_info_return,
+        };
+        let layout = match layout_code {
+            INFO_LAYOUT_LP64 => LinuxLayout::Lp64,
+            _ => LinuxLayout::Ilp32,
+        };
+        let base = 0x4000u64;
+        let stash = InfoStart {
+            info_ptr: base,
+            slot,
+            mechanism,
+            kind,
+            layout: layout_code,
+            reserved: [0; 6],
+        };
+        let mut reader = p11scope_ebpf_common::FnByteReader(
+            |address: u64, _layout: LinuxLayout, out: &mut [u8]| {
+                let start = usize::try_from(address.wrapping_sub(base)).map_err(|_| ())?;
+                let end = start.checked_add(out.len()).ok_or(())?;
+                out.copy_from_slice(struct_bytes.get(start..end).ok_or(())?);
+                Ok(())
+            },
+        );
+        let mut payload = [0xCCu8; INFO_PAYLOAD_MAX];
+        let verdict = adapter_info_return(&stash, 0, layout, &mut payload, &mut reader);
+        let InfoReturnVerdict::Emit(len) = verdict else {
+            panic!("kind {kind}: CKR_OK packs, got {verdict:?}");
+        };
+        assert!(
+            payload[len as usize..].iter().all(|byte| *byte == 0),
+            "kind {kind}: slack past {len} is zero"
+        );
+        let header = InfoHeader {
+            endpoint: 7,
+            kind,
+            layout: layout_code,
+            reserved0: 0,
+            host_tgid: 4242,
+            reserved1: 0,
+            task_cookie: 11,
+            exec_id: 9,
+            slot,
+            mechanism,
+        };
+        let mut out = [0xCCu8; INFO_RECORD_LEN];
+        assert!(encode_info_record(
+            &mut out,
+            &header,
+            INFO_STATUS_OK,
+            &payload
+        ));
+        out.to_vec()
+    }
+
+    #[test]
+    fn info_round_trip_provider_lp64() {
+        let full = full_ck_info_lp64();
+        let bytes = round_trip_via_writer(INFO_KIND_PROVIDER, INFO_LAYOUT_LP64, &full, 0, 0);
+        assert!(!bytes.contains(&0xAA), "no pad byte reaches the record");
+        let record = decode_info_record(&bytes).expect("the writer output decodes");
+        assert_eq!(record.kind, INFO_KIND_PROVIDER);
+        assert_eq!(record.layout, INFO_LAYOUT_LP64);
+        assert_eq!(record.payload_len, 76);
+        let InfoValues::Provider(values) = parse_info_payload(&record) else {
+            panic!("provider kind parses as provider");
+        };
+        assert_eq!((values.cryptoki_major, values.cryptoki_minor), (3, 1));
+        assert_eq!(values.manufacturer.as_deref(), Ok("SoftHSM"));
+        assert_eq!(values.flags, 0);
+        assert_eq!(values.description.as_deref(), Ok("SoftHSM v2"));
+        assert_eq!((values.library_major, values.library_minor), (2, 6));
+    }
+
+    #[test]
+    fn info_round_trip_provider_ilp32() {
+        let full = full_ck_info_ilp32();
+        let bytes = round_trip_via_writer(INFO_KIND_PROVIDER, INFO_LAYOUT_ILP32, &full, 0, 0);
+        assert!(!bytes.contains(&0xAA), "no pad byte reaches the record");
+        let record = decode_info_record(&bytes).expect("the writer output decodes");
+        assert_eq!(record.kind, INFO_KIND_PROVIDER);
+        assert_eq!(record.layout, INFO_LAYOUT_ILP32);
+        assert_eq!(record.payload_len, 72);
+        let InfoValues::Provider(values) = parse_info_payload(&record) else {
+            panic!("provider kind parses as provider");
+        };
+        assert_eq!((values.cryptoki_major, values.cryptoki_minor), (3, 1));
+        assert_eq!(values.manufacturer.as_deref(), Ok("SoftHSM"));
+        assert_eq!(values.flags, 0);
+        assert_eq!(values.description.as_deref(), Ok("SoftHSM v2"));
+        assert_eq!((values.library_major, values.library_minor), (2, 6));
+    }
+
+    #[test]
+    fn info_round_trip_token_lp64() {
+        let full = full_token_lp64();
+        let bytes = round_trip_via_writer(INFO_KIND_TOKEN, INFO_LAYOUT_LP64, &full, 3, 0);
+        assert!(
+            !bytes.contains(&0xAA),
+            "no excluded byte reaches the record"
+        );
+        let record = decode_info_record(&bytes).expect("the writer output decodes");
+        assert_eq!(record.kind, INFO_KIND_TOKEN);
+        assert_eq!(record.layout, INFO_LAYOUT_LP64);
+        assert_eq!(record.payload_len, 76);
+        assert_eq!(record.slot, 3);
+        let InfoValues::Token(values) = parse_info_payload(&record) else {
+            panic!("token kind parses as token");
+        };
+        assert_eq!(values.manufacturer.as_deref(), Ok("TokenMfr"));
+        assert_eq!(values.model.as_deref(), Ok("Model-X"));
+        assert_eq!(values.flags, 0x06);
+        assert_eq!(values.pin_min_len, 4);
+        assert_eq!(values.pin_max_len, 255);
+        assert_eq!((values.hardware_major, values.hardware_minor), (2, 6));
+        assert_eq!((values.firmware_major, values.firmware_minor), (2, 7));
+    }
+
+    #[test]
+    fn info_round_trip_token_ilp32() {
+        let full = full_token_ilp32();
+        let bytes = round_trip_via_writer(INFO_KIND_TOKEN, INFO_LAYOUT_ILP32, &full, 3, 0);
+        assert!(
+            !bytes.contains(&0xAA),
+            "no excluded byte reaches the record"
+        );
+        let record = decode_info_record(&bytes).expect("the writer output decodes");
+        assert_eq!(record.kind, INFO_KIND_TOKEN);
+        assert_eq!(record.layout, INFO_LAYOUT_ILP32);
+        assert_eq!(record.payload_len, 64);
+        assert_eq!(record.slot, 3);
+        let InfoValues::Token(values) = parse_info_payload(&record) else {
+            panic!("token kind parses as token");
+        };
+        assert_eq!(values.manufacturer.as_deref(), Ok("TokenMfr"));
+        assert_eq!(values.model.as_deref(), Ok("Model-X"));
+        assert_eq!(values.flags, 0x06);
+        assert_eq!(values.pin_min_len, 4);
+        assert_eq!(values.pin_max_len, 255);
+        assert_eq!((values.hardware_major, values.hardware_minor), (2, 6));
+        assert_eq!((values.firmware_major, values.firmware_minor), (2, 7));
+    }
+
+    #[test]
+    fn info_round_trip_mechanism_lp64() {
+        let full = full_mech_lp64();
+        let bytes = round_trip_via_writer(INFO_KIND_MECHANISM, INFO_LAYOUT_LP64, &full, 3, 0x1082);
+        let record = decode_info_record(&bytes).expect("the writer output decodes");
+        assert_eq!(record.kind, INFO_KIND_MECHANISM);
+        assert_eq!(record.layout, INFO_LAYOUT_LP64);
+        assert_eq!(record.payload_len, 24);
+        assert_eq!(record.slot, 3);
+        assert_eq!(record.mechanism, 0x1082);
+        let InfoValues::Mechanism(values) = parse_info_payload(&record) else {
+            panic!("mechanism kind parses as mechanism");
+        };
+        assert_eq!(values.min_key_size, 1024);
+        assert_eq!(values.max_key_size, 4096);
+        assert_eq!(values.flags, 1);
+    }
+
+    #[test]
+    fn info_round_trip_mechanism_ilp32() {
+        let full = full_mech_ilp32();
+        let bytes = round_trip_via_writer(INFO_KIND_MECHANISM, INFO_LAYOUT_ILP32, &full, 3, 0x1082);
+        let record = decode_info_record(&bytes).expect("the writer output decodes");
+        assert_eq!(record.kind, INFO_KIND_MECHANISM);
+        assert_eq!(record.layout, INFO_LAYOUT_ILP32);
+        assert_eq!(record.payload_len, 12);
+        assert_eq!(record.slot, 3);
+        assert_eq!(record.mechanism, 0x1082);
+        let InfoValues::Mechanism(values) = parse_info_payload(&record) else {
+            panic!("mechanism kind parses as mechanism");
+        };
+        assert_eq!(values.min_key_size, 128);
+        assert_eq!(values.max_key_size, 256);
+        assert_eq!(values.flags, 3);
+    }
+
+    /// An unreadable struct at return still yields a valid record:
+    /// status UNAVAILABLE with a zero payload decodes, and the join
+    /// publishes nothing from it.
+    #[test]
+    fn info_round_trip_unavailable_joins_to_nothing() {
+        use p11scope_ebpf_common::LinuxLayout;
+        use p11scope_ebpf_common::inventory_info::{InfoHeader, encode_info_record};
+        use p11scope_ebpf_common::object_flow::{
+            InfoReturnVerdict, InfoStart, adapter_info_return,
+        };
+        let stash = InfoStart {
+            info_ptr: 0x4000,
+            slot: 3,
+            mechanism: 0,
+            kind: INFO_KIND_TOKEN,
+            layout: INFO_LAYOUT_LP64,
+            reserved: [0; 6],
+        };
+        let mut reader = p11scope_ebpf_common::FnByteReader(
+            |_address: u64, _layout: LinuxLayout, _out: &mut [u8]| Err(()),
+        );
+        let mut payload = [0xCCu8; INFO_PAYLOAD_MAX];
+        let verdict = adapter_info_return(&stash, 0, LinuxLayout::Lp64, &mut payload, &mut reader);
+        assert_eq!(verdict, InfoReturnVerdict::Unavailable);
+        assert_eq!(payload, [0u8; INFO_PAYLOAD_MAX]);
+        let header = InfoHeader {
+            endpoint: 7,
+            kind: INFO_KIND_TOKEN,
+            layout: INFO_LAYOUT_LP64,
+            reserved0: 0,
+            host_tgid: 4242,
+            reserved1: 0,
+            task_cookie: 11,
+            exec_id: 9,
+            slot: 3,
+            mechanism: 0,
+        };
+        let mut out = [0xCCu8; INFO_RECORD_LEN];
+        assert!(encode_info_record(
+            &mut out,
+            &header,
+            INFO_STATUS_UNAVAILABLE,
+            &payload
+        ));
+        let record = decode_info_record(&out).expect("unavailable decodes");
+        assert_eq!(record.status, INFO_STATUS_UNAVAILABLE);
+        let mut join = InfoJoin::new();
+        join.ingest(&record, ModuleId(1), Some(CallerId(11)), None);
+        let (providers, observations) = join.finish();
+        assert!(providers.is_empty());
+        assert!(observations.is_empty());
     }
 }

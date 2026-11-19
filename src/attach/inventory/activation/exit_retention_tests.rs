@@ -42,6 +42,8 @@ impl RetiringInventory {
             empty_worker: None,
             cleanup: None,
             control_error: None,
+            #[cfg(not(feature = "stub-object-attributes"))]
+            scrub: InfoScrubPhase::default(),
         };
         let counts = match mode {
             "pending" => {

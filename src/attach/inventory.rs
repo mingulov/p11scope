@@ -16,8 +16,8 @@ use aya::{Ebpf, EbpfLoader};
 #[cfg(not(p11scope_small_discovery_ring))]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::{
-    INVENTORY_OWNER_LIMIT, INVENTORY_USAGE_VERSION, ImageIdentityControl, InventoryUsageConfig,
-    PRODUCED_CELLS, ThreadOwnerControl,
+    INVENTORY_INFO_BYTES, INVENTORY_OWNER_LIMIT, INVENTORY_USAGE_VERSION, ImageIdentityControl,
+    InventoryUsageConfig, PRODUCED_CELLS, ThreadOwnerControl,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -172,6 +172,11 @@ impl PreparedInventory {
                         .btf(Some(host.btf()))
                         .allow_unsupported_maps()
                         .map_max_entries("USAGE", capacity.get());
+                    // Keymeta Task 7 (spec §17.4): the FULL flavors
+                    // size the endpoint→kind publication beside USAGE.
+                    // The P0 object carries no such map.
+                    #[cfg(not(feature = "stub-object-attributes"))]
+                    loader.map_max_entries("INFO_KIND", capacity.get());
                     let bytes = match flavor {
                         InventoryFlavor::Global => crate::EBPF_INVENTORY_OBJECT,
                         InventoryFlavor::Callers(caller_budget) => {
@@ -424,6 +429,10 @@ pub(crate) const EXPECTED_INVENTORY_DISCOVERY_BYTES: u32 = INVENTORY_DISCOVERY_B
 #[cfg(p11scope_small_discovery_ring)]
 pub(crate) const EXPECTED_INVENTORY_DISCOVERY_BYTES: u32 = 4_096;
 
+/// Keymeta Task 7 (spec §17.4): the expected INFO ring bytes (64
+/// KiB, both flavors, every build).
+pub(crate) const EXPECTED_INVENTORY_INFO_BYTES: u32 = INVENTORY_INFO_BYTES;
+
 fn inventory_capacity(budget: InventoryBudget) -> Result<NonZeroU32> {
     let n =
         u32::try_from(budget.endpoint_limit()).context("Inventory budget exceeds u32 capacity")?;
@@ -438,7 +447,8 @@ fn inventory_maps(
     capacity: NonZeroU32,
 ) -> BTreeMap<&'static str, (InventoryMapKind, ExactMapMetadata)> {
     use InventoryMapKind as K;
-    [
+    #[cfg_attr(feature = "stub-object-attributes", allow(unused_mut))]
+    let mut rows = vec![
         (
             "CONFIG",
             K::Array,
@@ -524,10 +534,37 @@ fn inventory_maps(
             K::PerCpuArray,
             map_metadata(MapType::PerCpuArray, 4, 8, 3, 0),
         ),
-    ]
-    .into_iter()
-    .map(|(name, kind, meta)| (name, (kind, meta)))
-    .collect()
+    ];
+    // Keymeta Task 7 (spec §17.4): the FULL manifest gains the
+    // `INFO_START` stash, the `INFO` ring, the `INFO_KIND`
+    // publication and the `INFO_EVIDENCE` cells. The P0 manifest
+    // keeps the pre-info set.
+    #[cfg(not(feature = "stub-object-attributes"))]
+    rows.extend([
+        (
+            "INFO_START",
+            K::Hash,
+            map_metadata(MapType::Hash, 16, 32, 1024, 0),
+        ),
+        (
+            "INFO",
+            K::RingBuf,
+            map_metadata(MapType::RingBuf, 0, 0, EXPECTED_INVENTORY_INFO_BYTES, 0),
+        ),
+        (
+            "INFO_KIND",
+            K::Array,
+            map_metadata(MapType::Array, 4, 8, capacity.get(), BPF_F_RDONLY_PROG),
+        ),
+        (
+            "INFO_EVIDENCE",
+            K::PerCpuArray,
+            map_metadata(MapType::PerCpuArray, 4, 8, 4, 0),
+        ),
+    ]);
+    rows.into_iter()
+        .map(|(name, kind, meta)| (name, (kind, meta)))
+        .collect()
 }
 
 fn validate_inventory_maps(
@@ -554,6 +591,110 @@ fn validate_inventory_maps(
         compare_map_metadata(name, actual_metadata, metadata)?;
     }
     Ok(())
+}
+
+/// Keymeta Task 7 `INFO_KIND` cell IO (spec §17.4, fix9 R1): the
+/// endpoint→kind publication with the kind in the low byte.
+pub(super) trait InfoKindIo {
+    fn read_kind(&mut self, endpoint: u32) -> Result<u64>;
+    fn write_kind(&mut self, endpoint: u32, value: u64) -> Result<()>;
+}
+
+/// Publish one endpoint's info kind: the cell must read zero
+/// (usage-only so far), the kind writes once with the kind in the
+/// low byte, and the read-back must agree. Re-publication, a
+/// nonzero cell, kind zero and a readback mismatch all refuse.
+/// Follows the `ENDPOINT_OBJECT` precedent exactly, except that the
+/// map is never frozen: endpoints are admitted during capture
+/// extends, after preparation loaded the programs.
+pub(super) fn publish_info_kind_with<I: InfoKindIo>(
+    io: &mut I,
+    endpoint: u32,
+    kind: u8,
+) -> Result<()> {
+    if kind == 0 {
+        bail!("info kind 0 is usage-only and never publishes");
+    }
+    let old = io.read_kind(endpoint)?;
+    if old != 0 {
+        bail!(
+            "info endpoint {endpoint} already publishes kind {}",
+            old as u8
+        );
+    }
+    let value = u64::from(kind);
+    io.write_kind(endpoint, value)?;
+    if io.read_kind(endpoint)? != value {
+        bail!("info endpoint {endpoint} kind readback differs");
+    }
+    Ok(())
+}
+
+/// One revoke cell's next native substep: the paced loop carries
+/// this across extends, so a quantum that ends mid-cell resumes at
+/// the pending map operation instead of redoing finished work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RevokeSubstep {
+    /// Read the cell (a zero cell completes the revoke at once).
+    ReadInitial,
+    /// Write the observed-nonzero cell back to zero.
+    WriteZero,
+    /// Read the zeroed cell back.
+    ReadBack,
+}
+
+/// What one paced revoke step did with its cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RevokeStepOutcome {
+    /// The cell reads zero (revoked, or already zero): done.
+    Done,
+    /// The extend deadline passed before the next map operation:
+    /// the cell keeps its state and the next extend resumes at
+    /// `next` without redoing finished operations.
+    Yielded { next: RevokeSubstep },
+}
+
+/// Revoke one endpoint's info kind within one extend's window
+/// (spec §17.4, INV-2): after a later pass proved the endpoint's
+/// names aliased, the cell writes back to zero with a read-back,
+/// barring new stashes there. Already-zero cells (never published,
+/// or revoked before) complete with one read, so revocation is
+/// idempotent; the attach set never re-publishes a revoked
+/// endpoint, so it is irreversible. No native map operation starts
+/// at or past `deadline` — the step yields at the pending substep
+/// instead, and the next extend resumes there without redoing
+/// finished operations.
+pub(super) fn revoke_info_kind_step<I: InfoKindIo, F: FnMut() -> std::time::Instant + ?Sized>(
+    io: &mut I,
+    endpoint: u32,
+    resume: RevokeSubstep,
+    deadline: std::time::Instant,
+    now: &mut F,
+) -> Result<RevokeStepOutcome> {
+    let mut next = resume;
+    loop {
+        if now() >= deadline {
+            return Ok(RevokeStepOutcome::Yielded { next });
+        }
+        match next {
+            RevokeSubstep::ReadInitial => {
+                if io.read_kind(endpoint)? == 0 {
+                    return Ok(RevokeStepOutcome::Done);
+                }
+                next = RevokeSubstep::WriteZero;
+            }
+            RevokeSubstep::WriteZero => {
+                io.write_kind(endpoint, 0)?;
+                next = RevokeSubstep::ReadBack;
+            }
+            RevokeSubstep::ReadBack => {
+                if io.read_kind(endpoint)? != 0 {
+                    bail!("info endpoint {endpoint} kind revocation readback differs");
+                }
+                return Ok(RevokeStepOutcome::Done);
+            }
+        }
+    }
 }
 
 fn freeze_inventory_map(name: &str, map: &Map) -> Result<()> {
@@ -599,6 +740,11 @@ fn validate_runtime_inventory_maps(ebpf: &Ebpf, capacity: NonZeroU32) -> Result<
     validate_inventory_maps(&actual, capacity)
 }
 
+/// Keymeta Task 7 (spec §17.4): the FULL inventory flavors carry
+/// the inventory info pair beside the usage entries (12 → 15); the
+/// P0 flavor omits the info programs (exact 12-program list), so P0
+/// acquires no info bytes.
+#[cfg(feature = "stub-object-attributes")]
 const INVENTORY_PROGRAMS: [(&str, InventoryProgramKind); 12] = {
     use InventoryProgramKind::*;
     [
@@ -610,6 +756,30 @@ const INVENTORY_PROGRAMS: [(&str, InventoryProgramKind); 12] = {
         ("interface_list_return", Return),
         ("interface_list_worker", Return),
         ("interface_return", Return),
+        ("p11_usage_entry_ia32", Entry),
+        ("p11_usage_entry_lp64", Entry),
+        ("sched_process_exec", RawTracePoint),
+        ("sched_process_exit", RawTracePoint),
+    ]
+};
+
+/// Keymeta Task 7 (spec §17.4): the FULL inventory flavors carry
+/// the inventory info pair beside the usage entries (12 → 15).
+#[cfg(not(feature = "stub-object-attributes"))]
+const INVENTORY_PROGRAMS: [(&str, InventoryProgramKind); 15] = {
+    use InventoryProgramKind::*;
+    [
+        ("dl_debug_state", Entry),
+        ("function_list_entry", Entry),
+        ("function_list_return", Return),
+        ("interface_entry", Entry),
+        ("interface_list_entry", Entry),
+        ("interface_list_return", Return),
+        ("interface_list_worker", Return),
+        ("interface_return", Return),
+        ("p11_info_entry_ia32", Entry),
+        ("p11_info_entry_lp64", Entry),
+        ("p11_info_return", Return),
         ("p11_usage_entry_ia32", Entry),
         ("p11_usage_entry_lp64", Entry),
         ("sched_process_exec", RawTracePoint),
@@ -669,7 +839,21 @@ fn inventory_program_load(name: &str, backend: AttachBackend) -> Result<Inventor
         InventoryProgramKind::RawTracePoint => InventoryProgramLoad::RawTracePoint,
         InventoryProgramKind::Entry
             if backend == AttachBackend::Multi
-                && matches!(name, "p11_usage_entry_lp64" | "p11_usage_entry_ia32") =>
+                && matches!(
+                    name,
+                    "p11_usage_entry_lp64"
+                        | "p11_usage_entry_ia32"
+                        | "p11_info_entry_lp64"
+                        | "p11_info_entry_ia32"
+                ) =>
+        {
+            InventoryProgramLoad::UProbeMulti
+        }
+        // Keymeta Task 7 (spec §17.4): the info return's group
+        // links need the multi load under the Multi backend; the
+        // lifecycle roots stay plain.
+        InventoryProgramKind::Return
+            if backend == AttachBackend::Multi && name == "p11_info_return" =>
         {
             InventoryProgramLoad::UProbeMulti
         }

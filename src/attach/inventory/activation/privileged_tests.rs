@@ -1386,6 +1386,12 @@ impl OwnedIds {
                 InventoryLinkIdentity::EntryGroup(serial) => {
                     bail!("the private activation never attaches group {serial}")
                 }
+                InventoryLinkIdentity::Return(id) => {
+                    bail!("the private activation never attaches return {id}")
+                }
+                InventoryLinkIdentity::ReturnGroup(serial) => {
+                    bail!("the private activation never attaches return group {serial}")
+                }
                 InventoryLinkIdentity::Entry(id) => {
                     let entry = &state.targets.entries[id as usize];
                     ensure!(entry.id == id && position == id as usize + 2);
@@ -5906,7 +5912,7 @@ fn inventory_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
     finish_owned_retirement_inner(&mut retiring, true, stop_budget)?;
     let stop_ms = stop_start.elapsed().as_millis();
     let mut retired = retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("wide retirement did not finish"))?;
     ensure!(
         retired.cleanup.closed == n as usize + 2 && retired.cleanup.failures.is_empty(),
@@ -6187,7 +6193,7 @@ fn multi_prefix_stop(capture: InventoryCapture) -> Result<RetiredCapture> {
         std::thread::sleep(Duration::from_millis(1));
     }
     retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("completed retirement did not transfer"))
 }
 
@@ -6998,7 +7004,7 @@ fn privileged_task4_inventory_physical_identity_controls() -> Result<()> {
     let mut retiring = active.begin_stop();
     finish_owned_retirement_inner(&mut retiring, true, Duration::from_secs(60))?;
     let mut retired = retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("identity retirement unfinished"))?;
     ensure!(retired.cleanup.closed == 4 && retired.cleanup.failures.is_empty());
     let terminal = retired.usage_snapshot(window());
@@ -10400,7 +10406,7 @@ fn await_lifecycle_record(active: &mut ActiveInventory, pid: u32, kind: u8) -> R
 fn finish_owned_retirement(mut retiring: RetiringInventory) -> Result<RetiredInventory> {
     finish_owned_retirement_inner(&mut retiring, false, Duration::from_secs(100))?;
     retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("completed retirement did not retain its result"))
 }
 
@@ -11330,11 +11336,13 @@ fn privileged_inventory_retirement_controlled_churn() -> Result<()> {
             empty_worker: None,
             cleanup: Some(cleanup),
             control_error: None,
+            #[cfg(not(feature = "stub-object-attributes"))]
+            scrub: InfoScrubPhase::default(),
         }
     };
     finish_owned_retirement_inner(&mut retiring, true, Duration::from_secs(100))?;
     let mut retired = retiring
-        .try_finish()
+        .try_finish(Instant::now() + Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("controlled retirement remains pending"))?;
     let after = retired.usage_snapshot(window());
     let counters = after
@@ -12194,4 +12202,38 @@ fn privileged_classic_pid_scope_singles_excludes_foreign_and_reused_pid_lp64() -
 #[ignore = "root-owned BPF lane; classic --pid forced multi names the target or is refused"]
 fn privileged_classic_pid_scope_forced_multi_names_the_target_or_refuses_lp64() -> Result<()> {
     classic_pid_scope_lane(crate::attach::BackendSelection::Multi, "multi")
+}
+
+/// Keymeta Task 7 teardown scrub (spec §17.4, fix8 I2): the stop
+/// scrub phase zero-verify-removes every `INFO_START` row on the
+/// real loaded Inventory object and leaves the map empty, like the
+/// `EVIDENCE_START` precedent. P0 objects carry no `INFO_START`
+/// map, so this runs on FULL flavors only.
+#[test]
+#[cfg(not(feature = "stub-object-attributes"))]
+#[ignore = "root-owned BPF lane; real INFO_START rows scrubbed on the loaded Inventory object"]
+fn info_stop_scrubs_real_info_start_and_leaves_the_map_empty() -> Result<()> {
+    let mut prepared = PreparedInventory::prepare(Scope::System, budget(), AttachBackend::Singles)?;
+    {
+        let mut table: HashMap<_, [u8; 16], [u8; 32]> =
+            HashMap::try_from(prepared.ebpf.map_mut("INFO_START").context("INFO_START")?)?;
+        table.insert([0x11; 16], [0xa5; 32], 0)?;
+        table.insert([0x22; 16], [0x5a; 32], 0)?;
+    }
+    let mut phase = super::InfoScrubPhase::default();
+    let mut budget =
+        super::ScrubBudget::per_poll(Instant::now() + Duration::from_secs(60), Instant::now);
+    let directive = phase.poll(false, |cleared, pending| {
+        super::scrub_info_start_step_on(&mut prepared.ebpf, cleared, pending, &mut budget)
+            .map_err(|error| format!("{error:#}"))
+    });
+    assert_eq!(
+        directive,
+        super::InfoScrubDirective::Transfer { unproven: false }
+    );
+    assert_eq!(phase.cleared, 2);
+    let table: HashMap<_, [u8; 16], [u8; 32]> =
+        HashMap::try_from(prepared.ebpf.map_mut("INFO_START").context("INFO_START")?)?;
+    assert_eq!(table.keys().count(), 0, "the stash scrubs empty");
+    Ok(())
 }

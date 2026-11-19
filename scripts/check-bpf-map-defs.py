@@ -1614,10 +1614,13 @@ PROGRAM_ARRAYS = ("TAIL_CALLS", "STACK_GUARD", "PAIR_CALLS")
 # CVE-2025-40123 (upstream 4540aed51b12, in the stable series) a program array
 # accepts only programs with its owner's expected attach type, so these
 # programs and the plainly loaded ones must never reference the same array.
+# Keymeta Task 7 spec 17.4: the info entries and the info return load
+# multi beside the usage entries under the same STACK_GUARD rule.
 MULTI_LOADED_PROGRAMS = frozenset({
     "p11_entry", "p11_entry_ia32", "p11_entry_template", "p11_entry_template_types",
     "p11_entry_template_pair", "p11_entry_template_second", "p11_return",
     "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+    "p11_info_entry_lp64", "p11_info_entry_ia32", "p11_info_return",
 })
 # The journal twins load with the multi flag exactly like the ordinary
 # static endpoint twins they replace (pinned by
@@ -2255,7 +2258,8 @@ _DETAILED_BASE_MAPS = {
         # Per-ring submitted records (ebpf-common PRODUCED_CELLS): the
         # kernel half of the ring cross-check, beside the failure
         # counters. Tracks the constant; change both together.
-        "PRODUCED": (6, 4, 8, 2),
+        # Keymeta Task 7: the INFO ring joins as cell 2 (2 -> 3).
+        "PRODUCED": (6, 4, 8, 3),
         "MECH_SHAPE": (1, 8, 4, 1_024, 128),
         "PAUSE_PIDS": (1, 16, 8, 1),
         "PID_FILTER": (1, 4, 8, 1_024, 128),
@@ -2412,10 +2416,18 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "USAGE": map_def(2, 4, 8, 1),
     "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": map_def(6, 4, 8, 3),
+    # Keymeta Task 7 (spec 17.4): the info stash, ring, kind
+    # publication and evidence cells. INFO_KIND rides the loader's
+    # capacity patch beside USAGE (placeholder 1 here).
+    "INFO_START": map_def(1, 16, 32, 1024),
+    "INFO": map_def(27, 0, 0, 64 * 1024),
+    "INFO_KIND": map_def(2, 4, 8, 1, 128),
+    "INFO_EVIDENCE": map_def(6, 4, 8, 4),
 }
 INVENTORY_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return", "task_newtask"}
                       - INSTANCE_PROGRAMS - SELECTED_PROGRAMS) | {
     "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+    "p11_info_entry_lp64", "p11_info_entry_ia32", "p11_info_return",
 }
 INVENTORY_FORBIDDEN_MAPS = {
     "STATS", "START", "RV_COUNTS", "EVENTS", "DESCRIPTORS", "MECH_SHAPE",
@@ -2587,8 +2599,15 @@ def self_test():
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 11)
-    assert SAFE_MAPS["PRODUCED"] == map_def(6, 4, 8, 2)
+    assert SAFE_MAPS["PRODUCED"] == map_def(6, 4, 8, 3)
     assert INVENTORY_MAPS["PRODUCED"] == SAFE_MAPS["PRODUCED"]
+    assert INVENTORY_MAPS["INFO_START"] == map_def(1, 16, 32, 1024)
+    assert INVENTORY_MAPS["INFO"] == map_def(27, 0, 0, 64 * 1024)
+    assert INVENTORY_MAPS["INFO_KIND"] == map_def(2, 4, 8, 1, 128)
+    assert INVENTORY_MAPS["INFO_EVIDENCE"] == map_def(6, 4, 8, 4)
+    assert "p11_info_entry_lp64" in INVENTORY_PROGRAMS
+    assert "p11_info_entry_ia32" in INVENTORY_PROGRAMS
+    assert "p11_info_return" in INVENTORY_PROGRAMS
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
     assert SAFE_MAPS["OBJECT_START"] == map_def(1, 16, 432, 16_384)
     assert SAFE_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)

@@ -32305,6 +32305,125 @@ mod seal_readiness_tests {
         );
     }
 
+    /// A refused `--key-sizes` journal start retries the base journal
+    /// before giving up key operations: the base lane seats, one `key
+    /// sizes unavailable` gap names the sizes refusal, and no `key
+    /// operations unavailable` gap is recorded.
+    #[test]
+    fn key_sizes_journal_refusal_retries_base_journal_with_named_gap() {
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(true);
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with_start_queue(
+            vec![
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+            ],
+            vec![
+                Err(SemanticRefusal::Attachment),
+                Ok(joint_lane(WindDownIo::completing(), false)),
+            ],
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                    None,
+                )
+            },
+        );
+        let lane = lane.expect("the base journal retry seats");
+        assert!(lane.is_live(), "the retry seats a live lane");
+        assert_eq!(
+            take_sealed_for_test().len(),
+            1,
+            "the reseated lane seals once"
+        );
+        let gaps = gaps_for_subject(&mut coordinator, "key sizes unavailable");
+        assert_eq!(gaps.len(), 1, "the sizes refusal is named once");
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert!(
+                gaps[0].1.contains("journal-pair-unavailable-in-build"),
+                "the build reason is named: {}",
+                gaps[0].1
+            );
+        } else {
+            assert!(
+                gaps[0].1.contains("semantic_attachment_refused"),
+                "the refusal class is named: {}",
+                gaps[0].1
+            );
+        }
+        assert!(
+            gaps[0].1.contains("without sizes"),
+            "the degraded mode is named: {}",
+            gaps[0].1
+        );
+        assert!(
+            gaps_for_subject(&mut coordinator, "key operations unavailable").is_empty(),
+            "key operations stay available"
+        );
+        assert!(
+            coordinator.key_sizes_requested(),
+            "the sizes request stays posed for the reducer"
+        );
+    }
+
+    /// Sizes and base journal refusals fall through to the ordinary
+    /// retry: the ordinary lane seats with the `key operations
+    /// unavailable` gap and no `key sizes unavailable` gap (sizes
+    /// degrade only when the base journal seats).
+    #[test]
+    fn key_sizes_double_journal_refusal_falls_back_to_ordinary() {
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(true);
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with_start_queue(
+            vec![
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+            ],
+            vec![
+                Err(SemanticRefusal::Attachment),
+                Err(SemanticRefusal::Attachment),
+                Ok(joint_lane(WindDownIo::completing(), false)),
+            ],
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                    None,
+                )
+            },
+        );
+        let lane = lane.expect("the ordinary retry seats");
+        assert!(lane.is_live(), "the retry seats a live lane");
+        assert_eq!(
+            take_sealed_for_test().len(),
+            1,
+            "the reseated lane seals once"
+        );
+        let gaps = gaps_for_subject(&mut coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "the journal reason is named once");
+        assert!(
+            gaps_for_subject(&mut coordinator, "key sizes unavailable").is_empty(),
+            "no sizes gap without a seated base journal"
+        );
+    }
+
     /// Semantic guards refuse identically under the flag: subset
     /// refusals (multi/PID/target/safety) at either mint keep their
     /// disclosures with no bypass and no journal attempt.

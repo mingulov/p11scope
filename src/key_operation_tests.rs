@@ -28930,6 +28930,54 @@ fn keymeta_unsupported_never_flips_to_inferred() {
     assert_eq!(inferred.size.completions, 2);
 }
 
+/// Forward-fill onto `Unsupported` pins: AES-KW unwrap parks wrapped
+/// material on a view whose sign row already proved `Unsupported`;
+/// the row's next touch forward-fills the park through the shared
+/// guard, so the row stays `Unsupported` with its first reason.
+#[test]
+fn keymeta_unsupported_pins_against_forward_fill() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    // Drive ids[0]'s sign row Unsupported first (unmapped subset).
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0121), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    // Park AES-KW unwrap material on ids[0] (ids[1] unwraps).
+    let unwrapping = KeymetaCtx::receipt(ids[1], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x2109),
+        &[unwrapping],
+        250,
+        Some(LengthOutcome::Value(32)),
+        Some(ids[0].as_u64()),
+    )
+    .expect("unwrap completes");
+    // Touch ids[0]'s proved bucket: the start forward-fills the park.
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 300);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 400, None, None);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_MAP)
+    );
+    assert_eq!(inferred.size.detail, None);
+    assert_eq!(inferred.size.completions, 2);
+}
+
 /// Corroboration mismatch records the named residual without
 /// conflicting; the terminal still classifies.
 #[test]

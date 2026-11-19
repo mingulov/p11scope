@@ -701,8 +701,9 @@ list reads as exact only with an R2-D1-6 proof behind it. Key presence
 never proves exactness. A `coverage_retired` window opens when a
 mid-capture global retirement detaches live attached counting probes
 with no same-apply reattach (`start_ns` is the detach decision
-instant, conservative by the async worker latency) and closes when the
-module re-attaches, else it reads open-ended at capture end. Every
+instant, conservative by the async worker latency) and closes when
+every module in the window re-attaches, else it reads open-ended at
+capture end. Every
 window carries conservative outer bounds, never a missed-call
 estimate; the affected-slot count rides in
 `evidence.coverage_retired_slots`.

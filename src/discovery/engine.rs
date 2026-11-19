@@ -15831,13 +15831,17 @@ impl Engine {
         Some((modules, slots, start_ns))
     }
 
-    /// Close open coverage-retire windows whose module has live cover
-    /// again (any plan slot of the module active). Runs at the end of
-    /// every apply that reaches it; a window opened earlier in the
-    /// same apply is never closed here (its detach committed without
-    /// same-apply reattach by construction, and no attach ran since).
-    /// An unreadable clock leaves windows open (fail closed: the
-    /// projection reads them open-ended instead of fabricating an end).
+    /// Close open coverage-retire windows whose every module has live
+    /// cover again (any plan slot of the module active). All-module
+    /// close keeps a partial revival conservative: closing on the
+    /// first revived module would end the window on the records of
+    /// modules that are still dark, silently un-disclosing their tail
+    /// loss. Runs at the end of every apply that reaches it; a window
+    /// opened earlier in the same apply is never closed here (its
+    /// detach committed without same-apply reattach by construction,
+    /// and no attach ran since). An unreadable clock leaves windows
+    /// open (fail closed: the projection reads them open-ended instead
+    /// of fabricating an end).
     fn close_revived_coverage_windows(&mut self) {
         if !self
             .coverage_retire_windows
@@ -15861,7 +15865,7 @@ impl Engine {
             .iter_mut()
             .filter(|window| window.end_ns.is_none())
         {
-            if window.modules.iter().any(|id| active.contains(id)) {
+            if window.modules.iter().all(|id| active.contains(id)) {
                 window.end_ns = Some(now);
             }
         }

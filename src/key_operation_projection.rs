@@ -1669,7 +1669,10 @@ pub(crate) mod producer {
         // authority keeps every already-attributed and S1-preserved
         // row under `partial`, with its unattributed calls counted
         // beside them. Only a census with no evidence at all (no
-        // rows, no sessions, no counted loss) stays unavailable.
+        // rows, no sessions, no counted loss, no model gaps) stays
+        // unavailable. Model gaps are per-key loss evidence (a
+        // pending key voided as OutcomeLost): a view with named
+        // gaps degrades to partial, never voids to unavailable.
         let has_evidence = !unattributed.is_empty()
             || !keyuse.aggregates().is_empty()
             || keyuse
@@ -1677,7 +1680,8 @@ pub(crate) mod producer {
                 .iter()
                 .any(|counters| counters.is_live())
             || !model.sessions.is_empty()
-            || !model.objects.is_empty();
+            || !model.objects.is_empty()
+            || !model.gaps.is_empty();
         let (status, reason) = if joint && evidence.partial {
             (ObsStatus::Partial, "row_budget_exhausted")
         } else if joint && lost {

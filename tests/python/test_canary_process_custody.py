@@ -91,19 +91,10 @@ def direct_term(observer, workload):
     with tempfile.TemporaryDirectory() as directory:
         path = str(Path(directory) / 'ready')
         with c.Custody() as owner:
-            started = time.monotonic()
             child = launch(owner, f"signal.signal(signal.SIGTERM, lambda n,f: os._exit(23)); open({path!r}, 'w').close(); time.sleep(30)")
             until(lambda: Path(path).exists())
-            ready_latency = time.monotonic() - started
-            # Hang-guard budget derived from the observed spawn-to-ready
-            # latency on this host: signal delivery plus handler scheduling
-            # stretches with the same load that slows process startup. The
-            # semantic assertion stays exact (exit code 23 proves the actual
-            # child handled TERM); the budget only bounds a hung child, and
-            # stays below the probe's 8s watchdog so that bound trips first.
-            budget = min(max(2.0, 8.0 * ready_latency), 7.0)
             fd = os.dup(child.group.fd)
-            child.terminate(time.monotonic() + budget, sig=signal.SIGTERM)
+            child.terminate(time.monotonic() + 2, sig=signal.SIGTERM)
             assert child.popen.returncode == 23, 'TERM was not handled by actual child'
             gone(fd)
             os.close(fd)

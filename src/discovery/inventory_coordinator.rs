@@ -776,6 +776,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// (test count): the stop-paced member pre-index.
     #[cfg(test)]
     fold_summary_sizing_visits: std::cell::Cell<u64>,
+    /// Departed-identity count-map entries rebuilt outside the shared
+    /// stop stride (test count): the paced derivation leaves this at
+    /// zero — every per-caller count lands inside the stop-paced edge
+    /// and instance scans, with no second pass over the touched map.
+    #[cfg(test)]
+    fold_identity_unpaced_writes: std::cell::Cell<u64>,
     /// Declared-layer matcher visits at the fold-planning call site
     /// (test count): every declaration, stat, comparison and ordered
     /// visit the coordinator's stride callback observes.
@@ -1582,6 +1588,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             fold_edge_sizing_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             fold_summary_sizing_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            fold_identity_unpaced_writes: std::cell::Cell::new(0),
             #[cfg(test)]
             forwarding_match_visits: std::cell::Cell::new(0),
             next_pending_id: 0,
@@ -6171,6 +6179,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.fold_summary_sizing_visits.get()
     }
 
+    /// Test-only: departed-identity count-map entries rebuilt outside
+    /// the shared stop stride.
+    #[cfg(test)]
+    pub(crate) fn fold_identity_unpaced_writes_for_test(&self) -> u64 {
+        self.fold_identity_unpaced_writes.get()
+    }
+
     /// Test-only: declared-layer matcher visits at the fold-planning
     /// call site.
     #[cfg(test)]
@@ -6923,7 +6938,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let identity_units: HashMap<CallerId, usize> = touched
             .into_iter()
-            .map(|(caller, modules)| (caller, modules.len()))
+            .map(|(caller, modules)| {
+                #[cfg(test)]
+                {
+                    self.fold_identity_unpaced_writes
+                        .set(self.fold_identity_unpaced_writes.get().saturating_add(1));
+                }
+                (caller, modules.len())
+            })
             .collect();
         Some(FoldContext {
             instances_by_caller,
@@ -27625,6 +27647,22 @@ exit 0
             .scene
             .coordinator
             .note_rendered_callers(&[heavy, sibling]);
+        // The staged pair keys before the first pass: the deferral
+        // must keep every target bound and every recovery owned.
+        let staged_targets: Vec<PairKey> = native
+            .scene
+            .coordinator
+            .pair_targets
+            .keys()
+            .copied()
+            .collect();
+        let staged_recoveries: Vec<PairKey> = native
+            .scene
+            .coordinator
+            .recoveries
+            .keys()
+            .copied()
+            .collect();
         // Pass 1: the sibling folds around the deferral.
         assert_eq!(
             native
@@ -27680,10 +27718,46 @@ exit 0
             3,
             "every deferred pair target waits"
         );
+        for key in &staged_targets {
+            assert!(
+                matches!(
+                    native.scene.coordinator.pair_targets.get(key),
+                    Some(PairTarget::Bound {
+                        caller,
+                        base: 10,
+                        staged: 10,
+                        ..
+                    }) if *caller == heavy
+                ),
+                "the deferred target {key:?} stays bound to the oversized caller with its staged counts"
+            );
+        }
+        assert_eq!(
+            native.scene.coordinator.recovery_order.len(),
+            5,
+            "every deferred pair key keeps its service order"
+        );
         assert_eq!(
             native.scene.coordinator.recoveries.len(),
             2,
             "every deferred recovery waits"
+        );
+        for key in &staged_recoveries {
+            assert_eq!(
+                native
+                    .scene
+                    .coordinator
+                    .recoveries
+                    .get(key)
+                    .map(|recovery| recovery.caller),
+                Some(heavy),
+                "the deferred recovery {key:?} stays owned by the oversized caller"
+            );
+        }
+        assert_eq!(
+            native.scene.coordinator.fold_pair_drop_visits_for_test(),
+            0,
+            "the deferral drops no pair target early"
         );
         let totals = native.scene.coordinator.registry().departed_totals();
         assert_eq!(
@@ -27773,6 +27847,56 @@ exit 0
             4,
             "every deferred edge stays live past two passes"
         );
+        assert_eq!(
+            native.scene.coordinator.pair_targets.len(),
+            3,
+            "every deferred pair target waits past two passes"
+        );
+        for key in &staged_targets {
+            assert!(
+                matches!(
+                    native.scene.coordinator.pair_targets.get(key),
+                    Some(PairTarget::Bound {
+                        caller,
+                        base: 10,
+                        staged: 10,
+                        ..
+                    }) if *caller == heavy
+                ),
+                "the deferred target {key:?} stays bound past two passes"
+            );
+        }
+        assert_eq!(
+            native.scene.coordinator.recoveries.len(),
+            2,
+            "every deferred recovery waits past two passes"
+        );
+        for key in &staged_recoveries {
+            assert_eq!(
+                native
+                    .scene
+                    .coordinator
+                    .recoveries
+                    .get(key)
+                    .map(|recovery| recovery.caller),
+                Some(heavy),
+                "the deferred recovery {key:?} stays owned past two passes"
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            2,
+            "every deferred summary waits past two passes"
+        );
+        assert_eq!(
+            native.scene.coordinator.fold_pair_drop_visits_for_test(),
+            0,
+            "no pass drops a pair target early"
+        );
         let totals = native.scene.coordinator.registry().departed_totals();
         assert_eq!(
             (totals.edges, totals.instances_folded),
@@ -27786,6 +27910,174 @@ exit 0
                 .fold_commit_identity_inserts_for_test(),
             1,
             "no pass inserts identities outside the sibling's fold"
+        );
+    }
+
+    /// Oversized-identity twin: 65,534 sequences plus one edge name
+    /// 65,535 member units — a fitting 1,024-credit caller — but the
+    /// edge's departed identity charges one more unit, so the caller
+    /// totals 65,536 charged units and no window reserves it. The
+    /// oversized gate reads the charged cost: the row defers under
+    /// its counted gap with every row kept while a fitting sibling
+    /// sorted after it folds the same pass.
+    #[test]
+    fn fold_oversized_identity_charge_defers_past_fitting_sibling() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        // 65,534 sequences + 1 edge = 65,535 members + 1 identity =
+        // 65,536 charged units: oversized only through the charge.
+        let heavy = stage_cutoff_caller(&mut native, 5030, 65_534, 0, 0, 1, 0, 0);
+        // The fitting sibling sorts after the oversized row: it
+        // folds only when the deferral falls through to it.
+        let sibling = stage_exited_caller(&mut native, 5031, 100);
+        for sequence in 0..2u64 {
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                200_000 + sequence,
+                sequence,
+                Some(sibling),
+            );
+        }
+        native
+            .scene
+            .coordinator
+            .registry_mut()
+            .scripted_module_edge(
+                ModuleKey::physical(8, 1, 9000, None, "/fold/sibling.so"),
+                sibling,
+            );
+        assert!(
+            sibling > heavy,
+            "the fitting sibling sorts after the oversized row"
+        );
+        native.scene.coordinator.registry_mut().publish();
+        native
+            .scene
+            .coordinator
+            .note_rendered_callers(&[heavy, sibling]);
+        // Pass 1: the sibling folds around the identity-tipped
+        // deferral.
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            1,
+            "the fitting sibling folds past the identity-tipped deferral"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the oversized row stays carried past the deferral"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(sibling).is_none(),
+            "the sibling leaves when it folds"
+        );
+        // The deferral folds nothing of the oversized row.
+        let bound = native.scene.coordinator.binder_bound_owners_for_test();
+        assert_eq!(bound.len(), 65_534, "every deferred sequence stays bound");
+        assert!(
+            bound.iter().all(|owner| *owner == heavy),
+            "no other row loses evidence to the deferral"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            1,
+            "the deferred edge stays live"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (1, 0),
+            "the pass aggregates only the sibling's edge"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            1,
+            "only the sibling's identity lands"
+        );
+        native.scene.coordinator.registry_mut().publish();
+        let registry = &native.scene.coordinator.registry;
+        let found = registry.gaps().iter().enumerate().find(|(_, gap)| {
+            gap.subject == FOLD_DEFERRED_OVERSIZED_SUBJECT && gap.caller == Some(heavy)
+        });
+        let Some((index, gap)) = found else {
+            panic!(
+                "the deferred caller gaps under its counted row: {:?}",
+                native.gap_subjects()
+            );
+        };
+        assert_eq!(
+            gap.reason, FOLD_DEFERRED_OVERSIZED_REASON,
+            "the deferral names the retained rows"
+        );
+        assert_eq!(
+            registry.gap_repeats()[index],
+            1,
+            "one deferral recorded after pass 1"
+        );
+        // Pass 2 without a re-note: the carried row retries on its
+        // kept carry, gaps again, and still folds nothing.
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "pass 2 folds nothing: the oversized row defers again"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the oversized row stays carried past two passes"
+        );
+        native.scene.coordinator.registry_mut().publish();
+        let registry = &native.scene.coordinator.registry;
+        let found = registry.gaps().iter().enumerate().find(|(_, gap)| {
+            gap.subject == FOLD_DEFERRED_OVERSIZED_SUBJECT && gap.caller == Some(heavy)
+        });
+        let Some((index, _)) = found else {
+            panic!(
+                "the deferred row keeps its counted gap: {:?}",
+                native.gap_subjects()
+            );
+        };
+        assert_eq!(
+            registry.gap_repeats()[index],
+            2,
+            "repeats count the run's deferrals"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder_bound_owners_for_test()
+                .len(),
+            65_534,
+            "every deferred sequence stays bound past two passes"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            1,
+            "the deferred edge stays live past two passes"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (1, 0),
+            "the deferral folds nothing across both passes"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            1,
+            "no pass inserts an identity outside the sibling's fold"
         );
     }
 
@@ -27836,6 +28128,109 @@ exit 0
             (totals.edges, totals.instances_folded),
             (3, 2),
             "the fold aggregates every edge and instance"
+        );
+    }
+
+    /// Identity-planning stride twin: 65 background callers each name
+    /// one edge module while a single two-module candidate triggers
+    /// planning — 67 touched callers with the fixture's live row,
+    /// past one stop stride. The
+    /// per-caller identity counts derive inside the stop-paced edge
+    /// and instance scans: no count map rebuilds outside the shared
+    /// stride, and the pass folds the candidate with an exact
+    /// receipt while every background edge stays live.
+    #[test]
+    fn fold_identity_planning_derives_counts_inside_the_shared_stride() {
+        const BACKGROUND: u32 = 65;
+        let (mut native, _live) = NativeScene::new();
+        let mut background = Vec::new();
+        for caller in 0..BACKGROUND {
+            let id = stage_exited_caller(&mut native, 5100 + caller, 100);
+            native
+                .scene
+                .coordinator
+                .registry_mut()
+                .scripted_module_edge(
+                    ModuleKey::physical(
+                        8,
+                        1,
+                        8000 + u64::from(caller),
+                        None,
+                        "/fold/background.so",
+                    ),
+                    id,
+                );
+            background.push(id);
+        }
+        // 1 sequence + 2 edges on distinct modules = 3 members + 2
+        // identities = 5 units = 1 credit.
+        let candidate = stage_cutoff_caller(&mut native, 6000, 1, 0, 0, 2, 0, 0);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[candidate]);
+        let before = native
+            .scene
+            .coordinator
+            .fold_identity_unpaced_writes_for_test();
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            1,
+            "the one-credit candidate folds past 65 background callers"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_identity_unpaced_writes_for_test()
+                - before,
+            0,
+            "67 touched callers rebuild no count map outside the shared stride"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(candidate).is_none(),
+            "the candidate leaves when it folds"
+        );
+        for id in &background {
+            assert!(
+                native.scene.coordinator.adapter.record(*id).is_some(),
+                "no background row folds behind the candidate"
+            );
+            assert_eq!(
+                native.scene.coordinator.registry().edges_of(*id).count(),
+                1,
+                "every background edge stays live"
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            2,
+            "the candidate names one identity per touched module"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (2, 0),
+            "the pass aggregates only the candidate's edges"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "exactly one row publishes"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "pass 2 folds nothing: only the candidate was noted"
         );
     }
 

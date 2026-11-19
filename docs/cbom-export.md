@@ -32,7 +32,10 @@ carries only joins the input proves: application → its modules,
 application/module → mechanisms observed on their edges, key object →
 its provider module and caller application via the key-operation →
 instance → module/caller join (when joinable, otherwise no edge and
-a named note). One caller folded at several providers counts one
+a named note). Folded instances keep the same joins through
+`modules[].departed_use.folded_instances[]` (instance → caller) plus
+the identities (caller → executable path). One caller folded at
+several providers counts one
 incarnation under its path: the per-module identity copies
 deduplicate by caller. Folded joins follow the same rule: each
 departed application joins the provider it folded at, and folded
@@ -143,8 +146,10 @@ primitives, keys without established size, callers without an
 executable path, unavailable object observations, profile inputs'
 missing caller/key/provenance linkage, and the departed-fold bounds
 (`departed_identities_dropped`, `departed_identities_saturated`,
-`departed_mech_overflow` with its calls/errors, and
-`departed_links_withheld`) are counted in properties and
+`departed_folded_instances_dropped`,
+`departed_folded_instances_saturated`, `departed_mech_overflow` with
+its calls/errors, and `departed_links_withheld`) are counted in
+properties and
 named in text. The departed properties ride only when nonzero, so
 inputs without a fold render exactly as before. Text output follows
 the usual contract (concise

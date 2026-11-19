@@ -471,6 +471,12 @@ and never proves an app identity. See the app identity rows of
   `lifecycle`/`lifecycle_reason`/instants/`exec_observed`/
   `metadata_status`) up to the 4096-per-module / 16384 run-wide
   bounds (`identities_saturated`, `identities_dropped` past them).
+  `folded_instances` (additive within v1) keeps the folded
+  instances' join keys (`id`/`caller` rows) under the same
+  4096-per-module / 16384 run-wide bounds
+  (`folded_instances_saturated`, `folded_instances_dropped` past
+  them), so key-operation rows still join their provider and
+  application after their instance row leaves `instances[]`.
   Launcher chains, app hints and metadata snapshots do not survive
   the fold (only the metadata status); coverage unknown-reason
   details stay in their gaps.
@@ -1396,8 +1402,10 @@ never imply S1 loss.
   metadata label) holds proved-key aggregate rows
   `{instance, object, category, role, metadata_at_use, unit,
   started, completed, failed, cancelled, unknown, active,
-  key_join_lost}`. `instance` joins `instances[]`; `unit` is
-  `operations`, or `message_contexts` for `message_*` categories.
+  key_join_lost}`. `instance` joins `instances[]`, falling back to
+  the `folded_instances[]` join keys in `modules[].departed_use`
+  once the row's instance has folded; `unit` is `operations`, or
+  `message_contexts` for `message_*` categories.
   Row equation: `started = completed + failed + cancelled + unknown
   + active + key_join_lost` (before counter saturation). Role rows
   count associations and cannot be summed across roles into a global

@@ -1038,6 +1038,13 @@ pub struct Engine {
     /// group per rebuild transaction. Ungated by scope — a rebuild blinds
     /// its members wherever the capture runs.
     multi_rebuild_gaps: u64,
+    /// Mid-capture counting-coverage retirements: one entry per live
+    /// global-retire apply that detached attached counting slots with no
+    /// same-apply reattach. Open (`end_ns: None`) until the module
+    /// re-attaches or the capture ends; projected onto the affected
+    /// records as `coverage_retired` unobserved windows at every
+    /// `capture_facts` read. Bounded by applies (one per retire apply).
+    coverage_retire_windows: Vec<CoverageRetireWindow>,
     // Both ledgers are capture-local and bounded by the process-view ceiling;
     // only the scalar crosses the render boundary.
     admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
@@ -2236,6 +2243,19 @@ struct InventorySurfaceBase {
 struct InventorySurfaceKey {
     base: InventorySurfaceBase,
     duplicate: u16,
+}
+
+/// One mid-capture counting-coverage retirement: live attached slots
+/// detached by a global-retire apply with no same-apply reattach.
+/// `end_ns` closes when the module re-attaches, else the projection
+/// reads it open-ended at capture end. `slots` counts the live
+/// attached slots that went down (scope, never a missed-call count).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoverageRetireWindow {
+    modules: BTreeSet<plan::ModuleId>,
+    start_ns: u64,
+    end_ns: Option<u64>,
+    slots: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -14256,6 +14276,7 @@ impl Engine {
             pid_descendant_gaps: 0,
             run_tree_handed_back: 0,
             multi_rebuild_gaps: 0,
+            coverage_retire_windows: Vec::new(),
             admitted_cgroup_views: BTreeMap::new(),
             admitted_cgroup_pid_counts: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
@@ -15710,6 +15731,15 @@ impl Engine {
 
     pub(crate) fn multi_rebuild_gaps(&self) -> u64 {
         self.multi_rebuild_gaps
+    }
+
+    /// Live attached counting slots retired mid-capture across every
+    /// coverage-retire window (scope, never a missed-call count).
+    pub(crate) fn coverage_retired_slots(&self) -> u64 {
+        self.coverage_retire_windows
+            .iter()
+            .map(|window| window.slots)
+            .sum()
     }
 
     /// Whether the scope is the whole machine: only then does a pass see

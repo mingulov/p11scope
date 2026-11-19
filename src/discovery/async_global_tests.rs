@@ -1495,3 +1495,187 @@ fn async_global_pending_refresh_keeps_a_learned_staging_unapplied() {
         "no candidate applied, so the staging is still unapplied"
     );
 }
+
+/// A mid-capture global retirement of live counting cover opens a
+/// `coverage_retired` unobserved window on the affected record, files the
+/// paired finite gap row, and counts the retired live slots: the detach
+/// interval is disclosed instead of silently losing calls. The peer
+/// module's same-apply attach must not suppress module one's window.
+#[test]
+fn async_global_live_retire_opens_a_counted_coverage_window() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut candidate = peer_candidate(&mut engine, &modules);
+    candidate
+        .delta
+        .retire
+        .push(engine.plan.slots[0].clone());
+    candidate.plan.deactivate(0);
+    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    assert!(
+        !retired_modules.is_empty(),
+        "the retired slot names its module"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(
+        !outcome.detach_failed,
+        "premise: the scripted detach commits"
+    );
+    assert!(
+        !engine.plan.is_active(0),
+        "premise: the retired slot leaves the active plan"
+    );
+    assert_eq!(
+        engine.coverage_retire_windows.len(),
+        1,
+        "one window opens for the retired live cover"
+    );
+    let window = &engine.coverage_retire_windows[0];
+    assert_eq!(window.modules, retired_modules);
+    assert_eq!(window.slots, 1);
+    assert!(window.start_ns > 0);
+    assert_eq!(window.end_ns, None, "nothing revived it yet");
+    assert_eq!(engine.coverage_retired_slots(), 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == crate::render::COVERAGE_RETIRED_SUBJECT
+                && skip.reason == crate::render::COVERAGE_RETIRED_REASON
+        }),
+        "the paired finite gap row files: {:?}",
+        engine.counters.object_skips
+    );
+    let facts = engine.capture_facts();
+    let record = facts
+        .discovery
+        .modules
+        .iter()
+        .find(|record| retired_modules.contains(&record.id))
+        .expect("the retired module projects a record");
+    let windows = record
+        .unobserved_windows
+        .as_ref()
+        .expect("the record discloses its retire window");
+    assert!(
+        windows.iter().any(|window| {
+            window.reason == crate::render::UnobservedReason::CoverageRetired
+                && window.start_ns > 0
+                && window.end_ns >= window.start_ns
+        }),
+        "a coverage_retired window with sane bounds: {windows:?}"
+    );
+}
+
+/// Re-attaching a retired module closes its coverage window at the
+/// revival instant instead of stretching it to capture end.
+#[test]
+fn async_global_revived_module_closes_its_coverage_window() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut candidate = peer_candidate(&mut engine, &modules);
+    candidate
+        .delta
+        .retire
+        .push(engine.plan.slots[0].clone());
+    candidate.plan.deactivate(0);
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert_eq!(
+        engine.coverage_retire_windows.len(),
+        1,
+        "premise: the retire opened its window"
+    );
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules[..1]));
+    let revive =
+        engine.live_candidate(pins, vec![modules[0].clone()], skipped);
+    let revive = revive.expect("the intact pins offer a revive candidate");
+    assert!(
+        !revive.delta.new.is_empty() || !revive.delta.replace.is_empty(),
+        "premise: the revive re-attaches module one"
+    );
+    let mut additions = true;
+    engine
+        .apply_candidate(&mut session, revive, &mut additions, false, &[])
+        .unwrap();
+    assert_eq!(
+        engine.coverage_retire_windows.len(),
+        1,
+        "reviving closes the window instead of opening another"
+    );
+    let window = &engine.coverage_retire_windows[0];
+    let end = window.end_ns.expect("the revive stamps the window end");
+    assert!(
+        end >= window.start_ns,
+        "the closed window keeps sane bounds"
+    );
+}
+
+/// Retiring a dead owner's slots (ended-PID path) opens no coverage
+/// window: the dead process can run no calls, so there is no gap.
+#[test]
+fn async_global_ended_pid_retire_opens_no_coverage_window() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .group_all();
+    let slots = engine.plan.slots.clone();
+    assert!(
+        slots.len() >= 2,
+        "the route needs a kept and a retired slot"
+    );
+    let retired = slots[1..].to_vec();
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let owner = engine.views.remove(0);
+    let proof = session
+        .prepare_ended_pid_retirement(&owner, &slots)
+        .unwrap();
+    let ended = PendingEndedPidRetirement { owner, proof };
+    let mut plan = engine.plan.clone();
+    for slot in &retired {
+        plan.deactivate(slot.index);
+    }
+    let candidate = LiveCandidate {
+        pinned: engine.pinned.clone(),
+        modules: Vec::new(),
+        plan,
+        delta: crate::plan::AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: retired,
+        },
+        views: std::collections::BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: std::collections::BTreeMap::new(),
+        selection_tables: engine.selection_tables.clone(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: std::collections::BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    };
+    let outcome = engine
+        .apply_candidate_with_ended(&mut session, candidate, &mut true, true, &[], Some(&ended))
+        .unwrap();
+    assert!(
+        !outcome.detach_failed,
+        "premise: the ended detach commits"
+    );
+    assert!(
+        engine.coverage_retire_windows.is_empty(),
+        "a dead owner's retire files no window"
+    );
+    assert_eq!(engine.coverage_retired_slots(), 0);
+}

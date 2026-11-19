@@ -1129,6 +1129,12 @@ pub enum UnobservedReason {
     HealthLoss,
     /// Scope membership was uncertain over the tail interval.
     ScopeUncertain,
+    /// Live counting cover was retired over the interval (a mid-capture
+    /// global retirement detached attached counting probes with no
+    /// same-apply reattach): calls in it were not observed. The paired
+    /// `coverage_retired_slots` count names how many live slots went
+    /// down; the window itself never estimates missed calls.
+    CoverageRetired,
 }
 
 /// One explicitly unobserved interval on a discovery module record. Key
@@ -1971,6 +1977,13 @@ const DISCOVERY_SUBJECT: &str = "discovery subject";
 /// Run-tree scope gaps file under this subject with finite reasons
 /// (schema v3): the survivor count rides in
 /// `evidence.run_tree_handed_back`, never in the reason.
+/// Counting-coverage retirements file under this subject with one finite
+/// reason (schema v3): the affected-slot count rides in
+/// `evidence.coverage_retired_slots`, the interval in the record's
+/// `coverage_retired` unobserved window, never in the reason.
+pub(crate) const COVERAGE_RETIRED_SUBJECT: &str = "counting coverage";
+pub(crate) const COVERAGE_RETIRED_REASON: &str =
+    "counting probes were retired mid-capture; calls in the retire window were not observed";
 pub(crate) const RUN_TREE_SUBJECT: &str = "run process tree";
 pub(crate) const RUN_TREE_SURVIVORS: &str = "process-tree members were still present when the command exited; their calls after the run end are out of scope";
 pub(crate) const RUN_TREE_DEGRADED: &str = "only the started command is observed";
@@ -2348,6 +2361,36 @@ fn run_tree_gaps_project_under_their_own_subject_with_finite_reasons() {
         assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
         let json = serde_json::to_string(&projected).unwrap();
         assert!(!json.contains("permission denied"), "{json}");
+    }
+}
+
+/// Counting-coverage retirements project under their own subject with
+/// their finite reason intact; anything else under the subject fails
+/// closed to the generic discovery skip instead of breaking the closed
+/// vocabulary.
+#[cfg(test)]
+#[test]
+fn coverage_retired_gaps_project_under_their_own_subject_with_finite_reason() {
+    let projected = capture_skipped_out(&Skipped {
+        subject: COVERAGE_RETIRED_SUBJECT.into(),
+        reason: COVERAGE_RETIRED_REASON.into(),
+    });
+    assert_eq!(projected.name, COVERAGE_RETIRED_SUBJECT);
+    assert_eq!(projected.reason, COVERAGE_RETIRED_REASON);
+    let json = serde_json::to_string(&projected).unwrap();
+    assert!(!json.contains("discovery unavailable"), "{json}");
+    for reason in [
+        "counting probes were retired: /opt/secret/provider.so (os error 13)",
+        "anything else under this subject",
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: COVERAGE_RETIRED_SUBJECT.into(),
+            reason: reason.into(),
+        });
+        assert_eq!(projected.name, "discovery subject", "{reason}");
+        assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("secret"), "{json}");
     }
 }
 

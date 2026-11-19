@@ -22,9 +22,9 @@ use crate::discovery::identity::test_fixture::{
     view_pin as overlay_view_pin,
 };
 use crate::discovery::identity::{
-    ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object, pin_manifest_objects,
-    pin_manifest_objects_deferred, pin_scanned_objects, pin_scanned_view_objects,
-    reconcile_scanned_modules,
+    ManifestStaleReason, PIN_WAIT_SUBJECT, PinnedObjectId, ReconciledModule, open_view_object,
+    pin_manifest_objects, pin_manifest_objects_deferred, pin_scanned_objects,
+    pin_scanned_view_objects, reconcile_scanned_modules,
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
@@ -13267,14 +13267,19 @@ fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
             .ids_for_view(ProcessViewId(0))
             .is_empty()
     );
+    // Healable budget pressure defers the pin (named cause, pending
+    // retry on a fresh budget) instead of refusing it: a refusal would
+    // reject the loader key, nuking every member's loader arming under
+    // churn (a global pause/learn blackout for transient pressure).
     let exact_pin_reason = format!("cannot read pid {pid}'s mount table: {IO_CEILING_REASON}");
+    let deferred_pin_reason = format!("{loader_subject}: {exact_pin_reason}");
     assert!(
-        pin_engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| { skip.subject == loader_subject && skip.reason == exact_pin_reason }),
-        "missing pin skip ({loader_subject:?}, {exact_pin_reason:?}) in {:?} (L={locator_bytes}, pin_cut={pin_cut})",
+        pin_engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == PIN_WAIT_SUBJECT
+                && skip.reason.starts_with(&deferred_pin_reason)
+                && skip.reason.contains("waits for the next tick")
+        }),
+        "missing deferred pin skip ({loader_subject:?}, {deferred_pin_reason:?}) in {:?} (L={locator_bytes}, pin_cut={pin_cut})",
         pin_engine.counters.object_skips
     );
     assert_named_io_cause(&pin_engine);

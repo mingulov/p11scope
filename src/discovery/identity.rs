@@ -11107,12 +11107,26 @@ fn pin_scanned_object(
                 // views keep refusing (fail closed where forgery evidence
                 // is possible).
                 Err(PinFailure::Gone { reason })
-            } else if crate::discovery::scan::names_capture_budget_stop(&reason) {
-                // Budget pressure is transient resource exhaustion, like
-                // handle exhaustion — never file evidence. Wait for a
-                // fresh budget instead of rejecting the key, so a
-                // starved tick cannot nuke every live view's coverage.
-                Err(PinFailure::Wait { reason })
+            } else if crate::discovery::scan::names_capture_budget_stop(&reason)
+                && !reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON)
+            {
+                // Healable budget pressure (a starved tick under a live
+                // cap) is transient resource exhaustion, like handle
+                // exhaustion — never file evidence. Wait for a fresh
+                // budget instead of rejecting the key, so a starved
+                // tick cannot nuke every live view's coverage. A zero
+                // cap can never heal, so it refuses (fail fast,
+                // named); an explicit collection stop is respected,
+                // never retried.
+                let limits = budget.limits();
+                let futile = limits.total_bytes == 0
+                    || limits.per_object_bytes == 0
+                    || budget.work_ceiling() == 0;
+                if futile {
+                    Err(PinFailure::Refused(reason))
+                } else {
+                    Err(PinFailure::Wait { reason })
+                }
             } else {
                 Err(PinFailure::Refused(reason))
             }
@@ -14773,9 +14787,17 @@ mod tests {
         assert_eq!(budget.stopped_reason(), Some(SCAN_DEADLINE_REASON));
         assert_eq!(pinned.pinned().count(), 0);
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].subject, module.path);
+        // An expired per-tick deadline defers the pin (named cause,
+        // pending retry on a fresh deadline) instead of refusing it: a
+        // refusal would reject the key, nuking live views' verified
+        // coverage for transient time pressure.
+        assert_eq!(skipped[0].subject, PIN_WAIT_SUBJECT);
         assert!(
             skipped[0].reason.contains(SCAN_DEADLINE_REASON),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped[0].reason.contains("waits for the next tick"),
             "{skipped:?}"
         );
 
@@ -17147,6 +17169,34 @@ mod tests {
     /// handle exhaustion does — never refuse (refusals reject the whole
     /// key, silently dropping every live view's coverage of the file
     /// under churn).
+    /// Twin: a budget refusal against a zero cap is futile, not
+    /// transient — no fresh pass can ever admit it — so it refuses
+    /// (fail fast, named) instead of waiting forever in limbo.
+    #[test]
+    fn futile_zero_cap_budget_refusal_still_refuses() {
+        let view = ProcessView::open(ProcessViewId(9), std::process::id()).unwrap();
+        let (path, key) = maps_libc_line(std::process::id());
+        let mut module = module(key);
+        module.path = path;
+        let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+        let mut mounts = MountTableCache::default();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(0);
+        let outcome = pin_scanned_object(
+            &view,
+            raw,
+            None,
+            None,
+            &|_| Err("test pinned identity never runs on a stopped budget".into()),
+            &mut mounts,
+            &mut budget,
+        );
+        assert!(
+            matches!(outcome, Err(PinFailure::Refused(_))),
+            "a zero work cap can never heal, so it must refuse (fail fast): {:?}",
+            outcome.as_ref().map(|_| ()),
+        );
+    }
+
     #[test]
     fn budget_exhausted_pin_failure_waits_instead_of_refusing() {
         let view = ProcessView::open(ProcessViewId(9), std::process::id()).unwrap();
@@ -17155,7 +17205,10 @@ mod tests {
         module.path = path;
         let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
         let mut mounts = MountTableCache::default();
-        let mut budget = CaptureWorkBudget::with_work_ceiling(0);
+        // Healable exhaustion: a live cap already spent (the next pass
+        // brings a fresh budget), not a zero cap that can never admit.
+        let mut budget = CaptureWorkBudget::with_work_ceiling(1);
+        assert!(budget.charge(1));
         let outcome = pin_scanned_object(
             &view,
             raw,

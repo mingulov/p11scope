@@ -2516,14 +2516,16 @@ mod tests {
     }
 
     /// A scripted self-mapping probe (see `p11scope_manifest::identity`):
-    /// `overlay` answers the overlayfs question and `key` answers the
-    /// kernel-rendered maps key, counting both consultations. Real
-    /// overlayfs is unmountable without privileges, so unit tests script
-    /// the kernel side of the pre-6.8 split.
+    /// `overlay`/`btrfs` answer the filesystem questions and `key` answers
+    /// the kernel-rendered maps key, counting consultations. Real
+    /// overlayfs/btrfs splits are unmountable without privileges, so unit
+    /// tests script the kernel side.
     struct FakeSelfMappingProbe {
         overlay: bool,
+        btrfs: bool,
         key: Option<ObjectKey>,
         overlay_checks: std::cell::Cell<usize>,
+        btrfs_checks: std::cell::Cell<usize>,
         probes: std::cell::Cell<usize>,
     }
 
@@ -2531,8 +2533,10 @@ mod tests {
         fn new(overlay: bool, key: Option<ObjectKey>) -> Self {
             Self {
                 overlay,
+                btrfs: false,
                 key,
                 overlay_checks: std::cell::Cell::new(0),
+                btrfs_checks: std::cell::Cell::new(0),
                 probes: std::cell::Cell::new(0),
             }
         }
@@ -2542,6 +2546,11 @@ mod tests {
         fn fd_is_on_overlayfs(&self, _file: &File) -> bool {
             self.overlay_checks.set(self.overlay_checks.get() + 1);
             self.overlay
+        }
+
+        fn fd_is_on_btrfs(&self, _file: &File) -> bool {
+            self.btrfs_checks.set(self.btrfs_checks.get() + 1);
+            self.btrfs
         }
 
         fn kernel_maps_key(

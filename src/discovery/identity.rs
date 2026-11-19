@@ -7886,10 +7886,11 @@ pub fn retained_object_key(
 }
 
 /// Maps identity for the retained interpreter before the owned child maps it.
-/// On pre-6.8 overlayfs the mountinfo/fd key can differ from the key the
-/// kernel later reports for the loader hook. Ask the existing bounded,
-/// read-only self-mapping probe about this exact retained descriptor once;
-/// an inconclusive overlay probe cannot authorize the future mapping.
+/// On pre-6.8 overlayfs — and on btrfs, which splits the same way — the
+/// mountinfo/fd key can differ from the key the kernel later reports for
+/// the loader hook. Ask the existing bounded, read-only self-mapping
+/// probe about this exact retained descriptor once; an inconclusive
+/// probe cannot authorize the future mapping.
 pub(crate) fn preexec_object_key(
     view: &ProcessView,
     file: &std::fs::File,
@@ -7905,7 +7906,7 @@ fn preexec_object_key_with(
     probe: &impl SelfMappingProbe,
 ) -> Result<ObjectKey, String> {
     let fd_key = retained_object_key(view, file, budget)?;
-    if !probe.fd_is_on_overlayfs(file) {
+    if !probe.fd_is_on_overlayfs(file) && !probe.fd_is_on_btrfs(file) {
         return Ok(fd_key);
     }
     probe
@@ -11803,14 +11804,16 @@ pub(crate) mod test_fixture {
         pins
     }
 
-    /// A scripted self-mapping probe: `overlay` answers the overlayfs
-    /// question and `key` answers the kernel-rendered maps key, counting both
-    /// consultations. Real overlayfs is unmountable without privileges, so
-    /// unit tests script the kernel side of the split.
+    /// A scripted self-mapping probe: `overlay`/`btrfs` answer the
+    /// filesystem questions and `key` answers the kernel-rendered maps key,
+    /// counting consultations. Real overlayfs/btrfs splits are unmountable
+    /// without privileges, so unit tests script the kernel side.
     pub(crate) struct FakeSelfMappingProbe {
         pub(crate) overlay: bool,
+        pub(crate) btrfs: bool,
         pub(crate) key: Option<ObjectKey>,
         pub(crate) overlay_checks: std::cell::Cell<usize>,
+        pub(crate) btrfs_checks: std::cell::Cell<usize>,
         pub(crate) probes: std::cell::Cell<usize>,
     }
 
@@ -11818,8 +11821,21 @@ pub(crate) mod test_fixture {
         pub(crate) fn new(overlay: bool, key: Option<ObjectKey>) -> Self {
             Self {
                 overlay,
+                btrfs: false,
                 key,
                 overlay_checks: std::cell::Cell::new(0),
+                btrfs_checks: std::cell::Cell::new(0),
+                probes: std::cell::Cell::new(0),
+            }
+        }
+
+        pub(crate) fn new_btrfs(key: Option<ObjectKey>) -> Self {
+            Self {
+                overlay: false,
+                btrfs: true,
+                key,
+                overlay_checks: std::cell::Cell::new(0),
+                btrfs_checks: std::cell::Cell::new(0),
                 probes: std::cell::Cell::new(0),
             }
         }
@@ -11829,6 +11845,11 @@ pub(crate) mod test_fixture {
         fn fd_is_on_overlayfs(&self, _file: &std::fs::File) -> bool {
             self.overlay_checks.set(self.overlay_checks.get() + 1);
             self.overlay
+        }
+
+        fn fd_is_on_btrfs(&self, _file: &std::fs::File) -> bool {
+            self.btrfs_checks.set(self.btrfs_checks.get() + 1);
+            self.btrfs
         }
 
         fn kernel_maps_key(
@@ -14046,6 +14067,30 @@ mod tests {
             maps_key,
             "the live loader record will name the maps identity, not the overlay fd device"
         );
+    }
+
+    /// A retained pre-exec interpreter on btrfs splits like an old
+    /// overlayfs one: its fd key must not become the live hook key
+    /// without the kernel proof.
+    #[test]
+    fn preexec_loader_key_uses_the_exact_kernel_maps_identity_on_btrfs() {
+        let (_dir, file) = probe_tempfile();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let maps_key = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 23,
+            },
+            inode: 712_355,
+        };
+        let probe = FakeSelfMappingProbe::new_btrfs(Some(maps_key));
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            preexec_object_key_with(&view, &file, &mut budget, &probe).unwrap(),
+            maps_key,
+            "the live loader record will name the maps identity, not the btrfs fd device"
+        );
+        assert_eq!(probe.probes.get(), 1, "btrfs consults the kernel probe");
     }
 
     #[test]

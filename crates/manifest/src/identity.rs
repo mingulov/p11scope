@@ -413,6 +413,11 @@ pub fn hex(bytes: &[u8]) -> String {
 /// helper passes [`UnboundedProbeBudget`].
 #[cfg(feature = "identify")]
 pub const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+/// Btrfs `f_type`: files reached directly (not through overlay) whose
+/// mount-table device can differ from the maps-rendered device, like the
+/// overlay split, so the same self-mapping proof applies.
+#[cfg(feature = "identify")]
+pub const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 
 /// The accounting surface the probe's `/proc/self/maps` read charges. The
 /// observer adapts `CaptureWorkBudget` 1:1 (deadline, per-chunk and per-line
@@ -459,6 +464,11 @@ impl ProbeBudget for UnboundedProbeBudget {
 pub trait SelfMappingProbe {
     /// Whether `file` was reached through an overlay mount (`fstatfs` magic).
     fn fd_is_on_overlayfs(&self, file: &std::fs::File) -> bool;
+    /// Whether `file` was reached directly on btrfs (`fstatfs` magic, not
+    /// through overlay: overlay reports its own magic). Like overlay, the
+    /// mount-table device can differ from the maps rendering, so the same
+    /// proof applies.
+    fn fd_is_on_btrfs(&self, file: &std::fs::File) -> bool;
     /// How the kernel renders `file` in `/proc` maps: one private read-only
     /// page of the fd, then its own maps line. `None` is inconclusive and
     /// always refuses. The read is charged to `budget` and stops at the
@@ -478,6 +488,10 @@ pub struct KernelSelfMappingProbe;
 impl SelfMappingProbe for KernelSelfMappingProbe {
     fn fd_is_on_overlayfs(&self, file: &std::fs::File) -> bool {
         fd_is_on_overlayfs(file)
+    }
+
+    fn fd_is_on_btrfs(&self, file: &std::fs::File) -> bool {
+        fd_is_on_btrfs(file)
     }
 
     fn kernel_maps_key(
@@ -506,6 +520,23 @@ pub fn fd_is_on_overlayfs(file: &std::fs::File) -> bool {
     #[allow(clippy::unnecessary_cast)]
     unsafe {
         buf.assume_init().f_type as u64 == OVERLAYFS_SUPER_MAGIC
+    }
+}
+
+/// Whether `file` was reached directly on btrfs (`fstatfs` magic). Through
+/// overlay the magic reads overlay, never btrfs, so the two answers are
+/// exclusive in practice. Fail-closed like the overlay check.
+#[cfg(feature = "identify")]
+pub fn fd_is_on_btrfs(file: &std::fs::File) -> bool {
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fstatfs` fills `buf` for a valid fd and is only read on success.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), buf.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: the successful `fstatfs` above initialized `buf`.
+    #[allow(clippy::unnecessary_cast)]
+    unsafe {
+        buf.assume_init().f_type as u64 & 0xffff_ffff == BTRFS_SUPER_MAGIC
     }
 }
 
@@ -634,7 +665,7 @@ pub fn opened_file_matches_maps(
     if fd_key == maps_key {
         return true;
     }
-    if !probe.fd_is_on_overlayfs(file) {
+    if !probe.fd_is_on_overlayfs(file) && !probe.fd_is_on_btrfs(file) {
         return false;
     }
     if !has_mappable_bytes(file) {
@@ -655,9 +686,9 @@ pub fn opened_file_matches_maps(
 pub enum SelfMappedFallback {
     /// The kernel renders this exact fd at a different key: retry there.
     Split(ObjectKey),
-    /// The rendering agrees with the fd key, or no split is possible (not
-    /// overlayfs, or no mappable bytes to render): no retry, nothing to
-    /// disclose.
+    /// The rendering agrees with the fd key, or no split is possible (neither
+    /// overlayfs nor btrfs, or no mappable bytes to render): no retry, nothing
+    /// to disclose.
     Agrees,
     /// The fd may split but the probe could not decide (budget spent, mmap
     /// or maps read failed): no retry, and the pin discloses it.
@@ -674,7 +705,7 @@ pub fn self_mapped_fallback_detailed(
     budget: &mut dyn ProbeBudget,
     probe: &impl SelfMappingProbe,
 ) -> SelfMappedFallback {
-    if !probe.fd_is_on_overlayfs(file) {
+    if !probe.fd_is_on_overlayfs(file) && !probe.fd_is_on_btrfs(file) {
         return SelfMappedFallback::Agrees;
     }
     if !has_mappable_bytes(file) {
@@ -687,8 +718,8 @@ pub fn self_mapped_fallback_detailed(
     }
 }
 
-/// The maps key to retry a snapshot with when an overlay fd's own key found
-/// no mapping: `None` unless the kernel renders this exact fd at a
+/// The maps key to retry a snapshot with when an overlay or btrfs fd's own key
+/// found no mapping: `None` unless the kernel renders this exact fd at a
 /// *different* key, so a pointless same-key retry never runs.
 #[cfg(feature = "identify")]
 pub fn self_mapped_fallback_key(
@@ -883,14 +914,16 @@ mod tests {
         );
     }
 
-    /// A scripted self-mapping probe: `overlay` answers the overlayfs
-    /// question and `key` answers the kernel-rendered maps key, counting both
-    /// consultations. Real overlayfs is unmountable without privileges, so
-    /// unit tests script the kernel side of the split.
+    /// A scripted self-mapping probe: `overlay`/`btrfs` answer the
+    /// filesystem questions and `key` answers the kernel-rendered maps key,
+    /// counting consultations. Real overlayfs/btrfs splits are unmountable
+    /// without privileges, so unit tests script the kernel side.
     struct FakeSelfMappingProbe {
         overlay: bool,
+        btrfs: bool,
         key: Option<ObjectKey>,
         overlay_checks: Cell<usize>,
+        btrfs_checks: Cell<usize>,
         probes: Cell<usize>,
     }
 
@@ -898,8 +931,21 @@ mod tests {
         fn new(overlay: bool, key: Option<ObjectKey>) -> Self {
             Self {
                 overlay,
+                btrfs: false,
                 key,
                 overlay_checks: Cell::new(0),
+                btrfs_checks: Cell::new(0),
+                probes: Cell::new(0),
+            }
+        }
+
+        fn new_btrfs(key: Option<ObjectKey>) -> Self {
+            Self {
+                overlay: false,
+                btrfs: true,
+                key,
+                overlay_checks: Cell::new(0),
+                btrfs_checks: Cell::new(0),
                 probes: Cell::new(0),
             }
         }
@@ -909,6 +955,11 @@ mod tests {
         fn fd_is_on_overlayfs(&self, _file: &std::fs::File) -> bool {
             self.overlay_checks.set(self.overlay_checks.get() + 1);
             self.overlay
+        }
+
+        fn fd_is_on_btrfs(&self, _file: &std::fs::File) -> bool {
+            self.btrfs_checks.set(self.btrfs_checks.get() + 1);
+            self.btrfs
         }
 
         fn kernel_maps_key(
@@ -1360,6 +1411,94 @@ mod tests {
         assert_eq!(
             KernelSelfMappingProbe.kernel_maps_key(&file, &mut budget),
             None
+        );
+    }
+
+    /// Btrfs mount-table identity for one file: the measured `0:35`
+    /// rendering of a provider copy whose maps line reads `00:23`.
+    fn btrfs_fd_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 35,
+            },
+            inode: INODE,
+        }
+    }
+
+    /// Btrfs maps-rendered identity for the same file: the measured
+    /// `00:23` rendering of the `btrfs_fd_key` mount-table identity.
+    fn btrfs_maps_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 23,
+            },
+            inode: INODE,
+        }
+    }
+
+    /// Btrfs splits file identity like pre-6.8 overlayfs (the
+    /// mount-table device can differ from the maps rendering), so the
+    /// same kernel proof applies. Table over the split matrix with a
+    /// scripted probe, through all three consultation sites.
+    #[test]
+    fn btrfs_split_identity_consults_the_kernel_probe_like_overlay() {
+        let (_dir, file) = probe_tempfile("btrfs");
+        let mut budget = UnboundedProbeBudget;
+        // (scripted rendering, match verdict, fallback key, fallback detail)
+        for (key, matches, fallback, detailed) in [
+            (
+                Some(btrfs_maps_key()),
+                true,
+                Some(btrfs_maps_key()),
+                SelfMappedFallback::Split(btrfs_maps_key()),
+            ),
+            (
+                Some(btrfs_fd_key()),
+                false,
+                None,
+                SelfMappedFallback::Agrees,
+            ),
+            (None, false, None, SelfMappedFallback::Inconclusive),
+        ] {
+            let probe = FakeSelfMappingProbe::new_btrfs(key);
+            assert_eq!(
+                opened_file_matches_maps(
+                    &file,
+                    btrfs_fd_key(),
+                    btrfs_maps_key(),
+                    &mut budget,
+                    &probe
+                ),
+                matches,
+                "match verdict for rendering {key:?}"
+            );
+            assert_eq!(
+                self_mapped_fallback_key(&file, btrfs_fd_key(), &mut budget, &probe),
+                fallback,
+                "fallback key for rendering {key:?}"
+            );
+            assert_eq!(
+                self_mapped_fallback_detailed(&file, btrfs_fd_key(), &mut budget, &probe),
+                detailed,
+                "fallback detail for rendering {key:?}"
+            );
+            assert_eq!(probe.probes.get(), 3, "every site consults for {key:?}");
+        }
+        // Neither filesystem splits: no consultation at all.
+        let probe = FakeSelfMappingProbe::new(false, Some(btrfs_maps_key()));
+        assert!(!opened_file_matches_maps(
+            &file,
+            btrfs_fd_key(),
+            btrfs_maps_key(),
+            &mut budget,
+            &probe,
+        ));
+        assert_eq!(probe.probes.get(), 0);
+        assert_eq!(
+            self_mapped_fallback_detailed(&file, btrfs_fd_key(), &mut budget, &probe),
+            SelfMappedFallback::Agrees
         );
     }
 }

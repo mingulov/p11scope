@@ -3384,6 +3384,39 @@ fn key_ops_verbose_row_detail() {
     );
 }
 
+/// `-v` per-row detail is bounded: past the cap the block names the
+/// hidden rows instead of printing one line per row.
+#[test]
+fn key_ops_verbose_row_detail_caps_with_a_more_line() {
+    let mut observations = populated(9);
+    for object in 0..40u64 {
+        observations.key_operations.push(key_row_inferred(
+            object,
+            "sign",
+            "key",
+            1,
+            "unknown",
+            inferred_rsa_2048(1),
+        ));
+    }
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&snapshot);
+    let shown = block
+        .iter()
+        .filter(|line| line.contains("key row "))
+        .count();
+    assert_eq!(shown, 32, "per-row detail is bounded:\n{snapshot}");
+    assert!(
+        block
+            .iter()
+            .any(|line| line.contains("and 8 more key rows")),
+        "the overflow names the hidden rows:\n{snapshot}"
+    );
+}
+
 /// `-v` conflict, unknown-reason, `+N more`, secret-key and XEdDSA
 /// fragments.
 #[test]

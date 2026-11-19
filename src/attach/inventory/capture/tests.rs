@@ -5893,6 +5893,318 @@ fn info_ring_loss_routes_to_evidence_not_lifecycle() {
     assert_eq!(book.ring_loss, 3);
 }
 
+/// Keymeta Task 7 retry bound (spec §17.4, INV-2): one table over
+/// the Singles retry's visit accounting. Every row parks through
+/// the real extend path, drives `retry_info_returns` directly with
+/// a counting clock, and pins the clock samples spent, the yield
+/// point and the outcome: a clean link, a pre-work expiry that
+/// touches nothing, an EMFILE head that re-parks and stops, and
+/// the allowance spent at the 65th pop.
+#[test]
+fn info_retry_budget_table_pins_singles_charges_and_yields() {
+    use std::cell::Cell;
+    // Park `count` info endpoints as Singles (EMFILE, then
+    // cleared): the harness holds that many pendings. The fixture
+    // stays alive beside the harness: dropping it deletes the temp
+    // provider files and the pin check fails the retry.
+    fn park_singles(count: u32) -> (SetFixture, Harness) {
+        let mut fixture = SetFixture::new(128);
+        let entries: Vec<(&'static str, u64)> = (0..count)
+            .map(|n| ("C_GetTokenInfo", 0x1000 + u64::from(n) * 0x10))
+            .collect();
+        let delta = absorb_named(&mut fixture, "a.so", &entries);
+        assert_eq!(delta.endpoints.len(), count as usize);
+        let mut harness = Harness::new(128, None);
+        for endpoint in &delta.endpoints {
+            harness.io.emfile_returns.insert(endpoint.id.0);
+        }
+        let first = harness.extend(delta, &fixture.set);
+        assert_eq!(first.info_return_deferred, u64::from(count));
+        assert_eq!(harness.book.info_return_pending.len(), count as usize);
+        match &harness.book.info_return_pending[0] {
+            InfoReturnPending::Singles(parked) => assert!(
+                parked.info_kind.is_some(),
+                "a parked Single keeps its info kind"
+            ),
+            InfoReturnPending::Multi { .. } => panic!("Singles park as Singles"),
+        }
+        harness.io.emfile_returns.clear();
+        (fixture, harness)
+    }
+    // (parked, expired, emfile_head, expect_linked, expect_pending,
+    // expect_calls): the full Singles bound matrix.
+    for (parked, expired, emfile_head, expect_linked, expect_pending, expect_calls) in [
+        (1u32, false, false, 1usize, 0usize, 2usize),
+        (1, true, false, 0, 1, 1),
+        (2, false, true, 0, 2, 2),
+        (65, false, false, 64, 1, 66),
+    ] {
+        let (_fixture, mut harness) = park_singles(parked);
+        if emfile_head {
+            harness.io.emfile_returns.insert(0);
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let fixed = if expired {
+            deadline + Duration::from_secs(1)
+        } else {
+            deadline - Duration::from_secs(1)
+        };
+        let calls = Cell::new(0usize);
+        let mut clock = || {
+            calls.set(calls.get() + 1);
+            fixed
+        };
+        let mut receipt = ExtendReceipt::default();
+        retry_info_returns(
+            &mut harness.io,
+            &mut harness.targets,
+            &mut harness.links,
+            &mut harness.book,
+            &mut receipt,
+            deadline,
+            &mut clock,
+        );
+        let linked = harness
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::Return(_)))
+            .count();
+        assert_eq!(
+            linked,
+            expect_linked,
+            "row parked={parked} expired={expired} emfile_head={emfile_head}: links (failed={:?} pending={} refused={})",
+            receipt.failed,
+            harness.book.info_return_pending.len(),
+            harness.book.info_return_refused
+        );
+        assert_eq!(
+            harness.book.info_return_pending.len(),
+            expect_pending,
+            "row parked={parked} expired={expired} emfile_head={emfile_head}: pendings"
+        );
+        assert_eq!(
+            calls.get(),
+            expect_calls,
+            "row parked={parked} expired={expired} emfile_head={emfile_head}: clock samples"
+        );
+    }
+}
+
+/// Keymeta Task 7 retry bound (spec §17.4, INV-2): one table over
+/// the Multi retry's visit accounting. Every row parks one group
+/// through the real extend path, drives `retry_info_returns`
+/// directly with a counting clock, and pins the clock samples
+/// spent, the yield point and the storage outcome: a clean link,
+/// a 96-site filter yielding at the 64-visit allowance with its
+/// storage in place, revoked sites spending visits without
+/// linking, and a post-filter expiry requeueing the original
+/// vector, cursor and mask.
+#[test]
+fn info_retry_budget_table_pins_multi_charges_and_yields() {
+    use std::cell::Cell;
+    // Park one Multi group of `count` sites (EMFILE, then
+    // cleared): the harness holds that one pending group. The
+    // fixture stays alive beside the harness (see park_singles).
+    fn park_multi(count: u32) -> (SetFixture, Harness) {
+        let mut fixture = SetFixture::new(128);
+        let entries: Vec<(&'static str, u64)> = (0..count)
+            .map(|n| ("C_GetInfo", 0x1000 + u64::from(n) * 0x10))
+            .collect();
+        let delta = absorb_named(&mut fixture, "a.so", &entries);
+        assert_eq!(delta.endpoints.len(), count as usize);
+        let mut harness = Harness::multi(128, None);
+        for endpoint in &delta.endpoints {
+            harness.io.emfile_returns.insert(endpoint.id.0);
+        }
+        let first = harness.extend(delta, &fixture.set);
+        assert_eq!(first.info_return_deferred, 1);
+        assert_eq!(harness.book.info_return_pending.len(), 1);
+        harness.io.emfile_returns.clear();
+        (fixture, harness)
+    }
+    fn pending_sites(harness: &Harness) -> (usize, usize, usize) {
+        match &harness.book.info_return_pending[0] {
+            InfoReturnPending::Multi {
+                sites, validated, ..
+            } => (sites.len(), *validated, sites.as_ptr() as usize),
+            InfoReturnPending::Singles(_) => panic!("a Multi group stays a Multi group"),
+        }
+    }
+    struct Row {
+        sites: u32,
+        revoke: &'static [u32],
+        expire_after_filter: bool,
+        expect_linked: usize,
+        expect_pending: usize,
+        expect_validated: Option<usize>,
+        expect_calls: usize,
+    }
+    for row in [
+        Row {
+            sites: 3,
+            revoke: &[],
+            expire_after_filter: false,
+            expect_linked: 3,
+            expect_pending: 0,
+            expect_validated: None,
+            expect_calls: 6,
+        },
+        Row {
+            sites: 96,
+            revoke: &[],
+            expire_after_filter: false,
+            expect_linked: 0,
+            expect_pending: 1,
+            expect_validated: Some(64),
+            expect_calls: 66,
+        },
+        Row {
+            sites: 4,
+            revoke: &[0, 2],
+            expire_after_filter: false,
+            expect_linked: 2,
+            expect_pending: 0,
+            expect_validated: None,
+            expect_calls: 7,
+        },
+        Row {
+            sites: 5,
+            revoke: &[],
+            expire_after_filter: true,
+            expect_linked: 0,
+            expect_pending: 1,
+            expect_validated: Some(5),
+            expect_calls: 8,
+        },
+    ] {
+        let (_fixture, mut harness) = park_multi(row.sites);
+        for endpoint in row.revoke {
+            harness.book.info_revoked.insert(*endpoint);
+        }
+        let ptr_before = pending_sites(&harness).2;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let wide = deadline - Duration::from_secs(1);
+        let expired = deadline + Duration::from_secs(1);
+        // Wide through the pre-work check, the queue gate and every
+        // site visit, then expired at the post-filter recheck: the
+        // group requeues instead of attaching.
+        let wide_reads = 2 + row.sites as usize;
+        let calls = Cell::new(0usize);
+        let mut clock = || {
+            calls.set(calls.get() + 1);
+            if row.expire_after_filter && calls.get() > wide_reads {
+                expired
+            } else {
+                wide
+            }
+        };
+        let mut receipt = ExtendReceipt::default();
+        retry_info_returns(
+            &mut harness.io,
+            &mut harness.targets,
+            &mut harness.links,
+            &mut harness.book,
+            &mut receipt,
+            deadline,
+            &mut clock,
+        );
+        let returns: Vec<usize> = harness
+            .group_ops()
+            .into_iter()
+            .filter_map(|(program, ids)| (program == "p11_info_return").then_some(ids.len()))
+            .collect();
+        assert_eq!(
+            returns.iter().sum::<usize>(),
+            row.expect_linked,
+            "row sites={} revoke={:?}: linked members",
+            row.sites,
+            row.revoke
+        );
+        assert_eq!(
+            harness.book.info_return_pending.len(),
+            row.expect_pending,
+            "row sites={} revoke={:?}: pendings",
+            row.sites,
+            row.revoke
+        );
+        if let Some(validated) = row.expect_validated {
+            let (len, at, ptr_after) = pending_sites(&harness);
+            assert_eq!(
+                len, row.sites as usize,
+                "row sites={}: survivors",
+                row.sites
+            );
+            assert_eq!(at, validated, "row sites={}: cursor", row.sites);
+            assert_eq!(
+                ptr_after, ptr_before,
+                "row sites={}: the yield keeps the original site storage",
+                row.sites
+            );
+        }
+        assert_eq!(
+            calls.get(),
+            row.expect_calls,
+            "row sites={} revoke={:?}: clock samples",
+            row.sites,
+            row.revoke
+        );
+    }
+}
+
+/// Keymeta Task 7 retry bound (spec §17.4, INV-2): the retry
+/// consults one budget owner — a queue-gate poll, an unconditional
+/// post-gate charge, an atomic filter visit and a window-only
+/// recheck — and no raw allowance or clock comparison remains in
+/// its body. Six scattered rounds preceded this owner; the pin
+/// fails any seventh.
+#[test]
+fn info_retry_bound_has_one_owner() {
+    fn body_of(source: &str) -> &str {
+        source
+            .split_once("fn retry_info_returns<")
+            .expect("retry_info_returns exists")
+            .1
+            .split_once("\n}")
+            .expect("retry_info_returns ends")
+            .0
+    }
+    fn is_code(line: &str) -> bool {
+        !line.trim_start().starts_with("//")
+    }
+    fn contract(body: &str) -> bool {
+        let code: Vec<&str> = body.lines().filter(|line| is_code(line)).collect();
+        let has = |needle: &str| code.iter().any(|line| line.contains(needle));
+        has("budget.poll()")
+            && has("budget.charge()")
+            && has("budget.visit()")
+            && has("budget.window_open()")
+            && !code.iter().any(|line| line.contains("remaining"))
+            && !code.iter().any(|line| line.contains("now()"))
+    }
+    let source = include_str!("../capture.rs");
+    let body = body_of(source).to_string();
+    assert!(
+        contract(&body),
+        "retry_info_returns must consult one budget owner with no raw bound checks"
+    );
+    // A reintroduced raw allowance check must fail.
+    let tail = body.replacen("budget.poll()", "budget.poll() || remaining == 0", 1);
+    assert!(!contract(&tail), "a scattered allowance check");
+    // A reintroduced raw clock check must fail.
+    let tail = body.replacen(
+        "budget.window_open()",
+        "budget.window_open() && now() < deadline",
+        1,
+    );
+    assert!(!contract(&tail), "a scattered clock check");
+    // A bypassed filter visit must fail.
+    let tail = body.replace("budget.visit()", "true");
+    assert!(!contract(&tail), "a filter step outside the owner");
+    // A bypassed charge must fail.
+    let tail = body.replace("budget.charge()", "remaining -= 1");
+    assert!(!contract(&tail), "a charge outside the owner");
+}
+
 /// Keymeta Task 7 ring gate, drain half (5k zero-loss): five thousand
 /// writer-built records across token and mechanism rows flow through
 /// the bounded INFO service, decode, and join with no loss, no

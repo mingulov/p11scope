@@ -1930,10 +1930,12 @@ impl LiveJointMachine {
         // The re-arm consumed the latch; a later stop must not show its code.
         self.audit_refusal = None;
         self.audit_refusal_detail = None;
+        let call_word = if discarded_calls == 1 { "call" } else { "calls" };
+        let feed_word = if discarded_feeds == 1 { "feed" } else { "feeds" };
         coordinator.note_scope_gap(
             RUNNING_REARM_SUBJECT.to_string(),
             format!(
-                "{reason}; discarded {discarded_calls} staged calls from {discarded_feeds} feeds of the stuck session; per-key attribution unknown for those calls; healthy sessions keep staged proof and continue exact; processes started later are tracked"
+                "{reason}; discarded {discarded_calls} staged {call_word} from {discarded_feeds} {feed_word} of the stuck session; per-key attribution unknown for those calls; healthy sessions keep staged proof and continue exact; processes started later are tracked"
             ),
         );
         Some(published)

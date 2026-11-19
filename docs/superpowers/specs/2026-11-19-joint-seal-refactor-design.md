@@ -125,10 +125,12 @@ against code before implementation):
   (`converted_for`), or attributable only to, stuck keys wipe;
   entries attributable to a healthy live key stay;
 - image taint (`tainted_images`) stays per-image (fail-closed):
-  same-image sessions share taint fate. This is residual R1: the
-  stuck session must avoid destroy-overlap for full same-image
-  preservation (the RED test and the soak do); cross-image healthy
-  sessions are fully preserved regardless.
+  same-image sessions share taint fate. This is residual R1: a wiped
+  non-excused orphan (a stranded destroy is the sharp case) taints
+  the shared image, so the stuck session must avoid those for full
+  same-image preservation; excuse-eligible terminals (neutral, every
+  operation Init) never taint, and cross-image healthy sessions are
+  fully preserved regardless.
 
 Shared identity means shared fate at that level, never silent
 splitting; everything else is preserved bit-for-bit.
@@ -201,8 +203,13 @@ Two break kinds, distinguished by what was lost:
     closes them for reseed exactly like a stream void's delivery;
   - orphan terminals shed at claim time: a void-wiped BEGIN's late
     END routes to plain S1 under the Voided cause (never to a
-    staged orphan head), and neutral ones excuse at ingest (no
-    taint);
+    staged orphan head). At ingest, excuse-eligible wipes excuse
+    without tainting: neutral functions plus `Access` (which covers
+    every operation Init), `OperationImport` and `GetAttributes`;
+    any other wiped BEGIN's late END taints its image fail-closed
+    (per-image, like the destroy case below). A BEGIN the wipe
+    spares (healthy-claimant rule) matches its late terminal, which
+    completes into the fenced domain's disclosed fallback instead;
   - reseed clears pinned bootstrap cuts: a void-fenced image
     rebirthing above its fence replaces stale below-cut evidence
     (stream voids already clear at wipe time, so this is a no-op
@@ -210,8 +217,8 @@ Two break kinds, distinguished by what was lost:
 
 Fail-closed destroy is preserved with narrowed scope: a stranded
 destroy inside the stuck session still promotes to taint its own
-image; healthy BEGINs survive the scoped wipe, so healthy destroys
-match and never taint.
+image, as does any other wiped non-excused orphan; healthy BEGINs
+survive the scoped wipe, so healthy destroys match and never taint.
 
 ### 3.5 Bounded recovery: per-session discard with a counted named gap
 

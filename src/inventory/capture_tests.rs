@@ -1141,6 +1141,8 @@ impl Scene {
                         } else {
                             crate::inspect_system::MemberStatus::Scanned
                         },
+                        work_disposition:
+                            crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
                         objects: vec![0],
                         generation: Some(crate::inspect_system::MemberGeneration {
                             start_time: Some(*start),

@@ -8923,18 +8923,18 @@ pub(crate) fn newcomer_arrival_possible(
 /// Deep-scan selection with kernel threads excluded first: threads with
 /// no user address space never consume cap slots. Every excluded pid is
 /// counted on the pass budget's kernel-thread note, and the rest select
-/// by provider rarity — tiered by freshness when `scanned` is non-empty
-/// (groups holding never-scanned pids first, then all-scanned groups),
-/// pure rarity for an empty set. The three selection call sites (capture,
-/// system inspect, cgroup inventory) share this; the exclusion predicate
-/// above stays separately pinned.
+/// by provider rarity — tiered by the pass cursor's tiers when any member
+/// was recorded (groups holding never-scanned pids first, then
+/// all-scanned groups), pure rarity for empty tiers. The three selection
+/// call sites (capture, system inspect, cgroup inventory) share this; the
+/// exclusion predicate above stays separately pinned.
 pub(crate) fn select_excluding_kernel_threads(
     sweep: &SweepSnapshots,
     unavailable: &BTreeSet<u32>,
     proc_root: &Path,
     cap: usize,
     budget: &mut CaptureWorkBudget,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
 ) -> Vec<u32> {
     let excluded = kernel_thread_exclusions(sweep, unavailable, proc_root);
     for _ in &excluded {
@@ -8945,10 +8945,10 @@ pub(crate) fn select_excluding_kernel_threads(
         .filter(|(pid, _)| !excluded.contains(pid))
         .cloned()
         .collect();
-    if scanned.is_empty() {
+    if tiers.examined.is_empty() && tiers.retry.is_empty() && tiers.demoted.is_empty() {
         select_deep_scan_candidates(&eligible, cap)
     } else {
-        select_fresh_first_candidates(&eligible, cap, scanned)
+        select_fresh_first_candidates(&eligible, cap, tiers)
     }
 }
 
@@ -9029,16 +9029,19 @@ fn select_rotation_candidates(
 /// pure-rarity cut is still selected once earlier passes scanned the
 /// incumbents, so a stable sweep cannot starve it across passes. With
 /// nothing scanned this agrees with rarity selection exactly.
+/// Under-cap members order by the pass cursor: never-attempted first,
+/// then cut-short retries, then demoted members, then examined ones —
+/// so a budget cut lands on already-examined members first and the
+/// refused tail retries first next pass.
 pub(crate) fn select_fresh_first_candidates(
     sweep: &[(u32, Vec<MapEntry>)],
     max_pids: usize,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
 ) -> Vec<u32> {
     if sweep.len() <= max_pids {
-        let mut pids: Vec<u32> = sweep.iter().map(|(pid, _)| *pid).collect();
-        pids.sort_unstable();
-        return pids;
+        return tiers.order_under_cap(&sweep.iter().map(|(pid, _)| *pid).collect::<Vec<_>>());
     }
+    let scanned = tiers.scanned_equivalent();
     // Same exact-maps grouping and census as rarity selection.
     let mut groups: BTreeMap<BTreeSet<ObjectKey>, Vec<u32>> = BTreeMap::new();
     let mut unmapped: Vec<u32> = Vec::new();
@@ -9474,11 +9477,17 @@ fn discover_plan(
         user_process_pids(&pids, Path::new("/proc"))
     };
     // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
-    // deep-scans the selected candidates only. Under the cap selection is
-    // the identity, so the sweep (and its budget charge) is skipped there.
+    // deep-scans the selected candidates only. Under the cap selection
+    // orders by the pass cursor (never-attempted first, then cut-short
+    // retries), so the sweep (and its budget charge) is skipped there.
     // Over the cap the sweep is kept for the counted gap below: user
     // processes only (kernel threads excluded), with same-shape sharing
     // counted from the retained views after the scans.
+    let tiers = discovered
+        .budget
+        .pass_owner_ref()
+        .cursor()
+        .tiers_for_selection(|pid| crate::process::process_start_time(pid).ok());
     let (selected, over_cap_sweep): (Vec<u32>, Option<(SweepSnapshots, BTreeSet<u32>)>) =
         if pids.len() > max_scan_pids {
             let sweep_start = crate::attach::monotonic_ns();
@@ -9501,8 +9510,7 @@ fn discover_plan(
                 Path::new("/proc"),
                 max_scan_pids,
                 &mut discovered.budget,
-                // Capture refresh keeps its own scheduler; no cross-pass set.
-                &BTreeSet::new(),
+                &tiers,
             );
             discovered.stage_timings.span(
                 crate::timing::StageKind::Scan,
@@ -9516,7 +9524,7 @@ fn discover_plan(
             let context = Some((sweep, excluded));
             (selected, context)
         } else {
-            (pids.clone(), None)
+            (tiers.order_under_cap(&pids), None)
         };
     if let Some((sweep, excluded)) = &over_cap_sweep {
         // User processes only: kernel threads never consume slots and
@@ -9575,6 +9583,7 @@ fn discover_plan(
     // One shared teardown-deferral budget for this pass: at most 1 s of
     // teardown waiting in total, however many processes tear down at once.
     discovered.teardown_deferral = TeardownDeferralBudget::new();
+    let mut member_outcomes = Vec::new();
     for (index, pid) in selected.iter().enumerate() {
         // The pass counts its own opens against the snapshot (conservative
         // within the pass: drops are not subtracted; the fresh snapshot
@@ -9712,6 +9721,7 @@ fn discover_plan(
         // through the single `acquire()`, so one scan can no longer
         // retain past the cap; shares file no new row.
         let admits_before = discovered.handle_table.stats().admits;
+        let stop_before = discovered.budget.stopped_reason();
         let scan_result = scan_and_pin_with_proof(
             &view,
             &a.modules,
@@ -9797,6 +9807,25 @@ fn discover_plan(
                     discovered.base_counters.object_skips.push(skipped);
                     break;
                 }
+                // Report this view's scan to the pass cursor: a scan
+                // that ran under an already-stopped budget never got a
+                // working turn; a budget stop the scan newly latched
+                // keeps it fresh for a first retry (accruing toward
+                // demotion); a completed scan joins examined memory.
+                {
+                    use crate::discovery::scan::is_capture_budget_stop_reason;
+                    use crate::discovery::scan_pass::MemberOutcome;
+                    let task = (*pid, view.start_time());
+                    let stop_after = discovered.budget.stopped_reason();
+                    let outcome = if stop_before.is_some() {
+                        MemberOutcome::Unattempted
+                    } else if stop_after.is_some_and(is_capture_budget_stop_reason) {
+                        MemberOutcome::CutShortBudgetStop
+                    } else {
+                        MemberOutcome::Examined
+                    };
+                    member_outcomes.push((task, outcome));
+                }
                 // Only a complete scan that proved every member of its
                 // own shape examined covers it: incomplete scans,
                 // skipped members, and unopened data-only `.so` files
@@ -9860,7 +9889,45 @@ fn discover_plan(
                     attribution::note(&skipped);
                     discovered.base_counters.object_skips.push(skipped);
                 }
+                // A failed scan of a live view stays fresh for a retry
+                // without accruing; an exited view reports nothing (it
+                // reads never-attempted until pruning drops it).
+                if !gone {
+                    member_outcomes.push((
+                        (*pid, view.start_time()),
+                        crate::discovery::scan_pass::MemberOutcome::CutShortOther,
+                    ));
+                }
             }
+        }
+    }
+    // Feed the pass cursor this pass's member outcomes and prune
+    // departed pids, so the next pass orders never-attempted members
+    // first and cut-short retries ahead of examined ones. Newly
+    // demoted members file one bounded named gap each.
+    {
+        use crate::discovery::scan_pass::BUDGET_STOP_DEMOTE_AFTER;
+        let live_pids: BTreeSet<u32> = pids.iter().copied().collect();
+        let newly_demoted = discovered
+            .budget
+            .pass_owner()
+            .cursor_mut()
+            .note_member_outcomes(&member_outcomes);
+        discovered
+            .budget
+            .pass_owner()
+            .cursor_mut()
+            .prune_to_live(&live_pids);
+        for (pid, _) in newly_demoted {
+            discovered.base_counters.object_skips.push(Skipped {
+                subject: crate::discovery::scan_pass::demotion_gap_subject(),
+                reason: format!(
+                    "pid {pid} had its scan stopped by a capture budget stop on \
+                     {BUDGET_STOP_DEMOTE_AFTER} passes without an intervening completed scan; it \
+                     now scans after never-scanned members until one of its scans completes, so \
+                     it cannot stall later newcomers"
+                ),
+            });
         }
     }
 
@@ -32663,6 +32730,15 @@ impl Engine {
         });
         let mut new_views = Vec::new();
         self.inventory_passes = self.inventory_passes.saturating_add(1);
+        // Renew the pass budget for this tick: renewable stops clear and
+        // the refused tail retries first from the cursor. An unreported
+        // cleared stop files against its own pass instead of vanishing.
+        if let Some(reason) = self.budget.pass_owner().end_pass() {
+            self.base_counters.object_skips.push(Skipped {
+                subject: "capture discovery".into(),
+                reason: reason.into(),
+            });
+        }
         // One shared teardown-deferral budget for this tick: at most 1 s of
         // teardown waiting in total across every scan the tick runs.
         self.begin_teardown_pass();

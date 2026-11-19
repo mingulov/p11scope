@@ -46901,7 +46901,7 @@ fn fresh_first_selection_with_empty_scanned_matches_rarity_selection() {
         (50, vec![]),
         (9001, vec![map_entry("/tmp/uniq-p11.so", 10)]),
     ];
-    let empty: BTreeSet<u32> = BTreeSet::new();
+    let empty = crate::discovery::scan_pass::MemberTiers::default();
     for cap in 1..=sweep.len() {
         assert_eq!(
             select_fresh_first_candidates(&sweep, cap, &empty),
@@ -46941,7 +46941,7 @@ fn fresh_first_selection_rescues_a_newcomer_group_below_the_cut() {
         (33, vec![map_entry("/opt/new-p11.so", 3)]),
     ];
     // Pass 1: nothing scanned yet; the newcomer group loses the cut.
-    let first: BTreeSet<u32> = BTreeSet::new();
+    let first = crate::discovery::scan_pass::MemberTiers::default();
     assert_eq!(
         select_fresh_first_candidates(&sweep, 2, &first),
         vec![10, 20]
@@ -46950,7 +46950,10 @@ fn fresh_first_selection_rescues_a_newcomer_group_below_the_cut() {
     assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![10, 20]);
     // Pass 2: pass 1 scanned {10, 20}; the all-fresh newcomer group
     // jumps ahead of the all-scanned rare group.
-    let scanned: BTreeSet<u32> = [10, 20].into_iter().collect();
+    let scanned = crate::discovery::scan_pass::MemberTiers {
+        examined: [10, 20].into_iter().collect(),
+        ..Default::default()
+    };
     assert_eq!(
         select_fresh_first_candidates(&sweep, 2, &scanned),
         vec![21, 30]
@@ -47607,14 +47610,9 @@ fn select_excluding_kernel_threads_counts_absences_on_the_budget() {
     ];
     let unavailable: BTreeSet<u32> = [12].into_iter().collect();
     let mut budget = CaptureWorkBudget::default();
-    let selected = select_excluding_kernel_threads(
-        &sweep,
-        &unavailable,
-        &proc_root,
-        4,
-        &mut budget,
-        &BTreeSet::new(),
-    );
+    let tiers = crate::discovery::scan_pass::MemberTiers::default();
+    let selected =
+        select_excluding_kernel_threads(&sweep, &unavailable, &proc_root, 4, &mut budget, &tiers);
     // Only pid 10 is a flagged thread with an empty available snapshot;
     // the cap then fits every remaining pid.
     assert_eq!(selected, vec![11, 12, 13, 14], "{selected:?}");

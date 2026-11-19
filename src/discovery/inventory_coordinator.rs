@@ -438,21 +438,6 @@ fn same_task_generation(recorded: Option<u64>, live: Option<u64>) -> bool {
     }
 }
 
-/// Prune cross-pass task memory to the latest enumeration: drop
-/// entries for departed pids and for pid reuse (same number, new start
-/// time), keep tasks still present with an unchanged generation. Unknown
-/// generations stay conservative: without positive start-time mismatch
-/// evidence nothing is dropped.
-fn retain_current_tasks(
-    tasks: &mut BTreeSet<(u32, Option<u64>)>,
-    current: &BTreeMap<u32, Option<u64>>,
-) {
-    tasks.retain(|(pid, start)| match current.get(pid) {
-        None => false,
-        Some(now) => same_task_generation(*start, *now),
-    });
-}
-
 /// Enumeration memory holds this many distinct tasks at most; past it
 /// departed tasks evict first (one bounded sweep per pass), so a fork
 /// storm cannot grow the observer without bound.
@@ -787,12 +772,6 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// stamps, so no clock comparison is needed. Cgroup scope never
     /// inserts (transaction coverage, not scan passes).
     post_pass_exec_newcomers: BTreeSet<(u32, Option<u64>)>,
-    /// Task identities deep-scanned by applied passes, pruned to the
-    /// latest enumeration: next-pass selection tiers never-scanned
-    /// groups first, so a stable sweep cannot starve a newcomer across
-    /// passes. Discarded passes record nothing (their outcomes never
-    /// applied); pid reuse drops the stale task by start-time mismatch.
-    scan_freshness: BTreeSet<(u32, Option<u64>)>,
     /// Per-pid (generation start-time, maps digest) from the last
     /// applied pass: the next collection's deep-scan skip priors.
     /// Replaced wholesale per applied pass (a pid the pass never saw
@@ -1383,7 +1362,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             staged_retirements: BTreeSet::new(),
             stopped: false,
             post_pass_exec_newcomers: BTreeSet::new(),
-            scan_freshness: BTreeSet::new(),
             maps_prior: BTreeMap::new(),
             mapper_groups_prior: BTreeMap::new(),
             ever_enumerated: BTreeSet::new(),
@@ -3534,7 +3512,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     #[cfg(test)]
     pub(crate) fn scan_freshness_for_test(&self) -> BTreeSet<(u32, Option<u64>)> {
-        self.scan_freshness.clone()
+        self.engine
+            .budget
+            .pass_owner_ref()
+            .cursor()
+            .examined_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn budget_stop_streaks_for_test(&self) -> BTreeMap<(u32, Option<u64>), u32> {
+        self.engine
+            .budget
+            .pass_owner_ref()
+            .cursor()
+            .streaks_for_test()
     }
 
     #[cfg(test)]
@@ -4478,7 +4469,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 HEAP_MAP_ENTRY,
             ),
             scan_freshness: counter_row(
-                self.scan_freshness.len(),
+                self.engine.budget.pass_owner_ref().cursor().examined_len(),
                 size_of::<(u32, Option<u64>)>(),
                 HEAP_MAP_ENTRY,
             ),
@@ -4940,7 +4931,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let (prior_objects, prior_bytes) = self.prearm_prior;
         let budget =
             self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default(), false);
-        let scanned = self.scanned_pids_for_selection();
+        let tiers = self.tiers_for_selection();
         let priors = self.priors_for_collection();
         move || {
             if cgroup_requires_transaction {
@@ -4965,7 +4956,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     max_scan_pids,
                     policy,
                     budget,
-                    &scanned,
+                    &tiers,
                     &manifests,
                     prior_objects,
                     prior_bytes,
@@ -4997,7 +4988,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             crate::discovery::scan::CaptureWorkBudget::default(),
             semantic_capture_live,
         );
-        let scanned = self.scanned_pids_for_selection();
+        let tiers = self.tiers_for_selection();
         let priors = self.priors_for_collection();
         move || {
             if cgroup_requires_transaction {
@@ -5023,7 +5014,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     policy,
                     shared,
                     budget,
-                    &scanned,
+                    &tiers,
                     &manifests,
                     prior_objects,
                     prior_bytes,
@@ -11068,20 +11059,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         groups.retain(|_, members| !members.is_empty());
         self.mapper_groups_prior = groups;
-        let current: BTreeMap<u32, Option<u64>> = catalog
-            .processes
-            .iter()
-            .map(|process| {
-                (
-                    process.pid,
-                    process
-                        .generation
-                        .as_ref()
-                        .and_then(|member| member.start_time),
-                )
-            })
-            .collect();
-        retain_current_tasks(&mut self.scan_freshness, &current);
+        // Feed the pass cursor one typed outcome per enumerated member.
+        // A deep scan a truncating gap cut short examined nothing to
+        // completion: it stays fresh so the next pass retries it first
+        // instead of stranding it behind the same prefix. Only a budget
+        // stop on a proven generation accrues toward demotion, and only
+        // a completed scan or a maps match clears the streak.
+        let cut_short = Self::truncated_member_pids(catalog);
+        let mut outcomes = Vec::with_capacity(catalog.processes.len());
         for process in &catalog.processes {
             let task = (
                 process.pid,
@@ -11091,15 +11076,94 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .and_then(|member| member.start_time),
             );
             self.ever_enumerated.insert(task);
-            if matches!(
-                process.status,
-                crate::inspect_system::MemberStatus::Scanned
-                    | crate::inspect_system::MemberStatus::MapsMatched
-            ) {
-                self.scan_freshness.insert(task);
-            }
+            outcomes.push((task, Self::member_outcome(process, &cut_short)));
+        }
+        let live_pids: BTreeSet<u32> = catalog
+            .processes
+            .iter()
+            .map(|process| process.pid)
+            .collect();
+        let newly_demoted = self
+            .engine
+            .budget
+            .pass_owner()
+            .cursor_mut()
+            .note_member_outcomes(&outcomes);
+        self.engine
+            .budget
+            .pass_owner()
+            .cursor_mut()
+            .prune_to_live(&live_pids);
+        for (pid, _) in newly_demoted {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(pid),
+                subject: crate::discovery::scan_pass::demotion_gap_subject(),
+                reason: format!(
+                    "pid {pid} had its scan stopped by a capture budget stop on {} passes \
+                     without an intervening completed scan or maps match; it now scans after \
+                     never-scanned members until one of its scans completes, so it cannot stall \
+                     later newcomers",
+                    crate::discovery::scan_pass::BUDGET_STOP_DEMOTE_AFTER
+                ),
+                budget: None,
+            });
         }
         self.evict_enumerated_overflow();
+    }
+
+    /// Members whose own deep scan a truncating gap cut short: every gap
+    /// naming a pid except witness-unavailable refusals (a member whose
+    /// witness never answered was never attempted, not cut short).
+    fn truncated_member_pids(catalog: &crate::inspect_system::Catalog) -> BTreeSet<u32> {
+        catalog
+            .skipped
+            .iter()
+            .filter(|gap| {
+                gap.pid.is_some()
+                    && !crate::discovery::overlay_witness::witness_unavailable_refusal(&gap.reason)
+            })
+            .filter_map(|gap| gap.pid)
+            .collect()
+    }
+
+    /// Maps one cataloged member to its cursor outcome. A budget stop
+    /// on a proven generation accrues whatever the result variant
+    /// (the accrual line is the member's work); otherwise a maps
+    /// match or a gap-free scan examines, any other truncation stays
+    /// fresh without accruing, and anything else was never attempted.
+    fn member_outcome(
+        process: &crate::inspect_system::ProcessRecord,
+        cut_short: &BTreeSet<u32>,
+    ) -> crate::discovery::scan_pass::MemberOutcome {
+        use crate::discovery::scan_pass::MemberOutcome;
+        use crate::inspect_system::{MemberStatus, MemberWorkDisposition};
+        let proven_generation = process
+            .generation
+            .as_ref()
+            .is_some_and(|member| member.start_time.is_some());
+        if proven_generation
+            && cut_short.contains(&process.pid)
+            && matches!(
+                process.work_disposition,
+                MemberWorkDisposition::StoppedDuringScan {
+                    full_allowance: true
+                }
+            )
+        {
+            return MemberOutcome::CutShortBudgetStop;
+        }
+        if matches!(process.status, MemberStatus::MapsMatched) {
+            return MemberOutcome::Examined;
+        }
+        if !matches!(process.status, MemberStatus::Scanned) {
+            return MemberOutcome::Unattempted;
+        }
+        if !cut_short.contains(&process.pid) {
+            return MemberOutcome::Examined;
+        }
+        MemberOutcome::CutShortOther
     }
 
     /// Keep enumeration memory capped: one bounded sweep evicts departed
@@ -11125,20 +11189,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// Pids the next pass treats as already scanned: recorded tasks whose
-    /// live `/proc` start-time still matches, plus tasks recorded without a
-    /// start-time (nothing verifiable, so nothing dropped). A recycled pid
-    /// reads fresh, so reuse never inherits the old incarnation's slot.
-    fn scanned_pids_for_selection(&self) -> BTreeSet<u32> {
-        self.scan_freshness
-            .iter()
-            .filter(|(pid, start_time)| {
-                start_time.is_none_or(|start| {
-                    crate::process::process_start_time(*pid).is_ok_and(|live| live == start)
-                })
-            })
-            .map(|(pid, _)| *pid)
-            .collect()
+    /// The cursor's tiers projected to pids for the next selection:
+    /// examined, retry and demoted sets with live start-time matching
+    /// (a recycled pid reads fresh). Never-attempted members are any
+    /// pid in no set.
+    fn tiers_for_selection(&self) -> crate::discovery::scan_pass::MemberTiers {
+        self.engine
+            .budget
+            .pass_owner_ref()
+            .cursor()
+            .tiers_for_selection(|pid| crate::process::process_start_time(pid).ok())
     }
 
     /// The deep-scan skip priors for the next collection: the last
@@ -13423,6 +13483,7 @@ pub(crate) mod tests {
             hints_examined,
             pid,
             status: MemberStatus::Scanned,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects: Vec::new(),
             generation: None,
         };
@@ -16636,6 +16697,7 @@ pub(crate) mod tests {
                 hints_examined: true,
                 pid,
                 status: crate::inspect_system::MemberStatus::Scanned,
+                work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
                 objects: (0..objects.len()).collect(),
                 generation,
             }],
@@ -24457,6 +24519,8 @@ exit 0
                     .push(crate::inspect_system::ProcessRecord {
                         pid,
                         status: crate::inspect_system::MemberStatus::Scanned,
+                        work_disposition:
+                            crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
                         objects: Vec::new(),
                         generation: Some(crate::inspect_system::MemberGeneration {
                             start_time: Some(800),
@@ -24527,6 +24591,8 @@ exit 0
                     .push(crate::inspect_system::ProcessRecord {
                         pid,
                         status: crate::inspect_system::MemberStatus::Scanned,
+                        work_disposition:
+                            crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
                         objects: Vec::new(),
                         generation: Some(crate::inspect_system::MemberGeneration {
                             start_time: Some(800),
@@ -24597,6 +24663,7 @@ exit 0
         first.processes.push(crate::inspect_system::ProcessRecord {
             pid: 8,
             status: crate::inspect_system::MemberStatus::Exited,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects: Vec::new(),
             generation: None,
             complete_scan: None,
@@ -24749,6 +24816,8 @@ exit 0
                     .push(crate::inspect_system::ProcessRecord {
                         pid: 8,
                         status: status.clone(),
+                        work_disposition:
+                            crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
                         objects: Vec::new(),
                         generation: None,
                         complete_scan: None,
@@ -36313,29 +36382,7 @@ mod continuity_clock_tests {
 mod scan_freshness_tests {
     use super::*;
     use crate::discovery::caller_registry::OsProcessSource;
-
-    /// Cross-pass task memory keeps entries still present with an
-    /// unchanged start generation; departed pids and pid reuse (same
-    /// number, new start time) drop, while unknown generations stay
-    /// conservative (no positive reuse evidence, no drop).
-    #[test]
-    fn retain_current_tasks_drops_departed_and_reused_tasks() {
-        let mut tasks: BTreeSet<(u32, Option<u64>)> =
-            [(1, Some(100)), (2, None), (3, Some(300)), (4, Some(400))]
-                .into_iter()
-                .collect();
-        let current: BTreeMap<u32, Option<u64>> = [
-            (1, Some(100)),
-            (2, Some(200)),
-            (3, Some(999)),
-            (5, Some(500)),
-        ]
-        .into_iter()
-        .collect();
-        retain_current_tasks(&mut tasks, &current);
-        let kept: BTreeSet<(u32, Option<u64>)> = [(1, Some(100)), (2, None)].into_iter().collect();
-        assert_eq!(tasks, kept);
-    }
+    use crate::discovery::scan_pass::BUDGET_STOP_DEMOTE_AFTER;
 
     fn freshness_coordinator() -> InventoryCoordinator<OsProcessSource> {
         InventoryCoordinator::new(
@@ -36362,9 +36409,15 @@ mod scan_freshness_tests {
     /// pruned instead of lingering as scanned.
     #[test]
     fn applied_pass_records_only_examined_tasks() {
+        use crate::discovery::scan_pass::MemberOutcome;
         use crate::inspect_system::{MemberStatus, ProcessRecord};
         let mut coordinator = freshness_coordinator();
-        coordinator.scan_freshness.insert((999_999_999, Some(7)));
+        coordinator
+            .engine
+            .budget
+            .pass_owner()
+            .cursor_mut()
+            .note_member_outcomes(&[((999_999_999, Some(7)), MemberOutcome::Examined)]);
         let generation = |start_time| {
             Some(crate::inspect_system::MemberGeneration {
                 start_time,
@@ -36380,6 +36433,7 @@ mod scan_freshness_tests {
         let record = |pid, start_time, status| ProcessRecord {
             pid,
             status,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects: Vec::new(),
             generation: generation(start_time),
             complete_scan: None,
@@ -36412,23 +36466,33 @@ mod scan_freshness_tests {
     }
 
     /// The selection projection re-validates recorded start-times against
-    /// live `/proc`: the running test process projects scanned, a
+    /// live `/proc`: the running test process projects examined, a
     /// mismatched start-time reads fresh (pid reuse inherits nothing), a
     /// nonexistent pid drops, and a task recorded without a start-time
-    /// stays scanned (nothing verifiable, nothing dropped).
+    /// stays examined (nothing verifiable, nothing dropped).
     #[test]
     fn scanned_projection_validates_start_time_against_live_proc() {
+        use crate::discovery::scan_pass::MemberOutcome;
         let me = std::process::id();
         let live = crate::process::process_start_time(me).unwrap();
         let project = |tasks: &[(u32, Option<u64>)]| {
             let mut coordinator = freshness_coordinator();
-            coordinator.scan_freshness.extend(tasks.iter().copied());
-            coordinator.scanned_pids_for_selection()
+            let outcomes: Vec<_> = tasks
+                .iter()
+                .map(|task| (*task, MemberOutcome::Examined))
+                .collect();
+            coordinator
+                .engine
+                .budget
+                .pass_owner()
+                .cursor_mut()
+                .note_member_outcomes(&outcomes);
+            coordinator.tiers_for_selection().examined
         };
         assert_eq!(
             project(&[(me, Some(live))]),
             BTreeSet::from([me]),
-            "the live incarnation projects scanned"
+            "the live incarnation projects examined"
         );
         assert!(
             project(&[(me, Some(live.wrapping_add(1)))]).is_empty(),
@@ -36441,7 +36505,711 @@ mod scan_freshness_tests {
         assert_eq!(
             project(&[(u32::MAX, None)]),
             BTreeSet::from([u32::MAX]),
-            "an unknown generation stays scanned"
+            "an unknown generation stays examined"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): a deep-scanned member whose own
+    /// scan a truncating gap cut short stays fresh for a retry
+    /// instead of joining cross-pass memory.
+    #[test]
+    fn applied_pass_keeps_cut_short_members_fresh_for_retry() {
+        use crate::inspect_system::{MemberStatus, ProcessRecord};
+        let mut coordinator = freshness_coordinator();
+        let generation = |start_time| {
+            Some(crate::inspect_system::MemberGeneration {
+                start_time,
+                exe: None,
+            })
+        };
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            generation(Some(110)),
+        );
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(11),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        catalog.processes.push(ProcessRecord {
+            pid: 12,
+            status: MemberStatus::Scanned,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            objects: Vec::new(),
+            generation: generation(Some(120)),
+            complete_scan: None,
+            application: unexamined_application(),
+            hints_examined: true,
+        });
+        coordinator.note_applied_scan_tasks(&catalog);
+        let expected: BTreeSet<(u32, Option<u64>)> = [(12, Some(120))].into_iter().collect();
+        assert_eq!(coordinator.scan_freshness_for_test(), expected);
+    }
+
+    /// Adopted bug-1 twin (ported): one member whose own scan
+    /// exhausts the pass window every pass keeps fresh retry
+    /// priority for `BUDGET_STOP_DEMOTE_AFTER` passes, then scans
+    /// after never-scanned members until one of its scans
+    /// completes.
+    #[test]
+    fn applied_pass_demotes_budget_stopped_member_behind_newcomers() {
+        let mut coordinator = freshness_coordinator();
+        let pid = std::process::id();
+        let live = crate::process::process_start_time(pid).unwrap();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            pid,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(live),
+                exe: None,
+            }),
+        );
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: true,
+            };
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for streak in 1..BUDGET_STOP_DEMOTE_AFTER {
+            coordinator.note_applied_scan_tasks(&catalog);
+            assert_eq!(
+                coordinator.budget_stop_streaks_for_test(),
+                BTreeMap::from([((pid, Some(live)), streak)]),
+                "pass {streak} still retries the budget-stopped member first"
+            );
+            let tiers = coordinator.tiers_for_selection();
+            assert!(
+                !tiers.examined.contains(&pid) && !tiers.demoted.contains(&pid),
+                "pass {streak}: the retrying member still counts as fresh"
+            );
+        }
+        coordinator.note_applied_scan_tasks(&catalog);
+        assert!(
+            !coordinator
+                .scan_freshness_for_test()
+                .contains(&(pid, Some(live))),
+            "the demoted member never joins examined memory"
+        );
+        assert_eq!(
+            coordinator.tiers_for_selection().demoted,
+            BTreeSet::from([pid]),
+            "past the bound the stuck member scans after never-scanned pids"
+        );
+        // A gap-free scan completes it: the streak clears and the
+        // member joins examined memory genuinely.
+        catalog.skipped.clear();
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::NoBudgetStop;
+        coordinator.note_applied_scan_tasks(&catalog);
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "completing a scan clears the streak"
+        );
+        assert_eq!(
+            coordinator.scan_freshness_for_test(),
+            BTreeSet::from([(pid, Some(live))]),
+            "the completed scan joins examined memory"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): the demotion files one bounded
+    /// named gap for the stuck member — exactly one row when the
+    /// streak reaches the bound, none while it stays stuck, and the
+    /// row stays once a later scan completes.
+    #[test]
+    fn demoted_member_files_one_bounded_gap_until_it_completes() {
+        let mut coordinator = freshness_coordinator();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(110),
+                exe: None,
+            }),
+        );
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: true,
+            };
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(11),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        coordinator.registry.publish();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.pid == Some(11))
+            .collect();
+        assert_eq!(gaps.len(), 1, "one named gap for the stuck member");
+        assert_eq!(
+            gaps[0].subject,
+            format!(
+                "member scan budget-stopped {BUDGET_STOP_DEMOTE_AFTER} passes without completing"
+            )
+        );
+        assert!(
+            gaps[0].reason.contains("pid 11")
+                && gaps[0].reason.contains("capture budget stop")
+                && gaps[0].reason.contains("scans after never-scanned members"),
+            "the gap names the member, the stop and the yield: {}",
+            gaps[0].reason
+        );
+        for _ in 0..2 {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        coordinator.registry.publish();
+        assert_eq!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.pid == Some(11))
+                .count(),
+            1,
+            "no per-pass flood while the member stays stuck"
+        );
+        catalog.skipped.clear();
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::NoBudgetStop;
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.registry.publish();
+        assert_eq!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.pid == Some(11))
+                .count(),
+            1,
+            "the completed scan keeps the episode's gap row"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): budget-stop streaks key by task
+    /// identity — a reused pid number with a new start-time restarts
+    /// instead of inheriting the old incarnation's streak.
+    #[test]
+    fn budget_stop_streak_restarts_on_pid_reuse() {
+        let mut coordinator = freshness_coordinator();
+        let generation = |start_time| {
+            Some(crate::inspect_system::MemberGeneration {
+                start_time,
+                exe: None,
+            })
+        };
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            generation(Some(110)),
+        );
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: true,
+            };
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(11),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        coordinator.note_applied_scan_tasks(&catalog);
+        assert_eq!(
+            coordinator.budget_stop_streaks_for_test(),
+            BTreeMap::from([((11, Some(110)), 1)]),
+        );
+        catalog.processes[0].generation = generation(Some(200));
+        coordinator.note_applied_scan_tasks(&catalog);
+        assert_eq!(
+            coordinator.budget_stop_streaks_for_test(),
+            BTreeMap::from([((11, Some(200)), 1)]),
+            "a reused pid inherits no streak"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): the demotion streak counts only
+    /// scans a capture budget stop ended early; routine per-member
+    /// refusals without a budget stop keep fresh retry priority but
+    /// never accrue and never file the yield gap.
+    #[test]
+    fn demotion_streak_counts_only_budget_stops() {
+        let mut coordinator = freshness_coordinator();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            None,
+        );
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(11),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::REPLACED_PROVIDER_REASON.into(),
+            generic: false,
+        });
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(11),
+            subject: "libcopy.so".into(),
+            reason: "module has no comparable pinned identity; it was not attached".into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER + 2 {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "refusals without a budget stop never accrue"
+        );
+        coordinator.registry.publish();
+        assert_eq!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.pid == Some(11))
+                .count(),
+            0,
+            "no yield gap without a budget stop streak"
+        );
+        assert!(
+            !coordinator.scan_freshness_for_test().contains(&(11, None)),
+            "the refused member keeps fresh retry priority"
+        );
+        let tiers = coordinator.tiers_for_selection();
+        assert!(
+            !tiers.examined.contains(&11) && !tiers.demoted.contains(&11),
+            "the refused member still scans first"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): a member stopped at the pass
+    /// boundary on a drained residual never accrues, however often
+    /// the position repeats.
+    #[test]
+    fn budget_stop_without_full_allowance_never_accrues() {
+        let mut coordinator = freshness_coordinator();
+        let pid = std::process::id();
+        let live = crate::process::process_start_time(pid).unwrap();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            pid,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(live),
+                exe: None,
+            }),
+        );
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: false,
+            };
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER + 2 {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "an inherited shortage never accrues, however often it repeats"
+        );
+        coordinator.registry.publish();
+        assert_eq!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.pid == Some(pid))
+                .count(),
+            0,
+            "no yield gap for a member without own-exhaustion evidence"
+        );
+        assert!(
+            !coordinator
+                .scan_freshness_for_test()
+                .contains(&(pid, Some(live))),
+            "the boundary member keeps fresh retry priority"
+        );
+        let tiers = coordinator.tiers_for_selection();
+        assert!(
+            !tiers.examined.contains(&pid) && !tiers.demoted.contains(&pid),
+            "the boundary member still scans first"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): a stop tripped in view
+    /// preparation never accrues.
+    #[test]
+    fn view_preparation_stop_never_accrues() {
+        let mut coordinator = freshness_coordinator();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(110),
+                exe: None,
+            }),
+        );
+        catalog.processes[0].status = crate::inspect_system::MemberStatus::Unreadable {
+            reason: "the process generation could not be pinned".into(),
+        };
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedInViewPreparation;
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(11),
+            subject: "capture discovery".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER + 2 {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "a view-preparation stop never accrues"
+        );
+        let tiers = coordinator.tiers_for_selection();
+        assert!(
+            !tiers.examined.contains(&11) && !tiers.demoted.contains(&11),
+            "the member keeps fresh retry priority"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): a member deferred before doing
+    /// any work never accrues.
+    #[test]
+    fn deferred_member_never_accrues() {
+        let mut coordinator = freshness_coordinator();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(110),
+                exe: None,
+            }),
+        );
+        catalog.processes[0].status = crate::inspect_system::MemberStatus::Unreadable {
+            reason: "the process generation could not be pinned".into(),
+        };
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::DeferredBeforeWork;
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER + 2 {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "a deferred member never accrues"
+        );
+        let tiers = coordinator.tiers_for_selection();
+        assert!(
+            !tiers.examined.contains(&11) && !tiers.demoted.contains(&11),
+            "the deferred member keeps fresh retry priority"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): the accrual line is the member's
+    /// work, not its result variant — a degraded scan that engaged
+    /// the stop with the standard allowance accrues like a full scan.
+    #[test]
+    fn degraded_scan_with_full_allowance_stop_accrues() {
+        let mut coordinator = freshness_coordinator();
+        let pid = std::process::id();
+        let live = crate::process::process_start_time(pid).unwrap();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            pid,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(live),
+                exe: None,
+            }),
+        );
+        catalog.processes[0].status = crate::inspect_system::MemberStatus::MemoryUnavailable {
+            reason: "ptrace refused",
+        };
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: true,
+            };
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER + 2 {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert_eq!(
+            coordinator.budget_stop_streaks_for_test(),
+            BTreeMap::from([((pid, Some(live)), BUDGET_STOP_DEMOTE_AFTER + 2)]),
+            "a full-allowance stop accrues whatever the result variant"
+        );
+        assert_eq!(
+            coordinator.tiers_for_selection().demoted,
+            BTreeSet::from([pid]),
+            "past the bound the stuck member scans after never-scanned pids"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): an unproven generation never
+    /// accrues; a later completion with a proven start-time examines
+    /// normally with no surviving streak.
+    #[test]
+    fn unknown_generation_stop_never_accrues_and_known_completion_examines() {
+        let mut coordinator = freshness_coordinator();
+        let pid = 999_999_999;
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            pid,
+            None,
+        );
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: true,
+            };
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "unproven stops never accrue"
+        );
+        coordinator.registry.publish();
+        assert_eq!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.pid == Some(pid))
+                .count(),
+            0,
+            "no yield gap without a proven streak"
+        );
+        let tiers = coordinator.tiers_for_selection();
+        assert!(
+            !tiers.examined.contains(&pid) && !tiers.demoted.contains(&pid),
+            "the unproven member keeps newcomer priority"
+        );
+        catalog.processes[0].generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: Some(100),
+            exe: None,
+        });
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::NoBudgetStop;
+        catalog.skipped.clear();
+        coordinator.note_applied_scan_tasks(&catalog);
+        assert_eq!(
+            coordinator.scan_freshness_for_test(),
+            BTreeSet::from([(pid, Some(100))]),
+            "the proven completion examines the member"
+        );
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "no streak survives the proven completion"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): a recycled pid keeps newcomer
+    /// priority across unproven stops, a proven reset and reuse.
+    #[test]
+    fn recycled_pid_after_unknown_stops_keeps_newcomer_priority() {
+        let mut coordinator = freshness_coordinator();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            None,
+        );
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: true,
+            };
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(11),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        catalog.processes[0].generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: Some(100),
+            exe: None,
+        });
+        catalog.processes[0].status = crate::inspect_system::MemberStatus::MapsMatched;
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::NoBudgetStop;
+        catalog.skipped.clear();
+        coordinator.note_applied_scan_tasks(&catalog);
+        catalog.processes[0].generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: Some(200),
+            exe: None,
+        });
+        catalog.processes[0].status = crate::inspect_system::MemberStatus::Unreadable {
+            reason: "the process generation could not be pinned".into(),
+        };
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::DeferredBeforeWork;
+        coordinator.note_applied_scan_tasks(&catalog);
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "no streak survives the proven reset and the reuse"
+        );
+        let tiers = coordinator.tiers_for_selection();
+        assert!(
+            !tiers.examined.contains(&11) && !tiers.demoted.contains(&11),
+            "the recycled newcomer keeps newcomer priority"
+        );
+        assert_eq!(
+            tiers.order_under_cap(&[11, 12]),
+            vec![11, 12],
+            "the recycled newcomer scans before incumbents"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): a pid absent from a pass's census
+    /// drops its proven streak, so a later reuse inherits nothing.
+    #[test]
+    fn absent_pid_drops_proven_streak_before_reuse() {
+        let mut coordinator = freshness_coordinator();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(100),
+                exe: None,
+            }),
+        );
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: true,
+            };
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(11),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert_eq!(
+            coordinator.budget_stop_streaks_for_test(),
+            BTreeMap::from([((11, Some(100)), BUDGET_STOP_DEMOTE_AFTER)]),
+            "the proven member accrues to the bound first"
+        );
+        catalog.processes[0].pid = 12;
+        catalog.processes[0].generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: Some(120),
+            exe: None,
+        });
+        catalog.processes[0].status = crate::inspect_system::MemberStatus::Unreadable {
+            reason: "the process generation could not be pinned".into(),
+        };
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::DeferredBeforeWork;
+        catalog.skipped.clear();
+        coordinator.note_applied_scan_tasks(&catalog);
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "the absent pid drops its streak"
+        );
+        catalog.processes[0].pid = 11;
+        catalog.processes[0].generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: Some(200),
+            exe: None,
+        });
+        coordinator.note_applied_scan_tasks(&catalog);
+        let tiers = coordinator.tiers_for_selection();
+        assert!(
+            !tiers.examined.contains(&11) && !tiers.demoted.contains(&11),
+            "the recycled newcomer keeps newcomer priority"
+        );
+    }
+
+    /// Adopted bug-1 twin (ported): a pin-wait gap whose module
+    /// pathname contains budget-stop vocabulary never accrues —
+    /// scheduling reads the typed disposition, never rendered text.
+    #[test]
+    fn pin_wait_pathname_with_budget_phrase_never_accrues() {
+        let mut coordinator = freshness_coordinator();
+        let pid = std::process::id();
+        let live = crate::process::process_start_time(pid).unwrap();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            pid,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(live),
+                exe: None,
+            }),
+        );
+        let path = format!(
+            "/tmp/probe-{}/libx.so",
+            crate::discovery::scan::WORK_CEILING_REASON
+        );
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: crate::discovery::identity::PIN_WAIT_SUBJECT.into(),
+            reason: format!(
+                "{}: {}; the pin waits for the next tick",
+                path,
+                crate::discovery::identity::PIN_RESERVE_STOP_DETAIL
+            ),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER + 2 {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert!(
+            coordinator.budget_stop_streaks_for_test().is_empty(),
+            "a pathname carrying the ceiling phrase never accrues"
+        );
+        coordinator.registry.publish();
+        assert_eq!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.pid == Some(pid))
+                .count(),
+            0,
+            "no yield gap for a pin wait"
+        );
+        let tiers = coordinator.tiers_for_selection();
+        assert!(
+            !tiers.examined.contains(&pid) && !tiers.demoted.contains(&pid),
+            "the waiting member keeps fresh retry priority"
         );
     }
 }
@@ -36792,6 +37560,7 @@ mod maps_skip_memory_tests {
         catalog.processes.push(ProcessRecord {
             pid: 12,
             status: MemberStatus::Scanned,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects: vec![0],
             generation: generation(Some(120)),
             complete_scan: None,
@@ -36842,6 +37611,7 @@ mod maps_skip_memory_tests {
         let record = |pid| ProcessRecord {
             pid,
             status: MemberStatus::Scanned,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects: vec![0],
             generation: generation(Some(120)),
             complete_scan: None,
@@ -36872,6 +37642,7 @@ mod maps_skip_memory_tests {
         let record = |pid| ProcessRecord {
             pid,
             status: MemberStatus::Scanned,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects: vec![0],
             generation: generation(Some(120)),
             complete_scan: None,
@@ -36945,6 +37716,7 @@ mod maps_skip_memory_tests {
         let record = |pid, objects| ProcessRecord {
             pid,
             status: MemberStatus::Scanned,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects,
             generation: generation(Some(120)),
             complete_scan: None,
@@ -37013,6 +37785,7 @@ mod maps_skip_memory_tests {
         let record = |pid, objects| ProcessRecord {
             pid,
             status: MemberStatus::Scanned,
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects,
             generation: generation(Some(120)),
             complete_scan: None,
@@ -37171,6 +37944,7 @@ mod stop_diff_tests {
             catalog.processes.push(ProcessRecord {
                 pid: NO_SUCH_PID - index as u32,
                 status: MemberStatus::NotSelected { loss: None },
+                work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
                 objects: Vec::new(),
                 generation: Some(MemberGeneration {
                     start_time: Some(7_000 + index as u64),

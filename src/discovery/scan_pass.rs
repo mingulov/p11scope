@@ -50,8 +50,9 @@ pub(crate) enum ChargeOutcome {
     Stopped {
         reason: &'static str,
         /// A terminal stop never heals: collection stops (external
-        /// authority) and zero-capacity allowances (degenerate
-        /// config). Renewable stops heal at `end_pass`.
+        /// authority), zero-capacity allowances (degenerate config)
+        /// and exhausted capture-lifetime allowances (nothing left
+        /// to admit). Renewable stops heal at `end_pass`.
         terminal: bool,
     },
 }
@@ -79,21 +80,26 @@ pub(crate) struct ResumeCursor {
 }
 
 impl ResumeCursor {
-    /// Records one applied pass's outcomes for exactly the enumerated
-    /// tasks (every enumerated task carries exactly one outcome) and
-    /// returns the tasks newly demoted this pass — the driver files
-    /// one [`demotion_gap_subject`] row per task, never a row per
-    /// pass. Discarded passes record nothing.
+    /// Records one applied pass's member outcomes and returns the
+    /// tasks newly demoted this pass — the driver files one
+    /// [`demotion_gap_subject`] row per task, never a row per pass.
+    /// Discarded passes record nothing. Noting a task with a proven
+    /// generation supersedes other generations of the same pid, so
+    /// pid reuse never inherits a tier or streak; call
+    /// [`ResumeCursor::prune_to_live`] with the pass enumeration to
+    /// drop departed pids.
     pub(crate) fn note_member_outcomes(
         &mut self,
         outcomes: &[(MemberTask, MemberOutcome)],
     ) -> Vec<MemberTask> {
-        let enumerated: BTreeSet<MemberTask> = outcomes.iter().map(|(task, _)| *task).collect();
-        self.examined.retain(|task| enumerated.contains(task));
-        self.fresh.retain(|task| enumerated.contains(task));
-        self.streaks.retain(|task, _| enumerated.contains(task));
         let mut newly_demoted = Vec::new();
         for (task, outcome) in outcomes {
+            if task.1.is_some() {
+                let superseded = |held: &MemberTask| held.0 == task.0 && held.1 != task.1;
+                self.examined.retain(|held| !superseded(held));
+                self.fresh.retain(|held| !superseded(held));
+                self.streaks.retain(|held, _| !superseded(held));
+            }
             match outcome {
                 MemberOutcome::Examined => {
                     self.examined.insert(*task);
@@ -102,16 +108,28 @@ impl ResumeCursor {
                 }
                 MemberOutcome::CutShortBudgetStop => {
                     self.examined.remove(task);
-                    self.fresh.insert(*task);
                     let streak = self.streaks.entry(*task).or_insert(0);
                     *streak = streak.saturating_add(1);
+                    if *streak >= BUDGET_STOP_DEMOTE_AFTER {
+                        // Graduates to demoted: out of the retry tier
+                        // until it genuinely completes.
+                        self.fresh.remove(task);
+                    } else {
+                        self.fresh.insert(*task);
+                    }
                     if *streak == BUDGET_STOP_DEMOTE_AFTER {
                         newly_demoted.push(*task);
                     }
                 }
                 MemberOutcome::CutShortOther | MemberOutcome::Unattempted => {
                     self.examined.remove(task);
-                    self.fresh.insert(*task);
+                    if self
+                        .streaks
+                        .get(task)
+                        .is_none_or(|streak| *streak < BUDGET_STOP_DEMOTE_AFTER)
+                    {
+                        self.fresh.insert(*task);
+                    }
                 }
             }
         }
@@ -164,6 +182,100 @@ impl ResumeCursor {
     #[cfg(test)]
     pub(crate) fn streaks_for_test(&self) -> BTreeMap<MemberTask, u32> {
         self.streaks.clone()
+    }
+
+    /// Examined tasks held, for memory telemetry.
+    pub(crate) fn examined_len(&self) -> usize {
+        self.examined.len()
+    }
+
+    /// Drops tasks whose pid the pass never enumerated (departed
+    /// members): tiers track live pids only and stay bounded.
+    pub(crate) fn prune_to_live(&mut self, live_pids: &BTreeSet<u32>) {
+        self.examined.retain(|task| live_pids.contains(&task.0));
+        self.fresh.retain(|task| live_pids.contains(&task.0));
+        self.streaks.retain(|task, _| live_pids.contains(&task.0));
+    }
+
+    /// Projects the tiers to pid sets for selection: recorded tasks
+    /// whose live start-time still matches, plus tasks recorded
+    /// without a start-time (nothing verifiable, so nothing dropped).
+    /// A recycled pid reads fresh, so reuse never inherits the old
+    /// incarnation's slot. Never-attempted is the complement (any pid
+    /// in no set); unknown work fails toward retry, never toward stall.
+    pub(crate) fn tiers_for_selection(
+        &self,
+        live_start_time: impl Fn(u32) -> Option<u64>,
+    ) -> MemberTiers {
+        let mut tiers = MemberTiers::default();
+        let live = |task: &MemberTask| {
+            task.1
+                .is_none_or(|start| live_start_time(task.0) == Some(start))
+        };
+        for task in self.examined.iter().filter(|task| live(task)) {
+            tiers.examined.insert(task.0);
+        }
+        for task in self.fresh.iter().filter(|task| live(task)) {
+            tiers.retry.insert(task.0);
+        }
+        for (task, streak) in self
+            .streaks
+            .iter()
+            .filter(|(task, _)| live(task))
+            .filter(|(_, streak)| **streak >= BUDGET_STOP_DEMOTE_AFTER)
+        {
+            tiers.demoted.insert(task.0);
+        }
+        tiers
+    }
+}
+
+/// The cursor's tiers projected to pids for one selection pass.
+/// Never-attempted members are any pid in no set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MemberTiers {
+    pub(crate) examined: BTreeSet<u32>,
+    pub(crate) retry: BTreeSet<u32>,
+    pub(crate) demoted: BTreeSet<u32>,
+}
+
+impl MemberTiers {
+    /// Pids selection treats as already scanned for rarity tiering:
+    /// examined plus demoted (demoted members sort with the
+    /// all-scanned groups, after never-scanned ones).
+    pub(crate) fn scanned_equivalent(&self) -> BTreeSet<u32> {
+        self.examined.union(&self.demoted).copied().collect()
+    }
+
+    /// Orders pids for an under-cap pass: never-attempted first,
+    /// then cut-short retries, then demoted members, then examined
+    /// ones (ascending pid within each tier).
+    pub(crate) fn order_under_cap(&self, pids: &[u32]) -> Vec<u32> {
+        let mut never = Vec::new();
+        let mut retry = Vec::new();
+        let mut demoted = Vec::new();
+        let mut examined = Vec::new();
+        for pid in pids {
+            if self.examined.contains(pid) {
+                examined.push(*pid);
+            } else if self.demoted.contains(pid) {
+                demoted.push(*pid);
+            } else if self.retry.contains(pid) {
+                retry.push(*pid);
+            } else {
+                never.push(*pid);
+            }
+        }
+        never.sort_unstable();
+        retry.sort_unstable();
+        demoted.sort_unstable();
+        examined.sort_unstable();
+        never
+            .into_iter()
+            .chain(retry)
+            .chain(demoted)
+            .chain(examined)
+            .collect()
     }
 }
 
@@ -293,6 +405,14 @@ impl ScanPassOwner {
         self.work_units
     }
 
+    /// Snapshot the consumed allowance (see [`super::scan::BudgetConsumption`]).
+    pub(crate) fn consumption_snapshot(&self) -> super::scan::BudgetConsumption {
+        super::scan::BudgetConsumption {
+            work_units: self.work_units,
+            attempted_io_bytes: self.attempted_io_bytes,
+        }
+    }
+
     pub(crate) fn window_exhaustions(&self) -> u64 {
         self.window_exhaustions
     }
@@ -367,35 +487,42 @@ impl ScanPassOwner {
         self.deadline_ns.is_some() || self.active_window.is_some() || self.collection_work.is_some()
     }
 
-    /// Ends one pass: renews per-pass allowances and clears renewable
-    /// stops, keeping the cursor. Returns the cleared stop (the
-    /// driver files the deferral gap) or `None` when nothing cleared:
-    /// a clean pass, an active window (windows own their renewal),
-    /// or a terminal stop (collection stops and zero caps are kept
-    /// and never admit).
+    /// Ends one pass: renews pass-scoped allowances (I/O bytes,
+    /// deadline) and clears renewable stops, keeping the cursor and
+    /// capture-lifetime consumed work. Returns the cleared stop when
+    /// it was never reported, so the driver files it against its own
+    /// pass instead of losing it; `None` for a clean pass, an already
+    /// reported stop, an active window (windows own their renewal),
+    /// or a terminal stop (collection stops, zero caps and exhausted
+    /// capture ceilings are kept and never admit).
     pub(crate) fn end_pass(&mut self) -> Option<&'static str> {
         if self.active_window.is_some() {
             return None;
-        }
-        if matches!(self.policy, DiscoveryPolicy::DetailedLegacy) {
-            self.work_units = 0;
         }
         self.pass_io_bytes = 0;
         let reason = self.scan_stop_reason?;
         if reason == COLLECTION_STOP_REASON || !self.allowance_allows_progress(reason) {
             return None;
         }
+        let unreported = !self.scan_stop_reported;
         self.scan_stop_reason = None;
         self.scan_stop_reported = false;
         self.deadline_ns = None;
-        Some(reason)
+        unreported.then_some(reason)
     }
 
     /// Whether the tripped dimension could admit anything next pass.
-    /// A zero allowance re-trips instantly, so its stop stays put.
+    /// An exhausted allowance re-trips instantly, so its stop stays
+    /// put; a stop with headroom left renews. Detailed work is
+    /// capture-lifetime (consumed units persist across passes), so
+    /// its headroom is the ceiling remainder; pass-scoped
+    /// allowances renew at `end_pass`, so theirs is the allowance.
     fn allowance_allows_progress(&self, reason: &'static str) -> bool {
         match reason {
-            WORK_CEILING_REASON => self.work_allowance() > 0,
+            WORK_CEILING_REASON => match self.policy {
+                DiscoveryPolicy::DetailedLegacy => self.work_units < self.work_ceiling,
+                DiscoveryPolicy::Inventory(_) => self.work_allowance() > 0,
+            },
             IO_CEILING_REASON => self.io_allowance() > 0,
             _ => true,
         }
@@ -540,14 +667,14 @@ impl ScanPassOwner {
             self.set_scan_stop(WORK_CEILING_REASON);
             return ChargeOutcome::Stopped {
                 reason: WORK_CEILING_REASON,
-                terminal: false,
+                terminal: !self.allowance_allows_progress(WORK_CEILING_REASON),
             };
         };
         if next > self.work_ceiling {
             self.set_scan_stop(WORK_CEILING_REASON);
             return ChargeOutcome::Stopped {
                 reason: WORK_CEILING_REASON,
-                terminal: false,
+                terminal: !self.allowance_allows_progress(WORK_CEILING_REASON),
             };
         }
         self.work_units = next;
@@ -1025,21 +1152,24 @@ mod tests {
 
     /// Owner 2 (admission refactor), renew/terminal table: every stop
     /// on every scope either renews next pass with cursor resume or
-    /// stays terminal. Renewable stops (work/IO ceilings, deadline,
-    /// clock) renew at `end_pass` and the refused tail retries first;
-    /// collection stops and zero caps never admit. N/A cells are
+    /// stays terminal. Renewable stops (work/IO ceilings with
+    /// headroom left, deadline, clock) renew at `end_pass` and the
+    /// refused tail retries first; collection stops, zero caps and
+    /// exhausted capture ceilings never admit. N/A cells are
     /// marked with their reason (a charge site only trips its own
     /// stop; Inventory windows reject a zero cap at construction).
     #[test]
     fn admission_owner2_pass_budget_renews_and_resumes() {
-        // Detailed work × work ceiling: renews, tail retries first.
+        // Detailed work × exhausted ceiling: the capture-lifetime
+        // stop stays put (consumed work persists across passes); the
+        // cursor is kept for the record.
         let mut pass = detailed(100, 1024);
         assert_eq!(pass.charge_work(100), ChargeOutcome::Admitted);
         assert_eq!(
             pass.charge_work(1),
             ChargeOutcome::Stopped {
                 reason: WORK_CEILING_REASON,
-                terminal: false,
+                terminal: true,
             }
         );
         assert_eq!(pass.stopped_reason(), Some(WORK_CEILING_REASON));
@@ -1049,9 +1179,16 @@ mod tests {
             ((3, Some(30)), MemberOutcome::CutShortBudgetStop),
             ((4, Some(40)), MemberOutcome::CutShortBudgetStop),
         ]);
-        assert_eq!(pass.end_pass(), Some(WORK_CEILING_REASON));
-        assert_eq!(pass.stopped_reason(), None);
-        assert_eq!(pass.charge_work(1), ChargeOutcome::Admitted);
+        assert_eq!(pass.end_pass(), None);
+        assert_eq!(pass.stopped_reason(), Some(WORK_CEILING_REASON));
+        assert_eq!(
+            pass.charge_work(1),
+            ChargeOutcome::Stopped {
+                reason: WORK_CEILING_REASON,
+                terminal: true,
+            },
+            "an exhausted capture ceiling stays sticky"
+        );
         assert_eq!(
             pass.cursor().order_members(&[
                 (1, Some(10)),
@@ -1063,6 +1200,41 @@ mod tests {
             vec![5, 3, 4, 1, 2],
             "never-attempted first, then cut-short retries, then examined"
         );
+        // Detailed work × partially consumed ceiling: the refused
+        // charge was too big for the remainder, so the stop renews
+        // and small charges still admit next pass.
+        let mut pass = detailed(100, 1024);
+        assert_eq!(pass.charge_work(90), ChargeOutcome::Admitted);
+        assert_eq!(
+            pass.charge_work(50),
+            ChargeOutcome::Stopped {
+                reason: WORK_CEILING_REASON,
+                terminal: false,
+            }
+        );
+        assert_eq!(pass.end_pass(), Some(WORK_CEILING_REASON));
+        assert_eq!(pass.charge_work(5), ChargeOutcome::Admitted);
+        assert_eq!(
+            pass.charge_work(50),
+            ChargeOutcome::Stopped {
+                reason: WORK_CEILING_REASON,
+                terminal: false,
+            },
+            "the remainder still refuses oversized charges"
+        );
+        // A reported stop renews silently: its row already published.
+        let mut pass = detailed(100, 1024);
+        assert_eq!(
+            pass.charge_work(101),
+            ChargeOutcome::Stopped {
+                reason: WORK_CEILING_REASON,
+                terminal: false,
+            }
+        );
+        assert_eq!(pass.take_scan_stop_reason(), Some(WORK_CEILING_REASON));
+        assert_eq!(pass.end_pass(), None);
+        assert_eq!(pass.stopped_reason(), None);
+        assert_eq!(pass.charge_work(1), ChargeOutcome::Admitted);
 
         // Detailed work × deadline: renews with a fresh (cleared) deadline.
         let mut pass = detailed(100, 1024);

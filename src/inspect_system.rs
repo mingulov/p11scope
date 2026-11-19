@@ -44,8 +44,8 @@ use crate::discovery::kernel_identity::{EXAMINED_ANCHOR_CAP, ExaminedCustody};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::proof_stats::{ProofStatPool, proof_stat_threads};
 use crate::discovery::scan::{
-    CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome, ScanRequest, ScannedModule, Skipped,
-    scan_process_view_examined, scan_skip_truncates,
+    BudgetConsumption, CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome, ScanRequest,
+    ScannedModule, Skipped, scan_process_view_examined, scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
     AttributionLoss, IoResources, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo,
@@ -122,7 +122,7 @@ fn run_with_writer(
         max_scan_pids,
         AdmissionPolicy::detailed(),
         // Single pass: no earlier scans, pure rarity selection.
-        &BTreeSet::new(),
+        &crate::discovery::scan_pass::MemberTiers::default(),
         // One-shot: the run never retries, so budget stops name the
         // terminal wait instead of a next tick or pass.
         true,
@@ -393,12 +393,72 @@ impl CompleteMemberScan {
     }
 }
 
+/// What one member's turn did about the capture budget: the typed
+/// scheduling signal behind retry demotion. The collector derives it
+/// from stop-latch transitions and the allowance baseline — never from
+/// gap text, so a pathname carrying budget vocabulary cannot accrue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberWorkDisposition {
+    /// No budget stop touched this turn.
+    NoBudgetStop,
+    /// A budget stop already latched at entry deferred the member
+    /// before it did any of its own work.
+    DeferredBeforeWork,
+    /// A budget stop tripped while opening the view, before the
+    /// member's own scan began.
+    StoppedInViewPreparation,
+    /// A budget stop latched during the member's own scan, read
+    /// at the turn's end. `full_allowance` tells whether the turn began
+    /// with the pass's standard allowance.
+    StoppedDuringScan { full_allowance: bool },
+}
+
+/// Derive one member's budget-work disposition from its turn's budget
+/// observations: the pass stop latch at entry, whether view preparation
+/// opened the view, the latch at the turn's end, and whether the turn
+/// began with the pass's standard allowance. Latch reasons match exactly
+/// (see `is_capture_budget_stop_reason`); anything else latched is not a
+/// budget stop for scheduling. A stop already latched at entry, or one
+/// tripped in view preparation, is an inherited shortage — never evidence
+/// of the member's own exhaustion.
+fn derive_member_work_disposition(
+    stop_before: Option<&'static str>,
+    view_opened: bool,
+    stop_after: Option<&'static str>,
+    full_allowance: bool,
+) -> MemberWorkDisposition {
+    use crate::discovery::scan::is_capture_budget_stop_reason;
+    if stop_before.is_some_and(is_capture_budget_stop_reason) {
+        // The pass stop was already latched at entry: the member did no
+        // work of its own under an unstopped budget.
+        return MemberWorkDisposition::DeferredBeforeWork;
+    }
+    if !view_opened {
+        // The view never opened. A freshly latched budget stop tripped in
+        // view preparation (a few units against a drained residual);
+        // anything else is an ordinary non-budget refusal.
+        if stop_after.is_some_and(is_capture_budget_stop_reason) {
+            return MemberWorkDisposition::StoppedInViewPreparation;
+        }
+        return MemberWorkDisposition::NoBudgetStop;
+    }
+    if stop_after.is_some_and(is_capture_budget_stop_reason) {
+        // The view opened and the scan began under an unstopped budget,
+        // and the turn ends with the stop latched: the member's own scan
+        // engaged it. Only a turn begun with the standard allowance is
+        // evidence of the member's own exhaustion.
+        return MemberWorkDisposition::StoppedDuringScan { full_allowance };
+    }
+    MemberWorkDisposition::NoBudgetStop
+}
+
 /// One scope member's deep-scan result: its status, what it mapped, and
 /// the pins the scan earned. Empty unless a scan ran.
 struct MemberResult {
     pid: u32,
     view: ProcessViewId,
     status: MemberStatus,
+    work_disposition: MemberWorkDisposition,
     generation: Option<MemberGeneration>,
     complete_scan: Option<CompleteMemberScan>,
     /// Completed presentation receipt, separate from physical/absence authority.
@@ -597,13 +657,13 @@ pub(crate) fn pair_priors(
 }
 
 /// The deep-scan selection over one sweep, for tests: rarity order with
-/// kernel threads excluded, tiered by `scanned` freshness.
+/// kernel threads excluded, tiered by the pass cursor.
 #[cfg(test)]
 pub(crate) fn select_for_test(
     sweep: &Vec<(u32, Vec<MapEntry>)>,
     unavailable: &BTreeSet<u32>,
     cap: usize,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
 ) -> Vec<u32> {
     select_excluding_kernel_threads(
         sweep,
@@ -611,7 +671,7 @@ pub(crate) fn select_for_test(
         std::path::Path::new("/proc"),
         cap,
         &mut CaptureWorkBudget::default(),
-        scanned,
+        tiers,
     )
 }
 
@@ -625,7 +685,7 @@ fn collect_members(
     max_scan_pids: Option<usize>,
     timings: &mut StageTimings,
     budget: CaptureWorkBudget,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
     priors: &ScanPriors,
     table: &mut HandleTable,
     one_shot: bool,
@@ -638,7 +698,7 @@ fn collect_members(
         false,
         budget,
         false,
-        scanned,
+        tiers,
         priors,
         table,
         one_shot,
@@ -701,7 +761,7 @@ fn collect_members_identity(
     identity: bool,
     mut budget: CaptureWorkBudget,
     take_anchors: bool,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
     priors: &ScanPriors,
     table: &mut HandleTable,
     one_shot: bool,
@@ -725,10 +785,10 @@ fn collect_members_identity(
     let mut noise = DiscoveryNoiseAggregator::default();
 
     // Phase 1+2, exactly like capture discovery: the sweep and the
-    // rarity selection run only over the cap; under it selection is the
-    // identity (ascending pids). A non-empty scanned set tiers the
-    // selection (never-scanned groups first) so multi-pass scans cannot
-    // starve a newcomer; single passes pass an empty set. Past the cap
+    // rarity selection run only over the cap; under it selection orders
+    // by the pass cursor tiers. Recorded tiers order never-scanned
+    // groups first so multi-pass scans cannot starve a newcomer; single
+    // passes pass empty tiers. Past the cap
     // the sweep is kept: C1b attributes the unselected pids from it
     // after the deep scans, and the capped-or-complete record is decided
     // then, from its counts.
@@ -756,7 +816,7 @@ fn collect_members_identity(
             Path::new("/proc"),
             cap,
             &mut budget,
-            scanned,
+            tiers,
         );
         timings.span(StageKind::Scan, "select", select_start, monotonic_ns());
         sweep = swept;
@@ -767,9 +827,7 @@ fn collect_members_identity(
             "p11scope: sweep skipped ({} processes fit the {cap} cap)",
             pids.len()
         );
-        let mut pids = pids.clone();
-        pids.sort_unstable();
-        pids
+        tiers.order_under_cap(&pids)
     };
 
     // Cross-pass deep-scan skip: selected members whose maps digest and
@@ -834,6 +892,11 @@ fn collect_members_identity(
 
     let mut members = Vec::with_capacity(selected.len());
     let deep_start = monotonic_ns();
+    // The pass's standard allowance for this deep-scan loop: each member's
+    // turn compares its entry consumption against this baseline, so only a
+    // stop tripped with nothing preceding it counts as the member's own
+    // exhaustion.
+    let allowance_baseline = budget.consumption_snapshot();
     for (index, pid) in selected.iter().enumerate() {
         if deep_scan_progress_visible(index, selected.len()) {
             progress!(
@@ -857,6 +920,7 @@ fn collect_members_identity(
             custody.as_mut(),
             &mut *table,
             one_shot,
+            allowance_baseline,
         ));
     }
     if let Some(summary) = deep_scan_progress_summary(selected.len()) {
@@ -921,9 +985,19 @@ fn scan_member(
     noise: &mut DiscoveryNoiseAggregator,
     table: &mut HandleTable,
     one_shot: bool,
+    allowance_baseline: BudgetConsumption,
 ) -> MemberResult {
     scan_member_identity(
-        pid, view, hints, hooks, budget, noise, None, table, one_shot,
+        pid,
+        view,
+        hints,
+        hooks,
+        budget,
+        noise,
+        None,
+        table,
+        one_shot,
+        allowance_baseline,
     )
 }
 
@@ -938,24 +1012,36 @@ fn scan_member_identity(
     custody: Option<&mut ExaminedCustody>,
     table: &mut HandleTable,
     one_shot: bool,
+    allowance_baseline: BudgetConsumption,
 ) -> MemberResult {
     let started_ns = monotonic_ns();
     let budget_before = (budget.stopped_reason(), budget.refusal_counts());
+    // Whether this turn began with the pass's standard allowance: entry
+    // consumption equal to the deep-scan loop-start baseline. Read before
+    // the view opens; the disposition below compares it once.
+    let full_allowance = budget.consumption_snapshot() == allowance_baseline;
     let opened = ProcessView::open_with_budget(view, pid, budget);
     let view_handle = match opened {
         Ok(view_handle) => view_handle,
         Err(error) => {
-            return member_not_scanned(
+            let mut member = member_not_scanned(
                 pid,
                 view,
                 &format!("the process generation could not be pinned: {error}"),
                 noise,
                 Vec::new(),
             );
+            member.work_disposition = derive_member_work_disposition(
+                budget_before.0,
+                false,
+                budget.stopped_reason(),
+                full_allowance,
+            );
+            return member;
         }
     };
     let mut reader = ProcessViewImageReader::new(&view_handle);
-    scan_member_application_with(&mut reader, |reader| {
+    let mut member = scan_member_application_with(&mut reader, |reader| {
         scan_pinned_member_identity(
             reader.view(),
             hints,
@@ -968,7 +1054,14 @@ fn scan_member_identity(
             &mut *table,
             one_shot,
         )
-    })
+    });
+    member.work_disposition = derive_member_work_disposition(
+        budget_before.0,
+        true,
+        budget.stopped_reason(),
+        full_allowance,
+    );
+    member
 }
 
 /// The existing physical scan/absence authority remains independent of naming.
@@ -1204,6 +1297,7 @@ fn scan_pinned_member_inner(
         pid,
         view,
         status,
+        work_disposition: MemberWorkDisposition::NoBudgetStop,
         generation: Some(generation),
         modules,
         examined,
@@ -1265,6 +1359,7 @@ fn member_not_scanned(
         pid,
         view,
         status,
+        work_disposition: MemberWorkDisposition::NoBudgetStop,
         generation: None,
         modules: Vec::new(),
         examined: Vec::new(),
@@ -1443,6 +1538,7 @@ pub(crate) struct CatalogObject {
 pub(crate) struct ProcessRecord {
     pub pid: u32,
     pub status: MemberStatus,
+    pub work_disposition: MemberWorkDisposition,
     pub objects: Vec<usize>,
     /// The generation the member's mappings belong to (deep scans and
     /// maps matches); `None` when no read reached it.
@@ -1583,20 +1679,12 @@ pub(crate) fn collect(
     hooks: &HookRegistry,
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
     one_shot: bool,
 ) -> Result<Catalog> {
     let mut budget = CaptureWorkBudget::default();
     budget.set_excludes(excludes.to_vec());
-    collect_with_budget(
-        hints,
-        hooks,
-        max_scan_pids,
-        policy,
-        budget,
-        scanned,
-        one_shot,
-    )
+    collect_with_budget(hints, hooks, max_scan_pids, policy, budget, tiers, one_shot)
 }
 
 pub(crate) fn collect_with_budget(
@@ -1605,7 +1693,7 @@ pub(crate) fn collect_with_budget(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
     one_shot: bool,
 ) -> Result<Catalog> {
     collect_with_count_manifests(
@@ -1614,7 +1702,7 @@ pub(crate) fn collect_with_budget(
         max_scan_pids,
         policy,
         budget,
-        scanned,
+        tiers,
         &[],
         0,
         0,
@@ -1626,10 +1714,10 @@ pub(crate) fn collect_with_budget(
 /// System collection with explicit count manifests. `prior_objects` /
 /// `prior_bytes` are already-retained capture-level pins, charged against
 /// the shared manifest+pre-arm budget (packet 6.13 round-3, finding 3).
-/// `scanned` holds pids deep-scanned by earlier passes; a non-empty set
-/// tiers selection (never-scanned groups first) so multi-pass scans cannot
-/// starve a newcomer, while single passes pass an empty set for pure
-/// rarity selection.
+/// `tiers` holds the pass cursor's projection: recorded tiers order
+/// never-scanned groups first so multi-pass scans cannot starve a
+/// newcomer, while single passes pass empty tiers for pure rarity
+/// selection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_with_count_manifests(
     hints: &[PathBuf],
@@ -1637,7 +1725,7 @@ pub(crate) fn collect_with_count_manifests(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -1651,7 +1739,7 @@ pub(crate) fn collect_with_count_manifests(
         policy,
         false,
         budget,
-        scanned,
+        tiers,
         manifests,
         prior_objects,
         prior_bytes,
@@ -1682,7 +1770,7 @@ pub(crate) fn collect_inventory_identity(
         policy,
         true,
         CaptureWorkBudget::default(),
-        &BTreeSet::new(),
+        &crate::discovery::scan_pass::MemberTiers::default(),
         &[],
         0,
         0,
@@ -1700,7 +1788,7 @@ fn collect_identity(
     policy: AdmissionPolicy,
     identity: bool,
     budget: CaptureWorkBudget,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -1724,7 +1812,7 @@ fn collect_identity(
             true,
             budget,
             true,
-            scanned,
+            tiers,
             priors,
             &mut handles,
             one_shot,
@@ -1737,7 +1825,7 @@ fn collect_identity(
                 max_scan_pids,
                 &mut timings,
                 budget,
-                scanned,
+                tiers,
                 priors,
                 &mut handles,
                 one_shot,
@@ -1931,6 +2019,9 @@ pub(crate) fn collect_pid_with_count_manifests(
     // can take them: without the reservation a full table would
     // starve the Trusted manifest pins.
     reserve_count_manifest_rows(&mut handles, manifests, &budget);
+    // A single-member run: the turn begins with the run's standard
+    // allowance by construction (the baseline is read at its entry).
+    let allowance_baseline = budget.consumption_snapshot();
     let member = scan_member(
         pid,
         ProcessViewId(0),
@@ -1940,6 +2031,7 @@ pub(crate) fn collect_pid_with_count_manifests(
         &mut noise,
         &mut handles,
         false,
+        allowance_baseline,
     );
     noise.report();
     if !member.status.inventoried() {
@@ -2947,6 +3039,11 @@ fn assemble(
             hints_examined: members_by_pid
                 .get(pid)
                 .is_some_and(|member| member.hints_examined),
+            work_disposition: members_by_pid
+                .get(pid)
+                .map_or(MemberWorkDisposition::NoBudgetStop, |member| {
+                    member.work_disposition
+                }),
             pid: *pid,
             status,
             objects,
@@ -5230,7 +5327,7 @@ pub(crate) fn collect_system_with_identity(
     policy: AdmissionPolicy,
     shared: IdentityShared,
     mut budget: CaptureWorkBudget,
-    scanned: &BTreeSet<u32>,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -5268,7 +5365,7 @@ pub(crate) fn collect_system_with_identity(
         true,
         budget,
         identity_takes_anchors(selection),
-        scanned,
+        tiers,
         priors,
         &mut handles,
         false,
@@ -6016,6 +6113,7 @@ mod tests {
                     status: super::MemberStatus::Unreadable {
                         reason: "the process generation could not be pinned: Permission denied (os error 13)".into(),
                     },
+                    work_disposition: super::MemberWorkDisposition::NoBudgetStop,
                     generation: None,
                     complete_scan: None,
                     application: super::InspectApplicationResult::Unknown(
@@ -7587,6 +7685,7 @@ mod tests {
                 pid,
                 view: ProcessViewId(0),
                 status: MemberStatus::Scanned,
+                work_disposition: MemberWorkDisposition::NoBudgetStop,
                 generation: None,
                 complete_scan: None,
                 application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
@@ -7614,6 +7713,7 @@ mod tests {
             catalog.processes = vec![ProcessRecord {
                 pid,
                 status: member.status,
+                work_disposition: member.work_disposition,
                 objects: vec![0],
                 generation: member.generation,
                 complete_scan: member.complete_scan,
@@ -7708,15 +7808,18 @@ mod tests {
         fn system_inspect_os_scan_adapter_retains_the_owned_executable() {
             let pid = std::process::id();
             let mut table = crate::discovery::handle_table::HandleTable::new(1000);
+            let mut budget = CaptureWorkBudget::default();
+            let baseline = budget.consumption_snapshot();
             let result = scan_member(
                 pid,
                 ProcessViewId(0),
                 &[],
                 &HookRegistry::builtin(),
-                &mut CaptureWorkBudget::default(),
+                &mut budget,
                 &mut DiscoveryNoiseAggregator::default(),
                 &mut table,
                 false,
+                baseline,
             );
             assert!(result.status.inventoried());
             let json = application_json(&result.application);
@@ -7821,15 +7924,18 @@ int main(int argc, char **argv) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             let mut table = crate::discovery::handle_table::HandleTable::new(2);
+            let mut budget = CaptureWorkBudget::default();
+            let baseline = budget.consumption_snapshot();
             let result = scan_member(
                 pid,
                 ProcessViewId(0),
                 &[],
                 &HookRegistry::builtin(),
-                &mut CaptureWorkBudget::default(),
+                &mut budget,
                 &mut DiscoveryNoiseAggregator::default(),
                 &mut table,
                 false,
+                baseline,
             );
             assert!(result.status.inventoried());
             assert_eq!(
@@ -8192,6 +8298,7 @@ int main(int argc, char **argv) {
                     hints_examined: true,
                     pid: 100,
                     status: MemberStatus::Scanned,
+                    work_disposition: MemberWorkDisposition::NoBudgetStop,
                     objects: vec![0],
                     generation: None,
                 },
@@ -8203,6 +8310,7 @@ int main(int argc, char **argv) {
                     hints_examined: true,
                     pid: 200,
                     status: MemberStatus::Scanned,
+                    work_disposition: MemberWorkDisposition::NoBudgetStop,
                     objects: if objects.len() > 1 { vec![1] } else { vec![] },
                     generation: None,
                 },
@@ -8422,6 +8530,7 @@ int main(int argc, char **argv) {
                 pid,
                 view: ProcessViewId(view),
                 status: MemberStatus::Scanned,
+                work_disposition: MemberWorkDisposition::NoBudgetStop,
                 generation: Some(MemberGeneration {
                     start_time: Some(1),
                     exe: Some(exe()),
@@ -9477,6 +9586,7 @@ int main(int argc, char **argv) {
                 status: MemberStatus::Unreadable {
                     reason: detail.to_string(),
                 },
+                work_disposition: MemberWorkDisposition::NoBudgetStop,
                 generation: None,
                 modules: Vec::new(),
                 examined: Vec::new(),
@@ -10880,6 +10990,7 @@ int main(int argc, char **argv) {
             hints_examined: false,
             pid,
             status,
+            work_disposition: MemberWorkDisposition::NoBudgetStop,
             objects: Vec::new(),
             generation: None,
         };
@@ -11211,6 +11322,7 @@ pub(crate) mod demotion_retirement_producer_tests {
                 ("non-UTF-8 pathname", false)
             };
             let mut budget = CaptureWorkBudget::default();
+            let baseline = budget.consumption_snapshot();
             let mut noise = DiscoveryNoiseAggregator::default();
             let mut table = crate::discovery::handle_table::HandleTable::new(1000);
             let member = scan_member(
@@ -11222,6 +11334,7 @@ pub(crate) mod demotion_retirement_producer_tests {
                 &mut noise,
                 &mut table,
                 false,
+                baseline,
             );
             // SAFETY: the exact owned mapping is no longer used by the scanner.
             assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
@@ -11268,6 +11381,7 @@ pub(crate) mod demotion_retirement_producer_tests {
         std::fs::rename(&path, dir.path().join("still-mapped.so")).unwrap();
         std::fs::write(&path, b"replacement physical file").unwrap();
         let mut budget = CaptureWorkBudget::default();
+        let baseline = budget.consumption_snapshot();
         let mut noise = DiscoveryNoiseAggregator::default();
         let mut table = crate::discovery::handle_table::HandleTable::new(1000);
         let member = scan_member(
@@ -11279,6 +11393,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             &mut noise,
             &mut table,
             false,
+            baseline,
         );
         // SAFETY: scanning completed; this is the exact owned 4096-byte mapping.
         assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
@@ -11294,6 +11409,7 @@ pub(crate) mod demotion_retirement_producer_tests {
         );
         let child = OwnedStoppedChild::new();
         let mut positive_budget = CaptureWorkBudget::default();
+        let baseline = positive_budget.consumption_snapshot();
         let mut table = crate::discovery::handle_table::HandleTable::new(1000);
         let member = scan_member(
             child.id(),
@@ -11304,6 +11420,7 @@ pub(crate) mod demotion_retirement_producer_tests {
             &mut noise,
             &mut table,
             false,
+            baseline,
         );
         drop(child);
         assert!(
@@ -12226,7 +12343,7 @@ mod maps_skip_tests {
         };
         use std::collections::BTreeSet;
 
-        let scanned = BTreeSet::new();
+        let scanned = crate::discovery::scan_pass::MemberTiers::default();
         // Cap 1 forces the sweep on any multi-process host (the skip needs
         // sweep snapshots) and keeps the test to one deep scan per run.
         let run = |priors: &ScanPriors| {
@@ -12317,8 +12434,8 @@ mod take_anchors_wiring_tests {
                 true,
                 CaptureWorkBudget::default(),
                 take_anchors,
-                // Cap 0 selects nothing; freshness is moot.
-                &std::collections::BTreeSet::new(),
+                // Cap 0 selects nothing; tiers are moot.
+                &crate::discovery::scan_pass::MemberTiers::default(),
                 &super::ScanPriors::empty(),
                 &mut table,
                 false,
@@ -12573,6 +12690,7 @@ mod bind_collection_strict_tests {
             pid,
             view,
             status: MemberStatus::Scanned,
+            work_disposition: MemberWorkDisposition::NoBudgetStop,
             generation: None,
             complete_scan: Some(CompleteMemberScan::scripted(
                 MemberGeneration {

@@ -2217,6 +2217,11 @@ impl CaptureWorkBudget {
         self.pass.work_units()
     }
 
+    /// Snapshot the consumed allowance (see [`BudgetConsumption`]).
+    pub(crate) fn consumption_snapshot(&self) -> BudgetConsumption {
+        self.pass.consumption_snapshot()
+    }
+
     #[cfg(test)]
     pub(crate) fn retained_counts(&self) -> (usize, usize, usize, usize, usize, u64) {
         (
@@ -5842,6 +5847,29 @@ pub(crate) fn names_capture_budget_stop(reason: &str) -> bool {
         .any(|budget| reason.contains(budget))
 }
 
+/// Whether a latched stop reason is a capture-wide budget stop: the exact
+/// [`BUDGET_EXHAUSTION_REASONS`] membership behind the per-member
+/// scheduling signal. Unlike [`names_capture_budget_stop`] (rendered-text
+/// vocabulary for gap reporting) this matches the typed latch, so a
+/// pathname containing diagnostic vocabulary can never classify as a
+/// budget stop.
+pub(crate) fn is_capture_budget_stop_reason(reason: &'static str) -> bool {
+    BUDGET_EXHAUSTION_REASONS.contains(&reason)
+}
+
+/// The pass budget's consumed allowance at one instant: work units plus
+/// attempted I/O bytes. The collector snapshots this when the deep-scan
+/// loop starts and compares it at each member's entry: equality means
+/// the turn began with the pass's standard allowance (no member work
+/// preceded it), so a stop the turn then trips while doing the member's
+/// own work is evidence of the member's own exhaustion rather than an
+/// inherited shortage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetConsumption {
+    pub(crate) work_units: u64,
+    pub(crate) attempted_io_bytes: u64,
+}
+
 fn scan_skip(subject: &str, reason: String) -> Skipped {
     Skipped {
         subject: if capture_scan_reason(&reason) {
@@ -8354,6 +8382,42 @@ pub(crate) fn final_maps_refusal_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scheduling latch match is exact membership, never a substring
+    /// search: every budget-stop constant matches, while a composed
+    /// reason (a pin-wait detail prefixed with a module pathname, a
+    /// budget phrase with an action suffix, an unknown refusal) does
+    /// not — a pathname containing diagnostic vocabulary can never
+    /// classify as a capture-wide budget stop.
+    #[test]
+    fn budget_stop_latch_match_is_exact_membership() {
+        for reason in BUDGET_EXHAUSTION_REASONS {
+            assert!(
+                is_capture_budget_stop_reason(reason),
+                "the latch must match its own constant: {reason}"
+            );
+        }
+        let poisoned_path = format!("/tmp/probe/{WORK_CEILING_REASON}/libx.so");
+        let composed = format!("{poisoned_path}: library file open waits; the pin waits");
+        // `&'static str` latches only; leak the composed strings so the
+        // negative controls exercise the real signature.
+        let composed: &'static str = Box::leak(composed.into_boxed_str());
+        assert!(
+            !is_capture_budget_stop_reason(composed),
+            "a pathname carrying the ceiling phrase must not match"
+        );
+        let suffixed: &'static str = Box::leak(
+            format!("{WORK_CEILING_REASON}; the pin waits for the next tick").into_boxed_str(),
+        );
+        assert!(
+            !is_capture_budget_stop_reason(suffixed),
+            "a budget phrase with a suffix must not match"
+        );
+        assert!(
+            !is_capture_budget_stop_reason(REPLACED_PROVIDER_REASON),
+            "a routine per-member refusal must not match"
+        );
+    }
 
     fn exclusion_inputs(excludes: &[PathBuf]) -> (ExcludePaths, ExcludeNames) {
         use std::os::unix::ffi::OsStrExt as _;

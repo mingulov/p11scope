@@ -1691,7 +1691,9 @@ Limits that matter in pods:
   `--key-operations` (default off) opts in to per-key tracking through a linked
   journal session; it requires `--capture auto` or `native`. `--key-sizes`
   (default off) additionally infers key sizes from operation lengths; it needs
-  `--key-operations` and a FULL build (P0 omits length capture). Without it,
+  `--key-operations` and a FULL build (P0 omits length capture). On a kernel
+  that refuses only the length programs, the run keeps key operations and
+  records a `key sizes unavailable` gap instead. Without it,
   token-reported and creation-template sizes and inferred families are still
   shown. Without a manifest,
   the semantic lane seals only from scan-discovered tables whose publication is

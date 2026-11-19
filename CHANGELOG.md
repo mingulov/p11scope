@@ -45,7 +45,9 @@ versioned separately and are opaque, exact dispatch keys.
   both modes, sizes infer from operation lengths with the new
   `--key-sizes` opt-in (needs `--key-operations`, off by default;
   without it every size reads unknown and no length word is
-  acquired). Text gains parenthetical tallies plus `-v` per-row
+  acquired). On a kernel that refuses only the length programs, the
+  run keeps key operations and records a `key sizes unavailable`
+  gap. Text gains parenthetical tallies plus `-v` per-row
   lines, CBOM qualification counts inferred use without reading
   inferred facts, and versions 1–6 stay frozen and byte-stable.
 

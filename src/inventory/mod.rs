@@ -6157,6 +6157,48 @@ fn start_semantic_lane(
                 if stopped() {
                     return None;
                 }
+                // Sizes degradation: a refused length-carrying start
+                // retries the base journal (a kernel that refuses only
+                // the length pair still serves key operations). The
+                // retry re-mints over the consumed subsets; a seated
+                // base lane keeps the sizes request posed (rows read
+                // absent evidence) and names the sizes refusal once.
+                // Any other outcome falls through to the ordinary
+                // retry below, exactly as without the flag.
+                if spec.key_sizes && !stopped() {
+                    if let Ok((attach_subset, convert_subset)) =
+                        seal_mint_start_subsets(coordinator, scan_subset)
+                    {
+                        if stopped() {
+                            return None;
+                        }
+                        let base = crate::attach::journal::JournalSpec { key_sizes: false };
+                        if let Ok(lane) = seal_start_live(
+                            attach_subset,
+                            convert_subset,
+                            scope,
+                            backend,
+                            Some(&base),
+                            run_control,
+                        ) {
+                            let reason = key_operations_refusal_reason(&journal_refusal);
+                            coordinator.note_scope_gap(
+                                "key sizes unavailable".into(),
+                                format!("{reason}; key operations continue without sizes"),
+                            );
+                            inventory_diagnostic(&format!(
+                                "p11scope: key sizes unavailable: {reason}; key operations \
+                                 continue without sizes"
+                            ));
+                            note_semantic_lane_sealed(true, key_operations);
+                            coordinator.note_semantic_sealed();
+                            return Some(lane);
+                        }
+                    }
+                }
+                if stopped() {
+                    return None;
+                }
                 let reason = key_operations_refusal_reason(&journal_refusal);
                 coordinator.note_scope_gap(
                     "key operations unavailable".into(),

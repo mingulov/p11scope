@@ -34,6 +34,7 @@ pub mod noise;
 pub(crate) mod overlay_witness;
 pub(crate) mod pause;
 pub(crate) mod proof_stats;
+pub(crate) mod refresh_queue;
 // Z2 retained-member custody substrate; the Task 3 N1 confirm-path routing
 // is its first consumer (remove once it consumes the whole surface).
 #[allow(dead_code)]

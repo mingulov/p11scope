@@ -108,7 +108,7 @@ impl Case {
                     .request_refresh(FAKE_PID_FLOOR + offset as u32, Some(20 + offset as u64))
             );
         }
-        assert_eq!(self.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+        assert_eq!(self.engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     }
 
     fn scan_context(
@@ -537,7 +537,7 @@ fn async_global_candidate_handoff_keeps_only_actual_historical_retired_prefix() 
     let module = child_provider_modules(&view)[1].clone();
     case.engine.newcomer_first_seen.insert(peer, Some(17));
     assert!(case.engine.request_refresh(peer, Some(23)));
-    let original = case.engine.refresh_requested[&peer].clone();
+    let original = case.engine.refresh_queue[&peer].clone();
     let mut pins = case.engine.pinned.clone();
     let skipped = pins.absorb(pin_test_modules(&view, std::slice::from_ref(&module)));
     let mut candidate = case
@@ -567,7 +567,7 @@ fn async_global_candidate_handoff_keeps_only_actual_historical_retired_prefix() 
     assert!(case.engine.pending_global_retirement.is_some());
     assert!(outcome.unpublished_views.contains(&view.id()));
     assert_eq!(case.engine.views.len(), 1);
-    assert_eq!(case.engine.refresh_requested[&peer], original);
+    assert_eq!(case.engine.refresh_queue[&peer], original);
     assert_eq!(case.engine.newcomer_first_seen[&peer], Some(17));
 }
 
@@ -664,7 +664,7 @@ fn async_global_settlement_requests_one_fresh_frame_and_keeps_original_intent() 
     let mut case = Case::new();
     let pid = case.child.id();
     case.engine.request_refresh(pid, Some(123));
-    let original = case.engine.refresh_requested[&pid].clone();
+    let original = case.engine.refresh_queue[&pid].clone();
     case.hold_pending();
     case.release();
     wait_for(|| {
@@ -682,10 +682,10 @@ fn async_global_settlement_requests_one_fresh_frame_and_keeps_original_intent() 
         .unwrap();
     assert!(outcome.progressed);
     assert!(case.engine.pending_global_retirement.is_none());
-    assert_eq!(case.engine.refresh_requested[&pid].serial, original.serial);
-    assert_eq!(case.engine.refresh_requested[&pid].owner, original.owner);
+    assert_eq!(case.engine.refresh_queue[&pid].serial, original.serial);
+    assert_eq!(case.engine.refresh_queue[&pid].owner, original.owner);
     assert_eq!(
-        case.engine.refresh_requested[&pid].first_seen_ns,
+        case.engine.refresh_queue[&pid].first_seen_ns,
         original.first_seen_ns
     );
     assert!(case.engine.take_immediate_exec_recovery_frame());
@@ -699,7 +699,7 @@ fn async_global_deferred_apply_does_not_settle_original_exec_markers() {
     let view = case.engine.views[0].id();
     let pid = case.child.id();
     case.engine.request_refresh(pid, Some(456));
-    let serial = case.engine.refresh_requested[&pid].serial;
+    let serial = case.engine.refresh_queue[&pid].serial;
     case.engine.exec_rearm_views.insert(view, Some(serial));
     let outcome = ApplyOutcome {
         disposition: ApplyDisposition::Deferred,
@@ -708,7 +708,7 @@ fn async_global_deferred_apply_does_not_settle_original_exec_markers() {
     case.engine
         .settle_applied_exec_rearms([(view, serial)], &BTreeSet::new(), &outcome);
     assert_eq!(case.engine.exec_rearm_views.get(&view), Some(&Some(serial)));
-    assert_eq!(case.engine.refresh_requested[&pid].serial, serial);
+    assert_eq!(case.engine.refresh_queue[&pid].serial, serial);
 }
 
 #[test]
@@ -716,7 +716,7 @@ fn async_global_h5_handoff_keeps_selected_request_and_whole_head() {
     let mut case = Case::new();
     let _scope = case.bounded_scope();
     case.full_requests();
-    let original = case.engine.refresh_requested.clone();
+    let original = case.engine.refresh_queue.snapshot_map_for_test();
     let mut records = vec![refresh_exec(9_000_000), refresh_exec(FAKE_PID_FLOOR)];
     let mut collect = |_: &mut dyn EngineSession| Ok((Vec::new(), 0));
     case.engine
@@ -743,7 +743,7 @@ fn async_global_h5_handoff_keeps_selected_request_and_whole_head() {
             .is_empty(),
         "a deferred selected request has not been ruled out"
     );
-    assert_eq!(case.engine.refresh_requested, original);
+    assert_eq!(case.engine.refresh_queue.snapshot_map_for_test(), original);
     assert_eq!(case.engine.pending_discovery_records.len(), 2);
     assert_eq!(
         case.engine.pending_discovery_records[0].record.pid_tgid >> 32,
@@ -802,7 +802,7 @@ fn async_global_pending_frames_preserve_scope_and_all_original_ages() {
     let pid = case.child.id();
     case.engine.request_refresh_consumed(pid, Some(123));
     case.engine.newcomer_first_seen.insert(9_000_000, Some(321));
-    let requests = case.engine.refresh_requested.clone();
+    let requests = case.engine.refresh_queue.snapshot_map_for_test();
     let newcomers = case.engine.newcomer_first_seen.clone();
     let scans = case.engine.deep_scans;
     case.hold_pending();
@@ -812,7 +812,7 @@ fn async_global_pending_frames_preserve_scope_and_all_original_ages() {
     for _ in 0..3 {
         refresh_inventory_with(&mut case.engine, &mut case.session);
     }
-    assert_eq!(case.engine.refresh_requested, requests);
+    assert_eq!(case.engine.refresh_queue.snapshot_map_for_test(), requests);
     assert_eq!(case.engine.newcomer_first_seen, newcomers);
     assert_eq!(case.engine.deep_scans, scans);
     assert_eq!(case.engine.plan.slots.len(), 1);
@@ -934,7 +934,7 @@ fn async_global_pending_records_keep_newer_exec_order_and_transport_loss() {
     let mut case = Case::new();
     case.engine
         .request_refresh_consumed(case.child.id(), Some(31));
-    let original = case.engine.refresh_requested.clone();
+    let original = case.engine.refresh_queue.snapshot_map_for_test();
     case.hold_pending();
     let first = refresh_exec(case.child.id());
     let second = refresh_exec(9_000_000);
@@ -942,7 +942,8 @@ fn async_global_pending_records_keep_newer_exec_order_and_transport_loss() {
         .apply_discovery_batch(&mut case.session, vec![first.record, second.record], 1)
         .unwrap();
     assert_eq!(
-        case.engine.refresh_requested, original,
+        case.engine.refresh_queue.snapshot_map_for_test(),
+        original,
         "queued newer execs cannot settle or renew the old request early"
     );
     assert_eq!(case.engine.pending_discovery_records.len(), 2);
@@ -972,7 +973,7 @@ fn async_global_pending_records_keep_newer_exec_order_and_transport_loss() {
 fn async_global_quiet_handoff_still_runs_one_fresh_scoped_scan_after_hint_consumption() {
     let mut case = Case::new();
     let _scope = case.bounded_scope();
-    assert!(case.engine.refresh_requested.is_empty());
+    assert!(case.engine.refresh_queue.is_empty());
     let scans = case.engine.deep_scans;
     let candidate = case.candidate();
     let outcome = case

@@ -19778,14 +19778,12 @@ impl Engine {
             && let Some(snapshot) = &retire_snapshot
         {
             if matches!(&detach_slots_outcome, Ok(report) if report.pending.is_some()) {
-                let (modules, slots) =
-                    CoverageRetireSnapshot::cover(&snapshot.attached, |_| true);
+                let (modules, slots) = CoverageRetireSnapshot::cover(&snapshot.attached, |_| true);
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             } else {
                 let planned = Self::planned_reattach_keys(&candidate);
-                let (modules, slots) = CoverageRetireSnapshot::cover(&snapshot.attached, |key| {
-                    !planned.contains(key)
-                });
+                let (modules, slots) =
+                    CoverageRetireSnapshot::cover(&snapshot.attached, |key| !planned.contains(key));
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             }
         }
@@ -20339,9 +20337,7 @@ impl Engine {
         // key although intent excluded it early. Only when the detach
         // committed (a failed detach retires nothing). Replace slots only:
         // new-attach failures keep their existing accounting.
-        if detach_committed
-            && let Some(snapshot) = &retire_snapshot
-        {
+        if detach_committed && let Some(snapshot) = &retire_snapshot {
             let stranded: BTreeSet<plan::AttachKey> = candidate
                 .delta
                 .replace
@@ -20350,9 +20346,8 @@ impl Engine {
                 .map(plan::AttachKey::of)
                 .collect();
             if !stranded.is_empty() {
-                let (modules, slots) = CoverageRetireSnapshot::cover(&snapshot.attached, |key| {
-                    stranded.contains(key)
-                });
+                let (modules, slots) =
+                    CoverageRetireSnapshot::cover(&snapshot.attached, |key| stranded.contains(key));
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             }
         }

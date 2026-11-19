@@ -1870,10 +1870,7 @@ fn async_global_running_owned_pure_retire_opens_a_counted_coverage_window() {
         candidate.delta.new.is_empty() && candidate.delta.replace.is_empty(),
         "premise: the retire is pure (no same-apply reattach)"
     );
-    candidate
-        .delta
-        .retire
-        .push(engine.plan.slots[0].clone());
+    candidate.delta.retire.push(engine.plan.slots[0].clone());
     candidate.plan.deactivate(0);
     let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
         engine.plan.slots[0].module_ids.iter().copied().collect();
@@ -1921,10 +1918,7 @@ fn async_global_owned_retire_with_reattach_stays_silent() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
     engine.owned_run_pid = Some(child.id());
     let mut candidate = peer_candidate(&mut engine, &modules);
-    candidate
-        .delta
-        .retire
-        .push(engine.plan.slots[0].clone());
+    candidate.delta.retire.push(engine.plan.slots[0].clone());
     candidate.plan.deactivate(0);
     assert!(
         !candidate.delta.new.is_empty() || !candidate.delta.replace.is_empty(),
@@ -1979,7 +1973,13 @@ fn async_global_owned_leader_with_descendant_pure_retire_opens_a_counted_coverag
     let peer = peer_candidate(&mut engine, &modules);
     let mut additions = true;
     engine
-        .apply_candidate(&mut ScriptedSession::default(), peer, &mut additions, false, &[])
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            peer,
+            &mut additions,
+            false,
+            &[],
+        )
         .unwrap();
     assert_eq!(
         engine.plan.slots.len(),
@@ -2067,10 +2067,7 @@ fn async_global_same_module_mixed_retire_discloses_the_dark_endpoint() {
         candidate.delta.replace.is_empty(),
         "premise: nothing replaces"
     );
-    candidate
-        .delta
-        .retire
-        .push(engine.plan.slots[0].clone());
+    candidate.delta.retire.push(engine.plan.slots[0].clone());
     candidate.plan.deactivate(0);
     let retired_key = crate::plan::AttachKey::of(&engine.plan.slots[0]);
     let fresh_key = crate::plan::AttachKey::of(&candidate.delta.new[0]);
@@ -2146,10 +2143,7 @@ fn async_global_precheck_failed_replacement_discloses_the_stranded_endpoint() {
         candidate.delta.new.is_empty() && candidate.delta.replace.is_empty(),
         "premise: nothing is left to attach"
     );
-    candidate
-        .delta
-        .replace
-        .push(engine.plan.slots[0].clone());
+    candidate.delta.replace.push(engine.plan.slots[0].clone());
     let retired_index = engine.plan.slots[0].index;
     let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
         engine.plan.slots[0].module_ids.iter().copied().collect();
@@ -2231,8 +2225,12 @@ fn async_global_pending_retirement_with_planned_reattach_files_for_every_attache
         .replace
         .push(case.engine.plan.slots[0].clone());
     let retired_index = case.engine.plan.slots[0].index;
-    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
-        case.engine.plan.slots[0].module_ids.iter().copied().collect();
+    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> = case.engine.plan.slots
+        [0]
+    .module_ids
+    .iter()
+    .copied()
+    .collect();
     case.session.scripted_stamps.insert(retired_index, 1);
     let outcome = case
         .engine

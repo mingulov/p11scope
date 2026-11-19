@@ -347,6 +347,60 @@ impl AtomicFile {
         }
     }
 
+    /// Saves a finished streaming export (already in `staging`) to
+    /// the recovery dir after its `-o` write failed: the temp holds at
+    /// most a partial write, so the fallback carries the staging's
+    /// complete bytes, never the temp. There is no retry — a full
+    /// destination stays full — the recovery dir on its own filesystem
+    /// is the retry. Consumes the sink and the staging; `Drop` unlinks
+    /// the partial temp. Reports the same typed failure as
+    /// `fail_write_with_recovery` with the same operator lines. The
+    /// caller checks cancellation before calling: a cancelled export
+    /// aborts its staging instead of finishing it.
+    pub(crate) fn fail_streaming_write_with_recovery(
+        self,
+        staging: RecoveryStaging,
+        write_error: String,
+    ) -> CommitFailure {
+        let base = recovered_base_dir();
+        match staging.finish() {
+            Ok(saved) => {
+                let euid = unsafe { libc::geteuid() } as u32;
+                let note = recovery_saved_note(euid, account_name(euid).as_deref());
+                eprintln!(
+                    "p11scope: writing {} failed: {write_error}; capture saved to {} {note}",
+                    self.final_path.display(),
+                    saved.display()
+                );
+                CommitFailure {
+                    message: format!(
+                        "writing {} failed: {write_error}; capture saved to {} {note}",
+                        self.final_path.display(),
+                        saved.display()
+                    ),
+                    kind: CommitFailureKind::SavedToRecovery,
+                    saved: Some(saved),
+                }
+            }
+            Err(e2) => {
+                eprintln!(
+                    "p11scope: writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
+                    self.final_path.display(),
+                    base.display()
+                );
+                CommitFailure {
+                    message: format!(
+                        "writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
+                        self.final_path.display(),
+                        base.display()
+                    ),
+                    kind: CommitFailureKind::RecoveryFailed,
+                    saved: None,
+                }
+            }
+        }
+    }
+
     /// The final report path, for error and fallback lines naming it.
     pub fn path(&self) -> &Path {
         &self.final_path
@@ -1753,7 +1807,7 @@ fn unlinkat(directory: &std::fs::File, name: &CString) -> std::io::Result<()> {
 /// always uses the per-euid `/var/tmp/p11scope-recovered-<euid>`
 /// (fixed behaviour, no knob), so one user's fallback never blocks
 /// another's.
-fn recovered_base_dir() -> PathBuf {
+pub(crate) fn recovered_base_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR") {
         return PathBuf::from(dir);
@@ -2100,6 +2154,139 @@ fn save_recovered_bytes(bytes: &[u8], dest: &Path, base: &Path) -> Result<PathBu
     save_recovered_stream(&mut src, dest, base)
 }
 
+/// A streaming recovery file: created up front in the held recovery
+/// dir (the base, or the fresh fallback sibling when the base is
+/// occupied) with the same names, `O_EXCL` and `0600` discipline as
+/// the shared recovery write, written incrementally with bounded
+/// memory, then finished (`fsync` of the file and the dir) or
+/// aborted (unlinked). Dropping an unfinished staging unlinks it, so
+/// a cancelled export leaves no fallback file behind.
+pub(crate) struct RecoveryStaging {
+    dir: std::fs::File,
+    file: std::fs::File,
+    name: CString,
+    path: PathBuf,
+    actual: PathBuf,
+    finished: bool,
+}
+
+impl RecoveryStaging {
+    /// Creates an empty private staging file for `dest` (whose
+    /// extension names the suffix, `json` when absent) in the recovery
+    /// dir held for `base`. The file is `0600`, `O_EXCL`, unique over
+    /// 128 sequence retries.
+    pub(crate) fn create(dest: &Path, base: &Path) -> Result<Self, String> {
+        let (dir, actual) = open_recovered_dir_or_fallback(base)?;
+        let ext = dest
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .filter(|ext| !ext.is_empty() && !ext.contains('/') && !ext.contains('\0'))
+            .unwrap_or("json");
+        let timestamp = fallback_timestamp();
+        let pid = std::process::id();
+        for seq in 0..128u32 {
+            let name = if seq == 0 {
+                format!("p11scope-{timestamp}-{pid}.{ext}")
+            } else {
+                format!("p11scope-{timestamp}-{pid}.{seq}.{ext}")
+            };
+            let c_name = CString::new(name.clone()).expect("generated recovery name has no NUL");
+            // SAFETY: the dir fd and the NUL-terminated name outlive the call;
+            // the returned fd is owned below on success.
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                return Err(format!(
+                    "creating recovery file {name} in {} failed: {error}",
+                    actual.display()
+                ));
+            }
+            // SAFETY: openat succeeded, so the fd is owned.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let path = actual.join(&name);
+            return Ok(Self {
+                dir,
+                file,
+                name: c_name,
+                path,
+                actual,
+                finished: false,
+            });
+        }
+        Err(format!(
+            "cannot allocate a unique recovery file in {}",
+            actual.display()
+        ))
+    }
+
+    /// The staging file, for incremental bounded writes.
+    pub(crate) fn file_mut(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+
+    /// The recovery dir actually held (the base or the fresh fallback
+    /// sibling), for error lines.
+    pub(crate) fn actual(&self) -> &Path {
+        &self.actual
+    }
+
+    /// Finishes the staging: `fsync` of the file and the dir, then the
+    /// saved path. A failure unlinks the partial file again.
+    pub(crate) fn finish(mut self) -> Result<PathBuf, String> {
+        let name = self
+            .name
+            .to_str()
+            .expect("generated recovery name is UTF-8")
+            .to_string();
+        if let Err(error) = self.file.sync_all() {
+            let _ = unlinkat(&self.dir, &self.name);
+            self.finished = true;
+            return Err(format!(
+                "syncing recovery file {name} in {} failed: {error}",
+                self.actual.display()
+            ));
+        }
+        if let Err(error) = self.dir.sync_all() {
+            let _ = unlinkat(&self.dir, &self.name);
+            self.finished = true;
+            return Err(format!(
+                "syncing recovery directory {} failed: {error}",
+                self.actual.display()
+            ));
+        }
+        self.finished = true;
+        Ok(self.path.clone())
+    }
+
+    /// Aborts the staging: unlinks the file, no error.
+    pub(crate) fn abort(mut self) {
+        let _ = unlinkat(&self.dir, &self.name);
+        self.finished = true;
+    }
+}
+
+impl Drop for RecoveryStaging {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = unlinkat(&self.dir, &self.name);
+        }
+    }
+}
+
 /// The shared recovery write: a new `0600` file in the held recovery
 /// dir (the base, or the fresh fallback sibling when the base is
 /// occupied), `O_EXCL`, then `fsync` of the file and the dir. A
@@ -2110,73 +2297,22 @@ fn save_recovered_stream(
     dest: &Path,
     base: &Path,
 ) -> Result<PathBuf, String> {
-    let (dir, actual) = open_recovered_dir_or_fallback(base)?;
-    let ext = dest
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .filter(|ext| !ext.is_empty() && !ext.contains('/') && !ext.contains('\0'))
-        .unwrap_or("json");
-    let timestamp = fallback_timestamp();
-    let pid = std::process::id();
-    for seq in 0..128u32 {
-        let name = if seq == 0 {
-            format!("p11scope-{timestamp}-{pid}.{ext}")
-        } else {
-            format!("p11scope-{timestamp}-{pid}.{seq}.{ext}")
-        };
-        let c_name = CString::new(name.clone()).expect("generated recovery name has no NUL");
-        // SAFETY: the dir fd and the NUL-terminated name outlive the call;
-        // the returned fd is owned below on success.
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                c_name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EEXIST) {
-                continue;
-            }
-            return Err(format!(
-                "creating recovery file {name} in {} failed: {error}",
-                actual.display()
-            ));
-        }
-        // SAFETY: openat succeeded, so the fd is owned.
-        let mut out = unsafe { std::fs::File::from_raw_fd(fd) };
-        let cleanup = |dir: &std::fs::File, name: &CString| {
-            let _ = unlinkat(dir, name);
-        };
-        if let Err(error) = std::io::copy(reader, &mut out) {
-            cleanup(&dir, &c_name);
-            return Err(format!(
-                "writing recovery file {name} in {} failed: {error}",
-                actual.display()
-            ));
-        }
-        if let Err(error) = out.sync_all() {
-            cleanup(&dir, &c_name);
-            return Err(format!(
-                "syncing recovery file {name} in {} failed: {error}",
-                actual.display()
-            ));
-        }
-        if let Err(error) = dir.sync_all() {
-            cleanup(&dir, &c_name);
-            return Err(format!(
-                "syncing recovery directory {} failed: {error}",
-                actual.display()
-            ));
-        }
-        return Ok(actual.join(name));
+    let mut staging = RecoveryStaging::create(dest, base)?;
+    let name = staging
+        .path
+        .file_name()
+        .expect("generated recovery path has a name")
+        .to_string_lossy()
+        .into_owned();
+    let actual = staging.actual().to_path_buf();
+    if let Err(error) = std::io::copy(reader, staging.file_mut()) {
+        staging.abort();
+        return Err(format!(
+            "writing recovery file {name} in {} failed: {error}",
+            actual.display()
+        ));
     }
-    Err(format!(
-        "cannot allocate a unique recovery file in {}",
-        actual.display()
-    ))
+    staging.finish()
 }
 
 /// Serializes tests that override the recovery directory: the override

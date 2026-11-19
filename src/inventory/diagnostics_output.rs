@@ -55,69 +55,223 @@ impl DiagnosticsDestination {
     }
 
     /// Called after primary report attempts. Cancellation is the second signal.
+    ///
+    /// The export streams each line (fixed 8 KiB scratch, cancellation
+    /// checked between records) to both the `-o` temp and a private
+    /// disk-backed recovery staging, with bounded heap: no in-memory
+    /// copy of the complete file while the rings and export indexes
+    /// are live. A short `-o` write then finishes the staging instead
+    /// of dropping the export. Cancellation is checked before
+    /// starting recovery; a cancelled export aborts its staging and
+    /// leaves the old destination intact.
     pub(crate) fn deliver(
         mut self,
         finished: FinishedDiagnostics,
         view: &impl RetainedIdentityView,
         mut second_signal: impl FnMut() -> bool,
     ) -> Result<DiagnosticSummary, String> {
-        // Render into memory first (the export enforces its own byte
-        // bound): a short `-o` write then saves these complete bytes
-        // to the recovery dir instead of dropping the export.
-        let mut bytes = Vec::new();
-        let summary = finished
-            .write_jsonl(&mut bytes, view, &mut second_signal)
-            .map_err(|error| {
-                format!(
+        let base = crate::output::recovered_base_dir();
+        let (staging, creation_error) =
+            match crate::output::RecoveryStaging::create(&self.path, &base) {
+                Ok(staging) => (Some(staging), None),
+                // No staging: the primary may still succeed, and a
+                // primary failure then reports both errors as lost.
+                Err(error) => (None, Some(error)),
+            };
+        // Stream the export through the tee; the tee borrows the `-o`
+        // temp only for this block, so the tail below reclaims it.
+        let (export, primary_failed, primary_error, staging, creation_error, staging_error) = {
+            let mut tee = StreamingTee {
+                output: &mut self.output,
+                staging,
+                creation_error,
+                staging_error: None,
+                primary_failed: false,
+                primary_error: None,
+            };
+            let export = finished.write_jsonl(&mut tee, view, &mut second_signal);
+            (
+                export,
+                tee.primary_failed,
+                tee.primary_error,
+                tee.staging.take(),
+                tee.creation_error,
+                tee.staging_error,
+            )
+        };
+        // From here the tee is gone; `self.output` and `staging` are
+        // usable again.
+        match export {
+            Ok(summary) => {
+                if primary_failed {
+                    let Some(staging) = staging else {
+                        // Primary failed with no staging (creation
+                        // failed up front, or a staging write failed
+                        // mid-export): both errors, as lost.
+                        if second_signal() {
+                            return Err(format!(
+                                "diagnostics export cancelled: {}",
+                                self.path.display()
+                            ));
+                        }
+                        let second = creation_error
+                            .or(staging_error)
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        return Err(format!(
+                            "writing diagnostics {} failed: {}; saving to {} also failed: {second}; capture lost",
+                            self.path.display(),
+                            primary_error.unwrap_or_else(|| "unknown error".to_string()),
+                            base.display(),
+                        ));
+                    };
+                    // The `-o` temp holds at most a partial write; the
+                    // staging holds the complete export. Check
+                    // cancellation before starting recovery.
+                    if second_signal() {
+                        staging.abort();
+                        return Err(format!(
+                            "diagnostics export cancelled: {}",
+                            self.path.display()
+                        ));
+                    }
+                    let failure = self.output.fail_streaming_write_with_recovery(
+                        staging,
+                        format!(
+                            "writing diagnostics {} failed: {}",
+                            self.path.display(),
+                            primary_error.unwrap_or_else(|| "unknown error".to_string()),
+                        ),
+                    );
+                    return Err(failure.into_message());
+                }
+                // Primary holds the complete export; the staging (if
+                // any) is unneeded. Dropping it unlinks it.
+                drop(staging);
+                // Fall through with `summary` to the publication tail.
+                Self::publish_tail(self, summary, &mut second_signal)
+            }
+            Err(error) => {
+                // The tee failed both sinks (or the primary with no
+                // staging), or the export was cancelled, or a line
+                // could not serialize. Abort any partial staging and
+                // leave the old destination intact.
+                drop(staging);
+                if second_signal() {
+                    return Err(format!(
+                        "diagnostics export cancelled: {}",
+                        self.path.display()
+                    ));
+                }
+                Err(format!(
                     "writing diagnostics {} failed: {error}",
                     self.path.display()
-                )
-            })?;
-        if let Err(error) = self.output.write_document(&bytes) {
-            let failure = self.output.fail_write_with_recovery(
-                &bytes,
-                format!(
-                    "writing diagnostics {} failed: {error}",
-                    self.path.display()
-                ),
-            );
-            return Err(failure.into_message());
+                ))
+            }
         }
+    }
+
+    /// The post-export publication tail: cancellation, alias
+    /// revalidation, cancellation, commit. Split so the streaming head
+    /// above returns early on write failure without duplicating it.
+    fn publish_tail(
+        destination: DiagnosticsDestination,
+        summary: DiagnosticSummary,
+        second_signal: &mut impl FnMut() -> bool,
+    ) -> Result<DiagnosticSummary, String> {
         if second_signal() {
             return Err(format!(
                 "diagnostics export cancelled: {}",
-                self.path.display()
+                destination.path.display()
             ));
         }
         validate_aliases_with_identity(
-            &self.path,
+            &destination.path,
             || {
-                self.output
+                destination
+                    .output
                     .destination_identity()
                     .map_err(PrepareError::Unavailable)
             },
-            self.report.as_deref(),
-            self.event_log.as_deref(),
+            destination.report.as_deref(),
+            destination.event_log.as_deref(),
         )
         .map_err(|error| {
             format!(
                 "checking diagnostics {} aliases before publication failed: {error}",
-                self.path.display()
+                destination.path.display()
             )
         })?;
         if second_signal() {
             return Err(format!(
                 "diagnostics export cancelled: {}",
-                self.path.display()
+                destination.path.display()
             ));
         }
-        self.output.commit().map_err(|error| {
+        destination.output.commit().map_err(|error| {
             format!(
                 "publishing diagnostics {} failed: {error}",
-                self.path.display()
+                destination.path.display()
             )
         })?;
         Ok(summary)
+    }
+}
+
+/// Streams each export line to both the `-o` temp and the recovery
+/// staging with bounded heap. A failed sink is retried no further;
+/// the export continues to the surviving sink, so a short `-o` write
+/// still yields a complete staging. Both sinks failed is an I/O
+/// error; at least one success is a full write.
+struct StreamingTee<'a> {
+    output: &'a mut AtomicFile,
+    staging: Option<crate::output::RecoveryStaging>,
+    creation_error: Option<String>,
+    staging_error: Option<String>,
+    primary_failed: bool,
+    primary_error: Option<String>,
+}
+
+impl std::io::Write for StreamingTee<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut primary_ok = false;
+        if !self.primary_failed {
+            match self.output.write_document(bytes) {
+                Ok(()) => primary_ok = true,
+                Err(error) => {
+                    self.primary_failed = true;
+                    self.primary_error = Some(error.to_string());
+                }
+            }
+        }
+        let mut staging_ok = false;
+        if let Some(staging) = self.staging.as_mut() {
+            match std::io::Write::write_all(staging.file_mut(), bytes) {
+                Ok(()) => staging_ok = true,
+                Err(error) => {
+                    // Drop the broken staging now: its partial file is
+                    // unlinked, and the export continues primary-only.
+                    // A later primary failure then reports both errors.
+                    let staging = self.staging.take();
+                    drop(staging);
+                    self.staging_error = Some(error.to_string());
+                }
+            }
+        }
+        if primary_ok || staging_ok {
+            Ok(bytes.len())
+        } else {
+            // Both sinks failed (or the primary with no staging):
+            // abort the export with the primary error.
+            Err(std::io::Error::other(
+                self.primary_error
+                    .clone()
+                    .unwrap_or_else(|| "diagnostics write failed".to_string()),
+            ))
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -537,6 +691,10 @@ mod tests {
     fn real_preflight_and_delivery_publish_private_complete_jsonl() {
         let directory = private_directory();
         let path = directory.path().join("diagnostics.jsonl");
+        // The streaming export stages to the recovery dir: hold the
+        // override so the staging lands in this test's own dir.
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
         let destination = DiagnosticsDestination::prepare(&path, None, None).unwrap();
         destination
             .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
@@ -553,6 +711,8 @@ mod tests {
         let directory = private_directory();
         let path = directory.path().join("diagnostics.jsonl");
         std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
         let destination = fixture_destination(&path, None, None);
         let summary = destination
             .deliver(finished(CaptureOutcome::Stopped), &NoLabels, || false)
@@ -676,6 +836,8 @@ mod tests {
         let directory = private_directory();
         let path = directory.path().join("diagnostics.jsonl");
         std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
         let destination = fixture_destination(&path, None, None);
         let mut checks = 0;
         let error = destination
@@ -694,6 +856,8 @@ mod tests {
         let directory = private_directory();
         let path = directory.path().join("diagnostics.jsonl");
         std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
         let destination = fixture_destination(&path, None, None);
         let error = destination
             .deliver(finished(CaptureOutcome::Stopped), &NoLabels, || {
@@ -727,6 +891,8 @@ mod tests {
         let report = directory.path().join("report.json");
         std::fs::write(&path, b"old diagnostics").unwrap();
         std::fs::write(&report, b"primary report").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
         let destination = fixture_destination(&path, Some(&report), None);
         let mut swapped = false;
         let error = destination
@@ -751,6 +917,8 @@ mod tests {
     #[test]
     fn revalidation_uses_retained_destination_when_its_parent_is_renamed() {
         let directory = private_directory();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
         let capture_directory = directory.path().join("capture");
         std::fs::create_dir(&capture_directory).unwrap();
         std::fs::set_permissions(&capture_directory, std::fs::Permissions::from_mode(0o700))
@@ -787,6 +955,8 @@ mod tests {
         let directory = private_directory();
         let path = directory.path().join("diagnostics.jsonl");
         std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
         let destination = fixture_destination(&path, None, None);
         let mut damaged = false;
         let result = destination.deliver(finished(CaptureOutcome::Completed), &NoLabels, || {

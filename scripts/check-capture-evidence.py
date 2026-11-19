@@ -2458,6 +2458,7 @@ def expected_gap_classes(evidence):
             ("vendor_interfaces", evidence["vendor_interfaces"] > 0),
             ("interface_list", evidence["interface_list"].startswith("error:")),
             ("event_loss", evidence["event_loss"] > 0),
+            ("coverage_retired_slots", evidence["coverage_retired_slots"] > 0),
             ("start_insert_failures", evidence["start_insert_failures"] > 0),
             ("unmatched_returns", evidence["unmatched_returns"] > 0),
             ("rv_update_failures", evidence["rv_update_failures"] > 0),
@@ -2476,7 +2477,6 @@ def expected_gap_classes(evidence):
             ("discovery_read_failures", evidence["discovery_read_failures"] > 0),
             ("discovery_truncated", evidence["discovery_truncated"] > 0),
             ("task_uprobe_link_losses", evidence["task_uprobe_link_losses"] > 0),
-            ("coverage_retired_slots", evidence["coverage_retired_slots"] > 0),
             ("pause_partial", evidence["pause_partial"] > 0),
             ("pause_unavailable", evidence["pause_unavailable"] > 0),
             ("loader_discovery", not loader_discovery_complete(evidence["loader_discovery"])),
@@ -5418,6 +5418,9 @@ def self_test():
         completeness="PARTIAL",
         verdict_detail="concrete_gap",
     )
+    # The one lost event dropped while the capture loop ran, so the
+    # scheduling split still sums to event_loss.
+    retired["evidence"]["scheduling"]["capture_event_loss"] = 1
     settle_fixture_verdict(retired)
     require(
         retired["evidence"]["gap_classes"]["observation"]["causes"]

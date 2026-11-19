@@ -2328,7 +2328,8 @@ fn cbom_folded_instance_rows_count_toward_the_row_bound() {
 }
 
 /// Folded-instance drops and saturation stay named unknowns: summed
-/// across modules, rendered only when nonzero.
+/// across modules, rendered only when nonzero, in JSON and both text
+/// modes.
 #[test]
 fn cbom_folded_instance_bounds_stay_named_unknowns() {
     let mut departed = departed_use(
@@ -2364,6 +2365,28 @@ fn cbom_folded_instance_bounds_stay_named_unknowns() {
     assert_eq!(
         metadata_value(&document, "p11scope:departed_folded_instances_saturated"),
         "1"
+    );
+    let mut concise = Vec::new();
+    super::render::render_concise(&projection, &mut concise).unwrap();
+    let concise = String::from_utf8(concise).unwrap();
+    assert!(
+        concise.contains("7 departed folded instances dropped"),
+        "concise names the dropped instances: {concise}"
+    );
+    assert!(
+        concise.contains("1 module with saturated departed folded instances"),
+        "concise names the saturated module: {concise}"
+    );
+    let mut verbose = Vec::new();
+    super::render::render_verbose(&projection, &mut verbose).unwrap();
+    let verbose = String::from_utf8(verbose).unwrap();
+    assert!(
+        verbose.contains("7 departed folded instances dropped"),
+        "verbose names the dropped instances: {verbose}"
+    );
+    assert!(
+        verbose.contains("1 module with saturated departed folded instances"),
+        "verbose names the saturated module: {verbose}"
     );
 }
 

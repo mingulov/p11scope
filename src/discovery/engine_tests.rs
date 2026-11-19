@@ -97631,8 +97631,23 @@ fn mo_entry_e2_retirement() -> MoEntryOutcome {
         "the replay files no claims under the retired view"
     );
     assert!(
-        engine.pinned.carried_ids().contains(&object),
-        "the replayed pin reads as carried coverage"
+        engine.pinned.summary(object).is_some(),
+        "the replayed pin stays resolvable"
+    );
+    // E1 custody: the owned-run harvest files a reserved-owner pins-only
+    // alias on the replayed pin by design (transient-member persistence),
+    // so the pin reads claimed-but-resolvable rather than carried-claimless.
+    let learned = engine
+        .pinned
+        .view_claims(Engine::RUN_LEARNED_VIEW_ID)
+        .expect("the replayed pin rides E1 custody under the reserved learned owner");
+    assert!(
+        learned.pins.contains(&object),
+        "the reserved learned owner holds the replayed pin"
+    );
+    assert!(
+        learned.tables.is_empty() && learned.targets.is_empty(),
+        "the learned custody is a pins-only alias"
     );
     MoEntryOutcome {
         committed: true,

@@ -18379,6 +18379,7 @@ impl Engine {
         // too (it is authorized below, so the scrub spares it).
         let ridden: BTreeSet<ProcessViewId> =
             raw_modules.iter().map(|module| module.view).collect();
+        let raw_pre_reject = raw_modules.len();
         raw_modules.retain(|module| {
             !pinned.rejects(module.key)
                 && !module
@@ -18387,6 +18388,14 @@ impl Engine {
                     .flat_map(|table| &table.entries)
                     .any(|entry| pinned.rejects(entry.object))
         });
+        if raw_modules.len() != raw_pre_reject {
+            eprintln!(
+                "p11scope: DIAG v072b reject_filter dropped={} kept={} mono_ns={:?}",
+                raw_pre_reject - raw_modules.len(),
+                raw_modules.len(),
+                crate::attach::monotonic_ns(),
+            );
+        }
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(
                 "p11scope: candidate scan inputs: {} frame + {} run-learned, {} survive rejects",
@@ -18720,6 +18729,19 @@ impl Engine {
             merge_tail_start,
             crate::attach::monotonic_ns(),
         );
+        if !delta.retire.is_empty() {
+            let bound_learned = modules
+                .iter()
+                .filter(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID)
+                .count();
+            eprintln!(
+                "p11scope: DIAG v072b retire_candidate retire={} bound_modules={} bound_learned={} mono_ns={:?}",
+                delta.retire.len(),
+                modules.len(),
+                bound_learned,
+                crate::attach::monotonic_ns(),
+            );
+        }
         Ok(LiveCandidate {
             pinned,
             modules,

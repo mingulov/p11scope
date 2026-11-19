@@ -3519,6 +3519,98 @@ fn key_ops_concise_wrapped_material() {
     );
 }
 
+/// An above-bound refusal renders `size unsupported (outside admission
+/// bound)` only when that reason is set: the refused row names it,
+/// while a retained inferred row keeps its value fragment instead.
+#[test]
+fn key_ops_verbose_outside_bound_only_when_set() {
+    let wrapped_family = || FamilyState {
+        status: InferredStatus::Unknown,
+        value: None,
+        completions: 1,
+        value_completions: 0,
+        conflict_value: None,
+        conflict_completions: 0,
+        further: 0,
+        reason: Some(crate::keymeta::REASON_OPERATION_KEY_ONLY),
+        further_seen: 0,
+    };
+    let mut observations = populated(9);
+    observations.key_operations.push(key_row_inferred(
+        11,
+        "wrap",
+        "wrapped_object",
+        1,
+        "unknown",
+        RowInference {
+            family: wrapped_family(),
+            size: SizeState {
+                status: InferredStatus::Unsupported,
+                detail: None,
+                completions: 1,
+                conflict_detail: None,
+                further: 0,
+                reason: Some(crate::keymeta::REASON_OUTSIDE_ADMISSION_BOUND),
+                further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
+            },
+        },
+    ));
+    observations.key_operations.push(key_row_inferred(
+        12,
+        "wrap",
+        "wrapped_object",
+        2,
+        "unknown",
+        RowInference {
+            family: wrapped_family(),
+            size: SizeState {
+                status: InferredStatus::Inferred,
+                detail: Some((
+                    SizeDetail::WrappedMaterial {
+                        material_octets: 24,
+                        octets: 32,
+                    },
+                    EvidenceTag::WrapOutput,
+                )),
+                completions: 2,
+                conflict_detail: None,
+                further: 0,
+                reason: None,
+                further_seen: Vec::new(),
+                rsa_further_seen: [0; 32],
+                wrapped_further_seen: None,
+            },
+        },
+    ));
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&snapshot);
+    let refused = block
+        .iter()
+        .find(|line| line.contains("object 11"))
+        .expect("the refused row renders");
+    assert!(
+        refused.contains("size unsupported (outside admission bound)"),
+        "refused row names the bound:\n{snapshot}"
+    );
+    let kept = block
+        .iter()
+        .find(|line| line.contains("object 12"))
+        .expect("the retained row renders");
+    assert!(
+        !kept.contains("size unsupported"),
+        "the retained row keeps its value:\n{snapshot}"
+    );
+    assert!(
+        kept.contains("wrapped material 24 bytes (from 32-byte wrap output"),
+        "the retained value renders:\n{snapshot}"
+    );
+}
+
 /// An established-vs-inferred size mismatch names the single inferred
 /// value with no phantom second side: `conflict_detail` is absent
 /// and `further` is 0, so `-v` renders the bare value (the

@@ -29154,6 +29154,182 @@ fn keymeta_above_bound_wrapped_evidence_never_publishes() {
             EvidenceTag::WrapOutput,
         ))
     );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.object == ids[1].as_u64() && row.category == "wrap")
+        .expect("the conflicting row publishes");
+    assert_eq!(
+        key_row_json(row)["inferred_size"],
+        serde_json::json!({
+            "status": "conflicting",
+            "detail": {"kind": "wrapped_material",
+                       "material_octets": 24,
+                       "octets": 32,
+                       "evidence": "wrap_output", "about": "wrapped"},
+            "conflict_detail": {"kind": "wrapped_material",
+                       "material_octets": 32,
+                       "octets": 40,
+                       "evidence": "wrap_output", "about": "wrapped"},
+            "completions": 4
+        })
+    );
+}
+
+/// Above-bound wrapped evidence after one admitted value keeps the
+/// inferred size: the refusal counts its completion, contributes no
+/// new size, and the row still publishes the first value.
+#[test]
+fn keymeta_above_bound_after_inferred_wrapped_keeps_inferred() {
+    use crate::key_operation_projection::key_row_json;
+    use crate::key_operation_projection::producer::commit;
+    use crate::keymeta::WRAPPED_MATERIAL_MAX;
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(32)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(inferred.size.completions, 1);
+    assert_eq!(inferred.size.reason, None);
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        200,
+        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row stands");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(inferred.size.completions, 2);
+    assert_eq!(inferred.size.reason, None);
+    assert_eq!(inferred.size.conflict_detail, None);
+    assert_eq!(inferred.size.further, 0);
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: 24,
+                octets: 32,
+            },
+            EvidenceTag::WrapOutput,
+        ))
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.object == ids[1].as_u64() && row.category == "wrap")
+        .expect("the wrapped row publishes");
+    assert_eq!(
+        key_row_json(row)["inferred_size"],
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {"kind": "wrapped_material",
+                       "material_octets": 24,
+                       "octets": 32,
+                       "evidence": "wrap_output", "about": "wrapped"},
+            "completions": 2
+        })
+    );
+}
+
+/// Above-bound wrapped evidence after a stronger unknown keeps that
+/// unknown: a tiny length pins `unmapped_length`, and the refusal
+/// counts its completion without flipping to `unsupported`.
+#[test]
+fn keymeta_above_bound_after_stronger_unknown_wrapped_keeps_unknown() {
+    use crate::key_operation_projection::key_row_json;
+    use crate::key_operation_projection::producer::commit;
+    use crate::keymeta::WRAPPED_MATERIAL_MAX;
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(7)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row exists");
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(inferred.size.completions, 1);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_UNMAPPED_LENGTH)
+    );
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x2109),
+        &[wrapping, wrapped],
+        200,
+        Some(LengthOutcome::Value(WRAPPED_MATERIAL_MAX + 9)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row stands");
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(inferred.size.completions, 2);
+    assert_eq!(inferred.size.detail, None);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_UNMAPPED_LENGTH)
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.object == ids[1].as_u64() && row.category == "wrap")
+        .expect("the wrapped row publishes");
+    assert_eq!(
+        key_row_json(row)["inferred_size"],
+        serde_json::json!({
+            "status": "unknown",
+            "detail": null,
+            "completions": 2
+        })
+    );
 }
 
 /// Off-mode counts no corroboration mismatches: a stale terminal

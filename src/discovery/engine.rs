@@ -15849,7 +15849,7 @@ impl Engine {
             if !seen.insert(slot.index) {
                 continue;
             }
-            let Some(committed) = self.plan.slots.iter().find(|own| own.index == slot.index) else {
+            let Some(committed) = self.plan.slots.get(slot.index as usize) else {
                 continue;
             };
             if !self.plan.is_active(committed.index) {

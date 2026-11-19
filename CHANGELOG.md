@@ -186,6 +186,15 @@ versioned separately and are opaque, exact dispatch keys.
   through the shared stop-checked stride, committing the carry
   wholesale once it is complete; every declared module match costs
   a planning unit even against an empty module table.
+- Oversized caller folds rehearse their member lists read-only across
+  passes and publish each completed fold as one coherent revision, so
+  a paused fold never exposes partially folded edges, aggregates or
+  receipts and a stop between slices keeps the last coherent view; a
+  stage whose members or certification changed underneath cancels and
+  restages from current truth. Fold commits read every member exactly
+  once from the stop-paced per-pass index, matching the admitted cost,
+  and every staged mutation entry and the publication gate itself
+  check the live stop signal.
 
 ## [0.7.1] - 2026-11-17
 

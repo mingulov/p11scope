@@ -624,12 +624,15 @@ never get per-key rows, the report reads PARTIAL with the stop named
 as a gap, and a stderr note says coverage is partial. Since 0.7.1
 the lane continues past a transient interruption at the audit step,
 whether it strikes while a batch of calls is being checked or right
-after (up to 32 interruptions per rolling 2 minutes, named once
-with a count as a gap), so the stop is narrower. Processes already
-running when that happens keep exact
-call counts but lose per-key rows for the rest of the run, while
-processes started later are tracked. A refusal at any other step,
-or past the continuation limit, still stops the lane. One exception
+after (up to 32 interruptions per rolling 2 minutes, each named
+as a gap with its discarded count; identical re-arms fold into one
+counted row), so the stop is narrower. Since 0.7.2
+only the stuck session loses its per-key detail: its staged calls
+are discarded and counted under a named gap, while healthy sessions,
+including processes already running when the interruption hits, keep
+staged proof and continue exact, and processes started later are
+tracked. A refusal at any other step, or past the continuation limit,
+still stops the lane. One exception
 is a single call whose retained journal original can no longer be
 certified at its claim step: that call is kept as a plain row
 without key identity under its own counted gap (see below) and the
@@ -641,7 +644,12 @@ capture, or narrow the scope (`--pid`).
 
 ### A call caught mid-flight by a tracking interruption can lose its per-key detail
 
-When tracking hits a transient interruption, a call that was waiting
+When a running batch is interrupted transiently,
+only the stuck session's waiting calls are affected: they are
+discarded as counted loss under a named gap, with per-key attribution
+unknown for those calls, while calls from healthy sessions keep their
+staged proof and seal exact once unblocked. When tracking instead hits
+a genuine break in the ingested stream, a call that was waiting
 for a seal (for example behind a still-running call from the same
 process) is preserved as counted history: a completed staged call
 keeps a completed row without key identity, an unfinished one stays
@@ -1386,8 +1394,10 @@ the run: if it later becomes a tracked caller, it keeps the plain
 per-call view and a `Joint birth unavailable; retained S1` gap names
 `joint_image_refused`. A call from an untracked process that is still in
 progress when key operations are sealed cannot be accounted for; tracking
-then ends after about 6 s with a `joint audit made no progress` gap
-instead of waiting for the run deadline. This ends tracking; it never
+then trips after about 6 s with a `joint audit made no progress` gap
+naming the stuck frame instead of waiting for the run deadline, and
+the lane re-arms past the trip with the stuck session's loss counted,
+stopping only if stalls persist past the continuation limit. It never
 hangs, and the plain per-call counts are unaffected.
 The memory of refused processes holds 16,448 entries. Past that, every
 new untracked caller keeps the plain per-call view with the same
@@ -1631,8 +1641,11 @@ counted loss (see
 In long system-wide runs, a live publication can rarely stop making
 progress for one session or operation. The affected operations are
 counted in named `not attributed` reasons while exact rows continue
-for the rest, and the report marks coverage as partial. The capture
-does not hang, and nothing is silently dropped.
+for the rest, and the report marks coverage as partial. A seal
+consumer stalled without tripping the lane is parked past its stall
+instead: its degraded loss lands under a `joint stuck consumer parked`
+gap naming the caller and the counted loss, and the frame completes.
+The capture does not hang, and nothing is silently dropped.
 
 `--prearm-module` pins the named provider before any mapping and watches
 its proved offsets (`watch` on the discovery record, with `attached_at_ns`

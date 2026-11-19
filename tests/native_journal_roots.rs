@@ -339,14 +339,17 @@ fn end_length_header_trailer_and_absent_tail_initialize_in_poisoned_storage() {
 }
 
 /// Length stash (v0.8.0 keymeta Task 2): every entry acquisition
-/// flows through the shared `acquire_length_entry_args!` macro —
-/// one guarded fetch expression whose exact sequence the
-/// ebpf-common twin asserts with a spy at the production boundary
-/// — and a zero mask (count-only, narrowed, unlisted, corrupt,
-/// info) deletes any stale row and returns before that call. No
-/// direct `arg_u64` fetch may remain in the stash body: an extra
-/// read there would bypass the shared guard-to-index binding the
-/// twin pins.
+/// flows through the single shared `acquire_length_entry_args!`
+/// invocation — the raw reader with the probe context, the layout
+/// and the descriptor-derived mask variable, spelled exactly once
+/// — whose exact fetch sequence the ebpf-common twin asserts with
+/// a spy at the production boundary. The mask resolves from the
+/// descriptor, and a zero mask (count-only, narrowed, unlisted,
+/// corrupt, info) deletes any stale row and returns before that
+/// call. No `arg_u64` use of any spelling may remain in the stash
+/// body outside the pinned invocation: an extra read there — or a
+/// widened mask in the invocation — would bypass the shared
+/// guard-to-index binding the twin pins.
 #[test]
 fn length_stash_acquires_only_through_the_shared_masked_call() {
     const SOURCE: &str = include_str!("../crates/ebpf/src/journal_roots.rs");
@@ -356,27 +359,66 @@ fn length_stash_acquires_only_through_the_shared_masked_call() {
             .map(|(_, tail)| tail)
             .and_then(|tail| tail.split_once("\n    }\n").map(|(text, _)| text))
     }
+    /// Code tokens of the stash body: line comments document the
+    /// reader and the mask in prose, so only non-comment text is
+    /// pinned. The body holds no string literal or `/` operator, so
+    /// `//` always opens a comment; a future `//` inside a literal
+    /// would truncate that line and fail the pin closed.
+    fn code_tokens(text: &str) -> String {
+        text.lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
     fn contract(source: &str) -> bool {
         let Some(text) = stash_body(source) else {
             return false;
         };
-        // The mask refusal precedes the acquisition: the head before
-        // the shared macro invocation resolves the mask, deletes any
-        // stale row and returns on zero.
-        let Some(acquire) = text.find("acquire_length_entry_args!") else {
+        let code = code_tokens(text);
+        // The sole acquisition: the shared macro exactly once, with
+        // the raw reader, the probe context, the layout and the
+        // descriptor-derived mask variable. A widened mask
+        // expression (`mask | 64`) would hand descriptor 31 [3, 4, 6]
+        // instead of the authorized [3, 4].
+        const INVOCATION: &str =
+            "acquire_length_entry_args!(arg_u64, ctx, layout, mask, words, present);";
+        if code.matches("acquire_length_entry_args!").count() != 1 || !code.contains(INVOCATION) {
+            return false;
+        }
+        let acquire = code
+            .find("acquire_length_entry_args!")
+            .expect("counted once");
+        let head = &code[..acquire];
+        // Descriptor-derived mask with a zero-mask refusal: the mask
+        // resolves from the descriptor before the acquisition, and
+        // the refusal branch deletes any stale row and returns.
+        const DEFINITION: &str = "let mask = length_entry_fetch_mask(descriptor);";
+        if code.matches(DEFINITION).count() != 1 {
+            return false;
+        }
+        let (Some(definition), Some(zero)) = (head.find(DEFINITION), head.find("if mask == 0"))
+        else {
             return false;
         };
-        let head = &text[..acquire];
-        head.contains("length_entry_fetch_mask(descriptor)")
-            && head.contains("EVIDENCE_START.remove(key)")
-            && head.contains("return;")
-            // Every acquisition runs inside the shared macro; no
-            // direct fetch survives beside it.
-            && !text.contains("arg_u64(ctx,")
+        if definition > zero {
+            return false;
+        }
+        let refusal = &head[zero..];
+        if !(refusal.contains("EVIDENCE_START.remove(key)") && refusal.contains("return;")) {
+            return false;
+        }
+        // No other mask use: past the definition, `mask` names only
+        // the refusal check and the pinned invocation argument.
+        if code.replacen(DEFINITION, "", 1).matches("mask").count() != 2 {
+            return false;
+        }
+        // No raw reader outside the pinned invocation: no `arg_u64`
+        // use of any spelling survives beside the shared call.
+        !code.replacen(INVOCATION, "", 1).contains("arg_u64")
     }
     assert!(
         contract(SOURCE),
-        "stash_length_entry must refuse on a zero mask before acquiring, then acquire only through acquire_length_entry_args! with no direct arg_u64 fetch"
+        "stash_length_entry must refuse on a zero mask before acquiring, then acquire only through the single exact acquire_length_entry_args!(arg_u64, ctx, layout, mask, words, present) invocation with no other arg_u64 use"
     );
     let start = SOURCE.find("    fn stash_length_entry(").unwrap();
     let tail = SOURCE[start..].replacen("acquire_length_entry_args!", "REMOVED!", 1);

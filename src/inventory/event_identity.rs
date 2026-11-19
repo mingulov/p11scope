@@ -24,27 +24,52 @@ struct ModuleIdentity<'a> {
 
 impl<'a> IdentityIndex<'a> {
     pub(crate) fn new(presentation: &'a Presentation) -> Self {
-        Self {
-            metadata: &presentation.caller_metadata,
-            callers: presentation
-                .callers
-                .iter()
-                .map(|caller| (caller.id, caller))
-                .collect(),
-            modules: presentation
-                .modules
-                .iter()
-                .map(|module| {
-                    (
-                        module.id,
-                        ModuleIdentity {
-                            record: module,
-                            path: module.paths.iter().min().map(String::as_str),
-                        },
-                    )
-                })
-                .collect(),
+        Self::new_counted(presentation, || false).expect("a never-abort scan always completes")
+    }
+
+    /// [`Self::new`] with pacing for terminal certification: every
+    /// caller entry, module entry and examined path string counts one
+    /// unit through `unit`, and a true return aborts with `None` (the
+    /// caller abandons the pass and retries quiet). The minimum-path
+    /// scan reads each path string, so each counts.
+    pub(crate) fn new_counted(
+        presentation: &'a Presentation,
+        mut unit: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        let mut callers = HashMap::new();
+        for caller in presentation.callers.iter() {
+            if unit() {
+                return None;
+            }
+            callers.insert(caller.id, caller);
         }
+        let mut modules = HashMap::new();
+        for module in presentation.modules.iter() {
+            if unit() {
+                return None;
+            }
+            let mut path = None;
+            for candidate in module.paths.iter() {
+                if unit() {
+                    return None;
+                }
+                path = Some(path.map_or(candidate.as_str(), |held: &str| {
+                    held.min(candidate.as_str())
+                }));
+            }
+            modules.insert(
+                module.id,
+                ModuleIdentity {
+                    record: module,
+                    path,
+                },
+            );
+        }
+        Some(Self {
+            metadata: &presentation.caller_metadata,
+            callers,
+            modules,
+        })
     }
 
     pub(crate) fn edge_context(&self, edge: &EdgeView) -> Value {

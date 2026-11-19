@@ -852,10 +852,10 @@ pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
 }
 
 /// [`match_forwarding_inputs`] with pacing for fold planning: every
-/// filesystem stat counts one I/O unit and every module comparison
-/// one scan unit through `unit`, and a true return aborts with
-/// `None` (the caller retries next pass). With no declarations the
-/// match is empty without scanning.
+/// declaration costs one unit, every filesystem stat one I/O unit
+/// and every module comparison one scan unit through `unit`, and a
+/// true return aborts with `None` (the caller retries next pass).
+/// With no declarations the match is empty without scanning.
 pub(crate) fn match_forwarding_inputs_counted<Id: Copy + Ord>(
     declared: &[std::path::PathBuf],
     modules: &[(Id, String, (u64, u64), u64)],
@@ -869,6 +869,12 @@ pub(crate) fn match_forwarding_inputs_counted<Id: Copy + Ord>(
     let mut matched: BTreeSet<Id> = BTreeSet::new();
     let mut unmatched: Vec<String> = Vec::new();
     for input in declared {
+        // Every declaration costs a planning unit — even a bare name
+        // against an empty module table, whose conversion and
+        // bookkeeping would otherwise run without a stop check.
+        if unit() {
+            return None;
+        }
         let text = input.as_os_str().as_bytes();
         let is_path = text.contains(&b'/');
         let mut hit = false;

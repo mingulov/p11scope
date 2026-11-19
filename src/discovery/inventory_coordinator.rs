@@ -5895,16 +5895,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.rendered_callers.len()
     }
 
-    /// Drop carried rows the current publication did not certify. A
+    /// Replace the carried rows with the freshly certified set. A
     /// credit-deferred row's old membership must not authorize its
     /// fold once its terminal payload changed while a revision waits
     /// in the stream FIFO (the post-fold forget would erase the
     /// digest and the queued update together). The streaming wrapper
-    /// calls this with its freshly certified set before noting;
-    /// rows that stay eligible are re-noted every pass, so dropping
-    /// them here only defers them until their revision lands.
-    pub(crate) fn retain_rendered_callers(&mut self, certified: &BTreeSet<CallerId>) {
-        self.rendered_callers.retain(|id| certified.contains(id));
+    /// stages the set locally through the shared stride and commits
+    /// it here wholesale once it is complete; rows that stay eligible
+    /// are re-noted every pass, so replacing them only defers them
+    /// until their revision lands.
+    pub(crate) fn set_rendered_callers(&mut self, certified: BTreeSet<CallerId>) {
+        self.rendered_callers = certified;
     }
 
     /// Retire rendered caller rows whose process is proven ended into the
@@ -6072,8 +6073,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             candidates.push((id, record.clone()));
         }
         // Missing, live and referenced rows drop here and re-note from
-        // the view next pass, as before.
+        // the view next pass, as before. Each removal counts through
+        // the shared stride: an abort keeps the unreached drops
+        // carried, and the next pass re-derives them from scratch, so
+        // a partial removal only defers cleanup.
         for id in drops {
+            if stride.unit(stop) {
+                return FoldReceipt::default();
+            }
             self.rendered_callers.remove(&id);
         }
         // Phase 2: one binder release plan for every candidate
@@ -26404,9 +26411,10 @@ exit 0
             "a stop inside the staged removals folds nothing"
         );
         assert_eq!(checks.get(), 8, "the trip fires at the first removal lap");
-        assert!(
-            native.scene.coordinator.rendered_len_for_test() > 1,
-            "unreached drops stay carried past the trip"
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            156,
+            "the shared stride aborts the removals 45 of 200 in"
         );
         assert!(
             native.scene.coordinator.adapter.record(id).is_some(),

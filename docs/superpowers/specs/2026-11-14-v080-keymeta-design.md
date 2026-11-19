@@ -2254,9 +2254,11 @@ entries only (the §8.4 rule, never provider-gating).
 
 New section body (normative):
 
-> **Status: PROPOSED (v0.8.0 keymeta Task 7 2026-11-14);
-> owner/Opus privacy review and Codex re-review required before
-> activation.** This section scopes the Task 7 schema section
+> **Status: APPROVED for `--provider-info` opt-in (v0.8.0 keymeta
+> Task 7); capture stays off by default. Owner direction 2026-11-19
+> via the Task 7 fix8 brief: finish the section without privacy
+> questions to the owner; owner sign-off at 0.9.x like Task 2.**
+> This section scopes the Task 7 schema section
 > (§17.5): the per-module `provider_info`, per-(module, caller,
 > slot) `tokens[]` and per-(module, caller, slot, mechanism)
 > `mechanisms[]` keys. Reads are fixed-size struct/range reads at
@@ -2277,14 +2279,24 @@ New section body (normative):
 > inventory and CBOM, not only under `--key-operations`, and
 > independent of `--key-sizes` (§17.7).
 >
-> Required evidence before activation: the §17.6 host twins
-> (LP64+ia32 layouts, sentinel non-publication, 129th-mechanism
-> cap, CBOM serial-absence), canary lanes with Task 7 sentinel
-> positions proving no excluded byte reaches output/maps/logs,
-> verifier headroom + `bpf loads` (§17.4), full
-> `artifact_contracts`, and the Task 5 live positives (SoftHSM
-> info calls with parsed fields matching the provider's own
-> reports).
+> Activation evidence (recorded 2026-11-19, Task 7 fix8 lane):
+> the §17.6 host twins (LP64+ia32 layouts, sentinel
+> non-publication, 129th-mechanism cap, CBOM serial-absence);
+> live SoftHSM end-to-end positive (LP64, PID with manifest: 2
+> token and 158 mechanism rows match the provider's own reports,
+> one proved instance on every row, label and serial absent from
+> JSON, text and diagnostics); live sentinel canaries on
+> output/maps/logs (LP64 SoftHSM: 31 surfaces clean with rows
+> flowing; ia32 mock provider: token, mechanism and provider rows
+> exact with 11 sentinels absent); a no-flag control run capturing
+> nothing; and BPF verifier-budget identity (two straight-line
+> instructions against the 15% pin margin, shape recorded). The
+> --system high-churn shortfall (F2) is diagnosed as designed
+> short-lived misses with healthy drains (reference caller fully
+> joined under 88-churn); instance attribution degrades to unknown
+> under churn instead of guessing. Wiring the same sentinel
+> positions into the verify-canaries.sh matrix remains recommended
+> hardening.
 
 ### 17.4 BPF design and budget
 

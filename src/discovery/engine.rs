@@ -23637,6 +23637,12 @@ impl Engine {
     /// first-map stop holds resume with table probes attached
     /// instead of at their bound.
     fn harvest_run_learned_tables(&mut self, pins: &mut PinnedObjects, proof: &OwnedLearnProof) {
+        eprintln!(
+            "p11scope: DIAG v072 harvest_attempt path={} tables={} mono_ns={:?}",
+            proof.path,
+            proof.module.tables.len(),
+            crate::attach::monotonic_ns(),
+        );
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
             return;
         }
@@ -23780,6 +23786,13 @@ impl Engine {
                 );
             }
         }
+        eprintln!(
+            "p11scope: DIAG v072 harvest_store path={} tables={} store={} mono_ns={:?}",
+            proof.path,
+            proof.module.tables.len(),
+            self.run_learned_modules.len(),
+            crate::attach::monotonic_ns(),
+        );
         if self.run_learned_modules == before {
             return;
         }

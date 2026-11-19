@@ -658,6 +658,15 @@ fn counter_start_state_with_owning_modules_survives_loader_arming() {
     let exe = child.exe_path();
     let mut pins = fixture::real_scan_pin(&exe, None, 1, &"ab".repeat(32));
     let object = pins.pinned().next().expect("one pin").id;
+    // Production scan pins file ownership with the entry; the owned
+    // module below re-binds through it.
+    let key = pins.summary(object).unwrap().key;
+    fixture::record_scan_ownership(
+        &mut pins,
+        crate::process::ProcessViewId(0),
+        key,
+        &exe.display().to_string(),
+    );
     let plan = counters_plan_on(8, object);
     let modules = vec![owning_module_for_test(&exe, &pins, object, &plan.slots)];
     // Synthetic entries use slot offsets no real ELF proves; prove them so

@@ -301,7 +301,9 @@ fn async_global_owned_only_retire_detaches_synchronously_without_ticket() {
 
 #[test]
 fn async_global_owned_only_retire_covers_split_identity_prearm_pin() {
-    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    use crate::discovery::identity::test_fixture::{
+        module as fixture_module, own_all_raws, real_scan_pin,
+    };
     // Lane-A (pre-6.8 overlay) split twin of the owned-only sync retire:
     // the retiring static slot hangs off the pre-arm pin — a distinct pin
     // over identical bytes — while the owned-view module's entry objects
@@ -328,7 +330,8 @@ fn async_global_owned_only_retire_covers_split_identity_prearm_pin() {
     // pin holds the overlay one).
     let mut split_key = summary.key;
     split_key.device.minor = split_key.device.minor.wrapping_add(1);
-    let split = real_scan_pin(std::path::Path::new(&path), Some(split_key), 2, &sha);
+    let mut split = real_scan_pin(std::path::Path::new(&path), Some(split_key), 2, &sha);
+    own_all_raws(&mut split);
     let skips = case.engine.pinned.absorb(split);
     assert!(skips.is_empty(), "{skips:?}");
     let split_pin = case

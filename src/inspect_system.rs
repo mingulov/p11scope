@@ -8270,7 +8270,7 @@ int main(int argc, char **argv) {
     mod c1b {
         use super::super::*;
         use crate::discovery::identity::test_fixture::{
-            PATH, SHA, large_owned_object, module, view_pin,
+            PATH, SHA, large_owned_object, module, record_scan_ownership, view_pin,
         };
         use crate::discovery::identity::{FileIdentity, MappedFile};
         use crate::discovery::sweep_attribution::{
@@ -8460,6 +8460,9 @@ int main(int argc, char **argv) {
             // so the strict inventory bind admits it.
             provider.tables[0].entries[0].file_offset = real_proof_starts()[0];
             let mut pins = view_pin(&provider, 21, SHA, 1, false);
+            // Production scan pins file ownership with the entry; the
+            // collection bind below resolves through it.
+            record_scan_ownership(&mut pins, provider.view, PROVIDER, PATH);
             pins.prove_elf_function_starts_for_test(large_owned_object());
             Collection {
                 enumerated: sweep.iter().map(|(pid, _)| *pid).collect(),

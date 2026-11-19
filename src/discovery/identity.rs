@@ -12474,6 +12474,30 @@ pub(crate) mod test_fixture {
         pins.raw_ownership.entry(view).or_default().insert(raw);
     }
 
+    /// Owns every pinned raw under its key-derived view (fixture keys
+    /// encode their view in device.minor, see `module()`): the
+    /// `raw_ownership` rows `record_scanned_candidate` would have
+    /// filed had each raw pinned under its own view's scan. For
+    /// fixtures whose binding views differ from the key-derived
+    /// views, prefer the explicit `own_all_raws_under`.
+    pub(crate) fn own_all_raws(pins: &mut PinnedObjects) {
+        let raws: Vec<_> = pins.raw_to_id.keys().cloned().collect();
+        for raw in raws {
+            let view = ProcessViewId(raw.key.device.minor as u32);
+            pins.raw_ownership.entry(view).or_default().insert(raw);
+        }
+    }
+
+    /// Owns every pinned raw under `view`: the `raw_ownership` rows a
+    /// scan of that view would have filed. Raw rows only, like
+    /// `own_all_raws` — pin claims stay exactly as staged.
+    pub(crate) fn own_all_raws_under(pins: &mut PinnedObjects, view: ProcessViewId) {
+        let raws: Vec<_> = pins.raw_to_id.keys().cloned().collect();
+        for raw in raws {
+            pins.raw_ownership.entry(view).or_default().insert(raw);
+        }
+    }
+
     /// The mount both halves of a forged pre-6.8 split resolve in: the scan
     /// pin and the manifest pin are one file in one mount namespace, so their
     /// mappings agree exactly.
@@ -12679,7 +12703,7 @@ pub(crate) mod test_fixture {
 mod tests {
     use super::test_fixture::{
         FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, mark_pre_copy_up, module, overlay,
-        pin_set, pins, reback, view_pin,
+        own_all_raws, own_all_raws_under, pin_set, pins, reback, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -13553,6 +13577,7 @@ mod tests {
         dependency_module.key = dependency;
         let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
         assert!(pinned.absorb(dependency_pins).is_empty());
+        own_all_raws(&mut pinned);
         // The pinned target defines the interface getter at the
         // verified offset only; the misdirected offset is unproven.
         let target = pinned
@@ -13626,6 +13651,10 @@ mod tests {
         dependency_module.key = dependency;
         let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
         assert!(pinned.absorb(dependency_pins).is_empty());
+        own_all_raws_under(
+            &mut pinned,
+            crate::discovery::engine::Engine::RUN_LEARNED_VIEW_ID,
+        );
         // The pinned target defines the login forward at the verified
         // offset only; the sign offset is unproven.
         let target = pinned
@@ -13701,6 +13730,7 @@ mod tests {
         dependency_module.key = dependency;
         let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
         assert!(pinned.absorb(dependency_pins).is_empty());
+        own_all_raws(&mut pinned);
         let target = pinned
             .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
             .expect("the dependency is pinned");
@@ -13770,6 +13800,7 @@ mod tests {
         dependency_module.key = dependency;
         let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
         assert!(pinned.absorb(dependency_pins).is_empty());
+        own_all_raws(&mut pinned);
         let target = pinned
             .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
             .expect("the dependency is pinned");
@@ -13823,6 +13854,7 @@ mod tests {
         dependency_module.key = dependency;
         let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
         assert!(pinned.absorb(dependency_pins).is_empty());
+        own_all_raws(&mut pinned);
         let target = pinned
             .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
             .expect("the dependency is pinned");
@@ -13857,6 +13889,7 @@ mod tests {
             file_offset: DANGLING_OFFSET,
         });
         let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        own_all_raws(&mut pinned);
 
         let (bound, skipped) = bind_scanned_modules_strict(&[scanned], &mut pinned);
 
@@ -13894,6 +13927,7 @@ mod tests {
             file_offset: DANGLING_OFFSET,
         });
         let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        own_all_raws(&mut pinned);
         let provider_id = pinned
             .id_for_scanned(&scanned, provider, &scanned.path)
             .expect("the provider is pinned");
@@ -13948,6 +13982,7 @@ mod tests {
         dependency_module.key = dependency;
         let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
         assert!(pinned.absorb(dependency_pins).is_empty());
+        own_all_raws(&mut pinned);
         // No export matches either name; only the login offset is a
         // proven function start.
         let target = pinned
@@ -14004,6 +14039,7 @@ mod tests {
         dependency_module.key = dependency;
         let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
         assert!(pinned.absorb(dependency_pins).is_empty());
+        own_all_raws(&mut pinned);
         let target = pinned
             .id_for_scanned(&dependency_module, dependency, &dependency_module.path)
             .expect("the dependency is pinned");
@@ -14148,6 +14184,7 @@ mod tests {
         let id = pins
             .insert_entry(entry, &mut filing_skipped)
             .expect("the proved entry files");
+        own_all_raws(&mut pins);
         assert!(filing_skipped.is_empty(), "{filing_skipped:?}");
         assert_eq!(
             pins.id_for_scanned(&scanned, provider, &scanned.path),
@@ -14196,11 +14233,12 @@ mod tests {
         let m1 = module(k1);
         let m2 = module(k2);
         let mut pins = image_pins(&[(k1, "aa", 1)]);
+        own_all_raws(&mut pins);
         reconcile_scanned_modules(std::slice::from_ref(&m1), &mut pins);
         let mut second = image_pins(&[(k2, "bb", 2)]);
+        own_all_raws(&mut second);
         reconcile_scanned_modules(std::slice::from_ref(&m2), &mut second);
         assert!(pins.absorb(second).is_empty());
-        own_all_raws(&mut pins);
         let id1 = pins
             .id_for_scanned(&m1, k1, &m1.path)
             .expect("view 1 resolves");
@@ -14228,6 +14266,7 @@ mod tests {
 
         let k3 = overlay(3);
         let mut incoming = image_pins(&[(k3, "cc", 3)]);
+        own_all_raws(&mut incoming);
         let incoming_id = incoming
             .id_for_scanned(&module(k3), k3, PATH)
             .expect("the incoming pin resolves");
@@ -14362,6 +14401,7 @@ mod tests {
         let k1 = overlay(1);
         let k2 = overlay(2);
         let mut pins = image_pins(&[(k1, SHA, 1), (k2, SHA, 2)]);
+        own_all_raws(&mut pins);
         let id1 = pins
             .id_for_scanned(&module(k1), k1, PATH)
             .expect("key 1 resolves");
@@ -14444,6 +14484,7 @@ mod tests {
         let k1 = overlay(1);
         let k2 = overlay(2);
         let mut pins = image_pins(&[(k1, SHA, 1), (k2, SHA, 2)]);
+        own_all_raws(&mut pins);
         let id1 = pins
             .id_for_scanned(&module(k1), k1, PATH)
             .expect("id 1 resolves");
@@ -15702,6 +15743,7 @@ mod tests {
         let mut scanned = module(key);
         scanned.decoder_abi = Some(ElfAbi::Ilp32);
         let mut pinned = view_pin(&scanned, 1, SHA, 1, false);
+        own_all_raws(&mut pinned);
 
         let (bound, skipped) = bind_scanned_modules(&[scanned.clone()], &mut pinned);
 
@@ -15729,6 +15771,7 @@ mod tests {
         dependency_module.key = dependency;
         let dependency_pins = view_pin(&dependency_module, 2, SHA, 1, false);
         assert!(pinned.absorb(dependency_pins).is_empty());
+        own_all_raws(&mut pinned);
 
         set_pin_abi(&mut pinned, dependency, ElfAbi::Ilp32);
         let mut matching = pinned.clone();
@@ -17074,6 +17117,7 @@ mod tests {
             assert!(summaries[1].pre_copy_up);
             // Lookups route by proof: the pre module resolves the lower
             // pin, the plain module the upper pin.
+            own_all_raws(&mut receiver);
             let mut lower_module = module(key);
             lower_module.pre_copy_up = Some(0);
             let mut upper_module = module(key);
@@ -17643,6 +17687,7 @@ mod tests {
 
         let (mut rebuilt, skipped) = PinnedObjects::aggregate_views([&stable]);
         assert!(skipped.is_empty(), "{skipped:?}");
+        own_all_raws(&mut rebuilt);
         let (modules, collapsed, lost) =
             reconcile_scanned_modules(std::slice::from_ref(&stable_module), &mut rebuilt);
         assert_eq!((collapsed, lost.len()), (0, 0), "{lost:?}");
@@ -17714,6 +17759,7 @@ mod tests {
         let stale = view_pin(&stale_module, 105, SHA, 1, true);
 
         let (mut initial, mut initial_lost) = PinnedObjects::aggregate_views([&stable, &stale]);
+        own_all_raws(&mut initial);
         let (modules, collapsed, lost) =
             reconcile_scanned_modules(&[stable_module.clone(), stale_module], &mut initial);
         initial_lost.extend(lost);
@@ -17732,6 +17778,7 @@ mod tests {
         );
 
         let (mut rebuilt, mut after_retirement) = PinnedObjects::aggregate_views([&stable]);
+        own_all_raws(&mut rebuilt);
         let (modules, collapsed, lost) = reconcile_scanned_modules(&[stable_module], &mut rebuilt);
         after_retirement.extend(lost);
         assert_eq!(collapsed, 0);
@@ -19466,6 +19513,7 @@ mod tests {
         let a = module(overlay(102));
         let b = module(overlay(104));
         let mut pinned = pins(&[(a.key, SHA, 1), (b.key, SHA, 1)]);
+        own_all_raws(&mut pinned);
 
         let (_, collapsed, initial_uncertainty) =
             reconcile_scanned_modules(&[a.clone(), b.clone()], &mut pinned);
@@ -19555,6 +19603,7 @@ mod tests {
         let mut manifest = manifest_pins(key, SHA, 1);
         reback(&mut manifest, &candidate);
         assert!(pinned.absorb(manifest).is_empty());
+        own_all_raws(&mut pinned);
         let id = pinned
             .id_for_scanned(&module(key), key, PATH)
             .expect("exact scan alias");
@@ -19606,6 +19655,7 @@ mod tests {
             .mapping
             .mount_id += 1;
         assert!(incoming.absorb(incoming_manifest).is_empty());
+        own_all_raws(&mut incoming);
         let id = incoming
             .id_for_scanned(&module(key), key, PATH)
             .expect("incoming scan alias");
@@ -19629,10 +19679,12 @@ mod tests {
         };
         let first_module = module(real(1));
         let mut first = image_pins(&[(real(1), "aaaaaaaa", 1)]);
+        own_all_raws(&mut first);
         reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut first);
 
         let incoming_module = module(real(17));
         let mut incoming = image_pins(&[(real(17), "bbbbbbbb", 2)]);
+        own_all_raws(&mut incoming);
         reconcile_scanned_modules(std::slice::from_ref(&incoming_module), &mut incoming);
         first.absorb(incoming);
 
@@ -19662,6 +19714,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
         reback(&mut first, &backing_file(&dir, "first.so"));
+        own_all_raws(&mut first);
         reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut first);
 
         let mut collision = image_pins(&[(key, "aaaaaaaa", 1)]);
@@ -19686,17 +19739,6 @@ mod tests {
     /// Fixture pins bypass `record_scanned_candidate`, which attaches raw
     /// ownership at pin time in production. Restore the production shape so
     /// the cycle below exercises states real scans can reach.
-    fn own_all_raws(pins: &mut PinnedObjects) {
-        let raws: Vec<_> = pins.raw_to_id.keys().cloned().collect();
-        for raw in raws {
-            // Fixture keys encode their view in device.minor (see module()).
-            pins.raw_ownership
-                .entry(ProcessViewId(raw.key.device.minor as u32))
-                .or_default()
-                .insert(raw);
-        }
-    }
-
     fn assert_pins_consistent(step: &str, pins: &PinnedObjects) {
         let by_id: BTreeSet<_> = pins.by_id.keys().copied().collect();
         let mut claimed = BTreeSet::new();
@@ -19751,20 +19793,20 @@ mod tests {
         };
         let first_module = module(real(1));
         let mut pins = image_pins(&[(real(1), "aaaaaaaa", 1)]);
-        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut pins);
         own_all_raws(&mut pins);
+        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut pins);
         assert_pins_consistent("reconcile", &pins);
 
         let second_module = module(real(17));
         let mut incoming = image_pins(&[(real(17), "bbbbbbbb", 2)]);
-        reconcile_scanned_modules(std::slice::from_ref(&second_module), &mut incoming);
         own_all_raws(&mut incoming);
+        reconcile_scanned_modules(std::slice::from_ref(&second_module), &mut incoming);
         pins.absorb(incoming);
         assert_pins_consistent("absorb", &pins);
 
         let mut rescan = image_pins(&[(real(1), "aaaaaaaa", 1)]);
-        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut rescan);
         own_all_raws(&mut rescan);
+        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut rescan);
         pins.replace_view_pins(first_module.view, rescan, &[]);
         assert_pins_consistent("replace", &pins);
 
@@ -20635,10 +20677,12 @@ mod tests {
     fn overlay_canonicalization_remaps_existing_view_claims() {
         let a = module(overlay(102));
         let mut pinned = pins(&[(overlay(102), SHA, 1)]);
+        own_all_raws(&mut pinned);
         reconcile_scanned_modules(std::slice::from_ref(&a), &mut pinned);
 
         let b = module(overlay(104));
         let mut incoming = pins(&[(overlay(104), SHA, 1)]);
+        own_all_raws(&mut incoming);
         reconcile_scanned_modules(std::slice::from_ref(&b), &mut incoming);
         pinned.absorb(incoming);
 
@@ -20667,6 +20711,7 @@ mod tests {
     fn common_shared_overlay_layer_is_one_module_and_one_slot_with_uncertainty() {
         let modules = vec![module(overlay(104)), module(overlay(102))];
         let mut pinned = pins(&[(overlay(104), SHA, 1), (overlay(102), SHA, 1)]);
+        own_all_raws(&mut pinned);
 
         let (modules, collapsed, uncertainty) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(collapsed, 1);
@@ -20733,6 +20778,7 @@ mod tests {
         };
         let modules = vec![module(image(0)), module(image(1))];
         let mut pinned = image_pins(&[(image(0), SHA, 1), (image(1), SHA, 1)]);
+        own_all_raws(&mut pinned);
 
         let (modules, collapsed, lost) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!((collapsed, lost), (0, vec![]));
@@ -20759,6 +20805,7 @@ mod tests {
             // Nothing hashed either one, so nothing identifies them.
             pins(&[(real(1), "", 1), (real(17), "", 1)]),
         ] {
+            own_all_raws(&mut pins);
             let modules = vec![module(real(1)), module(real(17))];
             let (modules, collapsed, lost) = reconcile_scanned_modules(&modules, &mut pins);
             assert_eq!((collapsed, lost), (0, vec![]));
@@ -20795,6 +20842,7 @@ mod tests {
             (dep(102), "dddddddd", 1),
             (dep(104), "dddddddd", 1),
         ]);
+        own_all_raws(&mut pinned);
 
         let (modules, collapsed, uncertainty) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(collapsed, 1);
@@ -20821,6 +20869,7 @@ mod tests {
         empty.tables.clear();
         let modules = vec![empty, module(overlay(102))];
         let mut pinned = pins(&[(overlay(104), SHA, 1), (overlay(102), SHA, 1)]);
+        own_all_raws(&mut pinned);
 
         let (modules, collapsed, uncertainty) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(collapsed, 1);
@@ -20846,6 +20895,7 @@ mod tests {
         patched.tables[0].entries.push(extra);
         let modules = vec![module(overlay(102)), patched];
         let mut pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
+        own_all_raws(&mut pinned);
 
         let (modules, collapsed, lost) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(collapsed, 1);
@@ -20873,6 +20923,7 @@ mod tests {
         });
         let modules = vec![a, b];
         let mut pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
+        own_all_raws(&mut pinned);
         let (modules, _, lost) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(lost.len(), 1, "only overlay uncertainty remains: {lost:?}");
         assert_eq!(
@@ -20896,6 +20947,7 @@ mod tests {
         incoming.tables[0].entries[0].file_offset = 0x2000;
         let modules = vec![existing, incoming];
         let mut pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
+        own_all_raws(&mut pinned);
 
         let (modules, _, lost) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(lost.len(), 1, "only overlay uncertainty remains: {lost:?}");
@@ -21860,6 +21912,9 @@ mod tests {
         // Both paths start from the same copied pins.
         let mut expected = pins.pinned().unwrap().clone();
         expected.reset_derived_claims();
+        // The pushed cross-view forward names a file this view's scan
+        // would have pinned: production owns it under the entry's view.
+        own_all_raws_under(&mut expected, raw[0].view);
         let (expected_modules, expected_skips) = bind_scanned_modules(&raw, &mut expected);
         // The original binding proves the pair: verified binds, wrong offset
         // refuses with the shared reason.

@@ -13994,6 +13994,65 @@ pub(crate) mod tests {
         assert_eq!(success.prefix.settled().len(), 1);
     }
 
+    /// A pending key hit by H3 loss degrades to a named per-key gap
+    /// instead of voiding the whole view with no per-key accounting.
+    /// Twin for the stub-provider live repro (147/147 joined, yet
+    /// void_audit=1 H3Loss keys_total=1 keys_pending=1 r4 zeros v1
+    /// unavailable 0 rows; SoftHSM control yields v7 rows): one
+    /// never-sealed key, one H3 loss, staged history present.
+    #[test]
+    fn object_journal_pending_key_h3_loss_degrades_per_key() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let before = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            (before.keys_total, before.keys_pending),
+            (1, 1),
+            "one attested-but-unsealed key pends before the loss"
+        );
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("H3 loss refuses the pending key");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            (after.void_audit, after.audit_h3_loss),
+            (1, 1),
+            "the audit void still counts for safety"
+        );
+        assert_eq!(
+            (after.keys_total, after.keys_pending),
+            (1, 1),
+            "the single key stays pending, never refused or tainted"
+        );
+        let projected = scene.model.project();
+        assert!(
+            projected.gap(super::ObjectGap::OutcomeLost) >= 1,
+            "the pending key's loss lands as a named per-key model gap, not a silent whole-view void"
+        );
+    }
+
     /// A novelty-broken birth reseeds only when its pre-cut history is
     /// fenced and its image is clean: after an H3 void, the same image
     /// (old affecting history at/below the fence, never tainted) may

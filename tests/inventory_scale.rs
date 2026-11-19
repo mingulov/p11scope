@@ -1008,12 +1008,12 @@ impl ChurnCondition {
         }
         self.offset += fresh.len() as u64;
         self.pending.push_str(&fresh);
-        // Snapshot before draining: a commit batch can land whole in one
-        // tick, so the admitting pass's own marker may be processed below
-        // before the kill check runs. The admitting pass is always one
-        // past the last marker seen on an earlier tick: admitted events
-        // precede their marker in one sequential byte stream, and
-        // complete-lines-only processing keeps that order.
+        // Snapshot before draining, for the pre-seeded fallback below
+        // only: streamed churn-A admissions resolve their admitting pass
+        // at row time in the admitted handler, from the most recent
+        // preceding ordinary marker. Only an admission that bypassed
+        // event lines (a twin pre-seeding `admitted` directly) still
+        // derives one past this snapshot.
         let pass_before_tick = self.last_pass;
         // Complete lines only: the observer may be mid-write, and files
         // flush per line, so a newline-terminated line parses whole.
@@ -1053,9 +1053,13 @@ impl ChurnCondition {
                         && pid_is_driver(churn_a, &self.driver_exe)
                         && pid_is_driver(anchor, &self.driver_exe)
                     {
-                        self.request_signal(churn_a);
-                        self.request_signal(anchor);
-                        true
+                        // Both requests run even when the first fails: a
+                        // fixture can exit between the identity check above
+                        // and its syscall, and the survivor's request must
+                        // still go out. Eligibility needs both to succeed.
+                        let churn_a_rc = self.request_signal(churn_a);
+                        let anchor_rc = self.request_signal(anchor);
+                        churn_a_rc == 0 && anchor_rc == 0
                     } else {
                         false
                     }

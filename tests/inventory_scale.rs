@@ -1521,6 +1521,13 @@ fn guard_exit_line(pid: u32) -> String {
     )
 }
 
+fn guard_terminal_marker_line(pass: u64) -> String {
+    // The native stop's commit, as emitted by the product: it commits
+    // after the last pass, scans nothing, and reuses the last ordinary
+    // pass number with `final` set.
+    format!("{{\"kind\":\"pass_committed\",\"event\":{{\"pass\":{pass},\"final\":true}}}}\n")
+}
+
 #[test]
 fn churn_kill_guard_records_admitting_pass_on_same_tick_batch() {
     // The whole commit batch lands in one pump tick: the admitted line
@@ -1740,13 +1747,165 @@ fn churn_stop_needs_both_exits_not_one() {
         !condition.settled_for_stop(),
         "one exit observation must not stop without the other"
     );
-    stream.push_str(&guard_exit_line(GUARD_CHURN_A));
-    stream.push_str(&guard_pass_marker_line(3));
-    std::fs::write(&condition.events, &stream).unwrap();
+    // Commit barrier: both exit rows alone are not a commit. The writer
+    // flushes per line, so the rows and their marker land as separate
+    // appends; the pump can read the rows and pause before the marker.
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&condition.events)
+            .unwrap();
+        file.write_all(guard_exit_line(GUARD_CHURN_A).as_bytes())
+            .unwrap();
+    }
     condition.pump();
+    assert!(
+        condition.exited.contains(&GUARD_ANCHOR)
+            && condition.exited.contains(&GUARD_CHURN_A),
+        "both exit rows are consumed before their marker"
+    );
+    assert_eq!(
+        condition.exit_observing_pass, None,
+        "both exit rows alone are not a commit"
+    );
+    assert!(
+        !condition.settled_for_stop(),
+        "both exit rows without their marker must not stop"
+    );
+    assert_eq!(
+        condition.last_pass,
+        Some(2),
+        "no new pass commits before its marker"
+    );
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&condition.events)
+            .unwrap();
+        file.write_all(guard_pass_marker_line(3).as_bytes())
+            .unwrap();
+    }
+    condition.pump();
+    assert_eq!(
+        condition.exit_observing_pass,
+        Some(3),
+        "the ordinary marker commits the staged exits at pass 3"
+    );
     assert!(
         condition.settled_for_stop(),
         "both exit observations stop the run"
+    );
+}
+
+#[test]
+fn churn_stop_refuses_exits_buffered_before_kill_request() {
+    // Twin: both exits land buffered in the same tick as the admitting
+    // row, before any kill request. The attempt latch fires, but the
+    // pre-request deaths must not satisfy the stop, and a later marker
+    // with no new observations must not commit them either.
+    let dir = tmp("inventory-churn-guard-stop-buffered");
+    let mut condition = scripted_churn_condition(&dir);
+    std::fs::write(
+        &condition.events,
+        format!(
+            "{}{}",
+            guard_admitted_line(GUARD_ANCHOR),
+            guard_pass_marker_line(0)
+        ),
+    )
+    .unwrap();
+    condition.pump();
+    assert!(
+        !condition.killed,
+        "anchor admission alone leaves the kill latch clear"
+    );
+    assert_eq!(condition.last_pass, Some(0));
+    std::fs::write(
+        condition.ready.join("churn-c.ready"),
+        format!("READY {}\n", GUARD_CHURN_C),
+    )
+    .unwrap();
+    let mut buffered = std::fs::read_to_string(&condition.events).unwrap();
+    buffered.push_str(&guard_admitted_line(GUARD_CHURN_A));
+    buffered.push_str(&guard_pass_marker_line(1));
+    buffered.push_str(&guard_exit_line(GUARD_ANCHOR));
+    buffered.push_str(&guard_exit_line(GUARD_CHURN_A));
+    buffered.push_str(&guard_pass_marker_line(2));
+    std::fs::write(&condition.events, &buffered).unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert_eq!(condition.kill_admitting_pass, Some(1));
+    assert!(condition.churn_c.is_some(), "churn-C birth is visible");
+    assert!(
+        condition.exited.contains(&GUARD_ANCHOR)
+            && condition.exited.contains(&GUARD_CHURN_A),
+        "both buffered exits are consumed in the request tick"
+    );
+    assert!(
+        !condition.settled_for_stop(),
+        "exits committed before the kill request must not stop"
+    );
+    buffered.push_str(&guard_pass_marker_line(3));
+    std::fs::write(&condition.events, &buffered).unwrap();
+    condition.pump();
+    assert!(
+        !condition.settled_for_stop(),
+        "a later marker with no new observations must not commit pre-request deaths"
+    );
+}
+
+#[test]
+fn churn_stop_ignores_terminal_marker() {
+    // Twin: a native stop batch can carry exits under a final marker
+    // that scans nothing and reuses the last ordinary pass number. The
+    // terminal commit must not satisfy the scan gate: no last-pass
+    // move, no exit-observing latch, no stop.
+    let dir = tmp("inventory-churn-guard-stop-terminal");
+    let mut condition = scripted_churn_condition(&dir);
+    std::fs::write(
+        &condition.events,
+        format!(
+            "{}{}{}",
+            guard_admitted_line(GUARD_CHURN_A),
+            guard_pass_marker_line(0),
+            guard_pass_marker_line(1)
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        condition.ready.join("churn-c.ready"),
+        format!("READY {}\n", GUARD_CHURN_C),
+    )
+    .unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert_eq!(condition.kill_admitting_pass, Some(0));
+    assert_eq!(condition.last_pass, Some(1));
+    let mut terminal = std::fs::read_to_string(&condition.events).unwrap();
+    terminal.push_str(&guard_exit_line(GUARD_ANCHOR));
+    terminal.push_str(&guard_exit_line(GUARD_CHURN_A));
+    terminal.push_str(&guard_terminal_marker_line(1));
+    std::fs::write(&condition.events, &terminal).unwrap();
+    condition.pump();
+    assert!(
+        condition.exited.contains(&GUARD_ANCHOR)
+            && condition.exited.contains(&GUARD_CHURN_A),
+        "both exits are consumed under the terminal marker"
+    );
+    assert_eq!(
+        condition.last_pass,
+        Some(1),
+        "a terminal marker never advances the last pass"
+    );
+    assert_eq!(
+        condition.exit_observing_pass, None,
+        "a terminal marker cannot satisfy the scan gate"
+    );
+    assert!(
+        !condition.settled_for_stop(),
+        "exits under a terminal marker must not stop"
     );
 }
 
